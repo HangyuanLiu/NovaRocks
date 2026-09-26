@@ -167,8 +167,7 @@ pub use domain_facts::{
 pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
 pub use execution::{
     ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
-    ConnectorPreparedScanUnitSet, ConnectorReadExecution,
-    MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
+    ConnectorPreparedScanUnitSet, MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
 };
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
@@ -262,13 +261,12 @@ pub use publication::{
     LakePublicationTarget, LakePublicationTerminal,
 };
 pub use read::{
-    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-    ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorChangePartition,
+    ConnectorChangePartitionField, ConnectorChangePartitionTransform,
     ConnectorChangePartitionValue, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
-    ConnectorChangeWindowReplaceFailure, ConnectorOpenReaderRequest, ConnectorReadPurpose,
-    ConnectorReadSelector, ConnectorReaderMetricsSnapshot, ConnectorReaderOptions, ConnectorScan,
-    ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
+    ConnectorChangeWindowReplaceFailure, ConnectorReadPurpose, ConnectorReadSelector,
+    ConnectorScan, ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
 };
 pub use read_session::{

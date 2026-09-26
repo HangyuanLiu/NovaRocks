@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -30,7 +29,6 @@ use crate::exec::fragment::program::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
-use novarocks_types::SlotId;
 
 #[derive(Debug)]
 pub struct FragmentSubmission {
@@ -73,12 +71,6 @@ impl FragmentSubmission {
         &self.instance
     }
 
-    pub fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
-        let mut contracts = HashMap::new();
-        collect_incremental_scan_contracts(&self.program.plan().root, &mut contracts);
-        contracts
-    }
-
     pub fn root_plan_node_id(&self) -> i32 {
         self.program.root_plan_node_id().get()
     }
@@ -102,63 +94,6 @@ impl FragmentSubmission {
     pub fn uses_split_data_stream_sink(&self) -> bool {
         self.program.sink().kind()
             == crate::exec::fragment::program::FragmentSinkKind::SplitDataStream
-    }
-}
-
-fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32, Option<SlotId>>) {
-    match &node.kind {
-        ExecNodeKind::Scan(scan) => {
-            if let Some(node_id) = scan.node_id() {
-                output.insert(node_id, None);
-            }
-        }
-        ExecNodeKind::AssertNumRows(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::Project(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Unpivot(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Filter(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Repeat(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::ChangeEventExpand(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::UnionAll(value) => {
-            for input in &value.inputs {
-                collect_incremental_scan_contracts(input, output);
-            }
-        }
-        ExecNodeKind::Limit(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Aggregate(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Join(value) => {
-            collect_incremental_scan_contracts(&value.left, output);
-            collect_incremental_scan_contracts(&value.right, output);
-        }
-        ExecNodeKind::NestedLoopJoin(value) => {
-            collect_incremental_scan_contracts(&value.left, output);
-            collect_incremental_scan_contracts(&value.right, output);
-        }
-        ExecNodeKind::Sort(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::TableFunction(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::Analytic(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::SetOp(value) => {
-            for input in &value.inputs {
-                collect_incremental_scan_contracts(input, output);
-            }
-        }
-        ExecNodeKind::RuntimeFilterConsumer(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::TableWriter(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::TableFinish(value) => {
-            for input in &value.inputs {
-                collect_incremental_scan_contracts(input, output);
-            }
-        }
-        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) => {}
     }
 }
 
@@ -598,7 +533,6 @@ mod tests {
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     };
-    use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::join::{
@@ -606,7 +540,7 @@ mod tests {
     };
     use crate::exec::node::runtime_filter::RuntimeFilterConsumerNode;
     use crate::exec::node::scan::{
-        BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
+        BoundScanRanges, ScanNode, ScanOp, ScanStreamSource, UnusedScanStream,
     };
     use crate::exec::node::set_op::{SetOpKind, SetOpNode};
     use crate::exec::node::union_all::UnionAllNode;
@@ -618,7 +552,6 @@ mod tests {
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
         FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
-    use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_options::QueryOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use novarocks_types::QueryId;
@@ -651,17 +584,8 @@ mod tests {
     struct DummyScanOp;
 
     impl ScanOp for DummyScanOp {
-        fn execute_iter(
-            &self,
-            _morsel: ScanMorsel,
-            _profile: Option<RuntimeProfile>,
-            _runtime_filters: Option<&RuntimeFilterContext>,
-        ) -> Result<BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn build_morsels(&self) -> Result<ScanMorsels, String> {
-            Ok(ScanMorsels::default())
+        fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+            Arc::new(UnusedScanStream)
         }
     }
 

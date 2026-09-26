@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::execution_services::IoExecutor;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -210,8 +210,10 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
         self.shared.finished.load(Ordering::Acquire)
     }
 
-    fn pending_finish(&self) -> bool {
-        self.finishing && !self.shared.finished.load(Ordering::Acquire)
+    fn pending_finish(&self) -> Option<FinishWatch> {
+        // The drain task wakes the shared observable when it finishes.
+        (self.finishing && !self.shared.finished.load(Ordering::Acquire))
+            .then(|| FinishWatch::Notify(Arc::clone(&self.shared.observable)))
     }
 
     fn cancel(&mut self) {
@@ -380,8 +382,6 @@ mod tests {
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 8,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 8,
                     spill_storage:
@@ -393,9 +393,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -416,7 +413,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 
@@ -444,7 +440,7 @@ mod tests {
 
         assert!(
             poll_until(
-                || op.is_finished() && !op.pending_finish(),
+                || op.is_finished() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "sink did not finish"
@@ -485,7 +481,7 @@ mod tests {
         op.set_finishing(&state).expect("finish");
         assert!(
             poll_until(
-                || op.is_finished() && !op.pending_finish(),
+                || op.is_finished() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "sink did not finish"
@@ -505,7 +501,7 @@ mod tests {
 
         // While finish() sleeps, pending_finish must be true and is_finished false.
         assert!(
-            poll_until(|| op.pending_finish(), Duration::from_secs(1)),
+            poll_until(|| op.pending_finish().is_some(), Duration::from_secs(1)),
             "expected pending_finish during async finish"
         );
         assert!(
@@ -516,13 +512,13 @@ mod tests {
         // After finish completes, pending_finish clears and is_finished is true.
         assert!(
             poll_until(
-                || op.is_finished() && !op.pending_finish(),
+                || op.is_finished() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "sink did not finish"
         );
         assert!(
-            !op.pending_finish(),
+            op.pending_finish().is_none(),
             "pending_finish must clear after finish"
         );
         assert_eq!(op.take_output(), Some(2));

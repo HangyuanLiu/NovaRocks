@@ -146,16 +146,14 @@ mod tests {
     };
     use crate::exec::fragment::sink::FragmentSinkProgram;
     use crate::exec::node::scan::{
-        BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
-        ScanSource,
+        BoundScanRanges, ScanNode, ScanOp, ScanSource, ScanStreamSource, UnusedScanStream,
     };
-    use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::runtime::fragment::error::{FragmentLaunchErrorKind, FragmentLaunchStage};
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
-    use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_options::QueryOptions;
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
@@ -168,7 +166,7 @@ mod tests {
     impl ScanSource for CountingFileSource {
         fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
             match ranges {
-                BoundScanRanges::None => Ok(Arc::new(CountingFileOp { morsels: 1 })),
+                BoundScanRanges::None => Ok(Arc::new(CountingFileOp)),
                 other => Err(format!(
                     "CountingFileSource expects no ranges, got {other:?}"
                 )),
@@ -176,35 +174,20 @@ mod tests {
         }
     }
 
-    struct CountingFileOp {
-        morsels: usize,
-    }
+    struct CountingFileOp;
 
     impl ScanOp for CountingFileOp {
-        fn execute_iter(
-            &self,
-            _morsel: ScanMorsel,
-            _profile: Option<RuntimeProfile>,
-            _runtime_filters: Option<&RuntimeFilterContext>,
-        ) -> Result<BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
+        fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+            Arc::new(UnusedScanStream)
         }
 
-        fn build_morsels(&self) -> Result<ScanMorsels, String> {
-            let morsels = (0..self.morsels).map(test_file_morsel).collect();
-            Ok(ScanMorsels::new(morsels, false))
+        fn profile_name(&self) -> Option<String> {
+            Some("CountingFileOp".to_string())
         }
     }
 
-    fn test_file_morsel(index: usize) -> ScanMorsel {
-        ScanMorsel::FileRange {
-            path: format!("s3://bucket/file-{index}.parquet"),
-            file_len: 0,
-            offset: 0,
-            length: 0,
-            scan_range_id: index as i32,
-            external_datacache: None,
-        }
+    fn bound_by_counting_source(op: &Arc<dyn ScanOp>) -> bool {
+        op.profile_name().as_deref() == Some("CountingFileOp")
     }
 
     fn static_source_ranges() -> BoundScanRanges {
@@ -268,7 +251,7 @@ mod tests {
 
         let bindings = materialize_scan_bindings(&program, &instance).expect("materialize");
         let op = bindings.get(SCAN_NODE_ID).expect("bound op for scan node");
-        assert_eq!(op.build_morsels().expect("morsels").morsels.len(), 1);
+        assert!(bound_by_counting_source(&op));
     }
 
     #[test]
@@ -293,8 +276,8 @@ mod tests {
 
         // Independent op sets remain distinct even when their assignments have
         // identical provider-neutral shapes.
-        assert_eq!(op_a.build_morsels().expect("a morsels").morsels.len(), 1);
-        assert_eq!(op_b.build_morsels().expect("b morsels").morsels.len(), 1);
+        assert!(bound_by_counting_source(&op_a));
+        assert!(bound_by_counting_source(&op_b));
 
         // The shared program is untouched: re-binding against a third instance
         // still works and reads only the static source, and the two Arcs above
@@ -305,16 +288,9 @@ mod tests {
             UniqueId::new(20, 3),
         );
         let bindings_c = materialize_scan_bindings(&program, &instance_c).expect("materialize c");
-        assert_eq!(
-            bindings_c
-                .get(SCAN_NODE_ID)
-                .expect("op c")
-                .build_morsels()
-                .expect("c morsels")
-                .morsels
-                .len(),
-            1
-        );
+        assert!(bound_by_counting_source(
+            &bindings_c.get(SCAN_NODE_ID).expect("op c")
+        ));
     }
 
     #[test]

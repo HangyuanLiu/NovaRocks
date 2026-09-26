@@ -437,7 +437,6 @@ message QueryOptions {
   bool enable_profile = 3;
   int32 pipeline_dop = 4;
   int64 query_mem_limit = 5;
-  int32 connector_io_tasks_per_scan_operator = 6;
   optional int64 runtime_filter_scan_wait_time_ms = 7;
   optional int32 runtime_filter_wait_timeout_ms = 8;
   bool allow_throw_exception = 9;
@@ -461,6 +460,8 @@ message QueryOptions {
   bool enable_file_metacache = 27;
   bool enable_file_pagecache = 28;
   bool enable_parquet_reader_page_index = 29;
+  reserved 6;
+  reserved "connector_io_tasks_per_scan_operator";
 }
 
 // Spill options consumed by NovaRocks native runtime.

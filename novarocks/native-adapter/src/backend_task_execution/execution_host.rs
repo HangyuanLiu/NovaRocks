@@ -200,8 +200,7 @@ pub struct NativeTaskExecutionHost {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
-    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
-    scan_preparation_timer: Arc<novarocks_worker::ScanPreparationTimer>,
+    scan_stream_host: novarocks_worker::ScanStreamHost,
     completion_supervisor: Arc<TaskCompletionSupervisor>,
     /// Split delivery, keyed by execution and kernel key so a replaced attempt
     /// gets a fresh queue set and can never inherit a sequence space.
@@ -397,7 +396,7 @@ impl NativeTaskExecutionHost {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
-        scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+        scan_stream_host: novarocks_worker::ScanStreamHost,
         completion_supervisor: Arc<TaskCompletionSupervisor>,
     ) -> Self {
         Self {
@@ -409,8 +408,7 @@ impl NativeTaskExecutionHost {
             exchange_receiver_port,
             commit_port,
             execution_runtime,
-            scan_preparation_config,
-            scan_preparation_timer: novarocks_worker::ScanPreparationTimer::new(),
+            scan_stream_host,
             completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -473,8 +471,7 @@ impl NativeTaskExecutionHost {
             runtime_filter,
             read_context,
             self.context_facts.storage_resolver(execution)?,
-            self.scan_preparation_config,
-            Arc::clone(&self.scan_preparation_timer),
+            self.scan_stream_host.clone(),
         ))
     }
 
@@ -1926,8 +1923,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 1,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 1,
                     spill_storage: ExecutionSpillStorageConfig::default(),
@@ -1938,9 +1933,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1,
                     local_exchange_max_buffered_rows: 1,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -1969,7 +1961,10 @@ mod tests {
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             test_execution_runtime(),
-            novarocks_worker::ScanPreparationConfig::default(),
+            novarocks_worker::ScanStreamHost::new(
+                novarocks_worker::ScanPreparationConfig::default(),
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+            ),
             completion_supervisor,
         )
     }
