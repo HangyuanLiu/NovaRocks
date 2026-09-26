@@ -451,15 +451,6 @@ impl RuntimeFilterParticipant {
         self.state.record_row_effect(fragment_instance_id, effect);
     }
 
-    pub fn record_scan_unit_outcome(
-        &self,
-        fragment_instance_id: UniqueId,
-        outcome: novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome,
-    ) {
-        self.state
-            .record_scan_unit_outcome(fragment_instance_id, outcome);
-    }
-
     #[doc(hidden)]
     pub fn with_close_hook_for_test(
         &self,

@@ -372,8 +372,7 @@ impl FragmentEventSink for TaskOperatorStatisticsSink {
             // Runtime-filter evidence answers to the query context's filter
             // participant. Folding it here would put two unrelated facts
             // behind one identity.
-            FragmentEvent::RuntimeFilterRowEffect(_)
-            | FragmentEvent::RuntimeFilterScanUnitOutcome(_) => {}
+            FragmentEvent::RuntimeFilterRowEffect(_) => {}
         }
     }
 }

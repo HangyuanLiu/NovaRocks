@@ -821,7 +821,7 @@ mod tests {
             RuntimeFilterExecutionContract::Membership(schema),
         )
         .expect("membership consumer contract");
-        RuntimeFilterConsumerBinding::new(expr_id, contract, None)
+        RuntimeFilterConsumerBinding::new(expr_id, contract)
     }
 
     fn published_runtime_state(accepted: Vec<i32>) -> RuntimeState {
