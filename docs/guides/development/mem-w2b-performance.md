@@ -1,6 +1,6 @@
 # MEM-W2B Linux 性能验收准备
 
-本指南只规定可复现的运行输入与判定方法。批准的阈值以外部 workflow 的 MEM-W2B core plan v5 §4 为准；macOS 冒烟不能填作 Linux 通过。运行前使用干净的同一代码 SHA、原生 Linux、release profile 和 `CountingAllocator<System>`，记录 kernel、CPU/硬件线程数、Rust 版本、allocator、频率/隔离条件、命令和原始文件目录。
+本指南只规定可复现的运行输入与判定方法。批准的阈值以外部 workflow 的 MEM-W2B core plan v6 §4 为准；macOS 冒烟不能填作 Linux 通过。运行前使用干净的同一代码 SHA、原生 Linux、release profile 和 `CountingAllocator<System>`，记录 kernel、CPU/硬件线程数、Rust 版本、allocator、频率/隔离条件、命令和原始文件目录。
 
 ## 叶子供给负载
 
@@ -28,9 +28,27 @@ cargo bench -p novarocks-memory --bench reservation_cost -- \
 
 ```bash
 cargo bench -p novarocks-memory-arrow --bench retained_cost -- \
-  --candidate retained --scenario derive8 --layout shared \
+  --candidate retained --scenario derive8 --layout shared --common-lineage \
   --threads 10 --rows 4096 --columns 8 --batches 100 \
   --latencies-file /absolute/output/retained-derive8-10t-run1.csv
 ```
 
 同输入执行 `--candidate none`。`shared`、`siblings`、`independent` 是域布局；以输出中的 `lineage_scope` 判断是否真为跨线程同一谱系，不以布局名推断。记录输入/输出实际 backing 数和容量、data/metadata exposure、分配次数/字节、父链次数、拒绝数与完成行数。正式 90% filter 与 8 跳 derive 的门为同 T median 延迟比 ≤1.15、p90 比 ≤1.25、吞吐比 ≥1/1.15；每格至少五个独立进程，并保留全部原始样本。
+
+## 专项入口与生命周期收据
+
+`--scenario mixed_output` 使用与 derive8 相同的透传列加一列操作，只执行一次派生。正式共同谱系仍需 `--layout shared --common-lineage`。
+
+`--scenario ipc_pin --keep-columns N` 在计时外准备独立的真实无压缩 IPC body，移交完整解码批次，保留 N 列后释放源，再释放最后 holder。N 必须非零且小于输入列数；该场景不支持共同谱系。collector 要验证选中列持有准确 record-body 基址及完整 capacity，不能用其他共享 backing 冒充。字典 message 的独立 backing 仍计入输入/投影的实际容量。为满足请求 backing，准备阶段可能序列化更多物理行，再 slice 到指定可见行数；输出报告实际容量、可见数据字节与放大比。每个线程在计时前准备全部批次，因此需要事前冻结 `batches × threads × 实际 body` 的内存预算。
+
+```bash
+cargo bench -p novarocks-memory-arrow --bench retained_cost -- \
+  --candidate retained --scenario ipc_pin --layout shared \
+  --threads 2 --rows 1024 --columns 8 --keep-columns 1 --batches 10 \
+  --value-type primitive --backing-bytes 1MiB \
+  --latencies-file /absolute/output/ipc-pin-retained.csv
+```
+
+同输入运行 `--candidate none`；两边完成相同 projection、消费和源/输出析构。`phase=domain_lifecycle` 单列本进程实际域构造、稳态、close、最后 domain drop 与 sponsor drop 的时间及分配量，并断言 Entry/set、account 数与最终 root L/C 回到静止点。none 不创建治理域，harness 初始化成本单独标示；不以零基线计算域构造比。该统计每进程只经历一次真实域生命周期，不是逐批创建域的额外矩阵；多线程分配只记录全局增量，不归因给单线程。
+
+本轮仅交付可运行入口和正确性 smoke。五轮独立进程、完整参数矩阵与 Linux 门仍由后续正式验收执行，`matrix_complete=false` 保留。

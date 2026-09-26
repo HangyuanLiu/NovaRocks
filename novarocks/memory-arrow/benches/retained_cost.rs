@@ -35,7 +35,14 @@ use arrow::array::{
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
-use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow::ipc::{
+    convert::fb_to_schema,
+    reader::{StreamReader, read_dictionary, read_record_batch},
+    writer::{
+        CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter,
+    },
+};
+use arrow_buffer::Buffer;
 use novarocks_memory::account::TopUpPolicy;
 use novarocks_memory::authority::{AuthorityConfig, MemoryAuthority};
 use novarocks_memory::ids::{AccountKind, ExternalRef};
@@ -45,7 +52,7 @@ use novarocks_memory_arrow::{BackingCollector, BackingProvenance, Retained, Rete
 #[global_allocator]
 static ALLOCATOR: CountingAllocator<System> = CountingAllocator::new(System);
 
-const GENERATOR_VERSION: u32 = 6;
+const GENERATOR_VERSION: u32 = 7;
 const QUANTUM: u64 = 1024 * 1024;
 const DEFAULT_BATCHES: usize = 100;
 const DERIVE_HOPS: usize = 8;
@@ -109,12 +116,14 @@ impl ValueType {
 enum Scenario {
     Filter,
     Derive8,
+    MixedOutput,
     Move8,
     Fanout2,
     Fanout4,
     Fanout8,
     IpcGroup,
     IpcDecode,
+    IpcPin,
     SliceStream,
     UnaryMut,
     CrossThreadRelease,
@@ -125,12 +134,14 @@ impl Scenario {
         match value {
             "filter" => Self::Filter,
             "derive8" => Self::Derive8,
+            "mixed_output" => Self::MixedOutput,
             "move8" => Self::Move8,
             "fanout2" => Self::Fanout2,
             "fanout4" => Self::Fanout4,
             "fanout8" => Self::Fanout8,
             "ipc_group" => Self::IpcGroup,
             "ipc_decode" => Self::IpcDecode,
+            "ipc_pin" => Self::IpcPin,
             "slice_stream" => Self::SliceStream,
             "unary_mut" => Self::UnaryMut,
             "cross_thread_release" => Self::CrossThreadRelease,
@@ -142,12 +153,14 @@ impl Scenario {
         match self {
             Self::Filter => "filter",
             Self::Derive8 => "derive8",
+            Self::MixedOutput => "mixed_output",
             Self::Move8 => "move8",
             Self::Fanout2 => "fanout2",
             Self::Fanout4 => "fanout4",
             Self::Fanout8 => "fanout8",
             Self::IpcGroup => "ipc_group",
             Self::IpcDecode => "ipc_decode",
+            Self::IpcPin => "ipc_pin",
             Self::SliceStream => "slice_stream",
             Self::UnaryMut => "unary_mut",
             Self::CrossThreadRelease => "cross_thread_release",
@@ -157,6 +170,7 @@ impl Scenario {
     fn hops(self) -> usize {
         match self {
             Self::Derive8 => DERIVE_HOPS,
+            Self::MixedOutput => 1,
             _ => 0,
         }
     }
@@ -213,6 +227,7 @@ struct Args {
     batches: usize,
     rows: usize,
     columns: usize,
+    keep_columns: usize,
     backing_bytes: Option<u64>,
     phase_alloc: bool,
     independent_input: bool,
@@ -230,6 +245,7 @@ fn parse_args() -> Args {
         batches: DEFAULT_BATCHES,
         rows: 4096,
         columns: 8,
+        keep_columns: 1,
         backing_bytes: None,
         phase_alloc: false,
         independent_input: false,
@@ -253,6 +269,7 @@ fn parse_args() -> Args {
             "--batches" => args.batches = parse_next(&mut input, "batches"),
             "--rows" => args.rows = parse_next(&mut input, "rows"),
             "--columns" => args.columns = parse_next(&mut input, "columns"),
+            "--keep-columns" => args.keep_columns = parse_next(&mut input, "keep-columns"),
             "--backing-bytes" => {
                 args.backing_bytes = Some(parse_bytes(&input.next().expect("backing-bytes")));
             }
@@ -267,9 +284,9 @@ fn parse_args() -> Args {
                 println!(
                     "retained_cost --candidate retained|none \
                      [--value-type primitive|nullable|dictionary|nested|view] \
-                     --scenario filter|derive8|move8|fanout2|fanout4|fanout8|ipc_group|ipc_decode|slice_stream|unary_mut|cross_thread_release \
+                     --scenario filter|derive8|mixed_output|move8|fanout2|fanout4|fanout8|ipc_group|ipc_decode|ipc_pin|slice_stream|unary_mut|cross_thread_release \
                      [--layout shared|siblings|independent] [--threads N] [--batches N] \
-                     [--rows N] [--columns N] [--backing-bytes 64KiB|1MiB|8MiB|16MiB] \
+                     [--rows N] [--columns N] [--keep-columns N] [--backing-bytes 64KiB|1MiB|8MiB|16MiB] \
                      [--independent-input|--common-lineage] [--phase-alloc] \
                      [--latencies-file PATH]"
                 );
@@ -282,6 +299,16 @@ fn parse_args() -> Args {
     assert!(args.batches > 0, "batches must be positive");
     assert!(args.rows > 0, "rows must be positive");
     assert!(args.columns > 0, "columns must be positive");
+    if args.scenario == Scenario::IpcPin {
+        assert!(
+            args.keep_columns > 0 && args.keep_columns < args.columns,
+            "IPC pin needs a nonempty strict subset of columns"
+        );
+        assert!(
+            !args.common_lineage,
+            "IPC pin consumes independent per-batch bodies"
+        );
+    }
     if args.scenario == Scenario::SliceStream {
         assert!(args.rows >= 8, "slice stream needs at least eight rows");
     }
@@ -314,6 +341,7 @@ fn parse_args() -> Args {
                 args.scenario,
                 Scenario::IpcGroup
                     | Scenario::IpcDecode
+                    | Scenario::IpcPin
                     | Scenario::SliceStream
                     | Scenario::UnaryMut
                     | Scenario::CrossThreadRelease
@@ -550,6 +578,17 @@ struct Completed {
     output_backings: usize,
     output_backing_bytes: u64,
     copy_fallbacks: usize,
+    ipc_body_bytes: u64,
+    ipc_body_capacity: u64,
+    ipc_input_backings: usize,
+    ipc_input_backing_bytes: u64,
+    ipc_shared_backings: usize,
+    ipc_record_body_columns: usize,
+    pin_governed_live_bytes: u64,
+    pin_governed_data_bytes: u64,
+    pin_governed_metadata_bytes: u64,
+    pin_visible_bytes: u64,
+    pin_backing_bytes: u64,
     phase_alloc: PhaseAlloc,
 }
 
@@ -633,6 +672,317 @@ fn shared_body_group(input: &RecordBatch) -> Vec<RecordBatch> {
     vec![input.clone(), input.slice(0, input.num_rows().div_ceil(2))]
 }
 
+struct PreparedIpcPin {
+    batch: RecordBatch,
+    input_backings: usize,
+    input_backing_bytes: u64,
+    shared_backings: usize,
+    record_body_columns: usize,
+    body_base: usize,
+    body_bytes: u64,
+    body_capacity: u64,
+}
+
+fn decode_ipc_body(source: &RecordBatch) -> PreparedIpcPin {
+    let options = IpcWriteOptions::default();
+    let generator = IpcDataGenerator::default();
+    let mut tracker = DictionaryTracker::new(false);
+    let encoded_schema = generator.schema_to_bytes_with_dictionary_tracker(
+        source.schema().as_ref(),
+        &mut tracker,
+        &options,
+    );
+    // Dictionary ids belong to the encoded schema. The original Arrow schema
+    // can reuse id=0 for multiple columns while the encoder assigns distinct
+    // ids; dictionary decoding must therefore consume the emitted schema.
+    let schema_message = arrow::ipc::root_as_message(&encoded_schema.ipc_message)
+        .expect("decode IPC pin schema metadata");
+    let decoded_schema = Arc::new(fb_to_schema(
+        schema_message
+            .header_as_schema()
+            .expect("IPC schema header"),
+    ));
+    let (dictionary_messages, encoded) = generator
+        .encode(
+            source,
+            &mut tracker,
+            &options,
+            &mut CompressionContext::default(),
+        )
+        .expect("encode IPC pin body");
+    let mut dictionaries = HashMap::new();
+    for dictionary in dictionary_messages {
+        let message = arrow::ipc::root_as_message(&dictionary.ipc_message)
+            .expect("decode IPC dictionary metadata");
+        let buffer = Buffer::from_slice_ref(&dictionary.arrow_data);
+        read_dictionary(
+            &buffer,
+            message
+                .header_as_dictionary_batch()
+                .expect("dictionary header"),
+            decoded_schema.as_ref(),
+            &mut dictionaries,
+            &message.version(),
+        )
+        .expect("decode IPC dictionary");
+    }
+    let message =
+        arrow::ipc::root_as_message(&encoded.ipc_message).expect("decode IPC pin metadata");
+    // This is one aligned allocation for the actual uncompressed IPC body.
+    // The decoder takes zero-copy slices from it; all preparation owners drop
+    // on return, leaving only the returned batch and its array buffers.
+    let body = Buffer::from_slice_ref(&encoded.arrow_data);
+    let body_base = body.as_ptr() as usize;
+    let body_bytes = body.len() as u64;
+    let body_capacity = body.capacity() as u64;
+    let batch = read_record_batch(
+        &body,
+        message
+            .header_as_record_batch()
+            .expect("record batch header"),
+        decoded_schema,
+        &dictionaries,
+        None,
+        &message.version(),
+    )
+    .expect("decode IPC pin body");
+    PreparedIpcPin {
+        batch,
+        input_backings: 0,
+        input_backing_bytes: 0,
+        shared_backings: 0,
+        record_body_columns: 0,
+        body_base,
+        body_bytes,
+        body_capacity,
+    }
+}
+
+fn prepare_ipc_pin(
+    input: &RecordBatch,
+    value_type: ValueType,
+    requested_backing: Option<u64>,
+    keep_columns: usize,
+    provenance: &BackingProvenance,
+) -> PreparedIpcPin {
+    let mut physical_rows = input.num_rows();
+    loop {
+        // Serialize real rows, rather than appending fictitious body padding.
+        // A visible-row slice keeps the entire decoded physical body alive.
+        let source = build_input(physical_rows, input.num_columns(), value_type, 0);
+        let mut prepared = decode_ipc_body(&source);
+        let (input_backings, actual_bytes) = backing_stats(&prepared.batch, provenance);
+        if actual_bytes >= requested_backing.unwrap_or(0) {
+            let columns = (0..prepared.batch.num_columns())
+                .map(|column| prepared.batch.project(&[column]).unwrap())
+                .collect::<Vec<_>>();
+            // Track the exact record-body allocation, not any dictionary body
+            // that happens to be shared. Loss of record-body sharing fails this
+            // fixture rather than silently measuring a different pin scenario.
+            assert!(
+                pins_exact_body(
+                    &prepared.batch,
+                    prepared.body_base,
+                    prepared.body_capacity,
+                    provenance
+                ),
+                "decoded batch lost IPC record body"
+            );
+            let record_body_columns = columns
+                .iter()
+                .filter(|column| {
+                    pins_exact_body(
+                        column,
+                        prepared.body_base,
+                        prepared.body_capacity,
+                        provenance,
+                    )
+                })
+                .count();
+            assert!(
+                record_body_columns >= 2,
+                "record body must be shared by at least two columns"
+            );
+            prepared.batch = prepared.batch.slice(0, input.num_rows());
+            let projection = prepared
+                .batch
+                .project(&(0..keep_columns).collect::<Vec<_>>())
+                .unwrap();
+            assert!(
+                pins_exact_body(
+                    &projection,
+                    prepared.body_base,
+                    prepared.body_capacity,
+                    provenance
+                ),
+                "kept columns do not pin IPC record body"
+            );
+            let shared_backings = 1;
+            prepared.record_body_columns = record_body_columns;
+            prepared.input_backings = input_backings;
+            prepared.input_backing_bytes = actual_bytes;
+            prepared.shared_backings = shared_backings;
+            return prepared;
+        }
+        physical_rows = physical_rows.checked_mul(2).expect("IPC pin rows overflow");
+    }
+}
+
+fn pins_exact_body(
+    batch: &RecordBatch,
+    body_base: usize,
+    body_capacity: u64,
+    provenance: &BackingProvenance,
+) -> bool {
+    let mut collector = BackingCollector::new();
+    collector
+        .collect_batch(batch, provenance)
+        .expect("collect IPC body provenance");
+    let collection = collector.finish();
+    collection
+        .backings()
+        .iter()
+        .any(|backing| backing.base() == body_base && backing.capacity() == body_capacity)
+}
+
+// Logical values and validity visible through the projected arrays. This is
+// deliberately distinct from allocation capacity; slices retain a full body.
+fn logical_visible_bytes(array: &dyn Array) -> u64 {
+    let validity = if array.nulls().is_some() {
+        array.len().div_ceil(8) as u64
+    } else {
+        0
+    };
+    let values = if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        (a.len() * 4) as u64
+    } else if let Some(a) = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+        let labels = a.values().as_any().downcast_ref::<StringArray>().unwrap();
+        (a.len() * 4 + (labels.len() + 1) * 4) as u64
+            + (0..labels.len())
+                .map(|i| labels.value(i).len() as u64)
+                .sum::<u64>()
+    } else if let Some(a) = array.as_any().downcast_ref::<ListArray>() {
+        let offsets = a.value_offsets();
+        ((a.len() + 1) * 4) as u64 + ((offsets[a.len()] - offsets[0]) as u64) * 4
+    } else if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        (a.len() * 16) as u64
+            + (0..a.len())
+                .filter(|&i| !a.is_null(i))
+                .map(|i| a.value(i).len() as u64)
+                .sum::<u64>()
+    } else {
+        panic!("unsupported IPC pin value type");
+    };
+    values + validity
+}
+
+fn one_ipc_pin_batch(
+    candidate: Candidate,
+    domain: Option<&RetentionDomain>,
+    prepared: PreparedIpcPin,
+    keep_columns: usize,
+    provenance: &BackingProvenance,
+    sample_bytes: bool,
+) -> Result<Completed, String> {
+    let PreparedIpcPin {
+        batch,
+        input_backings,
+        input_backing_bytes,
+        shared_backings,
+        record_body_columns,
+        body_base: _,
+        body_bytes,
+        body_capacity,
+    } = prepared;
+    let kept = (0..keep_columns).collect::<Vec<_>>();
+    if candidate == Candidate::None {
+        let projected = batch.project(&kept).expect("IPC pin baseline projection");
+        drop(batch);
+        let pin_visible_bytes = if sample_bytes {
+            projected
+                .columns()
+                .iter()
+                .map(|a| logical_visible_bytes(a.as_ref()))
+                .sum()
+        } else {
+            0
+        };
+        let pin_backing_bytes = if sample_bytes {
+            backing_stats(&projected, provenance).1
+        } else {
+            0
+        };
+        let mut completed =
+            finish_plain_output(projected, Scenario::Filter, provenance, sample_bytes);
+        completed.ipc_input_backings = input_backings;
+        completed.ipc_input_backing_bytes = input_backing_bytes;
+        completed.ipc_shared_backings = shared_backings;
+        completed.ipc_record_body_columns = record_body_columns;
+        completed.ipc_body_bytes = body_bytes;
+        completed.ipc_body_capacity = body_capacity;
+        completed.pin_visible_bytes = pin_visible_bytes;
+        completed.pin_backing_bytes = pin_backing_bytes;
+        return Ok(completed);
+    }
+    let domain = domain.expect("retained candidate domain");
+    let source = domain
+        .retain(batch, provenance)
+        .map_err(|error| error.to_string())?;
+    let projected = source.payload().project(&kept).expect("IPC pin projection");
+    let output = domain
+        .derive(&[&source], projected, provenance)
+        .map_err(|error| error.to_string())?;
+    drop(source);
+    let pin_visible_bytes = if sample_bytes {
+        output
+            .payload()
+            .columns()
+            .iter()
+            .map(|a| logical_visible_bytes(a.as_ref()))
+            .sum()
+    } else {
+        0
+    };
+    let pin_backing_bytes = if sample_bytes {
+        backing_stats(output.payload(), provenance).1
+    } else {
+        0
+    };
+    let hold_live = if sample_bytes {
+        domain.snapshot().live_bytes
+    } else {
+        0
+    };
+    let hold_census = sample_bytes.then(|| domain.census());
+    if let Some(census) = &hold_census {
+        assert_eq!(
+            census.data_bytes, pin_backing_bytes,
+            "IPC pin census must account the retained allocation capacity"
+        );
+        assert_eq!(
+            hold_live,
+            census.data_bytes + census.metadata_bytes,
+            "IPC pin live accounting must match independent census"
+        );
+    }
+    let mut completed =
+        finish_retained_output(output, Scenario::Filter, domain, provenance, sample_bytes)?;
+    completed.pin_governed_live_bytes = hold_live;
+    if let Some(census) = hold_census {
+        completed.pin_governed_data_bytes = census.data_bytes;
+        completed.pin_governed_metadata_bytes = census.metadata_bytes;
+    }
+    completed.ipc_input_backings = input_backings;
+    completed.ipc_input_backing_bytes = input_backing_bytes;
+    completed.ipc_shared_backings = shared_backings;
+    completed.ipc_record_body_columns = record_body_columns;
+    completed.ipc_body_bytes = body_bytes;
+    completed.ipc_body_capacity = body_capacity;
+    completed.pin_visible_bytes = pin_visible_bytes;
+    completed.pin_backing_bytes = pin_backing_bytes;
+    Ok(completed)
+}
+
 fn ipc_roundtrip_group(input: &RecordBatch) -> (Vec<RecordBatch>, usize) {
     let source = shared_body_group(input);
     let mut encoded = Vec::new();
@@ -658,7 +1008,7 @@ fn ipc_roundtrip_group(input: &RecordBatch) -> (Vec<RecordBatch>, usize) {
 
 fn group_batch(
     candidate: Candidate,
-    domain: &RetentionDomain,
+    domain: Option<&RetentionDomain>,
     group: &[RecordBatch],
     mask: &BooleanArray,
     provenance: &BackingProvenance,
@@ -676,6 +1026,7 @@ fn group_batch(
             sample_bytes,
         ));
     }
+    let domain = domain.expect("retained candidate domain");
     let group = domain
         .retain_many(group.to_vec(), provenance)
         .map_err(|error| error.to_string())?;
@@ -810,7 +1161,7 @@ fn unary_input(rows: usize) -> Int32Array {
 
 fn one_unary_batch(
     candidate: Candidate,
-    domain: &RetentionDomain,
+    domain: Option<&RetentionDomain>,
     array: Int32Array,
     provenance: &BackingProvenance,
     sample_bytes: bool,
@@ -825,6 +1176,7 @@ fn one_unary_batch(
     let source = if candidate == Candidate::Retained {
         Some(
             domain
+                .expect("retained candidate domain")
                 .retain(source_batch, provenance)
                 .map_err(|error| error.to_string())?,
         )
@@ -848,6 +1200,7 @@ fn one_unary_batch(
     )
     .unwrap();
     let mut completed = if let Some(source) = source {
+        let domain = domain.expect("retained candidate domain");
         let output = domain
             .derive(&[&source], output_batch, provenance)
             .map_err(|error| error.to_string())?;
@@ -880,7 +1233,7 @@ fn one_unary_batch(
 fn one_batch(
     candidate: Candidate,
     scenario: Scenario,
-    domain: &RetentionDomain,
+    domain: Option<&RetentionDomain>,
     input: &RecordBatch,
     mask: &BooleanArray,
     provenance: &BackingProvenance,
@@ -906,6 +1259,7 @@ fn one_batch(
             std::thread::spawn(move || drop(output)).join().unwrap();
             return Ok(completed);
         }
+        let domain = domain.expect("retained candidate domain");
         let source = domain
             .retain(input.clone(), provenance)
             .map_err(|error| error.to_string())?;
@@ -989,6 +1343,7 @@ fn one_batch(
             sample_bytes,
         ));
     }
+    let domain = domain.expect("retained candidate domain");
     let source = domain
         .retain(input.clone(), provenance)
         .map_err(|error| error.to_string())?;
@@ -998,7 +1353,7 @@ fn one_batch(
 fn one_common_batch(
     source: CommonSource,
     scenario: Scenario,
-    domain: &RetentionDomain,
+    domain: Option<&RetentionDomain>,
     mask: &BooleanArray,
     provenance: &BackingProvenance,
 ) -> Result<Completed, String> {
@@ -1010,9 +1365,14 @@ fn one_common_batch(
             provenance,
             false,
         )),
-        CommonSource::Retained(source) => {
-            retained_output(source.fork(), scenario, domain, mask, provenance, false)
-        }
+        CommonSource::Retained(source) => retained_output(
+            source.fork(),
+            scenario,
+            domain.expect("retained candidate domain"),
+            mask,
+            provenance,
+            false,
+        ),
     }
 }
 
@@ -1044,8 +1404,16 @@ fn code_dirty() -> &'static str {
 fn main() {
     let args = parse_args();
     let provenance = unsafe { BackingProvenance::trusted_standard_arrow() };
-    let (shared_batch, input_padding) =
-        make_input(args.rows, args.columns, args.value_type, args.backing_bytes);
+    let (shared_batch, input_padding) = make_input(
+        args.rows,
+        args.columns,
+        args.value_type,
+        if args.scenario == Scenario::IpcPin {
+            None
+        } else {
+            args.backing_bytes
+        },
+    );
     let shared_input = Arc::new(shared_batch);
     let inputs = (0..args.threads)
         .map(|_| {
@@ -1093,7 +1461,7 @@ fn main() {
     let mask = Arc::new(BooleanArray::from(
         (0..args.rows).map(|row| row % 10 != 0).collect::<Vec<_>>(),
     ));
-    let selected_rows = if args.scenario == Scenario::UnaryMut {
+    let selected_rows = if matches!(args.scenario, Scenario::UnaryMut | Scenario::IpcPin) {
         args.rows
     } else if args.scenario == Scenario::SliceStream {
         let slice_len = args.rows - 7;
@@ -1142,11 +1510,23 @@ fn main() {
     let mut config = AuthorityConfig::new(capacity * 2, capacity, capacity);
     config.top_up = TopUpPolicy::uniform(QUANTUM);
     let authority = MemoryAuthority::new(config).unwrap();
+    let authority_account_baseline = authority.live_accounts();
     let common_sponsor = authority
         .create_account(AccountKind::Work, ExternalRef::from_u128(1))
         .unwrap();
-    let domains = (0..args.threads)
+    let account_baseline = authority.live_accounts();
+    let construct_alloc_before = ALLOCATOR.snapshot();
+    let construct_began = Instant::now();
+    let domain_count = if args.layout == Layout::SharedDomain {
+        1
+    } else {
+        args.threads
+    };
+    let domains = (0..domain_count)
         .map(|index| {
+            if args.candidate == Candidate::None {
+                return None;
+            }
             let sponsor = if args.layout == Layout::IndependentQueries {
                 authority
                     .create_account(
@@ -1162,7 +1542,7 @@ fn main() {
             } else {
                 1_000 + index as u128
             };
-            RetentionDomain::new(&sponsor, ExternalRef::from_u128(domain_identity)).unwrap()
+            Some(RetentionDomain::new(&sponsor, ExternalRef::from_u128(domain_identity)).unwrap())
         })
         .collect::<Vec<_>>();
     let domains = if args.layout == Layout::SharedDomain {
@@ -1174,12 +1554,30 @@ fn main() {
         domains
     };
 
+    let construct_ns = construct_began.elapsed().as_nanos();
+    let construct_alloc_after = ALLOCATOR.snapshot();
     // The same untimed warmup runs for both candidates and records one
     // quiescent data/metadata sample. Timed input references are prepared.
-    let warmup = if args.scenario == Scenario::UnaryMut {
+    let warmup = if args.scenario == Scenario::IpcPin {
+        let prepared = prepare_ipc_pin(
+            &shared_input,
+            args.value_type,
+            args.backing_bytes,
+            args.keep_columns,
+            &provenance,
+        );
+        one_ipc_pin_batch(
+            args.candidate,
+            domains[0].as_ref(),
+            prepared,
+            args.keep_columns,
+            &provenance,
+            true,
+        )
+    } else if args.scenario == Scenario::UnaryMut {
         one_unary_batch(
             args.candidate,
-            &domains[0],
+            domains[0].as_ref(),
             unary_input(args.rows),
             &provenance,
             true,
@@ -1188,7 +1586,7 @@ fn main() {
     } else if args.scenario == Scenario::IpcDecode {
         group_batch(
             args.candidate,
-            &domains[0],
+            domains[0].as_ref(),
             ipc_groups[0].as_ref().expect("prepared IPC group"),
             &mask,
             &provenance,
@@ -1198,7 +1596,7 @@ fn main() {
         one_batch(
             args.candidate,
             args.scenario,
-            &domains[0],
+            domains[0].as_ref(),
             &inputs[0],
             &mask,
             &provenance,
@@ -1207,9 +1605,20 @@ fn main() {
     }
     .expect("warmup must succeed");
     assert_eq!(warmup.rows, selected_rows);
+    let (input_backings, input_backing_bytes, group_shared_backings) =
+        if args.scenario == Scenario::IpcPin {
+            (
+                warmup.ipc_input_backings,
+                warmup.ipc_input_backing_bytes,
+                warmup.ipc_shared_backings,
+            )
+        } else {
+            (input_backings, input_backing_bytes, group_shared_backings)
+        };
     let mut seen_leaves = HashSet::new();
     let metric_domains = domains
         .iter()
+        .flatten()
         .filter(|domain| seen_leaves.insert(domain.leaf_id()))
         .cloned()
         .collect::<Vec<_>>();
@@ -1217,6 +1626,8 @@ fn main() {
         .iter()
         .map(RetentionDomain::metrics)
         .collect::<Vec<_>>();
+    let preparation_ready = Arc::new(Barrier::new(args.threads + 1));
+    let preparation_began = Instant::now();
     let start = Arc::new(Barrier::new(args.threads + 1));
     let wave_done = Arc::new(Barrier::new(args.threads + 1));
     let shared_source = Arc::new(Mutex::new(None::<CommonSource>));
@@ -1228,6 +1639,7 @@ fn main() {
         .zip(ipc_groups)
         .enumerate()
     {
+        let preparation_ready = Arc::clone(&preparation_ready);
         let start = Arc::clone(&start);
         let wave_done = Arc::clone(&wave_done);
         let shared_source = Arc::clone(&shared_source);
@@ -1238,6 +1650,9 @@ fn main() {
         let common_lineage = args.common_lineage;
         let phase_alloc = args.phase_alloc;
         let unary_rows = args.rows;
+        let keep_columns = args.keep_columns;
+        let pin_value_type = args.value_type;
+        let requested_pin_backing = args.backing_bytes;
         joins.push(std::thread::spawn(move || {
             let mut samples = Vec::with_capacity(batches);
             let mut rows = 0usize;
@@ -1252,6 +1667,22 @@ fn main() {
                 .map(|_| unary_input(unary_rows))
                 .collect::<Vec<_>>()
                 .into_iter();
+            // Each decoded IPC body has exactly one prepared owner. No body,
+            // decoder, or full-batch alias escapes preparation into the loop.
+            let mut pin_inputs = (0..batches)
+                .filter(|_| scenario == Scenario::IpcPin)
+                .map(|_| {
+                    prepare_ipc_pin(
+                        &input,
+                        pin_value_type,
+                        requested_pin_backing,
+                        keep_columns,
+                        &provenance,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter();
+            preparation_ready.wait();
             if !common_lineage {
                 start.wait();
             }
@@ -1260,10 +1691,19 @@ fn main() {
                     start.wait();
                 }
                 let began = Instant::now();
-                let result = if scenario == Scenario::UnaryMut {
+                let result = if scenario == Scenario::IpcPin {
+                    one_ipc_pin_batch(
+                        candidate,
+                        domain.as_ref(),
+                        pin_inputs.next().expect("prepared IPC pin input"),
+                        keep_columns,
+                        &provenance,
+                        false,
+                    )
+                } else if scenario == Scenario::UnaryMut {
                     one_unary_batch(
                         candidate,
-                        &domain,
+                        domain.as_ref(),
                         unary_inputs.next().expect("prepared unary input"),
                         &provenance,
                         false,
@@ -1271,11 +1711,11 @@ fn main() {
                     )
                 } else if common_lineage {
                     let source = shared_source.lock().unwrap().as_ref().unwrap().clone();
-                    one_common_batch(source, scenario, &domain, &mask, &provenance)
+                    one_common_batch(source, scenario, domain.as_ref(), &mask, &provenance)
                 } else if scenario == Scenario::IpcDecode {
                     group_batch(
                         candidate,
-                        &domain,
+                        domain.as_ref(),
                         ipc_group.as_ref().expect("prepared IPC group"),
                         &mask,
                         &provenance,
@@ -1285,7 +1725,7 @@ fn main() {
                     one_batch(
                         candidate,
                         scenario,
-                        &domain,
+                        domain.as_ref(),
                         &input,
                         &mask,
                         &provenance,
@@ -1327,6 +1767,8 @@ fn main() {
             )
         }));
     }
+    preparation_ready.wait();
+    let input_prepare_ns = preparation_began.elapsed().as_nanos();
     let alloc_before = ALLOCATOR.snapshot();
     let began = Instant::now();
     let mut wave_samples = Vec::with_capacity(args.batches);
@@ -1336,6 +1778,8 @@ fn main() {
             let source = if args.candidate == Candidate::Retained {
                 CommonSource::Retained(Arc::new(
                     domains[0]
+                        .as_ref()
+                        .expect("retained candidate domain")
                         .retain(shared_input.as_ref().clone(), &provenance)
                         .expect("common input admission must succeed"),
                 ))
@@ -1440,7 +1884,7 @@ fn main() {
         .map(|value| value.get())
         .unwrap_or(0);
     println!(
-        "kind={} scenario={} layout={} lineage_scope={} latency_unit={} input={} input_origin={} matrix_complete=false value_type={} handover={} generator_version={} code_sha={} code_dirty={} os={} kernel={} arch={} machine={} rustc={} allocator=System logical_threads={} threads={} rows={} columns={} selected_rows={} requested_backing_bytes={} input_backings={} input_backing_bytes={} group_batches={} group_shared_backings={} source_group_shared_backings={} ipc_encoded_bytes={} ipc_sharing_survives={} sample_output_backings={} sample_output_backing_bytes={} batches_per_thread={} attempted_batches={} completed_batches={completed} completed_rows={rows} denied_batches={denied} elapsed_ns={} batches_per_s={:.0} median_ns={} p90_ns={} p99_ns={} p999_ns={} allocation_calls={} allocated_bytes={} deallocated_bytes={} sample_lineage_data_bytes={} sample_lineage_metadata_exposure_bytes={} free_cas_retries={free_cas_retries} parent_top_up_calls={parent_top_up_calls} parent_return_calls={parent_return_calls} copy_fallback_batches={copy_fallbacks} phase_alloc={} phase_input_calls={} phase_input_bytes={} phase_kernel_calls={} phase_kernel_bytes={} phase_output_calls={} phase_output_bytes={} phase_kernel_observed_live_delta_bytes={} checksum={checksum} first_error={} latencies_file={}",
+        "kind={} scenario={} layout={} lineage_scope={} latency_unit={} input={} input_origin={} matrix_complete=false value_type={} handover={} generator_version={} code_sha={} code_dirty={} os={} kernel={} arch={} machine={} rustc={} allocator=System logical_threads={} threads={} rows={} columns={} selected_rows={} requested_backing_bytes={} input_backing_source={} shared_backing_scope={} ipc_record_body_columns={} input_backings={} input_backing_bytes={} group_batches={} group_shared_backings={} source_group_shared_backings={} ipc_encoded_bytes={} ipc_sharing_survives={} sample_output_backings={} sample_output_backing_bytes={} batches_per_thread={} attempted_batches={} completed_batches={completed} completed_rows={rows} denied_batches={denied} elapsed_ns={} batches_per_s={:.0} median_ns={} p90_ns={} p99_ns={} p999_ns={} allocation_calls={} allocated_bytes={} deallocated_bytes={} sample_lineage_data_bytes={} sample_lineage_metadata_exposure_bytes={} free_cas_retries={free_cas_retries} parent_top_up_calls={parent_top_up_calls} parent_return_calls={parent_return_calls} copy_fallback_batches={copy_fallbacks} phase_alloc={} phase_input_calls={} phase_input_bytes={} phase_kernel_calls={} phase_kernel_bytes={} phase_output_calls={} phase_output_bytes={} phase_kernel_observed_live_delta_bytes={} checksum={checksum} first_error={} latencies_file={}",
         args.candidate.name(),
         args.scenario.name(),
         args.layout.name(),
@@ -1450,7 +1894,9 @@ fn main() {
             "per_batch"
         },
         if args.common_lineage { "wave" } else { "batch" },
-        if args.independent_input {
+        if args.scenario == Scenario::IpcPin {
+            "independent_ipc_body"
+        } else if args.independent_input {
             "independent"
         } else {
             "shared"
@@ -1458,6 +1904,7 @@ fn main() {
         match args.scenario {
             Scenario::IpcGroup => "shared_body_synthetic",
             Scenario::IpcDecode => "arrow_ipc_roundtrip",
+            Scenario::IpcPin => "arrow_ipc_body_projection",
             _ => "generated",
         },
         args.value_type.name(),
@@ -1480,6 +1927,17 @@ fn main() {
         args.columns,
         selected_rows,
         args.backing_bytes.unwrap_or(0),
+        match args.scenario {
+            Scenario::IpcPin => "decoded_ipc_pin",
+            Scenario::IpcDecode => "decoded_ipc_roundtrip",
+            _ => "generated",
+        },
+        match args.scenario {
+            Scenario::IpcPin => "exact_record_body_shared_by_columns",
+            Scenario::IpcGroup | Scenario::IpcDecode => "batches_within_group",
+            _ => "not_applicable",
+        },
+        warmup.ipc_record_body_columns,
         input_backings,
         input_backing_bytes,
         source_group.as_ref().map_or(0, Vec::len),
@@ -1531,6 +1989,110 @@ fn main() {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "none".to_string()),
+    );
+    // Every worker and source holder has exited before closing domains. The
+    // diagnostic clones must also exit before measuring the final drop.
+    let quiescent_entries = metric_domains
+        .iter()
+        .map(|d| d.census().entries)
+        .sum::<u64>();
+    let quiescent_sets = metric_domains.iter().map(|d| d.census().sets).sum::<u64>();
+    assert_eq!(
+        (quiescent_entries, quiescent_sets),
+        (0, 0),
+        "lineage did not settle"
+    );
+    let close_before = ALLOCATOR.snapshot();
+    let close_began = Instant::now();
+    for domain in &metric_domains {
+        domain.close();
+    }
+    let close_ns = close_began.elapsed().as_nanos();
+    let close_after = ALLOCATOR.snapshot();
+    let drop_began = Instant::now();
+    drop(metric_domains);
+    drop(domains);
+    let domain_drop_ns = drop_began.elapsed().as_nanos();
+    let drop_after = ALLOCATOR.snapshot();
+    let account_after = authority.live_accounts();
+    assert_eq!(
+        account_after, account_baseline,
+        "domain accounts did not exit"
+    );
+    let sponsor_drop_began = Instant::now();
+    drop(common_sponsor);
+    let sponsor_drop_ns = sponsor_drop_began.elapsed().as_nanos();
+    let final_accounts = authority.live_accounts();
+    assert_eq!(
+        final_accounts, authority_account_baseline,
+        "sponsor accounts did not exit"
+    );
+    let final_root = authority.snapshot().root;
+    assert_eq!(
+        final_root.live_bytes, 0,
+        "final root retention remained live"
+    );
+    assert_eq!(
+        final_root.committed_bytes, 0,
+        "final root capacity did not return"
+    );
+    println!(
+        "kind={} phase=domain_lifecycle governance_applicable={} construct_scope={} domain_construct_ns={} baseline_harness_setup_ns={} construct_ns={} steady_ns={} close_ns={} domain_drop_ns={} construct_allocation_calls={} construct_allocated_bytes={} close_allocation_calls={} close_allocated_bytes={} domain_drop_deallocated_bytes={} accounts_before={} accounts_after={} final_root_live_bytes={} final_root_committed_bytes={} quiescent_entries={} quiescent_sets={} input_prepare_ns={} sponsor_drop_ns={} authority_accounts_before={} final_accounts={} keep_columns={} ipc_body_bytes={} ipc_body_capacity={} pin_visible_bytes={} pin_backing_bytes={} pin_governed_live_before_final_drop={} pin_governed_data_before_final_drop={} pin_governed_metadata_before_final_drop={} pin_amplification={:.6}",
+        args.candidate.name(),
+        args.candidate == Candidate::Retained,
+        if args.candidate == Candidate::Retained {
+            "domain_with_harness"
+        } else {
+            "baseline_harness_only"
+        },
+        if args.candidate == Candidate::Retained {
+            construct_ns
+        } else {
+            0
+        },
+        if args.candidate == Candidate::None {
+            construct_ns
+        } else {
+            0
+        },
+        construct_ns,
+        elapsed.as_nanos(),
+        close_ns,
+        domain_drop_ns,
+        construct_alloc_after
+            .allocations
+            .saturating_sub(construct_alloc_before.allocations),
+        construct_alloc_after
+            .allocated_total_bytes
+            .saturating_sub(construct_alloc_before.allocated_total_bytes),
+        close_after
+            .allocations
+            .saturating_sub(close_before.allocations),
+        close_after
+            .allocated_total_bytes
+            .saturating_sub(close_before.allocated_total_bytes),
+        drop_after
+            .deallocated_total_bytes
+            .saturating_sub(close_after.deallocated_total_bytes),
+        account_baseline,
+        account_after,
+        final_root.live_bytes,
+        final_root.committed_bytes,
+        quiescent_entries,
+        quiescent_sets,
+        input_prepare_ns,
+        sponsor_drop_ns,
+        authority_account_baseline,
+        final_accounts,
+        args.keep_columns,
+        warmup.ipc_body_bytes,
+        warmup.ipc_body_capacity,
+        warmup.pin_visible_bytes,
+        warmup.pin_backing_bytes,
+        warmup.pin_governed_live_bytes,
+        warmup.pin_governed_data_bytes,
+        warmup.pin_governed_metadata_bytes,
+        warmup.pin_backing_bytes as f64 / warmup.pin_visible_bytes.max(1) as f64
     );
     assert_eq!(
         rows,
