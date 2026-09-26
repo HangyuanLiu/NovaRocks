@@ -1386,6 +1386,7 @@ async fn supervise_rows(
                 let prepared = prepare_native_attempt(
                     session,
                     replacement,
+                    decision.topology_requirement(),
                     frontend_process_id,
                     shutdown,
                     requester,
@@ -1655,15 +1656,20 @@ async fn supervise_rows(
 async fn prepare_native_attempt(
     session: &mut LogicalNativeSession,
     execution: QueryExecutionId,
+    topology_requirement: crate::api::NativeAttemptTopologyRequirement,
     frontend_process_id: FrontendProcessId,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
 ) -> Result<(super::AttemptSchedule, Box<dyn DormantNativeAttemptOwner>), QueryExecutionError> {
     let (request, acceptance) = session.issue_attempt(execution).map_err(contract_error)?;
-    let prepared = await_with_shutdown(session.prepare(request), shutdown, requester)
-        .await
-        .and_then(|prepared| acceptance.accept(prepared).map_err(Into::into))
-        .map_err(native_prepare_error)?;
+    let prepared = await_with_shutdown(
+        session.prepare(request.require_topology(topology_requirement)),
+        shutdown,
+        requester,
+    )
+    .await
+    .and_then(|prepared| acceptance.accept(prepared).map_err(Into::into))
+    .map_err(native_prepare_error)?;
     let schedule = build_attempt_schedule(
         execution,
         frontend_process_id,
