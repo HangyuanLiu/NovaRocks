@@ -28,7 +28,6 @@ pub mod contribution;
 pub mod evaluator;
 pub mod feedback_domain;
 pub mod row_group_domain;
-pub mod scan_domain;
 
 pub use evaluator::{
     RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterRowEffect,

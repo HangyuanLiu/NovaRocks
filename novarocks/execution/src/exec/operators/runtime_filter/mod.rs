@@ -88,40 +88,6 @@ impl Clone for NativeOrderedLiveConsumerSet {
     reason = "Ordered live-consumer helpers remain available for native scan integration paths."
 )]
 impl NativeOrderedLiveConsumerSet {
-    #[expect(
-        clippy::type_complexity,
-        reason = "The return value preserves each scan-domain binding with its independently optional snapshot."
-    )]
-    pub(crate) fn scan_domain_snapshots(
-        &self,
-    ) -> Result<
-        Vec<(
-            execution::scan_domain::RuntimeFilterScanDomainBinding,
-            Option<Arc<execution::RuntimeFilterSnapshot>>,
-        )>,
-        String,
-    > {
-        self.poll_updates()?;
-        let bindings = self
-            .inner
-            .bindings
-            .lock()
-            .expect("native ordered RF consumer lock");
-        Ok(bindings
-            .iter()
-            .filter_map(|binding| {
-                let target = binding.spec.scan_domain.clone()?;
-                let snapshot = match &binding.state {
-                    NativeOrderedLiveBindingState::BoundExecutionLive {
-                        latest_snapshot, ..
-                    } => latest_snapshot.clone(),
-                    _ => None,
-                };
-                Some((target, snapshot))
-            })
-            .collect())
-    }
-
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
@@ -499,28 +465,6 @@ impl NativeConsumerPredicate {
     reason = "The direct consumer API remains available for non-polling integration callers."
 )]
 impl RuntimeFilterConsumerSet {
-    pub(crate) fn scan_domain_snapshots(
-        &self,
-    ) -> Vec<(
-        execution::scan_domain::RuntimeFilterScanDomainBinding,
-        Option<Arc<execution::RuntimeFilterSnapshot>>,
-    )> {
-        let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
-        bindings
-            .iter()
-            .filter_map(|binding| {
-                let target = binding.spec.scan_domain.clone()?;
-                let snapshot = match &binding.state {
-                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(
-                        snapshot,
-                    )) => Some(Arc::clone(snapshot)),
-                    _ => None,
-                };
-                Some((target, snapshot))
-            })
-            .collect()
-    }
-
     pub(crate) fn from_plan(
         owner: &'static str,
         specs: &[RuntimeFilterConsumerBinding],
@@ -1413,7 +1357,6 @@ mod tests {
                 RuntimeFilterExecutionContract::Membership(schema),
             )
             .expect("consumer contract"),
-            None,
         )
     }
 
@@ -1464,7 +1407,7 @@ mod tests {
             RuntimeFilterExecutionContract::Ordered(order),
         );
         let error = match NativeOrderedLiveConsumerSet::from_plan(
-            &[RuntimeFilterConsumerBinding::new(expr_id, contract, None)],
+            &[RuntimeFilterConsumerBinding::new(expr_id, contract)],
             Arc::new(arena),
         ) {
             Ok(_) => panic!("ordered consumers are live only"),

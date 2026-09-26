@@ -169,11 +169,6 @@ struct RuntimeFilterConsumerWire {
     row_evaluations: u64,
     input_rows: u64,
     output_rows: u64,
-    scan_evaluated: u64,
-    scan_kept: u64,
-    scan_pruned: u64,
-    scan_not_evaluated: u64,
-    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedWire,
 }
 
 #[derive(serde::Deserialize)]
@@ -235,23 +230,6 @@ struct RuntimeFilterConsumerTotalsWire {
     row_evaluations: u64,
     input_rows: u64,
     output_rows: u64,
-    scan_evaluated: u64,
-    scan_kept: u64,
-    scan_pruned: u64,
-    scan_not_evaluated: u64,
-    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedWire,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
-struct RuntimeFilterScanNotEvaluatedWire {
-    unit_facts_missing: u64,
-    column_facts_missing: u64,
-    data_type_unsupported: u64,
-    predicate_capability_unsupported: u64,
-    resource_unavailable: u64,
-    snapshot_unavailable: u64,
-    snapshot_timed_out: u64,
-    snapshot_not_published: u64,
 }
 
 fn query_lifecycle_structured_snapshot_from_fe(
@@ -937,11 +915,6 @@ pub struct RuntimeFilterConsumerTerminalDetail {
     pub row_evaluations: u64,
     pub input_rows: u64,
     pub output_rows: u64,
-    pub scan_evaluated: u64,
-    pub scan_kept: u64,
-    pub scan_pruned: u64,
-    pub scan_not_evaluated: u64,
-    pub scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedCounters,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1023,23 +996,6 @@ pub struct RuntimeFilterConsumerTotals {
     pub row_evaluations: u64,
     pub input_rows: u64,
     pub output_rows: u64,
-    pub scan_evaluated: u64,
-    pub scan_kept: u64,
-    pub scan_pruned: u64,
-    pub scan_not_evaluated: u64,
-    pub scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedCounters,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeFilterScanNotEvaluatedCounters {
-    pub unit_facts_missing: u64,
-    pub column_facts_missing: u64,
-    pub data_type_unsupported: u64,
-    pub predicate_capability_unsupported: u64,
-    pub resource_unavailable: u64,
-    pub snapshot_unavailable: u64,
-    pub snapshot_timed_out: u64,
-    pub snapshot_not_published: u64,
 }
 
 fn decode_runtime_filter_terminal_rollup(
@@ -1228,13 +1184,6 @@ fn decode_runtime_filter_consumer(
         row_evaluations: wire.row_evaluations,
         input_rows: wire.input_rows,
         output_rows: wire.output_rows,
-        scan_evaluated: wire.scan_evaluated,
-        scan_kept: wire.scan_kept,
-        scan_pruned: wire.scan_pruned,
-        scan_not_evaluated: wire.scan_not_evaluated,
-        scan_not_evaluated_reasons: runtime_filter_scan_not_evaluated(
-            wire.scan_not_evaluated_reasons,
-        ),
     })
 }
 
@@ -1287,13 +1236,6 @@ fn decode_runtime_filter_totals(
                     row_evaluations: consumers.row_evaluations,
                     input_rows: consumers.input_rows,
                     output_rows: consumers.output_rows,
-                    scan_evaluated: consumers.scan_evaluated,
-                    scan_kept: consumers.scan_kept,
-                    scan_pruned: consumers.scan_pruned,
-                    scan_not_evaluated: consumers.scan_not_evaluated,
-                    scan_not_evaluated_reasons: runtime_filter_scan_not_evaluated(
-                        consumers.scan_not_evaluated_reasons,
-                    ),
                 },
             },
         )),
@@ -1307,21 +1249,6 @@ fn decode_runtime_filter_totals(
             };
             Ok(RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason))
         }
-    }
-}
-
-fn runtime_filter_scan_not_evaluated(
-    wire: RuntimeFilterScanNotEvaluatedWire,
-) -> RuntimeFilterScanNotEvaluatedCounters {
-    RuntimeFilterScanNotEvaluatedCounters {
-        unit_facts_missing: wire.unit_facts_missing,
-        column_facts_missing: wire.column_facts_missing,
-        data_type_unsupported: wire.data_type_unsupported,
-        predicate_capability_unsupported: wire.predicate_capability_unsupported,
-        resource_unavailable: wire.resource_unavailable,
-        snapshot_unavailable: wire.snapshot_unavailable,
-        snapshot_timed_out: wire.snapshot_timed_out,
-        snapshot_not_published: wire.snapshot_not_published,
     }
 }
 
@@ -5343,20 +5270,6 @@ mod tests {
                             "row_evaluations": 100,
                             "input_rows": 100,
                             "output_rows": 20,
-                            "scan_evaluated": 10,
-                            "scan_kept": 4,
-                            "scan_pruned": 6,
-                            "scan_not_evaluated": 0,
-                            "scan_not_evaluated_reasons": {
-                                "unit_facts_missing": 0,
-                                "column_facts_missing": 0,
-                                "data_type_unsupported": 0,
-                                "predicate_capability_unsupported": 0,
-                                "resource_unavailable": 0,
-                                "snapshot_unavailable": 0,
-                                "snapshot_timed_out": 0,
-                                "snapshot_not_published": 0
-                            }
                         }]
                     }
                 }],
@@ -5366,11 +5279,7 @@ mod tests {
                     "producer_streams": { "count": 1, "accepted_count": 1, "duplicate_count": 2, "stale_count": 0, "conflict_count": 0, "resource_limit_count": 0 },
                     "transport_routes": { "count": 1, "sent_count": 1, "sent_bytes": 17, "retried_count": 1, "retried_bytes": 17, "acked_count": 1, "acked_bytes": 17, "fail_open_count": 0, "fail_open_bytes": 0 },
                     "consumers": {
-                        "count": 1, "row_evaluations": 100, "input_rows": 100, "output_rows": 20, "scan_evaluated": 10, "scan_kept": 4, "scan_pruned": 6, "scan_not_evaluated": 0,
-                        "scan_not_evaluated_reasons": {
-                            "unit_facts_missing": 0, "column_facts_missing": 0, "data_type_unsupported": 0, "predicate_capability_unsupported": 0,
-                            "resource_unavailable": 0, "snapshot_unavailable": 0, "snapshot_timed_out": 0, "snapshot_not_published": 0
-                        }
+                        "count": 1, "row_evaluations": 100, "input_rows": 100, "output_rows": 20
                     }
                 }
             },
@@ -5431,7 +5340,7 @@ mod tests {
         assert_eq!(totals.channels.completed_count, 1);
         assert_eq!(totals.producer_streams.duplicate_count, 2);
         assert_eq!(totals.transport_routes.acked_count, 1);
-        assert_eq!(totals.consumers.scan_pruned, 6);
+        assert_eq!(totals.consumers.output_rows, 20);
     }
 
     #[test]
