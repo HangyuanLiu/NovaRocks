@@ -949,16 +949,12 @@ mod tests {
     }
 
     fn http_get(port: u16, path: &str) -> std::io::Result<String> {
-        let mut stream =
-            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP listener");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("set HTTP read timeout");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         write!(
             stream,
             "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write HTTP request");
+        )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         Ok(response)
