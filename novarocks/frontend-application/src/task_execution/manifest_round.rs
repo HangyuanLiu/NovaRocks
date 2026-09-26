@@ -466,7 +466,11 @@ impl ManifestAssembledRound {
 
 fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
     let topology_requirement = match &error {
-        TaskExecutionError::PreReadyEstablishTransportUnknown { backend }
+        TaskExecutionError::ParticipantUnobservable {
+            backend,
+            state: ParticipantObservationFailure::Transport(_),
+        }
+        | TaskExecutionError::PreReadyEstablishTransportUnknown { backend }
         | TaskExecutionError::PreReadyEstablishRejected {
             backend,
             outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
@@ -601,6 +605,28 @@ mod tests {
         else {
             panic!("identity mismatch must fail the attempt");
         };
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                backend
+            )
+        );
+    }
+    #[test]
+    fn lost_status_transport_preserves_failed_process_for_replacement() {
+        let backend = novarocks_types::identity::BackendProcessId::new_v7();
+        let NativeAttemptTerminal::Failed(failure) =
+            task_protocol_failure(TaskExecutionError::ParticipantUnobservable {
+                backend,
+                state: ParticipantObservationFailure::Transport("stream_lost"),
+            })
+        else {
+            panic!("lost participant must fail the attempt");
+        };
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
         assert_eq!(
             failure.topology_requirement(),
             novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(

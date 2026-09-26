@@ -656,7 +656,11 @@ async fn acquire_replacement_admissions(
                     .admission_epoch_capability(),
             );
             let intent = OperationIntent::AcquireQueryContextAdmissionTicket(request);
+            let mut retry_delay = runtime.task_update_retry_policy.initial_backoff();
             loop {
+                if *cancellation.borrow() {
+                    return Err(ReplacementQualificationFailure::Rejected);
+                }
                 // One exact admission per context, retried in place: this owner
                 // has no successor candidate that a full target could reorder.
                 let permit = match sink.try_reserve_queue(intent.queue_request()) {
@@ -722,7 +726,21 @@ async fn acquire_replacement_admissions(
                         )?);
                         break;
                     }
-                    (None, _) => continue,
+                    (None, _) => {
+                        // Replay the exact admission without turning immediate
+                        // transport refusal into an unbounded RPC spin. The
+                        // qualification's outer expiry still bounds this wait.
+                        tokio::select! {
+                            _ = tokio::time::sleep(retry_delay) => {},
+                            _ = cancellation.changed() => {
+                                return Err(ReplacementQualificationFailure::Rejected);
+                            }
+                        }
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(runtime.task_update_retry_policy.max_backoff());
+                        continue;
+                    }
                     _ => {
                         return Err(ReplacementQualificationFailure::Rejected);
                     }
@@ -1915,7 +1933,7 @@ where
             // A failed attempt can be replaced on the same live processes once
             // its exact contexts are fenced. Qualification, not a topology
             // revision change, enforces that isolation before activation. A typed
-            // invalid process additionally constrains successor placement.
+            // failed process additionally constrains successor placement.
             let snapshot = wait_for_attempt_topology(
                 &state.topology,
                 request.topology_requirement(),
@@ -2004,13 +2022,11 @@ fn topology_satisfies_requirement(
         novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot => true,
         novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
             process,
-        ) => {
-            !snapshot.targets().is_empty()
-                && snapshot
-                    .targets()
-                    .iter()
-                    .all(|target| target.process_id() != Ok(process))
-        }
+        ) => snapshot.targets().iter().any(|target| {
+            target
+                .process_id()
+                .is_ok_and(|candidate| candidate != process)
+        }),
     }
 }
 
@@ -2174,7 +2190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_waits_until_failed_process_leaves_a_nonempty_eligible_snapshot() {
+    async fn replacement_waits_for_other_capacity_without_rewriting_membership() {
         use novarocks_query_application::api::NativeAttemptTopologyRequirement;
         let failed = BackendProcessId::new_v7();
         let remaining = BackendProcessId::new_v7();
@@ -2195,8 +2211,7 @@ mod tests {
         let (changes, _) = tokio::sync::watch::channel(7);
         let mutable = Arc::new(FixedLiveTopology {
             snapshot: std::sync::Mutex::new(
-                BackendTopologySnapshot::try_new(7, vec![target(0, failed), target(1, remaining)])
-                    .unwrap(),
+                BackendTopologySnapshot::try_new(7, vec![target(0, failed)]).unwrap(),
             ),
             changes,
         });
@@ -2223,14 +2238,30 @@ mod tests {
         );
         // No restart is required: remaining live capacity can admit the successor.
         *mutable.snapshot.lock().unwrap() =
-            BackendTopologySnapshot::try_new(9, vec![target(1, remaining)]).unwrap();
+            BackendTopologySnapshot::try_new(9, vec![target(0, failed), target(1, remaining)])
+                .unwrap();
         mutable.changes.send_replace(9);
         let snapshot = tokio::time::timeout(Duration::from_secs(1), &mut wait)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.targets()[0].process_id().unwrap(), remaining);
+        assert!(
+            snapshot
+                .targets()
+                .iter()
+                .any(|target| target.process_id() == Ok(failed)),
+            "membership remains the owner's complete snapshot"
+        );
+        assert!(
+            snapshot
+                .targets()
+                .iter()
+                .any(|target| target.process_id() == Ok(remaining))
+        );
         drop(wait);
+        *mutable.snapshot.lock().unwrap() =
+            BackendTopologySnapshot::try_new(10, vec![target(1, remaining)]).unwrap();
+        mutable.changes.send_replace(10);
         root.owner.cancel(CancellationReason::ClientDisconnected);
         let cancelled = tokio::time::timeout(
             Duration::from_secs(1),

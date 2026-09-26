@@ -342,12 +342,24 @@ pub struct RootResultFetchFailure {
 }
 
 impl RootResultFetchFailure {
+    pub const fn with_topology_requirement(
+        mut self,
+        requirement: NativeAttemptTopologyRequirement,
+    ) -> Self {
+        self.topology_requirement = requirement;
+        self
+    }
+
     pub fn new(class: AttemptFailureClass, error: QueryExecutionError) -> Self {
         Self {
             class,
             error,
             topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
         }
+    }
+
+    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.topology_requirement
     }
 
     pub const fn class(&self) -> AttemptFailureClass {

@@ -126,7 +126,7 @@ impl std::error::Error for LogicalNativeOpenError {}
 pub enum NativeAttemptTopologyRequirement {
     #[default]
     LiveSnapshot,
-    /// An exhausted or identity-invalid admission cannot reuse that process.
+    /// Successor placement selects other eligible processes from the live snapshot.
     ExcludeProcess(BackendProcessId),
 }
 
