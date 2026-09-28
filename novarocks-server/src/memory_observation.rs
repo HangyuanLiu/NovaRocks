@@ -93,6 +93,7 @@ use crate::memory_limit::{self, CgroupFinding};
 /// on a sharded counter array around each call, so the counters keep their
 /// meaning whichever allocator sits inside.
 // Design: ADR-0148 (docs/adr/ADR-0148-process-memory-capacity-authority.md)
+// Design: ADR-0161 (docs/adr/ADR-0161-jemalloc-process-allocator-and-cgroup-memory-bound.md)
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: CountingAllocator<tikv_jemallocator::Jemalloc> =

@@ -179,6 +179,7 @@ fn read_required(
 /// A v1 hierarchy with the `memory` controller wins over the unified
 /// hierarchy: a controller is bound to one hierarchy at a time, so in hybrid
 /// mode the unified hierarchy carries no memory limit at all.
+// Design: ADR-0161 (docs/adr/ADR-0161-jemalloc-process-allocator-and-cgroup-memory-bound.md)
 pub fn locate(proc_self_cgroup: &str, mountinfo: &str) -> Result<Option<CgroupLayout>, ProbeError> {
     let mounts = parse_mountinfo(mountinfo);
     let (version, cgroup_path) = if let Some(path) = v1_memory_path(proc_self_cgroup) {

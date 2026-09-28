@@ -59,6 +59,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 # jemalloc runs background purge threads only on Linux. On macOS it is built
 # without them, and enabling them there makes jemalloc fail to initialise, so
 # the crate feature must not reach any other target.
+# Design: ADR-0161 (docs/adr/ADR-0161-jemalloc-process-allocator-and-cgroup-memory-bound.md)
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
