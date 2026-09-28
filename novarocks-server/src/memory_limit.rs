@@ -14,11 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::path::Path;
+
+use crate::cgroup_memory::{self, CgroupLayout, CgroupMemory, ProbeError};
 
 pub const DEFAULT_MEM_LIMIT_SPEC: &str = "90%";
 pub const FALLBACK_VISIBLE_MEMORY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -27,7 +29,7 @@ const BE_SOFT_LIMIT_RATIO: f64 = 0.9;
 
 pub fn resolve_starrocks_process_mem_limit_bytes(mem_limit: &str) -> Result<u64> {
     let visible_memory_bytes =
-        detect_visible_memory_bytes().unwrap_or(FALLBACK_VISIBLE_MEMORY_BYTES);
+        visible_memory().map_or(FALLBACK_VISIBLE_MEMORY_BYTES, |visible| visible.bytes);
     resolve_starrocks_process_mem_limit_bytes_for_visible_memory(mem_limit, visible_memory_bytes)
 }
 
@@ -86,55 +88,183 @@ fn parse_float_bytes(mem_spec: &str, number_part: &str, multiplier: f64) -> Resu
     Ok((value * multiplier) as i128)
 }
 
-pub fn detect_visible_memory_bytes() -> Option<u64> {
-    match (
-        detect_container_memory_limit_bytes(),
-        detect_physical_memory_bytes(),
-    ) {
-        (Some(container), Some(physical)) => Some(container.min(physical)),
-        (Some(container), None) => Some(container),
-        (None, Some(physical)) => Some(physical),
-        (None, None) => None,
+/// What bounds this process's memory: the smaller of its cgroup limit and
+/// physical memory, with where each number came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleMemory {
+    /// The smaller of the cgroup limit and physical memory.
+    pub bytes: u64,
+    /// Physical memory, when the platform reports it.
+    pub physical_bytes: Option<u64>,
+    /// What probing this process's memory cgroup found.
+    pub cgroup: CgroupFinding,
+}
+
+/// What probing this process's memory cgroup found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CgroupFinding {
+    /// A memory cgroup with a limit somewhere on its path.
+    Limited {
+        /// Where the cgroup is.
+        layout: CgroupLayout,
+        /// The smallest limit on its path.
+        limit_bytes: u64,
+    },
+    /// A memory cgroup with no limit anywhere on its path.
+    Unlimited {
+        /// Where the cgroup is.
+        layout: CgroupLayout,
+    },
+    /// No memory cgroup is visible: the platform has none, or no hierarchy
+    /// carrying the memory controller is mounted.
+    Absent,
+    /// Probing failed, so physical memory bounds the process instead. The
+    /// reason is kept: a failed probe is never read as "no limit" silently.
+    Failed {
+        /// Why the probe failed.
+        reason: String,
+    },
+}
+
+impl CgroupFinding {
+    /// This process's cgroup, when one was located.
+    pub fn layout(&self) -> Option<&CgroupLayout> {
+        match self {
+            Self::Limited { layout, .. } | Self::Unlimited { layout } => Some(layout),
+            Self::Absent | Self::Failed { .. } => None,
+        }
+    }
+
+    /// The cgroup limit, when one was found.
+    pub fn limit_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Limited { limit_bytes, .. } => Some(*limit_bytes),
+            Self::Unlimited { .. } | Self::Absent | Self::Failed { .. } => None,
+        }
     }
 }
 
-#[cfg(target_os = "linux")]
-fn detect_container_memory_limit_bytes() -> Option<u64> {
-    if !Path::new("/.dockerenv").exists() {
-        return None;
+impl VisibleMemory {
+    /// Combines a cgroup probe with physical memory; `None` when neither
+    /// bounds the process.
+    pub fn compose(
+        probe: Result<Option<CgroupMemory>, ProbeError>,
+        physical_bytes: Option<u64>,
+    ) -> Option<Self> {
+        let cgroup = match probe {
+            Ok(Some(CgroupMemory {
+                layout,
+                limit_bytes: Some(limit_bytes),
+            })) => CgroupFinding::Limited {
+                layout,
+                limit_bytes,
+            },
+            Ok(Some(CgroupMemory {
+                layout,
+                limit_bytes: None,
+            })) => CgroupFinding::Unlimited { layout },
+            Ok(None) => CgroupFinding::Absent,
+            Err(error) => CgroupFinding::Failed {
+                reason: error.to_string(),
+            },
+        };
+        let bytes = match (cgroup.limit_bytes(), physical_bytes) {
+            (Some(limit), Some(physical)) => limit.min(physical),
+            (Some(limit), None) => limit,
+            (None, Some(physical)) => physical,
+            (None, None) => return None,
+        };
+        Some(Self {
+            bytes,
+            physical_bytes,
+            cgroup,
+        })
     }
 
-    let cgroup_path = std::ffi::CString::new("/sys/fs/cgroup").ok()?;
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(cgroup_path.as_ptr(), &mut stat) } != 0 {
-        return None;
+    /// Reports whether the cgroup limit, rather than physical memory, binds.
+    pub fn bound_by_cgroup(&self) -> bool {
+        self.cgroup
+            .limit_bytes()
+            .is_some_and(|limit| self.physical_bytes.is_none_or(|physical| limit <= physical))
     }
-
-    const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
-    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
-
-    if stat.f_type == TMPFS_MAGIC {
-        return read_cgroup_memory_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    }
-    if stat.f_type == CGROUP2_SUPER_MAGIC {
-        return read_cgroup_memory_limit("/sys/fs/cgroup/memory.max")
-            .or_else(|| read_cgroup_memory_limit("/sys/fs/cgroup/kubepods/memory.max"));
-    }
-
-    None
 }
 
-#[cfg(not(target_os = "linux"))]
-fn detect_container_memory_limit_bytes() -> Option<u64> {
-    None
+/// Returns this process's visible memory, probed once on first use.
+///
+/// `None` when neither a cgroup limit nor physical memory could be read. The
+/// probe runs once so every derivation of P in this process sees the same
+/// input, and so the start-up line describes the value actually used.
+pub fn visible_memory() -> Option<&'static VisibleMemory> {
+    static VISIBLE: OnceLock<Option<VisibleMemory>> = OnceLock::new();
+    VISIBLE
+        .get_or_init(|| {
+            VisibleMemory::compose(cgroup_memory::probe(), detect_physical_memory_bytes())
+        })
+        .as_ref()
 }
 
-#[cfg(target_os = "linux")]
-fn read_cgroup_memory_limit(path: &str) -> Option<u64> {
-    let content = fs::read_to_string(path).ok()?;
-    match content.trim().parse::<u64>() {
-        Ok(value) => Some(value),
-        Err(_) => Some(u64::MAX),
+/// Emits the start-up line that says what bounds this process's memory.
+///
+/// Called once after logging is ready. Configuration may resolve P before
+/// that, which is why the probe itself does not log.
+pub fn log_visible_memory() {
+    const TARGET: &str = "novarocks::memory_limit";
+    let Some(visible) = visible_memory() else {
+        tracing::warn!(
+            target: TARGET,
+            fallback_bytes = FALLBACK_VISIBLE_MEMORY_BYTES,
+            "visible memory unknown: no cgroup limit and no physical memory reading"
+        );
+        return;
+    };
+    let source = if visible.bound_by_cgroup() {
+        "cgroup"
+    } else {
+        "physical"
+    };
+    let physical_bytes = visible
+        .physical_bytes
+        .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
+    match &visible.cgroup {
+        CgroupFinding::Limited {
+            layout,
+            limit_bytes,
+        } => tracing::info!(
+            target: TARGET,
+            visible_bytes = visible.bytes,
+            source,
+            cgroup_version = layout.version.label(),
+            cgroup_dir = %layout.dir.display(),
+            cgroup_limit_bytes = limit_bytes,
+            physical_bytes = %physical_bytes,
+            "process visible memory detected"
+        ),
+        CgroupFinding::Unlimited { layout } => tracing::info!(
+            target: TARGET,
+            visible_bytes = visible.bytes,
+            source,
+            cgroup_version = layout.version.label(),
+            cgroup_dir = %layout.dir.display(),
+            cgroup_limit_bytes = "none",
+            physical_bytes = %physical_bytes,
+            "process visible memory detected"
+        ),
+        CgroupFinding::Absent => tracing::info!(
+            target: TARGET,
+            visible_bytes = visible.bytes,
+            source,
+            cgroup = "absent",
+            physical_bytes = %physical_bytes,
+            "process visible memory detected"
+        ),
+        CgroupFinding::Failed { reason } => tracing::warn!(
+            target: TARGET,
+            visible_bytes = visible.bytes,
+            source,
+            cgroup_error = %reason,
+            physical_bytes = %physical_bytes,
+            "process visible memory detected without its cgroup"
+        ),
     }
 }
 
@@ -185,7 +315,74 @@ fn detect_physical_memory_bytes() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_starrocks_process_mem_limit_bytes_for_visible_memory;
+    use std::path::PathBuf;
+
+    use super::{
+        CgroupFinding, VisibleMemory, resolve_starrocks_process_mem_limit_bytes_for_visible_memory,
+    };
+    use crate::cgroup_memory::{CgroupLayout, CgroupMemory, CgroupVersion, ProbeError};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn pod_cgroup(limit_bytes: Option<u64>) -> CgroupMemory {
+        CgroupMemory {
+            layout: CgroupLayout {
+                version: CgroupVersion::V2,
+                dir: PathBuf::from("/sys/fs/cgroup"),
+                mount_point: PathBuf::from("/sys/fs/cgroup"),
+            },
+            limit_bytes,
+        }
+    }
+
+    #[test]
+    fn a_cgroup_limit_below_physical_memory_binds() {
+        let visible =
+            VisibleMemory::compose(Ok(Some(pod_cgroup(Some(16 * GIB)))), Some(128 * GIB)).unwrap();
+        assert_eq!(visible.bytes, 16 * GIB);
+        assert!(visible.bound_by_cgroup());
+    }
+
+    #[test]
+    fn physical_memory_binds_when_the_cgroup_limit_is_larger_or_absent() {
+        let larger =
+            VisibleMemory::compose(Ok(Some(pod_cgroup(Some(256 * GIB)))), Some(128 * GIB)).unwrap();
+        assert_eq!(larger.bytes, 128 * GIB);
+        assert!(!larger.bound_by_cgroup());
+
+        let unlimited =
+            VisibleMemory::compose(Ok(Some(pod_cgroup(None))), Some(128 * GIB)).unwrap();
+        assert_eq!(unlimited.bytes, 128 * GIB);
+        assert!(matches!(unlimited.cgroup, CgroupFinding::Unlimited { .. }));
+
+        let absent = VisibleMemory::compose(Ok(None), Some(128 * GIB)).unwrap();
+        assert_eq!(absent.cgroup, CgroupFinding::Absent);
+    }
+
+    #[test]
+    fn a_failed_probe_keeps_its_reason_and_falls_back_to_physical_memory() {
+        let failed = VisibleMemory::compose(
+            Err(ProbeError::Read {
+                path: PathBuf::from("/proc/self/mountinfo"),
+                error: "permission denied".to_string(),
+            }),
+            Some(128 * GIB),
+        )
+        .unwrap();
+        assert_eq!(failed.bytes, 128 * GIB);
+        match failed.cgroup {
+            CgroupFinding::Failed { reason } => assert!(reason.contains("mountinfo"), "{reason}"),
+            other => panic!("expected a failed probe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_known_means_no_visible_memory() {
+        assert_eq!(VisibleMemory::compose(Ok(None), None), None);
+        let limit_only = VisibleMemory::compose(Ok(Some(pod_cgroup(Some(8 * GIB)))), None).unwrap();
+        assert_eq!(limit_only.bytes, 8 * GIB);
+        assert!(limit_only.bound_by_cgroup());
+    }
 
     #[test]
     fn parses_starrocks_mem_spec_units() {

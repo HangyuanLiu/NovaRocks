@@ -60,20 +60,136 @@
 //! lock-free, so a sampler owns its own cadence and its own observed maximum.
 //! No peak is kept here, because a peak would need one contended cache line
 //! for every allocation in the process.
-
-use std::alloc::System;
+//!
+//! # Which allocator serves the memory
+//!
+//! jemalloc, behind the `jemalloc` Cargo feature that is on by default. It is
+//! the only supported production allocator: its internal statistics are the
+//! process's second physical reading, and later governance builds on its size
+//! classes. A Rust global allocator is fixed at link time, so the choice is a
+//! build choice and never a runtime switch. Building without the feature keeps
+//! the system allocator for same-revision baselines and for tools that need
+//! it; such a build is not a supported deployment, and it says so through
+//! [`process_allocator`] and [`log_allocator_configuration`].
+//!
+//! jemalloc's defaults are compiled in, background purge threads only on
+//! Linux: jemalloc is built without them on macOS, where asking for them makes
+//! its initialisation fail. jemalloc also reads `_RJEM_MALLOC_CONF` at start-up
+//! and lets it override the compiled defaults, so instead of claiming the
+//! environment is ignored, the process logs the configuration that took
+//! effect.
 
 use novarocks_memory::observe::{AllocatorSnapshot, CountingAllocator, CoverageDescriptor};
 
-/// This process's allocator: the system allocator, counted.
+/// This process's allocator: jemalloc, counted.
 ///
-/// `System` stays the allocator that actually serves the memory; the wrapper
-/// only adds relaxed atomic arithmetic on a sharded counter array around each
-/// call, so installing it changes what the process can report about itself and
-/// not how it obtains memory.
+/// jemalloc serves the memory; the wrapper only adds relaxed atomic arithmetic
+/// on a sharded counter array around each call, so the counters keep their
+/// meaning whichever allocator sits inside.
 // Design: ADR-0148 (docs/adr/ADR-0148-process-memory-capacity-authority.md)
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
-static GLOBAL: CountingAllocator<System> = CountingAllocator::new(System);
+static GLOBAL: CountingAllocator<tikv_jemallocator::Jemalloc> =
+    CountingAllocator::new(tikv_jemallocator::Jemalloc);
+
+/// This process's allocator in a build without the `jemalloc` feature: the
+/// system allocator, counted.
+#[cfg(not(feature = "jemalloc"))]
+#[global_allocator]
+static GLOBAL: CountingAllocator<std::alloc::System> = CountingAllocator::new(std::alloc::System);
+
+/// The allocator that actually serves this process's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessAllocator {
+    /// jemalloc: the only supported production allocator.
+    Jemalloc,
+    /// The platform allocator of a build without the `jemalloc` feature, kept
+    /// for same-revision baselines and for tools that need it.
+    System,
+}
+
+impl ProcessAllocator {
+    /// Returns the stable label used in logs and metrics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Jemalloc => "jemalloc",
+            Self::System => "system",
+        }
+    }
+}
+
+/// Returns the allocator this build installed.
+pub const fn process_allocator() -> ProcessAllocator {
+    if cfg!(feature = "jemalloc") {
+        ProcessAllocator::Jemalloc
+    } else {
+        ProcessAllocator::System
+    }
+}
+
+/// The jemalloc configuration that took effect in this process.
+///
+/// Read back through `mallctl` rather than restated from the build, because
+/// `_RJEM_MALLOC_CONF` overrides the compiled defaults at start-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JemallocConfiguration {
+    /// `opt.background_thread`. The process never changes it at run time, so
+    /// the option is also the running state.
+    pub background_thread: bool,
+    /// `opt.dirty_decay_ms`; `-1` disables decay-based purging.
+    pub dirty_decay_ms: i64,
+    /// `opt.muzzy_decay_ms`; `-1` disables decay-based purging.
+    pub muzzy_decay_ms: i64,
+    /// `config.malloc_conf`: the defaults compiled into this binary.
+    pub compiled_malloc_conf: &'static str,
+}
+
+/// Reads the jemalloc configuration that took effect.
+///
+/// `Ok(None)` means this build has no jemalloc. An error names the option
+/// that could not be read; it is reported as such and never replaced by a
+/// guessed default.
+pub fn jemalloc_configuration() -> Result<Option<JemallocConfiguration>, String> {
+    #[cfg(feature = "jemalloc")]
+    {
+        jemalloc::configuration().map(Some)
+    }
+    #[cfg(not(feature = "jemalloc"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "jemalloc")]
+mod jemalloc {
+    use tikv_jemalloc_ctl::{config, opt, raw};
+
+    use super::JemallocConfiguration;
+
+    pub(super) fn configuration() -> Result<JemallocConfiguration, String> {
+        let background_thread = opt::background_thread::read()
+            .map_err(|error| format!("read opt.background_thread: {error}"))?;
+        let dirty_decay_ms = read_decay(b"opt.dirty_decay_ms\0")?;
+        let muzzy_decay_ms = read_decay(b"opt.muzzy_decay_ms\0")?;
+        let compiled_malloc_conf = config::malloc_conf::read()
+            .map_err(|error| format!("read config.malloc_conf: {error}"))?;
+        Ok(JemallocConfiguration {
+            background_thread,
+            dirty_decay_ms,
+            muzzy_decay_ms,
+            compiled_malloc_conf,
+        })
+    }
+
+    fn read_decay(name: &'static [u8]) -> Result<i64, String> {
+        // SAFETY: jemalloc declares both decay options as `ssize_t`, and
+        // `name` is one of those two NUL-terminated option names.
+        let printable = || String::from_utf8_lossy(&name[..name.len() - 1]).into_owned();
+        let value = unsafe { raw::read::<libc::ssize_t>(name) }
+            .map_err(|error| format!("read {}: {error}", printable()))?;
+        i64::try_from(value).map_err(|_| format!("read {}: {value} exceeds i64", printable()))
+    }
+}
 
 /// Reads this process's current allocation counters.
 ///
@@ -113,6 +229,39 @@ pub fn log_installed() {
         blind_spots = %blind_spots,
         "process allocator observation installed"
     );
+}
+
+/// Emits the startup line that says which allocator serves this process and,
+/// for jemalloc, the configuration that took effect.
+///
+/// A line of its own rather than extra fields on [`log_installed`], whose
+/// field set is frozen. An unreadable jemalloc option is logged as a warning
+/// with its reason, not filled in.
+pub fn log_allocator_configuration() {
+    let allocator = process_allocator().label();
+    match jemalloc_configuration() {
+        Ok(Some(configuration)) => tracing::info!(
+            target: "novarocks::memory_observation",
+            allocator,
+            background_thread = configuration.background_thread,
+            dirty_decay_ms = configuration.dirty_decay_ms,
+            muzzy_decay_ms = configuration.muzzy_decay_ms,
+            compiled_malloc_conf = configuration.compiled_malloc_conf,
+            "process allocator configured"
+        ),
+        Ok(None) => tracing::info!(
+            target: "novarocks::memory_observation",
+            allocator,
+            allocator_internals = "unknown",
+            "process allocator configured"
+        ),
+        Err(error) => tracing::warn!(
+            target: "novarocks::memory_observation",
+            allocator,
+            %error,
+            "process allocator configuration unreadable"
+        ),
+    }
 }
 
 /// Joins a descriptor's blind-spot labels into one comma-separated field value.
@@ -163,6 +312,42 @@ mod tests {
         for spot in BlindSpot::ALL {
             assert!(labels.contains(&spot.label()), "{rendered}");
         }
+    }
+
+    #[test]
+    fn the_reported_allocator_is_the_one_this_build_installed() {
+        let expected = if cfg!(feature = "jemalloc") {
+            ProcessAllocator::Jemalloc
+        } else {
+            ProcessAllocator::System
+        };
+        assert_eq!(process_allocator(), expected);
+    }
+
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn jemalloc_runs_background_threads_on_linux_only() {
+        let configuration = jemalloc_configuration()
+            .expect("jemalloc configuration is readable")
+            .expect("a jemalloc build reports its configuration");
+        assert_eq!(
+            configuration.background_thread,
+            cfg!(target_os = "linux"),
+            "{configuration:?}"
+        );
+        assert_eq!(
+            configuration
+                .compiled_malloc_conf
+                .contains("background_thread:true"),
+            cfg!(target_os = "linux"),
+            "{configuration:?}"
+        );
+    }
+
+    #[cfg(not(feature = "jemalloc"))]
+    #[test]
+    fn a_build_without_jemalloc_reports_no_jemalloc_configuration() {
+        assert_eq!(jemalloc_configuration(), Ok(None));
     }
 
     #[test]
