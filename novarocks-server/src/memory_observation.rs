@@ -192,8 +192,10 @@ mod jemalloc {
             .map_err(|error| format!("read opt.background_thread: {error}"))?;
         let dirty_decay_ms = read_decay(b"opt.dirty_decay_ms\0")?;
         let muzzy_decay_ms = read_decay(b"opt.muzzy_decay_ms\0")?;
+        // tikv-jemalloc-ctl returns C strings with their terminating NUL.
         let compiled_malloc_conf = config::malloc_conf::read()
-            .map_err(|error| format!("read config.malloc_conf: {error}"))?;
+            .map_err(|error| format!("read config.malloc_conf: {error}"))?
+            .trim_end_matches('\0');
         Ok(JemallocConfiguration {
             background_thread,
             dirty_decay_ms,
@@ -445,6 +447,10 @@ mod tests {
                 .compiled_malloc_conf
                 .contains("background_thread:true"),
             cfg!(target_os = "linux"),
+            "{configuration:?}"
+        );
+        assert!(
+            !configuration.compiled_malloc_conf.contains('\0'),
             "{configuration:?}"
         );
     }
