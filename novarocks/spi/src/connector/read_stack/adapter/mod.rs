@@ -1448,6 +1448,10 @@ where
     P: ProviderReadRuntime,
     F: ProviderAdmittedReadFactory<P>,
 {
+    fn binding(&self) -> &ConnectorReadBinding {
+        self.adapter.binding()
+    }
+
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,

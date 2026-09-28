@@ -1363,6 +1363,7 @@ mod tests {
             "test-deployment",
             "test-build",
             NativeCompatibilityId::new([0x71; 32]),
+            4096,
         )
         .expect("valid descriptor");
         LiveBackendTarget::new(

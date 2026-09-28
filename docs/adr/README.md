@@ -146,7 +146,7 @@ code-anchors:
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active）
-- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0158）
+- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
@@ -195,14 +195,17 @@ code-anchors:
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
-- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0158）
+- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
-- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active；其中背景对两段创建载体的描述与 Create 的 conflict verdict 已由 ADR-0158 替换，其余仍有效）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149）
-- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（active；规则 3 所称的创建冲突判定已由 ADR-0158 取消，owner 分工不变）
-- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划（active）
+
+- ADR-0161 — 纯本地程序为何分离 Task 接管、安装、覆盖观察与实际收敛（active；继承逻辑执行/Native入口/冻结身份的有效规则）
 
 #### 历史
+
+- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（superseded → ADR-0161）
+- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（superseded → ADR-0161）
+- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划；准确文件 ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md（superseded → ADR-0161）
 
 - ADR-0149 — vended 凭据续期失败为何只终结本轮、失效判定为何收归访问解析点（superseded → ADR-0151）
 - ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（superseded → ADR-0102）
@@ -220,24 +223,25 @@ code-anchors:
 - ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（superseded → ADR-0135）
 - ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（superseded → ADR-0135）
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
-
 ### sql-compiler
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、view rewrite、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
 
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
-- ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0158 的一次激活与固定版本恢复替换，其余仍有效）
-- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划（active）
+- ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0161 的一次激活与固定版本恢复替换，其余仍有效）
 - ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
 - ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 
+- ADR-0161 — 纯本地程序为何分离 Task 接管、安装、覆盖观察与实际收敛（active；继承逻辑执行/Native入口/冻结身份的有效规则）
+
 #### 历史
+
+- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划；准确文件 ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md（superseded → ADR-0161）
 
 - ADR-0050 — sealed DistributedPlan 为何以 logical mutation effect 与 opaque provider route 服务跨 owner encoder（superseded → ADR-0153）
 - ADR-0025 — SQL compiler 为何以显式 request、immutable snapshots 与 post-compile binding context 形成唯一入口（superseded → ADR-0073）
 - ADR-0042 — sealed DistributedPlan 为何以单一只读契约服务跨 owner encoder（superseded → ADR-0050）
-
 ### sql-language
 
 领域哲学：SQL语言事实由自有parser及其source span定义；持久化定义保存用户有效原文与创建时解析上下文，不保存

@@ -109,6 +109,15 @@ struct LocalExchangeSourceOperator {
     blocked_empty: bool,
 }
 
+impl LocalExchangeSourceOperator {
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.exchanger.close_consumer(self.consumer);
+        }
+    }
+}
+
 impl Operator for LocalExchangeSourceOperator {
     fn name(&self) -> &str {
         &self.name
@@ -127,10 +136,12 @@ impl Operator for LocalExchangeSourceOperator {
     }
 
     fn close(&mut self) -> Result<(), String> {
-        // A consumer whose pipeline ends before end of stream still leaves the
-        // exchange; otherwise producers would keep filling a queue nobody reads.
-        self.exchanger.close_consumer(self.consumer);
+        self.finish();
         Ok(())
+    }
+
+    fn cancel(&mut self) {
+        self.finish();
     }
 }
 
@@ -191,8 +202,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
             return Ok(Some(chunk));
         }
         if self.exchanger.is_done(self.partition) {
-            self.finished = true;
-            self.exchanger.close_consumer(self.consumer);
+            self.finish();
             let stats = self.exchanger.stats_snapshot();
             if let Some(part) = stats
                 .partitions
@@ -235,6 +245,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        self.finish();
         Ok(())
     }
 

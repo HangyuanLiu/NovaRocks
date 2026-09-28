@@ -82,6 +82,9 @@ impl Cli {
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
         }
+        if cli.list && cli.list_default {
+            bail!("--list and --list-default are mutually exclusive");
+        }
         if cli.cluster_size == 0 {
             bail!("--cluster-size must be >= 1");
         }
@@ -93,7 +96,7 @@ impl Cli {
 
     pub const fn usage() -> &'static str {
         concat!(
-            "usage: novarocks-system-tests [--list|--list-default] [--only <exact-name>]... ",
+            "usage: novarocks-system-tests [--list | --list-default] [--only <exact-name>]... ",
             "[--binary <path> [--compatible-binary <path>] ",
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
@@ -116,11 +119,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_default_scenario_listing() {
-        let cli =
-            Cli::parse(vec!["--list-default".to_string()]).expect("parse default scenario listing");
-        assert!(cli.list_default);
-        assert!(!cli.list);
+    fn parses_distinct_registry_list_modes() {
+        let all = Cli::parse(vec!["--list".to_string()]).expect("list all");
+        assert!(all.list && !all.list_default);
+        let defaults = Cli::parse(vec!["--list-default".to_string()]).expect("list defaults");
+        assert!(!defaults.list && defaults.list_default);
+        assert!(Cli::parse(vec!["--list".to_string(), "--list-default".to_string()]).is_err());
     }
 
     #[test]

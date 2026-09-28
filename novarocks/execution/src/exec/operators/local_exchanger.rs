@@ -381,11 +381,11 @@ impl LocalExchanger {
                 && !self.closed_partitions[partition].swap(true, Ordering::AcqRel)
             {
                 closed_partition = Some(partition);
-                let was_full = self.capacity_full();
                 discarded = self.drain_partition_locked(&mut guard, partition);
-                if was_full && !self.capacity_full() {
-                    notify_sink.arm();
-                }
+                // Demand withdrawal changes routing even when a necessary
+                // sibling still keeps the byte/row queue full. Publish that
+                // exact transition once, as well as any capacity relief.
+                notify_sink.arm();
             }
             let all_closed = self
                 .closed_partitions
@@ -974,6 +974,9 @@ impl LocalExchanger {
     }
 
     fn maybe_schedule_restore(self: &Arc<Self>, state: &RuntimeState, partition: usize) {
+        if self.partition_closed(partition) {
+            return;
+        }
         let Some(spill) = self.spill_state() else {
             return;
         };
