@@ -1627,7 +1627,7 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::operators::table_writer::tests::target;
     use crate::runtime::ExecutionRuntime;
-    use crate::runtime::execution_runtime::{ExecutionRuntimeConfig, ExecutionSpillStorageConfig};
+    use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
 
     /// A row shape the tests can express, including shapes a correct
     /// `TableWriter` would never produce.
@@ -1957,9 +1957,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    spill_io_threads: 1,
-                    spill_io_queue_capacity: 8,
-                    spill_storage: ExecutionSpillStorageConfig::default(),
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
@@ -1977,17 +1974,7 @@ mod tests {
             )
             .expect("composite test runtime"),
         );
-        RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            tracker,
-            None,
-            None,
-            Some(runtime),
-        )
+        RuntimeState::new(None, None, None, None, None, tracker, Some(runtime))
     }
 
     fn composite_fixture(

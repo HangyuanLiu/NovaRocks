@@ -1180,21 +1180,18 @@ pub fn prepare_fragment(
         resources.acquire_exchange(program, instance)?;
         context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
 
-        let runtime_state = build_runtime_state(
-            RuntimeStateInputs {
-                query_options: apply_query_option_overrides(
-                    Some(instance.runtime_options().query_options().clone()),
-                    context.execution_runtime.as_deref(),
-                ),
-                query_id: Some(query_id),
-                fragment_instance_id: Some(finst_id),
-                backend_num: Some(instance.backend_num().get()),
-                mem_tracker: context.mem_tracker.clone(),
-                runtime_filter_session: context.runtime_filter.clone(),
-                execution_runtime: context.execution_runtime.clone(),
-            },
-            context.profiler.as_ref(),
-        )
+        let runtime_state = build_runtime_state(RuntimeStateInputs {
+            query_options: apply_query_option_overrides(
+                Some(instance.runtime_options().query_options().clone()),
+                context.execution_runtime.as_deref(),
+            ),
+            query_id: Some(query_id),
+            fragment_instance_id: Some(finst_id),
+            backend_num: Some(instance.backend_num().get()),
+            mem_tracker: context.mem_tracker.clone(),
+            runtime_filter_session: context.runtime_filter.clone(),
+            execution_runtime: context.execution_runtime.clone(),
+        })
         .map_err(|error| {
             FragmentLaunchError::new(
                 FragmentLaunchStage::BuildRuntimeState,

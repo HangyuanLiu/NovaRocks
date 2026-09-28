@@ -970,7 +970,7 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
         .map(|options| *options.as_proto())
         .unwrap_or_default();
     raw.enable_profile = true;
-    QueryOptions::parse(raw).expect("enabling query profiling does not invalidate query options")
+    QueryOptions::from_proto(raw)
 }
 
 pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {

@@ -33,8 +33,8 @@
 //!   re-enters the authority while the allocation path holds its own
 //!   invariants half-applied.
 //! - **Latency ownership.** Reclaiming is slow and may block on I/O. An
-//!   allocation call that silently waits for a spill turns every operator into
-//!   a place where a query can stall, with no timeout anyone chose.
+//!   allocation call that silently waits for cache eviction turns every operator
+//!   into a place where a query can stall, with no timeout anyone chose.
 //! - **Priority.** Deciding *whose* memory to take back is a policy question
 //!   about the whole workload. An allocation knows only about itself, so it is
 //!   the worst possible place to decide.
@@ -47,8 +47,8 @@
 //!
 //! [`ReclaimEstimate`] says how much a subsystem *believes* it could give
 //! back. Believing is not releasing: a cache may find its candidate frames
-//! pinned, a spiller may fail on a full disk. Nothing in this module lets an
-//! estimate raise grantable capacity. Only a `Completed` [`ReclaimOutcome`]
+//! pinned, or its candidates may still have other owners. Nothing in this module
+//! lets an estimate raise grantable capacity. Only a `Completed` [`ReclaimOutcome`]
 //! contributes, and only its confirmed bytes — see
 //! [`ReclaimOutcome::grantable_contribution_bytes`].
 
@@ -151,9 +151,11 @@ impl ReclaimEstimate {
 
 /// A subsystem that can give memory back when asked.
 ///
-/// Implemented by caches, spillers and buffer pools; called only by an
-/// arbitrator, and never from inside an allocation path (see the module
-/// documentation for why).
+/// Design: docs/adr/ADR-0162-in-memory-query-execution-boundary.md
+///
+/// Supports reclaim actions such as cache eviction or releasing idle buffer
+/// pool memory; called only by an arbitrator, and never from inside an
+/// allocation path (see the module documentation for why).
 ///
 /// Both methods must return promptly. [`Self::estimate`] is polled while the
 /// arbitrator surveys its options, so it reads bookkeeping rather than walking

@@ -981,8 +981,6 @@ mod tests {
             None,
             Some(Arc::clone(&fragment)),
             None,
-            None,
-            None,
         );
         let control = Arc::new(StreamControl::default());
         let (mut scan, _source, _) = observed_stream_scan_source_in(&control, &state);

@@ -26,7 +26,6 @@ use crate::query_execution::artifact::{
 };
 use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
 use crate::query_execution::statistics::StatisticsCollectionProgram;
-use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
@@ -114,8 +113,8 @@ pub(crate) fn completed_plan_dop_domain(
     })
 }
 
-/// Reconstructs the Frontend-local execution view from an already validated
-/// protocol value without creating a second wire representation or decoder.
+/// Reconstructs the Frontend-local execution view from the protocol value
+/// without creating a second wire representation or decoder.
 fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOptions {
     let src = options.as_proto();
     RuntimeQueryOptions {
@@ -152,40 +151,6 @@ fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOpti
             datacache_sharing_work_period: (src.datacache_sharing_work_period > 0)
                 .then_some(src.datacache_sharing_work_period),
         },
-        spill: src.enable_spill.then(|| {
-            let spill = src
-                .spill_options
-                .as_ref()
-                .expect("validated enabled spilling has spill options");
-            SpillConfig {
-                enable_spill: src.enable_spill,
-                spill_mode: match spill.spill_mode {
-                    0 => SpillMode::Auto,
-                    1 => SpillMode::Force,
-                    2 => SpillMode::None,
-                    _ => {
-                        unreachable!("validated Protocol query options have a supported spill mode")
-                    }
-                },
-                spill_mem_limit_threshold: (spill.spill_mem_limit_threshold > 0.0)
-                    .then_some(spill.spill_mem_limit_threshold),
-                spill_operator_min_bytes: (spill.spill_operator_min_bytes > 0)
-                    .then_some(spill.spill_operator_min_bytes),
-                spill_operator_max_bytes: (spill.spill_operator_max_bytes > 0)
-                    .then_some(spill.spill_operator_max_bytes),
-                spill_encode_level: (spill.spill_encode_level > 0)
-                    .then_some(spill.spill_encode_level),
-                enable_spill_buffer_read: Some(spill.enable_spill_buffer_read),
-                max_spill_read_buffer_bytes_per_driver: (spill
-                    .max_spill_read_buffer_bytes_per_driver
-                    > 0)
-                .then_some(spill.max_spill_read_buffer_bytes_per_driver),
-                spill_mem_table_size: (spill.spill_mem_table_size > 0)
-                    .then_some(spill.spill_mem_table_size),
-                spill_mem_table_num: (spill.spill_mem_table_num > 0)
-                    .then_some(spill.spill_mem_table_num),
-            }
-        }),
     }
 }
 
@@ -719,11 +684,10 @@ mod tests {
 
     #[test]
     fn completed_plan_dop_domain_uses_resolved_driver_width_not_backend_count() {
-        let explicit = QueryOptions::parse(novarocks::QueryOptions {
+        let explicit = QueryOptions::from_proto(novarocks::QueryOptions {
             pipeline_dop: 5,
             ..Default::default()
-        })
-        .expect("valid explicit DOP");
+        });
         assert_eq!(completed_plan_dop_domain(Some(&explicit)).unwrap().max, 5);
         assert_eq!(
             completed_plan_dop_domain(None).unwrap().max as i32,
@@ -733,7 +697,7 @@ mod tests {
 
     #[test]
     fn reconstructed_runtime_options_preserve_protocol_scalars() {
-        let protocol = QueryOptions::parse(novarocks::QueryOptions {
+        let protocol = QueryOptions::from_proto(novarocks::QueryOptions {
             batch_size: 4096,
             query_timeout: 60,
             query_delivery_timeout: 30,
@@ -760,20 +724,7 @@ mod tests {
             datacache_priority: 2,
             datacache_ttl_seconds: 3600,
             datacache_sharing_work_period: 10,
-            enable_spill: true,
-            spill_options: Some(novarocks::SpillOptions {
-                spill_mode: 1,
-                spill_mem_limit_threshold: 0.75,
-                spill_operator_min_bytes: 64,
-                spill_operator_max_bytes: 128,
-                spill_encode_level: 3,
-                enable_spill_buffer_read: true,
-                max_spill_read_buffer_bytes_per_driver: 256,
-                spill_mem_table_size: 512,
-                spill_mem_table_num: 4,
-            }),
-        })
-        .expect("valid query options");
+        });
 
         let runtime = reconstruct_runtime_query_options(&protocol);
 
@@ -798,14 +749,5 @@ mod tests {
         assert_eq!(runtime.cache.datacache_priority, Some(2));
         assert_eq!(runtime.cache.datacache_ttl_seconds, Some(3600));
         assert_eq!(runtime.cache.datacache_sharing_work_period, Some(10));
-        let spill = runtime.spill.expect("enabled spill is reconstructed");
-        assert!(spill.enable_spill);
-        assert_eq!(spill.spill_mem_limit_threshold, Some(0.75));
-        assert_eq!(spill.spill_operator_min_bytes, Some(64));
-        assert_eq!(spill.spill_operator_max_bytes, Some(128));
-        assert_eq!(spill.spill_encode_level, Some(3));
-        assert_eq!(spill.max_spill_read_buffer_bytes_per_driver, Some(256));
-        assert_eq!(spill.spill_mem_table_size, Some(512));
-        assert_eq!(spill.spill_mem_table_num, Some(4));
     }
 }

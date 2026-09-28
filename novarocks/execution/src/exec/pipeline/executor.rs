@@ -721,7 +721,7 @@ mod tests {
     use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
     use crate::exec::pipeline::schedule::observer::Observable;
-    use crate::runtime::execution_runtime::ExecutionSpillStorageConfig;
+
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
@@ -739,9 +739,6 @@ mod tests {
                 ExecutionRuntime::new(
                     ExecutionRuntimeConfig {
                         driver_threads: 1,
-                        spill_io_threads: 1,
-                        spill_io_queue_capacity: 8,
-                        spill_storage: ExecutionSpillStorageConfig::default(),
                         exchange_wait_ms: 120_000,
                         exchange_io_threads: 1,
                         exchange_io_max_inflight_bytes: 1024,
@@ -764,8 +761,6 @@ mod tests {
 
     fn test_runtime_state() -> Arc<RuntimeState> {
         Arc::new(RuntimeState::new(
-            None,
-            None,
             None,
             None,
             None,
@@ -1070,8 +1065,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                None,
                 Some(Arc::clone(&runtime)),
             ));
             let output = ResultSinkHandle::new();
@@ -1222,8 +1215,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
         ));
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
@@ -1295,8 +1286,6 @@ mod tests {
             None,
             None,
             Some(query_id),
-            None,
-            None,
             None,
             None,
             None,

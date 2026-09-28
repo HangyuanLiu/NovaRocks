@@ -455,9 +455,6 @@ pub struct NovaRocksConfig {
     pub connector: ConnectorConfig,
 
     #[serde(default)]
-    pub spill: SpillStorageConfig,
-
-    #[serde(default)]
     pub cluster: ClusterConfig,
 
     #[serde(default, deserialize_with = "deserialize_native_trust_config")]
@@ -762,7 +759,6 @@ impl Default for NovaRocksConfig {
             rejected_foundationdb_client: None,
             standalone_server: None,
             connector: ConnectorConfig::default(),
-            spill: SpillStorageConfig::default(),
             cluster: ClusterConfig::default(),
             native_trust: None,
             mv_management: MvManagementConfig::default(),
@@ -1400,10 +1396,6 @@ pub struct RuntimeConfig {
     /// startup preflight.
     #[serde(default = "default_query_blocking_queue_capacity")]
     pub query_blocking_queue_capacity: usize,
-    #[serde(default = "default_spill_io_threads")]
-    pub spill_io_threads: usize,
-    #[serde(default = "default_spill_io_queue_size")]
-    pub spill_io_queue_size: usize,
     #[serde(default = "default_profile_report_interval")]
     pub profile_report_interval: i64,
     #[serde(default = "default_table_schema_service_max_retries")]
@@ -1737,48 +1729,6 @@ impl ObjectStorageConfig {
             retry_max_delay_ms: self.retry_max_delay_ms,
             timeout_ms: self.timeout_ms,
             io_timeout_ms: self.io_timeout_ms,
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-pub struct SpillStorageConfig {
-    #[serde(default = "default_spill_enable")]
-    pub enable: bool,
-    #[serde(default)]
-    pub local_dirs: Vec<String>,
-    #[serde(default = "default_spill_dir_max_bytes")]
-    pub dir_max_bytes: u64,
-    #[serde(default = "default_spill_block_size_bytes")]
-    pub block_size_bytes: u64,
-    #[serde(default = "default_spill_ipc_compression")]
-    pub ipc_compression: String,
-}
-
-fn default_spill_enable() -> bool {
-    true
-}
-
-fn default_spill_dir_max_bytes() -> u64 {
-    0
-}
-
-fn default_spill_block_size_bytes() -> u64 {
-    134_217_728
-}
-
-fn default_spill_ipc_compression() -> String {
-    "lz4".to_string()
-}
-
-impl Default for SpillStorageConfig {
-    fn default() -> Self {
-        Self {
-            enable: default_spill_enable(),
-            local_dirs: Vec::new(),
-            dir_max_bytes: default_spill_dir_max_bytes(),
-            block_size_bytes: default_spill_block_size_bytes(),
-            ipc_compression: default_spill_ipc_compression(),
         }
     }
 }
@@ -2487,14 +2437,6 @@ fn default_query_blocking_queue_capacity() -> usize {
     64
 }
 
-fn default_spill_io_threads() -> usize {
-    0 // 0 means use actual exec thread count
-}
-
-fn default_spill_io_queue_size() -> usize {
-    1024
-}
-
 fn default_io_coalesce_read_enable() -> bool {
     true
 }
@@ -2632,8 +2574,6 @@ impl Default for RuntimeConfig {
             native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
-            spill_io_threads: default_spill_io_threads(),
-            spill_io_queue_size: default_spill_io_queue_size(),
             profile_report_interval: default_profile_report_interval(),
             table_schema_service_max_retries: default_table_schema_service_max_retries(),
             table_schema_service_cache_capacity: default_table_schema_service_cache_capacity(),

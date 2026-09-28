@@ -50,7 +50,7 @@ Implemented or actively exercised areas include:
   - thrift-plan lowering
   - Arrow `RecordBatch` / `Chunk` processing
   - pipeline drivers, dependencies, and scheduling
-  - exchange, result buffering, runtime filters, spill, and cache plumbing
+  - exchange, result buffering, runtime filters, and cache plumbing
 - Standalone SQL stack:
   - StarRocks-oriented SQL parsing and analysis
   - SQL planner/codegen into NovaRocks execution plans

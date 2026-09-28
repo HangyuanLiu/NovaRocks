@@ -808,14 +808,6 @@ fn decode_update_query_context(
                     "establish requires query options",
                 )
             })?;
-            novarocks_proto_codec::lifecycle::QueryOptions::parse(query_options).map_err(
-                |error| {
-                    invalid(
-                        establish_path.clone().field("query_options"),
-                        error.detail(),
-                    )
-                },
-            )?;
             let query_options = Arc::new(WireContent::new(
                 ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
                 query_options,

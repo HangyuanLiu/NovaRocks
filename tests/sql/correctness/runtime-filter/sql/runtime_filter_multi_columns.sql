@@ -20,7 +20,7 @@
 -- 2. Cover inner/left/right/full-outer join types with colocate and bucket shuffle.
 -- 3. Cover cross join, CTE reuse, table function join, window function scenarios.
 -- 4. Verify bucket-shuffle join with and without GROUP BY.
--- 5. Verify tablet pruning, assert nodes, and spill case.
+-- 5. Verify tablet pruning, assert nodes, and join aggregates.
 
 -- query 1
 -- @skip_result_check=true
@@ -296,7 +296,6 @@ with
   ty as (select c0, c1 from ${case_db}.t0 where c0 = 1 and c1 = 1)
 select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from tx l full join [colocate] ty r on l.c0 = r.c0 and l.c1 = r.c1;
 
--- spill case
-set enable_spill = true;
+-- Join aggregate coverage
 -- query 81
 select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join [colocate] ${case_db}.t1 r on l.c0 = r.c0 join [bucket] ${case_db}.small_table s on l.c0 = s.c0 and l.c1 = s.c1;

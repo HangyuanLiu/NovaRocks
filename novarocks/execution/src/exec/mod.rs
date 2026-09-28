@@ -34,5 +34,4 @@ pub mod pipeline;
 pub mod row_position;
 pub mod runtime_filter;
 pub mod sketch_hash;
-pub mod spill;
 pub mod variant_read;

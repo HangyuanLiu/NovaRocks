@@ -444,44 +444,120 @@ mod tests {
     }
 
     #[test]
-    fn handoff_queue_ignores_the_query_spill_policy() {
-        let spill = crate::exec::spill::SpillConfig {
-            enable_spill: true,
-            spill_mode: crate::exec::spill::SpillMode::Force,
-            spill_mem_limit_threshold: None,
-            spill_operator_min_bytes: None,
-            spill_operator_max_bytes: None,
-            spill_encode_level: None,
-            enable_spill_buffer_read: None,
-            max_spill_read_buffer_bytes_per_driver: None,
-            spill_mem_table_size: None,
-            spill_mem_table_num: None,
-        };
-        // Force spill without a spill manager: a spilling exchange would fail
-        // to install its spill state, a handoff queue must never try.
-        let rt = RuntimeState::new(None, None, None, None, None, None, Some(spill), None, None);
-        let handoff = LocalExchanger::new_handoff(1, 2, 1, Arc::new(ExprArena::default()));
-        let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&handoff)).create(1, 0);
-        push(&mut sink, &rt, &[1]);
-        assert!(
-            !need_input(sink.as_ref()),
-            "a full handoff queue backpressures instead of spilling"
-        );
-
-        let buffered = LocalExchanger::new(
+    fn buffered_queue_wakes_on_push_capacity_recovery_and_last_producer_eos() {
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_with_limits(
             1,
-            1,
+            2,
             LocalExchangePartitionSpec::Single,
             Arc::new(ExprArena::default()),
+            1,
+            -1,
         );
-        let mut buffered_sink =
-            LocalExchangeSinkFactory::new(-1, Arc::clone(&buffered)).create(1, 0);
-        let error = buffered_sink
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let mut first = sink_factory.create(2, 0);
+        let mut second = sink_factory.create(2, 1);
+        let mut source =
+            LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0);
+        let readable = exchanger.source_observable();
+        let writable = exchanger.sink_observable();
+        let before_push = readable.generation();
+        assert!(!source.as_processor_ref().expect("source").has_output());
+        push(&mut first, &rt, &[7]);
+        assert!(readable.generation() > before_push);
+        assert!(!need_input(first.as_ref()));
+        assert!(!need_input(second.as_ref()));
+
+        let before_pop = writable.generation();
+        assert_eq!(
+            first_value(&pull(&mut source, &rt).expect("queued chunk")),
+            7
+        );
+        assert!(writable.generation() > before_pop);
+        assert!(need_input(first.as_ref()));
+        assert!(need_input(second.as_ref()));
+        first
             .as_processor_mut()
-            .expect("sink op")
-            .push_chunk(&rt, chunk_of(&[1]))
-            .expect_err("a spilling exchange needs the spill manager");
-        assert!(error.contains("spill manager"), "{error}");
+            .expect("first")
+            .set_finishing(&rt)
+            .expect("finish first");
+        assert!(!source.as_processor_ref().expect("source").has_output());
+        let before_eos = readable.generation();
+        second
+            .as_processor_mut()
+            .expect("second")
+            .set_finishing(&rt)
+            .expect("finish second");
+        assert!(readable.generation() > before_eos);
+        assert!(source.as_processor_ref().expect("source").has_output());
+        assert!(pull(&mut source, &rt).is_none());
+        assert!(source.is_finished());
+    }
+
+    #[test]
+    fn cancelling_the_last_consumer_releases_queue_owners_in_both_capacity_policies() {
+        for handoff in [false, true] {
+            let rt = RuntimeState::default();
+            let arena = Arc::new(ExprArena::default());
+            let exchanger = if handoff {
+                LocalExchanger::new_handoff(1, 1, 1, arena)
+            } else {
+                LocalExchanger::new_with_limits(
+                    1,
+                    1,
+                    LocalExchangePartitionSpec::Single,
+                    arena,
+                    1,
+                    -1,
+                )
+            };
+            let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
+            let mut source =
+                LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0);
+            let tracker = crate::runtime::mem_tracker::MemTracker::new_root("queued test input");
+            let mut chunk = chunk_of(&[1, 2]);
+            let array = Arc::downgrade(&chunk.columns()[0]);
+            chunk.transfer_to(&tracker);
+            let input_bytes = tracker.current();
+            assert!(input_bytes > 0);
+            sink.as_processor_mut()
+                .expect("sink")
+                .push_chunk(&rt, chunk)
+                .expect("push input");
+            assert!(array.upgrade().is_some());
+            assert_eq!(tracker.current(), input_bytes);
+            assert!(!need_input(sink.as_ref()));
+            let writable = exchanger.sink_observable();
+            let closed = exchanger.closed_observable();
+            let before_writable = writable.generation();
+            let before_closed = closed.generation();
+            source.cancel();
+            assert!(source.is_finished());
+            assert!(sink.is_finished());
+            assert!(array.upgrade().is_none());
+            assert_eq!(
+                tracker.current(),
+                0,
+                "cancel releases the live input charge"
+            );
+            assert!(writable.generation() > before_writable);
+            assert!(closed.generation() > before_closed);
+            let after_closed = closed.generation();
+            source.cancel();
+            source.close().expect("idempotent close after cancel");
+            assert_eq!(closed.generation(), after_closed);
+            let late = chunk_of(&[3]);
+            let late_array = Arc::downgrade(&late.columns()[0]);
+            sink.as_processor_mut()
+                .expect("sink")
+                .push_chunk(&rt, late)
+                .expect("late push");
+            assert!(late_array.upgrade().is_none());
+            assert_eq!(
+                exchanger.partition_buffered_chunks(0).map(|(n, _)| n),
+                Some(0)
+            );
+        }
     }
 
     #[test]
