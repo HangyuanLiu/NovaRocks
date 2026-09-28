@@ -264,6 +264,50 @@ fn parse_limit(
     Ok(Some(bytes))
 }
 
+/// Reads the anonymous memory charged to this process's cgroup:
+/// `active_anon + inactive_anon` from its `memory.stat`.
+///
+/// v1 reads the hierarchical `total_` counters, so memory charged to child
+/// cgroups is included exactly as v2 includes it. Page cache is excluded on
+/// both: it is reclaimable and would make the reading move with I/O.
+pub fn anonymous_bytes(
+    layout: &CgroupLayout,
+    read: impl Fn(&Path) -> io::Result<String>,
+) -> Result<u64, ProbeError> {
+    let path = layout.dir.join("memory.stat");
+    let content = read(&path).map_err(|error| ProbeError::Read {
+        path: path.clone(),
+        error: error.to_string(),
+    })?;
+    parse_anonymous_bytes(layout.version, &path, &content)
+}
+
+fn parse_anonymous_bytes(
+    version: CgroupVersion,
+    path: &Path,
+    content: &str,
+) -> Result<u64, ProbeError> {
+    let (active_key, inactive_key) = match version {
+        CgroupVersion::V1 => ("total_active_anon", "total_inactive_anon"),
+        CgroupVersion::V2 => ("active_anon", "inactive_anon"),
+    };
+    let counter = |key: &str| {
+        content.lines().find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == key)
+                .then(|| value.trim().parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    let missing = || ProbeError::Parse {
+        path: path.to_path_buf(),
+        content: format!("no numeric {active_key} and {inactive_key}"),
+    };
+    let active = counter(active_key).ok_or_else(missing)?;
+    let inactive = counter(inactive_key).ok_or_else(missing)?;
+    active.checked_add(inactive).ok_or_else(missing)
+}
+
 /// The path of the v1 hierarchy whose controller list includes `memory`.
 fn v1_memory_path(proc_self_cgroup: &str) -> Option<&str> {
     proc_self_cgroup.lines().find_map(|line| {
@@ -394,7 +438,7 @@ mod tests {
 
     /// A reader over an in-memory directory tree: listed files exist, the
     /// rest are `NotFound`.
-    fn files(entries: &[(&str, &str)]) -> impl Fn(&Path) -> io::Result<String> {
+    fn files(entries: &[(&str, &str)]) -> impl Fn(&Path) -> io::Result<String> + use<> {
         let map: HashMap<PathBuf, String> = entries
             .iter()
             .map(|(path, content)| (PathBuf::from(path), content.to_string()))
@@ -581,6 +625,36 @@ mod tests {
         let mountinfo = "35 25 0:30 / /mnt/cgroup\\040root rw shared:9 - cgroup2 cgroup2 rw\n";
         let found = locate("0::/a\n", mountinfo).unwrap().unwrap();
         assert_eq!(found.dir, PathBuf::from("/mnt/cgroup root/a"));
+    }
+
+    #[test]
+    fn anonymous_memory_sums_active_and_inactive_anon() {
+        let v2 = layout(CgroupVersion::V2, "/sys/fs/cgroup/a", "/sys/fs/cgroup");
+        let stat = "anon 900\nfile 5000\nactive_anon 700\ninactive_anon 300\nactive_file 4000\n";
+        let read = files(&[("/sys/fs/cgroup/a/memory.stat", stat)]);
+        assert_eq!(anonymous_bytes(&v2, read), Ok(1000));
+
+        let v1 = layout(
+            CgroupVersion::V1,
+            "/sys/fs/cgroup/memory/a",
+            "/sys/fs/cgroup/memory",
+        );
+        let stat = "active_anon 1\ninactive_anon 2\ntotal_active_anon 70\ntotal_inactive_anon 30\n";
+        let read = files(&[("/sys/fs/cgroup/memory/a/memory.stat", stat)]);
+        assert_eq!(anonymous_bytes(&v1, read), Ok(100));
+    }
+
+    #[test]
+    fn missing_anonymous_counters_are_errors_not_zero() {
+        let v2 = layout(CgroupVersion::V2, "/sys/fs/cgroup/a", "/sys/fs/cgroup");
+        let read = files(&[("/sys/fs/cgroup/a/memory.stat", "anon 900\nfile 5000\n")]);
+        let parsed = anonymous_bytes(&v2, read);
+        assert!(
+            matches!(parsed, Err(ProbeError::Parse { .. })),
+            "{parsed:?}"
+        );
+        let absent = anonymous_bytes(&v2, files(&[]));
+        assert!(matches!(absent, Err(ProbeError::Read { .. })), "{absent:?}");
     }
 
     #[test]

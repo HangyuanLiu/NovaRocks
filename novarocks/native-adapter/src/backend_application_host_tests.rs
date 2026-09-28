@@ -98,6 +98,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         scan_stream_runtime:
             novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
         execution_role_binding_factories: Vec::new(),
+        process_memory: novarocks_native_adapter::backend_test_support::test_process_memory(),
     }
 }
 

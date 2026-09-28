@@ -79,7 +79,13 @@
 //! environment is ignored, the process logs the configuration that took
 //! effect.
 
-use novarocks_memory::observe::{AllocatorSnapshot, CountingAllocator, CoverageDescriptor};
+use novarocks_memory::observe::{
+    AllocatorInternalsReading, AllocatorSnapshot, CountingAllocator, CoverageDescriptor,
+    PhysicalMemoryReading,
+};
+
+use crate::cgroup_memory;
+use crate::memory_limit::{self, CgroupFinding};
 
 /// This process's allocator: jemalloc, counted.
 ///
@@ -162,9 +168,24 @@ pub fn jemalloc_configuration() -> Result<Option<JemallocConfiguration>, String>
 
 #[cfg(feature = "jemalloc")]
 mod jemalloc {
-    use tikv_jemalloc_ctl::{config, opt, raw};
+    use novarocks_memory::observe::AllocatorInternalsReading;
+    use tikv_jemalloc_ctl::{config, epoch, opt, raw, stats};
 
     use super::JemallocConfiguration;
+
+    /// Reads jemalloc's statistics after refreshing them: jemalloc caches its
+    /// statistics until the epoch advances.
+    pub(super) fn internals() -> Option<AllocatorInternalsReading> {
+        fn bytes<E>(value: Result<usize, E>) -> Option<u64> {
+            value.ok().and_then(|bytes| u64::try_from(bytes).ok())
+        }
+        epoch::advance().ok()?;
+        Some(AllocatorInternalsReading {
+            allocated_bytes: bytes(stats::allocated::read())?,
+            active_bytes: bytes(stats::active::read())?,
+            resident_bytes: bytes(stats::resident::read())?,
+        })
+    }
 
     pub(super) fn configuration() -> Result<JemallocConfiguration, String> {
         let background_thread = opt::background_thread::read()
@@ -209,6 +230,90 @@ pub fn snapshot() -> AllocatorSnapshot {
 /// coverage instead of paraphrasing it at each call site.
 pub fn coverage() -> CoverageDescriptor {
     CoverageDescriptor::RUST_GLOBAL_ALLOCATOR
+}
+
+/// Samples what the operating system and the allocator report about this
+/// process.
+///
+/// When a cgroup limit bounds the process the cgroup's anonymous memory is
+/// read, otherwise the resident set. The allocator's statistics are read in a
+/// jemalloc build and are unknown in any other. A source that cannot be read
+/// stays unknown rather than zero. This reads files and allocator statistics,
+/// so it belongs to scrape and sampling paths, never to an allocator callback.
+pub fn sample_physical() -> PhysicalMemoryReading {
+    let limited_cgroup = memory_limit::visible_memory().and_then(|visible| match &visible.cgroup {
+        CgroupFinding::Limited { layout, .. } => Some(layout),
+        _ => None,
+    });
+    let (cgroup_anonymous_bytes, process_resident_bytes) = match limited_cgroup {
+        Some(layout) => (
+            cgroup_memory::anonymous_bytes(layout, |path| std::fs::read_to_string(path)).ok(),
+            None,
+        ),
+        None => (None, process_resident_bytes()),
+    };
+    PhysicalMemoryReading {
+        cgroup_anonymous_bytes,
+        process_resident_bytes,
+        allocator_internals: allocator_internals(),
+    }
+}
+
+#[cfg(feature = "jemalloc")]
+fn allocator_internals() -> Option<AllocatorInternalsReading> {
+    jemalloc::internals()
+}
+
+#[cfg(not(feature = "jemalloc"))]
+fn allocator_internals() -> Option<AllocatorInternalsReading> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    // SAFETY: `sysconf` has no preconditions.
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    resident_bytes_from_statm(&statm, page_size)
+}
+
+/// `/proc/self/statm` lists sizes in pages; its second field is the resident
+/// set.
+#[cfg(any(target_os = "linux", test))]
+fn resident_bytes_from_statm(statm: &str, page_size: u64) -> Option<u64> {
+    statm
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(page_size)
+}
+
+#[cfg(target_os = "macos")]
+fn process_resident_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: the buffer is one `proc_taskinfo` of exactly `size` bytes, which
+    // is what `PROC_PIDTASKINFO` writes for the calling process.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` filled the whole struct.
+    Some(unsafe { info.assume_init() }.pti_resident_size)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_resident_bytes() -> Option<u64> {
+    None
 }
 
 /// Emits the one startup line that records the observer is installed.
@@ -348,6 +453,48 @@ mod tests {
     #[test]
     fn a_build_without_jemalloc_reports_no_jemalloc_configuration() {
         assert_eq!(jemalloc_configuration(), Ok(None));
+    }
+
+    #[test]
+    fn a_physical_sample_reads_the_cgroup_or_the_resident_set() {
+        let reading = sample_physical();
+        assert!(
+            reading.cgroup_anonymous_bytes.is_some() || reading.process_resident_bytes.is_some(),
+            "{reading:?}"
+        );
+    }
+
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn a_jemalloc_build_samples_allocator_statistics() {
+        let held = std::hint::black_box(vec![1u8; 8 << 20]);
+        let internals = sample_physical()
+            .allocator_internals
+            .expect("jemalloc publishes statistics");
+        assert!(internals.allocated_bytes >= 8 << 20, "{internals:?}");
+        assert!(
+            internals.active_bytes >= internals.allocated_bytes,
+            "{internals:?}"
+        );
+        assert!(internals.resident_bytes > 0, "{internals:?}");
+        drop(held);
+    }
+
+    #[cfg(not(feature = "jemalloc"))]
+    #[test]
+    fn a_build_without_jemalloc_reports_allocator_statistics_as_unknown() {
+        let reading = sample_physical();
+        assert_eq!(reading.allocator_internals, None);
+        assert_eq!(reading.allocator_internals_line().measured_bytes(), None);
+    }
+
+    #[test]
+    fn statm_resident_pages_become_bytes() {
+        assert_eq!(
+            resident_bytes_from_statm("2500 1200 300 10 0 800 0\n", 4096),
+            Some(1200 * 4096)
+        );
+        assert_eq!(resident_bytes_from_statm("", 4096), None);
     }
 
     #[test]

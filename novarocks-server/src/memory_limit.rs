@@ -187,6 +187,15 @@ impl VisibleMemory {
             .limit_bytes()
             .is_some_and(|limit| self.physical_bytes.is_none_or(|physical| limit <= physical))
     }
+
+    /// Names what binds, as the stable label used in logs and metrics.
+    pub fn bound_label(&self) -> &'static str {
+        if self.bound_by_cgroup() {
+            "cgroup"
+        } else {
+            "physical"
+        }
+    }
 }
 
 /// Returns this process's visible memory, probed once on first use.
@@ -217,11 +226,7 @@ pub fn log_visible_memory() {
         );
         return;
     };
-    let source = if visible.bound_by_cgroup() {
-        "cgroup"
-    } else {
-        "physical"
-    };
+    let source = visible.bound_label();
     let physical_bytes = visible
         .physical_bytes
         .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());

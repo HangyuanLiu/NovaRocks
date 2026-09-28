@@ -27,6 +27,8 @@
 //!   requests that pass through it, without attributing a byte to any work.
 //! - [`coverage`] states, as typed data, what such a count includes and the
 //!   sources it structurally cannot include.
+//! - [`physical`] shapes what other mechanisms — the cgroup, the resident set,
+//!   the allocator's statistics — report about the same process.
 //!
 //! Nothing here grants, refuses, waits or reclaims. A reading is evidence for
 //! the headroom budget in the governance tier — never a substitute for the
@@ -34,6 +36,8 @@
 
 pub mod allocator;
 pub mod coverage;
+pub mod physical;
 
 pub use allocator::{AllocatorSnapshot, CountingAllocator, SHARD_COUNT};
 pub use coverage::{BlindSpot, CoverageDescriptor, CoverageReport, MeasuredSource, SourceReading};
+pub use physical::{AllocatorInternalsReading, PhysicalMemoryReading};

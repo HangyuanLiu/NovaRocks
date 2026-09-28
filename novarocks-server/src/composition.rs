@@ -515,7 +515,40 @@ pub fn compose_backend_server_config(
         },
         execution_role_binding_factories: provider_manifest
             .compose_execution_factories(config, runtime, scan_io)?,
+        process_memory: backend_process_memory_observation(),
     })
+}
+
+/// What the Backend `/metrics` endpoint reports about this process's memory:
+/// the allocator and the settings that took effect, the visible memory, and a
+/// sampler for the physical readings.
+fn backend_process_memory_observation()
+-> novarocks_native_adapter::backend_metrics::ProcessMemoryObservation {
+    // An unreadable jemalloc configuration was already logged at start-up;
+    // its settings are then not exported rather than guessed.
+    let allocator_settings = match crate::memory_observation::jemalloc_configuration() {
+        Ok(Some(configuration)) => vec![
+            (
+                "background_thread",
+                i64::from(configuration.background_thread),
+            ),
+            ("dirty_decay_ms", configuration.dirty_decay_ms),
+            ("muzzy_decay_ms", configuration.muzzy_decay_ms),
+        ],
+        Ok(None) | Err(_) => Vec::new(),
+    };
+    novarocks_native_adapter::backend_metrics::ProcessMemoryObservation {
+        allocator: crate::memory_observation::process_allocator().label(),
+        allocator_settings,
+        visible_memory: crate::memory_limit::visible_memory()
+            .map(|visible| (visible.bytes, visible.bound_label())),
+        sample: std::sync::Arc::new(|| {
+            (
+                crate::memory_observation::snapshot(),
+                crate::memory_observation::sample_physical(),
+            )
+        }),
+    }
 }
 
 /// Resolve every Frontend startup input from the application wire configuration.

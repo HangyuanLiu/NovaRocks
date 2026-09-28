@@ -19,10 +19,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::management_http::RoleMetricsRenderer;
+use novarocks_memory::observe::{AllocatorSnapshot, PhysicalMemoryReading};
 use novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 
 /// Explicitly-owned Backend metric registry.  It is intentionally separate
@@ -37,6 +39,36 @@ pub struct BackendMetricsRegistry {
         usize,
     )>,
     worker_registry_lock: Option<std::sync::Arc<novarocks_worker::RegistryLockObservation>>,
+    process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
+}
+
+/// What the Backend `/metrics` endpoint reports about this process's memory.
+///
+/// Supplied by the process that owns the allocator and the probes; this crate
+/// registers and renders the readings without knowing whether they came from
+/// a cgroup, the resident set or an allocator. Each source is its own family
+/// because the sources overlap and must never be summed.
+#[derive(Clone)]
+pub struct ProcessMemoryObservation {
+    /// The allocator that serves this process, as a stable label.
+    pub allocator: &'static str,
+    /// Allocator settings that took effect, by stable name; empty when the
+    /// allocator publishes none.
+    pub allocator_settings: Vec<(&'static str, i64)>,
+    /// What bounds this process's memory — its bytes, and `"cgroup"` or
+    /// `"physical"` for what binds — or `None` when neither is known.
+    pub visible_memory: Option<(u64, &'static str)>,
+    /// Sampled on every scrape.
+    pub sample:
+        std::sync::Arc<dyn Fn() -> (AllocatorSnapshot, PhysicalMemoryReading) + Send + Sync>,
+}
+
+/// The gauges refreshed from [`ProcessMemoryObservation::sample`]. Owned by
+/// one registry, so two registries in one process never share readings.
+struct ProcessMemoryGauges {
+    physical: IntGaugeVec,
+    allocator: IntGaugeVec,
+    counted_live: IntGauge,
 }
 
 // Native query resource gauges are process-global. Serialize their owner
@@ -100,7 +132,84 @@ impl BackendMetricsRegistry {
             native_query_resources: None,
             worker_reservations: None,
             worker_registry_lock: None,
+            process_memory: None,
         })
+    }
+
+    /// Registers this process's memory readings: the allocator and its
+    /// settings and the visible memory once, the physical readings on every
+    /// scrape. A reading the observation cannot provide is not exported.
+    pub fn with_process_memory(
+        mut self,
+        observation: ProcessMemoryObservation,
+    ) -> Result<Self, String> {
+        let registry = &self.registry;
+        let gauge_vec = |name: &str, help: &str, label: &str| -> Result<IntGaugeVec, String> {
+            let gauge = IntGaugeVec::new(Opts::new(name, help), &[label])
+                .map_err(|error| format!("construct {name}: {error}"))?;
+            registry
+                .register(Box::new(gauge.clone()))
+                .map_err(|error| format!("register {name}: {error}"))?;
+            Ok(gauge)
+        };
+        let visible = gauge_vec(
+            "novarocks_backend_process_visible_memory_bytes",
+            "The memory bound this Backend process plans against, labelled by what binds it: \
+             the cgroup limit or physical memory.",
+            "bound",
+        )?;
+        let allocator_info = gauge_vec(
+            "novarocks_backend_process_allocator_info",
+            "The allocator serving this Backend process; the value is always 1.",
+            "allocator",
+        )?;
+        let allocator_setting = gauge_vec(
+            "novarocks_backend_process_allocator_setting",
+            "Allocator settings that took effect in this Backend process, one series per \
+             setting; absent when the allocator publishes none.",
+            "setting",
+        )?;
+        let physical = gauge_vec(
+            "novarocks_backend_process_physical_memory_bytes",
+            "Physical memory of this Backend process as the operating system reports it, one \
+             series per source. Sources overlap and are not additive; a source that cannot be \
+             read is absent.",
+            "source",
+        )?;
+        let allocator = gauge_vec(
+            "novarocks_backend_process_allocator_memory_bytes",
+            "The process allocator's own statistics, one series per statistic. Statistics \
+             overlap and are not additive; they are absent when the allocator publishes none.",
+            "statistic",
+        )?;
+        let counted_live = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_process_counted_live_bytes",
+            "Live bytes requested through the Rust global allocator, as the process allocation \
+             wrapper counts them.",
+        ))
+        .map_err(|error| format!("construct counted live bytes gauge: {error}"))?;
+        registry
+            .register(Box::new(counted_live.clone()))
+            .map_err(|error| format!("register counted live bytes gauge: {error}"))?;
+
+        if let Some((bytes, bound)) = observation.visible_memory {
+            visible.with_label_values(&[bound]).set(gauge_value(bytes));
+        }
+        allocator_info
+            .with_label_values(&[observation.allocator])
+            .set(1);
+        for (setting, value) in &observation.allocator_settings {
+            allocator_setting.with_label_values(&[setting]).set(*value);
+        }
+        self.process_memory = Some((
+            observation,
+            ProcessMemoryGauges {
+                physical,
+                allocator,
+                counted_live,
+            },
+        ));
+        Ok(self)
     }
 
     pub fn with_native_query_resources(
@@ -129,11 +238,16 @@ impl BackendMetricsRegistry {
     }
 
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
-        let _query_resource_scrape_guard = self.native_query_resources.as_ref().map(|_| {
+        let observed = self.native_query_resources.is_some() || self.process_memory.is_some();
+        let _query_resource_scrape_guard = observed.then(|| {
             NATIVE_QUERY_RESOURCE_SCRAPE_LOCK
                 .lock()
                 .expect("native query resource scrape lock")
         });
+        if let Some((observation, gauges)) = &self.process_memory {
+            let (counted, physical) = (observation.sample)();
+            publish_process_memory(gauges, counted, physical);
+        }
         // Contexts can disappear in rollback and expiry paths. The owner is
         // the only source for these gauges, and the lock keeps concurrent
         // scrapes from publishing snapshots out of order.
@@ -715,6 +829,55 @@ fn publish_worker_registry_lock(snapshot: novarocks_worker::RegistryLockSnapshot
     );
 }
 
+fn publish_process_memory(
+    gauges: &ProcessMemoryGauges,
+    counted: AllocatorSnapshot,
+    physical: PhysicalMemoryReading,
+) {
+    fn set_or_remove(gauge: &IntGaugeVec, label: &str, value: Option<u64>) {
+        match value {
+            Some(bytes) => gauge.with_label_values(&[label]).set(gauge_value(bytes)),
+            // Absent, not zero: nothing measured this source on this scrape.
+            None => {
+                let _ = gauge.remove_label_values(&[label]);
+            }
+        }
+    }
+    gauges.counted_live.set(gauge_value(counted.live_bytes));
+    set_or_remove(
+        &gauges.physical,
+        "cgroup_anonymous",
+        physical.cgroup_anonymous_bytes,
+    );
+    set_or_remove(
+        &gauges.physical,
+        "process_resident",
+        physical.process_resident_bytes,
+    );
+    let internals = physical.allocator_internals;
+    set_or_remove(
+        &gauges.allocator,
+        "allocated",
+        internals.map(|reading| reading.allocated_bytes),
+    );
+    set_or_remove(
+        &gauges.allocator,
+        "active",
+        internals.map(|reading| reading.active_bytes),
+    );
+    set_or_remove(
+        &gauges.allocator,
+        "resident",
+        internals.map(|reading| reading.resident_bytes),
+    );
+}
+
+/// Byte counts fit an `i64` gauge on any real machine; saturate rather than
+/// wrap if one ever does not.
+fn gauge_value(bytes: u64) -> i64 {
+    i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
 /// Renders only the metric families registered by this Backend role.
 pub(crate) fn render_metrics(metrics: &BackendMetricsRegistry) -> Result<String, String> {
     refresh_backend_gauges();
@@ -913,6 +1076,118 @@ mod tests {
                 && row["tags"]["source"] == "exchange_slot"
                 && row["value"].as_f64() == Some(0.0)
         })));
+    }
+
+    fn process_memory(
+        allocator: &'static str,
+        allocator_settings: Vec<(&'static str, i64)>,
+        sample: impl Fn() -> PhysicalMemoryReading + Send + Sync + 'static,
+    ) -> ProcessMemoryObservation {
+        ProcessMemoryObservation {
+            allocator,
+            allocator_settings,
+            visible_memory: Some((16 << 30, "cgroup")),
+            sample: Arc::new(move || {
+                let counted = AllocatorSnapshot {
+                    live_bytes: 4096,
+                    ..AllocatorSnapshot::default()
+                };
+                (counted, sample())
+            }),
+        }
+    }
+
+    #[test]
+    fn process_memory_readings_are_rendered_in_both_formats() {
+        let reading = PhysicalMemoryReading {
+            cgroup_anonymous_bytes: Some(3000),
+            process_resident_bytes: None,
+            allocator_internals: Some(novarocks_memory::observe::AllocatorInternalsReading {
+                allocated_bytes: 100,
+                active_bytes: 120,
+                resident_bytes: 150,
+            }),
+        };
+        let backend = BackendMetricsRegistry::new()
+            .expect("construct Backend registry")
+            .with_process_memory(process_memory(
+                "jemalloc",
+                vec![("background_thread", 1), ("dirty_decay_ms", 10_000)],
+                move || reading,
+            ))
+            .expect("register process memory");
+        let rendered = render_metrics(&backend).expect("render Backend metrics");
+        for line in [
+            "novarocks_backend_process_visible_memory_bytes{bound=\"cgroup\"} 17179869184",
+            "novarocks_backend_process_allocator_info{allocator=\"jemalloc\"} 1",
+            "novarocks_backend_process_allocator_setting{setting=\"background_thread\"} 1",
+            "novarocks_backend_process_allocator_setting{setting=\"dirty_decay_ms\"} 10000",
+            "novarocks_backend_process_physical_memory_bytes{source=\"cgroup_anonymous\"} 3000",
+            "novarocks_backend_process_allocator_memory_bytes{statistic=\"allocated\"} 100",
+            "novarocks_backend_process_allocator_memory_bytes{statistic=\"active\"} 120",
+            "novarocks_backend_process_allocator_memory_bytes{statistic=\"resident\"} 150",
+            "novarocks_backend_process_counted_live_bytes 4096",
+        ] {
+            assert!(rendered.contains(line), "missing {line}\n{rendered}");
+        }
+        assert!(
+            !rendered.contains("source=\"process_resident\""),
+            "an unread source must be absent, not zero\n{rendered}"
+        );
+        let json = render_metrics_json(&backend).expect("render Backend JSON");
+        let rows: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(rows.as_array().is_some_and(|rows| rows.iter().any(|row| {
+            row["tags"]["metric"] == "novarocks_backend_process_allocator_memory_bytes"
+                && row["tags"]["statistic"] == "resident"
+                && row["value"].as_f64() == Some(150.0)
+        })));
+    }
+
+    #[test]
+    fn a_system_allocator_exports_no_allocator_statistics_or_settings() {
+        let backend = BackendMetricsRegistry::new()
+            .expect("construct Backend registry")
+            .with_process_memory(process_memory("system", Vec::new(), || {
+                PhysicalMemoryReading {
+                    process_resident_bytes: Some(5000),
+                    ..PhysicalMemoryReading::default()
+                }
+            }))
+            .expect("register process memory");
+        let rendered = render_metrics(&backend).expect("render Backend metrics");
+        assert!(
+            rendered.contains("novarocks_backend_process_allocator_info{allocator=\"system\"} 1")
+        );
+        assert!(rendered.contains(
+            "novarocks_backend_process_physical_memory_bytes{source=\"process_resident\"} 5000"
+        ));
+        assert!(
+            !rendered.contains("novarocks_backend_process_allocator_memory_bytes{"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("novarocks_backend_process_allocator_setting{"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_reading_that_disappears_is_removed_not_left_stale() {
+        let readable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let observed = Arc::clone(&readable);
+        let backend = BackendMetricsRegistry::new()
+            .expect("construct Backend registry")
+            .with_process_memory(process_memory("system", Vec::new(), move || {
+                PhysicalMemoryReading {
+                    process_resident_bytes: observed.load(AtomicOrdering::Relaxed).then_some(5000),
+                    ..PhysicalMemoryReading::default()
+                }
+            }))
+            .expect("register process memory");
+        let series = "novarocks_backend_process_physical_memory_bytes{source=\"process_resident\"}";
+        assert!(render_metrics(&backend).expect("render").contains(series));
+        readable.store(false, AtomicOrdering::Relaxed);
+        assert!(!render_metrics(&backend).expect("render").contains(series));
     }
 
     #[test]
