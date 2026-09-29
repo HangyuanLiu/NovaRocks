@@ -18,4 +18,4 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$SCRIPT_DIR/runtime_entry.py" status "$@"
+exec python3 -m unittest discover -s "$SCRIPT_DIR" -p 'test_*.py' -v
