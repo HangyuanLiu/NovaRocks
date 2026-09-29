@@ -163,8 +163,12 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
                   "iceberg_object_store_credential_generation": "v1", "benchmark_shared_root": config["benchmark"]["shared_root"], "fixture_env_file": str(publication / "env.sh")}
         text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\nport = ' + json_string(ports["mysql"]) + '\nuser = "root"\npassword = ""\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in values.items()))
         sql_values = {"type": "iceberg", "iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
-                      "aws.s3.endpoint": endpoint["minio_endpoint"], "aws.s3.access_key": ak, "aws.s3.secret_key": sk,
+                      "aws.s3.endpoint": endpoint["minio_endpoint"],
                       "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
+        for purpose, role in (("metadata", "frontend"), ("data", "backend")):
+            prefix = f"credential.object-store-{purpose}."
+            sql_values.update({prefix + "consumer-role": role, prefix + "mode": "static",
+                               prefix + "name": "iceberg-test-data", prefix + "generation": "v1"})
         sql_quote = lambda value: "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
         text_file(staging, "ice-rest-catalog.sql", "CREATE EXTERNAL CATALOG ice_rest PROPERTIES (\n" + ',\n'.join(f'  {sql_quote(k)} = {sql_quote(v)}' for k, v in sql_values.items()) + "\n);\n")
         spark = {"spark.master": "local[*]", "spark.app.name": "NovaRocksIcebergSpark", "spark.ui.bindAddress": "0.0.0.0", "spark.driver.bindAddress": "0.0.0.0",

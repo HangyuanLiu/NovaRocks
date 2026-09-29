@@ -136,8 +136,12 @@ class HiveOwner:
         props = {"type": "iceberg", "iceberg.catalog.type": "hive",
                  "iceberg.catalog.hive.metastore.uris": record["hms"]["uri"],
                  "iceberg.catalog.warehouse": record["hms"]["warehouse"],
-                 "aws.s3.endpoint": credentials["endpoint"], "aws.s3.access_key": user,
-                 "aws.s3.secret_key": secret, "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
+                 "aws.s3.endpoint": credentials["endpoint"],
+                 "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
+        for purpose, role in (("metadata", "frontend"), ("data", "backend")):
+            prefix = f"credential.object-store-{purpose}."
+            props.update({prefix + "consumer-role": role, prefix + "mode": "static",
+                          prefix + "name": "iceberg-test-data", prefix + "generation": "v1"})
         sql = "CREATE EXTERNAL CATALOG ice_hms\nPROPERTIES (\n" + ",\n".join(f"  {json.dumps(key)} = {json.dumps(value)}" for key, value in props.items()) + "\n);\n"
         self.write_definition(directory / "ice-hms-catalog.sql", sql.encode())
         props = {"": "org.apache.iceberg.spark.SparkCatalog", ".type": "hive", ".uri": "thrift://hms:9083",

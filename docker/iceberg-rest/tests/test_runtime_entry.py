@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -103,6 +104,23 @@ class RendererTests(RendererCase):
         self.assertEqual(runner['env']['iceberg_rest_uri'], manifest['iceberg_rest']['uri'])
         self.assertEqual(runner['env']['oss_endpoint'], manifest['minio']['endpoint'])
         self.assertEqual(runner['env']['oss_sk'], manifest['minio']['secret_access_key'])
+        sql = (final / 'ice-rest-catalog.sql').read_text()
+        properties = dict(re.findall(r"'([^']+)'\s*=\s*'([^']*)'", sql))
+        for purpose, consumer, role in (('metadata', 'frontend', 'fe'), ('data', 'backend', 'be')):
+            role_config = tomllib.loads((final / (role + '.toml')).read_text())
+            credential = next(item for item in role_config['connector']['credentials']
+                              if item['purpose'] == 'object-store-' + purpose)
+            prefix = 'credential.object-store-' + purpose + '.'
+            self.assertEqual(properties[prefix + 'consumer-role'], consumer)
+            self.assertEqual(properties[prefix + 'mode'], 'static')
+            self.assertEqual(properties[prefix + 'name'], credential['name'])
+            self.assertEqual(properties[prefix + 'generation'], credential['generation'])
+            self.assertEqual(credential['access_key_id'], '${ENV:AWS_S3_ACCESS_KEY_ID}')
+            self.assertEqual(credential['access_key_secret'], '${ENV:AWS_S3_SECRET_ACCESS_KEY}')
+        for retired in ('aws.s3.access_key', 'aws.s3.secret_key'):
+            self.assertNotIn(retired, properties)
+        self.assertNotIn(env['AWS_S3_ACCESS_KEY_ID'], sql)
+        self.assertNotIn(env['AWS_S3_SECRET_ACCESS_KEY'], sql)
         self.assertIn('http://rest:8181', (final / 'spark-defaults.conf').read_text())
         self.assertNotIn('http://rest:8181', (final / 'ice-rest-catalog.sql').read_text())
         with (final / 'sql-test.toml').open('a') as stream:

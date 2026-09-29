@@ -70,18 +70,15 @@ When backgrounding the server, gate the first query on the `NOVAROCKS_READY`
 marker it prints after binding — probing the port alone cannot tell a fresh
 server from a leftover process that already owned it.
 
-Then run a suite:
+非隔离套件运行时使用已绑定 publication 的生成配置；即使 `filter` 不访问 Iceberg，runner 仍在启动时核验这组明确的 fixture 配置：
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite filter --mode verify
 ```
 
-The runner defaults to `tests/sql/runner/conf/default.toml` (host `127.0.0.1`,
-port `9030`) when no explicit `--config` is provided; pass
-`--config "$NOVAROCKS_SQL_TEST_CONFIG"` to target the generated worktree
-environment instead. Suites that need an Iceberg fixture should pass the
-generated environment config or an explicit fixture config.
+所有非隔离套件都需要明确的端点、凭证和 `fixture_env_file`。默认 `tests/sql/runner/conf/default.toml` 不提供这些值，不能当作可直接运行的 fixture 配置。使用上述生成的 `--config`，或提供具有同一完整契约的显式配置；runner 不以默认端口或环境中的旧端点补齐缺失值。隔离套件由 runner 启动自己的 fixture，再统一投影其配置。
 
 `tests/sql/correctness/README.md` carries the suite map — which engine area each
 suite covers and what fixture or topology it needs. Choose suites from it rather

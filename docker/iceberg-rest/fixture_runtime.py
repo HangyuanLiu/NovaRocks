@@ -289,7 +289,49 @@ class Docker:
         except (OSError, ValueError):
             return False
 
+    @staticmethod
+    def service_aliases(service: str) -> list[str]:
+        return ["minio", "warehouse.minio", "novarocks.minio"] if service == "minio" else [service]
+
+    def own_network(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        network = self.inspect("network", record["network"], absent_ok=True)
+        if network and any((network.get("Labels") or {}).get(key) != value
+                           for key, value in self.labels(record).items()):
+            raise RuntimeFailure("RuntimeIdentityMismatch", "foreign service network")
+        return network
+
+    def service_connected(self, record: dict[str, Any], service: str,
+                          container: dict[str, Any], network: dict[str, Any]) -> bool:
+        endpoint = ((container.get("NetworkSettings") or {}).get("Networks") or {}).get(record["network"])
+        return bool(endpoint and endpoint.get("NetworkID") == network.get("Id")
+                    and container["Id"] in (network.get("Containers") or {})
+                    and set(self.service_aliases(service)).issubset(endpoint.get("Aliases") or []))
+
+    def repair_service_networks(self, record: dict[str, Any]) -> None:
+        network = self.own_network(record)
+        if not network:
+            raise RuntimeFailure("RuntimeStateUnreadable", "saved service network is missing")
+        for service in record["required_services"]:
+            container = self.container(record, service)
+            # Completed initialization containers do not retain live endpoints.
+            if not container or not (container.get("State") or {}).get("Running"):
+                continue
+            if self.service_connected(record, service, container, network):
+                continue
+            identity = container["Id"]
+            endpoints = (container.get("NetworkSettings") or {}).get("Networks") or {}
+            if record["network"] in endpoints or identity in (network.get("Containers") or {}):
+                self.command(["network", "disconnect", record["network"], identity], absent_ok=True)
+            aliases = [argument for alias in self.service_aliases(service) for argument in ("--alias", alias)]
+            self.command(["network", "connect", *aliases, record["network"], identity])
+            network = self.own_network(record)
+            if not network:
+                raise RuntimeFailure("RuntimeStateUnreadable", "saved service network disappeared")
+
     def healthy(self, record: dict[str, Any]) -> bool:
+        network = self.own_network(record)
+        if not network:
+            return False
         for service in record["required_services"]:
             info = self.container(record, service)
             if not info:
@@ -298,7 +340,7 @@ class Docker:
             if service == "mc-init":
                 if state.get("Status") != "exited" or state.get("ExitCode") != 0:
                     return False
-            elif not state.get("Running"):
+            elif not state.get("Running") or not self.service_connected(record, service, info, network):
                 return False
         for url in record["health_urls"]:
             if not self.http_ready(url):
@@ -341,7 +383,13 @@ class Docker:
         else:
             self.compose(record, ["up", "-d", "minio", "mc-init"])
         deadline = time.monotonic() + self.timeout
-        while not self.healthy(record):
+        while True:
+            # A failed Docker start can lose only the service's own endpoint
+            # while retaining attachments to other catalog networks. Compose
+            # up does not always restore that endpoint on the existing container.
+            self.repair_service_networks(record)
+            if self.healthy(record):
+                break
             if time.monotonic() >= deadline:
                 raise RuntimeFailure("ReadinessTimeout", record["id"])
             time.sleep(0.1)

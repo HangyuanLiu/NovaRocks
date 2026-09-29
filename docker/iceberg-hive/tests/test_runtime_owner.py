@@ -3,6 +3,8 @@
 # contributor license agreements. See the NOTICE file for additional
 # information. Licensed under the Apache License, Version 2.0.
 import importlib.util
+import re
+import tomllib
 from pathlib import Path
 import tempfile
 import unittest
@@ -84,6 +86,31 @@ class HiveOwnerTest(unittest.TestCase):
         self.assertIn("NOVA_ENV_SHARED_HMS_WAREHOUSE_URI=", env)
         self.assertIn("http://minio:9000", (self.hive.directory("cat-a") / "core-site.xml").read_text())
         self.assertIn("<value>secret</value>", (self.hive.directory("cat-a") / "core-site.xml").read_text())
+
+    def test_native_sql_binds_the_role_local_static_credentials(self):
+        import runtime_entry
+        record = self.hive.up(self.manifest("cat-a"), "local-hms", prepare_only=True)
+        directory = self.hive.directory("cat-a")
+        sql = (directory / "ice-hms-catalog.sql").read_text()
+        properties = dict(re.findall(r'"([^"\n]+)"\s*=\s*"([^"\n]*)"', sql))
+        ports = {"fe_http": 8100, "fe_grpc": 9100, "be_http": 8200, "be_grpc": 9200, "mysql": 9300}
+        runtime_entry.render_role_configs(directory, directory, "test-hms", ports,
+                                          {"deployment_id": "test-hms", "shared_secret": "test"})
+        for purpose, consumer, role in (("metadata", "frontend", "fe"), ("data", "backend", "be")):
+            role_config = tomllib.loads((directory / (role + ".toml")).read_text())
+            credential = next(item for item in role_config["connector"]["credentials"]
+                              if item["purpose"] == "object-store-" + purpose)
+            prefix = "credential.object-store-" + purpose + "."
+            self.assertEqual(properties[prefix + "consumer-role"], consumer)
+            self.assertEqual(properties[prefix + "mode"], "static")
+            self.assertEqual(properties[prefix + "name"], credential["name"])
+            self.assertEqual(properties[prefix + "generation"], credential["generation"])
+        self.assertEqual(properties["iceberg.catalog.warehouse"], record["hms"]["warehouse"])
+        self.assertEqual(properties["aws.s3.endpoint"], record["minio"]["endpoint"])
+        self.assertNotIn("aws.s3.access_key", properties)
+        self.assertNotIn("aws.s3.secret_key", properties)
+        self.assertNotIn('= "secret"', sql)
+        self.assertNotIn('= "key"', sql)
 
     def test_repeated_up_keeps_saved_definition_and_bind_mount_inodes(self):
         record = self.hive.up(self.manifest("cat-a"), "local-hms")

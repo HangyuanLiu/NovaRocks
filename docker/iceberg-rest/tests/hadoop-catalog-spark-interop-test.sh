@@ -193,8 +193,14 @@ mysql_exec "CREATE EXTERNAL CATALOG $catalog PROPERTIES(\
 \"iceberg.catalog.type\"=\"hadoop\",\
 \"iceberg.catalog.warehouse\"=\"$warehouse\",\
 \"aws.s3.endpoint\"=\"$AWS_S3_ENDPOINT\",\
-\"aws.s3.access_key\"=\"$AWS_S3_ACCESS_KEY_ID\",\
-\"aws.s3.secret_key\"=\"$AWS_S3_SECRET_ACCESS_KEY\",\
+\"credential.object-store-metadata.consumer-role\"=\"frontend\",\
+\"credential.object-store-metadata.mode\"=\"static\",\
+\"credential.object-store-metadata.name\"=\"$iceberg_object_store_credential_name\",\
+\"credential.object-store-metadata.generation\"=\"$iceberg_object_store_credential_generation\",\
+\"credential.object-store-data.consumer-role\"=\"backend\",\
+\"credential.object-store-data.mode\"=\"static\",\
+\"credential.object-store-data.name\"=\"$iceberg_object_store_credential_name\",\
+\"credential.object-store-data.generation\"=\"$iceberg_object_store_credential_generation\",\
 \"aws.s3.region\"=\"us-east-1\",\
 \"aws.s3.enable_path_style_access\"=\"true\"\
 );"

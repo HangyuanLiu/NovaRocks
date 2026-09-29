@@ -109,6 +109,119 @@ CONFIG = {"credentials": {"access_key": "access", "secret_key": "secret"},
           "buckets": ["warehouse", "novarocks"]}
 
 
+class DockerServiceNetworkTests(unittest.TestCase):
+    def fixture(self, service="minio", attached=False, aliases=None):
+        record = {"id": "os-test", "kind": "os", "namespace": "test-owner", "key": "test-key",
+                  "project": "test-project", "network": "saved-own-network", "volumes": ["saved-volume"],
+                  "compose_file": "/saved/compose.yml", "compose_env": "/saved/compose.env",
+                  "images": {service: {"image_id": "sha256:service", "tag": "saved-service-tag"}},
+                  "service_ports": {service: {"9000/tcp": 38000} if service == "minio" else {}},
+                  "ports": {"minio": 38000}, "required_services": [service], "health_urls": ["http://host-proxy"]}
+        if service == "minio":
+            record["images"]["mc-init"] = {"image_id": "sha256:mc", "tag": "saved-mc-tag"}
+            record["required_services"].append("mc-init")
+        labels = runtime.Docker.labels(record)
+        network = {"Id": "exact-own-network-id", "Labels": dict(labels), "Containers": {}}
+        containers = {}
+        for name, image in record["images"].items():
+            container = {"Id": "exact-" + name, "Image": image["image_id"], "Config": {"Labels": dict(labels)},
+                         "HostConfig": {"PortBindings": {port: [{"HostPort": str(host)}]
+                                        for port, host in record["service_ports"].get(name, {}).items()}},
+                         "State": {"Running": True, "Status": "running"},
+                         "NetworkSettings": {"Networks": {}}}
+            if name == service:
+                # These surviving attachments must never be disconnected during repair.
+                container["NetworkSettings"]["Networks"] = {
+                    "catalog-a": {"NetworkID": "other-a", "Aliases": ["minio"]},
+                    "catalog-b": {"NetworkID": "other-b", "Aliases": ["minio"]}}
+            if name != service or attached:
+                container["NetworkSettings"]["Networks"][record["network"]] = {
+                    "NetworkID": network["Id"], "Aliases": aliases if name == service else [name]}
+                network["Containers"][container["Id"]] = {}
+            containers[name] = container
+        backend = runtime.Docker(timeout=1)
+        calls = []
+        def inspect(kind, identity, **kwargs):
+            if kind == "container":
+                return copy.deepcopy(next(value for value in containers.values() if value["Id"] == identity))
+            if kind == "network":
+                self.assertEqual(identity, record["network"])
+                return copy.deepcopy(network)
+            if kind == "volume":
+                return {"Labels": dict(labels)}
+            if kind == "image":
+                return {"Id": next(image["image_id"] for image in record["images"].values() if image["tag"] == identity)}
+            self.fail("unexpected inspect: " + kind)
+        def command(args, **kwargs):
+            calls.append(args)
+            if args[0] == "ps":
+                selected = next(arg.split("=", 1)[1] for arg in args if arg.startswith("label=com.docker.compose.service="))
+                name = selected.rsplit("=", 1)[1]
+                return containers[name]["Id"]
+            if args[0] == "compose":
+                self.assertEqual(args[-4:], ["up", "-d", "minio", "mc-init"])
+                return ""
+            if args[:2] == ["network", "disconnect"]:
+                self.assertEqual(args[2], record["network"])
+                container = next(value for value in containers.values() if value["Id"] == args[3])
+                container["NetworkSettings"]["Networks"].pop(record["network"], None)
+                network["Containers"].pop(container["Id"], None)
+                return ""
+            if args[:2] == ["network", "connect"]:
+                self.assertEqual(args[-2], record["network"])
+                container = next(value for value in containers.values() if value["Id"] == args[-1])
+                container["NetworkSettings"]["Networks"][record["network"]] = {
+                    "NetworkID": network["Id"], "Aliases": args[3:-2:2]}
+                network["Containers"][container["Id"]] = {}
+                if "mc-init" in containers:
+                    containers["mc-init"]["State"] = {"Running": False, "Status": "exited", "ExitCode": 0}
+                    # Completed initialization does not need a retained live endpoint.
+                    containers["mc-init"]["NetworkSettings"]["Networks"] = {}
+                    network["Containers"].pop(containers["mc-init"]["Id"], None)
+                return ""
+            self.fail("unexpected command: " + repr(args))
+        backend.inspect = inspect
+        backend.command = command
+        backend.http_ready = lambda url: True
+        return backend, record, containers, network, calls
+
+    def test_failed_start_lost_endpoint_repairs_existing_minio_before_health(self):
+        backend, record, containers, network, calls = self.fixture()
+        original = copy.deepcopy(containers["minio"])
+        ports = copy.deepcopy(record["ports"])
+        containers["mc-init"]["State"] = {"Running": False, "Status": "exited", "ExitCode": 0}
+        # Even an accepting host HTTP endpoint and successful prior bucket init
+        # cannot mask the running service's missing own network.
+        self.assertFalse(backend.healthy(record))
+        containers["mc-init"]["State"] = {"Running": True, "Status": "running"}
+        backend.ensure(record)
+        self.assertTrue(backend.healthy(record))
+        self.assertEqual(record["ports"], ports)
+        self.assertEqual(record["containers"]["minio"], original["Id"])
+        for name in ("catalog-a", "catalog-b"):
+            self.assertEqual(containers["minio"]["NetworkSettings"]["Networks"][name],
+                             original["NetworkSettings"]["Networks"][name])
+        changes = [args for args in calls if args[0] == "network"]
+        self.assertEqual(changes, [["network", "connect", "--alias", "minio", "--alias", "warehouse.minio",
+                                   "--alias", "novarocks.minio", record["network"], original["Id"]]])
+
+    def test_service_aliases_are_repaired_without_recreating_the_container(self):
+        backend, record, containers, network, calls = self.fixture(service="spark", attached=True, aliases=["wrong"])
+        self.assertFalse(backend.healthy(record))
+        backend.repair_service_networks(record)
+        self.assertTrue(backend.healthy(record))
+        self.assertEqual([args for args in calls if args[0] == "network"], [
+            ["network", "disconnect", record["network"], "exact-spark"],
+            ["network", "connect", "--alias", "spark", record["network"], "exact-spark"]])
+
+    def test_foreign_network_is_not_repaired(self):
+        backend, record, containers, network, calls = self.fixture()
+        network["Labels"]["novarocks.fixture.owner"] = "foreign-owner"
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeIdentityMismatch"):
+            backend.repair_service_networks(record)
+        self.assertFalse(any(args[0] == "network" for args in calls))
+
+
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
