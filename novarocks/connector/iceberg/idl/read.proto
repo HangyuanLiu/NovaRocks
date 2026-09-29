@@ -149,6 +149,7 @@ message IcebergColumnHandle {
   string type_json = 4;
   bool nullable = 5;
   optional string comment = 6;
+  optional string scalar_integer_domain = 7;
 }
 
 message HiveTransactionHandle {
@@ -190,6 +191,7 @@ message IcebergTableHandle {
   map<string, string> storage_properties = 13;
   IcebergPinnedDataFileSet pinned_data_files = 14;
   optional IcebergReadDomain read_domain = 15;
+  map<int32, string> scalar_integer_domains = 16;
 }
 
 message TableChangesFunctionHandle {
