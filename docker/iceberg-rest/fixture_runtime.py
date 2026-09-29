@@ -438,6 +438,8 @@ class RuntimeOwner:
         self._daemon = daemon
         self.backend = backend if backend is not None else Docker()
         self.renderer = renderer
+        if not 0 < port_start <= port_end < 65536:
+            raise RuntimeFailure("PortUnavailable", "invalid runtime port range")
         self.port_start, self.port_end = port_start, port_end
         self.hook = hook or self.test_hook
         self.templates = templates or {kind: SCRIPT_DIR / "templates" / name for kind, name in (
@@ -540,6 +542,7 @@ class RuntimeOwner:
                               if location["owner_locator"] == self.locator and location["object_store_id"] == identity)
         return references
 
+    # Design: ADR-0165 (docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)
     def publish(self, entry: Path, metadata: dict[str, Any]) -> dict[str, Any]:
         config = metadata["config"]
         current = None
@@ -626,6 +629,8 @@ class RuntimeOwner:
 
     def allocate(self, names: list[str]) -> dict[str, int]:
         used = {port for record in self.records() for port in record["ports"].values()}
+        for path in (self.base / "hms").glob("*/manifest.json"):
+            used.update(read_json(path)["ports"].values())
         assigned = {}
         for name in names:
             for port in range(self.port_start, self.port_end + 1):
@@ -750,6 +755,7 @@ class RuntimeOwner:
                 self.save_record(record)
         return record
 
+    # Design: ADR-0165 (docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)
     def bind(self, worktree: str, entry: Path | str, config: dict[str, Any], bom: dict[str, Any]) -> dict[str, Any]:
         self.assert_live_daemon()
         entry = Path(entry).resolve()
@@ -848,6 +854,7 @@ class RuntimeOwner:
                     return self.publish(entry, self.unbound(previous, config=config))
             return self.publish(entry, self.unbound(previous, config=config))
 
+    # Design: ADR-0165 (docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)
     def delete_catalog(self, identity: str, *, force: bool = False) -> None:
         self.assert_live_daemon()
         initial = self.record(identity)
@@ -1029,9 +1036,9 @@ def main() -> int:
     sub.add_argument("--profile", choices=("stock", "publication-hook"), default="stock")
     sub.add_argument("--hook-image")
     args = parser.parse_args()
-    owner = RuntimeOwner(args.root, daemon=args.daemon, backend=Docker(args.timeout),
-                         port_start=args.port_start, port_end=args.port_end)
     try:
+        owner = RuntimeOwner(args.root, daemon=args.daemon, backend=Docker(args.timeout),
+                             port_start=args.port_start, port_end=args.port_end)
         if args.operation in {"bind", "prepare-entry"}:
             config = read_json(args.config_json)
             if args.operation == "bind":

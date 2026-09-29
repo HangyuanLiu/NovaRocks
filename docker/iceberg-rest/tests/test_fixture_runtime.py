@@ -125,6 +125,14 @@ class ProtocolTests(unittest.TestCase):
     def bind(self, images=None, entry=None, name="test"):
         return self.owner.bind(name, entry or self.entry, CONFIG, images or bom())
 
+    def test_prepared_hms_port_is_reserved_before_it_listens(self):
+        runtime.atomic_json(self.owner.base / "hms" / "cat-prepared" / "manifest.json",
+                            {"ports": {"hms": self.owner.port_start}})
+        publication = self.bind()
+        ports = [port for record in publication["records"].values()
+                 for port in record["ports"].values()]
+        self.assertNotIn(self.owner.port_start, ports)
+
     def assert_code(self, code, callable):
         with self.assertRaises(runtime.RuntimeFailure) as caught:
             callable()

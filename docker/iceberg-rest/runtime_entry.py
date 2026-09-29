@@ -529,6 +529,8 @@ def worktree_main(argv: list[str] | None = None) -> int:
     except (KeyError, OSError, ValueError) as error:
         print(f'InvalidConfiguration: {error}', file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == '__main__':

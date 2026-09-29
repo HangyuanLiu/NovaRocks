@@ -26,30 +26,17 @@ SQL tests have two physical roots:
 
 ## Object Store Prerequisite
 
-Only Iceberg and other object-store-backed suites require a
-reachable MinIO-compatible object store at `http://127.0.0.1:9000`.
-
-Default credentials (matching the standalone defaults):
-
-- access key: `admin`
-- secret key: `admin123`
-- bucket: `novarocks`
-
-If a selected suite declares an object-store warehouse and MinIO is not running,
-the runner fails fast before executing that suite:
-
-```
-MinIO at http://127.0.0.1:9000 is unreachable.
-hint: start it with:
-  mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &
-```
-
-Example local startup:
+Iceberg 等对象存储套件使用显式 runner 配置中的端点与凭证；fixture 服务的 host 端口由 runtime owner 分配，不能假设 `9000/8181` 或默认凭证。先验证本机 BOM 并绑定，再解析一次 publication：
 
 ```bash
-mkdir -p ~/minio-data
-minio server ~/minio-data --console-address :9001 &
+docker/iceberg-rest/up.sh
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
 ```
+
+生成的 `sql-test.toml` 同时包含实际端点和 `[env].fixture_env_file` 的不可变 publication 路径。缺少运行配置时 runner 明确报错，不回退固定端点。BOM 前置条件失败（75）是 BLOCKED；端口/身份/owner 失败是 VERIFY FAILED。verify/测试不自动 provision。
+
+`up.sh --prepare-only` 无 Docker，只恢复已保存状态；unbound 不提供占位端点，保存的 ready 也不是健康证明。`NOVA_ENV_RUNTIME_DIR` 存放稳定运行数据，消费者使用 `NOVA_ENV_REST_ENV_FILE`，不能拼接 runtime/env.sh。解绑/purge、版本实例及 HMS 退出顺序见 [fixture 操作说明](../../docker/iceberg-rest/README.md)。
 
 ## Who Owns the Server
 
@@ -118,7 +105,7 @@ tools/benchmark/run-sql-benchmark.sh --suite tpc-ds --backend-count 2
 tools/benchmark/run-sql-benchmark.sh --suite all --backend-count 4 --output-dir /tmp/novarocks-benchmarks
 ```
 
-The benchmark runner resolves the fixed shared fixture before any suite hook.
+benchmark runner 在 suite hook 前解析固定共享数据。bootstrap 先 bind 并读取同次 publication，再核对实际 Spark image ID/BOM producer 后检查或构建 READY；第一次新对象存储需要重建数据，worktree purge 保留共享 READY。
 It verifies results, performs one warmup pass, records five serial measured
 passes, and captures a profile pass. Generated reports go to
 `reports/sql-benchmarks/` and do not belong in correctness CI.

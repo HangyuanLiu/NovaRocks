@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Versioned local fixture ownership, durable references and atomic publication."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import socket
+import sys
+import time
+from xml.sax.saxutils import escape
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "iceberg-rest"))
+import fixture_runtime as runtime
+
+
+class HiveOwner:
+    """HMS owns its project; the fixture owner owns only the catalog attachment."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.backend = owner.backend
+
+    def directory(self, catalog):
+        return self.owner.base / "hms" / runtime.safe_component(catalog)
+
+    def read(self, catalog):
+        path = self.directory(catalog) / "manifest.json"
+        if not path.exists():
+            return None
+        record = runtime.read_json(path)
+        if (record.get("catalog_id") != catalog or record.get("owner_locator") != self.owner.locator
+                or record.get("project") != f"nr-hms-{self.owner.namespace}-{catalog}"):
+            raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "HMS record owner differs")
+        return record
+
+    def save(self, record):
+        runtime.atomic_json(self.directory(record["catalog_id"]) / "manifest.json", record)
+
+    def prepare(self, manifest, image):
+        catalog = manifest["runtime"]["catalog"]
+        identity = catalog["id"]
+        directory = self.directory(identity)
+        existing = self.read(identity)
+        if existing:
+            return existing
+        # This lock protects HMS reservations across catalog generations. It is
+        # never held while acquiring a fixture catalog/object-store lock.
+        with self.owner.lock("ports"):
+            used = {runtime.read_json(path)["ports"]["hms"] for path in
+                    (self.owner.base / "hms").glob("*/manifest.json")}
+            used.update(port for item in self.owner.records() for port in item["ports"].values())
+            port = None
+            for candidate in range(self.owner.port_start, self.owner.port_end + 1):
+                if candidate in used:
+                    continue
+                with socket.socket() as probe:
+                    try:
+                        probe.bind(("127.0.0.1", candidate))
+                    except OSError:
+                        continue
+                port = candidate
+                break
+            if port is None:
+                raise runtime.RuntimeFailure("PortUnavailable", "HMS port range exhausted")
+            project = f"nr-hms-{self.owner.namespace}-{identity}"
+            warehouse = catalog["server_warehouse"].rstrip("/") + "/hms"
+            record = {
+                "schema": 1, "kind": "hms", "key": identity, "catalog_id": identity,
+                "namespace": self.owner.namespace, "owner_locator": self.owner.locator,
+                "project": project, "network": project + "_default",
+                "rest_network": catalog["network"], "ports": {"hms": port},
+                "compose_file": str(directory / "compose.yml"), "compose_env": str(directory / "compose.env"),
+                "volumes": [project + "_metastore"], "state": "prepared", "container_id": None,
+                "images": {"hms": {"image_id": None, "tag": image}},
+                "service_ports": {"hms": {"9083/tcp": port}},
+                "hms": {"uri": f"thrift://127.0.0.1:{port}", "port": port, "warehouse": warehouse,
+                        "catalog_sql": str(directory / "ice-hms-catalog.sql"),
+                        "spark_defaults": str(directory / "spark-hms-defaults.conf"), "image": image},
+                "minio": manifest["minio"],
+            }
+            directory.mkdir(parents=True, exist_ok=True)
+            self.render(record)
+            self.save(record)
+        return record
+
+    def render(self, record):
+        directory = self.directory(record["catalog_id"])
+        credentials = record["minio"]
+        user, secret = credentials["access_key_id"], credentials["secret_access_key"]
+        if any("\n" in value or "\r" in value for value in (user, secret)):
+            raise runtime.RuntimeFailure("InvalidConfig", "multiline HMS credentials")
+        env = {
+            "HMS_IMAGE": record["images"]["hms"]["image_id"] or record["hms"]["image"],
+            "NOVA_ENV_HMS_PORT": record["ports"]["hms"], "NOVA_HMS_PROJECT": record["project"],
+            "NOVA_FIXTURE_OWNER": record["namespace"], "NOVA_FIXTURE_KEY": record["key"],
+            "NOVA_HMS_CONFIG": str(directory / "core-site.xml"),
+            "NOVA_HMS_WAREHOUSE": record["hms"]["warehouse"].replace("s3://", "s3a://", 1),
+        }
+        runtime.atomic_bytes(directory / "compose.yml", (HERE / "compose.yml").read_bytes())
+        runtime.atomic_bytes(directory / "compose.env", "".join(f"{key}={json.dumps(str(value))}\n" for key, value in env.items()).encode())
+        core = (HERE / "core-site.xml").read_text().replace("<value>admin</value>", f"<value>{escape(user)}</value>").replace("<value>admin123</value>", f"<value>{escape(secret)}</value>")
+        runtime.atomic_bytes(directory / "core-site.xml", core.encode())
+        # This read-only bind mount must be readable by the image's hive UID.
+        (directory / "core-site.xml").chmod(0o644)
+        props = {"type": "iceberg", "iceberg.catalog.type": "hive",
+                 "iceberg.catalog.hive.metastore.uris": record["hms"]["uri"],
+                 "iceberg.catalog.warehouse": record["hms"]["warehouse"],
+                 "aws.s3.endpoint": credentials["endpoint"], "aws.s3.access_key": user,
+                 "aws.s3.secret_key": secret, "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
+        sql = "CREATE EXTERNAL CATALOG ice_hms\nPROPERTIES (\n" + ",\n".join(f"  {json.dumps(key)} = {json.dumps(value)}" for key, value in props.items()) + "\n);\n"
+        runtime.atomic_bytes(directory / "ice-hms-catalog.sql", sql.encode())
+        props = {"": "org.apache.iceberg.spark.SparkCatalog", ".type": "hive", ".uri": "thrift://hms:9083",
+                 ".warehouse": record["hms"]["warehouse"], ".io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+                 ".s3.endpoint": "http://minio:9000", ".s3.path-style-access": "true",
+                 ".s3.access-key-id": user, ".s3.secret-access-key": secret, ".s3.region": "us-east-1"}
+        runtime.atomic_bytes(directory / "spark-hms-defaults.conf", "".join(f"spark.sql.catalog.hms_catalog{key} {value}\n" for key, value in props.items()).encode())
+        exports = {"NOVA_ENV_HIVE_RUNTIME_DIR": str(directory), "NOVA_ENV_HIVE_MANIFEST": str(directory / "manifest.json"),
+                   "NOVA_ENV_HIVE_CATALOG_ID": record["catalog_id"], "NOVA_ENV_HIVE_COMPOSE_PROJECT": record["project"],
+                   "NOVA_ENV_HIVE_COMPOSE_FILE": record["compose_file"], "NOVA_ENV_HIVE_COMPOSE_ENV": record["compose_env"],
+                   "NOVA_ENV_HMS_PORT": record["ports"]["hms"], "NOVA_ENV_REST_NETWORK": record["rest_network"],
+                   "NOVA_ENV_SHARED_HMS_WAREHOUSE_URI": record["hms"]["warehouse"],
+                   "NOVAROCKS_ICEBERG_HMS_URI": record["hms"]["uri"], "NOVAROCKS_ICEBERG_HMS_WAREHOUSE": record["hms"]["warehouse"],
+                   "NOVAROCKS_ICE_HMS_CATALOG_SQL": record["hms"]["catalog_sql"],
+                   "NOVAROCKS_SPARK_HMS_DEFAULTS": record["hms"]["spark_defaults"],
+                   "NOVAROCKS_SPARK_EXTRA_DEFAULTS": record["hms"]["spark_defaults"]}
+        runtime.atomic_bytes(directory / "env.sh", "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items()).encode())
+
+    def up(self, manifest, image, prepare_only=False):
+        identity = manifest["runtime"]["catalog"]["id"]
+        with self.owner.lock("hms-" + identity):
+            record = self.prepare(manifest, image)
+            if prepare_only:
+                return record
+            self.owner.assert_live_daemon()
+            image_id = self.backend.image_id(record["hms"]["image"])
+            saved = record["images"]["hms"]["image_id"]
+            if saved and image_id != saved:
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "HMS image alias changed")
+            record["images"]["hms"]["image_id"] = image_id
+            record["state"] = "starting"
+            self.render(record)
+            self.save(record)
+            self.backend.container(record, "hms")
+            self.backend.validate_resources(record)
+            self.backend.compose(record, ["up", "-d", "--no-build"])
+            container = self.backend.container(record, "hms")
+            if not container:
+                raise runtime.RuntimeFailure("RuntimeStateUnreadable", "HMS container missing")
+            record["container_id"] = container["Id"]
+            self.save(record)
+            self.owner.consumer(identity, container["Id"], alias="hms")
+            self.wait_ready(record)
+            record["state"] = "ready"
+            self.save(record)
+            return record
+
+    def wait_ready(self, record):
+        for _ in range(60):
+            try:
+                with socket.create_connection(("127.0.0.1", record["ports"]["hms"]), timeout=1):
+                    return
+            except OSError:
+                time.sleep(1)
+        raise runtime.RuntimeFailure("RuntimeNotReady", "HMS did not become ready")
+
+    def down(self, identity, volumes=False):
+        with self.owner.lock("hms-" + identity):
+            record = self.read(identity)
+            if not record:
+                return {"catalog_id": identity, "state": "absent"}
+            self.owner.assert_live_daemon()
+            self.backend.validate_resources(record)
+            container = self.backend.container(record, "hms") if record["images"]["hms"]["image_id"] else None
+            if container:
+                self.owner.consumer(identity, container["Id"], disconnect=True)
+            elif record["container_id"]:
+                self.owner.consumer(identity, record["container_id"], disconnect=True)
+            self.backend.compose(record, ["down", *(["--volumes"] if volumes else [])])
+            record.update(state="stopped", container_id=None)
+            self.save(record)
+            return record
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Catalog-scoped Hive Metastore owner")
+    parser.add_argument("command", choices=("up", "down", "status"))
+    parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--catalog-id")
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--daemon")
+    parser.add_argument("--port-start", type=int, default=int(os.environ.get("NOVA_ENV_RUNTIME_PORT_START", "28000")))
+    parser.add_argument("--port-end", type=int, default=int(os.environ.get("NOVA_ENV_RUNTIME_PORT_END", "28999")))
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--volumes", "-v", action="store_true")
+    parser.add_argument("--purge", action="store_true")
+    parser.add_argument("--docker", action="store_true")
+    args = parser.parse_args()
+    runtime.install_signal_handlers()
+    path = args.env_file or Path(os.environ.get("NOVA_ENV_REST_ENV_FILE", HERE.parent / "iceberg-rest/runtime/current/env.sh"))
+    manifest = None
+    if args.command == "up" or not (args.catalog_id and args.root and args.daemon):
+        publication = path.expanduser().resolve(strict=True).parent
+        manifest = runtime.read_json(publication / "manifest.json")
+        if not manifest.get("ready") or not manifest["runtime"].get("owner_locator"):
+            raise runtime.RuntimeFailure("RuntimeNotReady", "bind a shared REST fixture first")
+        locator = manifest["runtime"]["owner_locator"]
+    else:
+        locator = {"control_root": str(args.root.resolve()), "daemon_id": args.daemon}
+    owner = runtime.RuntimeOwner(args.root or locator["control_root"], daemon=args.daemon or locator["daemon_id"],
+                                 port_start=args.port_start, port_end=args.port_end)
+    if owner.locator != locator:
+        raise runtime.RuntimeFailure("OwnerMismatch", "HMS request differs from publication owner")
+    hive = HiveOwner(owner)
+    identity = args.catalog_id or manifest["runtime"]["catalog"]["id"]
+    if args.command == "up":
+        if identity != manifest["runtime"]["catalog"]["id"]:
+            raise runtime.RuntimeFailure("OwnerMismatch", "up catalog differs from publication")
+        result = hive.up(manifest, os.environ.get("HMS_IMAGE", "novarocks/hive-metastore:4.0.0"), args.prepare_only)
+    elif args.command == "down":
+        result = hive.down(identity, args.volumes or args.purge)
+    else:
+        result = hive.read(identity) or {"catalog_id": identity, "state": "absent"}
+    # Credential material stays in the private manifest and generated config.
+    print(json.dumps({key: value for key, value in result.items() if key != "minio"}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except (runtime.RuntimeFailure, OSError, ValueError, KeyError) as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1)
