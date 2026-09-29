@@ -17,7 +17,6 @@
 
 """Protocol tests with explicit failure and concurrency barriers, without Docker."""
 import copy
-import importlib.util
 import json
 import multiprocessing as mp
 import os
@@ -29,9 +28,8 @@ import time
 import unittest
 
 MODULE = Path(__file__).resolve().parents[1] / "fixture_runtime.py"
-spec = importlib.util.spec_from_file_location("fixture_runtime", MODULE)
-runtime = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(runtime)
+sys.path.insert(0, str(MODULE.parent))
+import fixture_runtime as runtime
 
 
 def renderer(context, staging):
@@ -62,6 +60,8 @@ class Backend:
         if self.fail == "ensure":
             raise runtime.RuntimeFailure("PortUnavailable", record["id"])
         (self.root / record["id"]).touch()
+        with (self.root / (record["id"] + ".ensure")).open("a") as log:
+            log.write("created\n")
 
     def reconnect(self, parent, catalogs):
         self.calls.append(("reconnect", [item["id"] for item in catalogs]))
@@ -392,6 +392,14 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_missing_docker_context_is_not_resource_absence(self):
+        _, environment = self.fake_docker()
+        executable = self.root / "bin/docker"
+        executable.write_text(f"#!{sys.executable}\nimport sys\n"
+            "print('context foreign not found',file=sys.stderr)\nsys.exit(1)\n")
+        backend = runtime.Docker(timeout=5, environment=environment)
+        self.assert_code("DockerOperationFailed", lambda: backend.command(["network", "inspect", "network"], absent_ok=True))
+
     def test_sigterm_settles_child_before_releasing_owner_lock(self):
         pidfile, environment = self.fake_docker()
         context = mp.get_context("fork")
@@ -483,6 +491,43 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(binding["object_store"], first["binding"]["object_store"])
         self.assertNotEqual(bindings[0]["catalog"], bindings[1]["catalog"])
 
+    def test_concurrent_same_key_creates_each_instance_once(self):
+        context = mp.get_context("fork")
+        reserved, release = context.Event(), context.Event()
+        results = context.Queue()
+        def child(index):
+            def barrier(name, **facts):
+                if index == 0 and name == "bind.ports_reserved" and facts["runtime"].startswith("os-"):
+                    reserved.set()
+                    if not release.wait(10):
+                        raise AssertionError("reservation barrier timed out")
+            try:
+                value = self.make_owner(hook=barrier).bind("w" + str(index),
+                    self.root / ("w" + str(index)), CONFIG, bom())
+                results.put(value["binding"])
+            except Exception as error:
+                results.put(str(error))
+        children = [context.Process(target=child, args=(index,)) for index in range(2)]
+        children[0].start()
+        try:
+            self.assertTrue(reserved.wait(5))
+            children[1].start()
+            self.assertEqual(len(self.owner.records()), 1)
+            self.assertEqual(self.owner.records()[0]["state"], "starting")
+        finally:
+            release.set()
+            for process in children:
+                if process.pid:
+                    process.join(10)
+                    if process.is_alive():
+                        process.kill()
+                        process.join()
+        bindings = [results.get(timeout=2) for _ in children]
+        self.assertEqual(bindings[0], bindings[1])
+        self.assertIsInstance(bindings[0], dict)
+        for identity in bindings[0].values():
+            self.assertEqual((self.backend.root / (identity + ".ensure")).read_text(), "created\n")
+
     def test_consumer_disconnect_allowed_during_deleting(self):
         first = self.bind()
         cat_id = first["binding"]["catalog"]
@@ -531,6 +576,12 @@ class ProtocolTests(unittest.TestCase):
             except Exception as error:
                 results.put(str(error))
         def second():
+            with (self.entry / ".owner.lock").open("a+b") as handle:
+                try:
+                    runtime.fcntl.flock(handle, runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB)
+                    results.put("lock-unexpectedly-free")
+                except BlockingIOError:
+                    results.put("lock-was-held")
             attempted.set()
             try:
                 self.make_owner("other").bind("test", self.entry, CONFIG, bom())
@@ -545,7 +596,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(entered.wait(5))
             two.start()
             self.assertTrue(attempted.wait(5))
-            self.assertFalse(finished.wait(0.15))
+            self.assertEqual(results.get(timeout=2), "lock-was-held")
         finally:
             release.set()
             one.join(10)

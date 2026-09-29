@@ -195,9 +195,11 @@ class Docker:
                 raise RuntimeFailure("DockerOperationTimeout", args[0]) from error
             raise
         if process.returncode:
-            if absent_ok and any(term in stderr.lower() for term in (
-                "no such", "not found", "does not exist", "not connected",
-            )):
+            missing_object = re.search(r"no such (object|container|image|volume|network)\b", stderr.lower())
+            daemon_absence = "error response from daemon" in stderr.lower() and (
+                "not found" in stderr.lower() or "is not connected" in stderr.lower()
+            )
+            if absent_ok and (missing_object or daemon_absence):
                 return ""
             # Do not print commands containing fixture credentials or cleanup URLs.
             code = "PortUnavailable" if any(term in stderr.lower() for term in (
@@ -478,7 +480,12 @@ class RuntimeOwner:
         path = self.record_path(identity)
         if not path.exists():
             return None
-        value = read_json(path)
+        try:
+            value = read_json(path)
+        except RuntimeFailure as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
         if value.get("schema") != PROTOCOL or value.get("id") != identity or value.get("owner_locator") != self.locator:
             raise RuntimeFailure("RuntimeIdentityMismatch", identity)
         if value.get("state") not in {"starting", "ready", "deleting"}:
@@ -486,7 +493,8 @@ class RuntimeOwner:
         return value
 
     def records(self) -> list[dict[str, Any]]:
-        return [self.record(path.parent.name) for path in sorted((self.base / "runtimes").glob("*/record.json"))]
+        records = (self.record(path.parent.name) for path in sorted((self.base / "runtimes").glob("*/record.json")))
+        return [record for record in records if record is not None]
 
     def save_record(self, record: dict[str, Any]) -> None:
         record["updated_at"] = time.time()
@@ -1059,4 +1067,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The renderer imports this owner module; share exception and contract types
+    # when this file is the CLI entrypoint rather than loading it twice.
+    sys.modules.setdefault("fixture_runtime", sys.modules[__name__])
     raise SystemExit(main())
