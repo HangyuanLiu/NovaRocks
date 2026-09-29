@@ -167,9 +167,7 @@ impl Scenario for IcebergDeletePerformance {
             launch.child_environment.fe.remove(name);
             launch.child_environment.be.remove(name);
         }
-        let overlay = credential_overlay_with_cache(settings.warm_cache);
-        launch.config_overlay.fe = Some(overlay.clone());
-        launch.config_overlay.be = Some(overlay);
+        launch.config_overlay = credential_overlay_with_cache(settings.warm_cache);
         Ok(launch)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {

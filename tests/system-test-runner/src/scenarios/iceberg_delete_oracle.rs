@@ -333,6 +333,7 @@ async fn verify_inputs(
         serde_json::to_vec_pretty(&json!({
             "sources":sources,
             "partition_parser_scope":"frozen empty or one integer p/partition_key partition only",
+            "java_metric_projection":"Iceberg 1.11 DeleteFileIndex: data=all published columns; position=DELETE_FILE_PATH; equality=equality field IDs. Complete projected inventories and values checked; raw SDK statistics retained.",
             "summary":summary,"cases":case_reports,"failures":failures,
         }))?,
     )?;
@@ -771,10 +772,32 @@ fn find_java_observation<'a>(
                     == java["referenced_data_file"].as_str()
         })
         .with_context(|| format!("Java descriptor has no exact raw manifest match: {java}"))?;
+    validate_java_metrics(java, &candidate.file, schema)?;
+    Ok(candidate)
+}
+
+/// Iceberg 1.11 DeleteFileIndex.loadDeleteFiles deliberately copies only path
+/// metrics for position deletes and equality-column metrics for equality deletes
+/// (DeleteFileIndex.java:434-440; ContentFileUtil.copy delegates copyWithStats).
+/// Task data files in this frozen includeColumnStats corpus keep all columns.
+/// Compare the complete known projection, never an arbitrary subset. The raw
+/// SDK DataFile remains intact for independent exclusion and read-fact evidence.
+fn java_publishes_metric(file: &DataFile, id: i32) -> bool {
+    match file.content_type() {
+        DataContentType::Data => true,
+        DataContentType::PositionDeletes => id == FILE_PATH_ID,
+        DataContentType::EqualityDeletes => {
+            file.equality_ids().is_some_and(|ids| ids.contains(&id))
+        }
+    }
+}
+
+fn validate_java_metrics(java: &Value, file: &DataFile, schema: &Schema) -> Result<()> {
+    let path = file.file_path();
     for (key, actual) in [
-        ("value_counts", candidate.file.value_counts()),
-        ("null_value_counts", candidate.file.null_value_counts()),
-        ("nan_value_counts", candidate.file.nan_value_counts()),
+        ("value_counts", file.value_counts()),
+        ("null_value_counts", file.null_value_counts()),
+        ("nan_value_counts", file.nan_value_counts()),
     ] {
         if java.get(key).is_some() {
             let expected = java[key]
@@ -792,20 +815,35 @@ fn find_java_observation<'a>(
                 .transpose()?
                 .unwrap_or_default();
             ensure!(
-                expected == actual.iter().map(|(id, n)| (*id, *n)).collect(),
+                expected
+                    == actual
+                        .iter()
+                        .filter(|(id, _)| java_publishes_metric(file, **id))
+                        .map(|(id, n)| (*id, *n))
+                        .collect(),
                 "Java {key} differs from raw manifest for {path}"
             );
         }
     }
     for (key, actual) in [
-        ("lower_bounds_base64", candidate.file.lower_bounds()),
-        ("upper_bounds_base64", candidate.file.upper_bounds()),
+        ("lower_bounds_base64", file.lower_bounds()),
+        ("upper_bounds_base64", file.upper_bounds()),
     ] {
         if let Some(expected) = java.get(key) {
             let expected = expected.as_object();
+            let expected_ids = expected
+                .into_iter()
+                .flatten()
+                .map(|(id, _)| id.parse::<i32>().map_err(anyhow::Error::from))
+                .collect::<Result<BTreeSet<_>>>()?;
+            let actual_ids = actual
+                .keys()
+                .filter(|id| java_publishes_metric(file, **id))
+                .copied()
+                .collect::<BTreeSet<_>>();
             ensure!(
-                expected.map_or(0, |map| map.len()) == actual.len(),
-                "Java {key} field inventory differs from raw manifest for {path}"
+                expected_ids == actual_ids,
+                "Java {key} field inventory differs from the exact content projection of raw manifest for {path}"
             );
             for (id, bytes) in expected.into_iter().flatten() {
                 let id = id.parse::<i32>()?;
@@ -834,7 +872,7 @@ fn find_java_observation<'a>(
             }
         }
     }
-    Ok(candidate)
+    Ok(())
 }
 
 fn decode_base64(text: &str) -> Result<Vec<u8>> {
@@ -1097,6 +1135,134 @@ mod tests {
     use super::*;
     use novarocks_connector_iceberg::iceberg::spec::DataFileBuilder;
     use std::collections::HashMap;
+
+    #[test]
+    fn position_metric_projection_is_exact_and_keeps_raw_position_evidence() {
+        let schema = Schema::builder().build().unwrap();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("position".into())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(4)
+            .file_size_in_bytes(100)
+            .value_counts(HashMap::from([(FILE_PATH_ID, 4), (FILE_PATH_ID - 1, 4)]))
+            .lower_bounds(HashMap::from([
+                (FILE_PATH_ID, Datum::string("a")),
+                (FILE_PATH_ID - 1, Datum::long(2)),
+            ]))
+            .upper_bounds(HashMap::from([
+                (FILE_PATH_ID, Datum::string("z")),
+                (FILE_PATH_ID - 1, Datum::long(9)),
+            ]))
+            .build()
+            .unwrap();
+        let java = json!({"value_counts":{FILE_PATH_ID.to_string():4},
+            "lower_bounds_base64":{FILE_PATH_ID.to_string():"YQ=="},
+            "upper_bounds_base64":{FILE_PATH_ID.to_string():"eg=="}});
+        validate_java_metrics(&java, &file, &schema).unwrap();
+        assert_eq!(file.lower_bounds().len(), 2);
+        assert_eq!(file.lower_bounds()[&(FILE_PATH_ID - 1)], Datum::long(2));
+        let mut omitted = java.clone();
+        omitted["lower_bounds_base64"] = json!({});
+        assert!(validate_java_metrics(&omitted, &file, &schema).is_err());
+        let mut extra = java.clone();
+        extra["lower_bounds_base64"][&(FILE_PATH_ID - 1).to_string()] = json!("AgAAAAAAAAA=");
+        assert!(validate_java_metrics(&extra, &file, &schema).is_err());
+        let mut changed = java.clone();
+        changed["value_counts"][&FILE_PATH_ID.to_string()] = json!(5);
+        assert!(validate_java_metrics(&changed, &file, &schema).is_err());
+        let mut changed = java;
+        changed["lower_bounds_base64"][&FILE_PATH_ID.to_string()] = json!("Yg==");
+        assert!(validate_java_metrics(&changed, &file, &schema).is_err());
+    }
+
+    #[test]
+    fn equality_projection_is_exact_while_data_metric_inventory_is_unfiltered() {
+        let schema = Schema::builder().build().unwrap();
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::EqualityDeletes)
+            .file_path("equality".into())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(4)
+            .file_size_in_bytes(100)
+            .equality_ids(Some(vec![1]))
+            .value_counts(HashMap::from([(1, 4), (2, 4)]));
+        let equality = builder.build().unwrap();
+        validate_java_metrics(&json!({"value_counts":{"1":4}}), &equality, &schema).unwrap();
+        assert!(
+            validate_java_metrics(&json!({"value_counts":{"2":4}}), &equality, &schema).is_err()
+        );
+        assert!(
+            validate_java_metrics(&json!({"value_counts":{"1":4,"2":4}}), &equality, &schema)
+                .is_err()
+        );
+        builder.content(DataContentType::Data).equality_ids(None);
+        let data = builder.build().unwrap();
+        assert!(validate_java_metrics(&json!({"value_counts":{"1":4}}), &data, &schema).is_err());
+        validate_java_metrics(&json!({"value_counts":{"1":4,"2":4}}), &data, &schema).unwrap();
+    }
+
+    /// Explicit local replay uses only the receipt's SHA-verified captured
+    /// artifacts. It starts no server and writes no fixture or golden input.
+    #[tokio::test]
+    #[ignore = "requires the explicit frozen Java receipt and output directory"]
+    async fn frozen_receipt_replay_without_native() {
+        let receipt_path = std::path::PathBuf::from(
+            std::env::var("NOVAROCKS_UEA4G_ORACLE_RECEIPT").expect("explicit receipt"),
+        );
+        let output = std::path::PathBuf::from(
+            std::env::var("NOVAROCKS_UEA4G_ORACLE_OUTPUT").expect("explicit output"),
+        );
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        let io = FileIO::new_with_memory();
+        let mut sdk_metrics = Vec::new();
+        for artifact in array(&receipt, "artifacts").unwrap() {
+            let bytes = std::fs::read(
+                receipt_path
+                    .parent()
+                    .unwrap()
+                    .join(string(artifact, "local_path").unwrap()),
+            )
+            .unwrap();
+            assert_eq!(bytes.len() as u64, uint(artifact, "size").unwrap());
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                string(artifact, "sha256").unwrap()
+            );
+            if artifact["kind"] == "manifest" {
+                let manifest =
+                    novarocks_connector_iceberg::iceberg::spec::Manifest::parse_avro(&bytes)
+                        .unwrap();
+                for entry in manifest.entries() {
+                    let file = entry.data_file();
+                    if file.content_type() == DataContentType::PositionDeletes {
+                        sdk_metrics.push(json!({"manifest_sha256":artifact["sha256"],"path":file.file_path(),
+                            "value_counts":file.value_counts(),"null_value_counts":file.null_value_counts(),
+                            "lower_bounds":file.lower_bounds().iter().map(|(id,value)|(id.to_string(),value.to_string())).collect::<BTreeMap<_,_>>(),
+                            "upper_bounds":file.upper_bounds().iter().map(|(id,value)|(id.to_string(),value.to_string())).collect::<BTreeMap<_,_>>()}));
+                    }
+                }
+            }
+            io.new_output(string(artifact, "path").unwrap())
+                .unwrap()
+                .write(bytes::Bytes::from(bytes))
+                .await
+                .unwrap();
+        }
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(
+            output.join("sdk-raw-position-metrics.json"),
+            serde_json::to_vec_pretty(&sdk_metrics).unwrap(),
+        )
+        .unwrap();
+        let summary = verify_receipt(&receipt_path, io, &output).await.unwrap();
+        assert_eq!(
+            summary.cases_verified,
+            array(&receipt, "cases").unwrap().len()
+        );
+    }
 
     #[test]
     fn scale_projection_retains_dictionary_members_and_both_endpoints() {

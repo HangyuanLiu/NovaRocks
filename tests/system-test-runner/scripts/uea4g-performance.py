@@ -340,8 +340,9 @@ def audit_effective_config(scenario, cache):
             # experiments. Preserve every other typed TOML field and attachment.
             normalized["semantics"]["roles"][index]["effective_config"]["value"]["runtime"]["value"]["cache"]["value"][flag]["value"] = False
         credentials = [entry for entry in config["connector"]["credentials"] if entry.get("name") == "uea4g-fixture"]
-        require(len(credentials) == 2 and {c["purpose"] for c in credentials} ==
-                {"object-store-metadata", "object-store-data"}, "fixture credential purposes differ")
+        purpose = "object-store-metadata" if role["role"] == "fe" else "object-store-data"
+        require(len(credentials) == 1 and credentials[0]["purpose"] == purpose,
+                "fixture credential purpose differs from native role ownership")
         for credential in credentials:
             require(credential["generation"] == "v1" and credential["kind"] == "s3" and
                     credential["access_key_id"] == "${ENV:NOVAROCKS_UEA4G_FIXTURE_ACCESS}" and

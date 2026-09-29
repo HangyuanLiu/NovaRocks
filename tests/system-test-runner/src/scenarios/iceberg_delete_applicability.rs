@@ -98,19 +98,22 @@ pub(super) fn table_name(raw: &str) -> Result<String> {
     ensure!(parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')), "fixture table must contain three exact identifiers");
     Ok(format!("{CATALOG}.{}.{}", parts[1], parts[2]))
 }
-fn credential_overlay() -> String {
-    credential_overlay_with_cache(false)
-}
-
-pub(super) fn credential_overlay_with_cache(enabled: bool) -> String {
+pub(super) fn credential_overlay_with_cache(enabled: bool) -> CrossProcessConfigOverlay {
     let cache = if enabled {
         "[runtime.cache]\npage_cache_enable = true\nparquet_page_cache_enable = true\ndatacache_enable = true\n"
     } else {
         CACHE
     };
-    ["object-store-metadata", "object-store-data"].into_iter().map(|purpose| format!(
-        "[[connector.credentials]]\npurpose = \"{purpose}\"\nname = \"uea4g-fixture\"\ngeneration = \"v1\"\nkind = \"s3\"\naccess_key_id = \"${{ENV:{ACCESS_ENV}}}\"\naccess_key_secret = \"${{ENV:{SECRET_ENV}}}\"\n"
-    )).collect::<String>() + cache
+    let role_config = |purpose| {
+        format!(
+            "[[connector.credentials]]\npurpose = \"{purpose}\"\nname = \"uea4g-fixture\"\ngeneration = \"v1\"\nkind = \"s3\"\naccess_key_id = \"${{ENV:{ACCESS_ENV}}}\"\naccess_key_secret = \"${{ENV:{SECRET_ENV}}}\"\n"
+        ) + cache
+    };
+    CrossProcessConfigOverlay {
+        fe: Some(role_config("object-store-metadata")),
+        be: Some(role_config("object-store-data")),
+        ..Default::default()
+    }
 }
 pub(super) fn create_catalog_sql(fixture: &Fixture) -> String {
     format!(
@@ -340,11 +343,7 @@ impl Scenario for IcebergDeleteApplicability {
         });
         Ok(ScenarioLaunchConfig {
             child_environment: child,
-            config_overlay: CrossProcessConfigOverlay {
-                fe: Some(credential_overlay()),
-                be: Some(credential_overlay()),
-                ..Default::default()
-            },
+            config_overlay: credential_overlay_with_cache(false),
             ..Default::default()
         })
     }
