@@ -756,6 +756,7 @@ pub struct IcebergReadRelation {
     partition_spec: PartitionSpec,
     name_mapping: Option<Arc<NameMapping>>,
     effective_predicate: TupleDomain<IcebergColumnHandle>,
+    delete_domains: super::delete_manager::DeleteDomainBindings,
 }
 
 impl IcebergReadRelation {
@@ -769,6 +770,11 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: handle.effective_predicate()?,
+            delete_domains: super::delete_manager::DeleteDomainBindings::Single(Arc::clone(
+                handle.read_domain().ok_or_else(|| {
+                    invalid("iceberg data reader requires its pinned read domain")
+                })?,
+            )),
         })
     }
 
@@ -786,7 +792,27 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: TupleDomain::all(),
+            delete_domains: super::delete_manager::DeleteDomainBindings::Window {
+                from: Arc::clone(handle.from_read_domain()),
+                to: Arc::clone(handle.to_read_domain()),
+            },
         })
+    }
+
+    /// Read one complete endpoint against its independently pinned owner.
+    pub fn of_change_window_endpoint(
+        handle: &IcebergChangeWindowHandle,
+        partition_spec_id: i32,
+        from: bool,
+    ) -> Result<Self, ConnectorError> {
+        let mut relation = Self::of_change_window(handle, partition_spec_id)?;
+        relation.delete_domains =
+            super::delete_manager::DeleteDomainBindings::Single(Arc::clone(if from {
+                handle.from_read_domain()
+            } else {
+                handle.to_read_domain()
+            }));
+        Ok(relation)
     }
 
     pub fn table_schema(&self) -> &Arc<Schema> {
@@ -836,7 +862,8 @@ fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, 
         split.decryption_data(),
         &format!("iceberg data file {}", split.path()),
     )?;
-    for delete in split.deletes() {
+    for delete in split.deletes().iter() {
+        let delete = delete?;
         reject_encryption_material(
             delete.decryption_data(),
             &format!("iceberg delete file {}", delete.path()),
@@ -853,7 +880,15 @@ fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, 
             partition_spec.spec_id()
         )));
     }
-    let partition_values = parse_partition_values(split, &partition_spec, &table_schema)?;
+    let partition_values = parse_partition_values(split, &partition_spec)?;
+    // Validate the relation/split binding before even the partition-only path
+    // can answer rows. The relation supplies the independent expected domain.
+    DeleteManager::preview_hidden_columns(
+        split,
+        &table_schema,
+        &request.relation.delete_domains,
+        &request.delete_mode,
+    )?;
     Ok(AdmittedSplit {
         table_schema,
         partition_spec,
@@ -892,6 +927,7 @@ struct ParquetSplitRequest {
     name_mapping: Option<Arc<NameMapping>>,
     columns: Vec<IcebergColumnHandle>,
     delete_manager: Arc<DeleteManager>,
+    delete_domains: super::delete_manager::DeleteDomainBindings,
     footers: Arc<ParquetFooterCache>,
     access_binding: IcebergReadBinding,
     context: FileReadContext,
@@ -912,6 +948,7 @@ impl ParquetSplitRequest {
                 name_mapping: request.relation.name_mapping.clone(),
                 columns: request.columns.to_vec(),
                 delete_manager: request.delete_manager,
+                delete_domains: request.relation.delete_domains.clone(),
                 footers: request.footers,
                 access_binding: request.access_binding,
                 context: request.context,
@@ -947,11 +984,14 @@ impl ParquetSplitRequest {
         self,
         admitted: AdmittedSplit,
         delete_filter: SplitDeleteFilter,
+        delete_mode: DeleteEvaluationMode,
         successor_control: Arc<SuccessorPreparationGroup>,
     ) -> IcebergParquetPageSource {
         let hidden_columns = delete_filter.required_hidden_columns().to_vec();
         let prepared_retained_capacity = self.prepared_retained_capacity();
         IcebergParquetPageSource {
+            delete_domains: self.delete_domains,
+            delete_mode,
             table_schema: admitted.table_schema,
             name_mapping: self.name_mapping,
             partition_spec: admitted.partition_spec,
@@ -1000,6 +1040,7 @@ pub(super) fn plan_iceberg_prepared_input(
     relation: &IcebergReadRelation,
     split: &IcebergSplit,
     columns: &[IcebergColumnHandle],
+    delete_mode: &DeleteEvaluationMode,
     footer: &ParquetMetadataInspection,
     access_binding: &IcebergReadBinding,
     context: FileReadContext,
@@ -1013,7 +1054,8 @@ pub(super) fn plan_iceberg_prepared_input(
         split.decryption_data(),
         &format!("iceberg data file {}", split.path()),
     )?;
-    for delete in split.deletes() {
+    for delete in split.deletes().iter() {
+        let delete = delete?;
         reject_encryption_material(
             delete.decryption_data(),
             &format!("iceberg delete file {}", delete.path()),
@@ -1027,18 +1069,18 @@ pub(super) fn plan_iceberg_prepared_input(
             relation.partition_spec.spec_id()
         )));
     }
-    let partition_values =
-        parse_partition_values(split, &relation.partition_spec, &relation.table_schema)?;
-    if try_partition_only_page_source(
-        split,
-        columns,
-        &relation.partition_spec,
-        &partition_values,
-        &relation.table_schema,
-        &relation.effective_predicate,
-        budget,
-    )?
-    .is_some()
+    let partition_values = parse_partition_values(split, &relation.partition_spec)?;
+    if *delete_mode == DeleteEvaluationMode::ExcludeDeleted
+        && try_partition_only_page_source(
+            split,
+            columns,
+            &relation.partition_spec,
+            &partition_values,
+            &relation.table_schema,
+            &relation.effective_predicate,
+            budget,
+        )?
+        .is_some()
     {
         return Ok(None);
     }
@@ -1057,7 +1099,8 @@ pub(super) fn plan_iceberg_prepared_input(
     let hidden = DeleteManager::preview_hidden_columns(
         split,
         &relation.table_schema,
-        &DeleteEvaluationMode::ExcludeDeleted,
+        &relation.delete_domains,
+        delete_mode,
     )?;
     let bound_handles = columns.iter().cloned().chain(hidden).collect::<Vec<_>>();
     let binding = bind_scan_columns(IcebergSchemaBindingRequest {
@@ -1164,32 +1207,18 @@ fn parse_name_mapping(json: Option<&str>) -> Result<Option<Arc<NameMapping>>, Co
 fn parse_partition_values(
     split: &IcebergSplit,
     partition_spec: &PartitionSpec,
-    table_schema: &Schema,
 ) -> Result<Struct, ConnectorError> {
-    let partition_type = partition_spec
-        .partition_type(table_schema)
-        .map_err(|error| {
-            invalid(format!(
-                "iceberg partition spec {} does not bind to the frozen table schema: {error}",
-                partition_spec.spec_id()
-            ))
-        })?;
-    let json: serde_json::Value =
-        serde_json::from_str(split.partition_data_json()).map_err(|error| {
-            corrupt(format!(
-                "iceberg split partition data json is invalid: {error}"
-            ))
-        })?;
-    let literal = Literal::try_from_json(json, &crate::iceberg::spec::Type::Struct(partition_type))
-        .map_err(|error| corrupt(format!("iceberg split partition data: {error}")))?;
-    match literal {
-        Some(Literal::Struct(values)) => Ok(values),
-        // A partition struct is never absent: an unpartitioned file encodes an
-        // empty struct, which is a value, not a missing fact.
-        Some(_) | None => Err(corrupt(
-            "iceberg split partition data json is not a partition struct",
-        )),
-    }
+    let partition_type = split
+        .read_domain()
+        .endpoint()
+        .partition_type(partition_spec.spec_id())
+        .map_err(|error| corrupt(format!("iceberg pinned partition type: {error}")))?;
+    crate::delete_semantics::decode_partition_data_json_with_type(
+        partition_spec,
+        &partition_type,
+        split.partition_data_json(),
+    )
+    .map_err(|error| corrupt(format!("iceberg split partition data: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,6 +1457,8 @@ pub struct IcebergParquetPageSource {
     /// The ordered output columns followed by the delete filter's hidden suffix.
     bound_handles: Vec<IcebergColumnHandle>,
     delete_filter: SplitDeleteFilter,
+    delete_domains: super::delete_manager::DeleteDomainBindings,
+    delete_mode: DeleteEvaluationMode,
     effective_predicate: TupleDomain<IcebergColumnHandle>,
     access_binding: IcebergReadBinding,
     context: FileReadContext,
@@ -1888,9 +1919,11 @@ impl IcebergParquetPageSource {
                 partition_spec: self.partition_spec.clone(),
                 name_mapping: self.name_mapping.clone(),
                 effective_predicate: self.effective_predicate.clone(),
+                delete_domains: self.delete_domains.clone(),
             };
             let split = self.split.clone();
             let columns = self.bound_handles[..self.prefix_len].to_vec();
+            let delete_mode = self.delete_mode.clone();
             let Some(footer) = self.footer.clone() else {
                 return Ok(ConnectorPreparationProgress::Deferred);
             };
@@ -1903,6 +1936,7 @@ impl IcebergParquetPageSource {
                     &relation,
                     &split,
                     &columns,
+                    &delete_mode,
                     &footer,
                     &binding,
                     context,
@@ -2145,7 +2179,13 @@ impl IcebergParquetPageSource {
                     self.split.path()
                 ))
             })?;
-            Some(self.delete_filter.evaluate(&page_batch, positions)?)
+            // Equality keys bind against their unique internal projection.
+            // Output columns may repeat the same field ID, including aliases.
+            let delete_columns: Vec<_> = (self.prefix_len..page_batch.num_columns()).collect();
+            let delete_batch = page_batch
+                .project(&delete_columns)
+                .map_err(|error| corrupt(format!("iceberg delete projection failed: {error}")))?;
+            Some(self.delete_filter.evaluate(&delete_batch, positions)?)
         };
         for check in checks.iter() {
             let mask = evaluate_domain(
@@ -2707,6 +2747,11 @@ mod tests {
             )
             .expect("schema table name"),
             snapshot_id: Some(11),
+            read_domain: Some(crate::delete_semantics::test_read_domain(
+                schema,
+                &[spec.clone()],
+                11,
+            )),
             table_schema_json: serde_json::to_string(schema).expect("serialize schema"),
             spec_id: Some(0),
             partition_spec_jsons,
@@ -2743,7 +2788,7 @@ mod tests {
                 file_size: file_size as i64,
                 file_record_count: records,
                 format: IcebergFileFormat::Parquet,
-                partition_data_json: "{}".to_owned(),
+                partition_data_json: r#"{"version":1,"values":[]}"#.to_owned(),
                 deletes: Vec::new(),
                 first_row_id: None,
                 decryption: None,
@@ -2752,7 +2797,11 @@ mod tests {
     }
 
     fn build_split(name: &str, options: SplitOptions) -> IcebergSplit {
+        let schema = iceberg_schema();
+        let partitioned = options.partition_data_json != r#"{"version":1,"values":[]}"#;
+        let handle = table_handle(&schema, partitioned);
         IcebergSplit::try_new(IcebergSplitParams {
+            read_domain: Arc::clone(handle.read_domain().expect("fixture domain")),
             path: name.to_owned(),
             start: options.start,
             length: options.length,
@@ -2761,7 +2810,7 @@ mod tests {
             file_format: options.format,
             partition_spec_id: 0,
             partition_data_json: options.partition_data_json,
-            deletes: options.deletes,
+            deletes: options.deletes.into(),
             file_statistics_domain: TupleDomain::all(),
             data_sequence_number: Some(3),
             file_first_row_id: options.first_row_id,
@@ -3618,7 +3667,7 @@ mod tests {
         let split = build_split(
             "s3://bucket/this/file/does/not/exist.parquet",
             SplitOptions {
-                partition_data_json: "{\"1000\":\"emea\"}".to_owned(),
+                partition_data_json: r#"{"version":1,"values":[{"string":"emea"}]}"#.to_owned(),
                 ..SplitOptions::whole_file(harness.file_size, records)
             },
         );
@@ -3660,7 +3709,7 @@ mod tests {
         let split = build_split(
             "s3://bucket/absent.parquet",
             SplitOptions {
-                partition_data_json: "{\"1000\":\"emea\"}".to_owned(),
+                partition_data_json: r#"{"version":1,"values":[{"string":"emea"}]}"#.to_owned(),
                 ..SplitOptions::whole_file(harness.file_size, 7)
             },
         );
@@ -3746,6 +3795,8 @@ mod tests {
             .join("eq-delete.parquet");
         write_equality_delete(&delete_path, &["r2", "r5"]);
         let delete = IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: r#"{"version":1,"values":[]}"#.to_owned(),
             content: IcebergDeleteFileContent::EqualityDeletes,
             path: delete_path.to_string_lossy().to_string(),
             format: IcebergFileFormat::Parquet,
@@ -3969,6 +4020,8 @@ mod tests {
             .join("eq-delete.parquet");
         write_equality_delete(&delete_path, regions);
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: r#"{"version":1,"values":[]}"#.to_owned(),
             content: IcebergDeleteFileContent::EqualityDeletes,
             path: delete_path.to_string_lossy().to_string(),
             format: IcebergFileFormat::Parquet,
@@ -4365,6 +4418,8 @@ mod tests {
         let payload = vector.to_iceberg_payload().expect("payload");
         fs::write(&path, &payload).expect("write deletion vector");
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: r#"{"version":1,"values":[]}"#.to_owned(),
             content: IcebergDeleteFileContent::PositionDeletes,
             path: path.to_string_lossy().to_string(),
             format: IcebergFileFormat::Puffin,
