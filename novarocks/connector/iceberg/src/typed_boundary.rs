@@ -70,10 +70,11 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
+#[cfg(test)]
+use crate::iceberg::spec::DataFileFormat;
 use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, Datum, FormatVersion, Literal, ManifestFile, ManifestStatus,
-    NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, Struct,
-    StructType, TableMetadata, Transform, Type,
+    Datum, FormatVersion, Literal, ManifestFile, NestedField, PartitionSpec, PrimitiveLiteral,
+    PrimitiveType, Schema, SchemaRef, Struct, StructType, TableMetadata, Transform, Type,
 };
 use crate::iceberg::table::Table;
 use crate::loaded_table::{IcebergAttemptTableAccess, IcebergPhysicalTable};
@@ -92,8 +93,8 @@ use crate::typed_read::{
     FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
     IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
-    IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileFacts, IcebergDeleteFileParams,
-    IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
+    IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
+    IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
     IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
     IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
     IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableExecution,
@@ -121,12 +122,6 @@ const READER_VISIBLE_TABLE_PROPERTIES: [&str; 4] = [
     "read.split.planning-lookback",
     "read.split.target-size",
 ];
-
-/// Iceberg's reserved field ID for `pos` in the position-delete schema.
-///
-/// A position-delete file publishes its row-position bounds under this ID, so
-/// it is how the manifest walk recovers them without opening the delete file.
-const RESERVED_FIELD_ID_DELETE_FILE_POS: i32 = i32::MAX - 102;
 
 /// One Iceberg system relation reachable as `<table>$<suffix>`.
 ///
@@ -411,26 +406,25 @@ impl IcebergTypedBoundary {
     fn change_window_endpoint_files(
         &self,
         table: &Table,
-        snapshot_id: i64,
+        domain: Arc<crate::delete_semantics::ReadDomain>,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         self.check_request_active()?;
         let table = table.clone();
         let control = self.request_context.clone();
-        let schema = table.metadata().current_schema().clone();
+        let schema = domain
+            .endpoint()
+            .schema()
+            .map_err(|e| corrupt(e.to_string()))?;
         let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(
-                async move { plan_pinned_snapshot(table, snapshot_id, control.as_ref()).await },
-            );
-        let (read_snapshot, facts) = self.complete_sdk_read(result)?;
+            .block_on(async move { plan_pinned_snapshot(table, domain, control.as_ref()).await });
+        let read_snapshot = self.complete_sdk_read(result)?;
         read_snapshot
             .files
             .into_iter()
-            .map(|read_file| {
-                planned_data_file(read_file, &facts, schema.as_ref(), None, &BTreeSet::new())
-            })
+            .map(|read_file| planned_data_file(read_file, &schema, None, &BTreeSet::new()))
             .collect()
     }
 
@@ -498,10 +492,10 @@ impl IcebergTypedBoundary {
         let physical = self.load_pinned_relation(handle.schema_table_name())?;
         let schema = handle.parse_table_schema()?;
         let partition_types = change_window_partition_types(physical.table.metadata(), &schema)?;
-        let from_visible = self
-            .change_window_endpoint_files(&physical.table, handle.from_snapshot_id_exclusive())?;
+        let from_visible =
+            self.change_window_endpoint_files(&physical.table, handle.from_read_domain().clone())?;
         let to_visible =
-            self.change_window_endpoint_files(&physical.table, handle.to_snapshot_id_inclusive())?;
+            self.change_window_endpoint_files(&physical.table, handle.to_read_domain().clone())?;
         let plan = plan_change_window_splits(
             handle,
             IcebergChangeWindowEndpoints {
@@ -544,14 +538,25 @@ fn rewrite_position_delete_file(
         content: IcebergDeleteFileContent::PositionDeletes,
         path: delete.path.clone(),
         format: IcebergFileFormat::Puffin,
-        // A deletion vector publishes no manifest record count of its own that
-        // this rewrite depends on; the positions come from the vector itself.
-        record_count: 0,
-        file_size_in_bytes: delete.length.unwrap_or_default(),
+        record_count: delete
+            .record_count
+            .ok_or_else(|| corrupt("rewrite delete has no manifest record count"))?,
+        file_size_in_bytes: delete
+            .length
+            .ok_or_else(|| corrupt("rewrite delete has no file size"))?,
+        partition_spec_id: delete
+            .partition_spec_id
+            .ok_or_else(|| corrupt("rewrite delete has no partition spec"))?,
+        partition_data_json: delete
+            .partition_data_json
+            .clone()
+            .ok_or_else(|| corrupt("rewrite delete has no typed partition tuple"))?,
         equality_field_ids: Vec::new(),
         row_position_lower_bound: None,
         row_position_upper_bound: None,
-        data_sequence_number: delete.sequence_number.unwrap_or_default(),
+        data_sequence_number: delete
+            .sequence_number
+            .ok_or_else(|| corrupt("rewrite delete has no data sequence"))?,
         content_offset: delete.content_offset,
         content_size_in_bytes: delete.content_size_in_bytes,
         referenced_data_file: delete.referenced_data_file.clone(),
@@ -559,30 +564,14 @@ fn rewrite_position_delete_file(
     })
 }
 
-/// Pair one snapshot's read view of a data file with its manifest facts.
+/// Project complete facts without a second manifest walk or path-based join.
 fn planned_data_file(
     read_file: IcebergReadFile,
-    facts: &ManifestFacts,
     schema: &Schema,
     partition_spec: Option<&PartitionSpec>,
     dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
 ) -> Result<IcebergPlannedDataFile, ConnectorError> {
-    let data_facts = facts.data.get(&read_file.path).ok_or_else(|| {
-        corrupt(format!(
-            "iceberg data file {} has no manifest entry in the pinned snapshot",
-            read_file.path
-        ))
-    })?;
-    let mut delete_facts = BTreeMap::new();
-    for delete in &read_file.deletes {
-        let fact = facts.deletes.get(&delete.path).ok_or_else(|| {
-            corrupt(format!(
-                "iceberg delete file {} has no manifest entry in the pinned snapshot",
-                delete.path
-            ))
-        })?;
-        delete_facts.insert(delete.path.clone(), fact.clone());
-    }
+    let data_facts = read_file.manifest.as_ref();
     Ok(IcebergPlannedDataFile {
         file_format: IcebergFileFormat::from_data_file_format(data_facts.file_format)?,
         split_offsets: data_facts.split_offsets.clone(),
@@ -599,7 +588,6 @@ fn planned_data_file(
             dynamic_filter_columns,
         )?,
         decryption_data: None,
-        delete_facts,
         read_file,
     })
 }
@@ -1514,14 +1502,16 @@ impl IcebergTypedBoundary {
         self.check_request_active()?;
         let table = physical.table.clone();
         let control = self.request_context.clone();
+        let domain = handle
+            .read_domain()
+            .cloned()
+            .ok_or_else(|| corrupt("snapshot handle has no read domain"))?;
         let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(
-                async move { plan_pinned_snapshot(table, snapshot_id, control.as_ref()).await },
-            );
-        let (read_snapshot, facts) = self.complete_sdk_read(result)?;
+            .block_on(async move { plan_pinned_snapshot(table, domain, control.as_ref()).await });
+        let read_snapshot = self.complete_sdk_read(result)?;
         let mut planned = Vec::with_capacity(read_snapshot.files.len());
         let mut pinned_seen = 0_usize;
         for read_file in read_snapshot.files {
@@ -1544,7 +1534,6 @@ impl IcebergTypedBoundary {
                 .transpose()?;
             planned.push(planned_data_file(
                 read_file,
-                &facts,
                 &schema,
                 partition_spec.as_ref(),
                 dynamic_filter_columns,
@@ -2109,9 +2098,14 @@ fn pinned_table_handle_with_schema(
     let table_schema_json = serde_json::to_string(schema.as_ref())
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
 
+    let read_domain = snapshot_id
+        .map(|id| crate::read_snapshot::mint_read_domain(metadata, id, &schema))
+        .transpose()
+        .map_err(corrupt)?;
     IcebergTableHandle::try_new(IcebergTableHandleParams {
         schema_table_name: name.clone(),
         snapshot_id,
+        read_domain,
         table_schema_json,
         spec_id: Some(spec_id),
         partition_spec_jsons,
@@ -2208,6 +2202,10 @@ fn pinned_change_window_handle(
         name_mapping_json: metadata.properties().get(NAME_MAPPING_PROPERTY).cloned(),
         from_snapshot_id_exclusive: from,
         to_snapshot_id_inclusive: to,
+        from_read_domain: crate::read_snapshot::mint_read_domain(metadata, from, &to_schema)
+            .map_err(corrupt)?,
+        to_read_domain: crate::read_snapshot::mint_read_domain(metadata, to, &to_schema)
+            .map_err(corrupt)?,
         partition_spec_jsons,
     })
     .map(Some)
@@ -2429,44 +2427,15 @@ fn system_relation_of(table_name: &str) -> Option<(String, IcebergSystemRelation
 // Manifest facts for split production
 // ---------------------------------------------------------------------------
 
-/// Manifest facts about one data file that the read view does not carry.
-#[derive(Clone, Debug)]
-struct DataFileManifestFacts {
-    file_format: DataFileFormat,
-    split_offsets: Vec<i64>,
-    key_metadata: Vec<u8>,
-    value_counts: HashMap<i32, u64>,
-    null_value_counts: HashMap<i32, u64>,
-    nan_value_counts: HashMap<i32, u64>,
-    lower_bounds: HashMap<i32, Datum>,
-    upper_bounds: HashMap<i32, Datum>,
-}
+use crate::read_model::IcebergDataFileMetadata as DataFileManifestFacts;
 
-/// Everything one manifest walk contributes beyond the read view.
-#[derive(Debug, Default)]
-struct ManifestFacts {
-    data: HashMap<String, DataFileManifestFacts>,
-    deletes: HashMap<String, IcebergDeleteFileFacts>,
-}
-
-/// Build the read view of one pinned snapshot together with its manifest facts.
-///
-/// The two walks are kept in one call so a single pass over the manifest list
-/// serves both, and so neither half can silently describe a different snapshot.
 async fn plan_pinned_snapshot(
     table: Table,
-    snapshot_id: i64,
+    domain: Arc<crate::delete_semantics::ReadDomain>,
     control: Option<&ConnectorRequestContext>,
-) -> Result<(IcebergReadSnapshot, ManifestFacts), String> {
+) -> Result<IcebergReadSnapshot, String> {
     let operation_control = control.map(|control| control as &dyn ConnectorOperationControl);
-    let read_snapshot = crate::read_snapshot::build_read_snapshot_at_with_control(
-        &table,
-        snapshot_id,
-        operation_control,
-    )
-    .await?;
-    let facts = collect_manifest_facts(&table, snapshot_id, operation_control).await?;
-    Ok((read_snapshot, facts))
+    crate::read_snapshot::build_read_snapshot_in_domain(&table, domain, operation_control).await
 }
 
 /// Every partition spec a table has ever had, in the order the metadata holds
@@ -2509,93 +2478,6 @@ fn check_manifest_control(control: Option<&dyn ConnectorOperationControl>) -> Re
         control.check_active().map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-async fn collect_manifest_facts(
-    table: &Table,
-    snapshot_id: i64,
-    control: Option<&dyn ConnectorOperationControl>,
-) -> Result<ManifestFacts, String> {
-    check_manifest_control(control)?;
-    let metadata = table.metadata();
-    let snapshot = metadata
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| format!("iceberg snapshot {snapshot_id} is absent from table metadata"))?;
-    let file_io = table.file_io();
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, metadata)
-        .await
-        .map_err(|error| format!("load manifest list: {error}"))?;
-    check_manifest_control(control)?;
-
-    let mut facts = ManifestFacts::default();
-    for manifest_file in manifest_list.entries() {
-        check_manifest_control(control)?;
-        let manifest = manifest_file
-            .load_manifest(file_io)
-            .await
-            .map_err(|error| format!("load manifest: {error}"))?;
-        check_manifest_control(control)?;
-        for entry in manifest.entries() {
-            check_manifest_control(control)?;
-            if entry.status == ManifestStatus::Deleted {
-                continue;
-            }
-            let data_file = entry.data_file();
-            match data_file.content_type() {
-                DataContentType::Data => {
-                    facts.data.insert(
-                        data_file.file_path().to_string(),
-                        DataFileManifestFacts {
-                            file_format: data_file.file_format(),
-                            split_offsets: data_file
-                                .split_offsets()
-                                .map(<[i64]>::to_vec)
-                                .unwrap_or_default(),
-                            key_metadata: data_file
-                                .key_metadata()
-                                .map(<[u8]>::to_vec)
-                                .unwrap_or_default(),
-                            value_counts: data_file.value_counts().clone(),
-                            null_value_counts: data_file.null_value_counts().clone(),
-                            nan_value_counts: data_file.nan_value_counts().clone(),
-                            lower_bounds: data_file.lower_bounds().clone(),
-                            upper_bounds: data_file.upper_bounds().clone(),
-                        },
-                    );
-                }
-                DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                    // A delete file's encryption material has nowhere to go in
-                    // the split contract, so an encrypted one must fail here
-                    // rather than travel with its key silently dropped.
-                    if data_file.key_metadata().is_some_and(|key| !key.is_empty()) {
-                        return Err(format!(
-                            "iceberg encrypted delete file {} is not supported by the connector read stack",
-                            data_file.file_path()
-                        ));
-                    }
-                    facts.deletes.insert(
-                        data_file.file_path().to_string(),
-                        IcebergDeleteFileFacts {
-                            record_count: i64::try_from(data_file.record_count()).map_err(
-                                |_| {
-                                    format!(
-                                        "iceberg delete file {} declares an unrepresentable record count",
-                                        data_file.file_path()
-                                    )
-                                },
-                            )?,
-                            row_position_lower_bound: row_position_bound(data_file.lower_bounds()),
-                            row_position_upper_bound: row_position_bound(data_file.upper_bounds()),
-                            decryption_data: None,
-                        },
-                    );
-                }
-            }
-        }
-    }
-    check_manifest_control(control)?;
-    Ok(facts)
 }
 
 /// Reconstruct the file-local dynamic-filter domain from one pinned manifest
@@ -2889,25 +2771,6 @@ fn primitive_literal_as_connector_value(
     }
 }
 
-/// The row-position bound a position-delete file publishes for `pos`.
-fn row_position_bound(bounds: &HashMap<i32, Datum>) -> Option<i64> {
-    match bounds.get(&RESERVED_FIELD_ID_DELETE_FILE_POS)?.literal() {
-        PrimitiveLiteral::Long(value) => Some(*value),
-        // Any other physical literal is not a row position; treating it as one
-        // would hand the reader a bound it cannot honor.
-        PrimitiveLiteral::Boolean(_)
-        | PrimitiveLiteral::Int(_)
-        | PrimitiveLiteral::Float(_)
-        | PrimitiveLiteral::Double(_)
-        | PrimitiveLiteral::String(_)
-        | PrimitiveLiteral::Binary(_)
-        | PrimitiveLiteral::Int128(_)
-        | PrimitiveLiteral::UInt128(_)
-        | PrimitiveLiteral::AboveMax
-        | PrimitiveLiteral::BelowMin => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Static file pruning
 // ---------------------------------------------------------------------------
@@ -3195,18 +3058,48 @@ mod mv_target_selection_tests {
             41,
         )
         .expect("selection");
-        let file = |path: &str, value: Option<Literal>, spec_id: i32| IcebergReadFile {
-            path: path.to_string(),
-            size: 1,
-            record_count: Some(1),
-            column_stats: None,
-            partition_spec_id: Some(spec_id),
-            partition_key: None,
-            partition_values: Some(Struct::from_iter([value])),
-            manifest_path: None,
-            first_row_id: None,
-            data_sequence_number: None,
-            deletes: Vec::new(),
+        let domain = crate::read_snapshot::mint_read_domain(&metadata, 41, &schema).unwrap();
+        let index = crate::delete_semantics::DeleteCandidateIndex::try_new(
+            domain,
+            crate::delete_semantics::DeleteObservation::from_manifests([]).unwrap(),
+        )
+        .unwrap();
+        let file = |path: &str, value: Option<Literal>, spec_id: i32| {
+            let values = Struct::from_iter([value]);
+            let data = crate::delete_semantics::DataFileFact::try_new(
+                path,
+                crate::delete_semantics::DataSequenceNumber::try_new(1).unwrap(),
+                crate::delete_semantics::TypedPartition::bind(spec, &schema, &values).unwrap(),
+                1,
+                crate::delete_semantics::FileMetrics::default(),
+            )
+            .unwrap();
+            IcebergReadFile {
+                path: path.to_string(),
+                size: 1,
+                record_count: Some(1),
+                column_stats: None,
+                partition_spec_id: Some(spec_id),
+                partition_key: None,
+                partition_values: Some(values),
+                manifest_path: None,
+                first_row_id: None,
+                data_sequence_number: Some(1),
+                manifest: Arc::new(DataFileManifestFacts {
+                    file_format: DataFileFormat::Parquet,
+                    split_offsets: Vec::new(),
+                    key_metadata: Vec::new(),
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
+                }),
+                deletes: index
+                    .for_data(&data)
+                    .unwrap()
+                    .load_view(crate::delete_semantics::StatisticsPolicy::Disabled),
+            }
         };
         let snapshot = IcebergReadSnapshot {
             snapshot_id: Some(41),
@@ -3345,6 +3238,7 @@ mod final_static_facts_tests {
         IcebergTableHandle::try_new(IcebergTableHandleParams {
             schema_table_name: SchemaTableName::try_new("db", "orders").expect("table name"),
             snapshot_id: Some(41),
+            read_domain: Some(crate::delete_semantics::test_read_domain(&schema, &[], 41)),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
             spec_id: None,
             partition_spec_jsons: BTreeMap::new(),

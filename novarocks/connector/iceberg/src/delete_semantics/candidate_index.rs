@@ -43,6 +43,7 @@ pub enum BucketKind {
 pub struct FrozenBucket {
     kind: BucketKind,
     members: Box<[Arc<DeleteFact>]>,
+    descriptor_variable_prefix: Box<[usize]>,
 }
 
 impl FrozenBucket {
@@ -52,9 +53,20 @@ impl FrozenBucket {
                 .cmp(&b.sequence())
                 .then_with(|| a.address().path().cmp(b.address().path()))
         });
+        let mut descriptor_variable_prefix = Vec::with_capacity(members.len() + 1);
+        descriptor_variable_prefix.push(0usize);
+        for member in &members {
+            descriptor_variable_prefix.push(
+                descriptor_variable_prefix
+                    .last()
+                    .unwrap()
+                    .saturating_add(member.descriptor_variable_bytes()),
+            );
+        }
         Arc::new(Self {
             kind,
             members: members.into_boxed_slice(),
+            descriptor_variable_prefix: descriptor_variable_prefix.into_boxed_slice(),
         })
     }
     pub fn kind(&self) -> &BucketKind {
@@ -62,6 +74,10 @@ impl FrozenBucket {
     }
     pub fn members(&self) -> &[Arc<DeleteFact>] {
         &self.members
+    }
+    pub(crate) fn descriptor_variable_suffix_bytes(&self, start: usize) -> usize {
+        self.descriptor_variable_prefix[self.members.len()]
+            .saturating_sub(self.descriptor_variable_prefix[start])
     }
 
     fn suffix(
@@ -342,6 +358,7 @@ pub fn validate_normalized_closure(
     let partition_bindings = received_domain.endpoint().bind_partition_specs(&schema)?;
     validate_partition_binding(&partition_bindings, data.partition())?;
     let mut seen = HashSet::new();
+    let mut validated_groups = HashSet::new();
     let mut positions = Vec::new();
     let mut equality = Vec::new();
     let mut dv = None;
@@ -358,7 +375,9 @@ pub fn validate_normalized_closure(
         }
         match fact.kind() {
             DeleteKind::Equality(fields) => {
-                fields.validate_schema(&schema)?;
+                if validated_groups.insert(fields.clone()) {
+                    fields.validate_schema(&schema)?;
+                }
                 equality.push(fact);
             }
             DeleteKind::Position { .. } => positions.push(fact),

@@ -41,6 +41,9 @@ impl BucketView {
     pub fn members(&self) -> &[Arc<DeleteFact>] {
         &self.bucket.members()[self.start..]
     }
+    fn descriptor_variable_bytes(&self) -> usize {
+        self.bucket.descriptor_variable_suffix_bytes(self.start)
+    }
     pub fn same_representation(&self, other: &Self) -> bool {
         self.start == other.start && Arc::ptr_eq(&self.bucket, &other.bucket)
     }
@@ -198,6 +201,7 @@ impl DeleteSet {
             estimated_comparisons,
             ..Default::default()
         };
+        let mut excluded_descriptor_variable_bytes = 0usize;
         let exclusions = if decision == StatisticsDecision::Applied {
             let mut excluded = Vec::new();
             for (index, fact) in self.members().enumerate() {
@@ -206,6 +210,8 @@ impl DeleteSet {
                 cost.field_comparisons += comparisons;
                 if !may_match {
                     excluded.push(index);
+                    excluded_descriptor_variable_bytes = excluded_descriptor_variable_bytes
+                        .saturating_add(fact.descriptor_variable_bytes());
                 }
             }
             cost.temporary_exclusion_capacity_bytes = excluded
@@ -222,6 +228,7 @@ impl DeleteSet {
             exclusions,
             decision,
             cost,
+            excluded_descriptor_variable_bytes,
         }
     }
 }
@@ -320,6 +327,7 @@ pub struct LoadView {
     exclusions: Exclusions,
     decision: StatisticsDecision,
     cost: StatisticsCost,
+    excluded_descriptor_variable_bytes: usize,
 }
 
 impl LoadView {
@@ -334,6 +342,23 @@ impl LoadView {
     }
     pub fn member_count(&self) -> usize {
         self.logical.member_count() - self.exclusions.len()
+    }
+    /// A representation-independent scheduling charge for inline wire expansion.
+    /// Prefix aggregates make unpruned suffix accounting proportional to buckets.
+    pub fn expanded_descriptor_bytes(&self, descriptor_fixed_bytes: usize) -> usize {
+        let positions = match self.logical.position() {
+            PositionSource::None => 0,
+            PositionSource::OneDv(fact) => fact.descriptor_variable_bytes(),
+            PositionSource::Files(views) => views.iter().fold(0usize, |sum, view| {
+                sum.saturating_add(view.descriptor_variable_bytes())
+            }),
+        };
+        let variable = self.logical.equality().iter().fold(positions, |sum, view| {
+            sum.saturating_add(view.descriptor_variable_bytes())
+        });
+        variable
+            .saturating_sub(self.excluded_descriptor_variable_bytes)
+            .saturating_add(self.member_count().saturating_mul(descriptor_fixed_bytes))
     }
     pub fn members(&self) -> impl Iterator<Item = &Arc<DeleteFact>> {
         self.logical

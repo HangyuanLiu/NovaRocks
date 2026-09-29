@@ -525,6 +525,24 @@ impl DeleteFact {
     pub fn read(&self) -> &DeleteReadFacts {
         &self.application.read
     }
+    /// Variable storage retained by the canonical expanded private descriptor.
+    /// The descriptor's fixed layout is supplied by its runtime owner.
+    pub fn descriptor_variable_bytes(&self) -> usize {
+        let (fields, target) = match self.kind() {
+            DeleteKind::Equality(group) => (group.fields().len(), 0),
+            DeleteKind::Position { exact_target } => {
+                (0, exact_target.as_ref().map_or(0, |path| path.len()))
+            }
+            DeleteKind::DeletionVector { exact_target } => (0, exact_target.len()),
+        };
+        self.address()
+            .path()
+            .len()
+            .saturating_add(self.partition().to_json_string().len())
+            .saturating_add(target)
+            .saturating_add(fields.saturating_mul(std::mem::size_of::<i32>()))
+            .saturating_add(self.read().key_metadata.len())
+    }
     pub fn metrics(&self) -> &FileMetrics {
         &self.metrics
     }
@@ -740,7 +758,7 @@ impl PinnedEndpointFacts {
                 "pinned endpoint table or metadata identity is absent",
             ));
         }
-        let schema_json = serde_json::to_string(schema)
+        let schema_json = super::canonical_schema_json(schema)
             .map_err(|e| Error::new(Kind::InvalidFieldBinding, e.to_string()))?;
         let mut partition_spec_jsons = BTreeMap::new();
         for spec in partition_specs {

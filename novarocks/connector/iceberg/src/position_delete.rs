@@ -18,7 +18,10 @@
 //! Physical Iceberg position-delete application for provider batch readers.
 
 use arrow::array::{Array, Int64Array, StringArray};
-use novarocks_fs::{FileProjection, FileReadContext, FileReadRange, FsAccessHandle};
+use novarocks_fs::{
+    FileProjection, FileReadContext, FileReadRange, FsAccessHandle, MinMaxPredicateOp,
+    MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+};
 use roaring::RoaringTreemap;
 
 use crate::commit::DeletionVector;
@@ -52,14 +55,15 @@ pub fn load_position_deletes_with_context(
                 apply_deletion_vector(spec, &payload, &mut deleted)?;
             }
             PositionDeleteRead::Parquet => {
-                let batches = crate::file_reader::read_parquet_batches(
+                crate::file_reader::visit_parquet_batches(
                     access,
                     &spec.path,
                     spec.length,
                     position_delete_projection(),
+                    position_delete_predicates(data_file_path),
                     context.clone(),
+                    |batch| apply_position_delete_batch(spec, data_file_path, batch, &mut deleted),
                 )?;
-                apply_position_delete_batches(spec, data_file_path, batches, &mut deleted)?;
             }
         }
     }
@@ -74,14 +78,31 @@ pub async fn load_position_deletes_async(
     access: &FsAccessHandle,
     context: &FileReadContext,
 ) -> Result<RoaringTreemap, String> {
+    load_position_deletes_async_with_metrics(specs, data_file_path, access, context, |_| {})
+        .await
+        .map(|(positions, _)| positions)
+        .map_err(|error| error.to_string())
+}
+
+/// Physical decoded rows, including rows later rejected by the exact path check.
+pub(crate) async fn load_position_deletes_async_with_metrics(
+    specs: &[IcebergDeleteFileSpec],
+    data_file_path: &str,
+    access: &FsAccessHandle,
+    context: &FileReadContext,
+    mut on_decoded: impl FnMut(usize) + Send,
+) -> Result<(RoaringTreemap, usize), novarocks_spi::connector::ConnectorError> {
     let mut deleted = RoaringTreemap::new();
+    let mut decoded_rows = 0;
     for spec in specs {
         if spec.file_content != IcebergFileContent::PositionDeletes {
             continue;
         }
-        match plan_position_delete(spec, data_file_path)? {
+        match plan_position_delete(spec, data_file_path)
+            .map_err(crate::file_reader::corrupt_delete_content)?
+        {
             PositionDeleteRead::DeletionVector(range) => {
-                let payload = crate::file_reader::read_bytes_async(
+                let payload = crate::file_reader::read_bytes_async_typed(
                     access,
                     &spec.path,
                     spec.length,
@@ -89,29 +110,40 @@ pub async fn load_position_deletes_async(
                     context,
                 )
                 .await?;
-                apply_deletion_vector(spec, &payload, &mut deleted)?;
+                let mut artifact = RoaringTreemap::new();
+                apply_deletion_vector(spec, &payload, &mut artifact)
+                    .map_err(crate::file_reader::corrupt_delete_content)?;
+                decoded_rows += artifact.len() as usize;
+                on_decoded(artifact.len() as usize);
+                deleted |= artifact;
             }
             PositionDeleteRead::Parquet => {
-                let batches = crate::file_reader::read_parquet_batches_async(
+                crate::file_reader::visit_parquet_batches_async(
                     access,
                     &spec.path,
                     spec.length,
                     position_delete_projection(),
+                    position_delete_predicates(data_file_path),
                     context.clone(),
+                    |batch| {
+                        decoded_rows += batch.batch.num_rows();
+                        on_decoded(batch.batch.num_rows());
+                        apply_position_delete_batch(spec, data_file_path, batch, &mut deleted)
+                            .map_err(crate::file_reader::corrupt_delete_content)
+                    },
                 )
                 .await?;
-                apply_position_delete_batches(spec, data_file_path, batches, &mut deleted)?;
             }
         }
     }
-    Ok(deleted)
+    Ok((deleted, decoded_rows))
 }
 
 /// What one position-delete file needs read before it can be applied.
 enum PositionDeleteRead {
     /// A deletion vector: one byte range of its Puffin container.
     DeletionVector(FileReadRange),
-    /// A Parquet position-delete file, read whole.
+    /// Projected path/position ranges after conservative row-group pruning.
     Parquet,
 }
 
@@ -157,6 +189,20 @@ fn plan_position_delete(
     Ok(PositionDeleteRead::Parquet)
 }
 
+fn position_delete_predicates(target: &str) -> Vec<ScanPredicate> {
+    vec![
+        ScanPredicate::new(
+            FILE_PATH_COLUMN,
+            ScanPredicateDomain::Range {
+                op: MinMaxPredicateOp::Eq,
+                value: MinMaxPredicateValue::ByteArray(target.as_bytes().to_vec()),
+            },
+            ScanPredicateSource::Static,
+        )
+        .with_physical_field_id(crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID),
+    ]
+}
+
 fn position_delete_projection() -> FileProjection {
     FileProjection::RootNames(vec![FILE_PATH_COLUMN.to_string(), POS_COLUMN.to_string()])
 }
@@ -176,13 +222,13 @@ fn apply_deletion_vector(
     Ok(())
 }
 
-fn apply_position_delete_batches(
+fn apply_position_delete_batch(
     spec: &IcebergDeleteFileSpec,
     data_file_path: &str,
-    batches: Vec<novarocks_fs::FileBatch>,
+    batch: novarocks_fs::FileBatch,
     deleted: &mut RoaringTreemap,
 ) -> Result<(), String> {
-    for batch in batches {
+    {
         let batch = batch.batch;
         let schema = batch.schema();
         let file_path_index = schema.index_of(FILE_PATH_COLUMN).map_err(|error| {

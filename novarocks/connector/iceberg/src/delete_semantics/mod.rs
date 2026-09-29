@@ -25,13 +25,17 @@
 //! logical `DeleteSet` used to compare snapshot endpoints.
 
 mod candidate_index;
+mod canonical_json;
 mod facts;
 mod metrics;
+mod partition_codec;
 mod set_view;
 
 pub use candidate_index::*;
+pub(crate) use canonical_json::{canonical_metadata_json, canonical_schema_json};
 pub use facts::*;
 pub use metrics::*;
+pub use partition_codec::*;
 pub use set_view::*;
 
 /// Stable categories that the provider boundary maps to its own error contract.
@@ -76,3 +80,23 @@ pub type Result<T> = std::result::Result<T, DeleteSemanticsError>;
 
 #[cfg(test)]
 mod tests;
+
+/// An explicitly pinned fixture domain shared by all test owners of a relation.
+#[cfg(test)]
+pub(crate) fn test_read_domain(
+    schema: &crate::iceberg::spec::Schema,
+    specs: &[crate::iceberg::spec::PartitionSpec],
+    snapshot: i64,
+) -> std::sync::Arc<ReadDomain> {
+    std::sync::Arc::new(ReadDomain::new(
+        ReadObservationId::try_new([7; 16]).expect("fixture observation"),
+        PinnedEndpointFacts::try_new(
+            uuid::Uuid::from_u128(7),
+            "fixture-pinned-metadata",
+            snapshot,
+            schema,
+            specs,
+        )
+        .expect("fixture endpoint"),
+    ))
+}
