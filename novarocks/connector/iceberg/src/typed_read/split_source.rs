@@ -139,16 +139,17 @@ impl IcebergSplitSource {
         files: Vec<IcebergPlannedDataFile>,
         options: IcebergSplitSourceOptions,
     ) -> Result<Self, ConnectorError> {
-        let schema = table_handle.parse_table_schema()?;
         let mut partition_types = BTreeMap::new();
         let mut identity_partition_ids = BTreeMap::new();
         for spec_id in table_handle.partition_spec_jsons().keys() {
             let spec = table_handle.parse_partition_spec(*spec_id)?;
-            let partition_type = spec.partition_type(&schema).map_err(|error| {
-                invalid(format!(
-                    "iceberg partition spec {spec_id} does not bind to the frozen table schema: {error}"
-                ))
-            })?;
+            let partition_type = match table_handle.read_domain() {
+                Some(domain) => domain
+                    .endpoint()
+                    .partition_type(*spec_id)
+                    .map_err(|e| invalid(e.to_string()))?,
+                None => continue, // An empty table has no files or read domain.
+            };
             partition_types.insert(*spec_id, Type::Struct(partition_type));
             identity_partition_ids.insert(*spec_id, identity_partition_source_field_ids(&spec));
         }
@@ -953,7 +954,6 @@ mod tests {
     };
 
     use crate::iceberg::spec::{Literal as IcebergLiteral, PartitionSpec, Struct};
-    use crate::read_model::iceberg_partition_key;
     use crate::typed_read::change_window::{IcebergChangeSide, IcebergChangeWindowHandleParams};
     use crate::typed_read::split::IcebergDeleteFileContent;
     use crate::typed_read::table_handle::tests::{

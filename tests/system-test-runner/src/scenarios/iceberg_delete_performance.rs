@@ -29,6 +29,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::LaunchProfile;
 use novarocks_cluster_harness::delayed_s3::DelayedS3Proxy;
+use novarocks_cluster_harness::process_resources::ProcessResourceMonitor;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -39,7 +40,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_ENV: &str = "NOVAROCKS_UEA4G_PERF_CACHE";
 const SIDE_ENV: &str = "NOVAROCKS_UEA4G_PERF_SIDE";
@@ -47,6 +48,7 @@ const PASS_ENV: &str = "NOVAROCKS_UEA4G_PERF_PASS";
 const WARMUP_RUNS: usize = 2;
 const MEASURED_RUNS: usize = 9;
 const CONCURRENCIES: [usize; 2] = [1, 4];
+const RESOURCE_SAMPLE_INTERVAL_MS: u64 = 50;
 
 #[derive(Default)]
 pub(super) struct IcebergDeletePerformance {
@@ -201,14 +203,30 @@ impl Scenario for IcebergDeletePerformance {
         let root = context.scenario_root().to_path_buf();
         let samples_path = root.join("delete-performance-samples.jsonl");
         let mut samples = BufWriter::new(File::create(&samples_path)?);
+        let resource_started_wall_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let resource_run_id = format!(
+            "uea4g-{}-{}-{}",
+            settings.pass,
+            settings.cache_name(),
+            settings.side
+        );
+        let monitor = ProcessResourceMonitor::start_with_identities(
+            context.process_resource_identities()?,
+            resource_run_id.as_str(),
+            Duration::from_millis(RESOURCE_SAMPLE_INTERVAL_MS),
+        )?;
+        let mut queries_finished_ms = None;
+        let mut convergence_finished_ms = None;
         let stop = AtomicBool::new(false);
         let (experiment, object_log) = thread::scope(|scope| {
             let recorder = scope.spawn(|| record_objects(&fixture.proxy, &stop, &root));
-            let result =
-                run_experiment(context, fixture, &settings, &mut samples).and_then(|summary| {
-                    await_resource_convergence(context, &baseline, "delete performance queries")?;
-                    Ok(summary)
-                });
+            let queries = run_experiment(context, fixture, &settings, &monitor, &mut samples);
+            queries_finished_ms = Some(monitor.elapsed_millis());
+            let result = queries.and_then(|summary| {
+                await_resource_convergence(context, &baseline, "delete performance queries")?;
+                convergence_finished_ms = Some(monitor.elapsed_millis());
+                Ok(summary)
+            });
             stop.store(true, Ordering::Release);
             let log = recorder
                 .join()
@@ -216,6 +234,17 @@ impl Scenario for IcebergDeletePerformance {
                 .and_then(|r| r);
             (result, log)
         });
+        // Explicitly settle the sampler on every experiment result, before any
+        // fallible evidence processing or native process teardown. Do not rely
+        // on Drop, which cannot report sampling errors.
+        let resources = finish_resources(
+            monitor,
+            &root,
+            &resource_run_id,
+            resource_started_wall_ns,
+            queries_finished_ms,
+            convergence_finished_ms,
+        );
         samples.flush()?;
         let sample_bytes = fs::read(&samples_path)?;
         let accepted = experiment
@@ -235,13 +264,16 @@ impl Scenario for IcebergDeletePerformance {
             "aggregate_checksum_definition":"SHA-256 over five big-endian 64-bit count/sum fields; this is not an exact row-bag hash",
             "samples_sha256":format!("{:x}",Sha256::digest(&sample_bytes)),
             "object_evidence":object_log.as_ref().ok(),
-            "summary":experiment.as_ref().ok(),"succeeded":experiment.is_ok() && object_log.is_ok() && accepted,
+            "resource_evidence":resources.as_ref().ok(),
+            "resource_error":resources.as_ref().err().map(|error| format!("{error:#}")),
+            "summary":experiment.as_ref().ok(),"succeeded":experiment.is_ok() && object_log.is_ok() && resources.is_ok() && accepted,
             "comparison_owner":"external two-pass baseline/candidate driver; no ratios or relaxed gates computed here",
         });
         fs::write(
             root.join("delete-performance.json"),
             serde_json::to_vec_pretty(&evidence)?,
         )?;
+        resources?;
         let summary = experiment?;
         object_log?;
         connection.query_drop(format!("DROP CATALOG {CATALOG}"))?;
@@ -261,6 +293,7 @@ fn run_experiment(
     context: &mut ScenarioContext,
     fixture: &Fixture,
     settings: &Settings,
+    monitor: &ProcessResourceMonitor,
     output: &mut impl Write,
 ) -> Result<Value> {
     let cases = fixture.scale["cases"]
@@ -307,6 +340,9 @@ fn run_experiment(
                     connections.push(connection);
                 }
                 let barrier = Arc::new(Barrier::new(concurrency + 1));
+                // These coarse resource timestamps enclose the existing timed
+                // wave; neither clock read is inside the query/wave timers.
+                let resource_window_start_ms = monitor.elapsed_millis();
                 let (elapsed, samples) = thread::scope(|scope| {
                     let handles = connections
                         .into_iter()
@@ -381,9 +417,10 @@ fn run_experiment(
                         .collect::<Result<Vec<_>>>();
                     (started.elapsed().as_nanos(), samples)
                 });
+                let resource_window_end_ms = monitor.elapsed_millis();
                 let samples = samples?;
                 let matched = samples.iter().all(|sample| sample.matched);
-                let record = json!({"case":name,"snapshot":snapshot,"metadata":case["metadata"],"cache":settings.cache_name(),"side":settings.side,"pass":settings.pass,"concurrency":concurrency,"run":run,"warmup":warmup,"wave_elapsed_ns":elapsed,"expected":expected,"expected_aggregate_sha256":expected.digest(),"samples":samples});
+                let record = json!({"case":name,"snapshot":snapshot,"metadata":case["metadata"],"cache":settings.cache_name(),"side":settings.side,"pass":settings.pass,"concurrency":concurrency,"run":run,"warmup":warmup,"wave_elapsed_ns":elapsed,"resource_window_start_ms":resource_window_start_ms,"resource_window_end_ms":resource_window_end_ms,"expected":expected,"expected_aggregate_sha256":expected.digest(),"samples":samples});
                 serde_json::to_writer(&mut *output, &record)?;
                 output.write_all(b"\n")?;
                 output.flush()?;
@@ -417,6 +454,83 @@ fn accepts_aggregates(settings: &Settings, summary: &Value) -> bool {
     } else {
         summary["baseline_controls_match"] == true
     }
+}
+
+fn finish_resources(
+    monitor: ProcessResourceMonitor,
+    root: &Path,
+    run_id: &str,
+    started_wall_ns: u128,
+    queries_finished_ms: Option<u128>,
+    convergence_finished_ms: Option<u128>,
+) -> Result<Value> {
+    let envelope_path = root.join("delete-performance-resources.json");
+    let mut sampler = monitor.finish(&envelope_path)?;
+    // Add an explicit final reading after convergence and worker settlement.
+    // This is outside every query timer and is not an RSS-based release oracle.
+    let final_reading = sampler.sample_cluster();
+    sampler.write_json(&envelope_path)?;
+    let ended_wall_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let samples_path = root.join("delete-performance-resources.jsonl");
+    let mut output = BufWriter::new(File::create(&samples_path)?);
+    for sample in sampler.samples() {
+        serde_json::to_writer(&mut output, sample)?;
+        output.write_all(b"\n")?;
+    }
+    output.flush()?;
+    final_reading?;
+    let mut roles = Vec::new();
+    for role in ["fe", "be-0", "be-1", "be-2"] {
+        let samples = sampler
+            .samples()
+            .iter()
+            .filter(|sample| sample.role == role)
+            .collect::<Vec<_>>();
+        ensure!(
+            samples.len() >= 2,
+            "insufficient process resource samples for {role}"
+        );
+        for sample in &samples {
+            ensure!(
+                sample.unavailable_reason.is_none()
+                    && sample.rss_bytes.is_some()
+                    && sample.cpu_user_nanos.is_some()
+                    && sample.cpu_system_nanos.is_some(),
+                "process resource counters unavailable for {role}: {:?}",
+                sample.unavailable_reason
+            );
+        }
+        for pair in samples.windows(2) {
+            ensure!(
+                pair[0].elapsed_millis <= pair[1].elapsed_millis
+                    && pair[0].cpu_user_nanos <= pair[1].cpu_user_nanos
+                    && pair[0].cpu_system_nanos <= pair[1].cpu_system_nanos,
+                "process resource counters moved backwards for {role}"
+            );
+        }
+        let first = samples[0];
+        let last = samples[samples.len() - 1];
+        roles.push(json!({
+            "role":role,"pid":first.pid,"process_start_token":first.process_start_token,
+            "sample_count":samples.len(),"first_sample_elapsed_ms":first.elapsed_millis,
+            "last_sample_elapsed_ms":last.elapsed_millis,
+            "max_sample_gap_ms":samples.windows(2).map(|pair| pair[1].elapsed_millis-pair[0].elapsed_millis).max(),
+            "rss_high_water_bytes":samples.iter().filter_map(|sample| sample.rss_bytes).max(),
+            "threads_high_water":samples.iter().filter_map(|sample| sample.threads).max(),
+            "cpu_user_delta_nanos":last.cpu_user_nanos.unwrap()-first.cpu_user_nanos.unwrap(),
+            "cpu_system_delta_nanos":last.cpu_system_nanos.unwrap()-first.cpu_system_nanos.unwrap(),
+        }));
+    }
+    Ok(json!({
+        "schema_version":1,"run_id":run_id,"sample_interval_ms":RESOURCE_SAMPLE_INTERVAL_MS,
+        "clock_resolution_ms":1,"started_wall_ns":started_wall_ns,"ended_wall_ns":ended_wall_ns,
+        "queries_finished_ms":queries_finished_ms,"convergence_finished_ms":convergence_finished_ms,
+        "envelope_sha256":format!("{:x}",Sha256::digest(fs::read(envelope_path)?)),
+        "samples_sha256":format!("{:x}",Sha256::digest(fs::read(samples_path)?)),
+        "sample_count":sampler.samples().len(),"roles":roles,
+        "scope":"Whole native FE/BE process RSS and cumulative CPU, including concurrent process work; not standalone delete-index memory or per-query CPU. Short waves may have no internal sample. RSS decrease is not a resource-release proof.",
+        "sampling":"50 ms worker sleep after each four-role sweep; actual per-role gaps are retained. Per-role OS counter reads and before/after birth-identity checks have an observation cost on both sides. Wave timestamps are floored monotonic milliseconds from this monitor; CPU counters have OS-dependent resolution despite nanosecond units. Final samples follow convergence and monitor join."
+    }))
 }
 
 fn summarize(values: &[u128]) -> Result<Value> {

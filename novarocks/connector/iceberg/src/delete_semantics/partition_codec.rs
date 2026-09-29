@@ -25,7 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::iceberg::spec::{Literal, PartitionSpec, PrimitiveLiteral, Schema, Struct};
+use crate::iceberg::spec::{Literal, PartitionSpec, PrimitiveLiteral, Schema, Struct, StructType};
 
 use super::{
     CanonicalScalar, DeleteSemanticsError, DeleteSemanticsErrorKind, Result, TypedPartition,
@@ -124,6 +124,17 @@ pub fn decode_partition_data_json(
     schema: &Schema,
     json: &str,
 ) -> Result<Struct> {
+    let partition_type = spec
+        .partition_type(schema)
+        .map_err(|e| invalid(e.to_string()))?;
+    decode_partition_data_json_with_type(spec, &partition_type, json)
+}
+
+pub fn decode_partition_data_json_with_type(
+    spec: &PartitionSpec,
+    partition_type: &StructType,
+    json: &str,
+) -> Result<Struct> {
     let envelope: TupleEnvelope = serde_json::from_str(json)
         .map_err(|error| invalid(format!("invalid canonical partition tuple: {error}")))?;
     if envelope.version != 1 {
@@ -134,7 +145,7 @@ pub fn decode_partition_data_json(
         .into_iter()
         .map(|value| value.map(EncodedScalar::into_literal).transpose())
         .collect::<Result<Struct>>()?;
-    TypedPartition::bind(spec, schema, &values)?;
+    TypedPartition::bind_type(spec, partition_type, &values)?;
     Ok(values)
 }
 
@@ -230,6 +241,33 @@ mod tests {
                 .fields()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn date_unit_promotion_is_rejected_only_when_a_value_requires_conversion() {
+        let (old_schema, spec) = binding(PrimitiveType::Date);
+        let old_values = Struct::from_iter([Some(Literal::int(-7))]);
+        let old = TypedPartition::bind(&spec, &old_schema, &old_values).unwrap();
+        for target in [PrimitiveType::Timestamp, PrimitiveType::TimestampNs] {
+            let (new_schema, _) = binding(target);
+            let storage_type = spec.partition_type(&new_schema).unwrap();
+            let error =
+                decode_partition_data_json_with_type(&spec, &storage_type, &old.to_json_string())
+                    .unwrap_err();
+            assert_eq!(error.kind, DeleteSemanticsErrorKind::UnsupportedPromotion);
+
+            let null = Struct::from_iter([None]);
+            let old_null = TypedPartition::bind(&spec, &old_schema, &null).unwrap();
+            assert_eq!(
+                decode_partition_data_json_with_type(
+                    &spec,
+                    &storage_type,
+                    &old_null.to_json_string(),
+                )
+                .unwrap(),
+                null
+            );
+        }
     }
 
     #[test]

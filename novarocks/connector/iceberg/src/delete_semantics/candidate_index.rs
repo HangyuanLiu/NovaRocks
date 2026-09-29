@@ -137,7 +137,7 @@ pub struct DeleteCandidateIndex {
 impl DeleteCandidateIndex {
     pub fn try_new(domain: Arc<ReadDomain>, observation: DeleteObservation) -> Result<Self> {
         let schema = domain.endpoint().schema()?;
-        let partition_bindings = domain.endpoint().bind_partition_specs(&schema)?;
+        let partition_bindings = domain.endpoint().bind_partition_specs()?;
         let mut validated_groups = HashSet::new();
         let mut groups: HashMap<BucketKind, Vec<Arc<DeleteFact>>> = HashMap::new();
         let mut deletion_vectors = HashMap::new();
@@ -355,7 +355,7 @@ pub fn validate_normalized_closure(
         ));
     }
     let schema = received_domain.endpoint().schema()?;
-    let partition_bindings = received_domain.endpoint().bind_partition_specs(&schema)?;
+    let partition_bindings = received_domain.endpoint().bind_partition_specs()?;
     validate_partition_binding(&partition_bindings, data.partition())?;
     let mut seen = HashSet::new();
     let mut validated_groups = HashSet::new();

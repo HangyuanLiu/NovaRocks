@@ -411,7 +411,7 @@ impl DeleteManager {
             let next = state.domains.len();
             *state.domains.entry(side.domain.clone()).or_insert(next)
         };
-        let mut positions = RoaringTreemap::new();
+        let mut positions: Option<Arc<RoaringTreemap>> = None;
         let mut unions = Vec::new();
         let mut seen = HashSet::new();
         for (delete, fact) in side.members {
@@ -544,7 +544,11 @@ impl DeleteManager {
                 })
                 .await?;
             match applied.as_ref() {
-                AppliedContent::Position(bitmap) => positions |= bitmap.as_ref(),
+                AppliedContent::Position(bitmap) => match &mut positions {
+                    None => positions = Some(bitmap.clone()),
+                    Some(existing) if Arc::ptr_eq(existing, bitmap) => {}
+                    Some(existing) => *Arc::make_mut(existing) |= bitmap.as_ref(),
+                },
                 AppliedContent::Equality(union) => {
                     if seen.insert(Arc::as_ptr(union) as usize) {
                         unions.push(union.clone());
@@ -553,7 +557,7 @@ impl DeleteManager {
             }
         }
         Ok(ResolvedDeletes {
-            positions,
+            positions: positions.unwrap_or_default(),
             equality: unions,
         })
     }
@@ -595,6 +599,7 @@ fn hidden_columns(
 }
 struct BoundDomain {
     schema: Schema,
+    partition_types: HashMap<i32, crate::iceberg::spec::StructType>,
     specs: HashMap<i32, PartitionSpec>,
     groups: HashMap<Vec<i32>, EqualityFieldGroup>,
 }
@@ -619,8 +624,21 @@ impl BoundDomain {
                 Ok((*id, spec))
             })
             .collect::<Result<HashMap<_, _>, ConnectorError>>()?;
+        let partition_types = domain
+            .endpoint()
+            .partition_type_jsons()
+            .keys()
+            .map(|id| {
+                domain
+                    .endpoint()
+                    .partition_type(*id)
+                    .map(|ty| (*id, ty))
+                    .map_err(|e| corrupt(e.to_string()))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         Ok(Self {
             schema,
+            partition_types,
             specs,
             groups: HashMap::new(),
         })
@@ -630,9 +648,17 @@ impl BoundDomain {
             .specs
             .get(&id)
             .ok_or_else(|| corrupt("Partition spec is not pinned by read domain"))?;
-        let values = decode_partition_data_json(spec, &self.schema, json)
-            .map_err(|e| corrupt(e.to_string()))?;
-        TypedPartition::bind(spec, &self.schema, &values).map_err(|e| corrupt(e.to_string()))
+        let partition_type = self
+            .partition_types
+            .get(&id)
+            .ok_or_else(|| corrupt("Partition storage type is not pinned by read domain"))?;
+        let values = crate::delete_semantics::decode_partition_data_json_with_type(
+            spec,
+            partition_type,
+            json,
+        )
+        .map_err(|e| corrupt(e.to_string()))?;
+        TypedPartition::bind_type(spec, partition_type, &values).map_err(|e| corrupt(e.to_string()))
     }
     fn group(&mut self, ids: &[i32]) -> Result<EqualityFieldGroup, ConnectorError> {
         let mut canonical = ids.to_vec();
@@ -823,7 +849,7 @@ fn bind_delete(
     .map_err(|e| corrupt(e.to_string()))
 }
 struct ResolvedDeletes {
-    positions: RoaringTreemap,
+    positions: Arc<RoaringTreemap>,
     equality: Vec<Arc<EqualityUnion>>,
 }
 impl ResolvedDeletes {
@@ -1699,9 +1725,22 @@ mod tests {
             Some(1),
             vec![DeleteBuilder::deletion_vector(&first, 9, first_range).build()],
         );
-        let mask = fixture
+        let first_filter = fixture
             .open_split(&single, &schema, DeleteEvaluationMode::ExcludeDeleted)
-            .expect("open split")
+            .expect("open split");
+        let second_filter = fixture
+            .open_split(&single, &schema, DeleteEvaluationMode::ExcludeDeleted)
+            .expect("reopen split");
+        let (FilterVerdict::Exclude(first_side), FilterVerdict::Exclude(second_side)) =
+            (&first_filter.verdict, &second_filter.verdict)
+        else {
+            panic!("ordinary filters");
+        };
+        assert!(
+            Arc::ptr_eq(&first_side.positions, &second_side.positions),
+            "normalized single DV shares the cached bitmap without payload cloning"
+        );
+        let mask = first_filter
             .evaluate(&batch, &positions(&[0, 1, 2]))
             .expect("evaluate");
         assert_eq!(keeps(&mask), vec![true, false, true]);

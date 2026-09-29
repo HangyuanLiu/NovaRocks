@@ -44,6 +44,11 @@ pub(crate) fn encode_read_domain(domain: &ReadDomain) -> dto::IcebergReadDomain 
         metadata_identity: endpoint.metadata_identity().to_string(),
         snapshot_id: Some(endpoint.snapshot_id()),
         schema_json: endpoint.schema_json().to_string(),
+        partition_type_jsons: endpoint
+            .partition_type_jsons()
+            .iter()
+            .map(|(id, json)| (*id, json.to_string()))
+            .collect(),
         partition_spec_jsons: endpoint
             .partition_spec_jsons()
             .iter()
@@ -57,6 +62,11 @@ pub(crate) fn decode_read_domain(
 ) -> Result<Arc<ReadDomain>, ConnectorError> {
     if raw.schema_json.len() > MAX_JSON_BYTES
         || raw.metadata_identity.len() > MAX_PATH_BYTES
+        || raw.partition_type_jsons.len() > MAX_EQUALITY_FIELD_IDS
+        || raw
+            .partition_type_jsons
+            .values()
+            .any(|json| json.len() > MAX_JSON_BYTES)
         || raw.partition_spec_jsons.len() > MAX_EQUALITY_FIELD_IDS
         || raw
             .partition_spec_jsons
@@ -90,13 +100,23 @@ pub(crate) fn decode_read_domain(
             Ok(spec)
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let endpoint = PinnedEndpointFacts::try_new(
+    let partition_types = raw
+        .partition_type_jsons
+        .iter()
+        .map(|(id, json)| {
+            serde_json::from_str(json)
+                .map(|ty| (*id, ty))
+                .map_err(|e| invalid(format!("invalid partition storage type: {e}")))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, ConnectorError>>()?;
+    let endpoint = PinnedEndpointFacts::try_new_with_partition_types(
         table_uuid,
         raw.metadata_identity.clone(),
         raw.snapshot_id
             .ok_or_else(|| invalid("Iceberg read domain requires a snapshot"))?,
         &schema,
         &specs,
+        &partition_types,
     )
     .map_err(|e| invalid(e.to_string()))?;
     Ok(Arc::new(ReadDomain::new(observation, endpoint)))
@@ -896,6 +916,7 @@ impl IcebergSplit {
 
     fn compute_retained_size_in_bytes(&self) -> u64 {
         let mut retained = size_of::<Self>()
+            + self.read_domain.expanded_descriptor_bytes()
             + self.path.len()
             + self.partition_data_json.len()
             + self.affinity_key.as_ref().map_or(0, |key| key.len())
@@ -1332,6 +1353,125 @@ pub(crate) mod tests {
         assert!(IcebergSplitWeightParameters::try_new(0, 0.05).is_err());
         assert!(IcebergSplitWeightParameters::try_new(100, 0.0).is_err());
         assert!(IcebergSplitWeightParameters::try_new(100, 1.5).is_err());
+    }
+
+    #[test]
+    fn domain_charge_covers_full_private_binding_and_survives_planned_wire_roundtrip() {
+        use crate::delete_semantics::*;
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Struct, Transform, Type};
+        use prost::Message;
+        fn split_with_binding(padding: &str) -> IcebergSplit {
+            let field_name = format!("key_{padding}");
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    &field_name,
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let empty = PartitionSpec::unpartition_spec();
+            let partitioned = PartitionSpec::builder(Arc::new(schema.clone()))
+                .with_spec_id(1)
+                .add_partition_field(
+                    &field_name,
+                    format!("stored_{padding}"),
+                    Transform::Identity,
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let seed = read_domain();
+            let domain = Arc::new(ReadDomain::new(
+                seed.observation(),
+                PinnedEndpointFacts::try_new(
+                    seed.endpoint().table_uuid(),
+                    format!("metadata:{padding}"),
+                    11,
+                    &schema,
+                    &[empty.clone(), partitioned],
+                )
+                .unwrap(),
+            ));
+            let partition = TypedPartition::bind(&empty, &schema, &Struct::empty()).unwrap();
+            let data = DataFileFact::try_new(
+                "data.parquet",
+                DataSequenceNumber::try_new(4).unwrap(),
+                partition.clone(),
+                100,
+                FileMetrics::default(),
+            )
+            .unwrap();
+            let fact = Arc::new(
+                DeleteFact::try_new(DeleteFactParams {
+                    address: DeleteContentAddress::file("eq.parquet").unwrap(),
+                    kind: DeleteKind::Equality(EqualityFieldGroup::bind(&[1], &schema).unwrap()),
+                    sequence: DataSequenceNumber::try_new(5).unwrap(),
+                    partition,
+                    read: DeleteReadFacts {
+                        format: DeleteFormat::Parquet,
+                        file_size: 128,
+                        record_count: 4,
+                        key_metadata: Arc::from([]),
+                    },
+                    metrics: FileMetrics::default(),
+                })
+                .unwrap(),
+            );
+            let index = DeleteCandidateIndex::try_new(
+                domain.clone(),
+                DeleteObservation::from_normalized_recall([fact]).unwrap(),
+            )
+            .unwrap();
+            let view = index
+                .for_data(&data)
+                .unwrap()
+                .load_view(StatisticsPolicy::Disabled);
+            let mut params = split_params("data.parquet", 0, 128, 128);
+            params.read_domain = domain;
+            params.partition_data_json = data.partition().to_json_string();
+            params.deletes = IcebergSplitDeletes::Planned(view);
+            IcebergSplit::try_new(params).unwrap()
+        }
+        let short = split_with_binding("short");
+        let long = split_with_binding(&"x".repeat(2048));
+        assert!(
+            long.retained_size_in_bytes() > short.retained_size_in_bytes() + 8_000,
+            "schema, spec, result-type and metadata strings all contribute to the expanded charge"
+        );
+        for planned in [short, long] {
+            let encoded = planned.to_proto().unwrap();
+            assert_eq!(
+                encoded
+                    .read_domain
+                    .as_ref()
+                    .unwrap()
+                    .partition_type_jsons
+                    .len(),
+                2
+            );
+            let bytes = encoded.encode_to_vec();
+            let decoded_dto = dto::IcebergSplit::decode(bytes.as_slice()).unwrap();
+            let decoded = IcebergSplit::from_proto(
+                &decoded_dto,
+                planned.split_weight(),
+                planned.affinity_key().map(str::to_owned),
+            )
+            .unwrap();
+            assert!(matches!(decoded.deletes(), IcebergSplitDeletes::Decoded(_)));
+            assert_eq!(planned.read_domain(), decoded.read_domain());
+            assert_eq!(
+                planned.retained_size_in_bytes(),
+                decoded.retained_size_in_bytes()
+            );
+            assert!(
+                planned.retained_size_in_bytes()
+                    >= encoded.read_domain.as_ref().unwrap().encoded_len() as u64
+            );
+            let charge = planned.retained_size_in_bytes();
+            let _shared = vec![planned.read_domain().clone(); 32];
+            assert_eq!(planned.clone().retained_size_in_bytes(), charge);
+        }
     }
 
     #[test]

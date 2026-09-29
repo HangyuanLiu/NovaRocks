@@ -880,7 +880,7 @@ fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, 
             partition_spec.spec_id()
         )));
     }
-    let partition_values = parse_partition_values(split, &partition_spec, &table_schema)?;
+    let partition_values = parse_partition_values(split, &partition_spec)?;
     // Validate the relation/split binding before even the partition-only path
     // can answer rows. The relation supplies the independent expected domain.
     DeleteManager::preview_hidden_columns(
@@ -1069,8 +1069,7 @@ pub(super) fn plan_iceberg_prepared_input(
             relation.partition_spec.spec_id()
         )));
     }
-    let partition_values =
-        parse_partition_values(split, &relation.partition_spec, &relation.table_schema)?;
+    let partition_values = parse_partition_values(split, &relation.partition_spec)?;
     if *delete_mode == DeleteEvaluationMode::ExcludeDeleted
         && try_partition_only_page_source(
             split,
@@ -1208,11 +1207,15 @@ fn parse_name_mapping(json: Option<&str>) -> Result<Option<Arc<NameMapping>>, Co
 fn parse_partition_values(
     split: &IcebergSplit,
     partition_spec: &PartitionSpec,
-    table_schema: &Schema,
 ) -> Result<Struct, ConnectorError> {
-    crate::delete_semantics::decode_partition_data_json(
+    let partition_type = split
+        .read_domain()
+        .endpoint()
+        .partition_type(partition_spec.spec_id())
+        .map_err(|error| corrupt(format!("iceberg pinned partition type: {error}")))?;
+    crate::delete_semantics::decode_partition_data_json_with_type(
         partition_spec,
-        table_schema,
+        &partition_type,
         split.partition_data_json(),
     )
     .map_err(|error| corrupt(format!("iceberg split partition data: {error}")))

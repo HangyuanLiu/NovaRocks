@@ -53,11 +53,18 @@ ORDER = tuple(
     for side in sides
 )
 CONTROL_NAMES = {"no_delete_n1", "no_delete_n10", "no_delete_n100", "no_delete_n1000", "equality_m1"}
-WAVE_KEYS = set("case snapshot metadata cache side pass concurrency run warmup wave_elapsed_ns expected expected_aggregate_sha256 samples".split())
+WAVE_KEYS = set("case snapshot metadata cache side pass concurrency run warmup wave_elapsed_ns resource_window_start_ms resource_window_end_ms expected expected_aggregate_sha256 samples".split())
 SAMPLE_KEYS = set("actor query_elapsed_ns aggregate aggregate_sha256 matched error_class".split())
 SUMMARY_KEYS = set("min median p95_nearest_rank max mean coefficient_of_variation all_samples_retained".split())
 CACHE_FLAGS = ("page_cache_enable", "parquet_page_cache_enable", "datacache_enable")
 FIXTURE_ENV = {"NOVAROCKS_UEA4G_FIXTURE_ACCESS", "NOVAROCKS_UEA4G_FIXTURE_SECRET"}
+RESOURCE_ROLES = ("fe", "be-0", "be-1", "be-2")
+OUTPUT_FILENAMES = {
+    "evidence": "delete-performance.json", "samples": "delete-performance-samples.jsonl",
+    "objects": "delete-performance-objects.jsonl", "scenario": "scenario-evidence.json",
+    "resource_envelope": "delete-performance-resources.json",
+    "resource_samples": "delete-performance-resources.jsonl",
+}
 
 
 def require(condition, message):
@@ -234,6 +241,11 @@ def load_inputs(args):
     return {"schema_version": 1, "files": files, "sources": sources,
             "platform": {"system": platform.system(), "machine": platform.machine(), "logical_cpus": os.cpu_count()},
             "parameters": params, "latency_gates": gates,
+            "resource_sampling": {"sample_interval_ms": 50, "clock_resolution_ms": 1,
+                                  "roles": list(RESOURCE_ROLES), "raw_envelope_schema": 3,
+                                  "scope": "whole process; no per-index attribution or RSS release gate",
+                                  "implementation": "cluster-harness ProcessResourceMonitor: four-role OS reads, with exact birth-identity checks before/after each role; macOS libproc and Linux procfs; no per-query subprocess",
+                                  "observer_cost": "Fixed four-role OS sampling work plus 50 ms sleep per sweep on both sides; actual gaps are retained, and observation is not zero-cost."},
             "source_provenance_limit": "Source checkout hashes exclude the experiment artifact root and accompany supplied binaries; the driver does not prove which source bytes compiled a binary."}, cases, manifest
 
 
@@ -263,6 +275,10 @@ def audit_wave(wave, spec, cases):
     run = integer(wave["run"], "run")
     require(run < 11 and wave["warmup"] is (run < 2), "wrong warmup/measured index")
     integer(wave["wave_elapsed_ns"], "wave elapsed", 1)
+    start = integer(wave["resource_window_start_ms"], "resource window start")
+    end = integer(wave["resource_window_end_ms"], "resource window end")
+    require(start <= end and wave["wave_elapsed_ns"] < (end - start + 1) * 1_000_000,
+            "resource window does not enclose the timed wave at millisecond resolution")
     require(wave["expected"] == case["expected_aggregate"], "sample expected aggregate differs")
     require(wave["expected_aggregate_sha256"] == aggregate_digest(wave["expected"]), "expected aggregate hash differs")
     samples = wave["samples"]
@@ -358,6 +374,81 @@ def audit_effective_config(scenario, cache):
             "without_cache_switches_sha256": canonical_digest(normalized), "native_sha256": native_sha}
 
 
+def audit_resources(report, envelope_path, samples_path, identities, status, spec, waves):
+    exact_keys(report, set("schema_version run_id sample_interval_ms clock_resolution_ms started_wall_ns ended_wall_ns queries_finished_ms convergence_finished_ms envelope_sha256 samples_sha256 sample_count roles scope sampling".split()), "resource evidence")
+    run_id = f"uea4g-{spec['pass']}-{spec['cache']}-{spec['side']}"
+    require(report["schema_version"] == 1 and report["run_id"] == run_id and
+            report["sample_interval_ms"] == 50 and report["clock_resolution_ms"] == 1,
+            "resource sampling contract differs")
+    require(report["envelope_sha256"] == sha256(envelope_path) and
+            report["samples_sha256"] == sha256(samples_path), "resource evidence hash mismatch")
+    for field in ("started_wall_ns", "ended_wall_ns", "queries_finished_ms", "convergence_finished_ms", "sample_count"):
+        integer(report[field], "resource " + field)
+    require(status["started_wall_ns"] <= report["started_wall_ns"] <= report["ended_wall_ns"] <= status["ended_wall_ns"],
+            "resource wall-clock window escapes the runner")
+    require(report["queries_finished_ms"] <= report["convergence_finished_ms"], "resource convergence precedes queries")
+    envelope = read_json(envelope_path)
+    exact_keys(envelope, {"schema_version", "run_id", "processes", "samples"}, "resource envelope")
+    require(envelope["schema_version"] == 3 and envelope["run_id"] == run_id, "resource envelope identity/schema differs")
+    expected_processes = {identity["role"]: {key: identity[key] for key in ("pid", "process_start_token")}
+                          for identity in identities}
+    require(set(expected_processes) == set(RESOURCE_ROLES) and len(identities) == 4 and
+            len({identity["pid"] for identity in identities}) == 4,
+            "resource launch roles are missing or duplicated")
+    require(envelope["processes"] == expected_processes, "resource identities differ from exact native launches")
+    samples = envelope["samples"]
+    require(isinstance(samples, list) and len(samples) == report["sample_count"], "resource sample count differs")
+    require(len(samples) % 4 == 0 and all([sample["role"] for sample in samples[offset:offset + 4]] == sorted(RESOURCE_ROLES)
+                                       for offset in range(0, len(samples), 4)), "incomplete/reordered four-role resource sweep")
+    with Path(samples_path).open() as stream:
+        require([parse_json(line) for line in stream] == samples, "resource JSONL differs from raw envelope")
+    by_role = {role: [] for role in RESOURCE_ROLES}
+    previous_elapsed = 0
+    for sample in samples:
+        exact_keys(sample, set("elapsed_millis role pid process_start_token rss_bytes threads cpu_user_nanos cpu_system_nanos unavailable_reason".split()), "resource sample")
+        role = sample["role"]
+        require(role in by_role and {key: sample[key] for key in ("pid", "process_start_token")} == expected_processes[role],
+                "resource sample belongs to another process lifetime")
+        elapsed = integer(sample["elapsed_millis"], "resource sample time")
+        require(previous_elapsed <= elapsed <= status["elapsed_monotonic_ns"] // 1_000_000 + 1,
+                "resource samples are unordered or outside runner duration")
+        previous_elapsed = elapsed
+        require(sample["unavailable_reason"] is None, "resource counters unavailable; never substitute zero")
+        integer(sample["rss_bytes"], "process RSS", 1)
+        for counter in ("cpu_user_nanos", "cpu_system_nanos"):
+            integer(sample[counter], counter)
+            require(not by_role[role] or by_role[role][-1][counter] <= sample[counter], "process CPU counter moved backwards")
+        if sample["threads"] is not None:
+            integer(sample["threads"], "process threads", 1)
+        by_role[role].append(sample)
+    require(waves, "missing resource wave windows")
+    previous_end = 0
+    for wave in waves:
+        require(previous_end <= wave["resource_window_start_ms"] <= wave["resource_window_end_ms"] <= report["queries_finished_ms"],
+                "resource wave windows overlap, reorder, or escape query phase")
+        previous_end = wave["resource_window_end_ms"]
+    measured = [wave for wave in waves if not wave["warmup"]]
+    require(measured, "missing measured resource window")
+    first_measured_start = measured[0]["resource_window_start_ms"]
+    summaries = []
+    for role, role_samples in by_role.items():
+        require(len(role_samples) >= 2, "insufficient resource samples for " + role)
+        first, last = role_samples[0], role_samples[-1]
+        require(first["elapsed_millis"] <= first_measured_start and
+                last["elapsed_millis"] >= report["convergence_finished_ms"],
+                "resource samples do not bracket measurements and terminal convergence")
+        threads = [sample["threads"] for sample in role_samples if sample["threads"] is not None]
+        summaries.append({"role": role, **expected_processes[role], "sample_count": len(role_samples),
+                          "first_sample_elapsed_ms": first["elapsed_millis"], "last_sample_elapsed_ms": last["elapsed_millis"],
+                          "max_sample_gap_ms": max(b["elapsed_millis"] - a["elapsed_millis"] for a, b in zip(role_samples, role_samples[1:])),
+                          "rss_high_water_bytes": max(sample["rss_bytes"] for sample in role_samples),
+                          "threads_high_water": max(threads) if threads else None,
+                          "cpu_user_delta_nanos": last["cpu_user_nanos"] - first["cpu_user_nanos"],
+                          "cpu_system_delta_nanos": last["cpu_system_nanos"] - first["cpu_system_nanos"]})
+    require(report["roles"] == summaries, "resource summary differs from raw process samples")
+    return report
+
+
 def audit_run(spec, inputs, cases, manifest):
     run_root = Path(spec["artifact_root"])
     status = read_json(run_root / "driver-run.json")
@@ -370,13 +461,11 @@ def audit_run(spec, inputs, cases, manifest):
             "invalid driver timing")
     require(status["runner_log"] == file_identity(run_root / "runner.log"), "runner log changed")
     root = run_root / SCENARIO_DIR
-    paths = {name: root / filename for name, filename in
-             (("evidence", "delete-performance.json"), ("samples", "delete-performance-samples.jsonl"),
-              ("objects", "delete-performance-objects.jsonl"), ("scenario", "scenario-evidence.json"))}
+    paths = {name: root / filename for name, filename in OUTPUT_FILENAMES.items()}
     hashes = {name: file_identity(path) for name, path in paths.items()}
     require(status["output_files"] == hashes, "run output files changed after completion")
     evidence = read_json(paths["evidence"])
-    expected_keys = set("manifest_sha256 corpus_sha256 scale_sha256 scale_artifacts_sha256 binary_sha256 cache side pass warmup_runs measured_runs concurrencies timing cold_definition warm_definition aggregate_checksum_definition samples_sha256 object_evidence summary succeeded comparison_owner".split())
+    expected_keys = set("manifest_sha256 corpus_sha256 scale_sha256 scale_artifacts_sha256 binary_sha256 cache side pass warmup_runs measured_runs concurrencies timing cold_definition warm_definition aggregate_checksum_definition samples_sha256 object_evidence resource_evidence resource_error summary succeeded comparison_owner".split())
     exact_keys(evidence, expected_keys, "performance evidence")
     for label in ("side", "pass", "cache"):
         require(evidence[label] == spec[label], f"wrong evidence {label}")
@@ -426,6 +515,11 @@ def audit_run(spec, inputs, cases, manifest):
             rows[key] = wave
     expected = {(name, concurrency, run) for name in cases for concurrency in (1, 4) for run in range(11)}
     require(rows.keys() == expected, "missing/extra case, concurrency, or repetition samples")
+    require(list(rows) == [(name, concurrency, run) for name in cases for concurrency in (1, 4) for run in range(11)],
+            "sample wave order differs from the frozen matrix")
+    require(evidence["resource_error"] is None, "resource sampler failed")
+    resources = audit_resources(evidence["resource_evidence"], paths["resource_envelope"], paths["resource_samples"],
+                                identities, status, spec, list(rows.values()))
     summary = evidence["summary"]
     exact_keys(summary, {"groups", "all_input_aggregates_match", "baseline_controls_match", "wrong_case_policy"}, "experiment summary")
     groups = {}
@@ -446,6 +540,8 @@ def audit_run(spec, inputs, cases, manifest):
                 group["incorrect_actor_samples"] == sum(not s["matched"] for w in waves for s in w["samples"]),
                 "group correctness summary differs from raw samples")
         groups[key] = {"query_ns": query_ns, "wave_ns": wave_ns, "correct": correct,
+                       "resource_windows": [{k: w[k] for k in ("run", "warmup", "resource_window_start_ms", "resource_window_end_ms")}
+                                            for w in waves],
                        "errors": [dict(run=w["run"], warmup=w["warmup"], **s)
                                   for w in waves for s in w["samples"] if not s["matched"]]}
     require(groups.keys() == {(name, c) for name in cases for c in (1, 4)}, "missing summary groups")
@@ -459,7 +555,7 @@ def audit_run(spec, inputs, cases, manifest):
             scenario["outcome"] == ("passed" if accepted else "failed") and
             scenario["exit_code"] == (0 if accepted else 1),
             "scenario exit differs from complete aggregate acceptance; possible infrastructure/cleanup failure")
-    return {"spec": spec, "groups": groups, "files": hashes, "object_counters": objects,
+    return {"spec": spec, "groups": groups, "files": hashes, "object_counters": objects, "resources": resources,
             "driver_run": file_identity(run_root / "driver-run.json"), "runner_log": status["runner_log"],
             "started_monotonic_ns": status["started_monotonic_ns"],
             "elapsed_monotonic_ns": status["elapsed_monotonic_ns"],
@@ -500,7 +596,8 @@ def compare_runs(audits, cases):
                         group = samples[p, side]
                         query = summarize(group["query_ns"])
                         part["sides"][side] = {"query_ns": query, "wave_ns": summarize(group["wave_ns"]),
-                                              "correct": group["correct"], "errors": group["errors"]}
+                                              "correct": group["correct"], "errors": group["errors"],
+                                              "resource_windows": group["resource_windows"]}
                         if control and query["coefficient_of_variation"] > .10:
                             noise.append(dict(label, side=side, pass_id=p, coefficient_of_variation=query["coefficient_of_variation"]))
                     item["passes"].append(part)
@@ -571,10 +668,8 @@ def execute(spec):
             status["elapsed_monotonic_ns"] = time.monotonic_ns() - status["started_monotonic_ns"]
             status["status"] = "completed" if status["exit_code"] == 0 else "failed"
             status["runner_log"] = file_identity(root / "runner.log")
-            filenames = {"evidence": "delete-performance.json", "samples": "delete-performance-samples.jsonl",
-                         "objects": "delete-performance-objects.jsonl", "scenario": "scenario-evidence.json"}
             status["output_files"] = {name: file_identity(root / SCENARIO_DIR / filename)
-                                      for name, filename in filenames.items() if (root / SCENARIO_DIR / filename).is_file()}
+                                      for name, filename in OUTPUT_FILENAMES.items() if (root / SCENARIO_DIR / filename).is_file()}
             write_json(root / "driver-run.json", status)
     require(not status.get("interrupted"), "experiment interrupted; do not reuse its incomplete run order")
 

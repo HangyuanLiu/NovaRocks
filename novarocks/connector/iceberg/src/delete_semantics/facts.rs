@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::iceberg::spec::{
     DataFileFormat, FormatVersion, Literal, ManifestStatus, PartitionSpec, PrimitiveLiteral,
-    PrimitiveType, Schema, Struct, Type,
+    PrimitiveType, Schema, Struct, StructType, Type,
 };
 
 use super::{DeleteSemanticsError as Error, DeleteSemanticsErrorKind as Kind, FileMetrics, Result};
@@ -113,6 +113,18 @@ impl CanonicalScalar {
             }
             _ => {}
         }
+        if matches!(
+            (value, value_type),
+            (
+                PrimitiveLiteral::Int(_),
+                PrimitiveType::Timestamp | PrimitiveType::TimestampNs
+            )
+        ) {
+            return Err(Error::new(
+                Kind::UnsupportedPromotion,
+                "date partition value requires an unsupported date-to-timestamp unit conversion",
+            ));
+        }
         if !value_type.compatible(value) {
             return Err(Error::new(
                 Kind::InvalidFieldBinding,
@@ -189,6 +201,17 @@ impl TypedPartition {
         let partition_type = spec
             .partition_type(schema)
             .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))?;
+        Self::bind_type(spec, &partition_type, tuple)
+    }
+
+    /// Bind stored values to the FE-frozen storage type, independently of the
+    /// projected query schema. Historical partition sources may be dropped.
+    pub fn bind_type(
+        spec: &PartitionSpec,
+        partition_type: &StructType,
+        tuple: &Struct,
+    ) -> Result<Self> {
+        validate_partition_type(spec, partition_type)?;
         if spec.spec_id() < 0 || partition_type.fields().len() != tuple.fields().len() {
             return Err(Error::new(
                 Kind::InvalidPartition,
@@ -239,6 +262,27 @@ impl TypedPartition {
     pub const fn is_unpartitioned(&self) -> bool {
         self.unpartitioned
     }
+}
+
+fn validate_partition_type(spec: &PartitionSpec, partition_type: &StructType) -> Result<()> {
+    if spec.fields().len() != partition_type.fields().len()
+        || spec
+            .fields()
+            .iter()
+            .zip(partition_type.fields())
+            .any(|(declared, field)| {
+                declared.field_id != field.id
+                    || declared.name != field.name
+                    || field.required
+                    || !matches!(field.field_type.as_ref(), Type::Primitive(_))
+            })
+    {
+        return Err(Error::new(
+            Kind::InvalidPartition,
+            "partition storage type does not match its ordered spec fields",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -739,6 +783,7 @@ pub struct PinnedEndpointFacts {
     snapshot_id: i64,
     schema_json: Arc<str>,
     partition_spec_jsons: BTreeMap<i32, Arc<str>>,
+    partition_type_jsons: BTreeMap<i32, Arc<str>>,
 }
 
 impl PinnedEndpointFacts {
@@ -751,6 +796,34 @@ impl PinnedEndpointFacts {
         schema: &Schema,
         partition_specs: &[PartitionSpec],
     ) -> Result<Self> {
+        let partition_types = partition_specs
+            .iter()
+            .map(|spec| {
+                spec.partition_type(schema)
+                    .map(|ty| (spec.spec_id(), ty))
+                    .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Self::try_new_with_partition_types(
+            table_uuid,
+            metadata_identity,
+            snapshot_id,
+            schema,
+            partition_specs,
+            &partition_types,
+        )
+    }
+
+    /// The FE supplies proven storage bindings; wire admission validates their
+    /// shape and compares the complete domain to the independent relation.
+    pub fn try_new_with_partition_types(
+        table_uuid: uuid::Uuid,
+        metadata_identity: impl Into<Arc<str>>,
+        snapshot_id: i64,
+        schema: &Schema,
+        partition_specs: &[PartitionSpec],
+        partition_types: &BTreeMap<i32, StructType>,
+    ) -> Result<Self> {
         let metadata_identity = metadata_identity.into();
         if table_uuid.is_nil() || metadata_identity.is_empty() {
             return Err(Error::new(
@@ -761,9 +834,34 @@ impl PinnedEndpointFacts {
         let schema_json = super::canonical_schema_json(schema)
             .map_err(|e| Error::new(Kind::InvalidFieldBinding, e.to_string()))?;
         let mut partition_spec_jsons = BTreeMap::new();
+        let mut partition_type_jsons = BTreeMap::new();
         for spec in partition_specs {
-            spec.partition_type(schema)
+            let partition_type = partition_types.get(&spec.spec_id()).ok_or_else(|| {
+                Error::new(
+                    Kind::InvalidPartition,
+                    "pinned partition storage type is absent",
+                )
+            })?;
+            validate_partition_type(spec, partition_type)?;
+            for (source, field) in spec.fields().iter().zip(partition_type.fields()) {
+                if let Some(query_field) = schema.field_by_id(source.source_id) {
+                    // An older query can predate this spec's transform input
+                    // type. Such a storage binding is authoritative only as
+                    // part of the complete independently pinned FE domain.
+                    if let Ok(expected) = source.transform.result_type(&query_field.field_type)
+                        && expected != *field.field_type
+                    {
+                        return Err(Error::new(
+                            Kind::InvalidPartition,
+                            "partition storage type disagrees with its resolved query source",
+                        ));
+                    }
+                }
+            }
+            let mut type_value = serde_json::to_value(partition_type)
                 .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))?;
+            type_value.sort_all_objects();
+            partition_type_jsons.insert(spec.spec_id(), Arc::from(type_value.to_string()));
             let json: Arc<str> = Arc::from(
                 serde_json::to_string(spec)
                     .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))?,
@@ -778,13 +876,32 @@ impl PinnedEndpointFacts {
                 ));
             }
         }
+        if partition_types.len() != partition_type_jsons.len() {
+            return Err(Error::new(
+                Kind::InvalidPartition,
+                "partition storage types and specs have different inventories",
+            ));
+        }
         Ok(Self {
             table_uuid,
             metadata_identity,
             snapshot_id,
             schema_json: Arc::from(schema_json),
             partition_spec_jsons,
+            partition_type_jsons,
         })
+    }
+    pub fn partition_type_jsons(&self) -> &BTreeMap<i32, Arc<str>> {
+        &self.partition_type_jsons
+    }
+    pub fn partition_type(&self, spec_id: i32) -> Result<StructType> {
+        let json = self.partition_type_jsons.get(&spec_id).ok_or_else(|| {
+            Error::new(
+                Kind::InvalidPartition,
+                "partition storage type is absent from the pinned endpoint",
+            )
+        })?;
+        serde_json::from_str(json).map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))
     }
     pub const fn table_uuid(&self) -> uuid::Uuid {
         self.table_uuid
@@ -808,18 +925,13 @@ impl PinnedEndpointFacts {
 
     /// Checks type/scope proof against the relation's frozen spec set. The
     /// caller cannot introduce a made-up unpartitioned spec on a delete alone.
-    pub(crate) fn bind_partition_specs(
-        &self,
-        schema: &Schema,
-    ) -> Result<BTreeMap<i32, PartitionTypeBinding>> {
+    pub(crate) fn bind_partition_specs(&self) -> Result<BTreeMap<i32, PartitionTypeBinding>> {
         self.partition_spec_jsons
             .iter()
             .map(|(id, json)| {
                 let spec: PartitionSpec = serde_json::from_str(json)
                     .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))?;
-                let partition_type = spec
-                    .partition_type(schema)
-                    .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))?;
+                let partition_type = self.partition_type(*id)?;
                 let fields = partition_type
                     .fields()
                     .iter()
@@ -864,14 +976,35 @@ pub(crate) fn validate_partition_binding(
 pub struct ReadDomain {
     observation: ReadObservationId,
     endpoint: PinnedEndpointFacts,
+    expanded_descriptor_bytes: usize,
 }
 
 impl ReadDomain {
     pub fn new(observation: ReadObservationId, endpoint: PinnedEndpointFacts) -> Self {
+        // Canonical expanded scheduling charge, independent of Arc sharing.
+        // Precompute once: split charge must not re-walk the schema/spec maps.
+        let expanded_descriptor_bytes = endpoint
+            .partition_spec_jsons
+            .values()
+            .chain(endpoint.partition_type_jsons.values())
+            .fold(
+                size_of::<Self>()
+                    .saturating_add(endpoint.metadata_identity.len())
+                    .saturating_add(endpoint.schema_json.len()),
+                |bytes, json| {
+                    bytes
+                        .saturating_add(size_of::<i32>() + size_of::<Arc<str>>())
+                        .saturating_add(json.len())
+                },
+            );
         Self {
             observation,
             endpoint,
+            expanded_descriptor_bytes,
         }
+    }
+    pub const fn expanded_descriptor_bytes(&self) -> usize {
+        self.expanded_descriptor_bytes
     }
     pub const fn observation(&self) -> ReadObservationId {
         self.observation

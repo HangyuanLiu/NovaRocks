@@ -45,6 +45,7 @@ pub enum DeleteSemanticsErrorKind {
     InvalidSequence,
     InvalidPartition,
     InvalidFieldBinding,
+    UnsupportedPromotion,
     InvalidAddress,
     InvalidReadFacts,
     MultipleDeletionVectors,

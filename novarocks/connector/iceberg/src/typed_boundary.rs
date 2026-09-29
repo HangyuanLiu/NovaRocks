@@ -490,8 +490,7 @@ impl IcebergTypedBoundary {
         handle: &IcebergChangeWindowHandle,
     ) -> Result<IcebergChangeWindowSplitSource, ConnectorError> {
         let physical = self.load_pinned_relation(handle.schema_table_name())?;
-        let schema = handle.parse_table_schema()?;
-        let partition_types = change_window_partition_types(physical.table.metadata(), &schema)?;
+        let partition_types = change_window_partition_types(handle.to_read_domain())?;
         let from_visible =
             self.change_window_endpoint_files(&physical.table, handle.from_read_domain().clone())?;
         let to_visible =
@@ -2167,7 +2166,7 @@ fn pinned_change_window_handle(
     }
 
     let from_schema = pinned_schema(metadata, Some(from))?;
-    let to_schema = pinned_schema(metadata, Some(to))?;
+    let to_schema = crate::change_planning::resolved_window_schema(metadata, to)?;
     if !struct_types_share_field_identities(from_schema.as_struct(), to_schema.as_struct()) {
         // A rename preserves every field ID, so one frozen schema still
         // describes both endpoints. Anything else does not, and the single
@@ -2283,20 +2282,20 @@ fn types_share_field_identities(previous: &Type, next: &Type) -> bool {
 /// the change-window handle itself carries no spec, so they are resolved from
 /// the same metadata the endpoints were pinned from.
 fn change_window_partition_types(
-    metadata: &TableMetadata,
-    schema: &Schema,
+    domain: &crate::delete_semantics::ReadDomain,
 ) -> Result<BTreeMap<i32, Type>, ConnectorError> {
-    let mut partition_types = BTreeMap::new();
-    for spec in metadata.partition_specs_iter() {
-        let partition_type = spec.partition_type(schema).map_err(|error| {
-            corrupt(format!(
-                "iceberg partition spec {} does not bind to the change window's frozen schema: {error}",
-                spec.spec_id()
-            ))
-        })?;
-        partition_types.insert(spec.spec_id(), Type::Struct(partition_type));
-    }
-    Ok(partition_types)
+    domain
+        .endpoint()
+        .partition_type_jsons()
+        .keys()
+        .map(|id| {
+            domain
+                .endpoint()
+                .partition_type(*id)
+                .map(|ty| (*id, Type::Struct(ty)))
+                .map_err(|e| corrupt(e.to_string()))
+        })
+        .collect()
 }
 
 /// The columns a change-window relation exposes.
@@ -3617,5 +3616,93 @@ mod manifest_statistics_tests {
         )
         .expect_err("inverted bounds are corruption");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+}
+
+#[cfg(test)]
+mod historical_window_schema_tests {
+    use super::*;
+    use crate::iceberg::spec::{Operation, Snapshot, SortOrder, Summary, TableMetadataBuilder};
+
+    #[test]
+    fn later_promotion_does_not_rebind_historical_window_admission_or_execution() {
+        let schema = |primitive| {
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "key",
+                    Type::Primitive(primitive),
+                ))])
+                .build()
+                .unwrap()
+        };
+        let metadata = TableMetadataBuilder::new(
+            schema(PrimitiveType::Int),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory:///window".to_owned(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let timestamp = metadata.last_updated_ms();
+        let snapshot = |id, parent| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_parent_snapshot_id(parent)
+                .with_sequence_number(id)
+                .with_timestamp_ms(timestamp)
+                .with_manifest_list(format!("memory:///window-{id}.avro"))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(0)
+                .build()
+        };
+        let metadata = metadata
+            .into_builder(None)
+            .add_snapshot(snapshot(1, None))
+            .unwrap()
+            .add_snapshot(snapshot(2, Some(1)))
+            .unwrap()
+            .add_current_schema(schema(PrimitiveType::Long))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata
+                .current_schema()
+                .field_by_id(1)
+                .unwrap()
+                .field_type
+                .as_ref(),
+            &Type::Primitive(PrimitiveType::Long)
+        );
+        let admitted = crate::change_planning::resolved_window_schema(&metadata, 2).unwrap();
+        let handle = pinned_change_window_handle(
+            &SchemaTableName::try_new("db", "t").unwrap(),
+            &metadata,
+            ConnectorReadChangeWindow::new(1, 2),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(admitted.as_ref(), &handle.parse_table_schema().unwrap());
+        assert_eq!(
+            admitted.field_by_id(1).unwrap().field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Int)
+        );
+        assert_eq!(
+            handle.from_read_domain().endpoint().schema().unwrap(),
+            *admitted
+        );
+        assert_eq!(
+            handle.to_read_domain().endpoint().schema().unwrap(),
+            *admitted
+        );
     }
 }

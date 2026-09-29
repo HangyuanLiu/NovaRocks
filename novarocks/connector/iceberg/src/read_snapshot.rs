@@ -27,8 +27,8 @@ use crate::delete_semantics::{
     RawDeleteFile, ReadDomain, ReadObservationId, StatisticsPolicy, TypedPartition,
 };
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, Literal, ManifestStatus, PrimitiveLiteral,
-    PrimitiveType, Schema, Struct, TableMetadata, Type,
+    DataContentType, DataFile, DataFileFormat, Literal, ManifestStatus, NestedField,
+    PrimitiveLiteral, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
 use crate::read_model::{
@@ -52,17 +52,149 @@ pub(crate) fn mint_read_domain(
         .partition_specs_iter()
         .map(|s| s.as_ref().clone())
         .collect::<Vec<_>>();
-    let endpoint = PinnedEndpointFacts::try_new(
+    let partition_types = frozen_partition_types(metadata, schema)?;
+    let endpoint = PinnedEndpointFacts::try_new_with_partition_types(
         metadata.uuid(),
         metadata_identity(metadata)?,
         snapshot_id,
         schema,
         &specs,
+        &partition_types,
     )
     .map_err(|e| e.to_string())?;
     let observation =
         ReadObservationId::try_new(*uuid::Uuid::now_v7().as_bytes()).map_err(|e| e.to_string())?;
     Ok(Arc::new(ReadDomain::new(observation, endpoint)))
+}
+
+/// Resolve storage partition types once from the pinned field-ID history.
+/// A missing projected source does not erase its historical storage facts.
+fn frozen_partition_types(
+    metadata: &TableMetadata,
+    query: &Schema,
+) -> Result<BTreeMap<i32, StructType>, String> {
+    let mut sources = BTreeMap::<i32, (PrimitiveType, PrimitiveType)>::new();
+    for spec in metadata.partition_specs_iter() {
+        for field in spec.fields() {
+            if sources.contains_key(&field.source_id) {
+                continue;
+            }
+            let mut historical = None;
+            for schema in metadata.schemas_iter() {
+                let Some(source) = schema.field_by_id(field.source_id) else {
+                    continue;
+                };
+                let Type::Primitive(ty) = source.field_type.as_ref() else {
+                    return Err(format!(
+                        "partition source {} is not primitive in retained schema {}",
+                        field.source_id,
+                        schema.schema_id()
+                    ));
+                };
+                historical = Some(match historical {
+                    None => ty.clone(),
+                    Some(previous) => legal_partition_type_join(metadata.format_version(), &previous, ty).ok_or_else(|| format!("partition source {} has incompatible retained types {previous:?} and {ty:?}", field.source_id))?,
+                });
+            }
+            let historical = historical.ok_or_else(|| {
+                format!(
+                    "partition source {} has no retained schema type evidence",
+                    field.source_id
+                )
+            })?;
+            let resolved = match query.field_by_id(field.source_id) {
+                Some(source) => {
+                    let Type::Primitive(ty) = source.field_type.as_ref() else {
+                        return Err(format!(
+                            "partition source {} is not primitive in the query schema",
+                            field.source_id
+                        ));
+                    };
+                    legal_partition_type_join(metadata.format_version(), &historical, ty)
+                        .ok_or_else(|| {
+                            format!(
+                                "query partition source {} conflicts with retained schema types",
+                                field.source_id
+                            )
+                        })?;
+                    ty.clone()
+                }
+                None => historical.clone(),
+            };
+            sources.insert(field.source_id, (resolved, historical));
+        }
+    }
+    metadata
+        .partition_specs_iter()
+        .map(|spec| {
+            let fields = spec
+                .fields()
+                .iter()
+                .map(|field| {
+                    let (query_source, storage_proof) = &sources[&field.source_id];
+                    // The query may predate a transform introduced by a later
+                    // spec (for example hour after Date -> Timestamp). Prove
+                    // that spec's storage type from the retained legal chain;
+                    // do not force its unrelated query projection to change.
+                    let ty = match field
+                        .transform
+                        .result_type(&Type::Primitive(query_source.clone()))
+                    {
+                        Ok(ty) => ty,
+                        Err(_) => field
+                            .transform
+                            .result_type(&Type::Primitive(storage_proof.clone()))
+                            .map_err(|e| e.to_string())?,
+                    };
+                    Ok(Arc::new(NestedField::optional(
+                        field.field_id,
+                        field.name.clone(),
+                        ty,
+                    )))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((spec.spec_id(), StructType::new(fields)))
+        })
+        .collect()
+}
+
+fn legal_partition_type_join(
+    version: crate::iceberg::spec::FormatVersion,
+    a: &PrimitiveType,
+    b: &PrimitiveType,
+) -> Option<PrimitiveType> {
+    use PrimitiveType::*;
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (Int, Long) | (Long, Int) => Some(Long),
+        (Float, Double) | (Double, Float) => Some(Double),
+        (Date, Timestamp) | (Timestamp, Date)
+            if version == crate::iceberg::spec::FormatVersion::V3 =>
+        {
+            Some(Timestamp)
+        }
+        (Date, TimestampNs) | (TimestampNs, Date)
+            if version == crate::iceberg::spec::FormatVersion::V3 =>
+        {
+            Some(TimestampNs)
+        }
+        (
+            Decimal {
+                precision: p,
+                scale: s,
+            },
+            Decimal {
+                precision: q,
+                scale: t,
+            },
+        ) if s == t => Some(Decimal {
+            precision: (*p).max(*q),
+            scale: *s,
+        }),
+        _ => None,
+    }
 }
 
 fn metadata_identity(metadata: &TableMetadata) -> Result<String, String> {
@@ -152,6 +284,10 @@ pub(crate) async fn build_read_snapshot_in_domain(
                 manifest_file.manifest_path
             ));
         }
+        let partition_type = domain
+            .endpoint()
+            .partition_type(spec.spec_id())
+            .map_err(|e| e.to_string())?;
         let mut delete_entries = Vec::new();
         let mut next_first_row_id = manifest_file
             .first_row_id
@@ -171,8 +307,8 @@ pub(crate) async fn build_read_snapshot_in_domain(
                 manifest_sequence: manifest_file.sequence_number,
             };
             let df = entry.data_file();
-            let typed_partition =
-                TypedPartition::bind(spec, &schema, df.partition()).map_err(|e| e.to_string())?;
+            let typed_partition = TypedPartition::bind_type(spec, &partition_type, df.partition())
+                .map_err(|e| e.to_string())?;
             let metrics = manifest_metrics(df, &schema);
             match df.content_type() {
                 DataContentType::Data => {
@@ -195,10 +331,7 @@ pub(crate) async fn build_read_snapshot_in_domain(
                         metrics,
                     )
                     .map_err(|e| e.to_string())?;
-                    let values = resolved_partition_values(
-                        df.partition(),
-                        &spec.partition_type(&schema).map_err(|e| e.to_string())?,
-                    );
+                    let values = resolved_partition_values(df.partition(), &partition_type);
                     observed_data.push((
                         df.clone(),
                         data,
@@ -555,7 +688,6 @@ mod tests {
         partitioned: bool,
         separate_delete_spec: bool,
     ) -> Table {
-        let io = FileIO::new_with_memory();
         let schema = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
@@ -571,10 +703,30 @@ mod tests {
             ])
             .build()
             .unwrap();
+        table_with_schema_and_delete_spec(
+            manifests,
+            repeat,
+            partitioned,
+            separate_delete_spec,
+            schema,
+            Transform::Identity,
+        )
+        .await
+    }
+
+    async fn table_with_schema_and_delete_spec(
+        manifests: Vec<Vec<(DataFile, i64)>>,
+        repeat: Option<usize>,
+        partitioned: bool,
+        separate_delete_spec: bool,
+        schema: Schema,
+        partition_transform: Transform,
+    ) -> Table {
+        let io = FileIO::new_with_memory();
         let spec = if partitioned {
             PartitionSpec::builder(Arc::new(schema.clone()))
                 .with_spec_id(0)
-                .add_partition_field("region", "region_part", Transform::Identity)
+                .add_partition_field("region", "region_part", partition_transform)
                 .unwrap()
                 .build()
                 .unwrap()
@@ -671,6 +823,477 @@ mod tests {
             .disable_cache()
             .build()
             .unwrap()
+    }
+
+    fn with_metadata(table: &Table, metadata: TableMetadata) -> Table {
+        Table::builder()
+            .file_io(table.file_io().clone())
+            .metadata(metadata)
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .disable_cache()
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn avro_historical_snapshot_ignores_query_absence_of_unused_future_spec_source() {
+        let original = table(vec![vec![(data("a"), 5)]], None, false).await;
+        let mut fields = original
+            .metadata()
+            .current_schema()
+            .as_struct()
+            .fields()
+            .to_vec();
+        fields.push(Arc::new(NestedField::optional(
+            3,
+            "future",
+            Type::Primitive(PrimitiveType::Int),
+        )));
+        let future_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let future_spec = PartitionSpec::builder(Arc::new(future_schema.clone()))
+            .add_partition_field("future", "future_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata = original
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .add_current_schema(future_schema)
+            .unwrap()
+            .add_partition_spec(future_spec.into_unbound())
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let evolved = with_metadata(&original, metadata);
+        let read = build_read_snapshot_at(&evolved, 77).await.unwrap();
+        assert_eq!(read.files.len(), 1);
+        assert_eq!(read.files[0].path, "a");
+        let domain = read.files[0].read_domain();
+        assert!(domain.endpoint().schema().unwrap().field_by_id(3).is_none());
+        assert_eq!(
+            domain.endpoint().partition_type(1).unwrap().fields()[0]
+                .field_type
+                .as_ref(),
+            &Type::Primitive(PrimitiveType::Int)
+        );
+        let dto = crate::typed_read::split::encode_read_domain(domain);
+        assert_eq!(
+            crate::typed_read::split::decode_read_domain(&dto).unwrap(),
+            *domain
+        );
+        let mut absent = dto;
+        absent.partition_type_jsons.clear();
+        assert!(crate::typed_read::split::decode_read_domain(&absent).is_err());
+    }
+
+    #[tokio::test]
+    async fn avro_dropped_partition_source_keeps_historical_type_and_promotes_old_tuple() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "region",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let physical = file(
+            "old-int-data",
+            DataContentType::Data,
+            Struct::from_iter([Some(Literal::int(-7))]),
+        )
+        .build()
+        .unwrap();
+        let original = table_with_schema_and_delete_spec(
+            vec![vec![(physical, 5)]],
+            None,
+            true,
+            false,
+            schema,
+            Transform::Identity,
+        )
+        .await;
+        let promoted = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "region",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let dropped = Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = original
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .add_current_schema(promoted)
+            .unwrap()
+            .add_partition_spec(PartitionSpec::unpartition_spec().into_unbound())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .add_current_schema(dropped)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let next = Snapshot::builder()
+            .with_snapshot_id(78)
+            .with_parent_snapshot_id(Some(77))
+            .with_sequence_number(8)
+            .with_timestamp_ms(metadata.last_updated_ms())
+            .with_manifest_list(
+                original
+                    .metadata()
+                    .snapshot_by_id(77)
+                    .unwrap()
+                    .manifest_list()
+                    .to_string(),
+            )
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .with_row_range(metadata.next_row_id(), 0)
+            .build();
+        let metadata = metadata
+            .into_builder(None)
+            .add_snapshot(next)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let encoded = serde_json::to_string(&metadata).unwrap();
+        let evolved = with_metadata(&original, metadata);
+        let read = build_read_snapshot_at(&evolved, 78).await.unwrap();
+        let domain = read.files[0].read_domain();
+        assert!(domain.endpoint().schema().unwrap().field_by_id(2).is_none());
+        assert_eq!(
+            read.files[0].partition_values.as_ref().unwrap(),
+            &Struct::from_iter([Some(Literal::long(-7))])
+        );
+        assert_eq!(
+            read.files[0]
+                .logical_delete_set()
+                .data()
+                .partition()
+                .values(),
+            &[Some(crate::delete_semantics::CanonicalScalar::Long(-7))]
+        );
+        for _ in 0..16 {
+            let metadata: TableMetadata = serde_json::from_str(&encoded).unwrap();
+            let rebuilt = mint_read_domain(&metadata, 78, metadata.current_schema()).unwrap();
+            assert_eq!(rebuilt.endpoint(), domain.endpoint());
+        }
+        let dto = crate::typed_read::split::encode_read_domain(domain);
+        let decoded = crate::typed_read::split::decode_read_domain(&dto).unwrap();
+        assert_eq!(&decoded, domain);
+        // Exercise real FE split production and BE admission with the Avro facts.
+        use crate::typed_read::delete_manager::{
+            DeleteDomainBindings, DeleteEvaluationMode, DeleteManager,
+        };
+        use crate::typed_read::split_source::{
+            IcebergPlannedDataFile, IcebergSplitSource, IcebergSplitSourceOptions,
+        };
+        use crate::typed_read::table_handle::{IcebergTableHandle, IcebergTableHandleParams};
+        use novarocks_spi::connector::read_stack::{
+            ConnectorSplitSource, DynamicFilterSnapshot, SchemaTableName, TupleDomain,
+        };
+        let mut params = IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "t").unwrap(),
+            snapshot_id: Some(78),
+            read_domain: Some(domain.clone()),
+            table_schema_json: domain.endpoint().schema_json().to_string(),
+            spec_id: Some(evolved.metadata().default_partition_spec_id()),
+            partition_spec_jsons: domain
+                .endpoint()
+                .partition_spec_jsons()
+                .iter()
+                .map(|(id, json)| (*id, json.to_string()))
+                .collect(),
+            format_version: 3,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: Default::default(),
+            name_mapping_json: None,
+            table_location: "memory:///table".to_owned(),
+            storage_properties: Default::default(),
+            pinned_data_files: None,
+        };
+        let handle = IcebergTableHandle::try_new(params.clone()).unwrap();
+        let planned = IcebergPlannedDataFile {
+            read_file: read.files[0].clone(),
+            file_format: crate::typed_read::split::IcebergFileFormat::Parquet,
+            split_offsets: Vec::new(),
+            key_metadata: Vec::new(),
+            file_statistics_domain: TupleDomain::all(),
+            decryption_data: None,
+        };
+        let mut source = IcebergSplitSource::try_new(
+            &handle,
+            vec![planned],
+            IcebergSplitSourceOptions::default(),
+        )
+        .unwrap();
+        let splits = source
+            .next_batch(8, &DynamicFilterSnapshot::all_complete())
+            .unwrap()
+            .into_splits();
+        assert_eq!(splits.len(), 1);
+        assert!(
+            DeleteManager::preview_hidden_columns(
+                &splits[0],
+                &domain.endpoint().schema().unwrap(),
+                &DeleteDomainBindings::Single(domain.clone()),
+                &DeleteEvaluationMode::ExcludeDeleted
+            )
+            .unwrap()
+            .is_empty()
+        );
+        params.snapshot_id = None;
+        params.read_domain = None;
+        let empty = IcebergTableHandle::try_new(params).unwrap();
+        let empty =
+            IcebergSplitSource::try_new(&empty, Vec::new(), IcebergSplitSourceOptions::default())
+                .unwrap();
+        assert!(empty.is_finished());
+        let spec: PartitionSpec =
+            serde_json::from_str(&domain.endpoint().partition_spec_jsons()[&0]).unwrap();
+        let stored_type = decoded.endpoint().partition_type(0).unwrap();
+        let tuple = crate::delete_semantics::decode_partition_data_json_with_type(
+            &spec,
+            &stored_type,
+            &read.files[0]
+                .logical_delete_set()
+                .data()
+                .partition()
+                .to_json_string(),
+        )
+        .unwrap();
+        assert_eq!(tuple, Struct::from_iter([Some(Literal::long(-7))]));
+        let mut missing: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        for schema in missing["schemas"].as_array_mut().unwrap() {
+            schema["fields"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|field| field["id"] != 2);
+        }
+        let missing: TableMetadata = serde_json::from_value(missing).unwrap();
+        assert!(
+            mint_read_domain(&missing, 78, missing.current_schema())
+                .unwrap_err()
+                .contains("no retained schema type evidence")
+        );
+        let mut incompatible: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let historical_schema = incompatible["schemas"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|schema| schema["schema-id"] == 0)
+            .unwrap();
+        historical_schema["fields"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|field| field["id"] == 2)
+            .unwrap()["type"] = serde_json::json!("string");
+        let incompatible: TableMetadata = serde_json::from_value(incompatible).unwrap();
+        assert!(
+            mint_read_domain(&incompatible, 78, incompatible.current_schema())
+                .unwrap_err()
+                .contains("incompatible retained types")
+        );
+    }
+
+    #[tokio::test]
+    async fn avro_historical_date_partition_survives_later_legal_v3_timestamp_schema() {
+        let schema = |ty| {
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(2, "region", Type::Primitive(ty))),
+                ])
+                .build()
+                .unwrap()
+        };
+        let old = file(
+            "old-date-data",
+            DataContentType::Data,
+            Struct::from_iter([Some(Literal::int(-7))]),
+        )
+        .build()
+        .unwrap();
+        let original = table_with_schema_and_delete_spec(
+            vec![vec![(old, 5)]],
+            None,
+            true,
+            false,
+            schema(PrimitiveType::Date),
+            Transform::Day,
+        )
+        .await;
+        for future_type in [PrimitiveType::Timestamp, PrimitiveType::TimestampNs] {
+            // day(date) and day(timestamp) retain the same stored day value.
+            let future_schema = schema(future_type);
+            let future_hour_spec = PartitionSpec::builder(Arc::new(future_schema.clone()))
+                .add_partition_field("region", "future_hour", Transform::Hour)
+                .unwrap()
+                .build()
+                .unwrap();
+            let metadata = original
+                .metadata()
+                .clone()
+                .into_builder(None)
+                .add_current_schema(future_schema)
+                .unwrap()
+                .add_partition_spec(future_hour_spec.into_unbound())
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            let evolved = with_metadata(&original, metadata);
+            let read = build_read_snapshot_at(&evolved, 77).await.unwrap();
+            assert_eq!(
+                read.files[0]
+                    .read_domain()
+                    .endpoint()
+                    .partition_type(1)
+                    .unwrap()
+                    .fields()[0]
+                    .field_type
+                    .as_ref(),
+                &Type::Primitive(PrimitiveType::Int)
+            );
+            let wire = crate::typed_read::split::encode_read_domain(read.files[0].read_domain());
+            assert_eq!(
+                crate::typed_read::split::decode_read_domain(&wire).unwrap(),
+                *read.files[0].read_domain()
+            );
+            assert_eq!(
+                read.files[0].partition_values.as_ref().unwrap(),
+                &Struct::from_iter([Some(Literal::int(-7))])
+            );
+            assert_eq!(
+                read.files[0]
+                    .read_domain()
+                    .endpoint()
+                    .schema()
+                    .unwrap()
+                    .field_by_id(2)
+                    .unwrap()
+                    .field_type
+                    .as_ref(),
+                &Type::Primitive(PrimitiveType::Date)
+            );
+        }
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V2,
+                &PrimitiveType::Date,
+                &PrimitiveType::Timestamp
+            ),
+            None
+        );
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V3,
+                &PrimitiveType::Date,
+                &PrimitiveType::Timestamptz
+            ),
+            None
+        );
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V3,
+                &PrimitiveType::Date,
+                &PrimitiveType::TimestamptzNs
+            ),
+            None
+        );
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V3,
+                &PrimitiveType::Timestamp,
+                &PrimitiveType::TimestampNs
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn partition_history_join_is_commutative_and_rejects_unproven_type_changes() {
+        assert_eq!(
+            legal_partition_type_join(FormatVersion::V3, &PrimitiveType::Int, &PrimitiveType::Long),
+            Some(PrimitiveType::Long)
+        );
+        assert_eq!(
+            legal_partition_type_join(FormatVersion::V3, &PrimitiveType::Long, &PrimitiveType::Int),
+            Some(PrimitiveType::Long)
+        );
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V3,
+                &PrimitiveType::Float,
+                &PrimitiveType::Double
+            ),
+            Some(PrimitiveType::Double)
+        );
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V3,
+                &PrimitiveType::Int,
+                &PrimitiveType::String
+            ),
+            None
+        );
+        assert_eq!(
+            legal_partition_type_join(
+                FormatVersion::V3,
+                &PrimitiveType::Decimal {
+                    precision: 8,
+                    scale: 2
+                },
+                &PrimitiveType::Decimal {
+                    precision: 9,
+                    scale: 3
+                }
+            ),
+            None
+        );
     }
 
     #[tokio::test]

@@ -171,6 +171,7 @@ message IcebergReadDomain {
   optional int64 snapshot_id = 4;
   string schema_json = 5;
   map<int32, string> partition_spec_jsons = 6;
+  map<int32, string> partition_type_jsons = 7;
 }
 
 message IcebergTableHandle {

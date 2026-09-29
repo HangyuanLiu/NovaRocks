@@ -71,9 +71,23 @@ pub(crate) fn plan_change_window(
     }
     // Admission and execution observe the same complete endpoint semantics.
     // No manifest event or newly introduced delete artifact is a row delta.
-    let from = build_snapshot_controlled(table, from_exclusive, runtime, context)?;
-    let to = build_snapshot_controlled(table, to_inclusive, runtime, context)?;
+    let schema = resolved_window_schema(metadata, to_inclusive)?;
+    let from = build_snapshot_controlled(table, from_exclusive, &schema, runtime, context)?;
+    let to = build_snapshot_controlled(table, to_inclusive, &schema, runtime, context)?;
     endpoint_admission(metadata, &from.files, &to.files, context)
+}
+
+/// Admission and execution use the same pinned upper-endpoint interpretation.
+/// Later table schema changes cannot reinterpret an already selected window.
+pub(crate) fn resolved_window_schema(
+    metadata: &TableMetadata,
+    to: i64,
+) -> Result<Arc<Schema>, ConnectorError> {
+    metadata
+        .snapshot_by_id(to)
+        .ok_or_else(|| corrupt("Iceberg change-window To snapshot is absent"))?
+        .schema(metadata)
+        .map_err(|e| corrupt(e.to_string()))
 }
 
 pub(crate) fn same_immutable_data_facts(
@@ -155,18 +169,15 @@ fn endpoint_admission(
 fn build_snapshot_controlled(
     table: &Table,
     snapshot_id: i64,
+    schema: &Schema,
     runtime: &IcebergCatalogRuntime,
     context: &ConnectorRequestContext,
 ) -> Result<crate::read_model::IcebergReadSnapshot, ConnectorError> {
     check_active(context)?;
     let table = table.clone();
     let control = context.clone();
-    let domain = crate::read_snapshot::mint_read_domain(
-        table.metadata(),
-        snapshot_id,
-        table.metadata().current_schema(),
-    )
-    .map_err(corrupt)?;
+    let domain = crate::read_snapshot::mint_read_domain(table.metadata(), snapshot_id, schema)
+        .map_err(corrupt)?;
     let result = runtime.block_on(async move {
         crate::read_snapshot::build_read_snapshot_in_domain(
             &table,
@@ -270,7 +281,10 @@ fn classify_lineage(
 fn schema_differs_only_by_field_names(previous: &Schema, next: &Schema) -> bool {
     previous
         .identifier_field_ids()
-        .eq(next.identifier_field_ids())
+        .collect::<std::collections::BTreeSet<_>>()
+        == next
+            .identifier_field_ids()
+            .collect::<std::collections::BTreeSet<_>>()
         && fields_differ_only_by_names(previous.as_struct().fields(), next.as_struct().fields())
 }
 
@@ -873,6 +887,39 @@ mod tests {
         assert!(schema_differs_only_by_field_names(&previous, &renamed));
         assert!(!schema_differs_only_by_field_names(&previous, &widened));
     }
+    #[test]
+    fn rename_only_identifier_sets_ignore_independent_hash_iteration_order() {
+        let schema = |name: &str, ids: &[i32]| {
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        name,
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        "second",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .with_identifier_field_ids(ids.iter().copied())
+                .build()
+                .unwrap()
+        };
+        let original = schema("first", &[1, 2]);
+        for _ in 0..64 {
+            assert!(schema_differs_only_by_field_names(
+                &original,
+                &schema("renamed", &[2, 1])
+            ));
+        }
+        assert!(!schema_differs_only_by_field_names(
+            &original,
+            &schema("renamed", &[1])
+        ));
+    }
+
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),

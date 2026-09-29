@@ -394,7 +394,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         ReadDomain => match field {
             1..=3 | 5 => singular(Scalar),
             4 => singular(Varint),
-            6 => repeated(MapI32String),
+            6 | 7 => repeated(MapI32String),
             _ => return None,
         },
         Table => match field {
