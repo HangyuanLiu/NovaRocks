@@ -378,8 +378,8 @@ class ProtocolTests(unittest.TestCase):
         executable = self.root / "bin/docker"
         executable.parent.mkdir()
         pidfile = self.root / "docker-child.pid"
-        executable.write_text(f"#!{sys.executable}\nimport os,time\n"
-            f"open({str(pidfile)!r},'w').write(str(os.getpid()))\ntime.sleep(3600)\n")
+        executable.write_text("#!/bin/sh\n"
+            f"printf '%s' \"$$\" > {runtime.shlex.quote(str(pidfile))}\nexec sleep 3600\n")
         executable.chmod(0o700)
         environment = {"PATH": str(executable.parent) + ":" + os.environ["PATH"]}
         return pidfile, environment
@@ -395,8 +395,7 @@ class ProtocolTests(unittest.TestCase):
     def test_missing_docker_context_is_not_resource_absence(self):
         _, environment = self.fake_docker()
         executable = self.root / "bin/docker"
-        executable.write_text(f"#!{sys.executable}\nimport sys\n"
-            "print('context foreign not found',file=sys.stderr)\nsys.exit(1)\n")
+        executable.write_text("#!/bin/sh\nprintf '%s\\n' 'context foreign not found' >&2\nexit 1\n")
         backend = runtime.Docker(timeout=5, environment=environment)
         self.assert_code("DockerOperationFailed", lambda: backend.command(["network", "inspect", "network"], absent_ok=True))
 
