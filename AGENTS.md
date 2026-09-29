@@ -727,8 +727,13 @@ config so its configured MySQL port cannot collide with another worktree.
 
 **Run test suites:**
 
+Non-isolated runs require an explicit runner config with fixture endpoints and
+the exact publication env file. The default config does not supply them.
+
 ```bash
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite <suite> --mode <verify|record|diff> [--query-timeout 60] [-j 4]
 ```
 
