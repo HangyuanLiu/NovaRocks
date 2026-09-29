@@ -17,9 +17,6 @@ use novarocks_memory::MemoryAuthority;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRuntimeConfig {
     pub driver_threads: usize,
-    pub spill_io_threads: usize,
-    pub spill_io_queue_capacity: usize,
-    pub spill_storage: ExecutionSpillStorageConfig,
     /// How long an exchange source waits for its senders before failing.
     pub exchange_wait_ms: u64,
     pub exchange_io_threads: usize,
@@ -34,37 +31,10 @@ pub struct ExecutionRuntimeConfig {
     pub sink_io_max_blocking_threads: usize,
 }
 
-/// Frozen storage facts used by execution-side spilling.
-///
-/// Application composition resolves directories and codec defaults before
-/// constructing this value; the kernel never reads application configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionSpillStorageConfig {
-    pub enabled: bool,
-    pub local_dirs: Vec<String>,
-    pub dir_max_bytes: u64,
-    pub block_size_bytes: u64,
-    pub ipc_compression: String,
-}
-
-impl Default for ExecutionSpillStorageConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            local_dirs: Vec::new(),
-            dir_max_bytes: 0,
-            block_size_bytes: 1,
-            ipc_compression: "lz4".to_string(),
-        }
-    }
-}
-
 impl ExecutionRuntimeConfig {
     pub fn validate(&self) -> Result<(), ExecutionRuntimeConfigError> {
         for (name, value) in [
             ("driver_threads", self.driver_threads),
-            ("spill_io_threads", self.spill_io_threads),
-            ("spill_io_queue_capacity", self.spill_io_queue_capacity),
             ("exchange_io_threads", self.exchange_io_threads),
             (
                 "exchange_io_max_inflight_bytes",
@@ -93,18 +63,6 @@ impl ExecutionRuntimeConfig {
             return Err(ExecutionRuntimeConfigError::invalid_field(
                 "local_exchange_max_buffered_rows",
             ));
-        }
-        if self.spill_storage.enabled {
-            if self.spill_storage.local_dirs.is_empty() {
-                return Err(ExecutionRuntimeConfigError::invalid_field(
-                    "spill_storage.local_dirs",
-                ));
-            }
-            if self.spill_storage.block_size_bytes == 0 {
-                return Err(ExecutionRuntimeConfigError::invalid_field(
-                    "spill_storage.block_size_bytes",
-                ));
-            }
         }
         Ok(())
     }
@@ -237,9 +195,6 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
                 driver_threads: 1,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 8,
-                spill_storage: ExecutionSpillStorageConfig::default(),
                 exchange_wait_ms: 120_000,
                 exchange_io_threads: 1,
                 exchange_io_max_inflight_bytes: 1024,
@@ -302,10 +257,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{
-        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-        test_execution_function_set,
-    };
+    use super::{ExecutionRuntime, ExecutionRuntimeConfig, test_execution_function_set};
 
     fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
@@ -321,9 +273,6 @@ mod tests {
     fn config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 1,
-            spill_storage: ExecutionSpillStorageConfig::default(),
             exchange_wait_ms: 120_000,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
@@ -341,7 +290,7 @@ mod tests {
     #[test]
     fn rejects_zero_capacity_before_runtime_construction() {
         let mut config = config();
-        config.spill_io_queue_capacity = 0;
+        config.exchange_io_max_inflight_bytes = 0;
         let error = ExecutionRuntime::new(
             config,
             test_execution_function_set(),
@@ -350,7 +299,7 @@ mod tests {
         .expect_err("zero queue must be rejected");
         assert_eq!(
             error.to_string(),
-            "execution runtime configuration error: spill_io_queue_capacity must be non-zero"
+            "execution runtime configuration error: exchange_io_max_inflight_bytes must be non-zero"
         );
     }
 

@@ -28,32 +28,28 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use std::sync::Arc;
-use std::time::Instant;
 
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::operators::sort::{
-    ChunksSorter, ChunksSorterFullSort, ChunksSorterHeapSort, ChunksSorterPartitionTopN,
-    ChunksSorterTopN, SpillableChunksSorter,
+    ChunksSorter, ChunksSorterHeapSort, ChunksSorterPartitionTopN, ChunksSorterTopN,
 };
 use crate::exec::operators::sort::{
     append_stable_row_index_sort_column, concat_sort_chunks, normalize_sort_key_array,
 };
-use crate::exec::spill::spiller::{SpillFile, Spiller};
-use crate::exec::spill::{SpillConfig, SpillMode, SpillProfile};
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
-use tracing::warn;
 
 use arrow::array::ArrayRef;
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
-use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, SortField};
 
 /// Factory for sort processors that materialize ORDER BY output chunks.
+///
+/// Design: docs/adr/ADR-0162-in-memory-query-execution-boundary.md
 pub struct SortProcessorFactory {
     name: String,
     arena: Arc<ExprArena>,
@@ -196,7 +192,6 @@ impl OperatorFactory for SortProcessorFactory {
             buffered: Vec::new(),
             buffered_bytes: 0,
             buffered_rows: 0,
-            spill_state: None,
             pending_output: None,
             finishing: false,
             finished: false,
@@ -221,26 +216,11 @@ struct SortProcessorOperator {
     buffered: Vec<Chunk>,
     buffered_bytes: i64,
     buffered_rows: i64,
-    spill_state: Option<SortSpillState>,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
-}
-
-#[derive(Debug)]
-struct SpillRun {
-    schema: SchemaRef,
-    chunk_schema: ChunkSchemaRef,
-    file: SpillFile,
-}
-
-struct SortSpillState {
-    config: SpillConfig,
-    spiller: Spiller,
-    profile: Option<SpillProfile>,
-    runs: Vec<SpillRun>,
 }
 
 impl Operator for SortProcessorOperator {
@@ -274,7 +254,7 @@ impl ProcessorOperator for SortProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         if self.finished {
             return Ok(());
         }
@@ -290,8 +270,6 @@ impl ProcessorOperator for SortProcessorOperator {
             self.buffered.push(chunk);
         }
         self.maybe_prune_topn_buffered()?;
-        self.maybe_init_spill_state(state)?;
-        self.maybe_spill_buffered()?;
         Ok(())
     }
 
@@ -303,15 +281,15 @@ impl ProcessorOperator for SortProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         if self.finishing || self.finished {
             return Ok(());
         }
         self.init_profile_if_needed();
         self.finishing = true;
 
-        self.maybe_init_spill_state(state)?;
-        let out = self.build_final_output_with_spill()?;
+        let out = self.build_final_output_from_chunks(&self.buffered)?;
+        self.clear_buffered();
         self.pending_output = out;
         if self.pending_output.is_none() {
             self.finished = true;
@@ -358,32 +336,6 @@ impl SortProcessorOperator {
         }
     }
 
-    fn maybe_init_spill_state(&mut self, state: &RuntimeState) -> Result<(), String> {
-        if self.spill_state.is_some() {
-            return Ok(());
-        }
-        let Some(config) = state.spill_config().cloned() else {
-            return Ok(());
-        };
-        if !config.enable_spill || config.spill_mode == SpillMode::None {
-            return Ok(());
-        }
-        let manager = state
-            .spill_manager()
-            .ok_or_else(|| "spill manager is missing".to_string())?;
-        let runtime = state
-            .execution_runtime()
-            .ok_or_else(|| "spill-enabled sort requires an execution runtime".to_string())?;
-        let spiller = Spiller::new_from_execution_runtime(runtime, config.spill_encode_level)?;
-        self.spill_state = Some(SortSpillState {
-            config,
-            spiller,
-            profile: manager.profile(),
-            runs: Vec::new(),
-        });
-        Ok(())
-    }
-
     fn rows_to_keep_for_topn(&self) -> Option<usize> {
         if !self.use_top_n || self.topn_type != SortTopNType::RowNumber {
             return None;
@@ -407,7 +359,7 @@ impl SortProcessorOperator {
             .or_else(|| self.rank_like_limit_for_topn())
     }
 
-    fn build_topn_sorter(&self) -> Option<SpillableChunksSorter> {
+    fn build_topn_sorter(&self) -> Option<Box<dyn ChunksSorter>> {
         // Partition-TopN must be checked FIRST: a partition-topn node has
         // use_top_n=true and no global limit, so rows_to_keep_for_topn() /
         // rank_like_limit_for_topn() both return None and would fall through
@@ -450,7 +402,7 @@ impl SortProcessorOperator {
         } else {
             return None;
         };
-        Some(SpillableChunksSorter::new(sorter))
+        Some(sorter)
     }
 
     fn sort_chunks_for_topn_mode(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
@@ -561,285 +513,10 @@ impl SortProcessorOperator {
         Ok(())
     }
 
-    fn maybe_spill_buffered(&mut self) -> Result<(), String> {
-        let should_spill = match self.spill_state.as_ref() {
-            Some(spill) => self.should_spill_buffered(spill),
-            None => false,
-        };
-        if !should_spill {
-            return Ok(());
-        }
-        let mut spill = self.spill_state.take().expect("spill state checked");
-        let result = self.spill_buffered_run(&mut spill);
-        self.spill_state = Some(spill);
-        result
-    }
-
-    fn should_spill_buffered(&self, spill: &SortSpillState) -> bool {
-        if self.buffered.is_empty() {
-            return false;
-        }
-        if spill.config.spill_mode == SpillMode::None {
-            return false;
-        }
-        if let Some(max_rows) = self.max_buffered_rows {
-            let buffered_rows = usize::try_from(self.buffered_rows.max(0)).unwrap_or(usize::MAX);
-            if buffered_rows >= max_rows {
-                return true;
-            }
-        }
-        if let Some(max_bytes) = self.max_buffered_bytes {
-            let buffered_bytes = usize::try_from(self.buffered_bytes.max(0)).unwrap_or(usize::MAX);
-            if buffered_bytes >= max_bytes {
-                return true;
-            }
-        }
-        let min_bytes = spill.config.spill_operator_min_bytes.unwrap_or(0);
-        if self.buffered_bytes < min_bytes {
-            return false;
-        }
-        if spill.config.spill_mode == SpillMode::Force {
-            return true;
-        }
-        if let Some(max_bytes) = spill
-            .config
-            .spill_operator_max_bytes
-            .or_else(|| spill_mem_table_bytes(spill))
-        {
-            return self.buffered_bytes >= max_bytes;
-        }
-        false
-    }
-
-    fn spill_buffered_run(&mut self, spill: &mut SortSpillState) -> Result<(), String> {
-        if self.buffered.is_empty() {
-            return Ok(());
-        }
-        let start = Instant::now();
-        let run = self.build_sorted_run(&self.buffered)?;
-        let schema = run.schema();
-        let run_chunk_schema = run.chunk_schema_ref();
-        let run_rows = self.buffered_rows.max(0);
-        let run_bytes = self.buffered_bytes.max(0);
-        let spill_file = spill.spiller.spill_chunks(schema.clone(), &[run])?;
-        spill.runs.push(SpillRun {
-            schema,
-            chunk_schema: run_chunk_schema,
-            file: spill_file,
-        });
-        if let Some(profile) = spill.profile.as_ref() {
-            let elapsed_ns = start.elapsed().as_nanos();
-            let elapsed_ns = i64::try_from(elapsed_ns).unwrap_or(i64::MAX);
-            profile.spill_time.add(elapsed_ns);
-            profile.spill_rows.add(run_rows);
-            profile.spill_bytes.add(run_bytes);
-        }
-        self.buffered.clear();
-        self.buffered_bytes = 0;
-        self.buffered_rows = 0;
-        Ok(())
-    }
-
-    fn build_final_output_with_spill(&mut self) -> Result<Option<Chunk>, String> {
-        let Some(mut spill) = self.spill_state.take() else {
-            let out = self.build_final_output_from_chunks(&self.buffered)?;
-            self.clear_buffered();
-            return Ok(out);
-        };
-
-        let use_spill = !spill.runs.is_empty() || spill.config.spill_mode == SpillMode::Force;
-        if use_spill && !self.buffered.is_empty() {
-            self.spill_buffered_run(&mut spill)?;
-        }
-
-        if !use_spill {
-            let out = self.build_final_output_from_chunks(&self.buffered)?;
-            self.clear_buffered();
-            return Ok(out);
-        }
-
-        // Partition-TopN does not set topn_cutoff_base(), so it falls through to the
-        // full-sort restore path below; the partition limit is applied in
-        // build_final_output_from_chunks.
-        if self.topn_cutoff_base().is_some() {
-            let out = self.build_final_topn_output_with_spill(&mut spill)?;
-            self.clear_buffered();
-            return Ok(out);
-        }
-
-        let mut chunks = self.restore_spill_runs(&mut spill)?;
-        if !self.buffered.is_empty() {
-            let tail = self.build_sorted_run(&self.buffered)?;
-            chunks.push(tail);
-            self.clear_buffered();
-        }
-        self.build_final_output_from_chunks(&chunks)
-    }
-
     fn clear_buffered(&mut self) {
         self.buffered.clear();
         self.buffered_bytes = 0;
         self.buffered_rows = 0;
-    }
-
-    fn build_final_topn_output_with_spill(
-        &mut self,
-        spill: &mut SortSpillState,
-    ) -> Result<Option<Chunk>, String> {
-        let cutoff_base = self.topn_cutoff_base().unwrap_or(0);
-        if cutoff_base == 0 {
-            return Ok(None);
-        }
-
-        let sorter = self
-            .build_topn_sorter()
-            .ok_or_else(|| "topn sorter is missing for topn mode".to_string())?;
-
-        let mut candidate: Option<Chunk> = None;
-        let runs = std::mem::take(&mut spill.runs);
-        for run in runs {
-            candidate = self.merge_spill_run_into_topn_candidate(
-                &sorter,
-                spill,
-                run,
-                cutoff_base,
-                candidate,
-            )?;
-        }
-
-        if !self.buffered.is_empty() {
-            let mut inputs = Vec::with_capacity(self.buffered.len().saturating_add(1));
-            if let Some(prev) = candidate.take() {
-                inputs.push(prev);
-            }
-            inputs.extend(self.buffered.clone());
-            candidate = sorter.sort_chunks(&inputs)?;
-        }
-
-        let Some(topn_chunk) = candidate else {
-            return Ok(None);
-        };
-        if self.topn_type != SortTopNType::RowNumber {
-            return Ok(Some(topn_chunk));
-        }
-        let len = topn_chunk.len();
-        if self.offset >= len {
-            return Ok(None);
-        }
-        let take_len = self.limit.unwrap_or(0).min(len - self.offset);
-        if take_len == 0 {
-            return Ok(None);
-        }
-        Ok(Some(topn_chunk.slice(self.offset, take_len)))
-    }
-
-    fn merge_spill_run_into_topn_candidate(
-        &self,
-        sorter: &SpillableChunksSorter,
-        spill: &mut SortSpillState,
-        run: SpillRun,
-        _cutoff_base: usize,
-        mut candidate: Option<Chunk>,
-    ) -> Result<Option<Chunk>, String> {
-        let start = Instant::now();
-        let mut restore_rows = 0i64;
-        let mut restore_bytes = 0i64;
-
-        let mut stream = spill.spiller.open_stream(run.schema.clone(), &run.file)?;
-        while let Some(batch) = stream.next_batch()? {
-            let source = candidate.as_ref().ok_or_else(|| {
-                "sort spill merge expected candidate chunk before restore".to_string()
-            })?;
-            let chunk = Chunk::try_new_like(batch, source).map_err(|e| e.to_string())?;
-            restore_rows = restore_rows.saturating_add(chunk.len() as i64);
-            restore_bytes = restore_bytes
-                .saturating_add(i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX));
-
-            candidate = sorter.merge_candidate(candidate.take(), chunk)?;
-        }
-
-        if let Err(err) = std::fs::remove_file(&run.file.path) {
-            warn!(
-                "Sort spill remove file failed: path={} error={}",
-                run.file.path.display(),
-                err
-            );
-        }
-        if let Some(profile) = spill.profile.as_ref() {
-            let elapsed_ns = start.elapsed().as_nanos();
-            let elapsed_ns = i64::try_from(elapsed_ns).unwrap_or(i64::MAX);
-            profile.restore_time.add(elapsed_ns);
-            profile.restore_rows.add(restore_rows);
-            profile.restore_bytes.add(restore_bytes);
-            profile.spill_read_io_count.add(1);
-        }
-        Ok(candidate)
-    }
-
-    fn restore_spill_runs(&self, spill: &mut SortSpillState) -> Result<Vec<Chunk>, String> {
-        let mut out = Vec::new();
-        let runs = std::mem::take(&mut spill.runs);
-        for run in runs {
-            let restored = self.restore_single_spill_run(spill, run)?;
-            out.extend(restored);
-        }
-        Ok(out)
-    }
-
-    fn restore_single_spill_run(
-        &self,
-        spill: &mut SortSpillState,
-        run: SpillRun,
-    ) -> Result<Vec<Chunk>, String> {
-        let start = Instant::now();
-        let mut restore_rows = 0i64;
-        let mut restore_bytes = 0i64;
-        let mut out = Vec::new();
-
-        let mut stream = spill.spiller.open_stream(run.schema.clone(), &run.file)?;
-        while let Some(batch) = stream.next_batch()? {
-            let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&run.chunk_schema))
-                .map_err(|e| e.to_string())?;
-            restore_rows = restore_rows.saturating_add(chunk.len() as i64);
-            restore_bytes = restore_bytes
-                .saturating_add(i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX));
-            out.push(chunk);
-        }
-
-        if let Err(err) = std::fs::remove_file(&run.file.path) {
-            warn!(
-                "Sort spill remove file failed: path={} error={}",
-                run.file.path.display(),
-                err
-            );
-        }
-        if let Some(profile) = spill.profile.as_ref() {
-            let elapsed_ns = start.elapsed().as_nanos();
-            let elapsed_ns = i64::try_from(elapsed_ns).unwrap_or(i64::MAX);
-            profile.restore_time.add(elapsed_ns);
-            profile.restore_rows.add(restore_rows);
-            profile.restore_bytes.add(restore_bytes);
-            profile.spill_read_io_count.add(1);
-        }
-        Ok(out)
-    }
-
-    fn build_sorted_run(&self, chunks: &[Chunk]) -> Result<Chunk, String> {
-        if let Some(cutoff_base) = self.topn_cutoff_base() {
-            if cutoff_base == 0 {
-                let empty = arrow::record_batch::RecordBatch::new_empty(chunks[0].schema());
-                return Chunk::try_new_like(empty, &chunks[0]).map_err(|e| e.to_string());
-            }
-            return self
-                .sort_chunks_for_topn_mode(chunks)?
-                .ok_or_else(|| "topn sorted run expected non-empty output".to_string());
-        }
-        // Partition-TopN intermediate spill runs are written full-sorted (no per-partition
-        // pre-pruning); build_final_output_from_chunks applies the partition limit across
-        // all restored runs at the end.
-        ChunksSorterFullSort::new(Arc::clone(&self.arena), self.order_by.clone())
-            .sort_chunks(chunks)?
-            .ok_or_else(|| "full sort run expected non-empty output".to_string())
     }
 
     fn is_partition_topn(&self) -> bool {
@@ -1089,17 +766,370 @@ where
     cutoff
 }
 
-fn spill_mem_table_bytes(spill: &SortSpillState) -> Option<i64> {
-    let size = spill.config.spill_mem_table_size?;
-    let num = spill.config.spill_mem_table_num?;
-    let size = i64::from(size);
-    let num = i64::from(num);
-    Some(size.saturating_mul(num))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::exec::chunk::ChunkSchema;
+    use arrow::array::{Array, Decimal128Array, Int32Array, make_array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    fn make_chunk(values: Vec<Option<i32>>, nullable: bool) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Int32,
+            nullable,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
+            .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn make_chunk_with_decimal_payload(ids: Vec<i32>, prices: Vec<i128>) -> Chunk {
+        let wide_prices = Decimal128Array::from(prices.into_iter().map(Some).collect::<Vec<_>>())
+            .with_precision_and_scale(38, 2)
+            .expect("wide decimal prices");
+        let price_data = wide_prices
+            .to_data()
+            .into_builder()
+            .data_type(DataType::Decimal128(20, 2))
+            .build()
+            .expect("decimal20 price data");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("price", DataType::Decimal128(20, 2), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(ids)), make_array(price_data)],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    #[test]
+    fn full_sort_reconciles_nullable_columns_across_chunks() {
+        let chunks = vec![
+            make_chunk(vec![Some(1), Some(2)], false),
+            make_chunk(vec![None, Some(3)], true),
+        ];
+        let state = RuntimeState::default();
+        let mut processor = processor_for(
+            DataType::Int32,
+            false,
+            None,
+            0,
+            SortTopNType::RowNumber,
+            None,
+        );
+        for chunk in chunks {
+            processor
+                .push_chunk(&state, chunk)
+                .expect("push full-sort input");
+        }
+        processor.set_finishing(&state).expect("finish full sort");
+        let out = processor
+            .pull_chunk(&state)
+            .expect("pull sorted output")
+            .expect("chunk");
+        assert!(out.batch.schema().field(0).is_nullable());
+        let col = out
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32");
+        assert_eq!(col.len(), 4);
+        assert!(col.is_null(0));
+        assert_eq!(col.value(1), 1);
+        assert_eq!(col.value(2), 2);
+        assert_eq!(col.value(3), 3);
+    }
+
+    #[test]
+    fn full_sort_preserves_decimal_payload_exceeding_declared_precision() {
+        let overflow = 100_000_000_000_000_000_000_i128;
+        let chunks = vec![make_chunk_with_decimal_payload(
+            vec![2, 1],
+            vec![overflow, 12_345_i128],
+        )];
+        let state = RuntimeState::default();
+        let mut processor = processor_for(
+            DataType::Int32,
+            false,
+            None,
+            0,
+            SortTopNType::RowNumber,
+            None,
+        );
+        for chunk in chunks {
+            processor
+                .push_chunk(&state, chunk)
+                .expect("push full-sort input");
+        }
+        processor.set_finishing(&state).expect("finish full sort");
+        let out = processor
+            .pull_chunk(&state)
+            .expect("pull sorted output")
+            .expect("chunk");
+        let ids = out
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id int32");
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+        let prices = out
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("price decimal");
+        // Sort no longer widens decimal precision (it uses the array's own type;
+        // planning makes cross-fragment decimals canonical). The i128 payload is
+        // preserved regardless of the precision tag, so the over-precision value
+        // survives the sort/concat round trip with the declared Decimal128(20, 2).
+        assert_eq!(prices.data_type(), &DataType::Decimal128(20, 2));
+        assert_eq!(prices.value(0), 12_345_i128);
+        assert!(!prices.is_null(1));
+        assert_eq!(prices.value(1), overflow);
+    }
+
+    fn processor_for(
+        data_type: arrow::datatypes::DataType,
+        use_top_n: bool,
+        limit: Option<usize>,
+        offset: usize,
+        topn_type: SortTopNType,
+        max_buffered_rows: Option<usize>,
+    ) -> SortProcessorOperator {
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(
+            crate::exec::expr::ExprNode::SlotId(novarocks_types::SlotId::new(1)),
+            data_type,
+        );
+        SortProcessorOperator {
+            name: "test sort".to_string(),
+            arena: Arc::new(arena),
+            order_by: vec![SortExpression {
+                expr: key,
+                asc: true,
+                nulls_first: true,
+            }],
+            use_top_n,
+            limit,
+            offset,
+            topn_type,
+            max_buffered_rows,
+            max_buffered_bytes: None,
+            partition_exprs: Vec::new(),
+            partition_limit: None,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            buffered_rows: 0,
+            pending_output: None,
+            finishing: false,
+            finished: false,
+            profile_initialized: false,
+            profiles: None,
+        }
+    }
+
+    fn chunk_from_array(array: ArrayRef) -> Chunk {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", array.data_type().clone(), true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![array]).expect("batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[novarocks_types::SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn int_chunk(values: Vec<i32>) -> Chunk {
+        chunk_from_array(Arc::new(arrow::array::Int32Array::from(values)))
+    }
+
+    fn int_values(chunk: &Chunk) -> Vec<i32> {
+        chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("int output")
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn small_and_large_topn_prune_inputs_preserve_offset_and_release_candidates_at_finish() {
+        for limit in [3, 1025] {
+            let offset = 2;
+            let rows_to_keep = limit + offset;
+            let state = RuntimeState::default();
+            let mut processor = processor_for(
+                arrow::datatypes::DataType::Int32,
+                true,
+                Some(limit),
+                offset,
+                SortTopNType::RowNumber,
+                Some(rows_to_keep + 1),
+            );
+            let tracker = crate::runtime::mem_tracker::MemTracker::new_root("sort input");
+            let original = (0..(rows_to_keep * 2) as i32).rev().collect::<Vec<_>>();
+            let mut chunk = int_chunk(original.clone());
+            let schema = chunk.chunk_schema_ref();
+            let input_array = Arc::downgrade(&chunk.columns()[0]);
+            chunk.transfer_to(&tracker);
+            assert!(tracker.current() > 0);
+            processor
+                .push_chunk(&state, chunk)
+                .expect("push first batch");
+            assert_eq!(processor.buffered_rows, rows_to_keep as i64);
+            assert!(
+                input_array.upgrade().is_none(),
+                "pruning releases the input Arrow owner"
+            );
+            assert_eq!(
+                tracker.current(),
+                0,
+                "pruning releases the original input charge"
+            );
+            processor
+                .push_chunk(&state, int_chunk((-6..0).collect()))
+                .expect("push late best rows");
+            assert_eq!(processor.buffered_rows, rows_to_keep as i64);
+            let candidate_array = Arc::downgrade(&processor.buffered[0].columns()[0]);
+            processor.set_finishing(&state).expect("finish");
+            assert!(processor.buffered.is_empty());
+            assert_eq!((processor.buffered_rows, processor.buffered_bytes), (0, 0));
+            assert!(
+                candidate_array.upgrade().is_none(),
+                "finish releases the retained candidate"
+            );
+            let output = processor.pull_chunk(&state).expect("pull").expect("output");
+            let mut expected = original;
+            expected.extend(-6..0);
+            expected.sort_unstable();
+            assert_eq!(
+                int_values(&output),
+                expected
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(output.chunk_schema(), schema.as_ref());
+            assert!(processor.is_finished());
+            assert!(
+                processor
+                    .pull_chunk(&state)
+                    .expect("pull after finish")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn rank_and_dense_rank_pruning_recompute_ties_across_batches() {
+        for (kind, expected) in [
+            (SortTopNType::Rank, vec![1, 1]),
+            (SortTopNType::DenseRank, vec![1, 1, 2, 2, 2]),
+        ] {
+            let state = RuntimeState::default();
+            let mut processor = processor_for(
+                arrow::datatypes::DataType::Int32,
+                true,
+                Some(2),
+                0,
+                kind,
+                Some(3),
+            );
+            processor
+                .push_chunk(&state, int_chunk(vec![4, 2, 2, 1]))
+                .expect("first peer groups");
+            processor
+                .push_chunk(&state, int_chunk(vec![2, 1, 3]))
+                .expect("late boundary peers");
+            processor.set_finishing(&state).expect("finish");
+            let output = processor.pull_chunk(&state).expect("pull").expect("output");
+            assert_eq!(int_values(&output), expected);
+            assert!(processor.buffered.is_empty());
+        }
+    }
+
+    #[test]
+    fn full_sort_preserves_null_nan_order_and_releases_input_before_output_is_pulled() {
+        use arrow::array::{Array, Float64Array};
+        let state = RuntimeState::default();
+        let mut processor = processor_for(
+            arrow::datatypes::DataType::Float64,
+            false,
+            None,
+            0,
+            SortTopNType::RowNumber,
+            None,
+        );
+        let mut chunk = chunk_from_array(Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(2.0),
+            None,
+            Some(-1.0),
+        ])));
+        let input_array = Arc::downgrade(&chunk.columns()[0]);
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("full sort input");
+        chunk.transfer_to(&tracker);
+        processor.push_chunk(&state, chunk).expect("push");
+        assert!(input_array.upgrade().is_some());
+        assert!(tracker.current() > 0);
+        processor.set_finishing(&state).expect("finish");
+        assert!(input_array.upgrade().is_none());
+        assert_eq!(tracker.current(), 0);
+        assert_eq!((processor.buffered_rows, processor.buffered_bytes), (0, 0));
+        let output = processor.pull_chunk(&state).expect("pull").expect("output");
+        let values = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float output");
+        assert_eq!(values.len(), 4);
+        assert!(values.is_null(0));
+        assert_eq!(values.value(1), -1.0);
+        assert_eq!(values.value(2), 2.0);
+        assert!(values.value(3).is_nan());
+    }
+
+    #[test]
+    fn empty_sort_finishes_without_output_for_full_sort_and_topn() {
+        for use_top_n in [false, true] {
+            let state = RuntimeState::default();
+            let mut processor = processor_for(
+                arrow::datatypes::DataType::Int32,
+                use_top_n,
+                Some(3),
+                0,
+                SortTopNType::RowNumber,
+                None,
+            );
+            processor.set_finishing(&state).expect("finish empty input");
+            assert!(processor.is_finished());
+            assert!(!processor.has_output());
+            assert!(!processor.need_input());
+            assert!(processor.pull_chunk(&state).expect("pull empty").is_none());
+        }
+    }
 
     #[test]
     fn rank_like_cutoff_row_number_is_fixed_row_count() {
@@ -1351,7 +1381,7 @@ mod tests {
         let mut op = factory.create(1, 0);
         let proc = op.as_processor_mut().expect("processor");
 
-        // Simulate a minimal RuntimeState (no spill configured).
+        // Drive the ordinary runtime state through the processor lifecycle.
         let state = crate::runtime::runtime_state::RuntimeState::default();
 
         proc.push_chunk(&state, chunk).expect("push chunk");

@@ -434,6 +434,7 @@ message DatacacheOptions {
 }
 
 // Query options consumed by NovaRocks native runtime.
+// Design: docs/adr/ADR-0162-in-memory-query-execution-boundary.md
 message QueryOptions {
   int32 batch_size = 1;
   int32 query_timeout = 2;
@@ -444,8 +445,8 @@ message QueryOptions {
   optional int32 runtime_filter_wait_timeout_ms = 8;
   bool allow_throw_exception = 9;
   optional int64 group_concat_max_len = 10;
-  bool enable_spill = 11;
-  optional SpillOptions spill_options = 12;
+  reserved 11, 12;
+  reserved "enable_spill", "spill_options";
   bool enable_scan_datacache = 13;
   bool enable_populate_datacache = 14;
   bool enable_datacache_async_populate_mode = 15;
@@ -465,19 +466,6 @@ message QueryOptions {
   bool enable_parquet_reader_page_index = 29;
   reserved 6;
   reserved "connector_io_tasks_per_scan_operator";
-}
-
-// Spill options consumed by NovaRocks native runtime.
-message SpillOptions {
-  int32 spill_mode = 1;  // TSpillMode
-  double spill_mem_limit_threshold = 2;
-  int64 spill_operator_min_bytes = 3;
-  int64 spill_operator_max_bytes = 4;
-  int32 spill_encode_level = 5;
-  bool enable_spill_buffer_read = 6;
-  int64 max_spill_read_buffer_bytes_per_driver = 7;
-  int32 spill_mem_table_size = 8;
-  int32 spill_mem_table_num = 9;
 }
 
 // Coordinator long-poll request for one fragment instance result stream.

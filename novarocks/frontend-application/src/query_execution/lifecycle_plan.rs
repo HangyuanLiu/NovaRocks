@@ -781,7 +781,7 @@ mod tests {
     }
 
     fn wire_query_options() -> QueryOptions {
-        QueryOptions::parse(novarocks::QueryOptions::default()).expect("valid wire query options")
+        QueryOptions::from_proto(novarocks::QueryOptions::default())
     }
 
     fn catalog_set() -> CatalogSet {

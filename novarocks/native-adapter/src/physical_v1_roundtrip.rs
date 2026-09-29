@@ -30,9 +30,7 @@ use novarocks_execution::exec::pipeline::executor::execute_native_plan_with_pipe
 use novarocks_execution::exec::pipeline::operator::{Operator, ProcessorOperator};
 use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
 use novarocks_execution::runtime::runtime_state::RuntimeState;
-use novarocks_execution::runtime::{
-    ExecutionRuntime, ExecutionRuntimeConfig, execution_runtime::ExecutionSpillStorageConfig,
-};
+use novarocks_execution::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_physical_plan::{
     ChangeEventSpec, ChangeStreamRoute, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind,
     EdgePartitioning, EdgeSource, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
@@ -434,8 +432,6 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
             None,
             None,
             None,
-            None,
-            None,
             Some(test_execution_runtime()),
         )),
         None,
@@ -458,9 +454,6 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    spill_io_threads: 1,
-                    spill_io_queue_capacity: 8,
-                    spill_storage: ExecutionSpillStorageConfig::default(),
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,

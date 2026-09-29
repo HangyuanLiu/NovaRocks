@@ -1277,8 +1277,7 @@ impl ProductionManifestAttemptProjection {
             self.runtime.native_compatibility_id,
             live_backends,
             &self.options,
-            ProtocolQueryOptions::parse(encode_query_options(self.options.runtime_options()))
-                .map_err(|error| projection_message(error.to_string()))?,
+            ProtocolQueryOptions::from_proto(encode_query_options(self.options.runtime_options())),
         )
         .map_err(projection_failure)?
         .with_credential_leases(credential_leases);

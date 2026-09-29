@@ -1149,7 +1149,7 @@ mod tests {
     use novarocks_execution::exec::node::table_write_relation::RootWriteResultRelationSchema;
     use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
     use novarocks_execution::runtime::execution_runtime::{
-        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+        ExecutionRuntime, ExecutionRuntimeConfig,
     };
     use novarocks_execution::runtime::runtime_state::RuntimeState;
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
@@ -1213,9 +1213,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    spill_io_threads: 1,
-                    spill_io_queue_capacity: 1,
-                    spill_storage: ExecutionSpillStorageConfig::default(),
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
@@ -1233,17 +1230,7 @@ mod tests {
             )
             .expect("writer execution runtime"),
         );
-        RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(runtime),
-        )
+        RuntimeState::new(None, None, None, None, None, None, Some(runtime))
     }
 
     fn write_decode_context(execution: Arc<RecordingWriteExecution>) -> NativePlanDecodeContext {

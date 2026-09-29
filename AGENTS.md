@@ -300,7 +300,7 @@ Execution, and do not recreate a Backend facade around it.
   BE-local query context manager, cleanup leases and resource snapshots.
 
 - `novarocks/execution/src/runtime/runtime_state.rs`
-  Runtime state for cache, spill, runtime filters, and execution context.
+  Runtime state for cache, runtime filters, and execution context.
 
 ### 4.7 Connectors / Catalog Backends / Filesystem
 
@@ -432,7 +432,7 @@ Execution, and do not recreate a Backend facade around it.
   Arena-based expression graph model.
 
 - `RuntimeState`: `novarocks/execution/src/runtime/runtime_state.rs`
-  Runtime context for cache, spill, and runtime filter behavior.
+  Runtime context for cache and runtime filter behavior.
 
 - `ExchangeKey`: `novarocks/execution/src/runtime/exchange.rs`
   Exchange routing key (`finst_id_hi` + `finst_id_lo` + `node_id`).
@@ -497,9 +497,6 @@ Execution, and do not recreate a Backend facade around it.
 
 - `[debug]`
   `exec_node_output`, `exec_batch_plan_json`
-
-- `[spill]`
-  Spill enablement, directories, block size, and compression strategy
 
 ### 7.3 Local Test Environment (Iceberg REST + MinIO + Spark)
 

@@ -24,7 +24,6 @@
 //! keeps only the two derivations the frontend owns: a fragment's task width
 //! and the query-wide options an establish carries.
 
-use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_proto_models::novarocks as wire;
@@ -62,8 +61,8 @@ pub(crate) fn select_fragment_pipeline_dop(
 }
 
 /// FE-owned execution settings are projected into the generated native
-/// carrier at the fragment submission boundary. Protocol validates the wire
-/// carrier, but deliberately does not own runtime defaults or execution types.
+/// carrier at the fragment submission boundary. The protocol representation
+/// deliberately does not own runtime defaults or execution types.
 pub(crate) fn encode_query_options(src: &QueryOptions) -> wire::QueryOptions {
     wire::QueryOptions {
         batch_size: src.batch_size.unwrap_or_default(),
@@ -75,8 +74,6 @@ pub(crate) fn encode_query_options(src: &QueryOptions) -> wire::QueryOptions {
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,
         group_concat_max_len: src.group_concat_max_len,
-        enable_spill: src.spill.is_some(),
-        spill_options: src.spill.as_ref().map(encode_spill_config),
         enable_scan_datacache: src.cache.enable_scan_datacache,
         enable_populate_datacache: src.cache.enable_populate_datacache,
         enable_datacache_async_populate_mode: src.cache.enable_datacache_async_populate_mode,
@@ -96,26 +93,5 @@ pub(crate) fn encode_query_options(src: &QueryOptions) -> wire::QueryOptions {
         enable_file_metacache: src.enable_file_metacache,
         enable_file_pagecache: src.enable_file_pagecache,
         enable_parquet_reader_page_index: src.enable_parquet_reader_page_index,
-    }
-}
-
-fn encode_spill_config(src: &SpillConfig) -> wire::SpillOptions {
-    wire::SpillOptions {
-        spill_mode: match src.spill_mode {
-            SpillMode::Auto => 0,
-            SpillMode::Force => 1,
-            SpillMode::None => 2,
-            SpillMode::Random => 3,
-        },
-        spill_mem_limit_threshold: src.spill_mem_limit_threshold.unwrap_or_default(),
-        spill_operator_min_bytes: src.spill_operator_min_bytes.unwrap_or_default(),
-        spill_operator_max_bytes: src.spill_operator_max_bytes.unwrap_or_default(),
-        spill_encode_level: src.spill_encode_level.unwrap_or_default(),
-        enable_spill_buffer_read: src.enable_spill_buffer_read.unwrap_or(false),
-        max_spill_read_buffer_bytes_per_driver: src
-            .max_spill_read_buffer_bytes_per_driver
-            .unwrap_or_default(),
-        spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
-        spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
     }
 }

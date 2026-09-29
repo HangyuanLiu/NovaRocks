@@ -691,12 +691,7 @@ impl FrontendDistributedQueryCoordinator {
             self.native_compatibility_id,
             backend_services.live_backends.clone(),
             &parts.options,
-            ProtocolQueryOptions::parse(encode_query_options(parts.options.runtime_options()))
-                .map_err(|error| {
-                    failed(format!(
-                        "query options protocol projection is invalid: {error}"
-                    ))
-                })?,
+            ProtocolQueryOptions::from_proto(encode_query_options(parts.options.runtime_options())),
         )?
         .with_credential_leases(credential_leases);
         // A write session's catalog is a materialization input like any typed

@@ -8,7 +8,7 @@ mod tests {
         ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     };
     use novarocks_execution::runtime::execution_runtime::{
-        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+        ExecutionRuntime, ExecutionRuntimeConfig,
     };
     use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
     use novarocks_execution::runtime::runtime_state::RuntimeState;
@@ -27,9 +27,6 @@ mod tests {
     fn execution_runtime() -> Arc<ExecutionRuntime> {
         let config = ExecutionRuntimeConfig {
             driver_threads: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 1,
-            spill_storage: ExecutionSpillStorageConfig::default(),
             exchange_wait_ms: 1,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
@@ -439,8 +436,6 @@ mod tests {
             None,
             Some(query_id),
             Some(UniqueId::new(0x6d65_6d33, 0x6d65_6d34)),
-            None,
-            None,
             None,
             None,
             Some(execution_runtime()),

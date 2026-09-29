@@ -1908,8 +1908,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                None,
             )
             .with_runtime_filter_session(session),
         );

@@ -35,11 +35,9 @@ use std::sync::Arc;
 
 use novarocks_types::largeint;
 
-mod chunks_sorter_full_sort;
 mod chunks_sorter_heap_sort;
 mod chunks_sorter_topn;
 mod sort_processor;
-mod spillable_chunks_sorter;
 
 /// Shared sorter abstraction for sort/topn operator implementations.
 pub(crate) trait ChunksSorter: Send + Sync {
@@ -316,11 +314,9 @@ pub(crate) fn append_stable_row_index_sort_column(
     });
 }
 
-pub(crate) use chunks_sorter_full_sort::ChunksSorterFullSort;
 pub(crate) use chunks_sorter_heap_sort::ChunksSorterHeapSort;
 pub(crate) use chunks_sorter_topn::{ChunksSorterPartitionTopN, ChunksSorterTopN};
 pub use sort_processor::SortProcessorFactory;
-pub(crate) use spillable_chunks_sorter::SpillableChunksSorter;
 
 #[cfg(test)]
 mod tests {

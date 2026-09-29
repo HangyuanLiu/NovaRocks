@@ -2316,7 +2316,7 @@ fn with_query_hints(
             raw.query_mem_limit = limit;
         }
     }
-    QueryOptions::parse(raw).expect("typed query hints do not invalidate query options")
+    QueryOptions::from_proto(raw)
 }
 
 fn execute_prepared_query(
@@ -2755,7 +2755,7 @@ async fn wait_for_eligible_query_topology_after(
 /// Frontend's one-way projection from Query Application session state into
 /// the native query-options DTO consumed at the execution boundary.
 fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> QueryOptions {
-    QueryOptions::parse(novarocks::QueryOptions {
+    QueryOptions::from_proto(novarocks::QueryOptions {
         group_concat_max_len: Some(settings.group_concat_max_len()),
         query_timeout: settings
             .query_timeout_secs()
@@ -2769,9 +2769,6 @@ fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> Q
         enable_populate_datacache: settings.enable_populate_datacache(),
         ..Default::default()
     })
-    // Session settings never enable spilling, so the Protocol validation
-    // performed here cannot reject an internally constructed value.
-    .expect("session settings must satisfy the native query-options contract")
 }
 
 #[cfg(test)]
@@ -2812,8 +2809,7 @@ mod tests {
     use novarocks_workload_control::ResourceConfig;
 
     fn default_query_options() -> QueryOptions {
-        QueryOptions::parse(novarocks_proto_models::novarocks::QueryOptions::default())
-            .expect("default wire query options are valid")
+        QueryOptions::from_proto(novarocks_proto_models::novarocks::QueryOptions::default())
     }
 
     #[test]

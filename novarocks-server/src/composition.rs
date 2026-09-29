@@ -31,9 +31,7 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
-use novarocks_execution::runtime::execution_runtime::{
-    ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-};
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
 use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
@@ -979,31 +977,8 @@ fn frontend_native_transport(
 
 fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {
     let runtime = &config.runtime;
-    let spill_io_threads = if runtime.spill_io_threads == 0 {
-        runtime.actual_exec_threads()
-    } else {
-        runtime.spill_io_threads
-    };
     ExecutionRuntimeConfig {
         driver_threads: runtime.actual_exec_threads(),
-        spill_io_threads,
-        spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
-        spill_storage: ExecutionSpillStorageConfig {
-            enabled: config.spill.enable,
-            local_dirs: if config.spill.local_dirs.is_empty() {
-                vec![
-                    std::env::temp_dir()
-                        .join("novarocks-spill")
-                        .to_string_lossy()
-                        .into_owned(),
-                ]
-            } else {
-                config.spill.local_dirs.clone()
-            },
-            dir_max_bytes: config.spill.dir_max_bytes,
-            block_size_bytes: config.spill.block_size_bytes.max(1),
-            ipc_compression: config.spill.ipc_compression.clone(),
-        },
         exchange_wait_ms: runtime.exchange_wait_ms,
         exchange_io_threads: runtime.exchange_io_threads.max(1),
         exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),

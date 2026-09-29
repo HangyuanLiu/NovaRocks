@@ -554,10 +554,6 @@ mod tests {
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    spill_io_threads: 1,
-                    spill_io_queue_capacity: 8,
-                    spill_storage:
-                        crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
@@ -575,17 +571,7 @@ mod tests {
             )
             .expect("test execution runtime"),
         );
-        RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(runtime),
-        )
+        RuntimeState::new(None, None, None, None, None, None, Some(runtime))
     }
 
     #[test]

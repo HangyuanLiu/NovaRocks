@@ -67,7 +67,6 @@ use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoin
 use novarocks_execution::runtime::exchange::{
     ExchangeKey, ExchangeSenderIdentity, ExecutionExchangeRegistry,
 };
-use novarocks_execution::runtime::execution_runtime::ExecutionSpillStorageConfig;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection,
 };
@@ -461,9 +460,6 @@ fn build_runtime(
     ExecutionRuntime::new(
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 8,
-            spill_storage: ExecutionSpillStorageConfig::default(),
             exchange_wait_ms: 120_000,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1 << 20,
@@ -540,8 +536,6 @@ fn run_once(
         None,
         None,
         Some(Arc::clone(&query_tracker)),
-        None,
-        None,
         Some(runtime),
     );
     let writer_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableWriter"));

@@ -413,24 +413,30 @@ fn retired_mv_native_scan_fields_remain_reserved_and_fail_closed() {
 }
 
 #[test]
-fn retired_scan_io_task_query_option_remains_reserved() {
+fn retired_query_option_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     let query_options = pool
         .get_message_by_name("novarocks.QueryOptions")
         .expect("QueryOptions descriptor");
-    assert!(
-        query_options
-            .reserved_ranges()
-            .any(|range| range.contains(&6)),
-        "QueryOptions field 6 must remain reserved"
-    );
-    assert!(
-        query_options
-            .reserved_names()
-            .any(|name| name == "connector_io_tasks_per_scan_operator"),
-        "QueryOptions connector_io_tasks_per_scan_operator name must remain reserved"
-    );
+    for (field_number, field_name) in [
+        (6, "connector_io_tasks_per_scan_operator"),
+        (11, "enable_spill"),
+        (12, "spill_options"),
+    ] {
+        assert!(
+            query_options
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "QueryOptions field {field_number} must remain reserved"
+        );
+        assert!(
+            query_options
+                .reserved_names()
+                .any(|name| name == field_name),
+            "QueryOptions {field_name} name must remain reserved"
+        );
+    }
 }
 
 #[test]

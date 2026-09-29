@@ -3279,8 +3279,6 @@ mod tests {
             None,
             Some(Arc::clone(&tracker)),
             None,
-            None,
-            None,
         );
         (state, tracker)
     }

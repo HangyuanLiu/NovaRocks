@@ -172,18 +172,6 @@ fn query_options() -> novarocks::QueryOptions {
         runtime_filter_wait_timeout_ms: Some(3000),
         allow_throw_exception: true,
         group_concat_max_len: Some(65_536),
-        enable_spill: true,
-        spill_options: Some(novarocks::SpillOptions {
-            spill_mode: 2,
-            spill_mem_limit_threshold: 0.8,
-            spill_operator_min_bytes: 1 << 20,
-            spill_operator_max_bytes: 64 << 20,
-            spill_encode_level: 1,
-            enable_spill_buffer_read: true,
-            max_spill_read_buffer_bytes_per_driver: 8 << 20,
-            spill_mem_table_size: 16 << 20,
-            spill_mem_table_num: 3,
-        }),
         enable_scan_datacache: true,
         enable_populate_datacache: true,
         enable_datacache_async_populate_mode: true,
@@ -222,8 +210,10 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 
     assert_eq!(
         fields,
-        (1..=29).filter(|tag| *tag != 6).collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 6"
+        (1..=29)
+            .filter(|tag| ![6, 11, 12].contains(tag))
+            .collect::<Vec<_>>(),
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 6, 11, 12"
     );
 }
 
