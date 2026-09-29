@@ -20,6 +20,9 @@ class Backend:
     def __init__(self):
         self.calls = []
         self.containers = {}
+        self.networks = set()
+        self.volumes = set()
+        self.residual = None
         self.timeout = 90
 
     def daemon_id(self):
@@ -39,8 +42,30 @@ class Backend:
         self.calls.append(("compose", record["project"], args))
         if args[0] == "up":
             self.containers[record["project"]] = {"Id": record["project"] + "-exact-id"}
+            self.networks.add(record["network"])
+            self.volumes.update(record["volumes"])
         if args[0] == "down":
-            self.containers.pop(record["project"], None)
+            if self.residual != "container":
+                self.containers.pop(record["project"], None)
+            if self.residual != "network":
+                self.networks.discard(record["network"])
+            if ("-v" in args or "--volumes" in args) and self.residual != "volume":
+                self.volumes.difference_update(record["volumes"])
+
+    def command(self, args):
+        self.calls.append(("command", args))
+        if args[:3] != ["ps", "-a", "--filter"]:
+            raise AssertionError(args)
+        project = args[3].removeprefix("label=com.docker.compose.project=")
+        return self.containers.get(project, {}).get("Id", "")
+
+    def inspect(self, kind, identity, *, absent_ok=False):
+        self.calls.append(("inspect", kind, identity))
+        resources = {"network": self.networks, "volume": self.volumes}
+        return {"Name": identity} if identity in resources[kind] else None
+
+    # Exercise the production absence checks against this resource inventory.
+    delete_resources = hive.runtime.Docker.delete_resources
 
 
 class HiveOwnerTest(unittest.TestCase):
@@ -71,11 +96,70 @@ class HiveOwnerTest(unittest.TestCase):
         self.hive.down("cat-a", volumes=True)
         operations = self.backend.calls
         disconnect = operations.index(("consumer", "cat-a", first["container_id"], {"disconnect": True}))
-        down = operations.index(("compose", first["project"], ["down", "--volumes"]))
+        down = operations.index(("compose", first["project"], ["down", "-v"]))
         self.assertLess(disconnect, down)
         self.assertIn(second["project"], self.backend.containers)
-        self.assertEqual(self.hive.read("cat-a")["state"], "stopped")
+        self.assertIsNone(self.hive.read("cat-a"))
         self.assertEqual(self.hive.read("cat-b")["state"], "ready")
+
+    def test_ordinary_down_retains_derby_definition_and_port_reservation(self):
+        record = self.hive.up(self.manifest("cat-a"), "local-hms")
+        self.owner.port_start = self.owner.port_end = record["ports"]["hms"]
+        stopped = self.hive.down("cat-a")
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["ports"], record["ports"])
+        self.assertTrue(self.hive.directory("cat-a").is_dir())
+        self.assertTrue(set(record["volumes"]) <= self.backend.volumes)
+        with self.owner.lock("ports"), self.assertRaisesRegex(hive.runtime.RuntimeFailure, "PortUnavailable"):
+            self.owner.allocate(["rest"])
+        resumed = self.hive.up(self.manifest("cat-a"), "local-hms")
+        self.assertEqual(resumed["ports"], record["ports"])
+
+    def test_destructive_down_retires_definition_and_releases_port_with_stable_lock(self):
+        record = self.hive.up(self.manifest("cat-a"), "local-hms")
+        self.owner.port_start = self.owner.port_end = record["ports"]["hms"]
+        lock = self.owner.base / "locks" / "hms-cat-a.lock"
+        inode = lock.stat().st_ino
+        self.assertEqual(self.hive.down("cat-a", volumes=True), {"catalog_id": "cat-a", "state": "absent"})
+        self.assertNotIn(record["project"], self.backend.containers)
+        self.assertNotIn(record["network"], self.backend.networks)
+        self.assertFalse(set(record["volumes"]) & self.backend.volumes)
+        self.assertFalse(self.hive.directory("cat-a").exists())
+        self.assertEqual(lock.stat().st_ino, inode)
+        with self.owner.lock("ports"):
+            self.assertEqual(self.owner.allocate(["rest"]), {"rest": record["ports"]["hms"]})
+
+    def test_residual_resources_preserve_deleting_record_until_retry_succeeds(self):
+        for kind in ("container", "network", "volume"):
+            with self.subTest(kind=kind):
+                identity = "cat-" + kind
+                record = self.hive.up(self.manifest(identity), "local-hms")
+                self.owner.port_start = self.owner.port_end = record["ports"]["hms"]
+                self.backend.residual = kind
+                with self.assertRaises(hive.runtime.RuntimeFailure) as error:
+                    self.hive.down(identity, volumes=True)
+                self.assertEqual(error.exception.code, "ResourcesStillPresent")
+                failed = self.hive.read(identity)
+                self.assertEqual(failed["state"], "deleting")
+                self.assertEqual(failed["ports"], record["ports"])
+                self.assertTrue(Path(failed["compose_file"]).is_file())
+                with self.owner.lock("ports"), self.assertRaisesRegex(hive.runtime.RuntimeFailure, "PortUnavailable"):
+                    self.owner.allocate(["rest"])
+                for prepare in (False, True):
+                    with self.assertRaisesRegex(hive.runtime.RuntimeFailure, "RuntimeDeleting"):
+                        self.hive.up(self.manifest(identity), "local-hms", prepare_only=prepare)
+                self.backend.residual = None
+                # The durable deletion intent survives without repeating -v.
+                self.assertEqual(self.hive.down(identity)["state"], "absent")
+                with self.owner.lock("ports"):
+                    self.assertEqual(self.owner.allocate(["rest"])["rest"], record["ports"]["hms"])
+
+    def test_repeated_destructive_down_is_idempotent_without_docker_calls(self):
+        self.hive.up(self.manifest("cat-a"), "local-hms")
+        self.hive.down("cat-a", volumes=True)
+        self.backend.calls.clear()
+        self.assertEqual(self.hive.down("cat-a", volumes=True), {"catalog_id": "cat-a", "state": "absent"})
+        self.assertEqual(self.backend.calls, [])
 
     def test_prepare_without_docker_then_retry_keeps_fixed_port(self):
         first = self.hive.up(self.manifest("cat-a"), "local-hms", prepare_only=True)

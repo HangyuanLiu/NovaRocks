@@ -758,7 +758,9 @@ owns an alternate server runtime.
 **Run specific cases:**
 
 ```bash
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite join --only join_cross_join_small,join_array_type --mode verify
 ```
 

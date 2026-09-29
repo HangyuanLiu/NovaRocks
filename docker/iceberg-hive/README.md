@@ -63,8 +63,13 @@ docker/iceberg-rest/spark-sql.sh /tmp/hms-check.sql
 
 `status.sh` prints the saved project, catalog dependency, endpoint and state.
 `down.sh --catalog-id <id>` disconnects the exact HMS container through the
-owner, then stops only its own project. `--volumes` (or `--purge`) also removes
-its Derby volume. The saved record retains the fixed port for a later start.
+owner, then stops only its own project. Ordinary down retains the Derby volume,
+saved definition and fixed port for a later start. `--volumes` (or `--purge`)
+removes its Derby volume and verifies that its containers, network and volumes
+are absent before retiring the saved definition and releasing the port
+reservation. Stable owner lock files remain. A failed destructive cleanup keeps
+the deleting record and its reservation; `up` rejects it until `down` completes
+the cleanup. Repeating a completed destructive down is a no-op.
 HMS must exit before the dependent catalog can be deleted, including force.
 
 After switching a worktree to another catalog, explicitly select the old ID:

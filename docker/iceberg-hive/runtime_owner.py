@@ -25,9 +25,11 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import socket
 import sys
 import time
+import uuid
 from xml.sax.saxutils import escape
 
 HERE = Path(__file__).resolve().parent
@@ -164,6 +166,8 @@ class HiveOwner:
         identity = manifest["runtime"]["catalog"]["id"]
         with self.owner.lock("hms-" + identity):
             record = self.prepare(manifest, image)
+            if record["state"] == "deleting":
+                raise runtime.RuntimeFailure("RuntimeDeleting", identity)
             if prepare_only:
                 return record
             self.owner.assert_live_daemon()
@@ -235,13 +239,36 @@ class HiveOwner:
             if not record:
                 return {"catalog_id": identity, "state": "absent"}
             self.owner.assert_live_daemon()
+            # A retry must finish a saved destructive request, never restart an
+            # instance whose Derby volume may already have been removed.
+            deleting = volumes or record["state"] == "deleting"
+            if deleting:
+                record["state"] = "deleting"
+                self.save(record)
             self.backend.validate_resources(record)
             container = self.backend.container(record, "hms") if record["images"]["hms"]["image_id"] else None
             if container:
                 self.owner.consumer(identity, container["Id"], disconnect=True)
             elif record["container_id"]:
                 self.owner.consumer(identity, record["container_id"], disconnect=True)
-            self.backend.compose(record, ["down", *(["--volumes"] if volumes else [])])
+            if deleting:
+                # HMS records use catalog_id as their identity. The common
+                # resource verifier needs the same identity in its projection.
+                self.backend.delete_resources({**record, "id": identity})
+                directory = self.directory(identity)
+                retirement_root = self.owner.base / "retired-hms"
+                retirement_root.mkdir(parents=True, exist_ok=True)
+                retired = retirement_root / f"{identity}-{uuid.uuid4().hex}"
+                # The allocator reads HMS manifests under ports. Retire the
+                # whole saved definition atomically before releasing its port.
+                with self.owner.lock("ports"):
+                    os.rename(directory, retired)
+                    runtime.fsync_directory(directory.parent)
+                    runtime.fsync_directory(retirement_root)
+                shutil.rmtree(retired)
+                runtime.fsync_directory(retirement_root)
+                return {"catalog_id": identity, "state": "absent"}
+            self.backend.compose(record, ["down"])
             record.update(state="stopped", container_id=None)
             self.save(record)
             return record
