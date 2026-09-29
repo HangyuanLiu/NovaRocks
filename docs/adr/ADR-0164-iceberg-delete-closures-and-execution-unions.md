@@ -7,6 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-09-29
 provenance:
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1127"
   - "discussion: 2026-09-29 Iceberg delete closure authority, equality sharing and endpoint visibility"
 code-anchors:
   - "novarocks/connector/iceberg/src/read_snapshot.rs (build_read_snapshot_in_domain)"
