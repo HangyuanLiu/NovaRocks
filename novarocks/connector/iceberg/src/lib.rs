@@ -40,6 +40,7 @@ pub mod connector_factory;
 pub mod default_value;
 pub mod definition;
 pub mod delete_file;
+pub mod delete_semantics;
 pub mod delta;
 pub mod distributed_rewrite;
 pub mod document_storage;
