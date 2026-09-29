@@ -17,8 +17,6 @@
 
 use std::time::Duration;
 
-use crate::runtime::spill_config::SpillConfig;
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QueryOptions {
     pub batch_size: Option<i32>,
@@ -39,7 +37,6 @@ pub struct QueryOptions {
     pub enable_join_runtime_bitset_filter: Option<bool>,
     pub global_runtime_filter_build_max_size: Option<i64>,
     pub cache: QueryCacheOptions,
-    pub spill: Option<SpillConfig>,
 }
 
 /// Protocol-neutral query execution options captured at an ingress boundary.
@@ -66,7 +63,6 @@ pub struct QueryOptionsParts {
     pub enable_join_runtime_bitset_filter: Option<bool>,
     pub global_runtime_filter_build_max_size: Option<i64>,
     pub cache: QueryCacheOptions,
-    pub spill: Option<SpillConfig>,
 }
 
 impl QueryOptions {
@@ -95,7 +91,6 @@ impl QueryOptions {
             enable_join_runtime_bitset_filter: parts.enable_join_runtime_bitset_filter,
             global_runtime_filter_build_max_size: parts.global_runtime_filter_build_max_size,
             cache: parts.cache,
-            spill: parts.spill,
         }
     }
 
@@ -153,10 +148,6 @@ impl QueryOptions {
 
     pub const fn cache(&self) -> &QueryCacheOptions {
         &self.cache
-    }
-
-    pub fn spill(&self) -> Option<&SpillConfig> {
-        self.spill.as_ref()
     }
 
     pub const fn enable_profile(&self) -> bool {

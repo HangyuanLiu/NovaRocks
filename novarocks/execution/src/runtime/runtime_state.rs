@@ -18,7 +18,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::runtime::cache::ExecutionCacheOptions;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker, query_tracker_label};
 use crate::runtime::profile::clamp_u128_to_i64;
@@ -41,8 +40,6 @@ pub struct RuntimeState {
     fragment_instance_id: Option<UniqueId>,
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
-    spill_config: Option<SpillConfig>,
-    spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
     execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
 }
@@ -58,6 +55,9 @@ impl std::fmt::Debug for RuntimeState {
 #[derive(Debug, Default)]
 pub struct RuntimeErrorState {
     error: std::sync::Mutex<Option<String>>,
+    stopped: std::sync::Condvar,
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl RuntimeErrorState {
@@ -65,11 +65,36 @@ impl RuntimeErrorState {
         let mut guard = self.error.lock().expect("runtime error lock");
         if guard.is_none() {
             *guard = Some(err);
+            self.stopped.notify_all();
         }
     }
 
     pub fn error(&self) -> Option<String> {
         self.error.lock().expect("runtime error lock").clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_count(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
+    /// Wait without holding execution after this exact fragment stops.
+    /// The predicate and notification share the error lock, including an error
+    /// published before registration and spurious condition-variable wakes.
+    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
+        let guard = self.error.lock().expect("runtime error lock");
+        #[cfg(test)]
+        self.waiting.fetch_add(1, Ordering::Release);
+        let (guard, _) = self
+            .stopped
+            .wait_timeout_while(guard, duration, |error| error.is_none())
+            .expect("runtime stop wait");
+        #[cfg(test)]
+        self.waiting.fetch_sub(1, Ordering::Release);
+        match guard.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -87,8 +112,6 @@ impl Default for RuntimeState {
             fragment_instance_id: None,
             backend_num: None,
             mem_tracker: None,
-            spill_config: None,
-            spill_manager: None,
             runtime_filter_session: None,
             execution_runtime: None,
         }
@@ -108,8 +131,6 @@ impl Clone for RuntimeState {
             fragment_instance_id: self.fragment_instance_id,
             backend_num: self.backend_num,
             mem_tracker: self.mem_tracker.clone(),
-            spill_config: self.spill_config.clone(),
-            spill_manager: self.spill_manager.clone(),
             runtime_filter_session: self.runtime_filter_session.clone(),
             execution_runtime: self.execution_runtime.clone(),
         }
@@ -117,10 +138,6 @@ impl Clone for RuntimeState {
 }
 
 impl RuntimeState {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Runtime state construction accepts independently optional host-owned services."
-    )]
     pub fn new(
         query_options: Option<QueryOptions>,
         cache_options: Option<ExecutionCacheOptions>,
@@ -128,8 +145,6 @@ impl RuntimeState {
         fragment_instance_id: Option<UniqueId>,
         backend_num: Option<i32>,
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
-        spill_config: Option<SpillConfig>,
-        spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
         execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
     ) -> Self {
         let mem_tracker = mem_tracker.or_else(|| {
@@ -162,8 +177,6 @@ impl RuntimeState {
             fragment_instance_id,
             backend_num,
             mem_tracker,
-            spill_config,
-            spill_manager,
             runtime_filter_session: None,
             execution_runtime,
         }
@@ -193,14 +206,6 @@ impl RuntimeState {
 
     pub fn backend_num(&self) -> Option<i32> {
         self.backend_num
-    }
-
-    pub(crate) fn spill_config(&self) -> Option<&SpillConfig> {
-        self.spill_config.as_ref()
-    }
-
-    pub(crate) fn spill_manager(&self) -> Option<std::sync::Arc<QuerySpillManager>> {
-        self.spill_manager.clone()
     }
 
     pub(crate) fn runtime_filter_scan_wait_timeout(&self) -> Option<Duration> {
@@ -314,10 +319,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    spill_io_threads: 1,
-                    spill_io_queue_capacity: 1,
-                    spill_storage:
-                        crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1,
@@ -335,17 +336,7 @@ mod tests {
             )
             .expect("test runtime"),
         );
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(runtime),
-        );
+        let state = RuntimeState::new(None, None, None, None, None, None, Some(runtime));
         let exec = state.sink_io_executor().expect("sink_io executor");
         let handle = exec.spawn(async {
             std::thread::current()

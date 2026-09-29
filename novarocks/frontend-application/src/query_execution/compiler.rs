@@ -975,6 +975,7 @@ fn test_request_context_with_role(
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                        4096,
                     )
                     .expect("valid test descriptor"),
                     novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
@@ -1118,7 +1119,7 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
         .map(|options| *options.as_proto())
         .unwrap_or_default();
     raw.enable_profile = true;
-    QueryOptions::parse(raw).expect("enabling query profiling does not invalidate query options")
+    QueryOptions::from_proto(raw)
 }
 
 #[allow(
@@ -1852,34 +1853,20 @@ mod tests {
     fn explain_analyze_query_options_only_enable_profile() {
         assert_eq!(
             super::query_options_for_explain_analyze(None),
-            QueryOptions::parse(novarocks::QueryOptions {
+            QueryOptions::from_proto(novarocks::QueryOptions {
                 enable_profile: true,
                 ..Default::default()
             })
-            .expect("profile-only query options are valid")
         );
 
-        let options = QueryOptions::parse(novarocks::QueryOptions {
+        let options = QueryOptions::from_proto(novarocks::QueryOptions {
             pipeline_dop: 3,
             query_timeout: 90,
-            enable_spill: true,
-            spill_options: Some(novarocks::SpillOptions {
-                spill_mode: 0,
-                spill_mem_limit_threshold: 0.7,
-                spill_operator_min_bytes: 64,
-                spill_operator_max_bytes: 1024,
-                spill_encode_level: 3,
-                enable_spill_buffer_read: true,
-                max_spill_read_buffer_bytes_per_driver: 4096,
-                spill_mem_table_size: 256,
-                spill_mem_table_num: 4,
-            }),
             ..Default::default()
-        })
-        .expect("valid protocol query options");
+        });
         let mut expected_raw = *options.as_proto();
         expected_raw.enable_profile = true;
-        let expected = QueryOptions::parse(expected_raw).expect("valid profile options");
+        let expected = QueryOptions::from_proto(expected_raw);
 
         assert_eq!(
             super::query_options_for_explain_analyze(Some(options)),

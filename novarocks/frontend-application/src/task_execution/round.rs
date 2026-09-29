@@ -26,7 +26,7 @@
 //! timed out, or finished -- it moves the state machine and lets the caller
 //! read the verdicts the machine already computes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::identity::TaskIdentity;
@@ -49,7 +49,11 @@ use super::context_owner::{ContextEstablishSource, QueryContextOwner};
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
 use super::intent::{AckPayload, OperationAcknowledgement};
-use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
+use super::status_intake::ObservationIntake;
+use crate::native::task_transport::{
+    CoveredTaskStatusSubscriber, SubscriptionState, TaskAckIntake, TaskOperationIntakeEvent,
+    TaskStatusSubscriber,
+};
 
 /// Something that must see every acknowledgement this runner settles.
 ///
@@ -211,13 +215,17 @@ pub(crate) struct TaskRound {
     execution: QueryTaskExecution,
     acks: TaskAckIntake,
     establish: Box<dyn ContextEstablishSource>,
-    subscriber: Arc<dyn StatusSubscriptions>,
+    subscriber: Option<Arc<dyn StatusSubscriptions>>,
+    covered_subscriber: Option<Arc<CoveredTaskStatusSubscriber>>,
+    observation_intake: Option<Arc<ObservationIntake>>,
     observers: Vec<Arc<dyn AcknowledgementObserver>>,
     pumps: Vec<Box<dyn TurnPump>>,
     pumps_sealed: bool,
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
     root_status_sender: Option<AcceptedRootStatusSender>,
     root_status_source: Option<AcceptedRootStatusSource>,
+    /// Result consumes root output; other intents retain their Task evidence.
+    result_consumer_attached: bool,
     pending_success_seal:
         Option<novarocks_query_application::coordination::AcceptedRootSuccessSealRequest>,
     abort_effect_intake: Option<NativeAbortEffectIntake>,
@@ -230,6 +238,8 @@ pub(crate) struct TaskRound {
     /// was already in flight when an older send finally answered.
     abort_closing_receipts:
         BTreeMap<novarocks_execution::task_execution::TaskOperationId, OperationAcknowledgement>,
+    success_sealed: bool,
+    normal_drain_started: bool,
     terminal_cleanup_started: bool,
 }
 
@@ -239,6 +249,27 @@ impl TaskRound {
         acks: TaskAckIntake,
         establish: Box<dyn ContextEstablishSource>,
         subscriber: Arc<dyn StatusSubscriptions>,
+    ) -> Self {
+        Self::new_inner(execution, acks, establish, Some(subscriber))
+    }
+
+    pub(crate) fn new_covered(
+        execution: QueryTaskExecution,
+        acks: TaskAckIntake,
+        establish: Box<dyn ContextEstablishSource>,
+        subscriber: Arc<CoveredTaskStatusSubscriber>,
+        intake: Arc<ObservationIntake>,
+    ) -> Self {
+        let mut round = Self::new_inner(execution, acks, establish, None);
+        round.install_covered_observation(subscriber, intake);
+        round
+    }
+
+    fn new_inner(
+        execution: QueryTaskExecution,
+        acks: TaskAckIntake,
+        establish: Box<dyn ContextEstablishSource>,
+        subscriber: Option<Arc<dyn StatusSubscriptions>>,
     ) -> Self {
         let (root_status_sender, root_status_source) =
             accepted_root_status_projection_with_seal_port(
@@ -250,18 +281,130 @@ impl TaskRound {
             acks,
             establish,
             subscriber,
+            covered_subscriber: None,
+            observation_intake: None,
             observers: Vec::new(),
             pumps: Vec::new(),
             pumps_sealed: false,
             connector_blocking_io: None,
             root_status_sender: Some(root_status_sender),
             root_status_source: Some(root_status_source),
+            result_consumer_attached: false,
             pending_success_seal: None,
             abort_effect_intake: None,
             abort_effects: BTreeMap::new(),
             late_abort_settlements: BTreeMap::new(),
             abort_closing_receipts: BTreeMap::new(),
+            success_sealed: false,
+            normal_drain_started: false,
             terminal_cleanup_started: false,
+        }
+    }
+
+    fn legacy_subscriber(&self) -> &dyn StatusSubscriptions {
+        self.subscriber
+            .as_deref()
+            .expect("uncovered round owns its status subscriber")
+    }
+
+    /// Binds the result pump's move-only success seal to the same ordered
+    /// intake that accepts covered observation frames. This is installed
+    /// before the root status source is handed to the result pump.
+    pub(crate) fn replace_root_status_port(
+        &mut self,
+        intake: Arc<super::status_intake::ObservationIntake>,
+    ) {
+        assert!(
+            self.root_status_source.is_some(),
+            "root status source was already transferred before covered observation installation"
+        );
+        let (sender, source) = accepted_root_status_projection_with_seal_port(
+            self.execution.graph().root_identity(),
+            intake,
+        );
+        self.root_status_sender = Some(sender);
+        self.root_status_source = Some(source);
+    }
+
+    /// Installs one covered transport and its ordered intake before the root
+    /// result source is transferred to the result pump.
+    pub(crate) fn install_covered_observation(
+        &mut self,
+        subscriber: Arc<CoveredTaskStatusSubscriber>,
+        intake: Arc<ObservationIntake>,
+    ) {
+        assert!(self.covered_subscriber.is_none() && self.observation_intake.is_none());
+        self.replace_root_status_port(Arc::clone(&intake));
+        self.execution.activate_covered_observation();
+        self.covered_subscriber = Some(subscriber);
+        self.observation_intake = Some(intake);
+    }
+
+    pub(crate) fn covered_observation_ready(&self) -> bool {
+        self.execution.covered_observation_ready()
+    }
+
+    fn covered_request(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<novarocks_task_codec::operation::DecodedCoveredSubscription, TaskExecutionError>
+    {
+        let generation = self.execution.next_covered_generation(context)?;
+        self.execution
+            .covered_subscription_request(context, generation)
+    }
+
+    fn covered_subscription_failure(&self, context: QueryContextRef) -> Option<SubscriptionState> {
+        let state = self.covered_subscriber.as_ref()?.state(context)?;
+        self.classify_covered_subscription_state(context, state)
+    }
+
+    /// Exhausted transport recovery matters only while this Context still
+    /// owes required Task evidence. Plain disconnection never erases an
+    /// accepted fact or creates an application gap. Retired input demand and
+    /// an accepted success cut leave residual observation to the drain owner.
+    pub(super) fn classify_covered_subscription_state(
+        &self,
+        context: QueryContextRef,
+        state: SubscriptionState,
+    ) -> Option<SubscriptionState> {
+        match state {
+            SubscriptionState::BudgetExhausted => {
+                if self.success_sealed || self.terminal_cleanup_started {
+                    return None;
+                }
+                let root = self.execution.graph().root_identity();
+                if self.result_consumer_attached
+                    && self.execution.failure_cause().is_none()
+                    && self
+                        .execution
+                        .task(root.task_id())
+                        .and_then(|task| task.status())
+                        .is_some_and(|status| {
+                            status.identity() == root
+                                && status.state()
+                                    == novarocks_execution::task_execution::TaskState::Finished
+                                && status.output().responsibility_complete()
+                        })
+                {
+                    // Result fetch and its EOS acknowledgement have their own
+                    // owner. Once the exact root completed its output, residual
+                    // producer observation belongs to drain even before the
+                    // result consumer registers its success-seal request.
+                    return None;
+                }
+                self.execution
+                    .graph()
+                    .tasks()
+                    .filter(|task| task.context() == context)
+                    .filter_map(|task| self.execution.task(task.identity().task_id()))
+                    .any(|task| {
+                        !task.normally_stood_down() && !task.fenced_out() && !task.is_terminal()
+                    })
+                    .then_some(state)
+            }
+            state if state.is_fatal() => Some(state),
+            _ => None,
         }
     }
 
@@ -281,9 +424,12 @@ impl TaskRound {
     }
 
     /// Transfers the single accepted-root projection to the result-pump
-    /// owner. The round retains only its sender and remains the sole publisher.
+    /// owner and attaches its Result evidence policy. The round retains only
+    /// its sender and remains the sole publisher.
     pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
-        self.root_status_source.take()
+        let source = self.root_status_source.take()?;
+        self.result_consumer_attached = true;
+        Some(source)
     }
 
     /// Installs the process owner used by blocking Connector calls.
@@ -371,7 +517,20 @@ impl TaskRound {
         let mut report = TurnReport::default();
 
         let mut first_ack_error = None;
-        for ack in self.acks.drain() {
+        for event in self.acks.drain_events() {
+            let ack = match event {
+                TaskOperationIntakeEvent::EstablishSendStarted {
+                    operation_id,
+                    context,
+                } => {
+                    if let Err(error) = self.execution.establish_send_started(context, operation_id)
+                    {
+                        first_ack_error.get_or_insert(error);
+                    }
+                    continue;
+                }
+                TaskOperationIntakeEvent::Acknowledgement(ack) => ack,
+            };
             report.acknowledgements += 1;
             if let Err(error) = self.settle_acknowledgement(&ack) {
                 first_ack_error.get_or_insert(error);
@@ -389,9 +548,15 @@ impl TaskRound {
             if self.terminal_cleanup_started {
                 break;
             }
-            self.subscriber
-                .resubscribe(context, self.execution.status_cursors(context))
-                .map_err(TaskExecutionError::Schedule)?;
+            if let Some(subscriber) = &self.covered_subscriber {
+                subscriber
+                    .reconcile(self.covered_request(context)?)
+                    .map_err(TaskExecutionError::Schedule)?;
+            } else {
+                self.legacy_subscriber()
+                    .resubscribe(context, self.execution.status_cursors(context))
+                    .map_err(TaskExecutionError::Schedule)?;
+            }
             report.resubscriptions += 1;
         }
 
@@ -400,7 +565,47 @@ impl TaskRound {
         } else {
             STATUS_EVENTS_PER_TURN
         };
-        let status = self.execution.apply_status(status_budget)?;
+        let status = if let Some(intake) = &self.observation_intake {
+            if intake.local_progress_expired() {
+                return Err(TaskExecutionError::Schedule(
+                    "covered observation local application made no progress within its budget"
+                        .to_owned(),
+                ));
+            }
+            let entries = intake
+                .try_enter()
+                .map(|mut runner| runner.drain_ordered(status_budget))
+                .unwrap_or_default();
+            let applied_contexts = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    super::status_intake::ObservationIntakeEntry::Frame(
+                        super::status_intake::ObservationFrame::Covered { context, .. },
+                    ) => Some(*context),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let status = self.execution.apply_covered_entries(entries)?;
+            intake.acknowledge_applied();
+            if !self.terminal_cleanup_started
+                && let Some(subscriber) = &self.covered_subscriber
+            {
+                for context in applied_contexts {
+                    if !subscriber
+                        .state(context)
+                        .is_some_and(|state| !state.is_fatal())
+                    {
+                        continue;
+                    }
+                    subscriber
+                        .update_applied_request(self.covered_request(context)?)
+                        .map_err(TaskExecutionError::Schedule)?;
+                }
+            }
+            status
+        } else {
+            self.execution.apply_status(status_budget)?
+        };
         report.status_events = status.accepted + status.ignored;
         if let Some(request) = status.success_seal {
             if self.pending_success_seal.replace(request).is_some() {
@@ -417,9 +622,35 @@ impl TaskRound {
                 "success seal refused because Task status observation was incomplete before its linearization point",
             ));
         }
+        if self.execution.covered_observation_active()
+            && let Some(identity) = self.execution.required_terminal_evidence_expired()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "required Task terminal observation {identity:?} did not arrive within its recovery budget"
+            )));
+        }
+        if self.pending_success_seal.is_none()
+            && self.execution.covered_observation_active()
+            && self.execution.covered_recovery_expired()
+        {
+            return Err(TaskExecutionError::Schedule(
+                "required covered observation evidence could not be recovered within its budget"
+                    .to_owned(),
+            ));
+        }
         self.publish_root_status()?;
         if !status.resubscribe {
             self.try_settle_success_seal()?;
+        }
+        if !self.terminal_cleanup_started {
+            for context in self.execution.take_covered_reconciliations() {
+                if let Some(subscriber) = &self.covered_subscriber {
+                    subscriber
+                        .reconcile(self.covered_request(context)?)
+                        .map_err(TaskExecutionError::Schedule)?;
+                    report.resubscriptions += 1;
+                }
+            }
         }
         if status.resubscribe && !self.terminal_cleanup_started {
             for &context in self.execution.graph().contexts() {
@@ -430,11 +661,22 @@ impl TaskRound {
                 {
                     continue;
                 }
-                self.subscriber
-                    .resubscribe(context, self.execution.status_cursors(context))
-                    .map_err(TaskExecutionError::Schedule)?;
+                if let Some(subscriber) = &self.covered_subscriber {
+                    subscriber
+                        .reconcile(self.covered_request(context)?)
+                        .map_err(TaskExecutionError::Schedule)?;
+                } else {
+                    self.legacy_subscriber()
+                        .resubscribe(context, self.execution.status_cursors(context))
+                        .map_err(TaskExecutionError::Schedule)?;
+                }
                 report.resubscriptions += 1;
-                if let Some(state) = self.subscriber.settled_fatally(context) {
+                let fatal = if self.covered_subscriber.is_some() {
+                    self.covered_subscription_failure(context)
+                } else {
+                    self.legacy_subscriber().settled_fatally(context)
+                };
+                if let Some(state) = fatal {
                     return Err(TaskExecutionError::ParticipantUnobservable {
                         backend: context.backend_process_id(),
                         state: participant_observation_failure(state),
@@ -443,7 +685,10 @@ impl TaskRound {
             }
         }
 
-        if !self.terminal_cleanup_started {
+        if !self.normal_drain_started
+            && !self.terminal_cleanup_started
+            && self.execution.failure_cause().is_none()
+        {
             for pump in &mut self.pumps {
                 report.pumped += pump.drive(&mut self.execution)?;
             }
@@ -482,15 +727,25 @@ impl TaskRound {
             {
                 continue;
             }
-            let cursors = self.execution.status_cursors(context);
-            self.subscriber
-                .ensure(context, cursors)
-                .map_err(TaskExecutionError::Schedule)?;
+            if let Some(subscriber) = &self.covered_subscriber {
+                subscriber
+                    .ensure(self.covered_request(context)?)
+                    .map_err(TaskExecutionError::Schedule)?;
+            } else {
+                self.legacy_subscriber()
+                    .ensure(context, self.execution.status_cursors(context))
+                    .map_err(TaskExecutionError::Schedule)?;
+            }
             // A settled subscription is this attempt's evidence that the
             // backend process is gone. It is read after `ensure` on purpose:
             // `ensure` is what restarts a stream that can still recover, so
             // asking first would report a state the very next call repairs.
-            if let Some(state) = self.subscriber.settled_fatally(context) {
+            let fatal = if self.covered_subscriber.is_some() {
+                self.covered_subscription_failure(context)
+            } else {
+                self.legacy_subscriber().settled_fatally(context)
+            };
+            if let Some(state) = fatal {
                 return Err(TaskExecutionError::ParticipantUnobservable {
                     backend: context.backend_process_id(),
                     state: participant_observation_failure(state),
@@ -531,6 +786,16 @@ impl TaskRound {
         self.execution.acknowledge(ack)
     }
 
+    /// Stops input-producing pumps after the accepted root success seal while
+    /// keeping status observation, cancellation, renewal, and Release live.
+    pub(crate) fn begin_normal_drain(&mut self) {
+        if self.normal_drain_started {
+            return;
+        }
+        self.normal_drain_started = true;
+        self.execution.begin_normal_drain();
+    }
+
     /// Freezes normal attempt progress before remote convergence. Status and
     /// acknowledgements remain consumable, and actor-owned Abort effects keep
     /// their priority path, but this round cannot resubscribe or run a pump
@@ -547,7 +812,11 @@ impl TaskRound {
             ));
         });
         for &context in self.execution.graph().contexts() {
-            self.subscriber.stop(context);
+            if let Some(subscriber) = &self.covered_subscriber {
+                subscriber.stop(context);
+            } else {
+                self.legacy_subscriber().stop(context);
+            }
         }
         self.execution.begin_terminal_cleanup();
     }
@@ -882,7 +1151,7 @@ impl TaskRound {
                 "the frozen root Task is absent from its TaskRound".to_owned(),
             ));
         };
-        if !task.create_acknowledged() {
+        if !task.installed() && !task.status().is_some_and(|status| status.is_terminal()) {
             return Ok(());
         }
         let Some(status) = task.status().cloned() else {
@@ -906,6 +1175,24 @@ impl TaskRound {
         if self.pending_success_seal.is_none() {
             return Ok(());
         }
+        if self.execution.covered_observation_active() && !self.covered_observation_ready() {
+            // Only the Contexts with required missing evidence can exhaust
+            // this recovery. An unrelated disconnected stream is not a gate.
+            let exhausted = self.execution.covered_recovery_expired()
+                || self.execution.covered_gap_contexts().any(|context| {
+                    self.covered_subscriber
+                        .as_ref()
+                        .and_then(|subscriber| subscriber.state(context))
+                        == Some(SubscriptionState::BudgetExhausted)
+                });
+            if exhausted {
+                self.pending_success_seal.take().expect("pending recovery request").reject(
+                    QueryExecutionError::new(QueryExecutionErrorKind::Failed,
+                        "required covered observation evidence could not be recovered within its budget"),
+                );
+            }
+            return Ok(());
+        }
         let root = self.execution.graph().root_identity();
         let root_status = self
             .execution
@@ -915,14 +1202,16 @@ impl TaskRound {
             status.identity() == root
                 && status.state() == novarocks_execution::task_execution::TaskState::Finished
         });
-        if root_finished && self.execution.failure_cause().is_none() && self.tasks_created() {
+        if root_finished && self.execution.failure_cause().is_none() {
+            // Freeze admission in this same serial cut, before the seal reply
+            // can race a residual transport error or this turn's pumps.
+            self.begin_normal_drain();
             let sender = self.root_status_sender.take().ok_or_else(|| {
                 TaskExecutionError::Schedule(
                     "success seal reached TaskRound after its publisher was consumed".to_owned(),
                 )
             })?;
-            return self
-                .pending_success_seal
+            self.pending_success_seal
                 .take()
                 .expect("the success request was checked before settlement")
                 .accept(sender)
@@ -930,7 +1219,9 @@ impl TaskRound {
                     TaskExecutionError::Schedule(format!(
                         "seal accepted root Task success projection failed: {error}"
                     ))
-                });
+                })?;
+            self.success_sealed = true;
+            return Ok(());
         }
         let terminal_without_success = match self.execution.failure_cause() {
             // A derived cause deliberately freezes the decision until the
@@ -971,29 +1262,32 @@ impl TaskRound {
         })
     }
 
-    /// Whether every task of this attempt has acknowledged its exact create.
+    /// Whether every task of this attempt has a positive Worker ownership fact.
     ///
     /// This is the task protocol's Stage and Start: past it, every backend
     /// holds or historically held the exact task the schedule placed on it.
-    /// Lifecycle status cannot answer this: a task may skip the locally
-    /// visible Created state and reach Terminal before its create receipt is
-    /// settled, while the later receipt still proves admission.
+    /// Installed or terminal status can prove ownership before a lost Create
+    /// receipt is replayed.
     pub(crate) fn tasks_created(&self) -> bool {
         self.execution.graph().tasks().all(|task| {
             self.execution
                 .task(task.task_id())
-                .is_some_and(|task| task.create_acknowledged())
+                .is_some_and(|task| task.create_ownership_proven())
         })
     }
 
-    /// The historical create-receipt barrier for starting result fetches.
+    /// A result fetch needs its own root receiver installed. Other stage
+    /// creates may still be preparing or may later be stood down.
     pub(crate) fn result_pump_ready(&self) -> bool {
-        self.tasks_created()
+        let root = self.execution.graph().root_identity();
+        self.execution
+            .task(root.task_id())
+            .is_some_and(|task| task.installed())
     }
 
     #[cfg(test)]
     pub(crate) fn root_success_sealed(&self) -> bool {
-        self.root_status_sender.is_none()
+        self.success_sealed
     }
 
     /// The root task the client's result comes from.
@@ -1026,7 +1320,7 @@ impl TaskRound {
     /// round until the result pump's seal request is accepted, then publishes
     /// `NativeAttemptTerminal::Completed` back to that same pump.
     pub(crate) fn accepted_root_success_sealed(&self) -> bool {
-        self.root_status_sender.is_none()
+        self.success_sealed
     }
 
     /// Whether every task terminated and every context was released.

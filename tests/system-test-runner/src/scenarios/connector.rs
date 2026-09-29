@@ -17,7 +17,9 @@ use novarocks_cluster_harness::{
     QueryExecutionResourceSnapshot, ServerHandle,
 };
 use novarocks_secret::SecretValue;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -121,7 +123,138 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(AccessDomainCacheIsolation::default()),
         Box::new(PredicatePageIndexPruning),
         Box::new(TypedReadData),
+        Box::new(Uea5dMultiSplitDop),
     ]
+}
+
+/// A D00 correctness receipt for real Iceberg splits at two requested driver
+/// widths. It does not time queries or stand in for performance evidence.
+struct Uea5dMultiSplitDop;
+
+#[derive(Serialize)]
+struct Uea5dDopObservation {
+    requested_dop: i32,
+    rows: (i64, i64),
+    backend_markers: Vec<Vec<String>>,
+}
+
+impl Scenario for Uea5dMultiSplitDop {
+    fn name(&self) -> &'static str {
+        "connector/uea5d-multi-split-dop"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect UEA-5D multi-split control session")?,
+        )?;
+        const CATALOG: &str = "uea5d_dop_catalog";
+        const DATABASE: &str = "uea5d_dop_db";
+        const TABLE: &str = "uea5d_dop_data";
+        let warehouse = create_warehouse(context, "uea5d-multi-split-dop")?;
+        context.action("create three independent Iceberg data files for UEA-5D DOP reads");
+        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+
+        let mut observations = Vec::new();
+        for dop in [1, 4] {
+            control
+                .query_drop(format!("SET pipeline_dop = {dop}"))
+                .with_context(|| format!("select requested read DOP {dop}"))?;
+            let before = backend_log_snapshots(context)?;
+            context.action(format!(
+                "read three Iceberg splits with requested DOP {dop}"
+            ));
+            let rows: Vec<(i64, i64)> = control
+                .query(format!(
+                    "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"
+                ))
+                .with_context(|| format!("read UEA-5D multi-split fixture at DOP {dop}"))?;
+            ensure!(
+                rows == [(300_000, 45_000_150_000)],
+                "DOP {dop} typed read returned {rows:?}, expected count and sum"
+            );
+
+            let logs = wait_for_backend_logs_while(
+                context,
+                &format!("observe DOP {dop} split completion on multiple backends"),
+                None,
+                |logs| {
+                    let added = appended_since(logs, &before, "UEA-5D DOP read")?;
+                    let added = added
+                        .iter()
+                        .map(|log| (*log).to_owned())
+                        .collect::<Vec<_>>();
+                    Ok(assert_typed_split_evidence(&added).is_ok())
+                },
+            )?;
+            let added = appended_since(&logs, &before, "UEA-5D DOP read")?
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_typed_split_evidence(&added)?;
+            let actual_dop_marker = format!("dop={dop}");
+            ensure!(
+                added.iter().any(|log| {
+                    let scan_instances = log
+                        .lines()
+                        .filter(|line| line.contains(TYPED_SPLIT_ACCEPTED))
+                        .filter_map(|line| line.split_once("finst=").map(|(_, rest)| rest))
+                        .filter_map(|rest| rest.split_whitespace().next())
+                        .collect::<Vec<_>>();
+                    log.lines().any(|line| {
+                        line.contains("NOVAROCKS_TASK_PREPARED_DOP")
+                            && line.contains(&actual_dop_marker)
+                            && scan_instances
+                                .iter()
+                                .any(|instance| line.contains(&format!("finst={instance} ")))
+                    })
+                }),
+                "DOP {dop} read produced no split-owning prepared task with {actual_dop_marker}"
+            );
+            observations.push(Uea5dDopObservation {
+                requested_dop: dop,
+                rows: rows[0],
+                backend_markers: added
+                    .iter()
+                    .map(|log| {
+                        log.lines()
+                            .filter(|line| {
+                                line.contains(TYPED_SPLIT_ACCEPTED)
+                                    || line.contains(TYPED_SPLIT_NO_MORE)
+                                    || line.contains(TYPED_PAGE_SOURCE_OPEN)
+                                    || line.contains(TYPED_PAGE_SOURCE_CLOSE)
+                                    || line.contains("NOVAROCKS_TASK_PREPARED_DOP")
+                            })
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .collect(),
+            });
+        }
+        std::fs::write(
+            context.scenario_root().join("uea5d-multi-split-dop.json"),
+            serde_json::to_vec_pretty(&observations)?,
+        )
+        .context("persist exact UEA-5D multi-split DOP observations")?;
+        await_resource_convergence(context, &baseline, "UEA-5D multi-split DOP reads")?;
+        Ok(())
+    }
 }
 
 /// Proves a typed connector read works on the real 1FE+3BE topology, and that
@@ -696,8 +829,12 @@ impl Scenario for CatalogReadyLifecycle {
         context.action("fail the cold catalog install on one Backend and reject the query");
         let failed_query: Result<Vec<i64>, mysql::Error> =
             control.query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"));
-        if let Ok(rows) = failed_query {
-            bail!("catalog install failure query unexpectedly succeeded: {rows:?}");
+        match failed_query {
+            Err(mysql::Error::MySqlError(_)) => {}
+            Ok(rows) => bail!("catalog install failure query unexpectedly succeeded: {rows:?}"),
+            Err(error) => {
+                bail!("catalog install failure did not return a public SQL error: {error}")
+            }
         }
         wait_for_catalog_lifecycle_marker_on_backend(
             context,
@@ -3029,7 +3166,21 @@ impl Scenario for CatalogVersionDrain {
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        let mut launch = connector_launch_config();
+        // The old reader's scan-side filter holds its pipeline driver in SLEEP.
+        // Reserve a second driver worker so the replacement query can run before
+        // cancellation; this scenario verifies concurrent catalog versions.
+        let overlay = launch
+            .config_overlay
+            .be
+            .as_mut()
+            .expect("connector BE overlay");
+        *overlay = overlay.replacen(
+            "[runtime]",
+            "[runtime]\npipeline_exec_thread_pool_thread_num = 2",
+            1,
+        );
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -3041,6 +3192,10 @@ impl Scenario for CatalogVersionDrain {
             port,
             context.remaining("connect catalog version drain control session")?,
         )?;
+
+        control
+            .query_drop("SET pipeline_dop = 1")
+            .context("bound catalog version drain control driver parallelism")?;
 
         let warehouse = create_warehouse(context, "catalog-version-drain")?;
         context.action("create the first Iceberg catalog version and three data files");
@@ -3054,12 +3209,14 @@ impl Scenario for CatalogVersionDrain {
 
         context.action("start a read pinned to the first catalog version");
         let baseline_logs = backend_log_snapshots(context)?;
-        let target = start_connector_read(
+        let target = start_connector_read_on(
             &user,
             port,
             "connector_generation_catalog",
             "connector_generation_db",
             "connector_generation_data",
+            ReaderConnection::SocketBounded,
+            Some(NonZeroU32::new(1).expect("nonzero reader DOP")),
         )?;
         let connection_id = target
             .ready
@@ -3721,6 +3878,7 @@ fn start_connector_read(
         database,
         table,
         ReaderConnection::SocketBounded,
+        None,
     )
 }
 
@@ -3740,6 +3898,7 @@ fn start_held_connector_read(
         database,
         table,
         ReaderConnection::ScenarioBounded,
+        None,
     )
 }
 
@@ -3750,6 +3909,7 @@ fn start_connector_read_on(
     database: &str,
     table: &str,
     connection_form: ReaderConnection,
+    pipeline_dop: Option<NonZeroU32>,
 ) -> Result<ConnectorRead> {
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (done_tx, done) = mpsc::sync_channel(1);
@@ -3793,6 +3953,11 @@ fn start_connector_read_on(
             }
         }
         .context("connect connector reader MySQL client")?;
+        if let Some(dop) = pipeline_dop {
+            connection
+                .query_drop(format!("SET pipeline_dop = {}", dop.get()))
+                .context("set explicit connector reader driver parallelism")?;
+        }
         ready_tx
             .send(connection.connection_id())
             .context("publish connector reader MySQL connection id")?;

@@ -109,6 +109,15 @@ struct LocalExchangeSourceOperator {
     blocked_empty: bool,
 }
 
+impl LocalExchangeSourceOperator {
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.exchanger.close_consumer(self.consumer);
+        }
+    }
+}
+
 impl Operator for LocalExchangeSourceOperator {
     fn name(&self) -> &str {
         &self.name
@@ -127,10 +136,12 @@ impl Operator for LocalExchangeSourceOperator {
     }
 
     fn close(&mut self) -> Result<(), String> {
-        // A consumer whose pipeline ends before end of stream still leaves the
-        // exchange; otherwise producers would keep filling a queue nobody reads.
-        self.exchanger.close_consumer(self.consumer);
+        self.finish();
         Ok(())
+    }
+
+    fn cancel(&mut self) {
+        self.finish();
     }
 }
 
@@ -149,16 +160,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
             if buffered > 0 {
                 return true;
             }
-            if self.exchanger.has_spill_pending(self.partition) {
-                if self.exchanger.restore_blocked() || self.exchanger.restore_inflight() {
-                    return false;
-                }
-                return true;
-            }
             return remaining == 0;
-        }
-        if self.exchanger.has_spill_pending(self.partition) {
-            return !(self.exchanger.restore_blocked() || self.exchanger.restore_inflight());
         }
         !self.exchanger.is_done(self.partition)
     }
@@ -167,11 +169,11 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
         Err("local exchange source operator does not accept input".to_string())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
         if self.finished {
             return Ok(None);
         }
-        if let Some(chunk) = self.exchanger.pop_chunk(state, self.partition) {
+        if let Some(chunk) = self.exchanger.pop_chunk(self.partition) {
             if self.blocked_empty {
                 if let Some((buffered, remaining)) =
                     self.exchanger.partition_buffered_chunks(self.partition)
@@ -191,8 +193,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
             return Ok(Some(chunk));
         }
         if self.exchanger.is_done(self.partition) {
-            self.finished = true;
-            self.exchanger.close_consumer(self.consumer);
+            self.finish();
             let stats = self.exchanger.stats_snapshot();
             if let Some(part) = stats
                 .partitions
@@ -235,6 +236,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        self.finish();
         Ok(())
     }
 

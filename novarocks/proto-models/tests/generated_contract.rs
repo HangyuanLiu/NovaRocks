@@ -413,24 +413,30 @@ fn retired_mv_native_scan_fields_remain_reserved_and_fail_closed() {
 }
 
 #[test]
-fn retired_scan_io_task_query_option_remains_reserved() {
+fn retired_query_option_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     let query_options = pool
         .get_message_by_name("novarocks.QueryOptions")
         .expect("QueryOptions descriptor");
-    assert!(
-        query_options
-            .reserved_ranges()
-            .any(|range| range.contains(&6)),
-        "QueryOptions field 6 must remain reserved"
-    );
-    assert!(
-        query_options
-            .reserved_names()
-            .any(|name| name == "connector_io_tasks_per_scan_operator"),
-        "QueryOptions connector_io_tasks_per_scan_operator name must remain reserved"
-    );
+    for (field_number, field_name) in [
+        (6, "connector_io_tasks_per_scan_operator"),
+        (11, "enable_spill"),
+        (12, "spill_options"),
+    ] {
+        assert!(
+            query_options
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "QueryOptions field {field_number} must remain reserved"
+        );
+        assert!(
+            query_options
+                .reserved_names()
+                .any(|name| name == field_name),
+            "QueryOptions {field_name} name must remain reserved"
+        );
+    }
 }
 
 #[test]
@@ -1353,6 +1359,31 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
                 "abort_query_context",
                 "release_query_context",
                 "acquire_query_context_admission_ticket",
+                "quiesce_query_context",
+            ][..],
+        ),
+        (
+            "novarocks.TaskControlOperation",
+            "control",
+            &[
+                "renew_lease",
+                "cancel_task",
+                "abort_query_context",
+                "release_query_context",
+                "quiesce_query_context",
+            ][..],
+        ),
+        (
+            "novarocks.TaskOperationReceipt",
+            "ack",
+            &[
+                "create_task",
+                "update_task",
+                "query_context",
+                "release_query_context",
+                "cancel_task",
+                "query_context_admission_ticket",
+                "quiesce_query_context",
             ][..],
         ),
         (
@@ -1363,7 +1394,12 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         (
             "novarocks.TaskDomainUpdate",
             "domain",
-            &["split_assignment", "dynamic_filter", "open_exchange_edges"][..],
+            &[
+                "split_assignment",
+                "dynamic_filter",
+                "open_exchange_edges",
+                "close_exchange_destination",
+            ][..],
         ),
         (
             "novarocks.QueryContextDomainUpdate",
@@ -1378,12 +1414,28 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         (
             "novarocks.TaskStatusStreamEvent",
             "event",
-            &["task_status", "task_gone", "context_convergence"][..],
+            &[
+                "task_status",
+                "task_gone",
+                "context_convergence",
+                "task_convergence",
+                "quiesce",
+                "task_status_unchanged",
+                "task_convergence_unchanged",
+                "task_unknown",
+                "catch_up_complete",
+                "bookmark",
+            ][..],
         ),
         (
             "novarocks.TaskDomainReceipt",
             "receipt",
-            &["split_assignment", "dynamic_filter", "open_exchange_edges"][..],
+            &[
+                "split_assignment",
+                "dynamic_filter",
+                "open_exchange_edges",
+                "close_exchange_destination",
+            ][..],
         ),
         (
             "novarocks.QueryContextDomainReceipt",

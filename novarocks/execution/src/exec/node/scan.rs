@@ -158,6 +158,30 @@ impl ScanSource for FixedOpScanSource {
 }
 
 impl ScanNode {
+    /// Split the temporary decoder node without losing the exact runtime
+    /// source that the Task instance must later bind to its scan ranges.
+    pub(crate) fn into_static_fields_with_source(
+        self,
+    ) -> (
+        Arc<dyn ScanSource>,
+        (
+            Option<i32>,
+            Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
+            Option<ExprId>,
+            Option<usize>,
+        ),
+    ) {
+        (
+            self.source,
+            (
+                self.node_id,
+                self.native_runtime_filter_specs,
+                self.conjunct_predicate,
+                self.limit,
+            ),
+        )
+    }
+
     pub fn new(source: Arc<dyn ScanSource>) -> Self {
         Self {
             source,
@@ -268,8 +292,7 @@ impl std::fmt::Debug for ScanNode {
     }
 }
 
-/// A stream source for tests whose scan is built but never run: claiming it
-/// fails.
+/// A stream source for tests whose scan is built but never run: claiming it fails.
 #[cfg(test)]
 pub(crate) struct UnusedScanStream;
 
@@ -281,5 +304,33 @@ impl ScanStreamSource for UnusedScanStream {
         _profile: Option<RuntimeProfile>,
     ) -> Result<ScanOutputStream, String> {
         Err("this test scan is never run".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{BoundScanRanges, ScanNode, ScanOp, ScanSource};
+
+    #[test]
+    fn freezing_scan_keeps_exact_source_binding_capability() {
+        struct TestSource(Arc<AtomicUsize>);
+        impl ScanSource for TestSource {
+            fn bind(&self, _ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("test binding reached".to_string())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: Arc<dyn ScanSource> = Arc::new(TestSource(Arc::clone(&calls)));
+        let (retained, (node_id, ..)) = ScanNode::new(Arc::clone(&source))
+            .with_node_id(7)
+            .into_static_fields_with_source();
+        drop(source);
+        assert_eq!(node_id, Some(7));
+        assert!(retained.bind(BoundScanRanges::None).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

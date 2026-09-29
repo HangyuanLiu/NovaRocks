@@ -30,6 +30,9 @@
 
 use std::sync::Arc;
 
+mod local;
+pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
+
 use crate::runtime_filter as execution;
 
 use crate::exec::expr::agg::SealedExecutionFunctionSet;
@@ -117,6 +120,7 @@ struct PipelineBuildContext {
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+    precomputed_keyed_assert_keys: std::collections::HashMap<i32, Vec<ExprId>>,
 }
 
 struct PipelineRuntimeFilterExecution {
@@ -179,6 +183,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         1,
         1,
         i64::MAX,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     )
 }
 
@@ -248,6 +253,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         1,
         1,
         i64::MAX,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     )
 }
 
@@ -270,6 +276,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+
+    runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
         plan,
@@ -285,6 +293,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
         operator_buffer_chunks.max(1),
         local_exchange_buffer_mem_limit_per_driver.max(1),
         local_exchange_max_buffered_rows,
+        runtime_error,
     )
 }
 
@@ -321,6 +330,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_sess
         1,
         1,
         i64::MAX,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     )
 }
 
@@ -342,8 +352,12 @@ fn build_pipeline_graph_in_mode(
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+
+    runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
-    let arena = Arc::new(plan.arena.clone());
+    let mut arena = plan.arena.clone();
+    arena.bind_runtime_error(runtime_error);
+    let arena = Arc::new(arena);
     let mut ctx = PipelineBuildContext {
         arena,
         function_set,
@@ -357,6 +371,7 @@ fn build_pipeline_graph_in_mode(
         local_exchange_buffer_mem_limit_per_driver: local_exchange_buffer_mem_limit_per_driver
             .max(1),
         local_exchange_max_buffered_rows,
+        precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
     let mut build = build_pipeline_for_node(&plan.root, &mut ctx)?;
     if let Some(root_sink_dop) = root_sink_dop {
@@ -649,9 +664,19 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
         ExecNodeKind::Unpivot(unpivot) => Some(Arc::clone(&unpivot.output_chunk_schema)),
         ExecNodeKind::Filter(FilterNode { input, .. })
-        | ExecNodeKind::Repeat(RepeatNode { input, .. })
         | ExecNodeKind::Limit(LimitNode { input, .. })
         | ExecNodeKind::Sort(SortNode { input, .. }) => output_chunk_schema_for_node(input),
+        ExecNodeKind::Repeat(RepeatNode {
+            input,
+            null_slot_ids,
+            grouping_slot_ids,
+            ..
+        }) => crate::exec::operators::repeat_output_chunk_schema(
+            &output_chunk_schema_for_node(input)?,
+            null_slot_ids,
+            grouping_slot_ids,
+        )
+        .ok(),
         ExecNodeKind::ChangeEventExpand(node) => Some(Arc::clone(&node.output_chunk_schema)),
         ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => {
             inputs.first().and_then(output_chunk_schema_for_node)
@@ -2064,11 +2089,15 @@ fn build_pipeline_for_node(
                 let partitions = build.pipeline.dop.max(1) as usize;
                 build = shuffle_by_hash(build, ctx, node.node_id, hash_key, partitions);
             }
+            let mut runtime_node = node.clone();
+            runtime_node
+                .projection_arena_mut()
+                .bind_runtime_error(ctx.arena.runtime_error_binding()?);
             build
                 .pipeline
                 .factories
                 .push(Box::new(TableWriterOperatorFactory::try_new(
-                    node,
+                    &runtime_node,
                     Arc::clone(&ctx.function_set),
                 )?));
             build.stream = StreamDesc::any(build.pipeline.dop);

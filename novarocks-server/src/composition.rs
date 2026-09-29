@@ -31,9 +31,7 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
-use novarocks_execution::runtime::execution_runtime::{
-    ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-};
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
 use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
@@ -489,6 +487,18 @@ pub fn compose_backend_server_config(
             runtime_config.result_retained_bytes_per_process,
         )
         .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
+        preparation_limits: novarocks_worker::TaskPreparationLimits::try_new(
+            config.runtime.task_preparation_max_tasks_per_context,
+            config.runtime.task_preparation_max_tasks,
+            config.runtime.task_preparation_max_bytes,
+            config.runtime.task_preparation_max_workers,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve preparation limits: {error}"))?,
+        inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::try_new(
+            runtime_config.task_normal_close_max_records,
+            runtime_config.task_normal_close_max_bytes,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve normal-close capacity limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
             runtime_config.prefetch_input_bytes_per_stream,
@@ -1000,31 +1010,8 @@ fn frontend_native_transport(
 
 fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {
     let runtime = &config.runtime;
-    let spill_io_threads = if runtime.spill_io_threads == 0 {
-        runtime.actual_exec_threads()
-    } else {
-        runtime.spill_io_threads
-    };
     ExecutionRuntimeConfig {
         driver_threads: runtime.actual_exec_threads(),
-        spill_io_threads,
-        spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
-        spill_storage: ExecutionSpillStorageConfig {
-            enabled: config.spill.enable,
-            local_dirs: if config.spill.local_dirs.is_empty() {
-                vec![
-                    std::env::temp_dir()
-                        .join("novarocks-spill")
-                        .to_string_lossy()
-                        .into_owned(),
-                ]
-            } else {
-                config.spill.local_dirs.clone()
-            },
-            dir_max_bytes: config.spill.dir_max_bytes,
-            block_size_bytes: config.spill.block_size_bytes.max(1),
-            ipc_compression: config.spill.ipc_compression.clone(),
-        },
         exchange_wait_ms: runtime.exchange_wait_ms,
         exchange_io_threads: runtime.exchange_io_threads.max(1),
         exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
@@ -1050,15 +1037,14 @@ pub fn compose_iceberg_execution_resources(
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    let read_binding = compose_iceberg_access_template_from_resources(
-        config,
-        compose_connector_file_scan_resources(config, runtime.clone(), scan_io)?,
-    )?
-    .with_range_service(scan_io.range_service());
-    let write_binding = compose_iceberg_access_template_from_resources(
-        config,
-        compose_connector_file_planning_resources(config, runtime.clone())?,
-    )?;
+    let write_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
+    // Read and write are I/O views of the same BE storage authority. Moving
+    // reads onto scan I/O must not mint another credential registry or pool.
+    let read_resources =
+        write_resources.with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
+    let read_binding = compose_iceberg_access_template_from_resources(config, read_resources)?
+        .with_range_service(scan_io.range_service());
+    let write_binding = compose_iceberg_access_template_from_resources(config, write_resources)?;
     Ok(IcebergExecutionResources::new(
         read_binding,
         write_binding,
@@ -1121,7 +1107,8 @@ pub(crate) fn compose_paimon_execution_access_factory(
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = compose_connector_file_scan_resources(config, runtime, scan_io)?;
+    let resources = compose_connector_file_planning_resources(config, runtime)?
+        .with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
     Ok(std::sync::Arc::new(
         compose_paimon_access_factory_with_resources(config, ClusterRole::Be, resources)?
             .with_range_service(scan_io.range_service()),
@@ -1138,24 +1125,6 @@ fn compose_paimon_access_factory_with_resources(
         .credential_registry(role)
         .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
     Ok(ServerPaimonRoleFileIoFactory::new(resources, credentials))
-}
-
-fn compose_connector_file_scan_resources(
-    _config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-    scan_io: &ScanIoServices,
-) -> anyhow::Result<FsAccessResources> {
-    let pool = std::sync::Arc::new(
-        ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
-            .map_err(|error| anyhow::anyhow!("construct object-store provider pool: {error}"))?,
-    );
-    Ok(FsAccessResources::new_with_refresh_spawner(
-        pool,
-        FsAccessResolver::new(),
-        scan_io.file_runtime(),
-        scan_io.file_task_spawner(),
-        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
-    ))
 }
 
 pub fn compose_connector_file_planning_resources(

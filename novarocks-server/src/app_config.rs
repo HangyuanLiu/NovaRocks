@@ -455,9 +455,6 @@ pub struct NovaRocksConfig {
     pub connector: ConnectorConfig,
 
     #[serde(default)]
-    pub spill: SpillStorageConfig,
-
-    #[serde(default)]
     pub cluster: ClusterConfig,
 
     #[serde(default, deserialize_with = "deserialize_native_trust_config")]
@@ -762,7 +759,6 @@ impl Default for NovaRocksConfig {
             rejected_foundationdb_client: None,
             standalone_server: None,
             connector: ConnectorConfig::default(),
-            spill: SpillStorageConfig::default(),
             cluster: ClusterConfig::default(),
             native_trust: None,
             mv_management: MvManagementConfig::default(),
@@ -1278,6 +1274,19 @@ pub struct RuntimeConfig {
     pub task_max_tasks_per_context: usize,
     #[serde(default = "default_task_max_active_tasks_per_backend")]
     pub task_max_active_tasks_per_backend: usize,
+    #[serde(default = "default_task_preparation_max_tasks_per_context")]
+    pub task_preparation_max_tasks_per_context: usize,
+    #[serde(default = "default_task_preparation_max_tasks")]
+    pub task_preparation_max_tasks: usize,
+    #[serde(default = "default_task_preparation_max_bytes")]
+    pub task_preparation_max_bytes: usize,
+    #[serde(default = "default_task_preparation_max_workers")]
+    pub task_preparation_max_workers: usize,
+    /// Active and retained exact late-frame records share this process bound.
+    #[serde(default = "default_task_normal_close_max_records")]
+    pub task_normal_close_max_records: usize,
+    #[serde(default = "default_task_normal_close_max_bytes")]
+    pub task_normal_close_max_bytes: usize,
     #[serde(default = "default_task_operation_queue_residence_ms")]
     pub task_operation_queue_residence_ms: u64,
     #[serde(default = "default_task_operation_create_wait_cap_ms")]
@@ -1387,10 +1396,6 @@ pub struct RuntimeConfig {
     /// startup preflight.
     #[serde(default = "default_query_blocking_queue_capacity")]
     pub query_blocking_queue_capacity: usize,
-    #[serde(default = "default_spill_io_threads")]
-    pub spill_io_threads: usize,
-    #[serde(default = "default_spill_io_queue_size")]
-    pub spill_io_queue_size: usize,
     #[serde(default = "default_profile_report_interval")]
     pub profile_report_interval: i64,
     #[serde(default = "default_table_schema_service_max_retries")]
@@ -1728,48 +1733,6 @@ impl ObjectStorageConfig {
     }
 }
 
-#[derive(Clone, Deserialize)]
-pub struct SpillStorageConfig {
-    #[serde(default = "default_spill_enable")]
-    pub enable: bool,
-    #[serde(default)]
-    pub local_dirs: Vec<String>,
-    #[serde(default = "default_spill_dir_max_bytes")]
-    pub dir_max_bytes: u64,
-    #[serde(default = "default_spill_block_size_bytes")]
-    pub block_size_bytes: u64,
-    #[serde(default = "default_spill_ipc_compression")]
-    pub ipc_compression: String,
-}
-
-fn default_spill_enable() -> bool {
-    true
-}
-
-fn default_spill_dir_max_bytes() -> u64 {
-    0
-}
-
-fn default_spill_block_size_bytes() -> u64 {
-    134_217_728
-}
-
-fn default_spill_ipc_compression() -> String {
-    "lz4".to_string()
-}
-
-impl Default for SpillStorageConfig {
-    fn default() -> Self {
-        Self {
-            enable: default_spill_enable(),
-            local_dirs: Vec::new(),
-            dir_max_bytes: default_spill_dir_max_bytes(),
-            block_size_bytes: default_spill_block_size_bytes(),
-            ipc_compression: default_spill_ipc_compression(),
-        }
-    }
-}
-
 fn default_exchange_wait_ms() -> u64 {
     120_000
 }
@@ -1897,6 +1860,30 @@ fn default_task_max_active_tasks_per_backend() -> usize {
     FrontendTaskTransportBudget::DEFAULT.max_active_tasks_per_backend()
 }
 
+fn default_task_preparation_max_tasks_per_context() -> usize {
+    novarocks_worker::TaskPreparationLimits::default().per_context()
+}
+
+fn default_task_preparation_max_tasks() -> usize {
+    novarocks_worker::TaskPreparationLimits::default().tasks()
+}
+
+fn default_task_preparation_max_bytes() -> usize {
+    novarocks_worker::TaskPreparationLimits::default().bytes()
+}
+
+fn default_task_preparation_max_workers() -> usize {
+    novarocks_worker::TaskPreparationLimits::default().workers()
+}
+
+fn default_task_normal_close_max_records() -> usize {
+    novarocks_worker::TaskInboundCapabilityLimits::default().max_records()
+}
+
+fn default_task_normal_close_max_bytes() -> usize {
+    novarocks_worker::TaskInboundCapabilityLimits::default().max_bytes()
+}
+
 fn default_task_operation_queue_residence_ms() -> u64 {
     duration_millis(FrontendTaskTransportBudget::DEFAULT.frontend_queue_residence())
 }
@@ -1993,6 +1980,30 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.task_max_active_tasks_per_backend",
             runtime.task_max_active_tasks_per_backend,
         ),
+        (
+            "runtime.task_preparation_max_tasks_per_context",
+            runtime.task_preparation_max_tasks_per_context,
+        ),
+        (
+            "runtime.task_preparation_max_tasks",
+            runtime.task_preparation_max_tasks,
+        ),
+        (
+            "runtime.task_preparation_max_bytes",
+            runtime.task_preparation_max_bytes,
+        ),
+        (
+            "runtime.task_preparation_max_workers",
+            runtime.task_preparation_max_workers,
+        ),
+        (
+            "runtime.task_normal_close_max_records",
+            runtime.task_normal_close_max_records,
+        ),
+        (
+            "runtime.task_normal_close_max_bytes",
+            runtime.task_normal_close_max_bytes,
+        ),
     ];
     for (field, value) in nonzero_counts {
         if value == 0 {
@@ -2023,6 +2034,13 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             bail!("{field} must be greater than 0");
         }
     }
+    novarocks_worker::TaskPreparationLimits::try_new(
+        runtime.task_preparation_max_tasks_per_context,
+        runtime.task_preparation_max_tasks,
+        runtime.task_preparation_max_bytes,
+        runtime.task_preparation_max_workers,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid preparation limits: {error}"))?;
     if runtime.task_lease_max_ms < runtime.task_lease_min_ms {
         bail!("runtime.task_lease_max_ms must be at least runtime.task_lease_min_ms");
     }
@@ -2419,14 +2437,6 @@ fn default_query_blocking_queue_capacity() -> usize {
     64
 }
 
-fn default_spill_io_threads() -> usize {
-    0 // 0 means use actual exec thread count
-}
-
-fn default_spill_io_queue_size() -> usize {
-    1024
-}
-
 fn default_io_coalesce_read_enable() -> bool {
     true
 }
@@ -2506,6 +2516,13 @@ impl Default for RuntimeConfig {
             task_backend_max_queued_bytes: default_task_backend_max_queued_bytes(),
             task_max_tasks_per_context: default_task_max_tasks_per_context(),
             task_max_active_tasks_per_backend: default_task_max_active_tasks_per_backend(),
+            task_preparation_max_tasks_per_context: default_task_preparation_max_tasks_per_context(
+            ),
+            task_preparation_max_tasks: default_task_preparation_max_tasks(),
+            task_preparation_max_bytes: default_task_preparation_max_bytes(),
+            task_preparation_max_workers: default_task_preparation_max_workers(),
+            task_normal_close_max_records: default_task_normal_close_max_records(),
+            task_normal_close_max_bytes: default_task_normal_close_max_bytes(),
             task_operation_queue_residence_ms: default_task_operation_queue_residence_ms(),
             task_operation_create_wait_cap_ms: default_task_operation_create_wait_cap_ms(),
             task_operation_update_wait_cap_ms: default_task_operation_update_wait_cap_ms(),
@@ -2557,8 +2574,6 @@ impl Default for RuntimeConfig {
             native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
-            spill_io_threads: default_spill_io_threads(),
-            spill_io_queue_size: default_spill_io_queue_size(),
             profile_report_interval: default_profile_report_interval(),
             table_schema_service_max_retries: default_table_schema_service_max_retries(),
             table_schema_service_cache_capacity: default_table_schema_service_cache_capacity(),
@@ -3503,7 +3518,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn task_execution_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 19] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 25] = [
             ("task_dispatch_create_permits", |runtime| {
                 runtime.task_dispatch_create_permits = 0;
             }),
@@ -3542,6 +3557,24 @@ access_key_secret = ""
             }),
             ("task_max_active_tasks_per_backend", |runtime| {
                 runtime.task_max_active_tasks_per_backend = 0;
+            }),
+            ("task_preparation_max_tasks_per_context", |runtime| {
+                runtime.task_preparation_max_tasks_per_context = 0;
+            }),
+            ("task_preparation_max_tasks", |runtime| {
+                runtime.task_preparation_max_tasks = 0;
+            }),
+            ("task_preparation_max_bytes", |runtime| {
+                runtime.task_preparation_max_bytes = 0;
+            }),
+            ("task_preparation_max_workers", |runtime| {
+                runtime.task_preparation_max_workers = 0;
+            }),
+            ("task_normal_close_max_records", |runtime| {
+                runtime.task_normal_close_max_records = 0;
+            }),
+            ("task_normal_close_max_bytes", |runtime| {
+                runtime.task_normal_close_max_bytes = 0;
             }),
             ("task_status_subscription_error_budget", |runtime| {
                 runtime.task_status_subscription_error_budget = 0;

@@ -432,6 +432,14 @@ round(corr(val1, val2), 3)
 round(corr(val1, val2), 3)
 1
 
+-- query 92
+round(var_samp(c1), 3)
+NULL
+
+-- query 93
+round(var_samp(c1), 3)
+NULL
+
 -- query 94
 round(var_samp(c1), 3)
 NULL
@@ -442,21 +450,13 @@ NULL
 
 -- query 96
 round(var_samp(c1), 3)
-NULL
+1
 
 -- query 97
 round(var_samp(c1), 3)
-NULL
+1
 
 -- query 98
-round(var_samp(c1), 3)
-1
-
--- query 99
-round(var_samp(c1), 3)
-1
-
--- query 100
 k	val1	var_samp_val1
 1	1	NULL
 2	2	0.5
@@ -469,7 +469,7 @@ k	val1	var_samp_val1
 9	9	0.5
 10	10	1
 
--- query 101
+-- query 99
 k	val1	var_samp_val1
 1	1	NULL
 2	2	0.5
@@ -481,6 +481,14 @@ k	val1	var_samp_val1
 8	8	1
 9	9	1
 10	10	1
+
+-- query 100
+round(var_samp(val1), 3)
+NULL
+
+-- query 101
+round(var_samp(val1), 3)
+NULL
 
 -- query 102
 round(var_samp(val1), 3)
@@ -500,19 +508,19 @@ NULL
 
 -- query 106
 round(var_samp(val1), 3)
-NULL
+9.167
 
 -- query 107
 round(var_samp(val1), 3)
-NULL
+13.238
 
 -- query 108
-round(var_samp(val1), 3)
-9.167
+round(variance_samp(c1), 3)
+NULL
 
 -- query 109
-round(var_samp(val1), 3)
-13.238
+round(variance_samp(c1), 3)
+NULL
 
 -- query 110
 round(variance_samp(c1), 3)
@@ -524,21 +532,13 @@ NULL
 
 -- query 112
 round(variance_samp(c1), 3)
-NULL
+1
 
 -- query 113
 round(variance_samp(c1), 3)
-NULL
+1
 
 -- query 114
-round(variance_samp(c1), 3)
-1
-
--- query 115
-round(variance_samp(c1), 3)
-1
-
--- query 116
 k	val1	variance_samp_val1
 1	1	NULL
 2	2	0.5
@@ -551,7 +551,7 @@ k	val1	variance_samp_val1
 9	9	0.5
 10	10	1
 
--- query 117
+-- query 115
 k	val1	variance_samp_val1
 1	1	NULL
 2	2	0.5
@@ -563,6 +563,14 @@ k	val1	variance_samp_val1
 8	8	1
 9	9	1
 10	10	1
+
+-- query 116
+round(variance_samp(val1), 3)
+NULL
+
+-- query 117
+round(variance_samp(val1), 3)
+NULL
 
 -- query 118
 round(variance_samp(val1), 3)
@@ -582,19 +590,19 @@ NULL
 
 -- query 122
 round(variance_samp(val1), 3)
-NULL
+9.167
 
 -- query 123
 round(variance_samp(val1), 3)
-NULL
+13.238
 
 -- query 124
-round(variance_samp(val1), 3)
-9.167
+round(stddev_samp(c1), 3)
+NULL
 
 -- query 125
-round(variance_samp(val1), 3)
-13.238
+round(stddev_samp(c1), 3)
+NULL
 
 -- query 126
 round(stddev_samp(c1), 3)
@@ -606,21 +614,13 @@ NULL
 
 -- query 128
 round(stddev_samp(c1), 3)
-NULL
+1
 
 -- query 129
 round(stddev_samp(c1), 3)
-NULL
+1
 
 -- query 130
-round(stddev_samp(c1), 3)
-1
-
--- query 131
-round(stddev_samp(c1), 3)
-1
-
--- query 132
 k	val1	stddev_samp_val1
 1	1	NULL
 2	2	0.707
@@ -633,7 +633,7 @@ k	val1	stddev_samp_val1
 9	9	0.707
 10	10	1
 
--- query 133
+-- query 131
 k	val1	stddev_samp_val1
 1	1	NULL
 2	2	0.707
@@ -645,6 +645,14 @@ k	val1	stddev_samp_val1
 8	8	1
 9	9	1
 10	10	1
+
+-- query 132
+round(stddev_samp(val1), 3)
+NULL
+
+-- query 133
+round(stddev_samp(val1), 3)
+NULL
 
 -- query 134
 round(stddev_samp(val1), 3)
@@ -664,19 +672,19 @@ NULL
 
 -- query 138
 round(stddev_samp(val1), 3)
-NULL
+3.028
 
 -- query 139
 round(stddev_samp(val1), 3)
-NULL
+3.638
 
 -- query 140
-round(stddev_samp(val1), 3)
-3.028
+round(covar_samp(c1, c2), 3)
+NULL
 
 -- query 141
-round(stddev_samp(val1), 3)
-3.638
+round(covar_samp(c1, c2), 3)
+NULL
 
 -- query 142
 round(covar_samp(c1, c2), 3)
@@ -696,25 +704,17 @@ NULL
 
 -- query 146
 round(covar_samp(c1, c2), 3)
-NULL
+10
 
 -- query 147
 round(covar_samp(c1, c2), 3)
-NULL
+10
 
 -- query 148
 round(covar_samp(c1, c2), 3)
 10
 
 -- query 149
-round(covar_samp(c1, c2), 3)
-10
-
--- query 150
-round(covar_samp(c1, c2), 3)
-10
-
--- query 151
 k	val1	val2	covar_samp_val1
 1	1	10	NULL
 2	2	20	5
@@ -727,7 +727,7 @@ k	val1	val2	covar_samp_val1
 9	9	90	5
 10	10	100	10
 
--- query 152
+-- query 150
 k	val1	val2	covar_samp_val1
 1	1	10	NULL
 2	2	20	5
@@ -739,6 +739,14 @@ k	val1	val2	covar_samp_val1
 8	8	80	10
 9	9	90	10
 10	10	100	10
+
+-- query 151
+round(covar_samp(val1, val2), 3)
+NULL
+
+-- query 152
+round(covar_samp(val1, val2), 3)
+NULL
 
 -- query 153
 round(covar_samp(val1, val2), 3)
@@ -758,19 +766,19 @@ NULL
 
 -- query 157
 round(covar_samp(val1, val2), 3)
-NULL
+91.667
 
 -- query 158
 round(covar_samp(val1, val2), 3)
-NULL
+155
 
 -- query 159
-round(covar_samp(val1, val2), 3)
-91.667
+round(corr(c1, c2), 3)
+NULL
 
 -- query 160
-round(covar_samp(val1, val2), 3)
-155
+round(corr(c1, c2), 3)
+NULL
 
 -- query 161
 round(corr(c1, c2), 3)
@@ -790,25 +798,17 @@ NULL
 
 -- query 165
 round(corr(c1, c2), 3)
-NULL
+1
 
 -- query 166
 round(corr(c1, c2), 3)
-NULL
+1
 
 -- query 167
 round(corr(c1, c2), 3)
 1
 
 -- query 168
-round(corr(c1, c2), 3)
-1
-
--- query 169
-round(corr(c1, c2), 3)
-1
-
--- query 170
 k	val1	val2	corr_val1
 1	1	10	NULL
 2	2	20	1
@@ -821,7 +821,7 @@ k	val1	val2	corr_val1
 9	9	90	1
 10	10	100	1
 
--- query 171
+-- query 169
 k	val1	val2	corr_val1
 1	1	10	NULL
 2	2	20	1
@@ -833,6 +833,14 @@ k	val1	val2	corr_val1
 8	8	80	1
 9	9	90	1
 10	10	100	1
+
+-- query 170
+round(corr(val1, val2), 3)
+NULL
+
+-- query 171
+round(corr(val1, val2), 3)
+NULL
 
 -- query 172
 round(corr(val1, val2), 3)
@@ -852,16 +860,8 @@ NULL
 
 -- query 176
 round(corr(val1, val2), 3)
-NULL
-
--- query 177
-round(corr(val1, val2), 3)
-NULL
-
--- query 178
-round(corr(val1, val2), 3)
 1
 
--- query 179
+-- query 177
 round(corr(val1, val2), 3)
 1

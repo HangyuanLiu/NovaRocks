@@ -2,9 +2,9 @@
 id: ADR-0157
 title: "Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec"
 domain: [distributed-query-lifecycle, runtime-role]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0161
 date: 2026-09-23
 provenance:
   - "discussion: 2026-09-23 native RPC ingress and control isolation"

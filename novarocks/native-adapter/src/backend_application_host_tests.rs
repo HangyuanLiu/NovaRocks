@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{BackendApplicationHost, BackendServerConfig};
-use novarocks_execution::runtime::execution_runtime::{
-    ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-};
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
 use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
@@ -76,11 +74,10 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             32 * 1024 * 1024,
         )
         .expect("valid test result retained-byte limits"),
+        inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
+        preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
         execution_runtime_config: ExecutionRuntimeConfig {
             driver_threads: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 1,
-            spill_storage: ExecutionSpillStorageConfig::default(),
             exchange_wait_ms: 1,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,

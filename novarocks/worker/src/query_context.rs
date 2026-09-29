@@ -885,7 +885,10 @@ impl QueryContextManager {
                     .get_mut(&execution)
                     .expect("checked active context");
                 context.rollback_inc_fragments();
-                context.num_fragments == 0 && context.num_active_fragments == 0
+                // Completed siblings no longer own this native attempt. The
+                // final preparation rollback must release its context even if
+                // earlier fragments contributed to the cumulative count.
+                context.num_active_fragments == 0
             };
             remove_empty_context.then(|| {
                 guard

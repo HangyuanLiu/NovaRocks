@@ -2,9 +2,9 @@
 id: ADR-0158
 title: "Task creation is frozen once and replayed by its exact identity"
 domain: [distributed-query-lifecycle, sql-compiler]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0161
 date: 2026-09-24
 provenance:
   - "discussion: 2026-09-20 to 2026-09-23 frozen task creation carriers and identity replay"

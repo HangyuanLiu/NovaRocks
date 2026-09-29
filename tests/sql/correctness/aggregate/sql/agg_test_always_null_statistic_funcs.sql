@@ -540,47 +540,37 @@ USE ${case_db};
 select round(corr(val1, val2), 3) from t1;
 
 -- query 92
--- @skip_result_check=true
-USE ${case_db};
-set enable_spill=true;
-
--- query 93
--- @skip_result_check=true
-USE ${case_db};
-set spill_mode="force";
-
--- query 94
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
 select round(var_samp(c1), 3) from w1 where c1 > 10;
 
--- query 95
+-- query 93
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1) )t)
+select round(var_samp(c1), 3) from w1;
+
+-- query 94
+USE ${case_db};
+with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t)
+select round(var_samp(c1), 3) from w1;
+
+-- query 95
+USE ${case_db};
+with w1 as (select column_0 as c1 from ( values (null), (null) )t)
 select round(var_samp(c1), 3) from w1;
 
 -- query 96
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t)
+with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
 select round(var_samp(c1), 3) from w1;
 
 -- query 97
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t)
+with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t)
 select round(var_samp(c1), 3) from w1;
 
 -- query 98
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
-select round(var_samp(c1), 3) from w1;
-
--- query 99
-USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t)
-select round(var_samp(c1), 3) from w1;
-
--- query 100
-USE ${case_db};
 SELECT
     k,
     val1,
@@ -591,7 +581,7 @@ SELECT
 FROM t1
 order by k;
 
--- query 101
+-- query 99
 USE ${case_db};
 SELECT
     k,
@@ -603,70 +593,70 @@ SELECT
 FROM t1_nonnull
 order by k;
 
--- query 102
+-- query 100
 USE ${case_db};
 select round(var_samp(val1), 3) from t1 where k > 100;
 
--- query 103
+-- query 101
 USE ${case_db};
 select round(var_samp(val1), 3) from t1_nonnull where k > 100;
 
--- query 104
+-- query 102
 USE ${case_db};
 select round(var_samp(val1), 3) from t1 where k = 2;
 
--- query 105
+-- query 103
 USE ${case_db};
 select round(var_samp(val1), 3) from t1_nonnull where k = 2;
 
--- query 106
+-- query 104
 USE ${case_db};
 select round(var_samp(val1), 3) from t1 where k in (2, 5, 6);
 
--- query 107
+-- query 105
 USE ${case_db};
 select round(var_samp(val1), 3) from t1 where k in (5, 6);
 
--- query 108
+-- query 106
 USE ${case_db};
 select round(var_samp(val1), 3) from t1_nonnull;
 
--- query 109
+-- query 107
 USE ${case_db};
 select round(var_samp(val1), 3) from t1;
 
--- query 110
+-- query 108
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
 select round(variance_samp(c1), 3) from w1 where c1 > 10;
 
--- query 111
+-- query 109
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1) )t)
+select round(variance_samp(c1), 3) from w1;
+
+-- query 110
+USE ${case_db};
+with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t)
+select round(variance_samp(c1), 3) from w1;
+
+-- query 111
+USE ${case_db};
+with w1 as (select column_0 as c1 from ( values (null), (null) )t)
 select round(variance_samp(c1), 3) from w1;
 
 -- query 112
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t)
+with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
 select round(variance_samp(c1), 3) from w1;
 
 -- query 113
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t)
+with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t)
 select round(variance_samp(c1), 3) from w1;
 
 -- query 114
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
-select round(variance_samp(c1), 3) from w1;
-
--- query 115
-USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t)
-select round(variance_samp(c1), 3) from w1;
-
--- query 116
-USE ${case_db};
 SELECT
     k,
     val1,
@@ -677,7 +667,7 @@ SELECT
 FROM t1
 order by k;
 
--- query 117
+-- query 115
 USE ${case_db};
 SELECT
     k,
@@ -689,69 +679,69 @@ SELECT
 FROM t1_nonnull
 order by k;
 
--- query 118
+-- query 116
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1 where k > 100;
 
--- query 119
+-- query 117
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1_nonnull where k > 100;
 
--- query 120
+-- query 118
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1 where k = 2;
 
--- query 121
+-- query 119
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1_nonnull where k = 2;
 
--- query 122
+-- query 120
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1 where k in (2, 5, 6);
 
--- query 123
+-- query 121
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1 where k in (5, 6);
 
--- query 124
+-- query 122
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1_nonnull;
 
--- query 125
+-- query 123
 USE ${case_db};
 select round(variance_samp(val1), 3) from t1;
 
--- query 126
+-- query 124
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
 select round(stddev_samp(c1), 3) from w1 where c1 > 10;
 
--- query 127
+-- query 125
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1) )t)
 select round(stddev_samp(c1), 3) from w1;
 
--- query 128
+-- query 126
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t)
 select round(stddev_samp(c1), 3) from w1;
 
--- query 129
+-- query 127
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (null), (null) )t)
 select round(stddev_samp(c1), 3) from w1;
 
--- query 130
+-- query 128
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t)
 select round(stddev_samp(c1), 3) from w1;
 
--- query 131
+-- query 129
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t)
 select round(stddev_samp(c1), 3) from w1;
 
--- query 132
+-- query 130
 USE ${case_db};
 SELECT
     k,
@@ -763,7 +753,7 @@ SELECT
 FROM t1
 order by k;
 
--- query 133
+-- query 131
 USE ${case_db};
 SELECT
     k,
@@ -775,85 +765,85 @@ SELECT
 FROM t1_nonnull
 order by k;
 
--- query 134
+-- query 132
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1 where k > 100;
 
--- query 135
+-- query 133
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1_nonnull where k > 100;
 
--- query 136
+-- query 134
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1 where k = 2;
 
--- query 137
+-- query 135
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1_nonnull where k = 2;
 
--- query 138
+-- query 136
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1 where k in (2, 5, 6);
 
--- query 139
+-- query 137
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1 where k in (5, 6);
 
--- query 140
+-- query 138
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1_nonnull;
 
--- query 141
+-- query 139
 USE ${case_db};
 select round(stddev_samp(val1), 3) from t1;
 
--- query 142
+-- query 140
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t)
 select round(covar_samp(c1, c2), 3) from w1 where c1 > 10;
 
--- query 143
+-- query 141
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10) )t)
+select round(covar_samp(c1, c2), 3) from w1;
+
+-- query 142
+USE ${case_db};
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t)
+select round(covar_samp(c1, c2), 3) from w1;
+
+-- query 143
+USE ${case_db};
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t)
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 144
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t)
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t)
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 145
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t)
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t)
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 146
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t)
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t)
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 147
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t)
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t)
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 148
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t)
+with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t)
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 149
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t)
-select round(covar_samp(c1, c2), 3) from w1;
-
--- query 150
-USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t)
-select round(covar_samp(c1, c2), 3) from w1;
-
--- query 151
-USE ${case_db};
 SELECT
     k,
     val1,
@@ -865,7 +855,7 @@ SELECT
 FROM t1
 order by k;
 
--- query 152
+-- query 150
 USE ${case_db};
 SELECT
     k,
@@ -878,84 +868,84 @@ SELECT
 FROM t1_nonnull
 order by k;
 
--- query 153
+-- query 151
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1 where k > 100;
 
--- query 154
+-- query 152
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1_nonnull where k > 100;
 
--- query 155
+-- query 153
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1 where k = 2;
 
--- query 156
+-- query 154
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1_nonnull where k = 2;
 
--- query 157
+-- query 155
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1 where k in (2, 5, 6);
 
--- query 158
+-- query 156
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1 where k in (5, 6);
 
--- query 159
+-- query 157
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1_nonnull;
 
--- query 160
+-- query 158
 USE ${case_db};
 select round(covar_samp(val1, val2), 3) from t1;
 
--- query 161
+-- query 159
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t)
 select round(corr(c1, c2), 3) from w1 where c1 > 10;
 
--- query 162
+-- query 160
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 163
+-- query 161
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 164
+-- query 162
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 165
+-- query 163
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 166
+-- query 164
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 167
+-- query 165
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 168
+-- query 166
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 169
+-- query 167
 USE ${case_db};
 with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t)
 select round(corr(c1, c2), 3) from w1;
 
--- query 170
+-- query 168
 USE ${case_db};
 SELECT
     k,
@@ -968,7 +958,7 @@ SELECT
 FROM t1
 order by k;
 
--- query 171
+-- query 169
 USE ${case_db};
 SELECT
     k,
@@ -981,34 +971,34 @@ SELECT
 FROM t1_nonnull
 order by k;
 
--- query 172
+-- query 170
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1 where k > 100;
 
--- query 173
+-- query 171
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1_nonnull where k > 100;
 
--- query 174
+-- query 172
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1 where k = 2;
 
--- query 175
+-- query 173
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1_nonnull where k = 2;
 
--- query 176
+-- query 174
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1 where k in (2, 5, 6);
 
--- query 177
+-- query 175
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1 where k in (5, 6);
 
--- query 178
+-- query 176
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1_nonnull;
 
--- query 179
+-- query 177
 USE ${case_db};
 select round(corr(val1, val2), 3) from t1;

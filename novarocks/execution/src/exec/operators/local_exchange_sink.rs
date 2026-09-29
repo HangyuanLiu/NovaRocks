@@ -124,7 +124,7 @@ impl ProcessorOperator for LocalExchangeSinkOperator {
     }
 
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished {
+        if self.is_finished() {
             return Ok(());
         }
         if chunk.is_empty() {
@@ -444,44 +444,120 @@ mod tests {
     }
 
     #[test]
-    fn handoff_queue_ignores_the_query_spill_policy() {
-        let spill = crate::exec::spill::SpillConfig {
-            enable_spill: true,
-            spill_mode: crate::exec::spill::SpillMode::Force,
-            spill_mem_limit_threshold: None,
-            spill_operator_min_bytes: None,
-            spill_operator_max_bytes: None,
-            spill_encode_level: None,
-            enable_spill_buffer_read: None,
-            max_spill_read_buffer_bytes_per_driver: None,
-            spill_mem_table_size: None,
-            spill_mem_table_num: None,
-        };
-        // Force spill without a spill manager: a spilling exchange would fail
-        // to install its spill state, a handoff queue must never try.
-        let rt = RuntimeState::new(None, None, None, None, None, None, Some(spill), None, None);
-        let handoff = LocalExchanger::new_handoff(1, 2, 1, Arc::new(ExprArena::default()));
-        let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&handoff)).create(1, 0);
-        push(&mut sink, &rt, &[1]);
-        assert!(
-            !need_input(sink.as_ref()),
-            "a full handoff queue backpressures instead of spilling"
-        );
-
-        let buffered = LocalExchanger::new(
+    fn buffered_queue_wakes_on_push_capacity_recovery_and_last_producer_eos() {
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_with_limits(
             1,
-            1,
+            2,
             LocalExchangePartitionSpec::Single,
             Arc::new(ExprArena::default()),
+            1,
+            -1,
         );
-        let mut buffered_sink =
-            LocalExchangeSinkFactory::new(-1, Arc::clone(&buffered)).create(1, 0);
-        let error = buffered_sink
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let mut first = sink_factory.create(2, 0);
+        let mut second = sink_factory.create(2, 1);
+        let mut source =
+            LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0);
+        let readable = exchanger.source_observable();
+        let writable = exchanger.sink_observable();
+        let before_push = readable.generation();
+        assert!(!source.as_processor_ref().expect("source").has_output());
+        push(&mut first, &rt, &[7]);
+        assert!(readable.generation() > before_push);
+        assert!(!need_input(first.as_ref()));
+        assert!(!need_input(second.as_ref()));
+
+        let before_pop = writable.generation();
+        assert_eq!(
+            first_value(&pull(&mut source, &rt).expect("queued chunk")),
+            7
+        );
+        assert!(writable.generation() > before_pop);
+        assert!(need_input(first.as_ref()));
+        assert!(need_input(second.as_ref()));
+        first
             .as_processor_mut()
-            .expect("sink op")
-            .push_chunk(&rt, chunk_of(&[1]))
-            .expect_err("a spilling exchange needs the spill manager");
-        assert!(error.contains("spill manager"), "{error}");
+            .expect("first")
+            .set_finishing(&rt)
+            .expect("finish first");
+        assert!(!source.as_processor_ref().expect("source").has_output());
+        let before_eos = readable.generation();
+        second
+            .as_processor_mut()
+            .expect("second")
+            .set_finishing(&rt)
+            .expect("finish second");
+        assert!(readable.generation() > before_eos);
+        assert!(source.as_processor_ref().expect("source").has_output());
+        assert!(pull(&mut source, &rt).is_none());
+        assert!(source.is_finished());
+    }
+
+    #[test]
+    fn cancelling_the_last_consumer_releases_queue_owners_in_both_capacity_policies() {
+        for handoff in [false, true] {
+            let rt = RuntimeState::default();
+            let arena = Arc::new(ExprArena::default());
+            let exchanger = if handoff {
+                LocalExchanger::new_handoff(1, 1, 1, arena)
+            } else {
+                LocalExchanger::new_with_limits(
+                    1,
+                    1,
+                    LocalExchangePartitionSpec::Single,
+                    arena,
+                    1,
+                    -1,
+                )
+            };
+            let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
+            let mut source =
+                LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0);
+            let tracker = crate::runtime::mem_tracker::MemTracker::new_root("queued test input");
+            let mut chunk = chunk_of(&[1, 2]);
+            let array = Arc::downgrade(&chunk.columns()[0]);
+            chunk.transfer_to(&tracker);
+            let input_bytes = tracker.current();
+            assert!(input_bytes > 0);
+            sink.as_processor_mut()
+                .expect("sink")
+                .push_chunk(&rt, chunk)
+                .expect("push input");
+            assert!(array.upgrade().is_some());
+            assert_eq!(tracker.current(), input_bytes);
+            assert!(!need_input(sink.as_ref()));
+            let writable = exchanger.sink_observable();
+            let closed = exchanger.closed_observable();
+            let before_writable = writable.generation();
+            let before_closed = closed.generation();
+            source.cancel();
+            assert!(source.is_finished());
+            assert!(sink.is_finished());
+            assert!(array.upgrade().is_none());
+            assert_eq!(
+                tracker.current(),
+                0,
+                "cancel releases the live input charge"
+            );
+            assert!(writable.generation() > before_writable);
+            assert!(closed.generation() > before_closed);
+            let after_closed = closed.generation();
+            source.cancel();
+            source.close().expect("idempotent close after cancel");
+            assert_eq!(closed.generation(), after_closed);
+            let late = chunk_of(&[3]);
+            let late_array = Arc::downgrade(&late.columns()[0]);
+            sink.as_processor_mut()
+                .expect("sink")
+                .push_chunk(&rt, late)
+                .expect("late push");
+            assert!(late_array.upgrade().is_none());
+            assert_eq!(
+                exchanger.partition_buffered_chunks(0).map(|(n, _)| n),
+                Some(0)
+            );
+        }
     }
 
     #[test]
@@ -555,5 +631,204 @@ mod tests {
             Some(0)
         );
         assert_eq!(exchanger.consumer_count(), 2);
+    }
+    #[test]
+    fn local_exchange_limit_zero_wakes_source_blocked_remote_driver() {
+        use crate::exec::node::exchange_source::ExchangeSourceNode;
+        use crate::exec::operators::exchange_source::ExchangeSourceFactory;
+        use crate::exec::operators::limit_processor::LimitProcessorFactory;
+        use crate::exec::pipeline::binding::ExchangeBinding;
+        use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
+        use crate::exec::pipeline::operator::BlockedReason;
+        use crate::runtime::exchange::ExchangeKey;
+        use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+        use std::time::Duration;
+
+        let state = Arc::new(RuntimeState::default());
+        let arena = Arc::new(ExprArena::default());
+        let exchanger =
+            LocalExchanger::new(1, 1, LocalExchangePartitionSpec::Single, Arc::clone(&arena));
+        let sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let local_source = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
+        let schema = chunk_of(&[1]).chunk_schema_ref();
+        let key = ExchangeKey {
+            finst_id_hi: 97001,
+            finst_id_lo: 97002,
+            node_id: 97003,
+        };
+        let remote = ExchangeSourceFactory::new_native(
+            ExchangeSourceNode::new(key.node_id, Duration::from_secs(60), schema),
+            ExchangeBinding {
+                key,
+                expected_senders: 1,
+                receiver_port: in_process_test_exchange_receiver_port(),
+            },
+            arena,
+        )
+        .expect("remote source");
+        let mut source = remote.create(1, 0);
+        source.prepare().expect("prepare remote source");
+        let source_observable = source
+            .as_processor_ref()
+            .unwrap()
+            .source_observable()
+            .unwrap();
+        let mut producer = PipelineDriver::new(
+            0,
+            vec![source, sink.create(1, 0)],
+            None,
+            Vec::new(),
+            Arc::clone(&state),
+            None,
+        );
+        assert_eq!(
+            producer.process(Duration::from_secs(1)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        );
+        let (wait, generation, deadline) =
+            producer.blocked_observable_snapshot().expect("input wait");
+        assert!(deadline.is_some(), "remote idle deadline is preserved");
+        let source_observers = source_observable.num_observers();
+        let sink_observers = exchanger.sink_observable().num_observers();
+        producer.set_ready();
+        assert_eq!(
+            producer.process(Duration::from_secs(1)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        );
+        let (same_wait, same_generation, _) = producer.blocked_observable_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&wait, &same_wait));
+        assert_eq!(generation, same_generation);
+        assert_eq!(source_observers, source_observable.num_observers());
+        assert_eq!(sink_observers, exchanger.sink_observable().num_observers());
+        drop(same_wait);
+        let source_generation = source_observable.generation();
+        let limit = LimitProcessorFactory::new(-1, Some(0), 0);
+        let mut consumer = PipelineDriver::new(
+            1,
+            vec![local_source.create(1, 0), limit.create(1, 0)],
+            None,
+            Vec::new(),
+            state,
+            None,
+        );
+        assert_eq!(
+            consumer.process(Duration::from_secs(1)),
+            DriverState::Finished
+        );
+        assert_eq!(
+            source_observable.generation(),
+            source_generation,
+            "no remote chunk or EOS is needed"
+        );
+        assert!(
+            wait.generation() > generation,
+            "consumer close must invalidate the input wait"
+        );
+        producer.set_ready();
+        assert_eq!(
+            producer.process(Duration::from_secs(1)),
+            DriverState::Finished,
+            "sink-only notification permits actual driver completion"
+        );
+        // The same target also receives source events, including an event
+        // overlapping downstream completion. Neither event replaces the other.
+        source_observable.notify_observers();
+        assert!(wait.generation() > generation + 1);
+        assert!(exchanger.all_consumers_closed());
+        let weak_wait = Arc::downgrade(&wait);
+        drop(wait);
+        drop(producer);
+        assert!(
+            weak_wait.upgrade().is_none(),
+            "forwarding does not retain the driver wait"
+        );
+    }
+
+    #[test]
+    fn local_exchange_closed_partition_does_not_block_necessary_sibling() {
+        let state = RuntimeState::default();
+        let exchanger = LocalExchanger::new_with_limits(
+            2,
+            1,
+            LocalExchangePartitionSpec::InputSlotIds(vec![SlotId::new(1)]),
+            Arc::new(ExprArena::default()),
+            1024 * 1024,
+            1,
+        );
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let source_factory = LocalExchangeSourceFactory::new(-1, 2, Arc::clone(&exchanger));
+        let mut sink = sink_factory.create(1, 0);
+        let mut departed = source_factory.create(2, 0);
+        let mut sibling = source_factory.create(2, 1);
+        sink.as_processor_mut()
+            .unwrap()
+            .push_chunk(&state, chunk_of(&(0..64).collect::<Vec<_>>()))
+            .unwrap();
+        let before = exchanger.stats_snapshot();
+        assert!(before.partitions[0].buffered_chunks > 0);
+        let sibling_rows = before.partitions[1].pushed_rows;
+        assert!(sibling_rows > 0);
+        let wake = exchanger.sink_observable();
+        let generation = wake.generation();
+        departed.close().unwrap();
+        departed.cancel();
+        departed
+            .as_processor_mut()
+            .unwrap()
+            .set_finishing(&state)
+            .unwrap();
+        assert!(
+            !sink.is_finished(),
+            "a necessary sibling keeps its producer live"
+        );
+        assert_eq!(
+            wake.generation(),
+            generation + 1,
+            "close/cancel/finishing settle only once"
+        );
+        assert_eq!(exchanger.stats_snapshot().partitions[0].buffered_chunks, 0);
+        let mut rows = 0;
+        while let Some(chunk) = sibling
+            .as_processor_mut()
+            .unwrap()
+            .pull_chunk(&state)
+            .unwrap()
+        {
+            rows += chunk.len() as u64;
+        }
+        assert_eq!(rows, sibling_rows);
+        assert!(
+            sink.as_processor_ref().unwrap().need_input(),
+            "departed queue releases backpressure"
+        );
+        sink.as_processor_mut()
+            .unwrap()
+            .push_chunk(&state, chunk_of(&(64..128).collect::<Vec<_>>()))
+            .unwrap();
+        assert_eq!(
+            exchanger.stats_snapshot().partitions[0].buffered_chunks,
+            0,
+            "late partition output is discarded"
+        );
+        let expected = exchanger.stats_snapshot().partitions[1].pushed_rows;
+        sink.as_processor_mut()
+            .unwrap()
+            .set_finishing(&state)
+            .unwrap();
+        while let Some(chunk) = sibling
+            .as_processor_mut()
+            .unwrap()
+            .pull_chunk(&state)
+            .unwrap()
+        {
+            rows += chunk.len() as u64;
+        }
+        assert_eq!(rows, expected);
+        assert!(
+            sibling.is_finished(),
+            "necessary sibling receives normal EOS"
+        );
+        sibling.close().unwrap();
+        assert!(exchanger.all_consumers_closed());
     }
 }

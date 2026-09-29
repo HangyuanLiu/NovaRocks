@@ -2,9 +2,9 @@
 id: ADR-0146
 title: "Logical execution owns attempts, result visibility and residual convergence"
 domain: [distributed-query-lifecycle, distributed-execution]
-status: active
+status: superseded
 supersedes: [ADR-0135]
-superseded-by: null
+superseded-by: ADR-0161
 date: 2026-09-11
 provenance:
   - "PR: <backfill after merge>"

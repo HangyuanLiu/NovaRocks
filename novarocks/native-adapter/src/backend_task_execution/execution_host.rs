@@ -26,7 +26,8 @@
 //! install_receiver          decode + prepare_fragment -> dormant handle
 //! install_inbound_capability register the descriptor for frame admission
 //! apply_task_domain         initial splits / edge opens / filters
-//! submit_runnable           start and attach the dormant handle
+//! submit_runnable           reserve completion and return a dormant runnable
+//! commit_creation           start and attach after Worker installs Live
 //! ```
 //!
 //! The dormant handle is what makes that split honest. Receiver registration
@@ -34,8 +35,8 @@
 //! `prepare_fragment`, which also builds the pipeline and hands back a
 //! [`DormantFragmentHandle`]. So `install_receiver` prepares the whole
 //! fragment and parks the handle; `remove_receiver` drops it, and the
-//! `FragmentResources` it owns roll every registration back. `submit_runnable`
-//! is the only step that starts the prepared execution, and it runs last.
+//! `FragmentResources` it owns roll every registration back. The Worker's
+//! Live commit starts the prepared execution through the runnable.
 //!
 //! This host reads nothing from the fragment-based lifecycle registry. Every
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
@@ -53,8 +54,8 @@ use novarocks_execution::connector::{
 use novarocks_execution::exec::fragment::program::FragmentSinkKind;
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
-    ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort,
-    FragmentEvent, FragmentEventSink, FragmentResultWriter,
+    ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort,
+    FragmentCommitPort, FragmentEvent, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, FragmentTerminalFact,
@@ -91,7 +92,7 @@ use tracing::debug;
 
 use crate::fragment_instance::project_task_instance;
 use crate::fragment_request::NativeFragmentRequest;
-use crate::native_fragment_query::NativeFragmentQueryRuntime;
+use crate::native_fragment_query::{NativeFragmentQueryRuntime, NativeFragmentRegistrationLease};
 use crate::task_protocol_fault as fault;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
@@ -233,17 +234,16 @@ struct TaskRuntime {
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
     read_context: Arc<TypedReadAttemptContext>,
-    delivery_expire: Duration,
-    query_expire: Duration,
+    /// Retains preparation accounting until activation or receiver rollback.
+    registration: Mutex<Option<NativeFragmentRegistrationLease>>,
     /// This task's metrics owner, retained so `submit_runnable` can hand it
     /// the status reporter that only exists once the task is runnable.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
 }
 
-/// Preparation can start provider work before the task is installed in the
-/// registry. Every failing return must wake that work before its resources are
-/// rolled back; a successfully installed task transfers this duty to
-/// `remove_receiver` and the runnable's stand-down latch.
+/// A failed preparation must wake any provider work before resources roll
+/// back; an installed task transfers stop responsibility to `remove_receiver`
+/// and the runnable's stand-down latch.
 struct PreparationStopGuard(Option<ConnectorStopOwner>);
 
 impl PreparationStopGuard {
@@ -633,6 +633,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.close_context(context);
     }
 
+    fn abort_context_admission(&self, context: QueryContextRef) {
+        self.capabilities.abort_context(context);
+    }
+
     fn retire_context_execution(&self, context: QueryContextRef) {
         self.queries
             .retire_idle_execution(context.query_execution_id());
@@ -640,6 +644,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
 
     fn forget_context_admission(&self, context: QueryContextRef) {
         self.capabilities.forget_context(context);
+    }
+
+    fn retains_normal_close(&self, context: QueryContextRef) -> bool {
+        self.capabilities.retains_normal_close(context)
     }
 
     /// Interprets the winner's static plan and prepares the whole fragment.
@@ -676,6 +684,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )));
         }
 
+        crate::task_protocol_fault::hold_native_task_preparation(identity).map_err(internal)?;
         let (static_fragment, assignment) = input.into_parts();
         let fragment = decode_static_fragment(&static_fragment, FieldPath::root("frozen_fragment"))
             .map_err(|error| {
@@ -711,7 +720,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let context_options = self.context_facts.query_options(execution)?;
         let instance = project_task_instance(
             descriptor,
-            assignment.into_wire(),
+            assignment
+                .into_wire()
+                .map_err(|error| internal(format!("restore validated task assignment: {error}")))?,
             context_options.runtime().as_ref().clone(),
             sink_kind,
         )
@@ -804,6 +815,14 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let runtime_filter =
             self.context_facts
                 .runtime_filter_session(execution, kernel_key, expects_bindings)?;
+        // Resource ownership starts with preparation. This registration does
+        // not activate drivers; its lease rolls back every pre-submit exit.
+        let registration = self
+            .queries
+            .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
+            .map_err(|error| {
+                resource_exhausted(format!("task {identity} could not be registered: {error}"))
+            })?;
         let admission = self
             .queries
             .prepare_admission_execution(
@@ -848,6 +867,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             resource_exhausted(format!("task {identity} could not be prepared: {error}"))
         })?;
 
+        crate::task_execution_observation::emit_prepared_task_dop(
+            identity,
+            descriptor.fragment_instance_id(),
+            descriptor.pipeline_dop().get(),
+        );
+
         self.tasks.lock().expect(TASK_LOCK).insert(
             identity,
             Arc::new(TaskRuntime {
@@ -858,8 +883,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 edges,
                 splits,
                 read_context,
-                delivery_expire,
-                query_expire,
+                registration: Mutex::new(Some(registration)),
                 operator_statistics,
             }),
         );
@@ -894,15 +918,27 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.install(Arc::new(descriptor.clone()))
     }
 
+    fn reserve_inbound_close_capacity(
+        &self,
+        descriptor: &TaskDescriptor,
+    ) -> Result<(), HostRejection> {
+        self.capabilities.reserve_normal_close(descriptor)
+    }
+
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
         self.capabilities.remove(descriptor);
     }
 
-    /// Starts the prepared fragment and hands its terminal work to the
-    /// process-wide completion owner.
+    fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) {
+        self.capabilities
+            .close_normally(descriptor, || self.remove_receiver(descriptor));
+    }
+
+    /// Reserves the prepared fragment's terminal supervision and returns a
+    /// dormant runnable. The Worker starts it after installing the Live record.
     ///
-    /// This is the last install step. Everything fallible runs before the
-    /// dormant fragment starts, so a refusal leaves no running worker behind.
+    /// This is the last fallible install step, so a refusal leaves no running
+    /// worker behind.
     fn submit_runnable(
         &self,
         descriptor: &TaskDescriptor,
@@ -923,17 +959,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .take()
             .ok_or_else(|| internal(format!("task {identity} was submitted twice")))?;
 
-        let registration = self
-            .queries
-            .register_fragment_execution(
-                execution,
-                kernel_key,
-                runtime.delivery_expire,
-                runtime.query_expire,
-            )
-            .map_err(|error| {
-                resource_exhausted(format!("task {identity} could not be registered: {error}"))
-            })?;
+        let registration = runtime
+            .registration
+            .lock()
+            .expect(DORMANT_LOCK)
+            .take()
+            .ok_or_else(|| internal(format!("task {identity} has no preparation registration")))?;
         // A split may arrive the moment this create is acknowledged, so the
         // decoded read bindings become resolvable exactly here — after
         // preparation proved every plan node decodes, and before any worker
@@ -967,7 +998,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             kernel_key,
             runtime.stop.clone(),
         ));
-        let worker = Arc::clone(&task);
         let completion_worker = Arc::clone(&task);
         let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
@@ -1015,26 +1045,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             })?;
         task.bind_completion(completion.clone());
 
-        // The pre-start lease keeps the query route rollback-capable while
-        // this worker is dormant. Submission makes it live synchronously.
-        registration.into_running();
-        // RUNNING is published before the drivers are submitted because it is
-        // the route becoming live that the status describes, and because no
-        // terminal state is reachable from PLANNED.
-        reporter.running();
-        let running = if injected_execution_failure {
-            dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
-        } else {
-            dormant.start()
-        };
-        // Replays a stand-down that arrived while this task was submitted but
-        // not yet attached. The latch remains the first-wins cancellation
-        // authority.
-        worker.attach(Arc::new(running.clone()));
-        // Subscription after start is deliberate: the kernel retains an
-        // already-stopped fact and invokes this immediately, so neither a
-        // synchronous completion nor a stop-before-subscribe race is lost.
-        running.subscribe_stopped(move |fact| completion.publish(fact));
+        // The Worker must make the Live record findable before any driver can
+        // start or publish completion. The runnable owns this dormant start
+        // until the registry calls commit_creation after installing Live.
+        task.prepare_start(PreparedNativeStart {
+            dormant,
+            registration,
+            reporter,
+            completion,
+            injected_execution_failure,
+        });
         Ok(task)
     }
 
@@ -1096,6 +1116,24 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     .map_err(|conflict| {
                         protocol(format!("task {identity} edge open is illegal: {conflict}"))
                     })
+            }
+            TaskDomainUpdate::CloseExchangeDestination {
+                edge, destination, ..
+            } => {
+                let frozen = descriptor.topology().edge(*edge)
+                    .and_then(|outbound| outbound.destinations().iter().find(|member| member.task() == *destination))
+                    .ok_or_else(|| protocol(format!("task {identity} did not freeze destination {destination} on edge {edge}")))?;
+                let key = ExchangeDestinationKey::new(
+                    frozen.fragment_instance_id(),
+                    frozen.destination_node_id().get(),
+                );
+                let gate = runtime.edges.gate_for_destination(key)
+                    .filter(|gate| gate.edge_id() == *edge)
+                    .ok_or_else(|| protocol(format!("task {identity} has no matching runtime gate for destination {destination} on edge {edge}")))?;
+                self.execution_runtime
+                    .exchange_send_queue()
+                    .close_destination_normally(gate);
+                Ok(None)
             }
         }
     }
@@ -1162,6 +1200,7 @@ impl FragmentStandDown for RunningFragmentHandle {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum StandDown {
     Cancel(CancelReason),
+    Quiesce,
     Abort(AbortCause),
 }
 
@@ -1169,6 +1208,9 @@ impl StandDown {
     fn reason(self) -> FragmentCancelReason {
         match self {
             Self::Cancel(reason) => FragmentCancelReason::new(reason.as_str()),
+            Self::Quiesce => {
+                FragmentCancelReason::new(CancelReason::UpstreamNoLongerNeeded.as_str())
+            }
             Self::Abort(cause) => FragmentCancelReason::new(cause.as_str()),
         }
     }
@@ -1176,10 +1218,19 @@ impl StandDown {
 
 #[derive(Default)]
 struct RunnableState {
+    prepared_start: Option<PreparedNativeStart>,
     handle: Option<Arc<dyn FragmentStandDown>>,
     stand_down: Option<StandDown>,
     finished: bool,
     finished_root_reporter: Option<TaskStatusReporter>,
+}
+
+struct PreparedNativeStart {
+    dormant: DormantFragmentHandle,
+    registration: NativeFragmentRegistrationLease,
+    reporter: TaskStatusReporter,
+    completion: TaskCompletionSignal,
+    injected_execution_failure: bool,
 }
 
 /// One submitted task, as the owner may address it.
@@ -1234,7 +1285,59 @@ impl NativeRunnableTask {
         );
     }
 
+    fn prepare_start(&self, prepared: PreparedNativeStart) {
+        let mut state = self.state.lock().expect(RUNNABLE_LOCK);
+        assert!(state.prepared_start.replace(prepared).is_none());
+    }
+
+    fn start_committed(&self) {
+        let mut state = self.state.lock().expect(RUNNABLE_LOCK);
+        let prepared = state
+            .prepared_start
+            .take()
+            .expect("a committed native task has one dormant start");
+        let PreparedNativeStart {
+            dormant,
+            registration,
+            reporter,
+            completion,
+            injected_execution_failure,
+        } = prepared;
+        if let Some(stand_down) = state.stand_down {
+            // The task is Live before this call, but a Context stop can win
+            // while its kernel is still dormant. Complete the stopped fact
+            // without submitting any driver or rolling back its registration.
+            registration.into_running();
+            drop(dormant);
+            drop(state);
+            completion.publish(FragmentTerminalFact::new(
+                self.identity.query_execution_id().query_id(),
+                self.fragment_instance_id,
+                FragmentOutcome::Cancelled {
+                    reason: stand_down.reason(),
+                },
+                None,
+            ));
+            return;
+        }
+        registration.into_running();
+        // RUNNING precedes driver submission, including synchronous stop.
+        reporter.running();
+        let running = if injected_execution_failure {
+            dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
+        } else {
+            dormant.start()
+        };
+        // Serialize the start with request(): a stop observed before this
+        // lock was taken never starts work; a later stop sees this handle.
+        state.handle = Some(Arc::new(running.clone()));
+        drop(state);
+        // The kernel retains an already-stopped fact for this subscription.
+        running.subscribe_stopped(move |fact| completion.publish(fact));
+    }
+
     /// Publishes the started fragment and replays any latched stand-down.
+    #[cfg(test)]
     fn attach(&self, handle: Arc<dyn FragmentStandDown>) {
         let latched = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
@@ -1307,12 +1410,18 @@ fn settle_finished_root_result(reporter: &TaskStatusReporter, stand_down: StandD
     // Context termination and CancelTask normally discard this first. A
     // creation that lost to context termination can install its result after
     // that fan-out, so the execution owner must close its own late buffer too.
-    novarocks_worker::result_buffer::discard_task(reporter.identity());
+    if !matches!(stand_down, StandDown::Quiesce) {
+        novarocks_worker::result_buffer::discard_task(reporter.identity());
+    }
     if !current.is_terminal() {
         match stand_down {
             StandDown::Cancel(reason) => {
                 reporter.canceling(reason);
                 reporter.canceled(reason);
+            }
+            StandDown::Quiesce => {
+                reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
+                reporter.canceled(CancelReason::UpstreamNoLongerNeeded);
             }
             StandDown::Abort(cause) => {
                 reporter.aborting(cause);
@@ -1320,7 +1429,9 @@ fn settle_finished_root_result(reporter: &TaskStatusReporter, stand_down: StandD
             }
         }
     }
-    reporter.release_output();
+    if !matches!(stand_down, StandDown::Quiesce) {
+        reporter.release_output();
+    }
 }
 
 impl RunnableTask for NativeRunnableTask {
@@ -1329,10 +1440,15 @@ impl RunnableTask for NativeRunnableTask {
             .get()
             .expect("a submitted native task has a completion slot")
             .commit_creation();
+        self.start_committed();
     }
 
     fn cancel(&self, reason: CancelReason) {
         self.request(StandDown::Cancel(reason));
+    }
+
+    fn quiesce(&self) {
+        self.request(StandDown::Quiesce);
     }
 
     fn abort(&self, cause: AbortCause) {
@@ -1374,12 +1490,37 @@ fn report_terminal(
                 };
                 reporter.canceled_with_output(reason, output);
             }
+            StandDown::Quiesce => {
+                if let FragmentOutcome::Failed(error) = fact.outcome() {
+                    report_failure(
+                        reporter,
+                        TaskFailure::new(
+                            TaskFailureCategory::Execution,
+                            SafeDetail::truncating(&error.to_string()),
+                        ),
+                    );
+                } else {
+                    reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
+                    let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
+                        && !matches!(sink_kind, FragmentSinkKind::Result)
+                    {
+                        TaskOutputFacts::new(true)
+                    } else {
+                        TaskOutputFacts::default()
+                    };
+                    reporter.canceled_with_output(CancelReason::UpstreamNoLongerNeeded, output);
+                }
+            }
             StandDown::Abort(cause) => {
                 reporter.aborting(cause);
                 reporter.aborted(cause);
             }
         }
-        reporter.release_output();
+        if !matches!(stand_down, StandDown::Quiesce)
+            || !matches!(sink_kind, FragmentSinkKind::Result)
+        {
+            reporter.release_output();
+        }
         return;
     }
     match fact.outcome() {
@@ -1485,11 +1626,11 @@ mod tests {
     use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime::execution_runtime::{
-        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+        ExecutionRuntime, ExecutionRuntimeConfig,
     };
     use novarocks_execution::runtime::fragment::io::{
-        FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink,
-        UnavailableExchangeReceiverPort,
+        ExchangeDestinationKey, FragmentEvent, FragmentEventSink, FragmentProgress,
+        NoopFragmentEventSink, UnavailableExchangeReceiverPort,
     };
     use novarocks_execution::runtime::fragment::{
         FragmentCancelReason, FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -1657,6 +1798,9 @@ mod tests {
     struct ForeignAssignment;
 
     impl CreationContent for ForeignAssignment {
+        fn retained_bytes(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
         fn encoded_len(&self) -> usize {
             16
         }
@@ -1928,9 +2072,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    spill_io_threads: 1,
-                    spill_io_queue_capacity: 1,
-                    spill_storage: ExecutionSpillStorageConfig::default(),
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1,
@@ -1961,7 +2102,10 @@ mod tests {
             ),
             facts,
             TaskInboundCapabilities::new(),
-            novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(data_runtime),
+            novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
+                data_runtime,
+                Duration::from_millis(120_000),
+            ),
             novarocks_native_adapter::fragment_result_writer::test_native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
@@ -2674,6 +2818,87 @@ mod tests {
 
     // ----------------------------------------------------- prepared lifecycle
 
+    fn isolated_resource_host() -> (
+        NativeTaskExecutionHost,
+        Arc<novarocks_worker::query_context::QueryContextManager>,
+    ) {
+        let manager = novarocks_worker::query_context::QueryContextManager::new_for_test();
+        let mut host = host(Arc::new(StubContextFacts::default()));
+        host.queries = NativeFragmentQueryRuntime::new_for_test(
+            Arc::clone(&manager),
+            novarocks_native_adapter::backend_test_support::test_memory_authority(),
+        );
+        (host, manager)
+    }
+
+    #[test]
+    fn preparation_registration_rolls_back_when_a_prepared_receiver_is_removed() {
+        let (host, manager) = isolated_resource_host();
+        let descriptor = consistent_descriptor(identity(521, 1, 1), UniqueId::new(521, 522));
+        install(&host, &descriptor).expect("prepares without submitting drivers");
+        let prepared = manager.native_execution_resource_snapshot();
+        assert_eq!(prepared.active_contexts, 1);
+        assert_eq!(prepared.active_fragments, 1);
+        host.remove_receiver(&descriptor);
+        host.remove_receiver(&descriptor);
+        let removed = manager.native_execution_resource_snapshot();
+        assert_eq!(removed.active_contexts, 0);
+        assert_eq!(removed.active_fragments, 0);
+    }
+
+    #[test]
+    fn preparation_registration_rollback_preserves_a_submitted_sibling() {
+        let (host, manager) = isolated_resource_host();
+        let first = identity(523, 1, 1);
+        let sibling = TaskIdentity::new(
+            first.query_execution_id(),
+            first.stage_id(),
+            TaskId::new(2).expect("task"),
+            first.backend_process_id(),
+        );
+        let first_descriptor = consistent_descriptor(first, UniqueId::new(523, 524));
+        let sibling_descriptor = consistent_descriptor(sibling, UniqueId::new(525, 526));
+        install(&host, &first_descriptor).expect("first prepares");
+        let (owner, reporter) = reporter_for(first);
+        // Submission retains the registration in PreparedNativeStart. No
+        // commit has occurred, so this test cannot accidentally run drivers.
+        let runnable = host
+            .submit_runnable(&first_descriptor, reporter)
+            .expect("submits");
+        install(&host, &sibling_descriptor).expect("sibling prepares");
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            2
+        );
+        host.remove_receiver(&sibling_descriptor);
+        let retained = manager.native_execution_resource_snapshot();
+        assert_eq!(retained.active_contexts, 1);
+        assert_eq!(retained.active_fragments, 1);
+        host.remove_receiver(&first_descriptor);
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            1,
+            "the submitted start owns its registration independently of receiver removal"
+        );
+        runnable.commit_creation();
+        assert_eq!(await_terminal(&owner), TaskState::Finished);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while manager.native_execution_resource_snapshot().active_contexts != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completion must release runtime accounting"
+            );
+            std::thread::yield_now();
+        }
+        let removed = manager.native_execution_resource_snapshot();
+        assert_eq!(removed.active_contexts, 0);
+        assert_eq!(removed.active_fragments, 0);
+    }
+
     #[test]
     fn a_prepared_task_opens_only_the_edges_its_descriptor_froze() {
         let facts = Arc::new(StubContextFacts::default());
@@ -2725,6 +2950,71 @@ mod tests {
         host.remove_receiver(&descriptor);
         // Removal must be idempotent: the owner calls it for a rollback and
         // again when the task retires.
+        host.remove_receiver(&descriptor);
+    }
+
+    #[test]
+    fn a_prepared_task_closes_only_its_exact_frozen_destination() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let producer = identity(121, 1, 1);
+        let consumer = identity(121, 2, 1);
+        let edge = ExchangeEdgeId::new(1).expect("edge");
+        let descriptor = descriptor_with(
+            producer,
+            UniqueId::new(261, 262),
+            1,
+            outbound_topology(edge, consumer),
+        );
+        let body = Body::with_sink(
+            1,
+            stream_sink(plan::PartitionKind::Unpartitioned),
+            vec![edge.get()],
+        );
+        host.install_receiver(&descriptor, body.input(&descriptor))
+            .expect("prepares");
+
+        let replacement_process = TaskIdentity::new(
+            consumer.query_execution_id(),
+            consumer.stage_id(),
+            consumer.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let close = |destination| TaskDomainUpdate::CloseExchangeDestination {
+            version: DomainVersion::FIRST,
+            edge,
+            destination,
+        };
+        assert!(
+            host.apply_task_domain(&descriptor, &close(replacement_process))
+                .is_err()
+        );
+        let gate = host
+            .task_runtime(producer)
+            .expect("runtime")
+            .edges
+            .gate_for_destination(ExchangeDestinationKey::new(UniqueId::new(900, 901), 11))
+            .expect("gate")
+            .clone();
+        assert!(!gate.is_normally_canceled());
+
+        host.apply_task_domain(&descriptor, &close(consumer))
+            .expect("exact destination closes");
+        assert!(gate.is_normally_canceled());
+        host.apply_task_domain(&descriptor, &close(consumer))
+            .expect("repeat close is harmless");
+        host.apply_task_domain(
+            &descriptor,
+            &TaskDomainUpdate::OpenExchangeEdges {
+                version: EdgeOpenVersion::FIRST,
+                edges: vec![edge],
+            },
+        )
+        .expect("edge grant after close is recorded");
+        assert!(
+            gate.is_normally_canceled(),
+            "opening the edge cannot revive a closed destination"
+        );
         host.remove_receiver(&descriptor);
     }
 
@@ -2934,7 +3224,7 @@ mod tests {
 
     // ------------------------------------------------------ end-to-end submit
 
-    fn reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
+    fn planned_reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
         let owner = Arc::new(TaskStatusOwner::new(
             identity,
             Arc::new(TaskStatusSource::new()),
@@ -2943,6 +3233,18 @@ mod tests {
         ));
         owner.release_to_observers();
         (Arc::clone(&owner), TaskStatusReporter::new(owner))
+    }
+
+    fn reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
+        let (owner, reporter) = planned_reporter_for(identity);
+        // Direct Host tests bypass the registry's creation commit. Reproduce
+        // its irreversible Installed fact before the runnable may start.
+        assert!(matches!(
+            owner.note_installed(),
+            StatusAdvance::Published(_)
+        ));
+        assert!(owner.current().installed());
+        (owner, reporter)
     }
 
     /// Waits for a task to reach a terminal status, or gives up.
@@ -2969,6 +3271,61 @@ mod tests {
             .expect("a prepared fragment starts");
         runnable.commit_creation();
         runnable
+    }
+
+    #[test]
+    fn submitted_runnable_stays_dormant_until_creation_commit() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let task = identity(23, 1, 1);
+        let descriptor = consistent_descriptor(task, UniqueId::new(189, 190));
+        let (owner, reporter) = planned_reporter_for(task);
+
+        install(&host, &descriptor).expect("prepares");
+        host.install_inbound_capability(&descriptor)
+            .expect("installs");
+        let runnable = host
+            .submit_runnable(&descriptor, reporter)
+            .expect("reserves completion without starting drivers");
+        assert_eq!(owner.state(), TaskState::Planned);
+        assert!(!owner.current().installed());
+        assert!(!owner.convergence().actual_stopped());
+
+        // Worker publishes Installed while the kernel remains dormant.
+        assert!(matches!(
+            owner.note_installed(),
+            StatusAdvance::Published(_)
+        ));
+        assert_eq!(owner.state(), TaskState::Planned);
+        assert!(!owner.convergence().actual_stopped());
+        runnable.commit_creation();
+        assert_eq!(await_terminal(&owner), TaskState::Finished);
+        await_runtime_convergence(&owner);
+        host.remove_inbound_capability(&descriptor);
+        host.remove_receiver(&descriptor);
+    }
+
+    #[test]
+    fn stand_down_before_creation_commit_stops_without_starting_drivers() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let task = identity(231, 1, 1);
+        let descriptor = consistent_descriptor(task, UniqueId::new(1891, 1901));
+        let (owner, reporter) = planned_reporter_for(task);
+
+        install(&host, &descriptor).expect("prepares");
+        host.install_inbound_capability(&descriptor)
+            .expect("installs");
+        let runnable = host
+            .submit_runnable(&descriptor, reporter)
+            .expect("reserves completion without starting drivers");
+        runnable.cancel(CancelReason::UpstreamNoLongerNeeded);
+        runnable.commit_creation();
+
+        assert_eq!(await_terminal(&owner), TaskState::Canceled);
+        await_runtime_convergence(&owner);
+        host.remove_inbound_capability(&descriptor);
+        host.remove_receiver(&descriptor);
     }
 
     fn await_runtime_convergence(owner: &TaskStatusOwner) {
@@ -3239,6 +3596,103 @@ mod tests {
             runnable.abort(AbortCause::PeerTaskFailed);
             assert_eq!(owner.current().version(), settled_version);
         }
+    }
+
+    #[tokio::test]
+    async fn normal_quiesce_preserves_running_and_flushing_root_payloads() {
+        use novarocks_execution_contract::ResultByteLimit;
+        use novarocks_worker::result_buffer::{TryFetchTypedResult, wait_fetch_task_typed};
+
+        for already_flushing in [false, true] {
+            let task_id = identity(if already_flushing { 345 } else { 346 }, 1, 1);
+            let (owner, reporter) = reporter_for(task_id);
+            let runnable = NativeRunnableTask::new(task_id, UniqueId::new(345, 346));
+            novarocks_worker::result_buffer::create_task_typed_sender(task_id);
+            novarocks_worker::result_buffer::insert_task_typed(task_id, vec![7, 8, 9])
+                .expect("root payload");
+            owner.note_installed();
+            reporter.running();
+            if already_flushing {
+                reporter.note_actual_stopped();
+                report_terminal(
+                    &reporter,
+                    FragmentSinkKind::Result,
+                    &terminal_fact(FragmentOutcome::Succeeded),
+                    None,
+                );
+                runnable.finish(Some(&reporter));
+                assert_eq!(owner.state(), TaskState::Flushing);
+            }
+            runnable.quiesce();
+            if !already_flushing {
+                // The kernel's completion owner calls finish after the stop.
+                runnable.finish(Some(&reporter));
+            }
+            assert_eq!(owner.state(), TaskState::Canceled);
+            assert!(
+                !owner.output_released(),
+                "normal stop leaves root output owned until drain"
+            );
+            assert!(
+                !owner.retirement_ready(),
+                "retirement would remove unread root payload"
+            );
+            let fetched = wait_fetch_task_typed(
+                task_id,
+                None,
+                Duration::ZERO,
+                ResultByteLimit::new(1024).expect("byte cap"),
+            )
+            .await;
+            let TryFetchTypedResult::Ready(packet) = fetched else {
+                panic!("normal quiesce must preserve root payload: {fetched:?}");
+            };
+            assert_eq!(packet.payload.as_ref(), &[7, 8, 9]);
+            novarocks_worker::result_buffer::close_task_ok(task_id);
+            let eos = wait_fetch_task_typed(
+                task_id,
+                Some(packet.packet_seq),
+                Duration::ZERO,
+                ResultByteLimit::new(1024).expect("byte cap"),
+            )
+            .await;
+            let TryFetchTypedResult::Ready(eos) = eos else {
+                panic!("root EOS must remain readable: {eos:?}");
+            };
+            assert!(eos.eos);
+            assert!(matches!(
+                wait_fetch_task_typed(
+                    task_id,
+                    Some(eos.packet_seq),
+                    Duration::ZERO,
+                    ResultByteLimit::new(1024).expect("byte cap")
+                )
+                .await,
+                TryFetchTypedResult::EndAcknowledged
+            ));
+            owner.note_root_result_drained();
+            assert!(owner.output_released());
+            novarocks_worker::result_buffer::discard_task(task_id);
+        }
+    }
+
+    #[test]
+    fn normal_quiesce_does_not_mask_a_real_fragment_failure() {
+        let task_id = identity(347, 1, 1);
+        let (owner, reporter) = reporter_for(task_id);
+        owner.note_installed();
+        reporter.running();
+        reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Failed(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Pipeline,
+                "driver failed during normal stop",
+            ))),
+            Some(StandDown::Quiesce),
+        );
+        assert_eq!(owner.state(), TaskState::Failed);
     }
 
     #[test]
@@ -3780,6 +4234,14 @@ mod tests {
                 .query_mem_tracker_execution(query)
                 .is_some()
         );
+
+        let quiesced = fixture.registry.quiesce_query_context(
+            &novarocks_execution_contract::task_execution::operation::QuiesceQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+            ),
+        );
+        assert_eq!(quiesced.outcome(), OperationOutcome::Accepted);
 
         let released = fixture
             .registry

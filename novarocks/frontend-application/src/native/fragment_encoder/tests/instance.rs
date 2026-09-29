@@ -50,8 +50,6 @@ fn query_options_encoder_maps_every_query_wide_option() {
         ..Default::default()
     };
     let opts = instance::encode_query_options(&query_options);
-    novarocks_proto_codec::lifecycle::QueryOptions::parse(opts)
-        .expect("frontend query-options projection satisfies the Protocol contract");
     assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);
     assert_eq!(opts.query_delivery_timeout, 30);

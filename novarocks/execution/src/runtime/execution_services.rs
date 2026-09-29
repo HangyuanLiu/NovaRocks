@@ -241,10 +241,6 @@ mod tests {
     fn services() -> ExecutionServices {
         ExecutionServices::new(&ExecutionRuntimeConfig {
             driver_threads: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 1,
-            spill_storage: crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(
-            ),
             exchange_wait_ms: 120_000,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,

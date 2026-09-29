@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::exec::fragment::program::{FragmentProgram, FragmentSinkSpec};
-use crate::exec::fragment::sink::{
-    DataStreamSinkBranchProgram, DataStreamSinkFactoryInput, FragmentSinkProgram,
-    MultiCastDataStreamSinkProgram,
-};
+use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::fragment::program::FragmentProgram;
+use crate::exec::fragment::sink::DataStreamSinkFactoryInput;
 use crate::exec::operators::{
     DataStreamSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
     ResultBufferSinkFactory, SplitDataStreamSinkFactory,
@@ -33,6 +31,7 @@ use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssig
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::fragment::io::FragmentResultSession;
 use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
+use novarocks_local_program::{StaticSinkProgram, StaticStreamBranch};
 
 #[allow(
     dead_code,
@@ -43,9 +42,17 @@ pub(crate) fn materialize_fragment_sink(
     instance: &FragmentInstanceSpec,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    materialize_fragment_sink_with_result(program, instance, transmitter, result_session, None)
-        .map(|materialized| materialized.factory)
+    materialize_fragment_sink_with_result(
+        program,
+        instance,
+        transmitter,
+        result_session,
+        None,
+        std::sync::Arc::clone(&runtime_error),
+    )
+    .map(|materialized| materialized.factory)
 }
 
 /// Runtime-owned result of materializing a fragment sink.
@@ -59,9 +66,13 @@ pub(crate) fn materialize_fragment_sink_with_result(
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
     materialize_fragment_sink_components_impl(
-        program.sink(),
+        program
+            .local_program()
+            .sink()
+            .ok_or_else(|| materialization_error("local fragment program has no static sink"))?,
         instance.sink_assignment(),
         instance.fragment_instance_id().get(),
         instance.runtime_options().typed_result_sink(),
@@ -69,6 +80,7 @@ pub(crate) fn materialize_fragment_sink_with_result(
         transmitter,
         result_session,
         edge_gates,
+        std::sync::Arc::clone(&runtime_error),
     )
 }
 
@@ -77,13 +89,14 @@ pub(crate) fn materialize_fragment_sink_with_result(
     reason = "Compatibility materialization entrypoint retained for fragment sink integration callers."
 )]
 pub(crate) fn materialize_fragment_sink_components(
-    program: &FragmentSinkSpec,
+    program: &StaticSinkProgram,
     assignment: &FragmentSinkAssignment,
     fragment_instance_id: novarocks_types::UniqueId,
     typed_result_sink: bool,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components_with_result(
         program,
@@ -93,6 +106,7 @@ pub(crate) fn materialize_fragment_sink_components(
         plan_node_id,
         transmitter,
         result_session,
+        std::sync::Arc::clone(&runtime_error),
     )
 }
 
@@ -101,13 +115,14 @@ pub(crate) fn materialize_fragment_sink_components(
     reason = "Compatibility materialization entrypoint retained for fragment sink integration callers."
 )]
 pub(crate) fn materialize_fragment_sink_components_with_result(
-    program: &FragmentSinkSpec,
+    program: &StaticSinkProgram,
     assignment: &FragmentSinkAssignment,
     fragment_instance_id: novarocks_types::UniqueId,
     typed_result_sink: bool,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components_impl(
         program,
@@ -118,12 +133,13 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
         transmitter,
         result_session,
         None,
+        std::sync::Arc::clone(&runtime_error),
     )
     .map(|materialized| materialized.factory)
 }
 
 fn materialize_fragment_sink_components_impl(
-    program: &FragmentSinkSpec,
+    program: &StaticSinkProgram,
     assignment: &FragmentSinkAssignment,
     fragment_instance_id: novarocks_types::UniqueId,
     _typed_result_sink: bool,
@@ -131,9 +147,10 @@ fn materialize_fragment_sink_components_impl(
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
-    match (program.program(), assignment) {
-        (FragmentSinkProgram::Result, FragmentSinkAssignment::None) => {
+    match (program, assignment) {
+        (StaticSinkProgram::Result, FragmentSinkAssignment::None) => {
             let session = result_session.ok_or_else(|| {
                 materialization_error("RESULT_SINK requires an opened Fragment result session")
             })?;
@@ -141,23 +158,23 @@ fn materialize_fragment_sink_components_impl(
                 factory: Box::new(ResultBufferSinkFactory::new(session, None)),
             })
         }
-        (FragmentSinkProgram::Noop, FragmentSinkAssignment::None) => Ok(MaterializedFragmentSink {
+        (StaticSinkProgram::Noop, FragmentSinkAssignment::None) => Ok(MaterializedFragmentSink {
             factory: Box::new(NoopSinkFactory::new()),
         }),
         (
-            FragmentSinkProgram::DataStream(stream),
+            StaticSinkProgram::DataStream { branch, arena },
             FragmentSinkAssignment::StreamDestinations {
                 destinations,
                 sender_id,
             },
         ) => {
-            let input = stream_input(stream, destinations.clone())?;
+            let input = branch_input(branch, destinations.clone())?;
             let factory = DataStreamSinkFactory::new(
                 input,
                 fragment_instance_id,
                 *sender_id,
                 plan_node_id,
-                stream.partition_arena().clone(),
+                bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error)),
                 std::sync::Arc::clone(&transmitter),
             );
             // Without the gates a push sink sends the moment it has rows, and
@@ -171,29 +188,40 @@ fn materialize_fragment_sink_components_impl(
             })
         }
         (
-            FragmentSinkProgram::MultiCastDataStream(grouped),
+            StaticSinkProgram::MultiCastDataStream { branches, arena },
             FragmentSinkAssignment::DestinationGroups { groups, sender_id },
         ) => materialize_multicast(
-            grouped,
+            branches,
+            arena,
             groups,
             fragment_instance_id,
             *sender_id,
             plan_node_id,
             std::sync::Arc::clone(&transmitter),
             edge_gates.clone(),
+            std::sync::Arc::clone(&runtime_error),
         )
         .map(|factory| MaterializedFragmentSink { factory }),
         (
-            FragmentSinkProgram::SplitDataStream(split),
+            StaticSinkProgram::SplitDataStream {
+                branches,
+                split_exprs,
+                arena,
+                fanout,
+            },
             FragmentSinkAssignment::DestinationGroups { groups, sender_id },
         ) => materialize_split(
-            split,
+            branches,
+            split_exprs,
+            arena,
+            *fanout,
             groups,
             fragment_instance_id,
             *sender_id,
             plan_node_id,
             std::sync::Arc::clone(&transmitter),
             edge_gates.clone(),
+            std::sync::Arc::clone(&runtime_error),
         )
         .map(|factory| MaterializedFragmentSink { factory }),
         (static_program, dynamic_assignment) => Err(materialization_error(format!(
@@ -204,18 +232,28 @@ fn materialize_fragment_sink_components_impl(
     }
 }
 
+fn bound_sink_arena(
+    expressions: &novarocks_local_program::ImmutableExpressions,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+) -> ExprArena {
+    let mut arena = ExprArena::from_immutable(expressions);
+    arena.bind_runtime_error(runtime_error);
+    arena
+}
+
 fn materialize_multicast(
-    program: &MultiCastDataStreamSinkProgram,
+    branches: &[StaticStreamBranch],
+    arena: &novarocks_local_program::ImmutableExpressions,
     groups: &[Vec<FragmentDestination>],
     fragment_instance_id: novarocks_types::UniqueId,
     sender_id: Option<i32>,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    ensure_group_count(program.sinks().len(), groups.len())?;
-    let sinks = program
-        .sinks()
+    ensure_group_count(branches.len(), groups.len())?;
+    let sinks = branches
         .iter()
         .zip(groups)
         .map(|(stream, destinations)| {
@@ -226,7 +264,7 @@ fn materialize_multicast(
         sinks,
         fragment_instance_id,
         sender_id,
-        program.partition_arena().clone(),
+        bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error)),
         plan_node_id,
         transmitter,
     );
@@ -240,29 +278,34 @@ fn materialize_multicast(
 }
 
 fn materialize_split(
-    program: &crate::exec::fragment::sink::SplitDataStreamSinkProgram,
+    branches: &[StaticStreamBranch],
+    split_exprs: &[novarocks_local_program::ProgramExprId],
+    arena: &novarocks_local_program::ImmutableExpressions,
+    fanout: bool,
     groups: &[Vec<FragmentDestination>],
     fragment_instance_id: novarocks_types::UniqueId,
     sender_id: Option<i32>,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+    runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    let sinks = program
-        .sinks()
+    ensure_group_count(branches.len(), groups.len())?;
+    let sinks = branches
         .iter()
         .zip(groups)
         .map(|(stream, destinations)| branch_input(stream, destinations.clone()))
         .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
+    let runtime_arena = bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error));
     let factory = SplitDataStreamSinkFactory::new(
         sinks,
         fragment_instance_id,
         sender_id,
-        program.arena().clone(),
+        runtime_arena.clone(),
         plan_node_id,
-        std::sync::Arc::new(program.arena().clone()),
-        program.split_exprs().to_vec(),
-        program.fanout(),
+        std::sync::Arc::new(runtime_arena),
+        split_exprs.iter().map(|id| ExprId(id.index())).collect(),
+        fanout,
         transmitter,
     );
     let factory = match edge_gates {
@@ -272,30 +315,19 @@ fn materialize_split(
     Ok(Box::new(factory))
 }
 
-fn stream_input(
-    program: &crate::exec::fragment::sink::DataStreamSinkProgram,
-    destinations: Vec<FragmentDestination>,
-) -> Result<DataStreamSinkFactoryInput, FragmentLaunchError> {
-    DataStreamSinkFactoryInput::try_from_static_program(
-        program.dest_node_id(),
-        program.output_partition_type(),
-        program.output_exprs().to_vec(),
-        program.output_partition_exprs().to_vec(),
-        program.output_columns().to_vec(),
-        destinations,
-    )
-    .map_err(materialization_error)
-}
-
 fn branch_input(
-    program: &DataStreamSinkBranchProgram,
+    program: &StaticStreamBranch,
     destinations: Vec<FragmentDestination>,
 ) -> Result<DataStreamSinkFactoryInput, FragmentLaunchError> {
     DataStreamSinkFactoryInput::try_from_static_program(
         program.dest_node_id(),
-        program.output_partition_type(),
-        program.output_exprs().to_vec(),
-        program.output_partition_exprs().to_vec(),
+        program.partition_type(),
+        Vec::new(),
+        program
+            .partition_exprs()
+            .iter()
+            .map(|id| ExprId(id.index()))
+            .collect(),
         program.output_columns().to_vec(),
         destinations,
     )
@@ -319,13 +351,13 @@ fn materialization_error(detail: impl Into<String>) -> FragmentLaunchError {
     )
 }
 
-fn sink_program_name(program: &FragmentSinkProgram) -> &'static str {
+fn sink_program_name(program: &StaticSinkProgram) -> &'static str {
     match program {
-        FragmentSinkProgram::Result => "result",
-        FragmentSinkProgram::Noop => "noop",
-        FragmentSinkProgram::DataStream(_) => "data_stream",
-        FragmentSinkProgram::MultiCastDataStream(_) => "multi_cast_data_stream",
-        FragmentSinkProgram::SplitDataStream(_) => "split_data_stream",
+        StaticSinkProgram::Result => "result",
+        StaticSinkProgram::Noop => "noop",
+        StaticSinkProgram::DataStream { .. } => "data_stream",
+        StaticSinkProgram::MultiCastDataStream { .. } => "multi_cast_data_stream",
+        StaticSinkProgram::SplitDataStream { .. } => "split_data_stream",
     }
 }
 
@@ -334,6 +366,47 @@ fn sink_assignment_name(assignment: &FragmentSinkAssignment) -> &'static str {
         FragmentSinkAssignment::None => "none",
         FragmentSinkAssignment::StreamDestinations { .. } => "stream_destinations",
         FragmentSinkAssignment::DestinationGroups { .. } => "destination_groups",
+    }
+}
+
+#[cfg(test)]
+mod runtime_arena_tests {
+    use super::*;
+
+    #[test]
+    fn materialized_sink_arena_observes_only_its_exact_fragment_stop() {
+        let mut construction = ExprArena::default();
+        construction.push_typed(
+            crate::exec::expr::ExprNode::Literal(crate::exec::expr::LiteralValue::Int64(0)),
+            arrow::datatypes::DataType::Int64,
+        );
+        let frozen = construction.into_immutable().unwrap();
+        let stopped =
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
+        let runtime = bound_sink_arena(&frozen, std::sync::Arc::clone(&stopped));
+        let sibling = bound_sink_arena(
+            &frozen,
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        );
+        assert!(
+            runtime
+                .wait_interruptibly(std::time::Duration::ZERO)
+                .is_ok()
+        );
+        stopped.set_error("sink fragment cancelled".to_string());
+        assert_eq!(
+            runtime.wait_interruptibly(std::time::Duration::from_secs(60)),
+            Err("sink fragment cancelled".to_string())
+        );
+        assert!(
+            sibling
+                .wait_interruptibly(std::time::Duration::ZERO)
+                .is_ok()
+        );
+        assert!(matches!(
+            runtime.into_immutable(),
+            Err(novarocks_local_program::StaticExpressionError::RuntimeBoundArena)
+        ));
     }
 }
 
@@ -415,22 +488,55 @@ mod tests {
     }
 
     fn fragment_program(sink: FragmentSinkProgram) -> FragmentProgram {
-        FragmentProgram::new(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode {
-                        chunk: Chunk::default(),
-                        node_id: 99,
-                    }),
-                },
+        let arrow_schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "v",
+            arrow::datatypes::DataType::Int32,
+            true,
+        )]);
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &arrow_schema,
+            &[SlotId::new(3)],
+        )
+        .unwrap();
+        let chunk = Chunk::try_new_with_columns(
+            chunk_schema,
+            vec![std::sync::Arc::new(arrow::array::Int32Array::from(Vec::<
+                i32,
+            >::new(
+            )))],
+        )
+        .unwrap();
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 99 }),
             },
-            FragmentSinkSpec::try_new(sink).expect("fragment sink"),
+        };
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
+            .unwrap();
+        let static_sink = sink.into_static().unwrap();
+        let requirements = match &static_sink {
+            novarocks_local_program::StaticSinkProgram::Result => {
+                vec![crate::exec::node::ExternalSinkRequirement::Result]
+            }
+            novarocks_local_program::StaticSinkProgram::Noop => vec![],
+            _ => (0..static_sink.branches().len())
+                .map(|branch| crate::exec::node::ExternalSinkRequirement::ExchangeOutput { branch })
+                .collect(),
+        };
+        let (local, runtime) = plan
+            .into_local_program_and_bindings(profile, BTreeMap::new(), requirements, static_sink)
+            .unwrap();
+        assert_eq!(runtime.scan_count(), 0);
+        FragmentProgram::try_new(
+            std::sync::Arc::new(local),
             FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
             BTreeMap::new(),
             BTreeMap::new(),
             RuntimeFilterContract::default(),
         )
+        .unwrap()
     }
 
     fn assert_factory_and_operator_name(
@@ -483,6 +589,7 @@ mod tests {
                 test_transmitter(),
                 None,
                 Some(std::sync::Arc::clone(&gates)),
+                std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             )
             .expect("a gated sink materializes");
             let ungated = materialize_fragment_sink_with_result(
@@ -491,6 +598,7 @@ mod tests {
                 test_transmitter(),
                 None,
                 None,
+                std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             )
             .expect("an ungated sink materializes");
 
@@ -513,8 +621,14 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
-            .expect("data stream sink");
+        let factory = materialize_fragment_sink(
+            &program,
+            &instance,
+            test_transmitter(),
+            None,
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .expect("data stream sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "EXCHANGE_SINK (id=99)");
     }
@@ -530,8 +644,14 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
-            .expect("multicast sink");
+        let factory = materialize_fragment_sink(
+            &program,
+            &instance,
+            test_transmitter(),
+            None,
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .expect("multicast sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "MULTI_CAST_DATA_STREAM_SINK (id=99)");
     }
@@ -552,8 +672,14 @@ mod tests {
             sender_id: None,
         });
 
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
-            .expect("split sink");
+        let factory = materialize_fragment_sink(
+            &program,
+            &instance,
+            test_transmitter(),
+            None,
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .expect("split sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "SPLIT_DATA_STREAM_SINK (id=99)");
     }
@@ -568,6 +694,7 @@ mod tests {
             &instance,
             test_transmitter(),
             Some(crate::runtime::fragment::io::result::discard_result_session()),
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         )
         .expect("result sink");
 
@@ -583,6 +710,7 @@ mod tests {
             &instance(FragmentSinkAssignment::None),
             test_transmitter(),
             None,
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         ) {
             Ok(_) => panic!("missing stream destinations must fail"),
             Err(error) => error,
@@ -611,6 +739,7 @@ mod tests {
             &instance(assignment),
             test_transmitter(),
             None,
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         ) {
             Ok(_) => panic!("one destination group must not be truncated against two branches"),
             Err(error) => error,
@@ -623,7 +752,7 @@ mod tests {
 
     #[test]
     fn result_materialization_keeps_bridge_plan_node_unset() {
-        let sink = FragmentSinkSpec::try_new(FragmentSinkProgram::Result).expect("result sink");
+        let sink = novarocks_local_program::StaticSinkProgram::Result;
 
         let factory = materialize_fragment_sink_components(
             &sink,
@@ -633,6 +762,7 @@ mod tests {
             47,
             test_transmitter(),
             Some(crate::runtime::fragment::io::result::discard_result_session()),
+            std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         )
         .expect("result sink materialization");
 

@@ -17,26 +17,11 @@
 
 //! Native wire reconstruction of execution query options.
 
-use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
-use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
-use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks;
 
-pub fn decode_query_options_at(
-    src: &novarocks::QueryOptions,
-    path: FieldPath,
-) -> Result<QueryOptions, ProtocolError> {
-    validate_protocol_options(src, path.clone())?;
-    let validated = ProtocolQueryOptions::parse(*src).map_err(|error| {
-        ProtocolError::new(
-            path.clone(),
-            ProtocolErrorKind::InvalidValue,
-            error.detail(),
-        )
-    })?;
-    let src = validated.as_proto();
-    Ok(QueryOptions {
+pub fn decode_query_options(src: &novarocks::QueryOptions) -> QueryOptions {
+    QueryOptions {
         batch_size: (src.batch_size > 0).then_some(src.batch_size),
         query_timeout: (src.query_timeout > 0).then_some(src.query_timeout),
         query_delivery_timeout: (src.query_delivery_timeout > 0)
@@ -70,88 +55,13 @@ pub fn decode_query_options_at(
             datacache_sharing_work_period: (src.datacache_sharing_work_period > 0)
                 .then_some(src.datacache_sharing_work_period),
         },
-        spill: decode_spill_config(src, path.field("spill_options"))?,
-    })
-}
-
-fn validate_protocol_options(
-    src: &novarocks::QueryOptions,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    if !src.enable_spill {
-        return Ok(());
     }
-    let spill = src.spill_options.as_ref().ok_or_else(|| {
-        ProtocolError::new(
-            path.clone().field("spill_options"),
-            ProtocolErrorKind::MissingField,
-            "enable_spill=true requires spill_options",
-        )
-    })?;
-    match spill.spill_mode {
-        0..=2 => Ok(()),
-        3 => Err(ProtocolError::new(
-            path.field("spill_options").field("spill_mode"),
-            ProtocolErrorKind::InvalidValue,
-            "spill_mode RANDOM is not supported yet",
-        )),
-        value => Err(ProtocolError::new(
-            path.field("spill_options").field("spill_mode"),
-            ProtocolErrorKind::InvalidEnum,
-            format!("unknown spill_mode value {value}"),
-        )),
-    }
-}
-
-fn decode_spill_config(
-    src: &novarocks::QueryOptions,
-    _path: FieldPath,
-) -> Result<Option<SpillConfig>, ProtocolError> {
-    if !src.enable_spill {
-        return Ok(None);
-    }
-    let spill = src
-        .spill_options
-        .as_ref()
-        .expect("validated spill options are present");
-    let spill_mode = match spill.spill_mode {
-        0 => SpillMode::Auto,
-        1 => SpillMode::Force,
-        2 => SpillMode::None,
-        3 => unreachable!("validated spill mode is not RANDOM"),
-        _ => unreachable!("validated spill mode is known"),
-    };
-    Ok(Some(SpillConfig {
-        enable_spill: true,
-        spill_mode,
-        spill_mem_limit_threshold: (spill.spill_mem_limit_threshold > 0.0)
-            .then_some(spill.spill_mem_limit_threshold),
-        spill_operator_min_bytes: (spill.spill_operator_min_bytes > 0)
-            .then_some(spill.spill_operator_min_bytes),
-        spill_operator_max_bytes: (spill.spill_operator_max_bytes > 0)
-            .then_some(spill.spill_operator_max_bytes),
-        spill_encode_level: (spill.spill_encode_level > 0).then_some(spill.spill_encode_level),
-        enable_spill_buffer_read: Some(spill.enable_spill_buffer_read),
-        max_spill_read_buffer_bytes_per_driver: (spill.max_spill_read_buffer_bytes_per_driver > 0)
-            .then_some(spill.max_spill_read_buffer_bytes_per_driver),
-        spill_mem_table_size: (spill.spill_mem_table_size > 0)
-            .then_some(spill.spill_mem_table_size),
-        spill_mem_table_num: (spill.spill_mem_table_num > 0).then_some(spill.spill_mem_table_num),
-    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::decode_query_options_at;
-    use novarocks_execution::runtime::query_options::QueryOptions;
-    use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
+    use super::decode_query_options;
     use novarocks_proto_models::novarocks;
-
-    /// Decodes query options where production does: once per context, from
-    /// the Establish request.
-    fn decode_query_options(src: &novarocks::QueryOptions) -> Result<QueryOptions, ProtocolError> {
-        decode_query_options_at(src, FieldPath::root("establish").field("query_options"))
-    }
 
     #[test]
     fn preserves_explicit_zero_and_absent_bitset() {
@@ -161,26 +71,11 @@ mod tests {
             group_concat_max_len: Some(0),
             datacache_evict_probability: Some(0),
             ..Default::default()
-        })
-        .expect("valid query options");
+        });
         assert_eq!(decoded.runtime_filter_scan_wait_time_ms(), Some(0));
         assert_eq!(decoded.runtime_filter_wait_timeout_ms(), Some(0));
         assert_eq!(decoded.group_concat_max_len(), Some(0));
         assert_eq!(decoded.cache().datacache_evict_probability, Some(0));
         assert_eq!(decoded.enable_join_runtime_bitset_filter(), None);
-    }
-
-    #[test]
-    fn rejects_enabled_spill_without_options_with_a_typed_path() {
-        let error = decode_query_options(&novarocks::QueryOptions {
-            enable_spill: true,
-            ..Default::default()
-        })
-        .expect_err("spill options are required");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
-        assert_eq!(
-            error.path().to_string(),
-            "establish.query_options.spill_options"
-        );
     }
 }

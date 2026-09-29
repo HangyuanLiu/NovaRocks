@@ -104,6 +104,9 @@ pub struct BackendServerConfig {
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     /// Server-validated hierarchy for retained native query results.
     pub result_retained_limits: WorkerResultRetainedLimits,
+    /// Active and retained exact late-frame records use one Worker budget.
+    pub inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
+    pub preparation_limits: novarocks_worker::TaskPreparationLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
     /// The Server's scan I/O runtime. Typed scan streams are polled and
@@ -335,6 +338,8 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
+    inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
+    preparation_limits: novarocks_worker::TaskPreparationLimits,
     scan_stream_host: novarocks_worker::ScanStreamHost,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
@@ -395,7 +400,8 @@ fn compose_backend_application_services(
         }),
         data_runtime.clone(),
     ));
-    let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();
+    let inbound_capabilities =
+        novarocks_worker::TaskInboundCapabilities::with_capacity_limits(inbound_capability_limits);
     let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
@@ -404,9 +410,21 @@ fn compose_backend_application_services(
         novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
         novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
     );
+    let task_execution_registry_config =
+        task_execution_registry_config.with_preparation_limits(preparation_limits);
+    let completion_capacity =
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend();
+    task_execution_registry_config
+        .validate_completion_capacity(completion_capacity)
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("validate task capacity limits: {error}"),
+            )
+        })?;
     let task_completion_supervisor = novarocks_worker::TaskCompletionSupervisor::start(
         data_runtime.handle().clone(),
-        task_execution_registry_config.max_active_tasks_per_backend,
+        completion_capacity,
     );
     let execution_host = Arc::new(crate::backend_task_execution::NativeTaskExecutionHost::new(
         novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
@@ -416,6 +434,7 @@ fn compose_backend_application_services(
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
+            Duration::from_millis(execution_runtime.config().exchange_wait_ms),
         ),
         native_result_writer(result_retained_budget, result_retained_limits.per_root()),
         Arc::clone(&exchange_receiver_port),
@@ -570,6 +589,8 @@ impl BackendApplicationHost {
             announce_max_backoff,
             write_commit_evidence_limits,
             result_retained_limits,
+            inbound_capability_limits,
+            preparation_limits,
             execution_runtime_config,
             scan_preparation_config,
             scan_stream_runtime,
@@ -598,6 +619,8 @@ impl BackendApplicationHost {
             native_compatibility_id,
             write_commit_evidence_limits,
             result_retained_limits,
+            inbound_capability_limits,
+            preparation_limits,
             novarocks_worker::ScanStreamHost::new(scan_preparation_config, scan_stream_runtime),
             catalog_manager_config,
             &execution_role_binding_factories,
@@ -617,6 +640,7 @@ impl BackendApplicationHost {
             native_trust.deployment_id().as_str(),
             novarocks_version::native_build_identity(),
             native_compatibility_id,
+            preparation_limits.per_context(),
         )
         .map_err(|error| {
             BackendApplicationError::new(
@@ -646,7 +670,8 @@ impl BackendApplicationHost {
                 )
                 .with_worker_registry_lock(
                     services.task_execution_registry.registry_lock_observation(),
-                ),
+                )
+                .with_task_preparation(Arc::clone(&services.task_execution_registry)),
         );
         let metrics_http_server =
             MetricsHttpServer::start(&bind_host, metrics_http_port, metrics_registry).map_err(
@@ -823,9 +848,7 @@ mod tests {
         compose_backend_application_services,
     };
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
-    use novarocks_execution::runtime::execution_runtime::{
-        ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-    };
+    use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
     use novarocks_native_adapter::backend_test_support::test_backend_native_trust;
     use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
@@ -854,9 +877,6 @@ mod tests {
     fn execution_runtime_config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 1,
-            spill_storage: ExecutionSpillStorageConfig::default(),
             exchange_wait_ms: 1,
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
@@ -994,6 +1014,8 @@ mod tests {
                 32 * 1024 * 1024,
             )
             .expect("valid test result retained-byte limits"),
+            inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
+            preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
                 64 * 1024 * 1024,
@@ -1060,6 +1082,8 @@ mod tests {
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
+            novarocks_worker::TaskInboundCapabilityLimits::default(),
+            novarocks_worker::TaskPreparationLimits::default(),
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::try_new(
                     64 * 1024 * 1024,
@@ -1280,6 +1304,14 @@ mod tests {
             http_get(metrics_port, "/metrics").expect("read management metrics");
         assert!(management_response.starts_with("HTTP/1.1 200"));
         assert!(management_response.contains(BACKEND_OWNED_FAMILY));
+        assert!(
+            management_response
+                .contains("novarocks_backend_process_allocator_info{allocator=\"test\"} 1")
+        );
+        assert!(management_response.contains("novarocks_backend_process_counted_live_bytes 0"));
+        assert!(management_response.contains(
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"positions\"} 0"
+        ));
 
         host.shutdown().expect("native backend shutdown");
     }

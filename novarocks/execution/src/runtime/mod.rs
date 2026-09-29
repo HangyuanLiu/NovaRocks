@@ -16,7 +16,6 @@ pub mod profile;
 pub mod query_options;
 pub mod runtime_state;
 pub mod scan_stream_metrics;
-pub mod spill_config;
 pub mod table_writer_metrics;
 
 pub use execution_runtime::{

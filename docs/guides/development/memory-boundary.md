@@ -29,7 +29,7 @@ accounting model can be tested and reasoned about without a columnar runtime in
 the graph.
 
 **A policy or a queue belongs to neither crate.** Admission order, per-query
-budgets, spill thresholds, what to do when a request cannot be satisfied — those
+budgets, reclaim priorities, what to do when a request cannot be satisfied — those
 are decisions, not facts, and they belong to the arbitrator alongside the
 workload governance owner. The memory crates answer "how much is held and by
 whom"; they have no opinion about who should get the next allocation. Putting a

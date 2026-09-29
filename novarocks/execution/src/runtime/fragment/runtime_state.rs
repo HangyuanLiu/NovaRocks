@@ -17,10 +17,8 @@
 
 use std::sync::Arc;
 
-use crate::exec::spill::QuerySpillManager;
 use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::RuntimeFilterSessionRef;
@@ -56,30 +54,10 @@ pub(crate) fn apply_query_option_overrides(
     query_options
 }
 
-pub(crate) fn build_runtime_state(
-    inputs: RuntimeStateInputs,
-    profiler: Option<&Profiler>,
-) -> Result<Arc<RuntimeState>, String> {
+pub(crate) fn build_runtime_state(inputs: RuntimeStateInputs) -> Result<Arc<RuntimeState>, String> {
     let cache_options = crate::runtime::cache::ExecutionCacheOptions::from_query_options(
         inputs.query_options.as_ref(),
     )?;
-    let spill_config = inputs
-        .query_options
-        .as_ref()
-        .and_then(|opts| opts.spill.clone());
-    let spill_manager = if let Some(config) = spill_config.as_ref() {
-        let runtime = inputs
-            .execution_runtime
-            .as_ref()
-            .ok_or_else(|| "spill-enabled fragment requires an execution runtime".to_string())?;
-        Some(Arc::new(QuerySpillManager::new(
-            config.clone(),
-            profiler,
-            runtime,
-        )))
-    } else {
-        None
-    };
     Ok(Arc::new(
         RuntimeState::new(
             inputs.query_options,
@@ -88,8 +66,6 @@ pub(crate) fn build_runtime_state(
             inputs.fragment_instance_id,
             inputs.backend_num,
             inputs.mem_tracker,
-            spill_config,
-            spill_manager,
             inputs.execution_runtime,
         )
         .with_runtime_filter_session(inputs.runtime_filter_session),

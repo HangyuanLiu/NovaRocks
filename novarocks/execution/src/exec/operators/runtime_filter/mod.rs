@@ -1118,6 +1118,11 @@ impl Operator for NativeRuntimeFilterProcessor {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        let _ = state;
+        Ok(())
+    }
+
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
         self.consumers.bind(state)
     }
 
@@ -1193,6 +1198,7 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::runtime_filter::{
@@ -1281,6 +1287,7 @@ mod tests {
 
     struct SubscriptionSession {
         outcome: execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+        calls: Arc<AtomicUsize>,
     }
 
     impl execution::RuntimeFilterSession for SubscriptionSession {
@@ -1304,6 +1311,7 @@ mod tests {
             execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
             execution::RuntimeFilterContractViolation,
         > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.outcome {
                 execution::RuntimeFilterBindOutcome::Bound(handle) => match handle {
                     execution::RuntimeFilterSubscriptionHandle::Blocking(subscription) => {
@@ -1373,6 +1381,36 @@ mod tests {
     }
 
     #[test]
+    fn processor_defers_subscription_until_activation() {
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let factory = NativeRuntimeFilterProcessorFactory::new(
+            7,
+            &[membership_spec(expr_id)],
+            Arc::new(arena),
+        )
+        .expect("processor factory");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
+            outcome: execution::RuntimeFilterBindOutcome::Unavailable(
+                execution::UnavailableReason::ResourceLimit,
+            ),
+            calls: Arc::clone(&calls),
+        });
+        let state = RuntimeState::default().with_runtime_filter_session(Some(session));
+        let mut processor = factory.create(1, 0);
+
+        processor.prepare().expect("prepare processor");
+        processor
+            .bind_runtime_state(&state)
+            .expect("bind processor");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        processor.activate(&state).expect("activate processor");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn consumer_plan_rejects_missing_expression_coordinate() {
         let arena = Arc::new(ExprArena::default());
         let error = match RuntimeFilterConsumerSet::from_plan(
@@ -1436,6 +1474,7 @@ mod tests {
             Arc::new(Int32MembershipQuery { accepted: 2 }),
         ));
         let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
+            calls: Arc::new(AtomicUsize::new(0)),
             outcome: execution::RuntimeFilterBindOutcome::Bound(
                 execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::new(
                     PublishedSubscription::new(snapshot),
@@ -1478,6 +1517,7 @@ mod tests {
         )
         .expect("consumer set");
         let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
+            calls: Arc::new(AtomicUsize::new(0)),
             outcome: execution::RuntimeFilterBindOutcome::Unavailable(
                 execution::UnavailableReason::ResourceLimit,
             ),
@@ -1587,6 +1627,7 @@ mod tests {
         let subscription: Arc<dyn execution::BlockingSnapshotSubscription> =
             Arc::clone(subscription) as Arc<dyn execution::BlockingSnapshotSubscription>;
         let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
+            calls: Arc::new(AtomicUsize::new(0)),
             outcome: execution::RuntimeFilterBindOutcome::Bound(
                 execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
             ),
@@ -1850,12 +1891,30 @@ mod tests {
                 .expect("processor factory");
         let gate = factory.consumers.gate_observable();
         let subscription = ControlledSubscription::new();
-        let state = Arc::new(controlled_state(&subscription));
+        let session = controlled_state(&subscription)
+            .runtime_filter_session()
+            .cloned();
+        let state = Arc::new(
+            RuntimeState::new(
+                Some(crate::runtime::query_options::QueryOptions {
+                    runtime_filter_wait_timeout_ms: Some(
+                        i32::try_from(timeout.as_millis()).unwrap(),
+                    ),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .with_runtime_filter_session(session),
+        );
         let mut processor = factory.create(1, 0);
         processor
             .bind_runtime_state(&state)
             .expect("bind processor");
-        factory.consumers.set_wait_timeout(timeout);
         let chunks = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let source = Arc::new(Observable::new());

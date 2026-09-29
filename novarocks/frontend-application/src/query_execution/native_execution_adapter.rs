@@ -60,7 +60,9 @@ use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::fragment_transport::{
     NativeTaskResultTransport, TaskReadGrace, native_root_result_pump_binding,
 };
-use crate::native::task_transport::{AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake};
+use crate::native::task_transport::{
+    AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskOperationIntakeEvent,
+};
 use crate::query_execution::artifact::{
     ManifestBoundNativeAttemptInputs, PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
     SnapshotBoundDormantAttemptInputs, TaskExecutionPreparedQuery, TaskManifestBinding,
@@ -701,8 +703,12 @@ async fn acquire_replacement_admissions(
                 }
                 let acknowledgement = loop {
                     if let Some(ack) = acks
-                        .drain()
+                        .drain_events()
                         .into_iter()
+                        .filter_map(|event| match event {
+                            TaskOperationIntakeEvent::Acknowledgement(ack) => Some(ack),
+                            TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
+                        })
                         .find(|ack| ack.operation_id() == request.envelope().operation_id())
                     {
                         break ack;
@@ -1271,8 +1277,7 @@ impl ProductionManifestAttemptProjection {
             self.runtime.native_compatibility_id,
             live_backends,
             &self.options,
-            ProtocolQueryOptions::parse(encode_query_options(self.options.runtime_options()))
-                .map_err(|error| projection_message(error.to_string()))?,
+            ProtocolQueryOptions::from_proto(encode_query_options(self.options.runtime_options())),
         )
         .map_err(projection_failure)?
         .with_credential_leases(credential_leases);
@@ -1869,6 +1874,7 @@ struct FrontendNativeAttemptPreparationState<F> {
     template: PreparedDistributedAttemptTemplate,
     topology: BackendTopologyService,
     dormant_factory: F,
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
 impl<F> std::fmt::Debug for FrontendNativeAttemptPreparationPort<F>
@@ -1896,6 +1902,7 @@ where
                 template,
                 topology,
                 dormant_factory,
+                observation: crate::preparation_diagnostics::capture_statement_observation(),
             })),
         }
     }
@@ -1924,6 +1931,12 @@ where
                 }
                 state = state.lock() => state,
             };
+            if let Some(observation) = &state.observation {
+                crate::preparation_diagnostics::bind_observed_attempt(
+                    observation,
+                    request.execution(),
+                );
+            }
             // A failed attempt can be replaced on the same live processes once
             // its exact contexts are fenced. Qualification, not a topology
             // revision change, enforces that isolation before activation. A typed
@@ -2197,6 +2210,7 @@ mod tests {
                     "test-deployment",
                     "test-build",
                     NativeCompatibilityId::new([0x71; 32]),
+                    8,
                 )
                 .unwrap(),
                 AdmissionEpochCapability::try_from_bytes([index as u8 + 1; 16]).unwrap(),
@@ -2311,6 +2325,7 @@ mod tests {
                     "test-deployment",
                     "test-build",
                     NativeCompatibilityId::new([0x71; 32]),
+                    8,
                 )
                 .expect("test descriptor");
                 LiveBackendTarget::new(

@@ -106,6 +106,21 @@ pub struct TableWriterInputProjection {
 }
 
 impl TableWriterInputProjection {
+    pub(crate) fn from_static(
+        projection: &novarocks_local_program::StaticWriterProjection,
+        runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    ) -> Result<Self, String> {
+        let mut arena = ExprArena::from_immutable(&projection.arena);
+        arena.bind_runtime_error(runtime_error);
+        let exprs = projection
+            .expressions
+            .iter()
+            .map(|id| ExprId(id.index()))
+            .collect();
+        Self::try_new(arena, exprs, Arc::clone(projection.layout.schema()))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn try_new(
         arena: ExprArena,
         exprs: Vec<ExprId>,
@@ -161,6 +176,31 @@ impl TableWriterInputProjection {
 
     pub const fn chunk_schema(&self) -> &ChunkSchemaRef {
         &self.chunk_schema
+    }
+
+    /// Consume decoder-owned expression backing when freezing the local
+    /// program. No writer or request capability crosses this boundary.
+    pub(crate) fn into_static(
+        self,
+    ) -> Result<novarocks_local_program::StaticWriterProjection, String> {
+        let layout = novarocks_local_program::StaticLayout::try_new(
+            self.chunk_schema.arrow_schema_ref(),
+            Arc::from(self.chunk_schema.slot_ids()),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(novarocks_local_program::StaticWriterProjection {
+            arena: Arc::new(
+                self.arena
+                    .into_immutable()
+                    .map_err(|error| error.to_string())?,
+            ),
+            expressions: self
+                .exprs
+                .into_iter()
+                .map(|id| novarocks_local_program::ProgramExprId::new(id.0))
+                .collect(),
+            layout,
+        })
     }
 
     /// Evaluate the projection once and expose the exact same target-typed
@@ -231,6 +271,18 @@ pub struct TableWriterNode {
     partial_aggregate_plan: WriterPartialAggregatePlan,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
+/// Provider and attempt capabilities moved out of the transient decoder node.
+/// A pure local program never owns any of these values.
+pub(crate) struct TableWriterRuntimeBinding {
+    pub handle: ConnectorWriterHandle,
+    pub execution: Arc<dyn ConnectorWriteExecution>,
+    pub physical_template: TableWriterPhysicalContextTemplate,
+    pub request_context: ConnectorRequestContext,
+    pub fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+    #[cfg(debug_assertions)]
+    pub aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 impl TableWriterNode {
@@ -368,6 +420,40 @@ impl TableWriterNode {
         &self.partial_aggregate_plan
     }
 
+    pub(crate) fn into_static_parts_with_binding(
+        self,
+    ) -> (
+        TableWriterRuntimeBinding,
+        (
+            Box<ExecNode>,
+            WriteTargetOrdinal,
+            SchemaRef,
+            TableWriterInputProjection,
+            crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
+            WriterPartialAggregatePlan,
+        ),
+    ) {
+        (
+            TableWriterRuntimeBinding {
+                handle: self.handle,
+                execution: self.execution,
+                physical_template: self.physical_template,
+                request_context: self.request_context,
+                fragment_encoder: self.fragment_encoder,
+                #[cfg(debug_assertions)]
+                aggregate_guard: self.aggregate_guard,
+            },
+            (
+                self.input,
+                self.target,
+                self.expected_schema,
+                self.projection,
+                self.writer_multiplex_schema,
+                self.partial_aggregate_plan,
+            ),
+        )
+    }
+
     #[cfg(debug_assertions)]
     pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
         &self.aggregate_guard
@@ -384,5 +470,66 @@ impl std::fmt::Debug for TableWriterNode {
             .field("expected_schema", &self.expected_schema)
             .field("physical_template", &self.physical_template)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod runtime_projection_tests {
+    use super::*;
+    use crate::exec::expr::function::FunctionKind;
+    use crate::exec::expr::{ExprNode, LiteralValue};
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn static_writer_projection_binds_its_exact_fragment_stop_owner() {
+        let mut arena = ExprArena::default();
+        let seconds = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(0)), DataType::Int64);
+        let sleep = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Object("sleep"),
+                args: vec![seconds],
+            },
+            DataType::Boolean,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sleep",
+            DataType::Boolean,
+            false,
+        )]));
+        let frozen = TableWriterInputProjection::try_new(arena, vec![sleep], schema)
+            .unwrap()
+            .into_static()
+            .unwrap();
+        let first = Arc::new(RuntimeErrorState::default());
+        let sibling = Arc::new(RuntimeErrorState::default());
+        let projection =
+            TableWriterInputProjection::from_static(&frozen, Arc::clone(&first)).unwrap();
+        let sibling_projection = TableWriterInputProjection::from_static(&frozen, sibling).unwrap();
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&input_schema, &[SlotId::new(1)])
+                .unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
+        assert!(projection.project(&chunk).is_ok());
+        first.set_error("writer fragment cancelled".to_string());
+        assert_eq!(
+            projection.project(&chunk).unwrap_err(),
+            "writer fragment cancelled"
+        );
+        assert!(sibling_projection.project(&chunk).is_ok());
+        assert!(
+            projection
+                .into_static()
+                .unwrap_err()
+                .contains("RuntimeBoundArena")
+        );
     }
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::exec::fragment::program::FragmentProgram;
 use crate::exec::pipeline::executor::{
-    PreparedPipelineExecution, prepare_report_neutral_pipeline_execution,
+    PreparedPipelineExecution, prepare_report_neutral_local_program_pipeline_execution,
 };
 use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::fragment::error::{
@@ -97,12 +97,11 @@ mod owner_tests {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
-        FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
-        RuntimeFilterContract,
+        FragmentContractVersion, FragmentProgram, FragmentProgramOptions, RuntimeFilterContract,
     };
     use crate::exec::fragment::sink::FragmentSinkProgram;
     use crate::exec::node::values::ValuesNode;
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, ExternalSinkRequirement};
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
@@ -128,19 +127,38 @@ mod owner_tests {
         chunk: Chunk,
         sink: FragmentSinkProgram,
     ) -> FragmentSubmission {
-        let program = Arc::new(FragmentProgram::new(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 19 }),
-                },
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 19 }),
             },
-            FragmentSinkSpec::try_new(sink).expect("valid sink"),
-            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
-        ));
+        };
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).expect("one driver"), None)
+            .expect("local profile");
+        let sink_requirements = if matches!(&sink, FragmentSinkProgram::Result) {
+            vec![ExternalSinkRequirement::Result]
+        } else {
+            Vec::new()
+        };
+        let (local, bindings) = plan
+            .into_local_program_and_bindings(
+                profile,
+                BTreeMap::new(),
+                sink_requirements,
+                sink.into_static().expect("static sink"),
+            )
+            .expect("local program");
+        let program = Arc::new(
+            FragmentProgram::try_new(
+                Arc::new(local),
+                FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+            )
+            .expect("fragment program"),
+        );
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId::new(finst_id.high() - 2, finst_id.low() - 2),
@@ -152,7 +170,7 @@ mod owner_tests {
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(1).expect("backend number"),
         );
-        FragmentSubmission::try_new(program, instance).expect("valid submission")
+        FragmentSubmission::try_new(program, bindings, instance).expect("valid submission")
     }
 
     fn one_row_chunk() -> Chunk {
@@ -1162,21 +1180,18 @@ pub fn prepare_fragment(
         resources.acquire_exchange(program, instance)?;
         context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
 
-        let runtime_state = build_runtime_state(
-            RuntimeStateInputs {
-                query_options: apply_query_option_overrides(
-                    Some(instance.runtime_options().query_options().clone()),
-                    context.execution_runtime.as_deref(),
-                ),
-                query_id: Some(query_id),
-                fragment_instance_id: Some(finst_id),
-                backend_num: Some(instance.backend_num().get()),
-                mem_tracker: context.mem_tracker.clone(),
-                runtime_filter_session: context.runtime_filter.clone(),
-                execution_runtime: context.execution_runtime.clone(),
-            },
-            context.profiler.as_ref(),
-        )
+        let runtime_state = build_runtime_state(RuntimeStateInputs {
+            query_options: apply_query_option_overrides(
+                Some(instance.runtime_options().query_options().clone()),
+                context.execution_runtime.as_deref(),
+            ),
+            query_id: Some(query_id),
+            fragment_instance_id: Some(finst_id),
+            backend_num: Some(instance.backend_num().get()),
+            mem_tracker: context.mem_tracker.clone(),
+            runtime_filter_session: context.runtime_filter.clone(),
+            execution_runtime: context.execution_runtime.clone(),
+        })
         .map_err(|error| {
             FragmentLaunchError::new(
                 FragmentLaunchStage::BuildRuntimeState,
@@ -1190,6 +1205,7 @@ pub fn prepare_fragment(
             Arc::clone(&context.exchange_transmitter),
             resources.result_session(),
             context.edge_gates.clone(),
+            runtime_state.error_state(),
         )?;
         let sink = materialized_sink.factory;
         let _group_execution_scan_dop = context.group_execution_scan_dop;
@@ -1198,9 +1214,11 @@ pub fn prepare_fragment(
             instance,
             Arc::clone(&context.exchange_receiver_port),
         );
-        let scan_bindings = materialize_scan_bindings(program, instance)?;
-        prepare_report_neutral_pipeline_execution(
-            program.plan().clone(),
+        let scan_bindings =
+            materialize_scan_bindings(program, submission.runtime_bindings(), instance)?;
+        prepare_report_neutral_local_program_pipeline_execution(
+            program.local_program(),
+            submission.runtime_bindings(),
             context.debug_exec_node_output,
             Duration::from_millis(50),
             sink,

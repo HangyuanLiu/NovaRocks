@@ -27,7 +27,6 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
 use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_models::novarocks as proto;
@@ -37,7 +36,7 @@ use novarocks_task_codec::domain::{
 };
 use novarocks_worker::{HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation};
 
-use crate::query_options::decode_query_options_at;
+use crate::query_options::decode_query_options;
 
 const RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.release.runtime_filter_evidence.v1";
@@ -98,8 +97,7 @@ pub fn release_runtime_filter_telemetry(
 pub fn query_options(payload: &dyn CodecOwnedContent) -> Result<QueryOptions, HostRejection> {
     let raw = stored_message::<proto::QueryOptions>(payload)
         .ok_or_else(|| internal("query options payload is not a native query options message"))?;
-    decode_query_options_at(raw, FieldPath::root("establish").field("query_options"))
-        .map_err(|error| protocol(&format!("query options are invalid: {error}")))
+    Ok(decode_query_options(raw))
 }
 
 pub fn credential_material(update: &CredentialUpdate) -> Result<&WireCredential, HostRejection> {

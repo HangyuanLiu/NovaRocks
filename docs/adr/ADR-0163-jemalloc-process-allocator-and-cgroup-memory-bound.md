@@ -1,5 +1,5 @@
 ---
-id: ADR-0161
+id: ADR-0163
 title: "jemalloc serves the process and is chosen at build time; the memory bound and usage come from the process's own cgroup"
 domain: [memory-governance]
 status: active

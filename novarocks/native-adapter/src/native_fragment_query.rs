@@ -22,7 +22,7 @@
 //! query manager remains private to core.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use novarocks_execution::runtime::fragment::FragmentPrepareContext;
@@ -44,6 +44,16 @@ use novarocks_worker::sink_commit::WorkerSinkCommitPort;
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
     manager: Arc<QueryContextManager>,
+    /// Clones must publish one current manager snapshot in a single order.
+    resource_metrics_publish: Arc<Mutex<()>>,
+    #[cfg(test)]
+    resource_snapshot_observer: Option<
+        Arc<
+            dyn Fn(novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot)
+                + Send
+                + Sync,
+        >,
+    >,
     /// The one memory capacity authority this OS process was given.
     ///
     /// The registry behind `manager` is a process-global singleton, so the
@@ -54,9 +64,38 @@ pub struct NativeFragmentQueryRuntime {
 }
 
 impl NativeFragmentQueryRuntime {
+    pub fn publish_resource_snapshot(&self) {
+        let _publication = self
+            .resource_metrics_publish
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _global_publication = crate::backend_metrics::NATIVE_QUERY_RESOURCE_SCRAPE_LOCK
+            .lock()
+            .expect("native query resource scrape lock");
+        let snapshot = self.manager.native_execution_resource_snapshot();
+        crate::backend_metrics::publish_backend_query_execution_resource(
+            "native_query_contexts_active",
+            snapshot.active_contexts,
+        );
+        crate::backend_metrics::publish_backend_query_execution_resource(
+            "native_query_contexts_second_chance",
+            snapshot.second_chance_contexts,
+        );
+        crate::backend_metrics::publish_backend_query_execution_resource(
+            "native_query_active_fragments",
+            snapshot.active_fragments,
+        );
+        #[cfg(test)]
+        if let Some(observer) = &self.resource_snapshot_observer {
+            observer(snapshot);
+        }
+    }
     pub fn global(memory_authority: Arc<MemoryAuthority>) -> Self {
         Self {
             manager: query_context_manager(),
+            resource_metrics_publish: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            resource_snapshot_observer: None,
             memory_authority,
         }
     }
@@ -68,8 +107,24 @@ impl NativeFragmentQueryRuntime {
     ) -> Self {
         Self {
             manager,
+            resource_metrics_publish: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            resource_snapshot_observer: None,
             memory_authority,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_resource_publication_for_test(
+        mut self,
+        observer: Arc<
+            dyn Fn(novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot)
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        self.resource_snapshot_observer = Some(observer);
+        self
     }
 
     pub fn prepare_admission_execution(
@@ -188,6 +243,7 @@ impl Drop for NativeFragmentRegistrationLease {
                     self.execution,
                     self.fragment_instance_id,
                 );
+            self.runtime.publish_resource_snapshot();
             self.active = false;
         }
     }
