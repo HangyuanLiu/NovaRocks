@@ -123,6 +123,7 @@ pub struct CandidateIndexSize {
 /// observed DVs before any data-file statistics or sequence suffix can hide a
 /// duplicate. It owns no per-data expanded delete lists.
 #[derive(Debug)]
+// Design: ADR-0164 (docs/adr/ADR-0164-iceberg-delete-closures-and-execution-unions.md)
 pub struct DeleteCandidateIndex {
     domain: Arc<ReadDomain>,
     partition_bindings: BTreeMap<i32, PartitionTypeBinding>,

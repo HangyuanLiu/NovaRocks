@@ -276,6 +276,7 @@ pub(crate) struct DeleteDomainDiagnostics {
     pub probes: usize,
     pub retained_key_bytes: usize,
 }
+// Design: ADR-0164 (docs/adr/ADR-0164-iceberg-delete-closures-and-execution-unions.md)
 pub struct DeleteManager {
     binding: IcebergReadBinding,
     context: FileReadContext,
