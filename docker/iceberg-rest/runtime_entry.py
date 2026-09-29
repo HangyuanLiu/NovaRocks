@@ -486,7 +486,10 @@ def worktree_main(argv: list[str] | None = None) -> int:
             env_id = runtime.safe_component(os.environ['NOVA_ENV_ID'])
             if env_id in ('.', '..'):
                 raise runtime.RuntimeFailure('InvalidIdentity', env_id)
-        entry = HERE / 'runtime' / env_id
+        # A shared publication and its W lock belong to the consumer worktree,
+        # regardless of which checkout supplies this request's declarations.
+        fixture_root = workspace / 'docker' / 'iceberg-rest' if shared else HERE
+        entry = fixture_root / 'runtime' / env_id
         owner = runtime.RuntimeOwner(port_start=int(os.environ.get('NOVA_ENV_RUNTIME_PORT_START', settings.get('NOVA_ENV_RUNTIME_PORT_START', '28000'))),
                                      port_end=int(os.environ.get('NOVA_ENV_RUNTIME_PORT_END', settings.get('NOVA_ENV_RUNTIME_PORT_END', '28999'))))
         if args.operation == 'status':

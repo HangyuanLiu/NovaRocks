@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # See spark-sql.sh: CI supplies its already-resolved generated environment so
 # this helper does not depend on the mutable interactive `current` link.
-CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/runtime/current/env.sh}"
+CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
 CURRENT_ENV="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CURRENT_ENV")"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then

@@ -23,7 +23,7 @@ WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # `current` is a convenience link for interactive use. CI passes the exact
 # generated entry it prepared so isolated system fixtures cannot redirect or
 # remove the environment required by subsequent SQL helpers.
-CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/runtime/current/env.sh}"
+CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
 CURRENT_ENV="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CURRENT_ENV")"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then

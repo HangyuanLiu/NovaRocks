@@ -171,6 +171,61 @@ class SharedEnvironmentTests(RendererCase):
         self.assertEqual(a['AWS_S3_ENDPOINT'], b['AWS_S3_ENDPOINT'])
         self.assertNotEqual(a['NOVA_ENV_REST_WAREHOUSE_URI'], b['NOVA_ENV_REST_WAREHOUSE_URI'])
 
+    def test_two_declaration_checkouts_keep_one_worktree_entry_and_lock(self):
+        import shutil
+        workspace = self.root / 'consumer-worktree'
+        workspace.mkdir()
+        sources = []
+        for generation in ('source-r1', 'source-r2'):
+            fixture = self.root / generation / 'docker' / 'iceberg-rest'
+            fixture.mkdir(parents=True)
+            for name in ('up.sh', 'status.sh', 'fixture_runtime.py', 'runtime_entry.py', 'shared.env'):
+                shutil.copy2(HERE / name, fixture / name)
+            for name in ('templates', 'spark'):
+                shutil.copytree(HERE / name, fixture / name)
+            sources.append(fixture)
+        fakebin = self.root / 'bin'
+        fakebin.mkdir()
+        marker = self.root / 'unexpected-docker'
+        fake_docker = fakebin / 'docker'
+        fake_docker.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 99\n')
+        fake_docker.chmod(0o755)
+        environment = {**os.environ, 'PATH': str(fakebin) + ':' + os.environ['PATH'],
+                       'NOVAROCKS_WORKSPACE_ROOT': str(workspace),
+                       'NOVA_ENV_SHARED_DOCKER': 'true', 'NOVA_ENV_UPDATE_CURRENT': 'true',
+                       'NOVA_FIXTURE_RUNTIME_DIR': str(self.root / 'private-owner')}
+        expected = workspace / 'docker' / 'iceberg-rest' / 'runtime' / entry.environment_identity(workspace)
+        current = expected.parent / 'current'
+        publications = []
+        lock_inode = None
+        for fixture in sources:
+            environment['NOVA_ENV_CONFIG_FILE'] = str(fixture / 'shared.env')
+            prepared = subprocess.run(['bash', str(fixture / 'up.sh'), '--prepare-only'],
+                                      env=environment, capture_output=True, text=True)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            result = json.loads(prepared.stdout)
+            publications.append(result)
+            self.assertFalse(result['ready'])
+            self.assertEqual(result['entry_root'], str(expected))
+            self.assertEqual(Path(result['published_dir']).parent, expected / 'publications')
+            self.assertEqual(result['config']['repo_root'], str(fixture.parent.parent))
+            self.assertEqual(current.resolve(), expected)
+            self.assertEqual((current / 'env.sh').resolve(), Path(result['published_dir']) / 'env.sh')
+            self.assertFalse((fixture / 'runtime').exists())
+            lock = expected / '.owner.lock'
+            if lock_inode is None:
+                lock_inode = lock.stat().st_ino
+            self.assertEqual(lock.stat().st_ino, lock_inode)
+        self.assertNotEqual(publications[0]['published_dir'], publications[1]['published_dir'])
+        self.assertEqual(publications[0]['config']['local_ports'], publications[1]['config']['local_ports'])
+        self.assertEqual(publications[0]['config']['native_trust'], publications[1]['config']['native_trust'])
+        # Either declaration checkout discovers the same final publication.
+        status = subprocess.run(['bash', str(sources[0] / 'status.sh')],
+                                env=environment, capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)['published_dir'], publications[1]['published_dir'])
+        self.assertFalse(marker.exists())
+
     def test_shell_prepare_is_offline_and_ignores_ambient_endpoints(self):
         copied = self.root / 'checkout'
         fixture = copied / 'docker' / 'iceberg-rest'
@@ -266,6 +321,8 @@ class IsolatedEntryTests(RendererCase):
         prepared = subprocess.run(['bash', str(fixture / 'up.sh'), '--prepare-only'], env=env, capture_output=True, text=True)
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         generated = Path(json.loads(prepared.stdout)['published_dir'])
+        self.assertEqual(generated.parent, fixture / 'runtime')
+        self.assertFalse((workspace / 'docker' / 'iceberg-rest' / 'runtime').exists())
         self.assertEqual(os.readlink(current), 'untouched-worktree')
         env['NOVA_ENV_ID'] = generated.name
         shutil.rmtree(workspace)
@@ -320,6 +377,21 @@ class HelperEntryTests(RendererCase):
             self.assertIn(first['records']['catalog']['compose_file'], call['args'])
             self.assertNotIn(second['records']['catalog']['compose_file'], call['args'])
             self.assertIsNone(call['foreign'])
+        # Without an explicit publication, discovery belongs to W rather than
+        # the checkout containing the helper script.
+        current = self.workspace / 'docker' / 'iceberg-rest' / 'runtime' / 'current'
+        current.parent.mkdir(parents=True)
+        current.symlink_to(self.entry)
+        env.pop('NOVA_ENV_REST_ENV_FILE')
+        env['NOVAROCKS_WORKSPACE_ROOT'] = str(self.workspace)
+        log.write_text('')
+        for helper, source in [('spark-sql.sh', sql), ('spark-shell.sh', scala)]:
+            result = subprocess.run(['bash', str(HERE / helper), str(source)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(x) for x in log.read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertIn(second['records']['catalog']['compose_file'], call['args'])
         self.owner.unbind('test-worktree', self.entry)
         env['NOVA_ENV_REST_ENV_FILE'] = str(self.entry / 'env.sh')
         result = subprocess.run(['bash', str(HERE / 'spark-sql.sh'), str(sql)], env=env, capture_output=True, text=True)
