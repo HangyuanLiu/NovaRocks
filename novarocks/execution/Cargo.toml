@@ -66,3 +66,7 @@ novarocks-sql.workspace = true
 [[bench]]
 name = "table_write_statistics"
 harness = false
+
+[[bench]]
+name = "regexp_pattern_compile"
+harness = false
