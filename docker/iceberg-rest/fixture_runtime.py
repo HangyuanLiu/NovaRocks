@@ -322,7 +322,8 @@ class Docker:
         identity = container["Id"]
         network = self.inspect("network", cat["network"])
         if identity not in (network.get("Containers") or {}):
-            self.command(["network", "connect", "--alias", "minio", cat["network"], identity])
+            self.command(["network", "connect", "--alias", "minio", "--alias", "warehouse.minio",
+                          "--alias", "novarocks.minio", cat["network"], identity])
         return identity
 
     def ensure(self, record: dict[str, Any], parent: dict[str, Any] | None = None) -> None:
@@ -466,6 +467,10 @@ class RuntimeOwner:
         return RuntimeOwner(locator["control_root"], daemon=locator["daemon_id"],
                             backend=self.backend, renderer=self.renderer, hook=self.hook)
 
+    def assert_live_daemon(self) -> None:
+        if self.backend.daemon_id() != self.daemon:
+            raise RuntimeFailure("OwnerMismatch", "Docker daemon differs from requested owner")
+
     def record_path(self, identity: str) -> Path:
         return self.base / "runtimes" / safe_component(identity) / "record.json"
 
@@ -528,6 +533,14 @@ class RuntimeOwner:
         return references
 
     def publish(self, entry: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+        config = metadata["config"]
+        current = None
+        if config.get("update_current", False):
+            current = Path(config["current_link"])
+            if not current.is_absolute() or current.parent.resolve() != entry.parent or (
+                current.exists() and not current.is_symlink()
+            ):
+                raise RuntimeFailure("RuntimeIdentityMismatch", "invalid current locator")
         publication_id = uuid.uuid4().hex
         directory = entry / "publications" / publication_id
         staging = entry / "publications" / f".prepare-{publication_id}"
@@ -569,6 +582,11 @@ class RuntimeOwner:
             temporary.symlink_to(Path("publications") / publication_id)
             os.replace(temporary, entry / "published")
             fsync_directory(entry)
+            if current is not None:
+                temporary = current.with_name(f".current-{publication_id}")
+                temporary.symlink_to(entry.name)
+                os.replace(temporary, current)
+                fsync_directory(current.parent)
             self.hook("publication.after_swap", worktree=metadata["worktree"])
             return {**metadata, "published_dir": str(directory)}
         finally:
@@ -725,6 +743,7 @@ class RuntimeOwner:
         return record
 
     def bind(self, worktree: str, entry: Path | str, config: dict[str, Any], bom: dict[str, Any]) -> dict[str, Any]:
+        self.assert_live_daemon()
         entry = Path(entry).resolve()
         safe_component(worktree)
         with file_lock(entry / ".owner.lock"):
@@ -822,6 +841,7 @@ class RuntimeOwner:
             return self.publish(entry, self.unbound(previous, config=config))
 
     def delete_catalog(self, identity: str, *, force: bool = False) -> None:
+        self.assert_live_daemon()
         initial = self.record(identity)
         if not initial:
             return
@@ -894,6 +914,7 @@ class RuntimeOwner:
         fsync_directory(retirement_root)
 
     def manage(self, identity: str, operation: str, *, force: bool = False) -> None:
+        self.assert_live_daemon()
         record = self.record(identity)
         if not record:
             return
@@ -931,6 +952,7 @@ class RuntimeOwner:
                 self.backend.stop(record)
 
     def consumer(self, identity: str, container: str, *, alias: str = "hms", disconnect: bool = False) -> None:
+        self.assert_live_daemon()
         initial = self.record(identity)
         if not initial or initial["kind"] != "cat":
             if disconnect:

@@ -249,6 +249,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(prepared["ready"])
         self.assertIsNone(prepared["owner_locator"])
 
+    def test_current_is_only_a_locator_published_inside_owner(self):
+        config = {**CONFIG, "update_current": True,
+                  "current_link": str((self.entry.parent / "current").resolve())}
+        publication = self.owner.prepare_entry("test", self.entry, config)
+        current = self.entry.parent / "current"
+        self.assertEqual(current.resolve(), self.entry.resolve())
+        self.assertEqual(runtime.current_publication(current)["published_dir"], publication["published_dir"])
+        isolated = {**CONFIG, "update_current": False, "current_link": str(current)}
+        self.owner.prepare_entry("isolated", self.entry.parent / "isolated", isolated)
+        self.assertEqual(current.resolve(), self.entry.resolve())
+
     def test_bad_index_fails_closed(self):
         first = self.bind()
         (self.entry / "published").unlink()
@@ -343,6 +354,25 @@ class ProtocolTests(unittest.TestCase):
         env = runtime.controlled_environment({"PATH": "path", "COMPOSE_PROJECT_NAME": "foreign",
             "REST_IMAGE": "foreign", "DOCKER_CONTEXT": "desktop-linux"})
         self.assertEqual(env, {"PATH": "path", "DOCKER_CONTEXT": "desktop-linux"})
+
+    def test_live_container_identity_mismatch_is_not_replaced(self):
+        publication = self.bind()
+        record = publication["records"]["catalog"]
+        backend = runtime.Docker()
+        backend.command = lambda *a, **k: "container-id"
+        backend.inspect = lambda *a, **k: {"Image": "sha256:foreign", "Config": {"Labels": {}}}
+        self.assert_code("RuntimeIdentityMismatch", lambda: backend.ensure(record))
+        self.assertEqual(runtime.current_publication(self.entry), publication)
+
+    def test_foreign_volume_or_network_is_rejected_before_compose(self):
+        publication = self.bind()
+        record = publication["records"]["object_store"]
+        backend = runtime.Docker()
+        backend.container = lambda *a: None
+        backend.inspect = lambda *a, **k: {"Labels": {"foreign": "true"}}
+        backend.compose = lambda *a: self.fail("foreign resources touched by Compose")
+        self.assert_code("RuntimeIdentityMismatch", lambda: backend.ensure(record))
+        self.assert_code("RuntimeIdentityMismatch", lambda: backend.delete_resources(record))
 
     def fake_docker(self):
         executable = self.root / "bin/docker"
