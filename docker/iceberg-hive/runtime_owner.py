@@ -105,7 +105,16 @@ class HiveOwner:
             self.save(record)
         return record
 
-    def render(self, record):
+    @staticmethod
+    def write_definition(path, content, *, pin_image=False):
+        if path.exists():
+            if path.read_bytes() == content:
+                return
+            if not pin_image:
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "saved HMS definition changed: " + path.name)
+        runtime.atomic_bytes(path, content)
+
+    def render(self, record, *, pin_image=False):
         directory = self.directory(record["catalog_id"])
         credentials = record["minio"]
         user, secret = credentials["access_key_id"], credentials["secret_access_key"]
@@ -118,10 +127,10 @@ class HiveOwner:
             "NOVA_HMS_CONFIG": str(directory / "core-site.xml"),
             "NOVA_HMS_WAREHOUSE": record["hms"]["warehouse"].replace("s3://", "s3a://", 1),
         }
-        runtime.atomic_bytes(directory / "compose.yml", (HERE / "compose.yml").read_bytes())
-        runtime.atomic_bytes(directory / "compose.env", "".join(f"{key}={json.dumps(str(value))}\n" for key, value in env.items()).encode())
+        self.write_definition(directory / "compose.yml", (HERE / "compose.yml").read_bytes())
+        self.write_definition(directory / "compose.env", "".join(f"{key}={json.dumps(str(value))}\n" for key, value in env.items()).encode(), pin_image=pin_image)
         core = (HERE / "core-site.xml").read_text().replace("<value>admin</value>", f"<value>{escape(user)}</value>").replace("<value>admin123</value>", f"<value>{escape(secret)}</value>")
-        runtime.atomic_bytes(directory / "core-site.xml", core.encode())
+        self.write_definition(directory / "core-site.xml", core.encode())
         # This read-only bind mount must be readable by the image's hive UID.
         (directory / "core-site.xml").chmod(0o644)
         props = {"type": "iceberg", "iceberg.catalog.type": "hive",
@@ -130,12 +139,12 @@ class HiveOwner:
                  "aws.s3.endpoint": credentials["endpoint"], "aws.s3.access_key": user,
                  "aws.s3.secret_key": secret, "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
         sql = "CREATE EXTERNAL CATALOG ice_hms\nPROPERTIES (\n" + ",\n".join(f"  {json.dumps(key)} = {json.dumps(value)}" for key, value in props.items()) + "\n);\n"
-        runtime.atomic_bytes(directory / "ice-hms-catalog.sql", sql.encode())
+        self.write_definition(directory / "ice-hms-catalog.sql", sql.encode())
         props = {"": "org.apache.iceberg.spark.SparkCatalog", ".type": "hive", ".uri": "thrift://hms:9083",
                  ".warehouse": record["hms"]["warehouse"], ".io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
                  ".s3.endpoint": "http://minio:9000", ".s3.path-style-access": "true",
                  ".s3.access-key-id": user, ".s3.secret-access-key": secret, ".s3.region": "us-east-1"}
-        runtime.atomic_bytes(directory / "spark-hms-defaults.conf", "".join(f"spark.sql.catalog.hms_catalog{key} {value}\n" for key, value in props.items()).encode())
+        self.write_definition(directory / "spark-hms-defaults.conf", "".join(f"spark.sql.catalog.hms_catalog{key} {value}\n" for key, value in props.items()).encode())
         exports = {"NOVA_ENV_HIVE_RUNTIME_DIR": str(directory), "NOVA_ENV_HIVE_MANIFEST": str(directory / "manifest.json"),
                    "NOVA_ENV_HIVE_CATALOG_ID": record["catalog_id"], "NOVA_ENV_HIVE_COMPOSE_PROJECT": record["project"],
                    "NOVA_ENV_HIVE_COMPOSE_FILE": record["compose_file"], "NOVA_ENV_HIVE_COMPOSE_ENV": record["compose_env"],
@@ -145,7 +154,7 @@ class HiveOwner:
                    "NOVAROCKS_ICE_HMS_CATALOG_SQL": record["hms"]["catalog_sql"],
                    "NOVAROCKS_SPARK_HMS_DEFAULTS": record["hms"]["spark_defaults"],
                    "NOVAROCKS_SPARK_EXTRA_DEFAULTS": record["hms"]["spark_defaults"]}
-        runtime.atomic_bytes(directory / "env.sh", "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items()).encode())
+        self.write_definition(directory / "env.sh", "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items()).encode())
 
     def up(self, manifest, image, prepare_only=False):
         identity = manifest["runtime"]["catalog"]["id"]
@@ -160,7 +169,10 @@ class HiveOwner:
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "HMS image alias changed")
             record["images"]["hms"]["image_id"] = image_id
             record["state"] = "starting"
-            self.render(record)
+            record.pop("failure", None)
+            # Only the first activation may replace the prepared image alias
+            # with an exact image ID, before Docker has created any container.
+            self.render(record, pin_image=saved is None)
             self.save(record)
             self.backend.container(record, "hms")
             self.backend.validate_resources(record)
@@ -171,19 +183,47 @@ class HiveOwner:
             record["container_id"] = container["Id"]
             self.save(record)
             self.owner.consumer(identity, container["Id"], alias="hms")
-            self.wait_ready(record)
+            try:
+                self.wait_ready(record)
+            except runtime.RuntimeFailure as error:
+                record.update(state="failed", failure={"code": error.code, "message": str(error)})
+                self.save(record)
+                raise
             record["state"] = "ready"
             self.save(record)
             return record
 
-    def wait_ready(self, record):
-        for _ in range(60):
-            try:
-                with socket.create_connection(("127.0.0.1", record["ports"]["hms"]), timeout=1):
+    def wait_ready(self, record, timeout=60):
+        # Docker Desktop's published port proxy can accept connections before
+        # Derby initialization finishes. Probe the listener in the exact saved
+        # container instead, with each Docker operation bounded by the deadline.
+        deadline = time.monotonic() + timeout
+        saved_timeout = self.backend.timeout
+        identity = record["container_id"]
+        try:
+            while time.monotonic() < deadline:
+                self.backend.timeout = min(saved_timeout, 5, max(0.001, deadline - time.monotonic()))
+                container = self.backend.inspect("container", identity, absent_ok=True)
+                if (not container or container.get("Id") != identity
+                        or not container.get("State", {}).get("Running")):
+                    raise runtime.RuntimeFailure("RuntimeNotReady", "HMS container exited before readiness")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.backend.timeout = min(saved_timeout, 2, remaining)
+                try:
+                    self.backend.command(["exec", identity, "/bin/bash", "-c",
+                                          "exec 3<>/dev/tcp/127.0.0.1/9083"])
                     return
-            except OSError:
-                time.sleep(1)
-        raise runtime.RuntimeFailure("RuntimeNotReady", "HMS did not become ready")
+                except runtime.RuntimeFailure as error:
+                    if error.code not in ("DockerOperationFailed", "DockerOperationTimeout"):
+                        raise
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(1, remaining))
+        finally:
+            self.backend.timeout = saved_timeout
+        raise runtime.RuntimeFailure("RuntimeNotReady", "HMS listener did not become ready before the deadline")
 
     def down(self, identity, volumes=False):
         with self.owner.lock("hms-" + identity):
