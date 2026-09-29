@@ -543,6 +543,12 @@ run_cargo_gates() {
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   run_fail_fast_stage "cargo check all targets" "cargo-check-all-targets.log" \
     cargo check --workspace --all-targets --locked
+  # Without its default `jemalloc` feature the server keeps the system
+  # allocator. That build is never deployed, but same-revision allocator
+  # baselines and allocator-sensitive tools depend on it, so it must compile.
+  run_fail_fast_stage "cargo check server without jemalloc" \
+    "cargo-check-server-system-allocator.log" \
+    cargo check -p novarocks-server --no-default-features --all-targets --locked
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates
   # silently covered one package and every other workspace member's tests

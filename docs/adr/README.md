@@ -418,6 +418,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0160 — Arrow 留存为何显式传播 backing 谱系，并由真实叶子承诺与最后持有者结算（active；替换 ADR-0148 的 Arrow pool charge 生命周期裁决）
 - ADR-0162 — 查询中间计算状态为何保持内存内，并完整退出外溢能力（active；收敛 ADR-0148 的回收动作范围，不改变容量与谱系规则）
 - ADR-0156 — Connector FE 操作控制为何不授予容量，以及 BE 为何只接受准入后的真实资源（active；不改变 ADR-0148 的 BE 容量权威）
+- ADR-0163 — 进程为何由构建期选定的 jemalloc 分配，并从本进程的 cgroup 路径得知内存上限与用量（active；建立在 ADR-0148 的观测级之上）
 
 ### crate-boundary
 

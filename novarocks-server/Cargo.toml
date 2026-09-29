@@ -52,8 +52,23 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time"] }
 uuid.workspace = true
+# The process allocator; see `src/memory_observation.rs`.
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
+
+# jemalloc runs background purge threads only on Linux. On macOS it is built
+# without them, and enabling them there makes jemalloc fail to initialise, so
+# the crate feature must not reach any other target.
+# Design: ADR-0163 (docs/adr/ADR-0163-jemalloc-process-allocator-and-cgroup-memory-bound.md)
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
 [features]
+default = ["jemalloc"]
+# jemalloc is the only supported production allocator. Building without this
+# feature keeps the system allocator for same-revision baselines and for tools
+# that require it; such a build is not a supported deployment.
+jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 mv-first-refresh-staging-test-support = []
 native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
 

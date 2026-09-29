@@ -118,6 +118,9 @@ pub struct BackendServerConfig {
     /// Provider-owned complete BE role factories. The backend seals exactly
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
+    /// This process's memory readings for the `/metrics` endpoint, supplied
+    /// by the process that owns the allocator and the probes.
+    pub process_memory: crate::backend_metrics::ProcessMemoryObservation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -593,6 +596,7 @@ impl BackendApplicationHost {
             scan_stream_runtime,
             catalog_manager_config,
             execution_role_binding_factories,
+            process_memory,
         } = config;
         let readiness_endpoint = novarocks_types::NativeEndpoint::from_host_port(
             &advertise_endpoint.host,
@@ -646,6 +650,7 @@ impl BackendApplicationHost {
         })?;
         let metrics_registry = Arc::new(
             BackendMetricsRegistry::new()
+                .and_then(|registry| registry.with_process_memory(process_memory))
                 .map_err(|error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
@@ -1024,6 +1029,7 @@ mod tests {
                 novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
             catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
+            process_memory: novarocks_native_adapter::backend_test_support::test_process_memory(),
         }
     }
 
@@ -1298,6 +1304,14 @@ mod tests {
             http_get(metrics_port, "/metrics").expect("read management metrics");
         assert!(management_response.starts_with("HTTP/1.1 200"));
         assert!(management_response.contains(BACKEND_OWNED_FAMILY));
+        assert!(
+            management_response
+                .contains("novarocks_backend_process_allocator_info{allocator=\"test\"} 1")
+        );
+        assert!(management_response.contains("novarocks_backend_process_counted_live_bytes 0"));
+        assert!(management_response.contains(
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"positions\"} 0"
+        ));
 
         host.shutdown().expect("native backend shutdown");
     }

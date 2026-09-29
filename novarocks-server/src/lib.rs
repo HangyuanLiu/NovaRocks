@@ -18,6 +18,7 @@
 pub mod app_config;
 pub mod catalog_credential_registry;
 pub mod catalog_source_config;
+pub mod cgroup_memory;
 pub mod composition;
 mod env_reference;
 pub mod launch;

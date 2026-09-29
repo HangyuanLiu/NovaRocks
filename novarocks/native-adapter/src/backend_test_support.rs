@@ -69,6 +69,24 @@ pub fn test_backend_native_trust() -> Arc<NativeTrust> {
     ))
 }
 
+/// The process memory observation a test backend reports: it has no probed
+/// cgroup or allocator of its own, so every physical source stays unknown and
+/// nothing is exported as zero.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_process_memory() -> crate::backend_metrics::ProcessMemoryObservation {
+    crate::backend_metrics::ProcessMemoryObservation {
+        allocator: "test",
+        allocator_settings: Vec::new(),
+        visible_memory: None,
+        sample: Arc::new(|| {
+            (
+                novarocks_memory::observe::AllocatorSnapshot::default(),
+                novarocks_memory::observe::PhysicalMemoryReading::default(),
+            )
+        }),
+    }
+}
+
 /// The runtime Native adapter tests poll typed scan streams in, standing in
 /// for the Server's scan I/O runtime.
 #[cfg(any(test, feature = "test-support"))]
