@@ -63,6 +63,9 @@ pub use higher_order_kernel::*;
 pub use kernel_control::*;
 pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
 pub use lambda_rows::*;
+pub use novarocks_constant_contract::{
+    ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
+};
 pub use novarocks_type_contract::{
     AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,

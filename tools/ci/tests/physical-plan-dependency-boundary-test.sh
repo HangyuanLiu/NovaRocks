@@ -55,6 +55,8 @@ exclude = ["crates/arrow-schema-v2", "crates/bytes-v2"]
 members = [
   "crates/arrow-array",
   "crates/connector-contract",
+  "crates/constant-contract",
+  "crates/fixture-pins",
   "crates/execution",
   "crates/feature-user",
   "crates/hyper",
@@ -76,6 +78,8 @@ EOF
   write_package "$fixture_root" bytes-v2 bytes
   replace_text "$fixture_root/crates/bytes-v2/Cargo.toml" \
     'version = "0.1.0"' 'version = "1.11.0"'
+  write_package "$fixture_root" constant-contract novarocks-constant-contract
+  write_package "$fixture_root" fixture-pins fixture-pins
   write_package "$fixture_root" connector-contract novarocks-connector-contract
   write_package "$fixture_root" execution novarocks-execution
   write_package "$fixture_root" feature-user feature-user
@@ -97,6 +101,28 @@ EOF
     'bytes = "=1.11.0"'
   append_dependency "$fixture_root" type-contract \
     'arrow-schema = "=58.2.0"'
+
+  append_dependency "$fixture_root" physical-plan \
+    'novarocks-constant-contract = { path = "../constant-contract" }'
+  append_dependency "$fixture_root" constant-contract \
+    'novarocks-type-contract = { path = "../type-contract" }'
+  local arrow_package
+  for arrow_package in arrow-array arrow-buffer arrow-data arrow-schema; do
+    append_dependency "$fixture_root" constant-contract "$arrow_package = \"=58.2.0\""
+  done
+  # Lock the independently selected real registry closure without activating
+  # unrelated fixture-pins features in physical-plan's own Cargo tree.
+  python3 - "$CHECKER" "$fixture_root/crates/fixture-pins/Cargo.toml" <<'PY_PINS'
+import importlib.util
+from pathlib import Path
+import sys
+spec = importlib.util.spec_from_file_location("guard", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with Path(sys.argv[2]).open("a") as out:
+    for index, (name, version) in enumerate(sorted(module.EXTERNAL_PACKAGE_VERSIONS)):
+        out.write(f'pin_{index} = {{ package = "{name}", version = "={version}", default-features = false }}\n')
+PY_PINS
 
   # Another workspace member enables a feature on a shared dependency. Cargo
   # metadata's workspace resolve graph sees serde, while physical-plan's own
@@ -215,8 +241,8 @@ append_dependency "$connector_to_type_root" connector-contract \
   'novarocks-type-contract = { path = "../type-contract" }'
 assert_accepted "$connector_to_type_root"
 
-# Public read/write recipes may freeze exact Arrow schemas. Arrays and all
-# executable capabilities remain excluded by the resolved closure guard.
+# Public read/write recipes may freeze exact Arrow schemas. Immutable arrays
+# enter solely through the constant owner; runtime capabilities remain excluded.
 connector_schema_root="$(new_mutation connector-public-schema)"
 append_dependency "$connector_schema_root" connector-contract \
   'arrow-schema = "=58.2.0"'
@@ -235,7 +261,7 @@ transitive_root="$(new_mutation transitive-execution)"
 append_dependency "$transitive_root" type-contract \
   'novarocks-execution = { path = "../execution" }'
 assert_rejected "$transitive_root" \
-  "resolved normal dependency closure contains forbidden application/execution owner" \
+  "resolved normal/build dependency closure contains forbidden application/execution owner" \
   "novarocks-execution"
 
 # The foundational type vocabulary cannot depend upward on Connector identity.
@@ -390,7 +416,7 @@ append_dependency_section "$selected_target_root" arrow-schema-v2 \
 } >>"$selected_target_root/Cargo.toml"
 assert_rejected "$selected_target_root" \
   "resolved normal dependency arrow-schema declares target-specific normal dependencies outside the exact audited closure allow-list" \
-  "resolved normal dependency closure contains package identities outside the exact audited allow-list" \
+  "resolved normal/build dependency closure contains package identities outside the exact audited allow-list" \
   "crates/arrow-schema-v2/Cargo.toml" \
   "hyper"
 
@@ -406,7 +432,7 @@ append_dependency_section "$selected_target_identity_root" arrow-schema-v2 \
   printf 'arrow-schema = { path = "crates/arrow-schema-v2" }\n'
 } >>"$selected_target_identity_root/Cargo.toml"
 assert_rejected "$selected_target_identity_root" \
-  "resolved normal dependency closure contains package identities outside the exact audited allow-list" \
+  "resolved normal/build dependency closure contains package identities outside the exact audited allow-list" \
   "bytes declares a custom build target" \
   "build.rs"
 
@@ -423,7 +449,7 @@ unknown_transitive_root="$(new_mutation unknown-transitive-runtime)"
 append_dependency "$unknown_transitive_root" type-contract \
   'hyper = { path = "../hyper" }'
 assert_rejected "$unknown_transitive_root" \
-  "resolved normal dependency closure contains package identities outside the exact audited allow-list" \
+  "resolved normal/build dependency closure contains package identities outside the exact audited allow-list" \
   "hyper"
 
 # Another workspace member selects a local package with the audited bytes name
@@ -436,18 +462,83 @@ replace_text "$same_name_identity_root/crates/connector-contract/Cargo.toml" \
   'bytes = "=1.11.0"' \
   'bytes = { path = "../bytes-v2" }'
 assert_rejected "$same_name_identity_root" \
-  "resolved normal dependency closure contains package identities outside the exact audited allow-list" \
+  "resolved normal/build dependency closure contains package identities outside the exact audited allow-list" \
   "bytes v1.11.0" \
   "crates/bytes-v2/Cargo.toml"
 
-# Only arrow-schema is part of the direct pure-contract vocabulary. A broader
-# Arrow runtime dependency must not enter through a package that is absent from
-# the capability deny-list.
+# Direct backing bypasses the constant owner and is still rejected. A foreign
+# same-name Arrow package also cannot impersonate its audited registry identity.
 arrow_runtime_root="$(new_mutation direct-arrow-runtime)"
 append_dependency "$arrow_runtime_root" physical-plan \
   'arrow-array = { path = "../arrow-array" }'
 assert_rejected "$arrow_runtime_root" \
   "declares packages outside the exact direct allow-list" \
   "arrow-array"
+
+# The constant owner has one exact surface, with no optional/target/build authority.
+constant_optional_root="$(new_mutation constant-hidden-runtime)"
+append_dependency "$constant_optional_root" constant-contract \
+  'rpc = { package = "tonic", path = "../tonic", optional = true }'
+assert_rejected "$constant_optional_root" \
+  "novarocks-constant-contract declares optional normal dependencies" \
+  "novarocks-constant-contract declares normal dependencies outside its exact owner allow-list"
+
+constant_target_root="$(new_mutation constant-inactive-runtime)"
+append_dependency_section "$constant_target_root" constant-contract \
+  'target.'"'"'cfg(target_os="none")'"'"'.dependencies' \
+  'novarocks-execution = { path = "../execution" }'
+assert_rejected "$constant_target_root" \
+  "novarocks-constant-contract declares target-specific normal dependencies" \
+  "novarocks-execution"
+
+constant_build_root="$(new_mutation constant-build)"
+append_dependency_section "$constant_build_root" constant-contract build-dependencies \
+  'arrow-schema = "=58.2.0"'
+assert_rejected "$constant_build_root" \
+  "novarocks-constant-contract declares build dependencies"
+
+constant_macro_root="$(new_mutation constant-proc-macro)"
+append_dependency_section "$constant_macro_root" constant-contract lib 'proc-macro = true'
+assert_rejected "$constant_macro_root" \
+  "novarocks-constant-contract declares a proc-macro target"
+
+foreign_arrow_root="$(new_mutation foreign-arrow-backing)"
+replace_text "$foreign_arrow_root/crates/arrow-array/Cargo.toml" \
+  'version = "0.1.0"' 'version = "58.2.0"'
+replace_text "$foreign_arrow_root/crates/constant-contract/Cargo.toml" \
+  'arrow-array = "=58.2.0"' 'arrow-array = { path = "../arrow-array" }'
+assert_rejected "$foreign_arrow_root" \
+  "package identities outside the exact audited allow-list" \
+  "arrow-array v58.2.0" \
+  "crates/arrow-array/Cargo.toml"
+
+# Build-only source replacements must be inspected, even though absent from
+# the normal graph. Matching an audited build helper's name/version is insufficient.
+foreign_build_root="$(new_mutation foreign-build-helper)"
+write_package "$foreign_build_root" autocfg-v2 autocfg
+replace_text "$foreign_build_root/crates/autocfg-v2/Cargo.toml" \
+  'version = "0.1.0"' 'version = "1.5.0"'
+cat >>"$foreign_build_root/Cargo.toml" <<'EOF_BUILD'
+[patch.crates-io]
+autocfg = { path = "crates/autocfg-v2" }
+EOF_BUILD
+assert_rejected "$foreign_build_root" \
+  "package identities outside the exact audited allow-list" \
+  "autocfg v1.5.0" \
+  "crates/autocfg-v2/Cargo.toml"
+
+foreign_macro_root="$(new_mutation foreign-proc-macro)"
+write_package "$foreign_macro_root" zerocopy-derive-v2 zerocopy-derive
+replace_text "$foreign_macro_root/crates/zerocopy-derive-v2/Cargo.toml" \
+  'version = "0.1.0"' 'version = "0.8.31"'
+append_dependency_section "$foreign_macro_root" zerocopy-derive-v2 lib 'proc-macro = true'
+cat >>"$foreign_macro_root/Cargo.toml" <<'EOF_MACRO'
+[patch.crates-io]
+zerocopy-derive = { path = "crates/zerocopy-derive-v2" }
+EOF_MACRO
+assert_rejected "$foreign_macro_root" \
+  "package identities outside the exact audited allow-list" \
+  "zerocopy-derive v0.8.31" \
+  "zerocopy-derive declares a proc-macro target"
 
 echo "physical-plan-dependency-boundary-test: PASS"

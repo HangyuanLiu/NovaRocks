@@ -42,6 +42,9 @@ pub use frozen_calls::*;
 pub use frozen_pruning::*;
 pub use identity::*;
 pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal};
+pub use novarocks_constant_contract::{
+    ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
+};
 pub use novarocks_type_contract::FunctionValueType as ValueType;
 pub use novarocks_type_contract::{
     AggregateStateFormatId, BucketLayoutAlgorithm, DecimalOverflowPolicy,

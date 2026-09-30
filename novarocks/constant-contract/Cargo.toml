@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "novarocks-functions"
+name = "novarocks-constant-contract"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -29,7 +29,7 @@ doctest = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
 novarocks-type-contract.workspace = true
-novarocks-constant-contract.workspace = true
-sha2.workspace = true

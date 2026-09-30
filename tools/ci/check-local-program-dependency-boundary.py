@@ -27,7 +27,7 @@ selects features. No source layout or retired symbol is part of this guard.
 Arrow backing, arithmetic, schema and immutable function signature support are
 allowed. This guard proves package ownership boundaries, not source purity;
 closed static fields and independent runtime instances still require review
-and behavioral tests. External build helpers used by Arrow are allowed, while
+and behavioral tests. Exact audited registry build helpers used by Arrow are allowed, while
 runtime/wire/storage capabilities in build dependencies are still rejected.
 """
 
@@ -43,12 +43,59 @@ PACKAGE_NAME = "novarocks-local-program"
 PURE_OWNERS = frozenset({
     PACKAGE_NAME,
     "novarocks-connector-contract",
+    "novarocks-constant-contract",
     "novarocks-execution-contract",
     "novarocks-functions",
     "novarocks-type-contract",
     "novarocks-types",
 })
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+# Additional immutable Arrow arithmetic/signature dependencies of LocalProgram.
+# Constant backing and its exact build authorities are shared with the physical guard.
+EXTRA_EXTERNAL_VERSIONS = frozenset({
+    ('arrow-cast', '58.2.0'),
+    ('arrow-ord', '58.2.0'),
+    ('arrow-select', '58.2.0'),
+    ('atoi', '2.0.0'),
+    ('base64', '0.22.1'),
+    ('block-buffer', '0.10.4'),
+    ('bytemuck', '1.25.0'),
+    ('byteorder', '1.5.0'),
+    ('cpufeatures', '0.2.17'),
+    ('crypto-common', '0.1.7'),
+    ('digest', '0.10.7'),
+    ('generic-array', '0.14.7'),
+    ('getrandom', '0.4.3'),
+    ('itoa', '1.0.15'),
+    ('lexical-core', '1.0.6'),
+    ('lexical-parse-float', '1.0.6'),
+    ('lexical-parse-integer', '1.0.6'),
+    ('lexical-util', '1.0.7'),
+    ('lexical-write-float', '1.0.6'),
+    ('lexical-write-integer', '1.0.6'),
+    ('memchr', '2.8.3'),
+    ('r-efi', '6.0.0'),
+    ('roaring', '0.10.12'),
+    ('ryu', '1.0.20'),
+    ('serde', '1.0.228'),
+    ('serde_core', '1.0.228'),
+    ('serde_derive', '1.0.228'),
+    ('serde_json', '1.0.150'),
+    ('sha2', '0.10.9'),
+    ('typenum', '1.20.1'),
+    ('uuid', '1.24.0'),
+    ('zmij', '1.0.23'),
+})
+EXTRA_BUILD_TARGETS = frozenset({
+    ('generic-array', '0.14.7'),
+    ('getrandom', '0.4.3'),
+    ('serde', '1.0.228'),
+    ('serde_core', '1.0.228'),
+    ('serde_json', '1.0.150'),
+    ('zmij', '1.0.23'),
+})
+EXTRA_PROC_MACROS = frozenset({("serde_derive", "1.0.228")})
+
 
 # These categories name capabilities, not every package currently in the tree.
 FORBIDDEN_EXACT = frozenset({
@@ -93,8 +140,25 @@ def verify_package(package, workspace_ids):
                                   + dependency["name"])
         if any("custom-build" in target["kind"] for target in package["targets"]):
             violations.append(f"{name} executes a custom build script")
-    elif package["source"] != REGISTRY_SOURCE:
-        violations.append(f"{name} has unaudited dependency source: {package['source']}")
+        if any("proc-macro" in target["kind"] for target in package["targets"]):
+            violations.append(f"{name} executes a proc-macro target")
+        support = metadata_support()
+        if name in support.INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS:
+            allowed = support.INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS[name]
+            unexpected = {d["name"] for d in package["dependencies"] if d["kind"] is None} - allowed
+            if unexpected:
+                violations.append(f"{name} declares unaudited normal edges: {sorted(unexpected)}")
+            violations.extend(support.verify_dependency_feature_policy(package, name))
+    else:
+        support = metadata_support()
+        build_edges = dict(support.EXTERNAL_BUILD_EDGES)
+        build_edges[("generic-array", "0.14.7")] = frozenset({"version_check"})
+        violations.extend(support.verify_external_authority(
+            package, support.EXTERNAL_PACKAGE_VERSIONS | EXTRA_EXTERNAL_VERSIONS,
+            support.EXTERNAL_BUILD_TARGETS | EXTRA_BUILD_TARGETS,
+            support.EXTERNAL_PROC_MACROS | EXTRA_PROC_MACROS, build_edges))
+        if package["source"] != REGISTRY_SOURCE:
+            violations.append(f"{name} has unaudited dependency source: {package['source']}")
     return violations
 
 
@@ -130,12 +194,18 @@ def selected_packages(manifest_path, graph):
     return packages.values()
 
 
+_METADATA_SUPPORT = None
+
 def metadata_support():
+    global _METADATA_SUPPORT
+    if _METADATA_SUPPORT is not None:
+        return _METADATA_SUPPORT
     # Reuse the existing guard's exact Cargo identity parser, not its policy.
     path = Path(__file__).with_name("check-physical-plan-dependency-boundary.py")
     spec = importlib.util.spec_from_file_location("physical_plan_metadata", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _METADATA_SUPPORT = module
     return module
 
 

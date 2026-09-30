@@ -94,13 +94,17 @@ class BoundaryTests(unittest.TestCase):
         self.assert_rejected(self.fixture(build_script=True), "executes a custom build script")
 
     @staticmethod
-    def external(name, source=guard.REGISTRY_SOURCE):
-        return {"id": f"{source}#{name}@1.0.0", "name": name, "source": source,
+    def external(name, version="1.0.0", source=guard.REGISTRY_SOURCE):
+        return {"id": f"{source}#{name}@{version}", "name": name, "source": source,
+                "version": version,
+                "manifest_path": f"/registry/{name}-{version}/Cargo.toml",
                 "dependencies": [], "features": {}, "targets": []}
 
-    def test_arrow_backing_is_allowed_without_exact_closure_snapshot(self):
-        for name in ("arrow-array", "arrow-buffer", "arrow-data", "half", "num-traits"):
-            self.assertEqual(guard.verify_package(self.external(name), set()), [])
+    def test_exact_arrow_backing_identities_are_allowed(self):
+        for name, version in (("arrow-array", "58.2.0"), ("arrow-buffer", "58.2.0"),
+                              ("arrow-data", "58.2.0"), ("half", "2.7.1"),
+                              ("num-traits", "0.2.19")):
+            self.assertEqual(guard.verify_package(self.external(name, version), set()), [])
 
     def test_same_named_pure_contract_replacement_is_rejected(self):
         package = self.external("novarocks-types")
@@ -111,6 +115,69 @@ class BoundaryTests(unittest.TestCase):
         for name in ("novarocks-connector-iceberg", "novarocks-spi",
                      "novarocks-proto-models", "novarocks-worker", "tonic", "object_store"):
             self.assertTrue(guard.verify_package(self.external(name), set()), name)
+
+    def test_same_name_foreign_arrow_and_version_drift_are_rejected(self):
+        for package in (self.external("arrow-array", "58.2.0", "git+https://example.invalid/arrow"),
+                        self.external("arrow-array", "58.4.0"),
+                        self.external("unknown-pure-looking-package")):
+            self.assertIn("unaudited external package identity", " ".join(
+                guard.verify_package(package, set())))
+
+    def test_registry_membership_does_not_authorize_new_build_or_macro(self):
+        for kind in ("custom-build", "proc-macro"):
+            package = self.external("bytes", "1.11.0")
+            package["targets"] = [{"name": "unaudited", "kind": [kind],
+                                   "src_path": "/registry/bytes-1.11.0/build.rs"}]
+            self.assertIn(f"unaudited {kind} authority", " ".join(
+                guard.verify_package(package, set())))
+
+    def test_exact_arrow_build_and_macro_sources_are_allowed(self):
+        for name, version, kind in (("ahash", "0.8.12", "custom-build"),
+                                    ("zerocopy-derive", "0.8.31", "proc-macro"),
+                                    ("serde_derive", "1.0.228", "proc-macro")):
+            package = self.external(name, version)
+            package["targets"] = [{"name": name, "kind": [kind],
+                                   "src_path": f"/registry/{name}-{version}/src/lib.rs"}]
+            self.assertEqual(guard.verify_package(package, set()), [])
+            package["source"] = None
+            self.assertTrue(guard.verify_package(package, set()))
+
+    def test_audited_build_source_cannot_escape_package(self):
+        package = self.external("ahash", "0.8.12")
+        package["targets"] = [{"name": "build", "kind": ["custom-build"],
+                               "src_path": "/foreign/build.rs"}]
+        self.assertIn("source escapes its audited package", " ".join(
+            guard.verify_package(package, set())))
+
+    def test_audited_registry_build_owner_cannot_acquire_runtime(self):
+        package = self.external("ahash", "0.8.12")
+        package["dependencies"] = [{"name": "tokio", "kind": "build"}]
+        self.assertIn("unaudited build dependencies: tokio", " ".join(
+            guard.verify_package(package, set())))
+
+    def test_pure_owner_cannot_execute_proc_macro(self):
+        result = self.fixture(extra='[lib]\nproc-macro = true\n')
+        self.assert_rejected(result, "executes a proc-macro target")
+
+    def test_constant_owner_has_no_normal_feature_or_build_escape(self):
+        package = {"id": "constant-local", "name": "novarocks-constant-contract",
+                   "source": None, "dependencies": [], "features": {}, "targets": []}
+        self.assertEqual(guard.verify_package(package, {"constant-local"}), [])
+        package["features"] = {"optional-runtime": []}
+        self.assertIn("unaudited Cargo feature variants", " ".join(
+            guard.verify_package(package, {"constant-local"})))
+        package["features"] = {}
+        package["dependencies"] = [{"name": "tokio", "kind": None, "optional": True,
+                                    "target": None, "features": [], "uses_default_features": True}]
+        violations = " ".join(guard.verify_package(package, {"constant-local"}))
+        self.assertIn("hides a normal edge", violations)
+        self.assertIn("runtime/wire/provider/storage capability: tokio", violations)
+        package["dependencies"][0].update(optional=False, target='cfg(target_os="none")')
+        self.assertIn("hides a normal edge", " ".join(
+            guard.verify_package(package, {"constant-local"})))
+        package["dependencies"][0].update(kind="build", target=None)
+        self.assertIn("declares a build dependency", " ".join(
+            guard.verify_package(package, {"constant-local"})))
 
 
 if __name__ == "__main__":
