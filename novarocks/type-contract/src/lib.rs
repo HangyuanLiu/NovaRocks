@@ -55,7 +55,7 @@ pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use logical::{
     MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
     ValueTypeError, field_logical_type, preserves_nested_logical_identity,
-    validate_nested_logical_types,
+    validate_nested_logical_types, validate_nested_logical_types_observed,
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,

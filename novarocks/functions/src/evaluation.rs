@@ -135,7 +135,7 @@ impl<'a> EvaluatedArgument<'a> {
         if self.array().len() != expected_rows {
             return Err(EvaluationContractError::ArgumentLength);
         }
-        if self.array().data_type() != exact_type {
+        if !novarocks_type_contract::arrow_data_types_exact(self.array().data_type(), exact_type) {
             return Err(EvaluationContractError::ArgumentType);
         }
         Ok(())
@@ -195,7 +195,7 @@ impl<'a> SelectedValues<'a> {
         if values.len() != selection.len() {
             return Err(EvaluationContractError::ResultLength);
         }
-        if values.data_type() != exact_type {
+        if !novarocks_type_contract::arrow_data_types_exact(values.data_type(), exact_type) {
             return Err(EvaluationContractError::ResultType);
         }
         if errors.len() > selection.len()

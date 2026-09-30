@@ -116,20 +116,35 @@ pub fn field_logical_type(field: &Field) -> Result<ValueLogicalType, ValueTypeEr
 /// This bound protects direct pure-catalog callers too, before recursive
 /// domain comparisons. The carrier's own structural/resource rules remain
 /// with its plan/codec owner.
-pub fn validate_nested_logical_types<'a>(root: &'a DataType) -> Result<(), ValueTypeError> {
+pub fn validate_nested_logical_types(root: &DataType) -> Result<(), ValueTypeError> {
+    validate_nested_logical_types_observed(root, || Ok(()))
+}
+
+/// Same bounded structural validation with a caller-owned work/control
+/// observer. Every type node and child edge is observed without a shadow
+/// validator or recursive type copy.
+pub fn validate_nested_logical_types_observed<'a, E>(
+    root: &'a DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<ValueTypeError>,
+{
     let mut pending = vec![(root, 1usize)];
     let mut visited = 0usize;
     while let Some((ty, depth)) = pending.pop() {
+        observe()?;
         visited += 1;
         if depth > MAX_VALUE_TYPE_DEPTH {
-            return Err(ValueTypeError::TooDeep);
+            return Err(ValueTypeError::TooDeep.into());
         }
         if visited > MAX_VALUE_TYPE_NODES {
-            return Err(ValueTypeError::TooManyNodes);
+            return Err(ValueTypeError::TooManyNodes.into());
         }
-        let mut push = |child: &'a DataType| {
+        let mut push = |child: &'a DataType| -> Result<(), E> {
+            observe()?;
             if visited + pending.len() >= MAX_VALUE_TYPE_NODES {
-                return Err(ValueTypeError::TooManyNodes);
+                return Err(ValueTypeError::TooManyNodes.into());
             }
             pending.push((child, depth + 1));
             Ok(())
@@ -356,5 +371,65 @@ mod tests {
         };
         assert_ne!(value(1), value(2));
         assert!(!value(1).same_value_domain(&value(2)));
+    }
+
+    #[test]
+    fn observed_validation_checks_child_edges_and_nodes_with_bounded_work() {
+        use crate::{CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
+        struct Control {
+            units: Mutex<Vec<u32>>,
+            cancel: bool,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                self.units.lock().unwrap().push(units);
+                if self.cancel && units > 0 {
+                    Err(CompileControlError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        #[derive(Debug, PartialEq)]
+        enum Failure {
+            Type(ValueTypeError),
+            Control(CompileControlError),
+        }
+        impl From<ValueTypeError> for Failure {
+            fn from(error: ValueTypeError) -> Self {
+                Self::Type(error)
+            }
+        }
+        let data_type = DataType::Struct(
+            (0..300)
+                .map(|n| std::sync::Arc::new(Field::new(n.to_string(), DataType::Int64, false)))
+                .collect(),
+        );
+        for cancel in [false, true] {
+            let control = Control {
+                units: Mutex::default(),
+                cancel,
+            };
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization)
+                    .unwrap();
+            let result = validate_nested_logical_types_observed::<Failure>(&data_type, || {
+                work.step().map_err(Failure::Control)
+            });
+            if cancel {
+                assert_eq!(
+                    result,
+                    Err(Failure::Control(CompileControlError::Cancelled))
+                );
+                assert_eq!(control.units.lock().unwrap().iter().sum::<u32>(), 256);
+            } else {
+                result.unwrap();
+                work.finish().unwrap();
+                let units = control.units.lock().unwrap();
+                assert_eq!(units.iter().sum::<u32>(), 601);
+                assert!(units.iter().all(|n| *n <= 256));
+            }
+        }
     }
 }

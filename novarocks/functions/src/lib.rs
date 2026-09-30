@@ -18,7 +18,8 @@
 //! Process-wide immutable engine function catalog.
 //!
 //! The catalog owns function identity, visibility and signature resolution.
-//! Execution-specific state erasure is intentionally not part of this crate.
+//! Scalar preparation and selected-batch invocation use neutral contracts.
+//! Aggregate arena placement and state erasure remain Execution-owned.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -31,6 +32,7 @@ use sha2::{Digest, Sha256};
 mod binding;
 mod effect_refinement;
 mod evaluation;
+mod scalar_kernel;
 
 pub use binding::*;
 pub use effect_refinement::*;
@@ -40,6 +42,7 @@ pub use novarocks_type_contract::{
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
     FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
 };
+pub use scalar_kernel::*;
 
 const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v5\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";

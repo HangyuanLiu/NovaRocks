@@ -209,13 +209,21 @@ impl RefinedCallEffects<'_> {
         input: CallEffectInput<'_>,
         arguments: ScopedExpressionEffects,
     ) -> Result<ScopedExpressionEffects, EffectContractError> {
+        if input.context != arguments.context() {
+            return Err(EffectContractError::CallIdentityMismatch);
+        }
+        self.validate_input(input)?;
+        arguments.with_verified_call(&self.effects)
+    }
+    /// Validate the exact immutable input borrow before owning specialization
+    /// facts. This does not compose or erase any child expression effects.
+    pub fn validate_input(&self, input: CallEffectInput<'_>) -> Result<(), EffectContractError> {
         let original = self.input;
         // The receipt borrows one immutable compilation input. Requiring those
         // exact borrows prevents attaching a proof to a different call without
         // repeatedly comparing/copying recursive schemas and constant backing.
         // These local addresses are never a wire, plan or profile identity.
         if original.context != input.context
-            || input.context != arguments.context()
             || !std::ptr::eq(original.argument_uses, input.argument_uses)
             || !std::ptr::eq(original.function_id, input.function_id)
             || original.kind != input.kind
@@ -229,7 +237,7 @@ impl RefinedCallEffects<'_> {
         {
             return Err(EffectContractError::CallIdentityMismatch);
         }
-        arguments.with_verified_call(&self.effects)
+        Ok(())
     }
 }
 
