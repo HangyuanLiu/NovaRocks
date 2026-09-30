@@ -647,7 +647,8 @@ fn every_control_and_guard_variant_roundtrips() {
 fn absent_mandatory_ids_and_oneofs_never_default_to_zero_or_eager() {
     let (fragment, roots) = binary_fixture();
     let encoded = encode_expression_control(&roots, &Control::default()).unwrap();
-    let mutations: &[(&str, fn(&mut wire::ExpressionControl))] = &[
+    type MissingFieldMutation = (&'static str, fn(&mut wire::ExpressionControl));
+    let mutations: &[MissingFieldMutation] = &[
         ("use domain is missing", |dto| dto.uses[0].domain_id = None),
         ("use definition is missing", |dto| {
             dto.uses[0].definition_id = None
@@ -754,7 +755,7 @@ fn duplicate_dangling_shared_and_reordered_use_graphs_keep_typed_rejections() {
     let (fragment, roots) = binary_fixture();
     let encoded = encode_expression_control(&roots, &Control::default()).unwrap();
     let mut forged = encoded.clone();
-    forged.domains.push(forged.domains[0].clone());
+    forged.domains.push(forged.domains[0]);
     assert_eq!(
         decode_expression_control(&fragment, &forged, &Control::default()).unwrap_err(),
         ControlCodecError::Flow(ExpressionControlFlowError::DuplicateIdentity)
@@ -809,7 +810,7 @@ fn duplicate_dangling_shared_and_reordered_use_graphs_keep_typed_rejections() {
         ControlCodecError::Roots(RootUseBindingError::SharedUse)
     );
     let mut forged = encode_expression_control(&roots, &Control::default()).unwrap();
-    forged.roots[1].site = forged.roots[0].site.clone();
+    forged.roots[1].site = forged.roots[0].site;
     assert_eq!(
         decode_expression_control(&fragment, &forged, &Control::default()).unwrap_err(),
         ControlCodecError::Roots(RootUseBindingError::DuplicateSite)
@@ -848,7 +849,7 @@ fn each_projection_and_validation_phase_observes_midwork_typed_control_failures(
             };
             assert_eq!(error, ControlCodecError::Control(failure));
             let observations = control.observations.lock().unwrap();
-            assert!(observations.iter().any(|item| *item == (phase, 256)));
+            assert!(observations.contains(&(phase, 256)));
             assert!(observations.iter().all(|(_, units)| *units <= 256));
         }
     }
