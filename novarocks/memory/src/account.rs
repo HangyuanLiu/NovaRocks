@@ -602,6 +602,7 @@ impl AccountHandle {
     }
 }
 
+// Design: ADR-0166 (docs/adr/ADR-0166-hierarchical-funding-and-stable-allocation-origins.md)
 pub(crate) fn grow_locked(
     request: &AccountHandle,
     path: &Path,

@@ -16,8 +16,6 @@ code-anchors:
   - "novarocks/memory-arrow/src/shared.rs (SharedRetention)"
 ---
 
-> 本条为历史裁决。MEM-1 M02a 由 ADR-0166 整体替换 Reservation 与 Arrow 谱系实现；下列源码锚点仅描述历史版本。
-
 ## 问题
 
 Arrow 的 backing 可被多个 batch、算子和作用域共享；容量权威如何在可拒绝的入口只为新 backing 付费，并让最后一个真实持有者释放后才撤账？

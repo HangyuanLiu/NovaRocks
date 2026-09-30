@@ -7,8 +7,8 @@ supersedes: [ADR-0160]
 superseded-by: null
 date: 2026-09-30
 provenance:
-  - "accepted: MEM-1 M02a design revision 3"
-  - "approved: MEM-1 M02a implementation plan revision 3, 2026-09-30"
+  - "discussion: 2026-09-29 independent funding, local stock and stable-origin retirement"
+  - "approval: 2026-09-30 hierarchical funding implementation and manual Linux acceptance"
 code-anchors:
   - "novarocks/memory/src/account.rs (Path, grow_locked, AccountHandle)"
   - "novarocks/memory/src/domain.rs (FundingDomain, split_free)"
@@ -19,7 +19,26 @@ code-anchors:
 
 ## 问题
 
-旧 Reservation 把每步结算送入共享叶子，并由最后持有者保活完整账户。根余额又同时表示配置目标和历史吸收量，未覆盖分配可能在全部释放后变成可再次授予的容量。没有生产分配消费者的 Arrow 谱系适配不能作为必须保留的资产。
+进程容量如何同时支持局部高频分配、独立可兑现授权、动态目标，以及执行账户退出后仍存活的分配责任？
+
+## 背景与执行事实
+
+| 实体 | 身份与责任 | 承重入口 |
+|---|---|---|
+| Account | 严格父链中的容量约束、独占 slack 与子域承诺；不是 allocation header 的寿命 owner | `AccountHandle`、`Path`、`grow_locked` |
+| FundingDomain | 独立的 A/L/O/E/F/C；不同域不得以净额抵消可兑现权 | `FundingDomain::split_free`、`settle` |
+| ScopeLease | 唯一活动发布者与本地 stock；不可跨线程移动或跨 await 持有 | `activate`、`record_allocation`、`finish` |
+| OwnerRecord | 稳定地址、不可变来源身份、live/访问计数；当前责任归属可在控制面转交 | `AllocationOrigin::record_deallocation`、`transfer_residual` |
+| CapacityWriter / maintenance | 唯一容量目标版本与有界结清；不撤销活动兑现权 | `set_capacity`、`maintain`、`shortage_is_fresh` |
+
+配置目标不是历史空闲余额。实际 C 包含未覆盖成功分配以及真实核心存储；归还 E 不能产生新的 A。每步 shared-leaf 事务会把工作频率变成跨线程竞争，完整账户强引用又使执行退出依赖最后一个分配的释放。ADR-0148 的单进程权威与观察责任保留，旧余额及通用仲裁框架由本条收敛；ADR-0160 的留存谱系整体替换。
+
+## 考虑过的选项
+
+- **每步进程或共享叶子事务：设计否决。** 容易获得一个统一快照，但让正常 funded 步强制竞争公共账本，违背局部执行责任与并行扩展要求。债务和授权控制仍必须具有显式慢路径。
+- **完整账户保活到最后 free：设计否决。** 强引用能保地址，却把执行账户退出与物理释放绑在一起；不能满足真实 teardown 后独立保留残留责任的生命周期合同。
+- **稳定小记录与分层量化控制：采用。** 正常步骤局部化，裸来源地址在发布/访问责任清零前保持稳定，退役转交同一记录。代价是记录实际字节持续收费，以及维护端承担最终归并和回收。
+- **立即复用固定 slot/generation：待评估。** generation 可区分身份，但尚不足以证明多代迟到 free 的目标路由、转交发布窗口、回绕和最后访问安全。没有完整协议与地址证明前，不作为稳定记录的等价实现。
 
 ## 裁决
 
@@ -40,11 +59,18 @@ code-anchors:
 
 ## 验证与限制
 
-行为测试覆盖独立域、split、债务、floor、动态目标、封口、退出 deadline、残留、metadata、结清后不足与管理分类。Loom 使用真实协议状态，限定有限操作数、最多三个参与者与两次抢占，不设置成功的时间/排列截断；地址生命周期另以 Miri 验证。Loom 已捕获最后 free 与记录回收之间遗漏 payload 撤账的竞态，长期反例随模型保留。
+行为测试覆盖独立域、split、债务、floor、动态目标、封口、退出 deadline、残留、metadata、结清后不足与管理分类。Loom 使用真实协议状态，限定有限操作数、最多三个参与者与两次抢占，不设置成功的时间/排列截断；地址生命周期另以 Miri 验证。并发模型覆盖最后 free 与记录回收、protected debt 归还和 drain/激活握手；模型不能代替裸地址及底层 allocator 的安全证明。
 
 性能入口保存固定 manifest、全部解析输入、真实 storage/工作集、原始 iteration 样本、父/root 余额交互以及实际资格门/账本等待和持有统计。锁等待/持有尾部使用有界对数直方图，报告桶上界与 overflow，不能冒充精确逐次样本。原生 Linux 独占性能验收由用户后续手动执行；macOS correctness smoke 不代表成本门通过。
 
 本条定义中立 teardown deadline 输入，不证明各生产 I/O owner 已交付退出上界。M02b/M03 接入安全点与 allocator，M08b 独立驱动回收，M10/M11 消费完整分类/新鲜收据并验证有界政策推进。
+
+## 接受的妥协（诚实记录）
+
+- 稳定记录以实际字节预算换取可审查的地址与归属寿命，不承诺 metadata 只随当前并发 owner 数增长。历史未释放对象会继续占用 payload 和记录预算，真实字节短缺仍可拒绝新工作。
+- 成功分配事实不可回滚；未覆盖 E 先进入责任账本，下一步独立拒绝。控制面及观测需区分已结算事实、hook 样本与不完整覆盖，不提供瞬时全树一致 L 快照。
+- 祖先资格门、债务和生命周期事务保留慢路径成本。正常局部化已有行为证据，Linux 尾延迟和吞吐门尚待手动采集，不以 macOS smoke 或软件计数器代替硬件成本。
+- 原始地址采用 unsafe 线性 free 合同，process authority 必须覆盖发布者与 outstanding origin。当前没有覆盖全部业务分配的新 allocator，也没有证明各生产 I/O owner 的退出上界；这些由对应 owner 接入验证。
 
 ## 何时重新评估
 
@@ -52,3 +78,5 @@ code-anchors:
 - 下游无法给出自有 I/O 的实际退出上界或可靠安全点：先修正 owner/责任交接设计，不把 timeout 当 teardown。
 - 需要跨 sponsor 移动活跃 L/O：先定义精确 owner/bound 集合与事务合同，不扩展 free-only split 为隐式迁移。
 - 正常存活进程的原始 allocation origin 必須由 process authority 覆盖其完整寿命；若新增比进程 owner 更长的分配寿命，需独立稳定存储退出协议。authority shutdown 只断开无发布或 raw 访问权的空记录，保留活动 scope、ExternalBound（含零字节）和未释放记录；process authority 须覆盖这些能力的完整寿命。
+
+- 固定 slot/generation 若取得多代路由、原子移交/回绕、发布者与最后访问回收的完整模型和真实地址证明，再评估其 metadata 收益；不得仅凭身份 CAS 替换存活证明。

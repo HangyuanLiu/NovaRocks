@@ -75,6 +75,7 @@ impl TeardownEvidence<'_> {
     }
 }
 impl AccountHandle {
+    // Design: ADR-0166 (docs/adr/ADR-0166-hierarchical-funding-and-stable-allocation-origins.md)
     pub fn retire(
         &self,
         evidence: &TeardownEvidence<'_>,

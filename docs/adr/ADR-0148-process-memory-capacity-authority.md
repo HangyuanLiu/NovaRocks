@@ -15,8 +15,6 @@ code-anchors:
   - "novarocks-server/src/memory_observation.rs (GLOBAL)"
 ---
 
-> ADR-0166 替换本条旧 reserved/local_free 余额、Arrow charge 与通用仲裁框架。唯一进程权威、两级覆盖及观察责任仍有效；ADR-0163 保留 jemalloc/cgroup 观察。下文旧类型与成本收据为历史记录。
-
 ## 问题
 
 一个进程如何在 Rust 与 Arrow 之上，说清内存由谁持有、哪些容量已经不可重复授予、何时真正释放——并且让 spill、resource group、内存队列、资源观测与 query OOM kill 五类消费者共用同一份事实？

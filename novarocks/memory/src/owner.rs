@@ -62,6 +62,7 @@ impl OwnerRecord {
 /// An opaque origin to store in an allocation header. It owns no account or
 /// query reference. Copying a value does not mint an allocation obligation.
 #[derive(Debug, Clone, Copy)]
+// Design: ADR-0166 (docs/adr/ADR-0166-hierarchical-funding-and-stable-allocation-origins.md)
 pub struct AllocationOrigin(*const OwnerRecord);
 // Origin publication is protected by a scope; outstanding allocations pin it
 // through their allocation count. Actual use remains an unsafe linear contract.
