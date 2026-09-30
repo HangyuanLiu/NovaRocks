@@ -30,8 +30,8 @@ use novarocks_functions::{
     validate_function_value_type_observed,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
-    arrow_data_types_exact_observed,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
+    ValueLogicalType, ValueTypeError, arrow_data_types_exact_observed,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -51,6 +51,7 @@ pub enum ProgramExpressionTypeError {
     WrongKind,
     WrongLambda,
     TypeMismatch,
+    WrongDemand,
 }
 impl From<CompileControlError> for ProgramExpressionTypeError {
     fn from(value: CompileControlError) -> Self {
@@ -133,6 +134,24 @@ impl ProgramTypedExpressions {
                         validate(value, &mut work)?;
                         same_carrier(definition.data_type(), &value.data_type, &mut work)?;
                     }
+                }
+            }
+        }
+        for (arena, flow) in calls.snapshot().flows() {
+            let entries = &types[arena];
+            for invocation in flow.uses().values() {
+                work.step()?;
+                let result = match &entries[invocation.definition.index()] {
+                    FunctionArgumentType::Value(value) => value,
+                    // LambdaBody demand belongs to its final body result;
+                    // the wrapper itself is a lexical callable, not a value.
+                    FunctionArgumentType::Lambda { result_type, .. } => result_type,
+                };
+                if invocation.context.demand == EvaluationDemand::TruthOnly
+                    && (result.data_type != arrow_schema::DataType::Boolean
+                        || result.logical_type != ValueLogicalType::Physical)
+                {
+                    return Err(ProgramExpressionTypeError::WrongDemand);
                 }
             }
         }

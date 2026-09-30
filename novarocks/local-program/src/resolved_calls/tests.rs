@@ -1218,14 +1218,39 @@ fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
         .unwrap_err(),
         ProgramResolvedCallsError::MissingSite(scope(4)),
     );
+    // Ordered intrinsic children are now checked before any call token is
+    // attached. Keep the actual sources/guards and change only edge order.
+    let snapshot = higher_snapshot_locals(1, true, false);
+    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
+    let mut uses = flow.uses().values().cloned().collect::<Vec<_>>();
+    uses.iter_mut()
+        .find(|invocation| invocation.context.use_id == ExpressionUseId::new(2))
+        .unwrap()
+        .arguments
+        .reverse();
+    let wrong = ProgramControlFlow::try_new(
+        flow.domains().values().copied().collect(),
+        uses,
+        snapshot.program().expressions().nodes().len(),
+        &Control::default(),
+    )
+    .unwrap();
     assert_eq!(
-        ProgramResolvedCalls::try_new(
-            higher_snapshot_locals(1, true, true),
-            vec![(scope(0), higher), (scope(4), common)],
+        ProgramRootControlBindings::try_new(
+            snapshot.program().clone(),
+            BTreeMap::from([(ProgramExpressionArena::Main, wrong)]),
+            snapshot
+                .bindings()
+                .iter()
+                .map(|(site, use_id)| ProgramRootUseBinding {
+                    site: *site,
+                    use_id: *use_id
+                })
+                .collect(),
             &Control::default(),
         )
         .unwrap_err(),
-        ProgramResolvedCallsError::WrongBody,
+        crate::ProgramRootBindingError::WrongArguments,
     );
     assert_eq!(owner.instances.load(Ordering::Relaxed), 0);
 }

@@ -22,11 +22,11 @@
 
 use crate::{
     ImmutableExpressions, JoinType, LocalProgram, NestedLoopJoinType, ProgramControlFlow,
-    ProgramExprId, ProgramNodeId, ProgramNodeKind, UnpivotConstant,
+    ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, ExpressionUseId,
-    MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
+    ExpressionUseId, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -614,6 +614,8 @@ pub enum ProgramRootBindingError {
     TooManyItems,
     InvalidArena,
     InvalidDefinition,
+    WrongControl,
+    WrongArguments,
     InvalidRoot,
     DuplicateSite,
     SharedRootUse,
@@ -629,7 +631,8 @@ impl std::error::Error for ProgramRootBindingError {}
 /// Root/control correspondence owned with the same actual program snapshot.
 /// A caller cannot attach a receipt from another equally sized program or
 /// supply an independent root table. This is a prerequisite for complete
-/// resolved expression construction, not a type/owner/effect verifier. The
+/// resolved expression construction. Actual intrinsic shape and ordered
+/// children are checked; types and exact function-owner effects are not. The
 /// common invocation-entry plus ordered-argument budget applies across all
 /// arena scopes; root-field references have their own common bounded table.
 #[derive(Clone, Debug)]
@@ -671,6 +674,7 @@ impl ProgramRootControlBindings {
                     return Err(ProgramRootBindingError::InvalidDefinition);
                 }
             }
+            validate_intrinsic_correspondence(arena, flow, &mut work)?;
             for use_id in flow.root_use_ids() {
                 work.step().map_err(ProgramRootBindingError::Control)?;
                 all_roots.insert((*scope, *use_id));
@@ -726,6 +730,151 @@ impl ProgramRootControlBindings {
     pub fn bindings(&self) -> &BTreeMap<ProgramExpressionRootSite, ExpressionUseId> {
         &self.bindings
     }
+}
+
+/// Match actual ordered source children without creating a second expression
+/// table. Function-call control belongs to the exact frozen implementation;
+/// no legacy family name can establish it here.
+fn validate_intrinsic_correspondence(
+    arena: &ImmutableExpressions,
+    flow: &ProgramControlFlow,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramRootBindingError> {
+    for invocation in flow.uses().values() {
+        work.step().map_err(ProgramRootBindingError::Control)?;
+        let definition = arena
+            .node(invocation.definition)
+            .ok_or(ProgramRootBindingError::InvalidDefinition)?;
+        let expected = match definition.kind() {
+            StaticExprKind::FunctionCall { .. } => continue,
+            StaticExprKind::And(..) => ControlShape::Conjunction,
+            StaticExprKind::Or(..) => ControlShape::Disjunction,
+            StaticExprKind::LambdaFunction { .. } => ControlShape::LambdaBody,
+            StaticExprKind::Case {
+                has_case_expr,
+                has_else_expr,
+                children,
+            } => {
+                let pairs = children
+                    .len()
+                    .checked_sub(usize::from(*has_case_expr) + usize::from(*has_else_expr))
+                    .filter(|count| *count >= 2 && count % 2 == 0)
+                    .ok_or(ProgramRootBindingError::WrongArguments)?;
+                ControlShape::Case {
+                    simple: *has_case_expr,
+                    arms: u32::try_from(pairs / 2)
+                        .map_err(|_| ProgramRootBindingError::WrongArguments)?,
+                    has_else: *has_else_expr,
+                }
+            }
+            StaticExprKind::Literal(_)
+            | StaticExprKind::SlotId(_)
+            | StaticExprKind::ArrayExpr { .. }
+            | StaticExprKind::StructExpr { .. }
+            | StaticExprKind::DictDecode { .. }
+            | StaticExprKind::Cast(..)
+            | StaticExprKind::CastTime(..)
+            | StaticExprKind::CastTimeFromDatetime(..)
+            | StaticExprKind::Add(..)
+            | StaticExprKind::Sub(..)
+            | StaticExprKind::Mul(..)
+            | StaticExprKind::Div(..)
+            | StaticExprKind::Mod(..)
+            | StaticExprKind::Eq(..)
+            | StaticExprKind::EqForNull(..)
+            | StaticExprKind::Ne(..)
+            | StaticExprKind::Lt(..)
+            | StaticExprKind::Le(..)
+            | StaticExprKind::Gt(..)
+            | StaticExprKind::Ge(..)
+            | StaticExprKind::Not(..)
+            | StaticExprKind::IsNull(..)
+            | StaticExprKind::IsNotNull(..)
+            | StaticExprKind::In { .. }
+            | StaticExprKind::Clone(..) => ControlShape::Eager,
+        };
+        if invocation.control != expected {
+            return Err(ProgramRootBindingError::WrongControl);
+        }
+        let mut ordinal = 0usize;
+        let mut child = |expected| -> Result<(), ProgramRootBindingError> {
+            work.step().map_err(ProgramRootBindingError::Control)?;
+            let use_id = invocation
+                .arguments
+                .get(ordinal)
+                .ok_or(ProgramRootBindingError::WrongArguments)?;
+            if flow.uses()[use_id].definition != expected {
+                return Err(ProgramRootBindingError::WrongArguments);
+            }
+            ordinal += 1;
+            Ok(())
+        };
+        match definition.kind() {
+            StaticExprKind::Literal(_) | StaticExprKind::SlotId(_) => {}
+            StaticExprKind::ArrayExpr { elements }
+            | StaticExprKind::StructExpr { fields: elements }
+            | StaticExprKind::Case {
+                children: elements, ..
+            } => {
+                for definition in elements {
+                    child(*definition)?;
+                }
+            }
+            StaticExprKind::LambdaFunction {
+                body,
+                common_sub_exprs,
+                ..
+            } => {
+                // Local computations execute in declaration order, then body.
+                for (_, definition) in common_sub_exprs {
+                    child(*definition)?;
+                }
+                child(*body)?;
+            }
+            StaticExprKind::DictDecode {
+                child: definition, ..
+            }
+            | StaticExprKind::Cast(definition, _)
+            | StaticExprKind::CastTime(definition, _)
+            | StaticExprKind::CastTimeFromDatetime(definition, _)
+            | StaticExprKind::Not(definition)
+            | StaticExprKind::IsNull(definition)
+            | StaticExprKind::IsNotNull(definition)
+            | StaticExprKind::Clone(definition) => child(*definition)?,
+            StaticExprKind::Add(a, b, _)
+            | StaticExprKind::Sub(a, b, _)
+            | StaticExprKind::Mul(a, b, _)
+            | StaticExprKind::Div(a, b, _)
+            | StaticExprKind::Mod(a, b, _)
+            | StaticExprKind::Eq(a, b)
+            | StaticExprKind::EqForNull(a, b)
+            | StaticExprKind::Ne(a, b)
+            | StaticExprKind::Lt(a, b)
+            | StaticExprKind::Le(a, b)
+            | StaticExprKind::Gt(a, b)
+            | StaticExprKind::Ge(a, b)
+            | StaticExprKind::And(a, b)
+            | StaticExprKind::Or(a, b) => {
+                child(*a)?;
+                child(*b)?;
+            }
+            StaticExprKind::In {
+                child: definition,
+                values,
+                ..
+            } => {
+                child(*definition)?;
+                for definition in values {
+                    child(*definition)?;
+                }
+            }
+            StaticExprKind::FunctionCall { .. } => unreachable!("frozen owner checks calls"),
+        }
+        if ordinal != invocation.arguments.len() {
+            return Err(ProgramRootBindingError::WrongArguments);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

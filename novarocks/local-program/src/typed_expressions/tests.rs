@@ -17,10 +17,12 @@
 
 use super::*;
 use crate::{
-    BindingRequirement, BindingRequirements, CompileProfile, ImmutableExpressions,
-    KernelAbiVersion, LocalProgram, ProgramControlFlow, ProgramEvaluationDomain, ProgramNode,
-    ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, StaticExprNode, StaticLayout,
-    StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues,
+    BindingRequirement, BindingRequirements, CompileProfile, ControlShape, ImmutableExpressions,
+    KernelAbiVersion, LocalProgram, ProgramControlFlow, ProgramEvaluationDomain,
+    ProgramExpressionRootSite, ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole,
+    ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, ProgramRootUseBinding,
+    StaticExprNode, StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch,
+    StaticValues,
 };
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -33,6 +35,154 @@ use std::{collections::HashMap, num::NonZeroUsize};
 struct Control {
     at: Option<u32>,
     failure: Option<CompileControlError>,
+}
+
+fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
+    let nodes = arena(vec![StaticExprNode::new(
+        StaticExprKind::Literal(StaticLiteral::Null),
+        ty.clone(),
+        None,
+    )]);
+    let source_schema = Arc::new(Schema::new(vec![Field::new(
+        "source",
+        DataType::Boolean,
+        false,
+    )]));
+    let source_layout =
+        StaticLayout::try_new(source_schema.clone(), Arc::from([SlotId::new(1)])).unwrap();
+    let values = StaticValues::try_new(
+        RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(BooleanArray::from(vec![true]))],
+        )
+        .unwrap(),
+        source_layout.clone(),
+    )
+    .unwrap();
+    let output = StaticLayout::try_new(
+        Arc::new(Schema::new(vec![Field::new("result", ty, true)])),
+        Arc::from([SlotId::new(2)]),
+    )
+    .unwrap();
+    let program = LocalProgram::try_new(
+        vec![
+            ProgramNode::new(0, ProgramNodeKind::Values { values }, source_layout.clone()),
+            ProgramNode::new(
+                1,
+                ProgramNodeKind::Filter {
+                    input: ProgramNodeId::new(0),
+                    predicate: ProgramExprId::new(0),
+                },
+                source_layout,
+            ),
+            ProgramNode::new(
+                2,
+                ProgramNodeKind::Project {
+                    input: ProgramNodeId::new(1),
+                    is_subordinate: false,
+                    exprs: vec![ProgramExprId::new(0)],
+                    expr_slot_ids: vec![SlotId::new(2)],
+                    expr_slot_schemas: None,
+                    output_indices: None,
+                },
+                output.clone(),
+            ),
+        ],
+        ProgramNodeId::new(2),
+        nodes,
+        CompileProfile::new(
+            NonZeroUsize::new(1).unwrap(),
+            None,
+            output.identity().unwrap(),
+            KernelAbiVersion::CURRENT,
+        ),
+        BindingRequirements::try_new(vec![]).unwrap(),
+    )
+    .unwrap();
+    let flow = ProgramControlFlow::try_new(
+        vec![ProgramEvaluationDomain {
+            id: EvaluationDomainId::new(0),
+            parent: None,
+            guard: None,
+        }],
+        [EvaluationDemand::TruthOnly, EvaluationDemand::Value]
+            .into_iter()
+            .enumerate()
+            .map(|(index, demand)| ProgramExpressionUse {
+                context: novarocks_type_contract::ExpressionEffectContext {
+                    use_id: novarocks_type_contract::ExpressionUseId::new(index as u32),
+                    domain: EvaluationDomainId::new(0),
+                    demand,
+                },
+                definition: ProgramExprId::new(0),
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            })
+            .collect(),
+        1,
+        &Control::default(),
+    )
+    .unwrap();
+    let bindings = [
+        ProgramNodeExpressionRole::FilterPredicate,
+        ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, role)| ProgramRootUseBinding {
+        site: ProgramExpressionRootSite::Node {
+            node: ProgramNodeId::new(index + 1),
+            role,
+        },
+        use_id: novarocks_type_contract::ExpressionUseId::new(index as u32),
+    })
+    .collect();
+    let snapshot = ProgramRootControlBindings::try_new(
+        program,
+        BTreeMap::from([(ProgramExpressionArena::Main, flow)]),
+        bindings,
+        &Control::default(),
+    )
+    .unwrap();
+    ProgramResolvedCalls::try_new(snapshot, vec![], &Control::default()).unwrap()
+}
+
+#[test]
+fn actual_truth_only_uses_require_boolean_without_erasing_shared_value_nullability() {
+    let typed = ProgramTypedExpressions::try_new(
+        shared_truth_value_fixture(DataType::Boolean),
+        main_types(vec![value(DataType::Boolean, true)]),
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        typed.definition_type(ProgramExpressionArena::Main, ProgramExprId::new(0)),
+        Some(&value(DataType::Boolean, true))
+    );
+    let uses = typed.resolved_calls().snapshot().flows()[&ProgramExpressionArena::Main].uses();
+    assert_eq!(
+        uses[&novarocks_type_contract::ExpressionUseId::new(0)]
+            .context
+            .demand,
+        EvaluationDemand::TruthOnly
+    );
+    assert_eq!(
+        uses[&novarocks_type_contract::ExpressionUseId::new(1)]
+            .context
+            .demand,
+        EvaluationDemand::Value
+    );
+    for ty in [DataType::Utf8, DataType::Int64, DataType::Null] {
+        assert_eq!(
+            ProgramTypedExpressions::try_new(
+                shared_truth_value_fixture(ty.clone()),
+                main_types(vec![value(ty, true)]),
+                &Control::default()
+            )
+            .unwrap_err(),
+            ProgramExpressionTypeError::WrongDemand
+        );
+    }
 }
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {

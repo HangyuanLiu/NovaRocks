@@ -16,7 +16,8 @@
 // under the License.
 
 //! Actual program/root correspondence; these tests do not establish expression
-//! type/control-shape, function-owner, effect or runtime evaluation proofs.
+//! type, function-owner, effect or runtime evaluation proofs. Intrinsic shape
+//! and ordered-child correspondence are checked against actual definitions.
 
 use super::*;
 use crate::{
@@ -427,7 +428,18 @@ fn orphan_flow_root_and_binding_to_nonroot_use_are_rejected() {
         .unwrap_err(),
         ProgramRootBindingError::IncompleteCoverage
     );
-    let mut owner = invocation(0, 0, EvaluationDemand::Value);
+    let mut owner = invocation(0, 1, EvaluationDemand::Value);
+    let program = project_program(
+        expressions(
+            vec![
+                StaticExprKind::Literal(StaticLiteral::Bool(true)),
+                StaticExprKind::Clone(ProgramExprId::new(0)),
+            ],
+            vec![DataType::Boolean; 2],
+        ),
+        vec![0],
+        DataType::Boolean,
+    );
     owner.arguments = vec![ExpressionUseId::new(1)].into_boxed_slice();
     let child = flow(vec![owner, invocation(1, 0, EvaluationDemand::Value)], 2);
     assert_eq!(
@@ -444,8 +456,18 @@ fn orphan_flow_root_and_binding_to_nonroot_use_are_rejected() {
 
 #[test]
 fn definition_membership_checks_child_uses_against_actual_arena() {
-    let program = project_program(bool_arena(), vec![0], DataType::Boolean);
-    let mut owner = invocation(0, 0, EvaluationDemand::Value);
+    let program = project_program(
+        expressions(
+            vec![
+                StaticExprKind::Literal(StaticLiteral::Bool(true)),
+                StaticExprKind::Clone(ProgramExprId::new(0)),
+            ],
+            vec![DataType::Boolean; 2],
+        ),
+        vec![1],
+        DataType::Boolean,
+    );
+    let mut owner = invocation(0, 1, EvaluationDemand::Value);
     owner.arguments = vec![ExpressionUseId::new(1)].into_boxed_slice();
     // The standalone flow's advertised count admits definition 2. The actual
     // program has only definitions 0 and 1, and the bad use is not a root.
@@ -460,6 +482,258 @@ fn definition_membership_checks_child_uses_against_actual_arena() {
         .unwrap_err(),
         ProgramRootBindingError::InvalidDefinition
     );
+}
+
+fn intrinsic_snapshot(
+    kind: StaticExprKind,
+    shape: ControlShape,
+    children: &[usize],
+) -> Result<ProgramRootControlBindings, ProgramRootBindingError> {
+    let arena = expressions(
+        vec![
+            StaticExprKind::Literal(StaticLiteral::Bool(true)),
+            StaticExprKind::Literal(StaticLiteral::Bool(false)),
+            kind,
+        ],
+        vec![DataType::Boolean; 3],
+    );
+    let mut root = invocation(10, 2, EvaluationDemand::Value);
+    root.control = shape;
+    root.arguments = (0..children.len())
+        .map(|ordinal| ExpressionUseId::new(ordinal as u32))
+        .collect();
+    let uses = std::iter::once(root)
+        .chain(children.iter().enumerate().map(|(ordinal, definition)| {
+            invocation(ordinal as u32, *definition, EvaluationDemand::Value)
+        }))
+        .collect();
+    ProgramRootControlBindings::try_new(
+        project_program(arena, vec![2], DataType::Boolean),
+        main_flow(flow(uses, 3)),
+        vec![binding(project_site(0), 10)],
+        &Control::default(),
+    )
+}
+
+#[test]
+fn actual_intrinsic_shape_and_zero_child_leaves_cannot_be_relabelled() {
+    for kind in [
+        StaticExprKind::Literal(StaticLiteral::Bool(true)),
+        StaticExprKind::SlotId(SlotId::new(1)),
+    ] {
+        intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[]).unwrap();
+        assert_eq!(
+            intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[0]).unwrap_err(),
+            ProgramRootBindingError::WrongArguments
+        );
+        assert_eq!(
+            intrinsic_snapshot(kind, ControlShape::Conjunction, &[0]).unwrap_err(),
+            ProgramRootBindingError::WrongControl
+        );
+    }
+    for (kind, expected) in [
+        (
+            StaticExprKind::And(ProgramExprId::new(0), ProgramExprId::new(1)),
+            ControlShape::Conjunction,
+        ),
+        (
+            StaticExprKind::Or(ProgramExprId::new(0), ProgramExprId::new(1)),
+            ControlShape::Disjunction,
+        ),
+    ] {
+        intrinsic_snapshot(kind.clone(), expected, &[0, 1]).unwrap();
+        assert_eq!(
+            intrinsic_snapshot(kind, ControlShape::Eager, &[0, 1]).unwrap_err(),
+            ProgramRootBindingError::WrongControl
+        );
+    }
+    for kind in [
+        StaticExprKind::Not(ProgramExprId::new(0)),
+        StaticExprKind::IsNull(ProgramExprId::new(0)),
+        StaticExprKind::Clone(ProgramExprId::new(0)),
+    ] {
+        intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[0]).unwrap();
+        assert_eq!(
+            intrinsic_snapshot(kind, ControlShape::Conjunction, &[0]).unwrap_err(),
+            ProgramRootBindingError::WrongControl
+        );
+    }
+}
+
+#[test]
+fn actual_ordered_primitive_children_and_lambda_common_then_body_are_preserved() {
+    for kind in [
+        StaticExprKind::Eq(ProgramExprId::new(0), ProgramExprId::new(1)),
+        StaticExprKind::ArrayExpr {
+            elements: vec![ProgramExprId::new(0), ProgramExprId::new(1)],
+        },
+        StaticExprKind::StructExpr {
+            fields: vec![ProgramExprId::new(0), ProgramExprId::new(1)],
+        },
+        StaticExprKind::In {
+            child: ProgramExprId::new(0),
+            values: vec![ProgramExprId::new(1)],
+            is_not_in: false,
+        },
+    ] {
+        intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[0, 1]).unwrap();
+        assert_eq!(
+            intrinsic_snapshot(kind.clone(), ControlShape::Eager, &[1, 0]).unwrap_err(),
+            ProgramRootBindingError::WrongArguments
+        );
+        assert_eq!(
+            intrinsic_snapshot(kind, ControlShape::Eager, &[0]).unwrap_err(),
+            ProgramRootBindingError::WrongArguments
+        );
+    }
+    let lambda = StaticExprKind::LambdaFunction {
+        body: ProgramExprId::new(1),
+        arg_slots: vec![SlotId::new(9)],
+        common_sub_exprs: vec![(SlotId::new(10), ProgramExprId::new(0))],
+        is_nondeterministic: false,
+    };
+    intrinsic_snapshot(lambda.clone(), ControlShape::LambdaBody, &[0, 1]).unwrap();
+    assert_eq!(
+        intrinsic_snapshot(lambda.clone(), ControlShape::LambdaBody, &[1, 0]).unwrap_err(),
+        ProgramRootBindingError::WrongArguments
+    );
+    assert_eq!(
+        intrinsic_snapshot(lambda, ControlShape::Eager, &[0, 1]).unwrap_err(),
+        ProgramRootBindingError::WrongControl
+    );
+}
+
+#[test]
+fn malformed_case_source_arity_cannot_hide_behind_generic_eager_flow() {
+    for (has_case_expr, has_else_expr, children) in [
+        (false, false, vec![ProgramExprId::new(0)]),
+        (
+            true,
+            true,
+            vec![ProgramExprId::new(0), ProgramExprId::new(1)],
+        ),
+    ] {
+        assert_eq!(
+            intrinsic_snapshot(
+                StaticExprKind::Case {
+                    has_case_expr,
+                    has_else_expr,
+                    children
+                },
+                ControlShape::Eager,
+                &[]
+            )
+            .unwrap_err(),
+            ProgramRootBindingError::WrongArguments
+        );
+    }
+    assert_eq!(
+        intrinsic_snapshot(
+            StaticExprKind::Case {
+                has_case_expr: false,
+                has_else_expr: false,
+                children: vec![ProgramExprId::new(0), ProgramExprId::new(1)]
+            },
+            ControlShape::Eager,
+            &[0, 1]
+        )
+        .unwrap_err(),
+        ProgramRootBindingError::WrongControl
+    );
+}
+
+#[test]
+fn guarded_case_flags_and_source_order_match_actual_flat_children() {
+    for simple in [false, true] {
+        for has_else in [false, true] {
+            let shape = ControlShape::Case {
+                simple,
+                arms: 1,
+                has_else,
+            };
+            let definitions: Vec<usize> = std::iter::repeat_n(0, usize::from(simple))
+                .chain([0, 1])
+                .chain(std::iter::repeat_n(1, usize::from(has_else)))
+                .collect();
+            let arena = expressions(
+                vec![
+                    StaticExprKind::Literal(StaticLiteral::Bool(true)),
+                    StaticExprKind::Literal(StaticLiteral::Bool(false)),
+                    StaticExprKind::Case {
+                        has_case_expr: simple,
+                        has_else_expr: has_else,
+                        children: definitions
+                            .iter()
+                            .map(|definition| ProgramExprId::new(*definition))
+                            .collect(),
+                    },
+                ],
+                vec![DataType::Boolean; 3],
+            );
+            let mut root = invocation(10, 2, EvaluationDemand::Value);
+            root.context.domain = EvaluationDomainId::new(0);
+            root.control = shape;
+            root.arguments = (0..definitions.len())
+                .map(|ordinal| ExpressionUseId::new(ordinal as u32))
+                .collect();
+            let mut domains = vec![ProgramEvaluationDomain {
+                id: EvaluationDomainId::new(0),
+                parent: None,
+                guard: None,
+            }];
+            let mut uses = vec![root];
+            for (ordinal, definition) in definitions.iter().enumerate() {
+                let (demand, guard) = novarocks_type_contract::control_argument_semantics(
+                    shape,
+                    definitions.len(),
+                    ordinal,
+                    EvaluationDemand::Value,
+                )
+                .unwrap();
+                let domain = if let Some(kind) = guard {
+                    let id = EvaluationDomainId::new(ordinal as u32 + 1);
+                    domains.push(ProgramEvaluationDomain {
+                        id,
+                        parent: Some(EvaluationDomainId::new(0)),
+                        guard: Some(novarocks_type_contract::DomainGuard {
+                            owner: ExpressionUseId::new(10),
+                            kind,
+                        }),
+                    });
+                    id
+                } else {
+                    EvaluationDomainId::new(0)
+                };
+                let mut child = invocation(ordinal as u32, *definition, demand);
+                child.context.domain = domain;
+                uses.push(child);
+            }
+            let valid =
+                ProgramControlFlow::try_new(domains.clone(), uses.clone(), 3, &Control::default())
+                    .unwrap();
+            let program = project_program(arena, vec![2], DataType::Boolean);
+            ProgramRootControlBindings::try_new(
+                program.clone(),
+                main_flow(valid),
+                vec![binding(project_site(0), 10)],
+                &Control::default(),
+            )
+            .unwrap();
+            // Keep real guards/demand and change only the THEN source identity.
+            uses[usize::from(simple) + 2].definition = ProgramExprId::new(0);
+            let wrong = ProgramControlFlow::try_new(domains, uses, 3, &Control::default()).unwrap();
+            assert_eq!(
+                ProgramRootControlBindings::try_new(
+                    program,
+                    main_flow(wrong),
+                    vec![binding(project_site(0), 10)],
+                    &Control::default()
+                )
+                .unwrap_err(),
+                ProgramRootBindingError::WrongArguments
+            );
+        }
+    }
 }
 
 #[test]
