@@ -4051,8 +4051,6 @@ mod tests {
                 ProviderReadLimitFact::Exact,
             ),
             provided_properties: ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         }
     }

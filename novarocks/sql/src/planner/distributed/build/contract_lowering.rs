@@ -32,8 +32,8 @@ use arrow::datatypes::DataType;
 use novarocks_physical_plan::ProviderReadOccurrenceId;
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregateGrouping,
-    AggregatePhase, AggregateSequenceId, ArtifactRefId, BinaryOperator, BoundFunction,
-    BoundTableFunction, BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
+    AggregatePhase, AggregateSequenceId, BinaryOperator, BoundFunction, BoundTableFunction,
+    BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
     ChangeStreamRoute as ContractChangeStreamRoute, DataRelation, Distribution, Edge,
     EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
     ExprKind as ContractExprKind, Fragment, FragmentBuilder, FragmentId, FragmentSink,
@@ -53,7 +53,7 @@ use novarocks_physical_plan::{
     RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterLineageStep,
     RuntimeFilterNullSemantics, RuntimeFilterOrderKey, RuntimeFilterPolicy, RuntimeFilterProducer,
     RuntimeFilterProducerProgress, RuntimeFilterProducerTarget, RuntimeFilterReduction,
-    RuntimeFilterWitnessId, SealedArtifactRef, SetOperationKind, SortDirection, SortExpr, SortMode,
+    RuntimeFilterWitnessId, SetOperationKind, SortDirection, SortExpr, SortMode,
     TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId, UnaryOperator,
     UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValidationErrors,
     ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -257,7 +257,6 @@ struct ContractLoweringVisitor {
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
     plan_builder: PlanBuilder,
-    artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     provider_partition_definitions: BTreeMap<PartitionSpaceId, ProviderPartitionDefinition>,
     dop_domain: PipelineDopDomain,
     provider_reads: Option<FinalizedProviderReadSet>,
@@ -1287,7 +1286,6 @@ impl ContractLoweringVisitor {
             completions: BTreeMap::new(),
             plan_version: version,
             plan_builder: PlanBuilder::new(version),
-            artifact_refs: BTreeMap::new(),
             provider_partition_definitions: BTreeMap::new(),
             dop_domain,
             provider_reads,
@@ -1330,28 +1328,6 @@ impl ContractLoweringVisitor {
                 .get_mut(&fragment)
                 .expect("runtime-filter endpoint fragment has been allocated")
                 .attach_runtime_filter(filter)?;
-        }
-        Ok(())
-    }
-
-    fn register_provider_artifacts(
-        &mut self,
-        artifacts: &[SealedArtifactRef],
-    ) -> Result<(), ContractLoweringError> {
-        for artifact in artifacts {
-            if let Some(existing) = self.artifact_refs.get(&artifact.id) {
-                if existing != artifact {
-                    return Err(ContractLoweringError::ProviderRead {
-                        detail: format!(
-                            "provider reads carry conflicting sealed artifact reference {}",
-                            artifact.id.get()
-                        ),
-                    });
-                }
-                continue;
-            }
-            self.plan_builder.add_artifact_ref(artifact.clone())?;
-            self.artifact_refs.insert(artifact.id, artifact.clone());
         }
         Ok(())
     }
@@ -2528,7 +2504,6 @@ impl ContractLoweringVisitor {
             &contract.read,
             &provider_values_by_request_ordinal,
         )?;
-        self.register_provider_artifacts(&contract.artifact_refs)?;
         let relation = match contract.request.relation() {
             ProviderReadRelationNeed::Metadata { kind, .. } => {
                 Relation::Metadata(MetadataRelation {
@@ -2540,7 +2515,7 @@ impl ContractLoweringVisitor {
                     predicate_guarantees: guarantees.into_boxed_slice(),
                     provided_properties: properties.clone(),
                     coverage_evidence: contract.coverage_evidence,
-                    artifact_inputs: contract.artifact_inputs,
+                    artifact_inputs: Box::default(),
                 })
             }
             _ => Relation::Data(DataRelation {
@@ -2550,7 +2525,7 @@ impl ContractLoweringVisitor {
                 schema: relation_schema.into_boxed_slice(),
                 predicate_guarantees: guarantees.into_boxed_slice(),
                 provided_properties: properties.clone(),
-                artifact_inputs: contract.artifact_inputs,
+                artifact_inputs: Box::default(),
             }),
         };
         self.fragment_mut().add_scan(
@@ -10259,9 +10234,8 @@ mod tests {
     use std::collections::HashMap;
 
     use novarocks_physical_plan::{
-        ArtifactFormat, ArtifactFormatId, ArtifactInputRequirement, ArtifactKind,
-        ArtifactSourceBinding, CoverageRange, CoverageSet, ExactInputVersion, NodeKind,
-        PhysicalPlan, ProviderColumnReference, ProviderReadReference, ValueOrigin,
+        ExactInputVersion, NodeKind, PhysicalPlan, ProviderColumnReference, ProviderReadReference,
+        ValueOrigin,
     };
     use novarocks_spi::connector::read_stack::{
         ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource,
@@ -11408,26 +11382,6 @@ mod tests {
                 encoded_provider_payload(&provider_binding, ConnectorCodecCategory::ReadView),
             ),
         };
-        let artifact = ArtifactRefId::new(7);
-        let artifact_kind = ArtifactKind::try_new("split-directory").unwrap();
-        let artifact_format = ArtifactFormat {
-            id: ArtifactFormatId::try_new("uea5.provider-artifact").unwrap(),
-            revision: 1,
-        };
-        let artifact_schema: Box<[ValueType]> = Box::from([value_type(&row_id)]);
-        let artifact_source = ArtifactSourceBinding {
-            source: read.clone(),
-            selection_digest: [8; 32],
-        };
-        let artifact_coverage = CoverageSet {
-            domain: "manifest-entry".into(),
-            selection_digest: [8; 32],
-            ranges: Box::from([CoverageRange {
-                start: None,
-                end: None,
-            }]),
-            complete_input: true,
-        };
         let contract = ProviderReadStaticContract {
             sql_binding: binding,
             request: ProviderReadRequestBinding::from_need(&need),
@@ -11467,27 +11421,6 @@ mod tests {
                     },
                 ]),
             },
-            artifact_inputs: Box::from([ArtifactInputRequirement {
-                artifact,
-                kind: artifact_kind.clone(),
-                format: artifact_format.clone(),
-                schema: artifact_schema.clone(),
-                source: artifact_source.clone(),
-                required_coverage: artifact_coverage.clone(),
-            }]),
-            artifact_refs: Box::from([SealedArtifactRef {
-                id: artifact,
-                kind: artifact_kind,
-                format: artifact_format,
-                schema: artifact_schema,
-                source: artifact_source,
-                coverage: artifact_coverage,
-                location: "s3://warehouse/artifacts/7".into(),
-                content_digest: [62; 32],
-                schema_digest: [63; 32],
-                object_count: 1,
-                row_count: 3,
-            }]),
             coverage_evidence: Box::default(),
         };
         let mut bucket_contract = contract.clone();
@@ -11513,7 +11446,6 @@ mod tests {
                 .expect("interleaved scan output must finish validation");
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let root = fragment.nodes().get(&fragment.root()).unwrap();
-        assert_eq!(final_plan.artifact_refs().len(), 1);
         assert_eq!(root.output.columns.len(), 3);
         assert!(matches!(
             fragment

@@ -27,9 +27,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use novarocks_physical_plan::{
-    ArtifactInputRequirement, ArtifactRefId, NullOrdering, PlanBuilder, PlanVersionId,
-    PredicateGuaranteeKind, ProviderColumnReference, ProviderReadOccurrenceId,
-    ProviderReadReference, SealedArtifactRef, SortDirection, ValueType,
+    NullOrdering, PlanBuilder, PlanVersionId, PredicateGuaranteeKind, ProviderColumnReference,
+    ProviderReadOccurrenceId, ProviderReadReference, SortDirection, ValueType,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorFunctionName, ConnectorReadBinding, ConnectorReadRelationKind,
@@ -1376,8 +1375,6 @@ pub struct ProviderReadStaticContract {
     pub predicates: Box<[ProviderReadPredicateFact]>,
     pub limit: ProviderReadLimitFact,
     pub provided_properties: ProviderReadProperties,
-    pub artifact_inputs: Box<[ArtifactInputRequirement]>,
-    pub artifact_refs: Box<[SealedArtifactRef]>,
     pub coverage_evidence: Box<[u8]>,
 }
 
@@ -1393,8 +1390,6 @@ impl fmt::Debug for ProviderReadStaticContract {
             .field("predicate_guarantees", &self.predicates.len())
             .field("limit", &self.limit)
             .field("provided_properties", &self.provided_properties)
-            .field("artifact_inputs", &self.artifact_inputs.len())
-            .field("artifact_refs", &self.artifact_refs.len())
             .field("coverage_evidence_bytes", &self.coverage_evidence.len())
             .finish_non_exhaustive()
     }
@@ -1903,18 +1898,6 @@ pub enum CompletionProtocolError {
         id: CompileNeedId,
         reason: &'static str,
     },
-    ProviderArtifactReferenceMissing {
-        id: CompileNeedId,
-        artifact: ArtifactRefId,
-    },
-    ProviderArtifactReferenceExtra {
-        id: CompileNeedId,
-        artifact: ArtifactRefId,
-    },
-    ProviderArtifactReferenceConflict {
-        id: CompileNeedId,
-        artifact: ArtifactRefId,
-    },
     DuplicateMaterializedViewDefinition {
         id: CompileNeedId,
         mv_id: i64,
@@ -2121,24 +2104,6 @@ impl fmt::Display for CompletionProtocolError {
                 formatter,
                 "provider read fact {} has an invalid partition scheme: {reason}",
                 id.get()
-            ),
-            Self::ProviderArtifactReferenceMissing { id, artifact } => write!(
-                formatter,
-                "provider read fact {} is missing sealed artifact reference {}",
-                id.get(),
-                artifact.get()
-            ),
-            Self::ProviderArtifactReferenceExtra { id, artifact } => write!(
-                formatter,
-                "provider read fact {} contains unrequested sealed artifact reference {}",
-                id.get(),
-                artifact.get()
-            ),
-            Self::ProviderArtifactReferenceConflict { id, artifact } => write!(
-                formatter,
-                "provider read fact {} conflicts on sealed artifact reference {}",
-                id.get(),
-                artifact.get()
             ),
             Self::DuplicateMaterializedViewDefinition { id, mv_id } => write!(
                 formatter,
@@ -2582,7 +2547,6 @@ fn validate_provider_contract(
         return Err(CompletionProtocolError::ProviderLimitMismatch { id: need.id });
     }
     validate_provider_properties(need, &contract.provided_properties)?;
-    validate_provider_artifacts(need, contract)?;
     Ok(())
 }
 
@@ -2698,69 +2662,6 @@ fn validate_provider_properties(
         .map(|key| key.request_ordinal)
         .collect::<Vec<_>>();
     validate_unique("ordering", &ordering)
-}
-
-fn validate_provider_artifacts(
-    need: &ProviderReadNeed,
-    contract: &ProviderReadStaticContract,
-) -> Result<(), CompletionProtocolError> {
-    let mut requirements = BTreeMap::new();
-    for requirement in &contract.artifact_inputs {
-        if requirements
-            .insert(requirement.artifact, requirement)
-            .is_some()
-        {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                id: need.id,
-                artifact: requirement.artifact,
-            });
-        }
-    }
-    let mut references = BTreeMap::new();
-    for reference in &contract.artifact_refs {
-        if references.insert(reference.id, reference).is_some() {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                id: need.id,
-                artifact: reference.id,
-            });
-        }
-    }
-    for (&artifact, requirement) in &requirements {
-        let Some(reference) = references.get(&artifact) else {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceMissing {
-                id: need.id,
-                artifact,
-            });
-        };
-        if !provider_artifact_matches(requirement, reference) {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                id: need.id,
-                artifact,
-            });
-        }
-    }
-    if let Some((&artifact, _)) = references
-        .iter()
-        .find(|(artifact, _)| !requirements.contains_key(artifact))
-    {
-        return Err(CompletionProtocolError::ProviderArtifactReferenceExtra {
-            id: need.id,
-            artifact,
-        });
-    }
-    Ok(())
-}
-
-fn provider_artifact_matches(
-    requirement: &ArtifactInputRequirement,
-    reference: &SealedArtifactRef,
-) -> bool {
-    requirement.artifact == reference.id
-        && requirement.kind == reference.kind
-        && requirement.format == reference.format
-        && requirement.schema == reference.schema
-        && requirement.source == reference.source
-        && requirement.required_coverage == reference.coverage
 }
 
 fn provider_payload_matches_binding(
@@ -3103,18 +3004,6 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
             contract.predicates.len(),
             std::mem::size_of::<ProviderReadPredicateFact>(),
         )?;
-        let artifacts = checked_sum([
-            checked_mul(
-                contract.artifact_inputs.len(),
-                std::mem::size_of::<ArtifactInputRequirement>(),
-            ),
-            checked_sum(contract.artifact_inputs.iter().map(artifact_bytes)),
-            checked_mul(
-                contract.artifact_refs.len(),
-                std::mem::size_of::<SealedArtifactRef>(),
-            ),
-            checked_sum(contract.artifact_refs.iter().map(sealed_artifact_bytes)),
-        ])?;
         checked_sum([
             provider_request_dynamic_bytes(
                 &contract.request.relation,
@@ -3126,7 +3015,6 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
             Ok(schema),
             Ok(predicates),
             provider_properties_bytes(&contract.provided_properties),
-            Ok(artifacts),
             checked_size(contract.coverage_evidence.len()),
         ])?
     };
@@ -3161,64 +3049,6 @@ fn provider_column_bytes(column: &ProviderColumnReference) -> Result<u64, Comple
         checked_size(payload.header().catalog().catalog_name().as_str().len()),
         checked_size(payload.payload().len()),
     ])
-}
-
-fn artifact_bytes(artifact: &ArtifactInputRequirement) -> Result<u64, CompletionProtocolError> {
-    let schema = checked_sum([
-        checked_mul(artifact.schema.len(), std::mem::size_of::<ValueType>()),
-        checked_sum(
-            artifact
-                .schema
-                .iter()
-                .map(|value| data_type_dynamic_bytes(&value.data_type)),
-        ),
-    ])?;
-    let coverage = coverage_bytes(&artifact.required_coverage)?;
-    checked_sum([
-        checked_size(artifact.kind.as_str().len()),
-        checked_size(artifact.format.id.as_str().len()),
-        Ok(schema),
-        provider_reference_bytes(&artifact.source.source),
-        Ok(coverage),
-    ])
-}
-
-fn sealed_artifact_bytes(artifact: &SealedArtifactRef) -> Result<u64, CompletionProtocolError> {
-    let schema = checked_sum([
-        checked_mul(artifact.schema.len(), std::mem::size_of::<ValueType>()),
-        checked_sum(
-            artifact
-                .schema
-                .iter()
-                .map(|value| data_type_dynamic_bytes(&value.data_type)),
-        ),
-    ])?;
-    checked_sum([
-        checked_size(artifact.kind.as_str().len()),
-        checked_size(artifact.format.id.as_str().len()),
-        Ok(schema),
-        provider_reference_bytes(&artifact.source.source),
-        coverage_bytes(&artifact.coverage),
-        checked_size(artifact.location.len()),
-    ])
-}
-
-fn coverage_bytes(
-    coverage: &novarocks_physical_plan::CoverageSet,
-) -> Result<u64, CompletionProtocolError> {
-    let ranges = checked_sum([
-        checked_mul(
-            coverage.ranges.len(),
-            std::mem::size_of::<novarocks_physical_plan::CoverageRange>(),
-        ),
-        checked_sum(coverage.ranges.iter().map(|range| {
-            checked_sum([
-                checked_size(range.start.as_deref().map_or(0, <[u8]>::len)),
-                checked_size(range.end.as_deref().map_or(0, <[u8]>::len)),
-            ])
-        })),
-    ])?;
-    checked_add(checked_size(coverage.domain.len())?, ranges)
 }
 
 fn provider_properties_bytes(
@@ -3561,10 +3391,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use novarocks_physical_plan::{
-        ArtifactFormat, ArtifactFormatId, ArtifactKind, ArtifactSourceBinding, CoverageRange,
-        CoverageSet, Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId,
-        FragmentSink, LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties,
-        PipelineDopDomain, ResultField, ResultPort, RowMultiplicity, ValueOrigin,
+        Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
+        LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain,
+        ResultField, ResultPort, RowMultiplicity, ValueOrigin,
     };
     use novarocks_spi::connector::read_stack::{
         ConnectorReadBinding, ConnectorValue, Domain, TupleDomain,
@@ -3868,8 +3697,6 @@ mod tests {
                 None => ProviderReadLimitFact::NotRequested,
             },
             provided_properties: ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         }
     }
@@ -3885,54 +3712,6 @@ mod tests {
             },
             algorithm: PartitionHashAlgorithm::NativeExchangeV1,
         }
-    }
-
-    fn artifact_pair(
-        read: ProviderReadReference,
-        artifact: ArtifactRefId,
-    ) -> (ArtifactInputRequirement, SealedArtifactRef) {
-        let kind = ArtifactKind::try_new("split-directory").unwrap();
-        let format = ArtifactFormat {
-            id: ArtifactFormatId::try_new("uea5.provider-artifact").unwrap(),
-            revision: 1,
-        };
-        let schema: Box<[ValueType]> = Box::from([ValueType::new(DataType::Int64, false)]);
-        let source = ArtifactSourceBinding {
-            source: read,
-            selection_digest: [31; 32],
-        };
-        let coverage = CoverageSet {
-            domain: "manifest-entry".into(),
-            selection_digest: [32; 32],
-            ranges: Box::from([CoverageRange {
-                start: None,
-                end: None,
-            }]),
-            complete_input: true,
-        };
-        (
-            ArtifactInputRequirement {
-                artifact,
-                kind: kind.clone(),
-                format: format.clone(),
-                schema: schema.clone(),
-                source: source.clone(),
-                required_coverage: coverage.clone(),
-            },
-            SealedArtifactRef {
-                id: artifact,
-                kind,
-                format,
-                schema,
-                source,
-                coverage,
-                location: "s3://warehouse/artifacts/31".into(),
-                content_digest: [33; 32],
-                schema_digest: [34; 32],
-                object_count: 1,
-                row_count: 7,
-            },
-        )
     }
 
     #[test]
@@ -4800,49 +4579,6 @@ mod tests {
                 ordinal: 0,
                 ..
             })
-        ));
-    }
-
-    #[test]
-    fn provider_artifacts_require_one_exact_reference_per_requirement() {
-        let need = provider_need(1, DataType::Int64, &[], None);
-        let mut exact = provider_contract(&need, b"private");
-        let (requirement, reference) = artifact_pair(exact.read.clone(), ArtifactRefId::new(7));
-        exact.artifact_inputs = Box::from([requirement.clone()]);
-        exact.artifact_refs = Box::from([reference.clone()]);
-        ProviderReadFact::negotiated(&need, exact).expect("exact artifact pair must be accepted");
-
-        let mut missing = provider_contract(&need, b"private");
-        missing.artifact_inputs = Box::from([requirement.clone()]);
-        assert!(matches!(
-            ProviderReadFact::negotiated(&need, missing),
-            Err(CompletionProtocolError::ProviderArtifactReferenceMissing {
-                artifact,
-                ..
-            }) if artifact == ArtifactRefId::new(7)
-        ));
-
-        let mut extra = provider_contract(&need, b"private");
-        extra.artifact_refs = Box::from([reference.clone()]);
-        assert!(matches!(
-            ProviderReadFact::negotiated(&need, extra),
-            Err(CompletionProtocolError::ProviderArtifactReferenceExtra {
-                artifact,
-                ..
-            }) if artifact == ArtifactRefId::new(7)
-        ));
-
-        let mut conflict = provider_contract(&need, b"private");
-        let mut conflicting_reference = reference;
-        conflicting_reference.schema = Box::from([ValueType::new(DataType::Int32, false)]);
-        conflict.artifact_inputs = Box::from([requirement]);
-        conflict.artifact_refs = Box::from([conflicting_reference]);
-        assert!(matches!(
-            ProviderReadFact::negotiated(&need, conflict),
-            Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                artifact,
-                ..
-            }) if artifact == ArtifactRefId::new(7)
         ));
     }
 }

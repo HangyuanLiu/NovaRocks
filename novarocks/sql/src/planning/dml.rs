@@ -2639,8 +2639,6 @@ mod tests {
             predicates: Box::default(),
             limit: crate::compiler::ProviderReadLimitFact::NotRequested,
             provided_properties: crate::compiler::ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         };
         super::DmlFinalPlanContext::new(

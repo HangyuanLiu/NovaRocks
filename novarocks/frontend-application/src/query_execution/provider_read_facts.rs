@@ -470,12 +470,6 @@ pub(crate) fn freeze_one_read(
             work_source,
             &name,
         )?,
-        // Artifact inputs belong to reads derived from a sealed artifact, and
-        // the coverage a provider publishes here names digests rather than the
-        // artifacts themselves. The materialized-view slice that produces such
-        // a read is the owner that can name them.
-        artifact_inputs: Box::new([]),
-        artifact_refs: Box::new([]),
         coverage_evidence: frozen.coverage_evidence().into(),
     };
     ProviderReadFact::negotiated(need, contract).map_err(|error| {
