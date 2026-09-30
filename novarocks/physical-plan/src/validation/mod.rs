@@ -76,7 +76,7 @@ pub fn validate_fragment(fragment: &Fragment, cuts: &FragmentCuts) -> Result<(),
     if !errors.is_empty() {
         return Err(ValidationErrors::from_collector(errors));
     }
-    validate_fragment_cuts_into(fragment, cuts, true, &mut errors);
+    validate_fragment_cuts_into(fragment, cuts, &mut errors);
     validate_fragment_partition_identities(fragment, cuts, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -223,7 +223,7 @@ pub fn validate_plan_with_limits(
                 ));
                 return Err(ValidationErrors::from_collector(errors));
             };
-            validate_fragment_cuts_into(fragment, &cuts, false, &mut errors);
+            validate_fragment_cuts_into(fragment, &cuts, &mut errors);
             validate_fragment_partition_identities(fragment, &cuts, &mut errors);
             if !errors.is_empty() {
                 return Err(ValidationErrors::from_collector(errors));

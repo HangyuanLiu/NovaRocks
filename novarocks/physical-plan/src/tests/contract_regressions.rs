@@ -687,17 +687,12 @@ fn assert_runtime_filter_plan_accepted(fragment: Fragment, filter: RuntimeFilter
     builder.finish().unwrap();
 }
 
-fn local_runtime_filter_cuts(fragment: &Fragment, filter: &RuntimeFilter) -> FragmentCuts {
+fn local_runtime_filter_cuts(_fragment: &Fragment, filter: &RuntimeFilter) -> FragmentCuts {
     FragmentCuts {
         inbound: Box::default(),
         outbound: Box::default(),
         artifact_refs: Box::default(),
         runtime_filters: Box::from([filter.clone()]),
-        runtime_filter_proof: RuntimeFilterProofGraph {
-            fragments: Box::from([fragment.clone()]),
-            edges: Box::default(),
-            filters: Box::from([filter.clone()]),
-        },
     }
 }
 
@@ -957,6 +952,254 @@ fn runtime_filter_scan_field_accepts_direct_and_identity_project_lineage() {
         let (fragment, filter, _) =
             scan_lineage_filter(through_filter, through_project, false, false);
         assert_runtime_filter_plan_accepted(fragment, filter);
+    }
+}
+
+#[test]
+fn remote_labels_cannot_bypass_local_runtime_filter_lineage() {
+    let (fragment, filter, _) = scan_lineage_filter(true, true, false, false);
+    for mutation in 0..3 {
+        let mut malformed = filter.clone();
+        let RuntimeFilterConsumerTarget::ScanField { lineage, .. } =
+            &mut malformed.consumers[0].target
+        else {
+            unreachable!()
+        };
+        let mut steps = lineage.to_vec();
+        match mutation {
+            0 => steps.insert(
+                0,
+                RuntimeFilterLineageStep::ExchangeMapping {
+                    edge: EdgeId::new(900_001),
+                    mapping_ordinal: 0,
+                },
+            ),
+            1 => {
+                let RuntimeFilterLineageStep::ProjectIdentity { fragment: id, .. } = &mut steps[0]
+                else {
+                    unreachable!()
+                };
+                *id = FragmentId::new(900_001);
+            }
+            _ => {
+                let RuntimeFilterLineageStep::FilterPassThrough { input_ordinal, .. } =
+                    &mut steps[1]
+                else {
+                    unreachable!()
+                };
+                *input_ordinal = 1;
+                steps.insert(
+                    0,
+                    RuntimeFilterLineageStep::ExchangeMapping {
+                        edge: EdgeId::new(900_001),
+                        mapping_ordinal: 0,
+                    },
+                );
+            }
+        }
+        *lineage = steps.into_boxed_slice();
+        assert_local_runtime_filter_rejected_at_both_boundaries(
+            fragment.clone(),
+            malformed,
+            "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+        );
+    }
+}
+
+fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, FragmentId) {
+    let (original, mut filter, _) = scan_lineage_filter(true, true, false, false);
+    let destination_id = original.id();
+    let source_id = FragmentId::new(900);
+    let edge_id = EdgeId::new(900);
+    let join = &original.nodes()[&original.root()];
+    let probe_root = join.inputs[0];
+    let mut source_nodes = std::collections::BTreeSet::new();
+    let mut pending = vec![probe_root];
+    while let Some(id) = pending.pop() {
+        if source_nodes.insert(id) {
+            pending.extend(original.nodes()[&id].inputs.iter().copied());
+        }
+    }
+    let source_owns_value = |value: &ValueDef| match value.origin {
+        ValueOrigin::ProviderField { scan_node, .. } => source_nodes.contains(&scan_node),
+        ValueOrigin::Expr { node, .. } | ValueOrigin::NodeOutput { node, .. } => {
+            source_nodes.contains(&node)
+        }
+        _ => false,
+    };
+    let output = original.nodes()[&probe_root].output.columns.clone();
+    let mut source = FragmentBuilder::new(source_id);
+    let mut destination = FragmentBuilder::new(destination_id);
+    for expression in original
+        .expressions()
+        .iter()
+        .map(|(_, expression)| expression)
+    {
+        if source_nodes.contains(&expression.owner) {
+            source.insert_expression(expression.clone()).unwrap();
+        } else {
+            destination.insert_expression(expression.clone()).unwrap();
+        }
+    }
+    for value in original.values().values() {
+        if source_owns_value(value) {
+            source.insert_value(value.clone()).unwrap();
+            if output.contains(&value.id) {
+                let mut imported = value.clone();
+                imported.origin = ValueOrigin::ExchangeImport {
+                    edge: edge_id,
+                    source_value: value.id,
+                };
+                destination.insert_value(imported).unwrap();
+            }
+        } else {
+            destination.insert_value(value.clone()).unwrap();
+        }
+    }
+    for node in original.nodes().values() {
+        if source_nodes.contains(&node.id) {
+            source.insert_node_unchecked(node.clone()).unwrap();
+        } else {
+            destination.insert_node_unchecked(node.clone()).unwrap();
+        }
+    }
+    let properties = original.nodes()[&probe_root].output_properties.clone();
+    destination
+        .insert_node_unchecked(PhysicalNode {
+            id: probe_root,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: properties.clone(),
+            output: OutputPort {
+                node: probe_root,
+                columns: output.clone(),
+            },
+            kind: NodeKind::ExchangeSource {
+                edge: edge_id,
+                imports: output.iter().map(|value| (*value, *value)).collect(),
+            },
+        })
+        .unwrap();
+    source.attach_runtime_filter(filter.id).unwrap();
+    destination.attach_runtime_filter(filter.id).unwrap();
+    filter.consumers[0].endpoint.fragment = source_id;
+    let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
+    else {
+        unreachable!()
+    };
+    let mut steps = vec![RuntimeFilterLineageStep::ExchangeMapping {
+        edge: edge_id,
+        mapping_ordinal: 0,
+    }];
+    for mut step in lineage.iter().cloned() {
+        match &mut step {
+            RuntimeFilterLineageStep::FilterPassThrough { fragment, .. }
+            | RuntimeFilterLineageStep::ProjectIdentity { fragment, .. } => *fragment = source_id,
+            _ => unreachable!(),
+        }
+        steps.push(step);
+    }
+    *lineage = steps.into_boxed_slice();
+    filter.producers[0].progress.non_build_edges = Box::from([edge_id]);
+    let source = source
+        .finish_definition(probe_root, FragmentSink::Stream { edge: edge_id }, dop())
+        .unwrap();
+    let destination = destination
+        .finish_definition(original.root(), original.sink().clone(), dop())
+        .unwrap();
+    let mut plan = PlanBuilder::new(version());
+    plan.add_fragment(source).unwrap();
+    plan.add_fragment(destination).unwrap();
+    plan.add_edge(Edge {
+        id: edge_id,
+        kind: EdgeKind::Stream,
+        source: EdgeSource {
+            fragment: source_id,
+            projection: output.clone(),
+        },
+        destination: EdgeDestination {
+            fragment: destination_id,
+            node: probe_root,
+            receive_mapping: output.iter().map(|value| (*value, *value)).collect(),
+        },
+        partitioning: EdgePartitioning {
+            source: properties.distribution.clone(),
+            source_multiplicity: properties.row_multiplicity,
+            destination: properties.distribution,
+            destination_multiplicity: properties.row_multiplicity,
+        },
+    })
+    .unwrap();
+    plan.add_runtime_filter(filter).unwrap();
+    (plan.finish().unwrap(), source_id, destination_id)
+}
+
+#[test]
+fn cross_fragment_runtime_filter_validates_local_prefix_and_suffix() {
+    let (plan, source_id, destination_id) = cross_fragment_scan_lineage_plan();
+    for id in [source_id, destination_id] {
+        let fragment = &plan.fragments()[&id];
+        let cuts = fragment_cuts(&plan, id).unwrap();
+        validate_fragment(fragment, &cuts).unwrap();
+        for mutation in 0..5 {
+            let mut malformed = cuts.clone();
+            let RuntimeFilterConsumerTarget::ScanField { lineage, .. } =
+                &mut malformed.runtime_filters[0].consumers[0].target
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => {
+                    let RuntimeFilterLineageStep::ExchangeMapping {
+                        mapping_ordinal, ..
+                    } = &mut lineage[0]
+                    else {
+                        unreachable!()
+                    };
+                    *mapping_ordinal = 2; // The other projected value cannot reach the requested provider field.
+                }
+                1 => {
+                    let RuntimeFilterLineageStep::ProjectIdentity { output_ordinal, .. } =
+                        &mut lineage[1]
+                    else {
+                        unreachable!()
+                    };
+                    *output_ordinal = 2;
+                }
+                2 => {
+                    let RuntimeFilterLineageStep::FilterPassThrough { input_ordinal, .. } =
+                        &mut lineage[2]
+                    else {
+                        unreachable!()
+                    };
+                    *input_ordinal = 1;
+                }
+                3 => {
+                    let RuntimeFilterLineageStep::ExchangeMapping { edge, .. } = &mut lineage[0]
+                    else {
+                        unreachable!()
+                    };
+                    *edge = EdgeId::new(900_001);
+                }
+                _ => {
+                    let RuntimeFilterLineageStep::ProjectIdentity { fragment, .. } =
+                        &mut lineage[1]
+                    else {
+                        unreachable!()
+                    };
+                    *fragment = FragmentId::new(900_001);
+                }
+            }
+            // Remote suffix mistakes remain FE-owned at the producer. Both
+            // ends must still refuse an unknown or inconsistent local cut.
+            if id == source_id || mutation == 0 || mutation == 3 || mutation == 4 {
+                assert!(
+                    validate_fragment(fragment, &malformed).is_err(),
+                    "accepted mutation {mutation} at fragment {}",
+                    id.get()
+                );
+            }
+        }
     }
 }
 

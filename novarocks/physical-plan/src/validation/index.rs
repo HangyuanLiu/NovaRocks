@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use crate::resource::MAX_PLAN_DERIVED_CUT_ITEMS;
 use crate::{
-    AggregatePhase, ArtifactSourceBinding, Edge, EdgeId, ExprId, Fragment, FragmentCuts,
-    FragmentId, FragmentSink, NodeId, NodeKind, PhysicalNode, PhysicalPlan, ValueId,
+    AggregatePhase, ArtifactSourceBinding, EdgeId, ExprId, Fragment, FragmentCuts, FragmentId,
+    NodeId, NodeKind, PhysicalNode, PhysicalPlan, ValueId,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -827,67 +827,5 @@ pub(crate) fn bounded_count(
             path,
             format!("contains {actual} items, exceeding {maximum}"),
         ));
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct SourceSinkEdgeIndex {
-    pub(crate) owned: BTreeMap<EdgeId, bool>,
-}
-
-impl SourceSinkEdgeIndex {
-    pub(crate) fn new(plan: &PhysicalPlan) -> Self {
-        let mut index = Self::default();
-        for source in plan.fragments().values() {
-            match source.sink() {
-                FragmentSink::Stream { edge } => index.record(
-                    *edge,
-                    plan.edges().get(edge).is_some_and(|contract| {
-                        contract.source.fragment == source.id()
-                            && contract.kind == crate::EdgeKind::Stream
-                    }),
-                ),
-                FragmentSink::Multicast { edges } => {
-                    for edge in edges {
-                        index.record(
-                            *edge,
-                            plan.edges().get(edge).is_some_and(|contract| {
-                                contract.source.fragment == source.id()
-                                    && contract.kind == crate::EdgeKind::CteMulticast
-                            }),
-                        );
-                    }
-                }
-                FragmentSink::Router { routes, .. } => {
-                    for route in routes {
-                        index.record(
-                            route.edge,
-                            plan.edges().get(&route.edge).is_some_and(|contract| {
-                                contract.source.fragment == source.id()
-                                    && contract.kind == crate::EdgeKind::ChangeStreamRouter
-                                    && contract
-                                        .source
-                                        .projection
-                                        .iter()
-                                        .eq(route.input_mapping.iter().map(|(_, value)| value))
-                            }),
-                        );
-                    }
-                }
-                FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {}
-            }
-        }
-        index
-    }
-
-    pub(crate) fn record(&mut self, edge: EdgeId, valid: bool) {
-        self.owned
-            .entry(edge)
-            .and_modify(|owned| *owned = false)
-            .or_insert(valid);
-    }
-
-    pub(crate) fn owns(&self, edge: &Edge) -> bool {
-        self.owned.get(&edge.id) == Some(&true)
     }
 }

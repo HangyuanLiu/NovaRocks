@@ -2012,8 +2012,8 @@ pub fn contribute_builtin_functions(
         let declaration = FunctionBindingDeclaration::try_new(
             function_id,
             FunctionKind::Scalar,
-            builtin_scalar_semantics(name),
             [FunctionOverloadDeclaration {
+                semantics: builtin_scalar_semantics(name),
                 identity: overload.clone(),
                 argument_pattern: "owner-derived".into(),
                 result_pattern: "owner-derived".into(),
@@ -2061,11 +2061,11 @@ pub fn contribute_builtin_functions(
         let declaration = FunctionBindingDeclaration::try_new(
             builtin_scalar_function_id(&name, kind)?,
             kind,
-            builtin_scalar_semantics(&name),
             overloads
                 .into_iter()
                 .zip(&signatures)
                 .map(|(identity, signature)| FunctionOverloadDeclaration {
+                    semantics: builtin_scalar_semantics(&name),
                     identity,
                     argument_pattern: signature.clone().into_boxed_str(),
                     result_pattern: signature.clone().into_boxed_str(),
@@ -2105,14 +2105,14 @@ pub fn contribute_builtin_functions(
         let binding_declaration = FunctionBindingDeclaration::try_new(
             function_id,
             FunctionKind::Aggregate,
-            FunctionSemantics {
-                volatility: FunctionVolatility::Immutable,
-                argument_evaluation: FunctionArgumentEvaluation::Eager,
-                failure_behavior: FunctionFailureBehavior::Propagate,
-                intrinsic_row_error:
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
-            },
             [FunctionOverloadDeclaration {
+                semantics: FunctionSemantics {
+                    volatility: FunctionVolatility::Immutable,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                },
                 identity: overload_id,
                 argument_pattern: declaration.signature.into(),
                 result_pattern: "derived".into(),
@@ -2145,13 +2145,13 @@ pub fn contribute_builtin_functions(
             }
         })?,
         FunctionKind::Table,
-        FunctionSemantics {
-            volatility: FunctionVolatility::Immutable,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
-        },
         [FunctionOverloadDeclaration {
+            semantics: FunctionSemantics {
+                volatility: FunctionVolatility::Immutable,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+            },
             identity: FunctionOverloadId::try_new(BUILTIN_UNNEST_OVERLOAD_ID).map_err(|error| {
                 FunctionCatalogError::InvalidStableIdentity {
                     subject: "builtin table function overload",
@@ -2312,16 +2312,16 @@ pub(crate) fn test_exact_aggregate_catalog(
         FunctionId::try_new(format!("test.aggregate/{name}/v1"))
             .expect("test aggregate function identity"),
         FunctionKind::Aggregate,
-        FunctionSemantics {
-            volatility: FunctionVolatility::Immutable,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error:
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
-        },
         overloads
             .iter()
             .map(|overload| FunctionOverloadDeclaration {
+                semantics: FunctionSemantics {
+                    volatility: FunctionVolatility::Immutable,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                },
                 identity: FunctionOverloadId::try_new(overload.identity.as_str())
                     .expect("test aggregate overload identity"),
                 argument_pattern: format!("exact:{}:arguments", overload.identity.as_str()).into(),
@@ -2447,12 +2447,12 @@ mod tests {
         let declaration = FunctionBindingDeclaration::try_new(
             FunctionId::try_new("test.shadow/json_object/v1").unwrap(),
             FunctionKind::Scalar,
-            builtin_scalar_semantics("json_object"),
             overloads
                 .iter()
                 .cloned()
                 .zip(&signatures)
                 .map(|(identity, signature)| FunctionOverloadDeclaration {
+                    semantics: builtin_scalar_semantics("json_object"),
                     identity,
                     argument_pattern: signature.clone().into_boxed_str(),
                     result_pattern: signature.clone().into_boxed_str(),

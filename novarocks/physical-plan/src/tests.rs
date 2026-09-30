@@ -2515,7 +2515,6 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
         }]),
         artifact_refs: Box::default(),
         runtime_filters: Box::default(),
-        runtime_filter_proof: RuntimeFilterProofGraph::default(),
     };
     let error = validate_fragment(&fragment, &cuts).unwrap_err().to_string();
     assert!(error.contains("Arrow decimal precision/scale"));

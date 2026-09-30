@@ -1131,20 +1131,6 @@ pub struct FragmentCuts {
     pub artifact_refs: Box<[SealedArtifactRef]>,
     /// Complete static runtime-filter contracts with at least one local endpoint.
     pub runtime_filters: Box<[RuntimeFilter]>,
-    /// Exact immutable plan subgraph needed to recompute every attached
-    /// runtime-filter equality and scan-lineage proof without the rest of the
-    /// query plan.
-    pub runtime_filter_proof: RuntimeFilterProofGraph,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RuntimeFilterProofGraph {
-    pub fragments: Box<[Fragment]>,
-    pub edges: Box<[Edge]>,
-    /// Complete filter contracts needed to prove blocking-wait closure. This
-    /// includes the locally attached filters and any filter attached to a
-    /// fragment on their transitive producer build dependency paths.
-    pub filters: Box<[RuntimeFilter]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

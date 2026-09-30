@@ -64,6 +64,7 @@ fn semantics() -> FunctionSemantics {
 
 fn overload(id: &str, pattern: &str) -> FunctionOverloadDeclaration {
     FunctionOverloadDeclaration {
+        semantics: semantics(),
         identity: identity(id),
         argument_pattern: pattern.into(),
         result_pattern: "T".into(),
@@ -73,17 +74,17 @@ fn overload(id: &str, pattern: &str) -> FunctionOverloadDeclaration {
 
 fn declaration(
     kind: FunctionKind,
-    overloads: Vec<FunctionOverloadDeclaration>,
+    mut overloads: Vec<FunctionOverloadDeclaration>,
 ) -> FunctionBindingDeclaration {
-    let mut semantics = semantics();
     if matches!(kind, FunctionKind::Aggregate | FunctionKind::Window) {
-        semantics.intrinsic_row_error =
-            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
+        for overload in &mut overloads {
+            overload.semantics.intrinsic_row_error =
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
+        }
     }
     FunctionBindingDeclaration::try_new(
         FunctionId::try_new("test/function/v1").unwrap(),
         kind,
-        semantics,
         overloads,
     )
     .unwrap()
@@ -360,13 +361,19 @@ fn catalog_digest_covers_explicit_binding_contract_and_ignores_registration_orde
         match field {
             0 => changed.function_id = FunctionId::try_new("test/function/v2").unwrap(),
             1 => changed.overloads[0].identity = identity("test/echo/T/v2"),
-            2 => changed.semantics.volatility = FunctionVolatility::Stable,
-            3 => changed.semantics.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit,
-            4 => changed.semantics.failure_behavior = FunctionFailureBehavior::ReturnsNull,
+            2 => changed.overloads[0].semantics.volatility = FunctionVolatility::Stable,
+            3 => {
+                changed.overloads[0].semantics.argument_evaluation =
+                    FunctionArgumentEvaluation::ShortCircuit
+            }
+            4 => {
+                changed.overloads[0].semantics.failure_behavior =
+                    FunctionFailureBehavior::ReturnsNull
+            }
             5 => changed.overloads[0].argument_pattern = "(U)".into(),
             6 => changed.overloads[0].result_pattern = "U".into(),
             7 => {
-                changed.semantics.intrinsic_row_error =
+                changed.overloads[0].semantics.intrinsic_row_error =
                     novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
             }
             _ => unreachable!(),
@@ -381,7 +388,6 @@ fn declarations_reject_duplicate_identity_ambiguous_patterns_and_wrong_state_kin
         FunctionBindingDeclaration::try_new(
             FunctionId::try_new("test/function/v1").unwrap(),
             FunctionKind::Scalar,
-            semantics(),
             overloads,
         )
     };
@@ -625,6 +631,51 @@ fn bound_catalog_rejects_unmigrated_definitions_without_inventing_identities() {
 }
 
 struct FixedResolver(FunctionBindingSelection);
+
+#[test]
+fn selected_overload_semantics_are_exact_with_conservative_name_metadata() {
+    let mut stable = overload("test/stable/v1", "(Int32)");
+    stable.semantics.volatility = FunctionVolatility::Stable;
+    let mut volatile = overload("test/volatile/v1", "(Int64)");
+    volatile.semantics.volatility = FunctionVolatility::Volatile;
+    volatile.semantics.intrinsic_row_error =
+        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise;
+    volatile.semantics.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
+    for (chosen, data_type) in [(&stable, DataType::Int32), (&volatile, DataType::Int64)] {
+        let declaration = declaration(FunctionKind::Scalar, vec![stable.clone(), volatile.clone()]);
+        assert_eq!(declaration.volatility(), FunctionVolatility::Volatile);
+        let ty = value_type(data_type.clone(), false);
+        let selection = FunctionBindingSelection {
+            overload: chosen.identity.clone(),
+            argument_types: Box::from([FunctionArgumentType::Value(ty.clone())]),
+            result_type: FunctionResultType::Scalar(ty),
+            aggregate: None,
+        };
+        let catalog = catalog(Arc::new(FixedResolver(selection)), declaration);
+        let args = [argument(data_type, false)];
+        let bound = catalog
+            .resolve_bound_user("echo", FunctionKind::Scalar, request(&args))
+            .unwrap();
+        assert_eq!(bound.semantics, chosen.semantics);
+        catalog.validate_bound(&bound, request(&args)).unwrap();
+        let mut forged = bound;
+        forged.semantics = if chosen == &stable {
+            volatile.semantics
+        } else {
+            stable.semantics
+        };
+        assert!(catalog.validate_bound(&forged, request(&args)).is_err());
+    }
+    let first = declaration(FunctionKind::Scalar, vec![stable.clone(), volatile.clone()]);
+    let digest = catalog(Arc::new(EchoResolver::default()), first).digest();
+    stable.semantics.volatility = FunctionVolatility::Immutable;
+    let changed = declaration(FunctionKind::Scalar, vec![stable, volatile]);
+    assert_eq!(changed.volatility(), FunctionVolatility::Volatile);
+    assert_ne!(
+        digest,
+        catalog(Arc::new(EchoResolver::default()), changed).digest()
+    );
+}
 
 impl FunctionBindingResolver for FixedResolver {
     fn resolve(
@@ -894,10 +945,10 @@ fn intrinsic_row_error_is_independent_of_catching_and_closed_by_function_kind() 
                         .unwrap(),
                 });
             }
+            selected.semantics = semantics;
             let result = FunctionBindingDeclaration::try_new(
                 FunctionId::try_new("test/intrinsic/v1").unwrap(),
                 kind,
-                semantics,
                 [selected],
             );
             assert_eq!(

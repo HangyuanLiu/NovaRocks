@@ -17,7 +17,6 @@
 
 use super::*;
 
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::resource::{
@@ -25,8 +24,7 @@ use crate::resource::{
 };
 use crate::{
     CutImport, CutValue, Edge, EdgeId, Fragment, FragmentCuts, FragmentId, FragmentSink,
-    InboundFragmentCut, NodeId, NodeKind, OutboundFragmentCut, PhysicalPlan, RequiredContracts,
-    ValueOrigin,
+    InboundFragmentCut, NodeId, NodeKind, OutboundFragmentCut, PhysicalPlan, ValueOrigin,
 };
 
 /// Derive the explicit cut contract used to validate one fragment without the
@@ -65,41 +63,10 @@ pub(crate) struct FragmentCutDerivation {
     pub(crate) inbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) outbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) change_stream_writers: BTreeMap<EdgeId, crate::ChangeStreamWriterCut>,
-    pub(crate) proof_hulls: Vec<RuntimeFilterProofHull>,
-    pub(crate) proof_hull_by_fragment: BTreeMap<FragmentId, usize>,
-}
-
-pub(crate) struct RuntimeFilterProofHull {
-    pub(crate) fragments: BTreeSet<FragmentId>,
-    pub(crate) edges: BTreeSet<EdgeId>,
-    pub(crate) filters: BTreeSet<crate::RuntimeFilterId>,
-}
-
-#[derive(Default)]
-pub(crate) struct RuntimeFilterBuildDependencyClosure {
-    pub(crate) fragments: BTreeSet<FragmentId>,
-    pub(crate) edges: BTreeSet<EdgeId>,
-    pub(crate) sites: BTreeSet<(FragmentId, NodeId)>,
-}
-
-#[derive(Default)]
-pub(crate) struct RuntimeFilterBuildDependencyCache {
-    pub(crate) by_root: BTreeMap<(FragmentId, NodeId), RuntimeFilterBuildDependencyClosure>,
-    pub(crate) source_sinks: Option<SourceSinkEdgeIndex>,
-}
-
-pub(crate) struct RuntimeFilterBuildExpansion<'a> {
-    pub(crate) fragments: &'a mut BTreeSet<FragmentId>,
-    pub(crate) edges: &'a mut BTreeSet<EdgeId>,
-    pub(crate) dependency_sites: &'a mut BTreeSet<(FragmentId, NodeId)>,
-    pub(crate) new_dependency_sites: &'a mut Vec<(FragmentId, NodeId)>,
-    pub(crate) expanded_build_roots: &'a mut BTreeSet<(FragmentId, NodeId)>,
-    pub(crate) cache: &'a mut RuntimeFilterBuildDependencyCache,
-    pub(crate) work_budget: &'a mut SemanticTraceWorkBudget,
 }
 
 impl FragmentCutDerivation {
-    pub(crate) fn new(plan: &PhysicalPlan, limits: &PlanLimits) -> Option<Self> {
+    pub(crate) fn new(plan: &PhysicalPlan, _limits: &PlanLimits) -> Option<Self> {
         let provenance = source_provenance_index(plan)?;
         let mut inbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
         let mut outbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
@@ -132,50 +99,11 @@ impl FragmentCutDerivation {
                 }
             }
         }
-        let mut proof_hulls = Vec::new();
-        let mut proof_hull_by_fragment = BTreeMap::new();
-        let mut proof_hull_by_filter_set = BTreeMap::<Box<[crate::RuntimeFilterId]>, usize>::new();
-        let mut build_dependency_cache = RuntimeFilterBuildDependencyCache::default();
-        let mut proof_work_budget = SemanticTraceWorkBudget::new(limits);
-        for fragment in plan.fragments().values() {
-            let mut key = fragment.runtime_filters().to_vec();
-            key.sort_unstable();
-            let key = key.into_boxed_slice();
-            let index = if let Some(index) = proof_hull_by_filter_set.get(&key) {
-                *index
-            } else {
-                let mut fragments = BTreeSet::new();
-                let mut edges = BTreeSet::new();
-                let filters = extend_runtime_filter_proof_hull(
-                    plan,
-                    fragment.runtime_filters().iter().copied(),
-                    &mut fragments,
-                    &mut edges,
-                    &mut build_dependency_cache,
-                    &mut proof_work_budget,
-                )?;
-                for edge in &edges {
-                    let edge = plan.edges().get(edge)?;
-                    fragments.extend([edge.source.fragment, edge.destination.fragment]);
-                }
-                let index = proof_hulls.len();
-                proof_hulls.push(RuntimeFilterProofHull {
-                    fragments,
-                    edges,
-                    filters,
-                });
-                proof_hull_by_filter_set.insert(key, index);
-                index
-            };
-            proof_hull_by_fragment.insert(fragment.id(), index);
-        }
         Some(Self {
             provenance,
             inbound,
             outbound,
             change_stream_writers,
-            proof_hulls,
-            proof_hull_by_fragment,
         })
     }
 
@@ -210,13 +138,7 @@ impl FragmentCutDerivation {
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
             self,
-            self.proof_hull(fragment_id)?,
         )
-    }
-
-    pub(crate) fn proof_hull(&self, fragment_id: FragmentId) -> Option<&RuntimeFilterProofHull> {
-        self.proof_hulls
-            .get(*self.proof_hull_by_fragment.get(&fragment_id)?)
     }
 
     pub(crate) fn change_stream_writer(
@@ -298,17 +220,6 @@ pub(crate) fn preflight_fragment_cut_resources(
     for filter in fragment.runtime_filters() {
         usage.add_filter(plan.runtime_filters().get(filter)?, &path, errors);
     }
-    let proof_hull = derivation.proof_hull(fragment_id)?;
-    usage.add_items(proof_hull.fragments.len() + proof_hull.edges.len() + proof_hull.filters.len());
-    for proof_fragment in &proof_hull.fragments {
-        usage.add_fragment(plan.fragments().get(proof_fragment)?, errors);
-    }
-    for proof_edge in &proof_hull.edges {
-        usage.add_edge(plan.edges().get(proof_edge)?);
-    }
-    for proof_filter in &proof_hull.filters {
-        usage.add_filter(plan.runtime_filters().get(proof_filter)?, &path, errors);
-    }
     Some(usage.validate(&format!("{path}.resources"), errors))
 }
 
@@ -319,7 +230,6 @@ pub(crate) fn fragment_cuts_with_provenance(
     inbound_edges: &[EdgeId],
     outbound_edges: &[EdgeId],
     derivation: &FragmentCutDerivation,
-    proof_hull: &RuntimeFilterProofHull,
 ) -> Option<FragmentCuts> {
     let fragment = plan.fragments().get(&fragment_id)?;
     let inbound = inbound_edges
@@ -426,35 +336,11 @@ pub(crate) fn fragment_cuts_with_provenance(
         .iter()
         .map(|id| plan.runtime_filters().get(id).cloned())
         .collect::<Option<Vec<_>>>()?;
-    let runtime_filter_proof = crate::RuntimeFilterProofGraph {
-        fragments: proof_hull
-            .fragments
-            .iter()
-            .copied()
-            .map(|id| plan.fragments().get(&id).cloned())
-            .collect::<Option<Vec<_>>>()?
-            .into_boxed_slice(),
-        edges: proof_hull
-            .edges
-            .iter()
-            .copied()
-            .map(|id| plan.edges().get(&id).cloned())
-            .collect::<Option<Vec<_>>>()?
-            .into_boxed_slice(),
-        filters: proof_hull
-            .filters
-            .iter()
-            .copied()
-            .map(|id| plan.runtime_filters().get(&id).cloned())
-            .collect::<Option<Vec<_>>>()?
-            .into_boxed_slice(),
-    };
     Some(FragmentCuts {
         inbound: inbound.into_boxed_slice(),
         outbound: outbound.into_boxed_slice(),
         artifact_refs: artifact_refs.into_values().collect(),
         runtime_filters: runtime_filters.into_boxed_slice(),
-        runtime_filter_proof,
     })
 }
 
@@ -524,303 +410,9 @@ pub(crate) fn writer_result_cut(
     })
 }
 
-pub(crate) fn extend_runtime_filter_build_dependencies(
-    plan: &PhysicalPlan,
-    producer: &crate::RuntimeFilterProducer,
-    expansion: &mut RuntimeFilterBuildExpansion<'_>,
-) -> bool {
-    let Some(fragment) = plan.fragments().get(&producer.endpoint.fragment) else {
-        return false;
-    };
-    let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
-        return false;
-    };
-    let build_root = match (&producer.target, &node.kind) {
-        (
-            crate::RuntimeFilterProducerTarget::JoinBuildKey { .. },
-            NodeKind::HashJoin { build_side, .. },
-        ) => usize::try_from(build_side.input_ordinal())
-            .ok()
-            .and_then(|ordinal| node.inputs.get(ordinal))
-            .copied(),
-        (
-            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
-            NodeKind::Aggregate { .. },
-        ) => node.inputs.first().copied(),
-        _ => None,
-    };
-    let Some(build_root) = build_root else {
-        return false;
-    };
-
-    let root = (fragment.id(), build_root);
-    if !expansion.expanded_build_roots.insert(root) {
-        return true;
-    }
-    if expansion.cache.source_sinks.is_none() {
-        expansion.cache.source_sinks = Some(SourceSinkEdgeIndex::new(plan));
-    }
-
-    if let Entry::Vacant(entry) = expansion.cache.by_root.entry(root) {
-        let mut closure = RuntimeFilterBuildDependencyClosure::default();
-        let mut pending = vec![root];
-        let mut expanded_multicast_sources = BTreeSet::new();
-        while let Some((fragment_id, node_id)) = pending.pop() {
-            if !closure.sites.insert((fragment_id, node_id)) {
-                continue;
-            }
-            if !expansion.work_budget.charge(1) {
-                return false;
-            }
-            closure.fragments.insert(fragment_id);
-            let Some(fragment) = plan.fragments().get(&fragment_id) else {
-                return false;
-            };
-            if expanded_multicast_sources.insert(fragment_id)
-                && let FragmentSink::Multicast { edges } = fragment.sink()
-                && edges.len() >= 2
-            {
-                for edge in edges {
-                    let Some(edge_contract) = plan.edges().get(edge) else {
-                        return false;
-                    };
-                    if !expansion
-                        .cache
-                        .source_sinks
-                        .as_ref()
-                        .is_some_and(|sinks| sinks.owns(edge_contract))
-                    {
-                        return false;
-                    }
-                    let Some(destination) =
-                        plan.fragments().get(&edge_contract.destination.fragment)
-                    else {
-                        return false;
-                    };
-                    closure.edges.insert(*edge);
-                    closure.fragments.insert(destination.id());
-                    pending.push((destination.id(), destination.root()));
-                }
-            }
-            let Some(node) = fragment.nodes().get(&node_id) else {
-                return false;
-            };
-            if let NodeKind::ExchangeSource { edge, .. } = &node.kind {
-                let Some(edge_contract) = plan.edges().get(edge) else {
-                    return false;
-                };
-                if edge_contract.destination.fragment != fragment_id
-                    || edge_contract.destination.node != node_id
-                {
-                    return false;
-                }
-                closure.edges.insert(*edge);
-                closure.fragments.extend([
-                    edge_contract.source.fragment,
-                    edge_contract.destination.fragment,
-                ]);
-                let Some(source) = plan.fragments().get(&edge_contract.source.fragment) else {
-                    return false;
-                };
-                if !expansion
-                    .cache
-                    .source_sinks
-                    .as_ref()
-                    .is_some_and(|sinks| sinks.owns(edge_contract))
-                {
-                    return false;
-                }
-                pending.push((source.id(), source.root()));
-            }
-            pending.extend(node.inputs.iter().map(|input| (fragment_id, *input)));
-        }
-        entry.insert(closure);
-    }
-
-    let Some(closure) = expansion.cache.by_root.get(&root) else {
-        return false;
-    };
-    let merge_work = closure
-        .sites
-        .len()
-        .saturating_add(closure.fragments.len())
-        .saturating_add(closure.edges.len());
-    if !expansion.work_budget.charge(merge_work) {
-        return false;
-    }
-    for site in &closure.sites {
-        if expansion.dependency_sites.insert(*site) {
-            expansion.new_dependency_sites.push(*site);
-        }
-    }
-    expansion
-        .fragments
-        .extend(closure.fragments.iter().copied());
-    expansion.edges.extend(closure.edges.iter().copied());
-    true
-}
-
-pub(crate) fn extend_runtime_filter_proof_hull(
-    plan: &PhysicalPlan,
-    seed_filters: impl IntoIterator<Item = crate::RuntimeFilterId>,
-    fragments: &mut BTreeSet<FragmentId>,
-    edges: &mut BTreeSet<EdgeId>,
-    build_dependency_cache: &mut RuntimeFilterBuildDependencyCache,
-    work_budget: &mut SemanticTraceWorkBudget,
-) -> Option<BTreeSet<crate::RuntimeFilterId>> {
-    let mut seeds = BTreeSet::new();
-    for filter in seed_filters {
-        if !work_budget.charge(1) {
-            return None;
-        }
-        seeds.insert(filter);
-    }
-    let mut included = BTreeSet::new();
-    let mut expanded = BTreeSet::new();
-    let mut include_queue = seeds.iter().copied().collect::<Vec<_>>();
-    let mut active_queue = include_queue.clone();
-    let mut dependency_sites = BTreeSet::new();
-    let mut expanded_build_roots = BTreeSet::new();
-    let mut blocking_at = BTreeMap::<(FragmentId, NodeId), Vec<crate::RuntimeFilterId>>::new();
-
-    while !include_queue.is_empty() || !active_queue.is_empty() {
-        while let Some(filter_id) = include_queue.pop() {
-            if !included.insert(filter_id) {
-                continue;
-            }
-            let filter = plan.runtime_filters().get(&filter_id)?;
-            let static_work = filter
-                .equality_witnesses
-                .len()
-                .saturating_add(filter.producers.len())
-                .saturating_add(filter.consumers.len())
-                .saturating_add(filter.producers.iter().fold(0usize, |work, producer| {
-                    work.saturating_add(producer.progress.build_edges.len())
-                        .saturating_add(producer.progress.non_build_edges.len())
-                }))
-                .saturating_add(filter.consumers.iter().fold(0usize, |work, consumer| {
-                    work.saturating_add(match &consumer.target {
-                        crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => 0,
-                        crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-                        | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
-                            lineage,
-                            ..
-                        } => lineage.len(),
-                    })
-                }));
-            if !work_budget.charge(static_work) {
-                return None;
-            }
-            fragments.extend(
-                filter
-                    .equality_witnesses
-                    .iter()
-                    .map(|witness| witness.fragment),
-            );
-            fragments.extend(
-                filter
-                    .producers
-                    .iter()
-                    .map(|producer| producer.endpoint.fragment),
-            );
-            fragments.extend(
-                filter
-                    .consumers
-                    .iter()
-                    .map(|consumer| consumer.endpoint.fragment),
-            );
-            for producer in &filter.producers {
-                edges.extend(
-                    producer
-                        .progress
-                        .build_edges
-                        .iter()
-                        .chain(&producer.progress.non_build_edges)
-                        .copied(),
-                );
-            }
-            for consumer in &filter.consumers {
-                if consumer.activation == crate::RuntimeFilterConsumerActivation::BlockingSnapshot {
-                    let site = (consumer.endpoint.fragment, consumer.endpoint.node);
-                    blocking_at.entry(site).or_default().push(filter_id);
-                    if dependency_sites.contains(&site) {
-                        active_queue.push(filter_id);
-                    }
-                }
-                let lineage = match &consumer.target {
-                    crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-                    | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
-                        lineage, ..
-                    } => lineage,
-                    crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => continue,
-                };
-                for step in lineage {
-                    match step {
-                        crate::RuntimeFilterLineageStep::FilterPassThrough { fragment, .. }
-                        | crate::RuntimeFilterLineageStep::SortPassThrough { fragment, .. }
-                        | crate::RuntimeFilterLineageStep::ProjectIdentity { fragment, .. }
-                        | crate::RuntimeFilterLineageStep::JoinEquality { fragment, .. }
-                        | crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
-                            fragment, ..
-                        }
-                        | crate::RuntimeFilterLineageStep::AggregateGroupKey { fragment, .. }
-                        | crate::RuntimeFilterLineageStep::UnionAllBranch { fragment, .. } => {
-                            fragments.insert(*fragment);
-                        }
-                        crate::RuntimeFilterLineageStep::ExchangeMapping { edge, .. } => {
-                            edges.insert(*edge);
-                        }
-                    }
-                }
-            }
-        }
-
-        while let Some(filter_id) = active_queue.pop() {
-            if !expanded.insert(filter_id) {
-                continue;
-            }
-            let filter = plan.runtime_filters().get(&filter_id)?;
-            if !work_budget.charge(filter.producers.len()) {
-                return None;
-            }
-            for producer in &filter.producers {
-                let mut new_sites = Vec::new();
-                let mut expansion = RuntimeFilterBuildExpansion {
-                    fragments,
-                    edges,
-                    dependency_sites: &mut dependency_sites,
-                    new_dependency_sites: &mut new_sites,
-                    expanded_build_roots: &mut expanded_build_roots,
-                    cache: build_dependency_cache,
-                    work_budget,
-                };
-                if !extend_runtime_filter_build_dependencies(plan, producer, &mut expansion) {
-                    return None;
-                }
-                for site in new_sites {
-                    if let Some(blocked_filters) = blocking_at.get(&site) {
-                        if !work_budget.charge(blocked_filters.len()) {
-                            return None;
-                        }
-                        active_queue.extend(blocked_filters.iter().copied());
-                    }
-                    let dependency_fragment = plan.fragments().get(&site.0)?;
-                    if !work_budget.charge(dependency_fragment.runtime_filters().len()) {
-                        return None;
-                    }
-                    include_queue.extend(dependency_fragment.runtime_filters().iter().copied());
-                }
-            }
-        }
-    }
-
-    Some(included)
-}
-
 pub(crate) fn validate_fragment_cuts_into(
     fragment: &Fragment,
     cuts: &FragmentCuts,
-    validate_runtime_filter_proof: bool,
     errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].cuts", fragment.id().get());
@@ -1229,9 +821,7 @@ pub(crate) fn validate_fragment_cuts_into(
         ));
     }
     validate_fragment_artifact_cuts(fragment, cuts, &path, errors);
-    if validate_runtime_filter_proof {
-        validate_fragment_runtime_filter_cuts(fragment, cuts, &path, errors);
-    }
+    validate_fragment_runtime_filter_cuts(fragment, cuts, &path, errors);
 }
 
 pub(crate) fn validate_inbound_change_stream_writer(
@@ -1613,6 +1203,16 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    let inbound = cuts
+        .inbound
+        .iter()
+        .map(|cut| (cut.edge, cut))
+        .collect::<BTreeMap<_, _>>();
+    let outbound = cuts
+        .outbound
+        .iter()
+        .map(|cut| (cut.edge, cut))
+        .collect::<BTreeMap<_, _>>();
     let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
     let inbound_edges = cuts
         .inbound
@@ -1641,7 +1241,6 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
             "runtime filters in fragment cuts differ from fragment attachments",
         ));
     }
-    validate_runtime_filter_proof_graph(fragment, cuts, path, errors);
     for filter in &cuts.runtime_filters {
         if !validate_runtime_filter_shape(filter, path, errors) {
             continue;
@@ -1698,6 +1297,17 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
             }
         }
         for consumer in &filter.consumers {
+            validate_local_runtime_filter_consumer_lineage(
+                fragment,
+                &inbound,
+                &outbound,
+                &witnesses,
+                &filter.producers,
+                consumer,
+                path,
+                &mut lineage_indexes,
+                errors,
+            );
             if consumer.endpoint.fragment == fragment.id() {
                 local_endpoint_count += 1;
                 validate_runtime_filter_endpoint_in_fragment(
@@ -1783,234 +1393,4 @@ pub(crate) fn validate_runtime_filter_join_coverage(
             "runtime filter coverage shape differs from its exact join execution mode",
         ));
     }
-}
-
-pub(crate) fn validate_runtime_filter_proof_graph(
-    local_fragment: &Fragment,
-    cuts: &FragmentCuts,
-    path: &str,
-    errors: &mut ValidationContext,
-) {
-    let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
-    let mut root_port_indexes = BTreeMap::new();
-    let proof_fragments = cuts
-        .runtime_filter_proof
-        .fragments
-        .iter()
-        .map(|fragment| (fragment.id(), fragment.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let proof_edges = cuts
-        .runtime_filter_proof
-        .edges
-        .iter()
-        .map(|edge| (edge.id, edge.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let proof_filters = cuts
-        .runtime_filter_proof
-        .filters
-        .iter()
-        .map(|filter| (filter.id, filter.clone()))
-        .collect::<BTreeMap<_, _>>();
-    if proof_fragments.len() != cuts.runtime_filter_proof.fragments.len()
-        || proof_edges.len() != cuts.runtime_filter_proof.edges.len()
-        || proof_filters.len() != cuts.runtime_filter_proof.filters.len()
-    {
-        errors.push(ValidationError::new(
-            path,
-            "runtime-filter proof graph contains duplicate fragment, edge, or filter identities",
-        ));
-        return;
-    }
-    if cuts.runtime_filters.is_empty() {
-        if !proof_fragments.is_empty() || !proof_edges.is_empty() || !proof_filters.is_empty() {
-            errors.push(ValidationError::new(
-                path,
-                "runtime-filter proof graph is non-empty without an attached filter",
-            ));
-        }
-        return;
-    }
-
-    let proof_plan = PhysicalPlan::from(crate::PhysicalPlanParts {
-        version: crate::PlanVersionId::try_new([1; 16])
-            .expect("the proof-only plan version is non-zero"),
-        fragments: proof_fragments.clone(),
-        edges: proof_edges.clone(),
-        runtime_filters: proof_filters.clone(),
-        result_port: None,
-        artifact_refs: BTreeMap::new(),
-        required: RequiredContracts::default(),
-        annotations: Box::default(),
-    });
-    let attachments = runtime_filter_attachment_index(&proof_plan);
-    let inbound_edges = runtime_filter_inbound_edge_index(&proof_plan);
-    if cuts
-        .runtime_filters
-        .iter()
-        .any(|filter| proof_filters.get(&filter.id) != Some(filter))
-    {
-        errors.push(ValidationError::new(
-            path,
-            "runtime-filter proof graph changes a locally attached filter contract",
-        ));
-        return;
-    }
-    let mut required_fragments = BTreeSet::new();
-    let mut required_edges = BTreeSet::new();
-    let mut build_dependency_cache = RuntimeFilterBuildDependencyCache::default();
-    let mut proof_work_budget = SemanticTraceWorkBudget::new(errors.limits());
-    let Some(required_filters) = extend_runtime_filter_proof_hull(
-        &proof_plan,
-        cuts.runtime_filters.iter().map(|filter| filter.id),
-        &mut required_fragments,
-        &mut required_edges,
-        &mut build_dependency_cache,
-        &mut proof_work_budget,
-    ) else {
-        errors.push(ValidationError::new(
-            path,
-            "runtime-filter proof graph omits a join-build execution dependency",
-        ));
-        return;
-    };
-    for edge in &required_edges {
-        let Some(edge) = proof_edges.get(edge) else {
-            continue;
-        };
-        required_fragments.extend([edge.source.fragment, edge.destination.fragment]);
-    }
-    if proof_fragments.keys().copied().collect::<BTreeSet<_>>() != required_fragments
-        || proof_edges.keys().copied().collect::<BTreeSet<_>>() != required_edges
-        || proof_filters.keys().copied().collect::<BTreeSet<_>>() != required_filters
-        || proof_fragments.get(&local_fragment.id()) != Some(local_fragment)
-    {
-        errors.push(ValidationError::new(
-            path,
-            "runtime-filter proof graph differs from the exact referenced subgraph",
-        ));
-        return;
-    }
-
-    for fragment in proof_fragments.values() {
-        validate_fragment_into(fragment, errors);
-    }
-    for edge in proof_plan.edges().values() {
-        validate_edge(&proof_plan, edge, &mut root_port_indexes, errors);
-    }
-    validate_runtime_filter_proof_edge_source_sinks(&proof_plan, path, errors);
-    for filter in proof_plan.runtime_filters().values() {
-        if !validate_runtime_filter_shape(filter, path, errors) {
-            continue;
-        }
-        let witnesses = runtime_filter_witness_index(&filter.equality_witnesses);
-        for witness in &filter.equality_witnesses {
-            match proof_plan.fragments().get(&witness.fragment) {
-                Some(fragment) => validate_runtime_filter_equality_witness(
-                    fragment,
-                    witness,
-                    &filter.domain,
-                    path,
-                    errors,
-                ),
-                None => errors.push(ValidationError::new(
-                    path,
-                    "runtime-filter proof graph omits an equality fragment",
-                )),
-            }
-        }
-        for producer in &filter.producers {
-            validate_runtime_filter_attachment(
-                &proof_plan,
-                &attachments,
-                filter.id,
-                &producer.endpoint,
-                path,
-                errors,
-            );
-            if let Some(fragment) = proof_plan.fragments().get(&producer.endpoint.fragment) {
-                validate_runtime_filter_endpoint_in_fragment(
-                    fragment,
-                    &producer.endpoint,
-                    &filter.domain,
-                    path,
-                    errors,
-                );
-                validate_apply_point_in_fragment(
-                    fragment,
-                    &mut lineage_indexes,
-                    &producer.endpoint,
-                    producer.apply_point,
-                    path,
-                    errors,
-                );
-                validate_runtime_filter_producer_target(
-                    fragment,
-                    &witnesses,
-                    producer,
-                    &filter.domain,
-                    filter.reduction,
-                    path,
-                    errors,
-                );
-                validate_runtime_filter_join_coverage(fragment, filter, producer, path, errors);
-                validate_runtime_filter_producer_progress(
-                    fragment,
-                    producer,
-                    inbound_edges
-                        .get(&fragment.id())
-                        .unwrap_or(&BTreeSet::new()),
-                    &mut lineage_indexes,
-                    path,
-                    errors,
-                );
-            }
-        }
-        for consumer in &filter.consumers {
-            validate_runtime_filter_attachment(
-                &proof_plan,
-                &attachments,
-                filter.id,
-                &consumer.endpoint,
-                path,
-                errors,
-            );
-            if let Some(fragment) = proof_plan.fragments().get(&consumer.endpoint.fragment) {
-                validate_runtime_filter_endpoint_in_fragment(
-                    fragment,
-                    &consumer.endpoint,
-                    &filter.domain,
-                    path,
-                    errors,
-                );
-                validate_apply_point_in_fragment(
-                    fragment,
-                    &mut lineage_indexes,
-                    &consumer.endpoint,
-                    consumer.apply_point,
-                    path,
-                    errors,
-                );
-                validate_runtime_filter_consumer_semantics(
-                    fragment,
-                    &witnesses,
-                    &filter.producers,
-                    &filter.domain,
-                    consumer,
-                    &mut lineage_indexes,
-                    path,
-                    errors,
-                );
-            }
-            validate_runtime_filter_consumer_lineage(
-                &proof_plan,
-                &witnesses,
-                &filter.producers,
-                consumer,
-                path,
-                &mut lineage_indexes,
-                errors,
-            );
-        }
-    }
-    validate_runtime_filter_wait_graph(&proof_plan, path, errors);
 }

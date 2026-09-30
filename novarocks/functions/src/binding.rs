@@ -51,6 +51,7 @@ pub struct AggregateBindingDeclaration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionOverloadDeclaration {
     pub identity: FunctionOverloadId,
+    pub semantics: FunctionSemantics,
     pub argument_pattern: Box<str>,
     pub result_pattern: Box<str>,
     pub aggregate: Option<AggregateBindingDeclaration>,
@@ -60,7 +61,6 @@ pub struct FunctionOverloadDeclaration {
 pub struct FunctionBindingDeclaration {
     function_id: FunctionId,
     kind: FunctionKind,
-    semantics: FunctionSemantics,
     overloads: Box<[FunctionOverloadDeclaration]>,
 }
 
@@ -68,14 +68,8 @@ impl FunctionBindingDeclaration {
     pub fn try_new(
         function_id: FunctionId,
         kind: FunctionKind,
-        semantics: FunctionSemantics,
         overloads: impl IntoIterator<Item = FunctionOverloadDeclaration>,
     ) -> Result<Self, FunctionBindingError> {
-        if !semantics.intrinsic_row_error.is_valid_for_kind(kind) {
-            return Err(invalid(
-                "intrinsic row-error fact differs from the function kind",
-            ));
-        }
         let mut overloads = overloads.into_iter().collect::<Vec<_>>();
         if overloads.is_empty() {
             return Err(invalid("function has no declared overloads"));
@@ -83,6 +77,15 @@ impl FunctionBindingDeclaration {
         overloads.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
         let mut patterns = BTreeSet::new();
         for (index, overload) in overloads.iter().enumerate() {
+            if !overload
+                .semantics
+                .intrinsic_row_error
+                .is_valid_for_kind(kind)
+            {
+                return Err(invalid(
+                    "intrinsic row-error fact differs from the function kind",
+                ));
+            }
             if index > 0 && overloads[index - 1].identity == overload.identity {
                 return Err(FunctionBindingError::DuplicateOverload(
                     overload.identity.clone(),
@@ -107,7 +110,6 @@ impl FunctionBindingDeclaration {
         Ok(Self {
             function_id,
             kind,
-            semantics,
             overloads: overloads.into_boxed_slice(),
         })
     }
@@ -118,8 +120,14 @@ impl FunctionBindingDeclaration {
     pub const fn kind(&self) -> FunctionKind {
         self.kind
     }
-    pub const fn semantics(&self) -> FunctionSemantics {
-        self.semantics
+    /// Conservative metadata for name-based discovery. Exact calls consume
+    /// only their selected overload's semantics.
+    pub fn volatility(&self) -> FunctionVolatility {
+        self.overloads
+            .iter()
+            .map(|overload| overload.semantics.volatility)
+            .max()
+            .expect("a declaration always contains an overload")
     }
     pub fn overloads(&self) -> &[FunctionOverloadDeclaration] {
         &self.overloads
@@ -315,6 +323,13 @@ pub(crate) fn parametric_aggregate_binding(
         .iter()
         .map(|overload| {
             Ok(FunctionOverloadDeclaration {
+                semantics: FunctionSemantics {
+                    volatility,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                },
                 identity: FunctionOverloadId::try_new(overload.identity.as_str())
                     .map_err(|error| invalid_identity(&error))?,
                 argument_pattern: overload.argument_pattern.clone(),
@@ -326,19 +341,9 @@ pub(crate) fn parametric_aggregate_binding(
             })
         })
         .collect::<Result<Vec<_>, FunctionCatalogError>>()?;
-    let declaration = FunctionBindingDeclaration::try_new(
-        function_id,
-        crate::FunctionKind::Aggregate,
-        FunctionSemantics {
-            volatility,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error:
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
-        },
-        declared,
-    )
-    .map_err(|error| invalid_identity(&error))?;
+    let declaration =
+        FunctionBindingDeclaration::try_new(function_id, crate::FunctionKind::Aggregate, declared)
+            .map_err(|error| invalid_identity(&error))?;
     Ok(FunctionBindingDefinition::new(
         declaration,
         Arc::new(ParametricAggregateBindingResolver { aggregate_resolver }),
@@ -525,7 +530,7 @@ impl FunctionDefinition {
             canonical_name: canonical_name.into(),
             kind: declaration.kind,
             visibility,
-            volatility: declaration.semantics.volatility,
+            volatility: declaration.volatility(),
             canonical_signatures,
             aggregate_overloads: aggregate_overloads.into_boxed_slice(),
             exact_aggregate_overloads: Box::default(),
@@ -604,9 +609,8 @@ impl EngineFunctionCatalog {
             .definition_by_id(&bound.function_id)
             .ok_or(FunctionBindingError::UnknownFunction)?;
         let binding = exact_definition(definition)?;
-        if bound.kind != binding.declaration.kind
-            || bound.semantics != binding.declaration.semantics
-        {
+        let overload = binding.declaration.overload(&bound.selected.overload)?;
+        if bound.kind != binding.declaration.kind || bound.semantics != overload.semantics {
             return Err(invalid(
                 "frozen function kind or semantics differ from the declaration",
             ));
@@ -651,7 +655,7 @@ fn resolve_definition(
     Ok(ResolvedFunctionBinding {
         function_id: binding.declaration.function_id.clone(),
         kind: binding.declaration.kind,
-        semantics: binding.declaration.semantics,
+        semantics: binding.declaration.overload(&selected.overload)?.semantics,
         logical_argument_count: request.logical_argument_count,
         selected,
     })
@@ -747,26 +751,31 @@ pub(crate) fn digest_binding_definition(
     hasher.update([1]);
     let declaration = &binding.declaration;
     digest_text(hasher, declaration.function_id.as_str());
-    hasher.update([match declaration.semantics.argument_evaluation {
-        FunctionArgumentEvaluation::Eager => 1,
-        FunctionArgumentEvaluation::ShortCircuit => 2,
-    }]);
-    hasher.update([match declaration.semantics.failure_behavior {
-        FunctionFailureBehavior::Propagate => 1,
-        FunctionFailureBehavior::ReturnsNull => 2,
-    }]);
     hasher.update(
         u32::try_from(declaration.overloads.len())
             .expect("overload count fits u32")
             .to_be_bytes(),
     );
-    hasher.update([match declaration.semantics.intrinsic_row_error {
-        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => 1,
-        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => 2,
-        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => 3,
-    }]);
     for overload in &declaration.overloads {
         digest_text(hasher, overload.identity.as_str());
+        hasher.update([match overload.semantics.volatility {
+            FunctionVolatility::Immutable => 1,
+            FunctionVolatility::Stable => 2,
+            FunctionVolatility::Volatile => 3,
+        }]);
+        hasher.update([match overload.semantics.argument_evaluation {
+            FunctionArgumentEvaluation::Eager => 1,
+            FunctionArgumentEvaluation::ShortCircuit => 2,
+        }]);
+        hasher.update([match overload.semantics.failure_behavior {
+            FunctionFailureBehavior::Propagate => 1,
+            FunctionFailureBehavior::ReturnsNull => 2,
+        }]);
+        hasher.update([match overload.semantics.intrinsic_row_error {
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => 1,
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => 2,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => 3,
+        }]);
         digest_text(hasher, &overload.argument_pattern);
         digest_text(hasher, &overload.result_pattern);
         if let Some(aggregate) = &overload.aggregate {

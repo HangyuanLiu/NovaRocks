@@ -17,7 +17,7 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -25,8 +25,7 @@ use arrow_schema::DataType;
 use crate::resource::MAX_PLAN_DERIVED_CUT_ITEMS;
 use crate::{
     AggregatePhase, Distribution, EdgeId, ExprId, ExprKind, FragmentCuts, FragmentId, FragmentSink,
-    NodeId, NodeKind, PhysicalNode, PhysicalPlan, RequiredContracts, RowMultiplicity, ValueId,
-    ValueOrigin, ValueType,
+    NodeId, NodeKind, PhysicalNode, RowMultiplicity, ValueId, ValueOrigin, ValueType,
 };
 
 #[cfg(test)]
@@ -510,87 +509,6 @@ mod validation_error_tests {
         );
         assert_eq!(indexes.aggregate_sequences.len(), 1);
         assert_eq!(initial_work - budget.remaining, calls.len());
-    }
-
-    #[test]
-    fn overlapping_runtime_filter_hulls_charge_each_revisited_static_contribution() {
-        let runtime_filter = |id, witness_count| crate::RuntimeFilter {
-            id: crate::RuntimeFilterId::new(id),
-            kind: crate::RuntimeFilterKind::InList,
-            domain: crate::RuntimeFilterDomain::Membership {
-                ty: ValueType::new(DataType::Int64, false),
-                null_semantics: crate::RuntimeFilterNullSemantics::NeverMatches,
-            },
-            lifecycle: crate::RuntimeFilterLifecycle::CompleteOnce,
-            reduction: crate::RuntimeFilterReduction::SetUnion,
-            availability_coverage: crate::RuntimeFilterCoverage {
-                nodes: Box::default(),
-                root: 0,
-            },
-            terminal_coverage: crate::RuntimeFilterCoverage {
-                nodes: Box::default(),
-                root: 0,
-            },
-            equality_witnesses: (0..witness_count)
-                .map(|ordinal| crate::RuntimeFilterEqualityWitness {
-                    id: crate::RuntimeFilterEqualityWitnessId::new(ordinal + 1),
-                    fragment: FragmentId::new(1),
-                    join: NodeId::new(1),
-                    key_ordinal: ordinal,
-                    domain_side: crate::JoinSide::Right,
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            producers: Box::default(),
-            consumers: Box::default(),
-            policy: crate::RuntimeFilterPolicy {
-                max_contribution_bytes: 1,
-                max_artifact_bytes: 1,
-                deadline_ms: 1,
-                max_retries: 1,
-            },
-        };
-        let common = crate::RuntimeFilterId::new(1);
-        let mut filters = BTreeMap::from([(common, runtime_filter(1, 4096))]);
-        for id in 2..=257 {
-            filters.insert(crate::RuntimeFilterId::new(id), runtime_filter(id, 0));
-        }
-        let plan = PhysicalPlan::from(crate::PhysicalPlanParts {
-            version: crate::PlanVersionId::try_new([1; 16]).unwrap(),
-            fragments: BTreeMap::new(),
-            edges: BTreeMap::new(),
-            runtime_filters: filters,
-            result_port: None,
-            artifact_refs: BTreeMap::new(),
-            required: RequiredContracts::default(),
-            annotations: Box::default(),
-        });
-        let mut cache = RuntimeFilterBuildDependencyCache::default();
-        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
-        let mut rejected = false;
-
-        for id in 2..=257 {
-            let mut fragments = BTreeSet::new();
-            let mut edges = BTreeSet::new();
-            if extend_runtime_filter_proof_hull(
-                &plan,
-                [common, crate::RuntimeFilterId::new(id)],
-                &mut fragments,
-                &mut edges,
-                &mut cache,
-                &mut budget,
-            )
-            .is_none()
-            {
-                rejected = true;
-                break;
-            }
-        }
-
-        assert!(
-            rejected,
-            "overlapping but distinct proof hulls must not rescan a wide shared filter beyond the work budget"
-        );
     }
 
     #[test]

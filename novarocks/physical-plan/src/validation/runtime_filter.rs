@@ -26,38 +26,6 @@ use crate::{
     RuntimeFilterEndpoint, ValueId,
 };
 
-pub(crate) fn validate_runtime_filter_proof_edge_source_sinks(
-    plan: &PhysicalPlan,
-    path: &str,
-    errors: &mut ValidationContext,
-) {
-    let source_sinks = SourceSinkEdgeIndex::new(plan);
-    for edge in plan.edges().values() {
-        if !source_sinks.owns(edge) {
-            errors.push(ValidationError::new(
-                format!("{path}.edges[{}]", edge.id.get()),
-                "runtime-filter proof edge is not owned by its exact source fragment sink",
-            ));
-        }
-    }
-    for source in plan.fragments().values() {
-        let FragmentSink::Router { routes, .. } = source.sink() else {
-            continue;
-        };
-        for route in routes {
-            let Some(edge) = plan.edges().get(&route.edge) else {
-                continue;
-            };
-            if !source_sinks.owns(edge) {
-                continue;
-            }
-            let edge_path = format!("{path}.edges[{}]", edge.id.get());
-            validate_router_writer_contract(plan, route, edge, &edge_path, errors);
-            validate_router_partitioning(route, &edge.partitioning.source, &edge_path, errors);
-        }
-    }
-}
-
 pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
     let attachments = runtime_filter_attachment_index(plan);
@@ -1564,7 +1532,14 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
     };
     if lineage.len() > errors.limits().runtime_filter_lineage_steps
         || runtime_filter_scan_lineage_is_valid(
-            plan, witnesses, producers, consumer, origin, lineage, indexes,
+            |id| plan.fragments().get(&id),
+            |id| plan.edges().get(&id),
+            witnesses,
+            producers,
+            consumer,
+            origin,
+            lineage,
+            indexes,
         )
         .is_none()
     {
@@ -1575,14 +1550,217 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
     }
 }
 
+/// Recheck every locally addressable lineage segment using the whole-plan
+/// rules. Cross-fragment connectivity is FE-owned; no executable peer graph
+/// is materialized to reconstruct it here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "local boundary indexes and diagnostics share one validation walk"
+)]
+pub(crate) fn validate_local_runtime_filter_consumer_lineage(
+    fragment: &Fragment,
+    inbound: &BTreeMap<EdgeId, &crate::InboundFragmentCut>,
+    outbound: &BTreeMap<EdgeId, &crate::OutboundFragmentCut>,
+    witnesses: &RuntimeFilterWitnessIndex<'_>,
+    producers: &[crate::RuntimeFilterProducer],
+    consumer: &crate::RuntimeFilterConsumer,
+    path: &str,
+    indexes: &mut RuntimeFilterLineageIndexes,
+    errors: &mut ValidationContext,
+) {
+    let (origin, lineage, origin_fragment) = match &consumer.target {
+        crate::RuntimeFilterConsumerTarget::ScanField { equality, lineage } => {
+            let Some(witness) = runtime_filter_equality_witness(witnesses, *equality) else {
+                return;
+            };
+            (
+                RuntimeFilterLineageOrigin::Join(*equality),
+                lineage.as_ref(),
+                witness.fragment,
+            )
+        }
+        crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { producer, lineage } => {
+            let Some(producer) = producers.iter().find(|item| item.witness == *producer) else {
+                return;
+            };
+            (
+                RuntimeFilterLineageOrigin::AggregateTopN(producer.witness),
+                lineage.as_ref(),
+                producer.endpoint.fragment,
+            )
+        }
+        crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => return,
+    };
+    if lineage.len() > errors.limits().runtime_filter_lineage_steps {
+        errors.push(ValidationError::resource_limit(
+            path,
+            "runtime-filter lineage exceeds its local work bound",
+        ));
+        return;
+    }
+    let valid = validate_runtime_filter_local_segments(
+        fragment,
+        inbound,
+        outbound,
+        witnesses,
+        producers,
+        consumer,
+        origin,
+        origin_fragment,
+        lineage,
+        indexes,
+    );
+    if valid.is_none() {
+        errors.push(ValidationError::new(path,
+            "runtime filter scan consumer is not connected to its exact probe key by a safe lineage"));
+    }
+}
+
+/// State changes between local and remote only at an exact exchange mapping.
+/// Remote executable facts stay FE-owned; every locally addressable segment
+/// uses the same node/occurrence/adjacency rules as the complete-plan walk.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one local projection of the whole-plan lineage contract"
+)]
+fn validate_runtime_filter_local_segments(
+    fragment: &Fragment,
+    inbound: &BTreeMap<EdgeId, &crate::InboundFragmentCut>,
+    outbound: &BTreeMap<EdgeId, &crate::OutboundFragmentCut>,
+    witnesses: &RuntimeFilterWitnessIndex<'_>,
+    producers: &[crate::RuntimeFilterProducer],
+    consumer: &crate::RuntimeFilterConsumer,
+    origin: RuntimeFilterLineageOrigin,
+    origin_fragment: FragmentId,
+    lineage: &[crate::RuntimeFilterLineageStep],
+    indexes: &mut RuntimeFilterLineageIndexes,
+) -> Option<()> {
+    let lookup = |id| (id == fragment.id()).then_some(fragment);
+    let mut local = if origin_fragment == fragment.id() {
+        Some(runtime_filter_lineage_start(
+            lookup, witnesses, producers, origin, indexes,
+        )?)
+    } else {
+        None
+    };
+    // A cut fixes the immediate peer identity even though its executable
+    // nodes remain FE-owned. An unobserved remote exchange loses that fact.
+    let mut known_remote = (origin_fragment != fragment.id()).then_some(origin_fragment);
+    let mut visited = BTreeSet::new();
+    if let Some(position) = local {
+        visited.insert(position);
+    }
+    for step in lineage {
+        match step {
+            crate::RuntimeFilterLineageStep::ExchangeMapping {
+                edge,
+                mapping_ordinal,
+            } => {
+                let ordinal = usize::try_from(*mapping_ordinal).ok()?;
+                if let Some(position) = local {
+                    let cut = inbound.get(edge)?;
+                    let mapping = cut.imports.get(ordinal)?;
+                    let node = fragment.nodes().get(&position.1)?;
+                    let NodeKind::ExchangeSource {
+                        edge: node_edge,
+                        imports,
+                    } = &node.kind
+                    else {
+                        return None;
+                    };
+                    if cut.kind != crate::EdgeKind::Stream
+                        || cut.destination_node != position.1
+                        || mapping.destination != position.2
+                        || *node_edge != *edge
+                        || imports.get(ordinal).copied()
+                            != Some((mapping.source.value, mapping.destination))
+                    {
+                        return None;
+                    }
+                    local = None;
+                    known_remote = Some(cut.source_fragment);
+                } else if let Some(cut) = outbound.get(edge) {
+                    let mapping = cut.destination_imports.get(ordinal)?;
+                    if cut.kind != crate::EdgeKind::Stream
+                        || cut.projection.get(ordinal) != Some(&mapping.source)
+                        || known_remote.is_some_and(|peer| peer != cut.destination_fragment)
+                    {
+                        return None;
+                    }
+                    let position = (fragment.id(), fragment.root(), mapping.source.value);
+                    if !visited.insert(position) {
+                        return None;
+                    }
+                    local = Some(position);
+                    known_remote = None;
+                } else if inbound.contains_key(edge) {
+                    return None;
+                } else {
+                    known_remote = None;
+                }
+            }
+            crate::RuntimeFilterLineageStep::FilterPassThrough { fragment: id, .. }
+            | crate::RuntimeFilterLineageStep::SortPassThrough { fragment: id, .. }
+            | crate::RuntimeFilterLineageStep::ProjectIdentity { fragment: id, .. }
+            | crate::RuntimeFilterLineageStep::JoinEquality { fragment: id, .. }
+            | crate::RuntimeFilterLineageStep::JoinOutputPassThrough { fragment: id, .. }
+            | crate::RuntimeFilterLineageStep::AggregateGroupKey { fragment: id, .. }
+            | crate::RuntimeFilterLineageStep::UnionAllBranch { fragment: id, .. } => {
+                if *id == fragment.id() {
+                    let position = local?;
+                    let next = advance_runtime_filter_lineage_step(
+                        lookup,
+                        |_| None,
+                        position,
+                        step,
+                        indexes,
+                    )?;
+                    if !visited.insert(next) {
+                        return None;
+                    }
+                    local = Some(next);
+                } else if local.is_some() || known_remote.is_some_and(|peer| peer != *id) {
+                    return None;
+                }
+            }
+        }
+    }
+    if consumer.endpoint.fragment == fragment.id() {
+        let position = local?;
+        if position
+            != (
+                fragment.id(),
+                consumer.endpoint.node,
+                *consumer.endpoint.values.first()?,
+            )
+            || consumer.endpoint.values.len() != 1
+            || consumer.apply_point != crate::RuntimeFilterApplyPoint::ScanSource
+        {
+            return None;
+        }
+        let node = fragment.nodes().get(&position.1)?;
+        indexes
+            .scan_provider_contains(fragment, node, position.2)
+            .then_some(())
+    } else {
+        (local.is_none() && known_remote.is_none_or(|peer| peer == consumer.endpoint.fragment))
+            .then_some(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum RuntimeFilterLineageOrigin {
     Join(crate::RuntimeFilterEqualityWitnessId),
     AggregateTopN(crate::RuntimeFilterWitnessId),
 }
 
-pub(crate) fn runtime_filter_scan_lineage_is_valid(
-    plan: &PhysicalPlan,
+#[expect(
+    clippy::too_many_arguments,
+    reason = "carrier-neutral lookups preserve one shared global lineage walk"
+)]
+pub(crate) fn runtime_filter_scan_lineage_is_valid<'a>(
+    get_fragment: impl Fn(FragmentId) -> Option<&'a Fragment>,
+    get_edge: impl Fn(EdgeId) -> Option<&'a crate::Edge>,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
     producers: &[crate::RuntimeFilterProducer],
     consumer: &crate::RuntimeFilterConsumer,
@@ -1590,10 +1768,22 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
     lineage: &[crate::RuntimeFilterLineageStep],
     indexes: &mut RuntimeFilterLineageIndexes,
 ) -> Option<()> {
-    let mut position = match origin {
+    let position =
+        runtime_filter_lineage_start(&get_fragment, witnesses, producers, origin, indexes)?;
+    runtime_filter_scan_lineage_from(get_fragment, get_edge, consumer, position, lineage, indexes)
+}
+
+fn runtime_filter_lineage_start<'a>(
+    get_fragment: impl Fn(FragmentId) -> Option<&'a Fragment>,
+    witnesses: &RuntimeFilterWitnessIndex<'_>,
+    producers: &[crate::RuntimeFilterProducer],
+    origin: RuntimeFilterLineageOrigin,
+    indexes: &mut RuntimeFilterLineageIndexes,
+) -> Option<(FragmentId, NodeId, ValueId)> {
+    let position = match origin {
         RuntimeFilterLineageOrigin::Join(equality) => {
             let witness = runtime_filter_equality_witness(witnesses, equality)?;
-            let fragment = plan.fragments().get(&witness.fragment)?;
+            let fragment = get_fragment(witness.fragment)?;
             let join = fragment.nodes().get(&witness.join)?;
             let probe_side = witness.domain_side.opposite();
             let probe_value = equality_key_value(fragment, witness, probe_side)?;
@@ -1614,7 +1804,7 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
             else {
                 return None;
             };
-            let fragment = plan.fragments().get(&producer.endpoint.fragment)?;
+            let fragment = get_fragment(producer.endpoint.fragment)?;
             let aggregate = fragment.nodes().get(&producer.endpoint.node)?;
             let input = *aggregate.inputs.first()?;
             if aggregate.inputs.len() != 1
@@ -1625,290 +1815,21 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
             (fragment.id(), input, *producer.endpoint.values.first()?)
         }
     };
+    Some(position)
+}
+
+fn runtime_filter_scan_lineage_from<'a>(
+    get_fragment: impl Fn(FragmentId) -> Option<&'a Fragment>,
+    get_edge: impl Fn(EdgeId) -> Option<&'a crate::Edge>,
+    consumer: &crate::RuntimeFilterConsumer,
+    mut position: (FragmentId, NodeId, ValueId),
+    lineage: &[crate::RuntimeFilterLineageStep],
+    indexes: &mut RuntimeFilterLineageIndexes,
+) -> Option<()> {
     let mut visited = BTreeSet::from([position]);
     for step in lineage {
-        let next = match *step {
-            crate::RuntimeFilterLineageStep::FilterPassThrough {
-                fragment,
-                node,
-                input_ordinal,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                if !matches!(node.kind, NodeKind::Filter { .. })
-                    || node.inputs.len() != 1
-                    || input_ordinal != 0
-                    || !indexes.port_contains(fragment, node, position.2)
-                {
-                    return None;
-                }
-                let child = node.inputs[0];
-                let child_node = fragment.nodes().get(&child)?;
-                if !indexes.port_contains(fragment, child_node, position.2)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), child, position.2)
-            }
-            crate::RuntimeFilterLineageStep::SortPassThrough {
-                fragment,
-                node,
-                input_ordinal,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                let safe_sort = matches!(
-                    &node.kind,
-                    NodeKind::Sort {
-                        order_by,
-                        mode: crate::SortMode::Global | crate::SortMode::Analytic { .. },
-                    } if order_by
-                        .iter()
-                        .all(|item| crate::expression_value(fragment.expressions(), item.expr).is_some())
-                );
-                let child = node
-                    .inputs
-                    .get(usize::try_from(input_ordinal).ok()?)
-                    .copied()?;
-                let child_node = fragment.nodes().get(&child)?;
-                if !safe_sort
-                    || node.inputs.len() != 1
-                    || input_ordinal != 0
-                    || !indexes.port_contains(fragment, node, position.2)
-                    || !indexes.port_contains(fragment, child_node, position.2)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), child, position.2)
-            }
-            crate::RuntimeFilterLineageStep::ProjectIdentity {
-                fragment,
-                node,
-                output_ordinal,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                let NodeKind::Project { expressions } = &node.kind else {
-                    return None;
-                };
-                if node.inputs.len() != 1
-                    || node
-                        .output
-                        .columns
-                        .get(usize::try_from(output_ordinal).ok()?)
-                        .copied()
-                        != Some(position.2)
-                {
-                    return None;
-                }
-                let child = node.inputs[0];
-                let child_node = fragment.nodes().get(&child)?;
-                let (expression, output) = expressions
-                    .get(usize::try_from(output_ordinal).ok()?)
-                    .copied()?;
-                if output != position.2 {
-                    return None;
-                }
-                let source = crate::expression_value(fragment.expressions(), expression)?;
-                if !indexes.port_contains(fragment, child_node, source)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), child, source)
-            }
-            crate::RuntimeFilterLineageStep::JoinEquality {
-                fragment,
-                node,
-                key_ordinal,
-                source_side,
-                target_side,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                let NodeKind::HashJoin { kind, keys, .. } = &node.kind else {
-                    return None;
-                };
-                let key = keys.get(usize::try_from(key_ordinal).ok()?)?;
-                if !kind.key_filter_reaches_side(target_side)
-                    || key.null_safe
-                    || node.inputs.len() != 2
-                {
-                    return None;
-                }
-                let key_value = |side: crate::JoinSide| match side {
-                    crate::JoinSide::Left => {
-                        crate::join_key_source_value(fragment.expressions(), key.left)
-                    }
-                    crate::JoinSide::Right => {
-                        crate::join_key_source_value(fragment.expressions(), key.right)
-                    }
-                };
-                if key_value(source_side) != Some(position.2)
-                    || !indexes.port_contains(fragment, node, position.2)
-                {
-                    return None;
-                }
-                let target_value = key_value(target_side)?;
-                let target_input =
-                    node.inputs[usize::try_from(target_side.input_ordinal()).ok()?];
-                let child_node = fragment.nodes().get(&target_input)?;
-                if !indexes.port_contains(fragment, child_node, target_value)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, target_input, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), target_input, target_value)
-            }
-            crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
-                fragment,
-                node,
-                input_ordinal,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                let kind = match &node.kind {
-                    NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. } => *kind,
-                    _ => return None,
-                };
-                let side = match input_ordinal {
-                    0 => crate::JoinSide::Left,
-                    1 => crate::JoinSide::Right,
-                    _ => return None,
-                };
-                if node.inputs.len() != 2
-                    || !kind.side_only_loses_rows(side)
-                    || !indexes.port_contains(fragment, node, position.2)
-                {
-                    return None;
-                }
-                let child = node.inputs[usize::from(input_ordinal != 0)];
-                let child_node = fragment.nodes().get(&child)?;
-                // The value has to be the child's own, republished unchanged:
-                // a null-extended copy is a different value and stops here.
-                if !indexes.port_contains(fragment, child_node, position.2)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), child, position.2)
-            }
-            crate::RuntimeFilterLineageStep::AggregateGroupKey {
-                fragment,
-                node,
-                group_key_ordinal,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                let NodeKind::Aggregate { group_by, .. } = &node.kind else {
-                    return None;
-                };
-                let (expression, output) = group_by
-                    .get(usize::try_from(group_key_ordinal).ok()?)
-                    .copied()?;
-                let source = crate::expression_value(fragment.expressions(), expression)?;
-                let child = *node.inputs.first()?;
-                let child_node = fragment.nodes().get(&child)?;
-                if node.inputs.len() != 1
-                    || output != position.2
-                    || !indexes.port_contains(fragment, child_node, source)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), child, source)
-            }
-            crate::RuntimeFilterLineageStep::UnionAllBranch {
-                fragment,
-                node,
-                input_ordinal,
-                output_ordinal,
-            } => {
-                if (fragment, node) != (position.0, position.1) {
-                    return None;
-                }
-                let fragment = plan.fragments().get(&fragment)?;
-                let node = fragment.nodes().get(&node)?;
-                let NodeKind::SetOp {
-                    kind: crate::SetOperationKind::UnionAll,
-                    input_mappings,
-                } = &node.kind
-                else {
-                    return None;
-                };
-                let input_ordinal = usize::try_from(input_ordinal).ok()?;
-                let output_ordinal = usize::try_from(output_ordinal).ok()?;
-                if node.output.columns.get(output_ordinal).copied() != Some(position.2) {
-                    return None;
-                }
-                let child = *node.inputs.get(input_ordinal)?;
-                let source = *input_mappings.get(input_ordinal)?.get(output_ordinal)?;
-                let child_node = fragment.nodes().get(&child)?;
-                if !indexes.port_contains(fragment, child_node, source)
-                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
-                {
-                    return None;
-                }
-                (fragment.id(), child, source)
-            }
-            crate::RuntimeFilterLineageStep::ExchangeMapping {
-                edge,
-                mapping_ordinal,
-            } => {
-                let fragment = plan.fragments().get(&position.0)?;
-                let node = fragment.nodes().get(&position.1)?;
-                let NodeKind::ExchangeSource {
-                    edge: node_edge,
-                    imports,
-                } = &node.kind
-                else {
-                    return None;
-                };
-                let edge_contract = plan.edges().get(&edge)?;
-                let ordinal = usize::try_from(mapping_ordinal).ok()?;
-                let (source, destination) =
-                    *edge_contract.destination.receive_mapping.get(ordinal)?;
-                if *node_edge != edge
-                    || edge_contract.kind != crate::EdgeKind::Stream
-                    || edge_contract.destination.fragment != position.0
-                    || edge_contract.destination.node != position.1
-                    || destination != position.2
-                    || imports.get(ordinal).copied() != Some((source, destination))
-                    || edge_contract.source.projection.get(ordinal).copied() != Some(source)
-                {
-                    return None;
-                }
-                let source_fragment = plan.fragments().get(&edge_contract.source.fragment)?;
-                let source_root = source_fragment.nodes().get(&source_fragment.root())?;
-                if !indexes.port_contains(source_fragment, source_root, source)
-                    || !matches!(source_fragment.sink(), FragmentSink::Stream { edge: sink_edge }
-                        if *sink_edge == edge)
-                {
-                    return None;
-                }
-                (source_fragment.id(), source_fragment.root(), source)
-            }
-        };
+        let next =
+            advance_runtime_filter_lineage_step(&get_fragment, &get_edge, position, step, indexes)?;
         if !visited.insert(next) {
             return None;
         }
@@ -1926,11 +1847,299 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
     {
         return None;
     }
-    let fragment = plan.fragments().get(&position.0)?;
+    let fragment = get_fragment(position.0)?;
     let node = fragment.nodes().get(&position.1)?;
     indexes
         .scan_provider_contains(fragment, node, position.2)
         .then_some(())
+}
+
+fn advance_runtime_filter_lineage_step<'a>(
+    get_fragment: impl Fn(FragmentId) -> Option<&'a Fragment>,
+    get_edge: impl Fn(EdgeId) -> Option<&'a crate::Edge>,
+    position: (FragmentId, NodeId, ValueId),
+    step: &crate::RuntimeFilterLineageStep,
+    indexes: &mut RuntimeFilterLineageIndexes,
+) -> Option<(FragmentId, NodeId, ValueId)> {
+    let next = match *step {
+        crate::RuntimeFilterLineageStep::FilterPassThrough {
+            fragment,
+            node,
+            input_ordinal,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            if !matches!(node.kind, NodeKind::Filter { .. })
+                || node.inputs.len() != 1
+                || input_ordinal != 0
+                || !indexes.port_contains(fragment, node, position.2)
+            {
+                return None;
+            }
+            let child = node.inputs[0];
+            let child_node = fragment.nodes().get(&child)?;
+            if !indexes.port_contains(fragment, child_node, position.2)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), child, position.2)
+        }
+        crate::RuntimeFilterLineageStep::SortPassThrough {
+            fragment,
+            node,
+            input_ordinal,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            let safe_sort = matches!(
+                &node.kind,
+                NodeKind::Sort {
+                    order_by,
+                    mode: crate::SortMode::Global | crate::SortMode::Analytic { .. },
+                } if order_by
+                    .iter()
+                    .all(|item| crate::expression_value(fragment.expressions(), item.expr).is_some())
+            );
+            let child = node
+                .inputs
+                .get(usize::try_from(input_ordinal).ok()?)
+                .copied()?;
+            let child_node = fragment.nodes().get(&child)?;
+            if !safe_sort
+                || node.inputs.len() != 1
+                || input_ordinal != 0
+                || !indexes.port_contains(fragment, node, position.2)
+                || !indexes.port_contains(fragment, child_node, position.2)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), child, position.2)
+        }
+        crate::RuntimeFilterLineageStep::ProjectIdentity {
+            fragment,
+            node,
+            output_ordinal,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            let NodeKind::Project { expressions } = &node.kind else {
+                return None;
+            };
+            if node.inputs.len() != 1
+                || node
+                    .output
+                    .columns
+                    .get(usize::try_from(output_ordinal).ok()?)
+                    .copied()
+                    != Some(position.2)
+            {
+                return None;
+            }
+            let child = node.inputs[0];
+            let child_node = fragment.nodes().get(&child)?;
+            let (expression, output) = expressions
+                .get(usize::try_from(output_ordinal).ok()?)
+                .copied()?;
+            if output != position.2 {
+                return None;
+            }
+            let source = crate::expression_value(fragment.expressions(), expression)?;
+            if !indexes.port_contains(fragment, child_node, source)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), child, source)
+        }
+        crate::RuntimeFilterLineageStep::JoinEquality {
+            fragment,
+            node,
+            key_ordinal,
+            source_side,
+            target_side,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            let NodeKind::HashJoin { kind, keys, .. } = &node.kind else {
+                return None;
+            };
+            let key = keys.get(usize::try_from(key_ordinal).ok()?)?;
+            if !kind.key_filter_reaches_side(target_side) || key.null_safe || node.inputs.len() != 2
+            {
+                return None;
+            }
+            let key_value = |side: crate::JoinSide| match side {
+                crate::JoinSide::Left => {
+                    crate::join_key_source_value(fragment.expressions(), key.left)
+                }
+                crate::JoinSide::Right => {
+                    crate::join_key_source_value(fragment.expressions(), key.right)
+                }
+            };
+            if key_value(source_side) != Some(position.2)
+                || !indexes.port_contains(fragment, node, position.2)
+            {
+                return None;
+            }
+            let target_value = key_value(target_side)?;
+            let target_input = node.inputs[usize::try_from(target_side.input_ordinal()).ok()?];
+            let child_node = fragment.nodes().get(&target_input)?;
+            if !indexes.port_contains(fragment, child_node, target_value)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, target_input, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), target_input, target_value)
+        }
+        crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
+            fragment,
+            node,
+            input_ordinal,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            let kind = match &node.kind {
+                NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. } => *kind,
+                _ => return None,
+            };
+            let side = match input_ordinal {
+                0 => crate::JoinSide::Left,
+                1 => crate::JoinSide::Right,
+                _ => return None,
+            };
+            if node.inputs.len() != 2
+                || !kind.side_only_loses_rows(side)
+                || !indexes.port_contains(fragment, node, position.2)
+            {
+                return None;
+            }
+            let child = node.inputs[usize::from(input_ordinal != 0)];
+            let child_node = fragment.nodes().get(&child)?;
+            // The value has to be the child's own, republished unchanged:
+            // a null-extended copy is a different value and stops here.
+            if !indexes.port_contains(fragment, child_node, position.2)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), child, position.2)
+        }
+        crate::RuntimeFilterLineageStep::AggregateGroupKey {
+            fragment,
+            node,
+            group_key_ordinal,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            let NodeKind::Aggregate { group_by, .. } = &node.kind else {
+                return None;
+            };
+            let (expression, output) = group_by
+                .get(usize::try_from(group_key_ordinal).ok()?)
+                .copied()?;
+            let source = crate::expression_value(fragment.expressions(), expression)?;
+            let child = *node.inputs.first()?;
+            let child_node = fragment.nodes().get(&child)?;
+            if node.inputs.len() != 1
+                || output != position.2
+                || !indexes.port_contains(fragment, child_node, source)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), child, source)
+        }
+        crate::RuntimeFilterLineageStep::UnionAllBranch {
+            fragment,
+            node,
+            input_ordinal,
+            output_ordinal,
+        } => {
+            if (fragment, node) != (position.0, position.1) {
+                return None;
+            }
+            let fragment = get_fragment(fragment)?;
+            let node = fragment.nodes().get(&node)?;
+            let NodeKind::SetOp {
+                kind: crate::SetOperationKind::UnionAll,
+                input_mappings,
+            } = &node.kind
+            else {
+                return None;
+            };
+            let input_ordinal = usize::try_from(input_ordinal).ok()?;
+            let output_ordinal = usize::try_from(output_ordinal).ok()?;
+            if node.output.columns.get(output_ordinal).copied() != Some(position.2) {
+                return None;
+            }
+            let child = *node.inputs.get(input_ordinal)?;
+            let source = *input_mappings.get(input_ordinal)?.get(output_ordinal)?;
+            let child_node = fragment.nodes().get(&child)?;
+            if !indexes.port_contains(fragment, child_node, source)
+                || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+            {
+                return None;
+            }
+            (fragment.id(), child, source)
+        }
+        crate::RuntimeFilterLineageStep::ExchangeMapping {
+            edge,
+            mapping_ordinal,
+        } => {
+            let fragment = get_fragment(position.0)?;
+            let node = fragment.nodes().get(&position.1)?;
+            let NodeKind::ExchangeSource {
+                edge: node_edge,
+                imports,
+            } = &node.kind
+            else {
+                return None;
+            };
+            let edge_contract = get_edge(edge)?;
+            let ordinal = usize::try_from(mapping_ordinal).ok()?;
+            let (source, destination) = *edge_contract.destination.receive_mapping.get(ordinal)?;
+            if *node_edge != edge
+                || edge_contract.kind != crate::EdgeKind::Stream
+                || edge_contract.destination.fragment != position.0
+                || edge_contract.destination.node != position.1
+                || destination != position.2
+                || imports.get(ordinal).copied() != Some((source, destination))
+                || edge_contract.source.projection.get(ordinal).copied() != Some(source)
+            {
+                return None;
+            }
+            let source_fragment = get_fragment(edge_contract.source.fragment)?;
+            let source_root = source_fragment.nodes().get(&source_fragment.root())?;
+            if !indexes.port_contains(source_fragment, source_root, source)
+                || !matches!(source_fragment.sink(), FragmentSink::Stream { edge: sink_edge }
+                        if *sink_edge == edge)
+            {
+                return None;
+            }
+            (source_fragment.id(), source_fragment.root(), source)
+        }
+    };
+    Some(next)
 }
 
 pub(crate) fn node_has_exact_parent(

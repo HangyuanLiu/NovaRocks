@@ -699,35 +699,35 @@ fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
     }
 }
 
-fn replace_proof_fragment_sink(
-    cuts: &mut FragmentCuts,
-    fragment_id: FragmentId,
-    sink: FragmentSink,
-) {
-    let fragment = cuts
-        .runtime_filter_proof
-        .fragments
-        .iter()
-        .find(|fragment| fragment.id() == fragment_id)
-        .expect("proof source fragment must exist")
-        .clone();
-    let replacement = Fragment::from(crate::plan::FragmentParts {
-        id: fragment.id(),
-        root: fragment.root(),
-        values: fragment.values().clone(),
-        expressions: fragment.expressions().clone(),
-        nodes: fragment.nodes().clone(),
-        sink,
-        dop_domain: fragment.dop_domain(),
-        runtime_filters: fragment.runtime_filters().to_vec().into_boxed_slice(),
-    });
-    let slot = cuts
-        .runtime_filter_proof
-        .fragments
-        .iter_mut()
-        .find(|fragment| fragment.id() == fragment_id)
-        .expect("proof source fragment must remain addressable");
-    *slot = replacement;
+fn replace_source_fragment(
+    plan: &PhysicalPlan,
+    source_id: FragmentId,
+    change: impl FnOnce(&mut crate::plan::FragmentParts),
+) -> PhysicalPlan {
+    let source = &plan.fragments()[&source_id];
+    let mut parts = crate::plan::FragmentParts {
+        id: source.id(),
+        root: source.root(),
+        values: source.values().clone(),
+        expressions: source.expressions().clone(),
+        nodes: source.nodes().clone(),
+        sink: source.sink().clone(),
+        dop_domain: source.dop_domain(),
+        runtime_filters: source.runtime_filters().to_vec().into_boxed_slice(),
+    };
+    change(&mut parts);
+    let mut fragments = plan.fragments().clone();
+    fragments.insert(source_id, Fragment::from(parts));
+    PhysicalPlan::from(crate::PhysicalPlanParts {
+        version: plan.version(),
+        fragments,
+        edges: plan.edges().clone(),
+        runtime_filters: plan.runtime_filters().clone(),
+        result_port: plan.result_port().cloned(),
+        artifact_refs: plan.artifact_refs().clone(),
+        required: plan.required(),
+        annotations: plan.annotations().to_vec().into_boxed_slice(),
+    })
 }
 
 #[test]
@@ -735,71 +735,59 @@ fn blocking_runtime_filter_accepts_an_acyclic_recursive_build_dependency() {
     let fixture = acyclic_cross_fragment_fixture();
     let target = &fixture.plan.fragments()[&fixture.target_fragment];
     let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
-
     validate_fragment(target, &cuts).unwrap();
 }
 
 #[test]
-fn independent_fragment_rejects_a_missing_recursive_build_proof_dependency() {
+fn remote_execution_growth_does_not_expand_local_boundary_facts() {
     let fixture = acyclic_cross_fragment_fixture();
-    let target = &fixture.plan.fragments()[&fixture.target_fragment];
-    let mut cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
-    cuts.runtime_filter_proof.edges = cuts
-        .runtime_filter_proof
-        .edges
-        .iter()
-        .filter(|edge| edge.id != fixture.recursive_build_edge)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    cuts.runtime_filter_proof.fragments = cuts
-        .runtime_filter_proof
-        .fragments
-        .iter()
-        .filter(|fragment| fragment.id() != fixture.recursive_source_fragment)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-
-    let error = validate_fragment(target, &cuts).unwrap_err().to_string();
-    assert!(
-        error.contains("runtime-filter proof graph omits a join-build execution dependency")
-            || error
-                .contains("runtime-filter proof graph differs from the exact referenced subgraph")
-    );
+    let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
+    for count in [2, 64, 1024] {
+        let enlarged =
+            replace_source_fragment(&fixture.plan, fixture.recursive_source_fragment, |parts| {
+                let node = parts.nodes.get_mut(&parts.root).unwrap();
+                let NodeKind::Values { rows } = &mut node.kind else {
+                    panic!("fixture source must contain literal rows");
+                };
+                *rows = vec![rows[0].clone(); count].into_boxed_slice();
+            });
+        validate_plan(&enlarged).unwrap();
+        let local = fragment_cuts(&enlarged, fixture.target_fragment).unwrap();
+        assert_eq!(cuts, local);
+        validate_fragment(&enlarged.fragments()[&fixture.target_fragment], &local).unwrap();
+    }
 }
 
 #[test]
-fn independent_fragment_rejects_proof_edges_without_exact_source_sink_ownership() {
+fn global_validation_rejects_remote_sink_ownership_that_local_facts_cannot_prove() {
     let fixture = acyclic_cross_fragment_fixture();
-    let target = &fixture.plan.fragments()[&fixture.target_fragment];
-    let valid_cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
-    let other_edge = valid_cuts
-        .runtime_filter_proof
-        .edges
-        .iter()
-        .find(|edge| edge.id != fixture.recursive_build_edge)
-        .expect("fixture must contain a distinct direct build edge")
-        .id;
-    let mutations = [
+    let cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
+    let direct_edge = cuts.inbound[0].edge;
+    for sink in [
         FragmentSink::Noop,
-        FragmentSink::Stream { edge: other_edge },
+        FragmentSink::Stream { edge: direct_edge },
         FragmentSink::Multicast {
             edges: Box::from([fixture.recursive_build_edge]),
         },
-    ];
-
-    for sink in mutations {
-        let mut cuts = valid_cuts.clone();
-        replace_proof_fragment_sink(&mut cuts, fixture.recursive_source_fragment, sink);
-
-        let error = validate_fragment(target, &cuts).unwrap_err().to_string();
-        assert!(
-            error.contains("edge is not owned by its source fragment sink")
-                || error.contains("sink edge belongs to another source fragment")
-                || error
-                    .contains("runtime-filter proof graph omits a join-build execution dependency"),
-            "unexpected proof source-sink ownership error: {error}"
-        );
+    ] {
+        let malformed =
+            replace_source_fragment(&fixture.plan, fixture.recursive_source_fragment, |parts| {
+                parts.sink = sink
+            });
+        assert!(validate_plan(&malformed).is_err());
+        // The receiver cannot reconstruct remote executable dependencies. Its
+        // own self-consistent input boundary remains independently valid.
+        validate_fragment(&malformed.fragments()[&fixture.target_fragment], &cuts).unwrap();
     }
+}
+
+#[test]
+fn local_validation_rejects_an_unattached_runtime_filter() {
+    let fixture = acyclic_cross_fragment_fixture();
+    let mut cuts = fragment_cuts(&fixture.plan, fixture.target_fragment).unwrap();
+    cuts.runtime_filters = Box::default();
+    let error = validate_fragment(&fixture.plan.fragments()[&fixture.target_fragment], &cuts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("differ from fragment attachments"));
 }

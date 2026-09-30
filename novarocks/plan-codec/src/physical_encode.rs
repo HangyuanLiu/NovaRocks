@@ -4833,8 +4833,8 @@ mod tests {
         let declaration = FunctionBindingDeclaration::try_new(
             function_id.clone(),
             FunctionKind::Scalar,
-            semantics,
             [FunctionOverloadDeclaration {
+                semantics: semantics,
                 identity: overload.clone(),
                 argument_pattern: "(Int64)".into(),
                 result_pattern: "Int64".into(),

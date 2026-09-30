@@ -111,19 +111,6 @@ impl CutResourcePreflight {
         add_runtime_filter_usage(filter, path, &mut self.usage, errors);
     }
 
-    pub(crate) fn add_fragment(&mut self, fragment: &Fragment, errors: &mut ValidationContext) {
-        self.usage.merge(fragment_usage(fragment, errors));
-    }
-
-    pub(crate) fn add_edge(&mut self, edge: &crate::Edge) {
-        self.usage.add_item_counts([
-            edge.source.projection.len(),
-            edge.destination.receive_mapping.len(),
-            distribution_items(&edge.partitioning.source),
-            distribution_items(&edge.partitioning.destination),
-        ]);
-    }
-
     pub(crate) fn add_value_type(
         &mut self,
         ty: &ValueType,
@@ -339,39 +326,6 @@ pub(crate) fn validate_fragment_cut_resources(
         add_runtime_filter_usage(
             filter,
             &format!("{prefix}.runtime_filters[{index}]"),
-            &mut usage,
-            errors,
-        );
-    }
-    usage.add_item_counts([
-        cuts.runtime_filter_proof.fragments.len(),
-        cuts.runtime_filter_proof.edges.len(),
-        cuts.runtime_filter_proof.filters.len(),
-    ]);
-    for fragment in &cuts.runtime_filter_proof.fragments {
-        if usage.exhausted() {
-            break;
-        }
-        usage.merge(fragment_usage(fragment, errors));
-    }
-    for edge in &cuts.runtime_filter_proof.edges {
-        if usage.exhausted() {
-            break;
-        }
-        usage.add_item_counts([
-            edge.source.projection.len(),
-            edge.destination.receive_mapping.len(),
-            distribution_items(&edge.partitioning.source),
-            distribution_items(&edge.partitioning.destination),
-        ]);
-    }
-    for (index, filter) in cuts.runtime_filter_proof.filters.iter().enumerate() {
-        if usage.exhausted() {
-            break;
-        }
-        add_runtime_filter_usage(
-            filter,
-            &format!("{prefix}.runtime_filter_proof.filters[{index}]"),
             &mut usage,
             errors,
         );

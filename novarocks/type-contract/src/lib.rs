@@ -26,6 +26,7 @@ mod comparison;
 mod function;
 mod largeint;
 mod partition;
+mod semantics;
 
 pub use arithmetic::{
     ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,
@@ -45,4 +46,8 @@ pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
     PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
+};
+pub use semantics::{
+    BooleanValue, EvaluationDemand, SemanticParameterError, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterValue, SemanticParameters,
 };
