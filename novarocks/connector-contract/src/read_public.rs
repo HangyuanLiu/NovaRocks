@@ -112,10 +112,7 @@ impl ConnectorReadPublicFacts {
         for key in source.properties().ordering() {
             check_column(key.column())?;
         }
-        budget.add(
-            source.properties().ordering().len()
-                * std::mem::size_of::<crate::ConnectorReadOrderingKey<ScanColumnId>>(),
-        )?;
+        budget.add(std::mem::size_of_val(source.properties().ordering()))?;
         if let ConnectorReadArtifactCoverage::Exact {
             source_selection_digest,
             content_digest,

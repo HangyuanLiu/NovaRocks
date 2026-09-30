@@ -22,6 +22,7 @@
 //! as its node and expression types are separated from task-owned bindings.
 
 mod contract;
+mod control_flow;
 mod expressions;
 mod layout;
 mod program;
@@ -35,6 +36,7 @@ pub use contract::{
     FragmentSinkAssignmentRequirement, KernelAbiVersion, LayoutIdentity, RuntimeFilterContract,
     RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
 };
+pub use control_flow::*;
 pub use expressions::{
     ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH, MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
     MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind, StaticExprNode, StaticExpressionError,

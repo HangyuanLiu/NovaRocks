@@ -410,6 +410,10 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
 
+fn exhausted(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -468,8 +472,4 @@ mod tests {
             .is_err()
         );
     }
-}
-
-fn exhausted(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
 }
