@@ -32,6 +32,7 @@ mod logical;
 mod partition;
 mod schema;
 mod semantics;
+mod window;
 
 pub use arithmetic::{
     ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,
@@ -75,3 +76,5 @@ pub use semantics::{
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
     SemanticParameters,
 };
+
+pub use window::{WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits};

@@ -178,37 +178,9 @@ pub enum LiteralValue {
     IntervalMonthDayNano(i128),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowFrameUnits {
-    Rows,
-    Range,
-    Groups,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum WindowBound {
-    UnboundedPreceding,
-    Preceding(ExprId),
-    CurrentRow,
-    Following(ExprId),
-    UnboundedFollowing,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct WindowFrame {
-    pub units: WindowFrameUnits,
-    pub start: WindowBound,
-    pub end: WindowBound,
-    pub exclusion: WindowFrameExclusion,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowFrameExclusion {
-    NoOthers,
-    CurrentRow,
-    Group,
-    Ties,
-}
+pub use novarocks_type_contract::{WindowFrameExclusion, WindowFrameUnits};
+pub type WindowBound = novarocks_type_contract::WindowBound<ExprId>;
+pub type WindowFrame = novarocks_type_contract::WindowFrame<ExprId>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
