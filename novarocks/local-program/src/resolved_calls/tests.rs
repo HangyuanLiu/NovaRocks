@@ -1064,7 +1064,14 @@ fn higher_snapshot() -> ProgramRootControlBindings {
     higher_snapshot_parameters(1)
 }
 fn higher_snapshot_parameters(count: usize) -> ProgramRootControlBindings {
-    let arena = arena(vec![
+    higher_snapshot_locals(count, false, false)
+}
+fn higher_snapshot_locals(
+    count: usize,
+    has_common: bool,
+    wrong_order: bool,
+) -> ProgramRootControlBindings {
+    let mut nodes = vec![
         (
             StaticExprKind::Literal(StaticLiteral::Int64(2)),
             DataType::Int64,
@@ -1077,7 +1084,11 @@ fn higher_snapshot_parameters(count: usize) -> ProgramRootControlBindings {
             StaticExprKind::LambdaFunction {
                 body: crate::ProgramExprId::new(1),
                 arg_slots: (0..count).map(|i| SlotId::new(99 + i as u32)).collect(),
-                common_sub_exprs: vec![],
+                common_sub_exprs: if has_common {
+                    vec![(SlotId::new(200), crate::ProgramExprId::new(2))]
+                } else {
+                    vec![]
+                },
                 is_nondeterministic: false,
             },
             DataType::Boolean,
@@ -1089,27 +1100,65 @@ fn higher_snapshot_parameters(count: usize) -> ProgramRootControlBindings {
             },
             DataType::Boolean,
         ),
-    ]);
-    let mut edge = invocation(2, 2, ControlShape::LambdaBody, &[3]);
+    ];
+    if has_common {
+        nodes.insert(
+            2,
+            (
+                StaticExprKind::FunctionCall {
+                    kind: StaticFunctionKind::Abs,
+                    args: vec![crate::ProgramExprId::new(0), crate::ProgramExprId::new(0)],
+                },
+                DataType::Boolean,
+            ),
+        );
+        let StaticExprKind::FunctionCall { args, .. } = &mut nodes[4].0 else {
+            unreachable!()
+        };
+        args[1] = crate::ProgramExprId::new(3);
+    }
+    let arena = arena(nodes);
+    let edge_uses: &[u32] = if has_common {
+        if wrong_order { &[3, 4] } else { &[4, 3] }
+    } else {
+        &[3]
+    };
+    let mut edge = invocation(
+        2,
+        if has_common { 3 } else { 2 },
+        ControlShape::LambdaBody,
+        edge_uses,
+    );
     edge.context.domain = EvaluationDomainId::new(8);
     let mut body = invocation(3, 1, ControlShape::Eager, &[]);
     body.context.domain = EvaluationDomainId::new(8);
+    let mut uses = vec![
+        invocation(
+            0,
+            if has_common { 4 } else { 3 },
+            ControlShape::HigherOrder {
+                body_ordinal: 1,
+                body_demand: EvaluationDemand::Value,
+            },
+            &[1, 2],
+        ),
+        invocation(1, 0, ControlShape::Eager, &[]),
+        edge,
+        body,
+    ];
+    if has_common {
+        for mut child in [
+            invocation(4, 2, ControlShape::Eager, &[5, 6]),
+            invocation(5, 0, ControlShape::Eager, &[]),
+            invocation(6, 0, ControlShape::Eager, &[]),
+        ] {
+            child.context.domain = EvaluationDomainId::new(8);
+            uses.push(child);
+        }
+    }
     snapshot(
-        project_program(arena, &[3]),
-        vec![
-            invocation(
-                0,
-                3,
-                ControlShape::HigherOrder {
-                    body_ordinal: 1,
-                    body_demand: EvaluationDemand::Value,
-                },
-                &[1, 2],
-            ),
-            invocation(1, 0, ControlShape::Eager, &[]),
-            edge,
-            body,
-        ],
+        project_program(arena, &[if has_common { 4 } else { 3 }]),
+        uses,
         vec![(root(0), 0)],
         vec![
             root_domain(),
@@ -1124,6 +1173,63 @@ fn higher_snapshot_parameters(count: usize) -> ProgramRootControlBindings {
         ],
     )
 }
+#[test]
+fn lambda_local_calls_require_exact_frozen_tokens_and_order_before_body() {
+    let (catalog, owner, _) = catalogue();
+    let higher = token(
+        &catalog,
+        &owner,
+        HIGHER,
+        context(0, DOMAIN, EvaluationDemand::Value),
+        &[Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],
+        Some(context(
+            3,
+            EvaluationDomainId::new(8),
+            EvaluationDemand::Value,
+        )),
+        false,
+    );
+    let common = token(
+        &catalog,
+        &owner,
+        SCALAR,
+        context(4, EvaluationDomainId::new(8), EvaluationDemand::Value),
+        &[Some(ExpressionUseId::new(5)), Some(ExpressionUseId::new(6))],
+        None,
+        false,
+    );
+    let resolved = ProgramResolvedCalls::try_new(
+        higher_snapshot_locals(1, true, false),
+        vec![(scope(0), higher.clone()), (scope(4), common.clone())],
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(resolved.calls().len(), 2);
+    assert_eq!(
+        resolved.calls()[&scope(4)].call_contract().context().domain,
+        EvaluationDomainId::new(8)
+    );
+    assert_eq!(
+        ProgramResolvedCalls::try_new(
+            higher_snapshot_locals(1, true, false),
+            vec![(scope(0), higher.clone())],
+            &Control::default(),
+        )
+        .unwrap_err(),
+        ProgramResolvedCallsError::MissingSite(scope(4)),
+    );
+    assert_eq!(
+        ProgramResolvedCalls::try_new(
+            higher_snapshot_locals(1, true, true),
+            vec![(scope(0), higher), (scope(4), common)],
+            &Control::default(),
+        )
+        .unwrap_err(),
+        ProgramResolvedCallsError::WrongBody,
+    );
+    assert_eq!(owner.instances.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn higher_order_keeps_actual_body_edge_and_inner_root_but_does_not_claim_capture_closure() {
     let (catalog, owner, _) = catalogue();

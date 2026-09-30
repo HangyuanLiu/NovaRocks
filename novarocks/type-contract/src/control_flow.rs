@@ -45,7 +45,9 @@ pub enum ControlShape {
     Eager,
     TypeOnly,
     /// The exact higher-order call has already established the invocation
-    /// guard. The lexical lambda wrapper passes demand to its one body.
+    /// guard. Ordered local definitions require Value, followed by the body
+    /// which inherits the wrapper's demand. A lambda with no locals has one
+    /// argument: its body.
     LambdaBody,
     Conjunction,
     Disjunction,
@@ -224,7 +226,12 @@ impl<D: Copy> ExpressionControlFlow<D> {
                     .get(argument)
                     .ok_or(ExpressionControlFlowError::InvalidReference)?;
                 if child.context.demand
-                    != control_argument_demand(owner.control, ordinal, owner.context.demand)
+                    != control_argument_demand(
+                        owner.control,
+                        owner.arguments.len(),
+                        ordinal,
+                        owner.context.demand,
+                    )
                 {
                     return Err(ExpressionControlFlowError::InvalidDemand);
                 }
@@ -320,7 +327,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
     let valid = match shape {
         ControlShape::Eager => true,
         ControlShape::TypeOnly => count == 0,
-        ControlShape::LambdaBody => count == 1,
+        ControlShape::LambdaBody => count > 0,
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
@@ -382,13 +389,21 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
 
 fn control_argument_demand(
     shape: ControlShape,
+    count: usize,
     ordinal: usize,
     owner: crate::EvaluationDemand,
 ) -> crate::EvaluationDemand {
     use crate::EvaluationDemand::{TruthOnly, Value};
     match shape {
         ControlShape::Eager | ControlShape::TypeOnly | ControlShape::Coalesce => Value,
-        ControlShape::Conjunction | ControlShape::Disjunction | ControlShape::LambdaBody => owner,
+        ControlShape::Conjunction | ControlShape::Disjunction => owner,
+        ControlShape::LambdaBody => {
+            if ordinal + 1 == count {
+                owner
+            } else {
+                Value
+            }
+        }
         ControlShape::If => {
             if ordinal == 0 {
                 TruthOnly
@@ -439,7 +454,7 @@ pub fn control_argument_semantics(
         return Err(ExpressionControlFlowError::InvalidReference);
     }
     Ok((
-        control_argument_demand(shape, ordinal, owner),
+        control_argument_demand(shape, argument_count, ordinal, owner),
         control_argument_guard(shape, ordinal),
     ))
 }
@@ -458,16 +473,24 @@ mod tests {
                 Ok((demand, None))
             );
         }
-        for count in [0, 2] {
-            assert_eq!(
-                control_argument_semantics(
-                    ControlShape::LambdaBody,
-                    count,
-                    0,
-                    EvaluationDemand::TruthOnly
-                ),
-                Err(ExpressionControlFlowError::InvalidControlShape)
-            );
+        assert_eq!(
+            control_argument_semantics(ControlShape::LambdaBody, 0, 0, EvaluationDemand::TruthOnly),
+            Err(ExpressionControlFlowError::InvalidControlShape)
+        );
+        for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
+            for ordinal in 0..3 {
+                assert_eq!(
+                    control_argument_semantics(ControlShape::LambdaBody, 3, ordinal, demand),
+                    Ok((
+                        if ordinal == 2 {
+                            demand
+                        } else {
+                            EvaluationDemand::Value
+                        },
+                        None
+                    ))
+                );
+            }
         }
         assert_eq!(
             control_argument_semantics(ControlShape::LambdaBody, 1, 1, EvaluationDemand::TruthOnly),

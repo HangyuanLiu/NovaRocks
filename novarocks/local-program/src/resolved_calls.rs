@@ -664,18 +664,31 @@ fn validate_expression(
         }
         let edge = &flow.uses()[&contract.body_edge_use()];
         let Some(StaticExprKind::LambdaFunction {
-            body, arg_slots, ..
+            body,
+            arg_slots,
+            common_sub_exprs,
+            ..
         }) = definitions.node(edge.definition).map(|node| node.kind())
         else {
             return Err(ProgramResolvedCallsError::WrongBody);
         };
         if edge.control != ControlShape::LambdaBody
-            || edge.arguments.len() != 1
+            || edge.arguments.len() != common_sub_exprs.len().saturating_add(1)
             || arg_slots.len() != contract.parameter_types().len()
         {
             return Err(ProgramResolvedCallsError::WrongBody);
         }
-        let body_use = &flow.uses()[&edge.arguments[0]];
+        for ((_, definition), use_id) in common_sub_exprs.iter().zip(&edge.arguments) {
+            work.step()?;
+            let common_use = &flow.uses()[use_id];
+            if common_use.definition != *definition
+                || common_use.context.domain != edge.context.domain
+                || common_use.context.demand != EvaluationDemand::Value
+            {
+                return Err(ProgramResolvedCallsError::WrongBody);
+            }
+        }
+        let body_use = &flow.uses()[edge.arguments.last().expect("checked lambda body arity")];
         if body_use.definition != *body || body_use.context != kernel.body_contract().context() {
             return Err(ProgramResolvedCallsError::WrongBody);
         }

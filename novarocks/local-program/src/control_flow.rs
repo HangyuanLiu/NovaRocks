@@ -112,6 +112,30 @@ mod tests {
         }
     }
     #[test]
+    fn lambda_locals_need_values_while_the_final_body_keeps_truth_only_demand() {
+        let mut owner = value(0, root().id);
+        owner.control = ControlShape::LambdaBody;
+        owner.context.demand = EvaluationDemand::TruthOnly;
+        owner.arguments = (1..=3).map(ExpressionUseId::new).collect();
+        let mut body = value(3, root().id);
+        body.context.demand = EvaluationDemand::TruthOnly;
+        let uses = vec![owner, value(1, root().id), value(2, root().id), body];
+        ProgramControlFlow::try_new(vec![root()], uses.clone(), 1, &Control(false)).unwrap();
+        for index in [1, 2, 3] {
+            let mut wrong = uses.clone();
+            wrong[index].context.demand = if index == 3 {
+                EvaluationDemand::Value
+            } else {
+                EvaluationDemand::TruthOnly
+            };
+            assert_eq!(
+                ProgramControlFlow::try_new(vec![root()], wrong, 1, &Control(false)).unwrap_err(),
+                ProgramControlFlowError::InvalidDemand
+            );
+        }
+    }
+
+    #[test]
     fn if_retains_distinct_occurrences_and_strong_branch_domains() {
         let mut owner = value(0, root().id);
         owner.control = ControlShape::If;
