@@ -39,6 +39,7 @@ mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
 mod higher_order_call;
+mod higher_order_kernel;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
@@ -57,6 +58,7 @@ pub use call_contract::*;
 pub use effect_refinement::*;
 pub use evaluation::*;
 pub use higher_order_call::*;
+pub use higher_order_kernel::*;
 pub use kernel_control::*;
 pub use lambda_rows::*;
 pub use novarocks_type_contract::{
