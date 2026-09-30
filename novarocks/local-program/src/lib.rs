@@ -26,6 +26,7 @@ mod control_flow;
 mod expressions;
 mod layout;
 mod program;
+mod provenance;
 mod requirements;
 mod runtime_filter;
 mod sink;
@@ -59,6 +60,7 @@ pub use program::{
     WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
     WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
 };
+pub use provenance::*;
 pub use requirements::{
     BindingRequirement, BindingRequirements, BindingRequirementsError, ProgramNodeId,
     ScanSourceKind,
