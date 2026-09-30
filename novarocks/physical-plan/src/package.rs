@@ -31,9 +31,9 @@ use novarocks_type_contract::{
 
 use crate::{
     AnnotationSubject, Fragment, FragmentCuts, FragmentId, FrozenCallError, FrozenFragmentCalls,
-    NodeId, PhysicalPlan, PhysicalRootUses, PlanAnnotation, PlanVersionId,
-    ProviderReadOccurrenceId, RequiredContracts, ResultPort, RootUseBindingError, ValidationErrors,
-    derive_fragment_cuts,
+    FrozenFragmentPruning, FrozenPruningError, NodeId, PhysicalPlan, PhysicalRootUses,
+    PlanAnnotation, PlanVersionId, ProviderReadOccurrenceId, RequiredContracts, ResultPort,
+    RootUseBindingError, ValidationErrors, derive_fragment_cuts,
 };
 
 /// An owned input for the same checked constructor on FE and BE. It contains
@@ -49,6 +49,9 @@ pub struct FragmentPackageInput {
     /// Mandatory complete per-occurrence claims. Structural validity does not
     /// authenticate these facts; the installed exact owner rechecks them.
     pub calls: FrozenFragmentCalls,
+    /// Explicit derived-domain declarations. Structure never grants pruning
+    /// authority; the FE still proves semantics and complete consumer coverage.
+    pub pruning: FrozenFragmentPruning,
     pub cuts: FragmentCuts,
     pub result: Option<ResultPort>,
     pub parameters: SemanticParameters,
@@ -78,7 +81,11 @@ impl FragmentPackage {
                     FrozenCallError::Control(error) => FragmentPackageError::Control(error),
                     error => FragmentPackageError::Calls(error),
                 })?;
-        crate::validation::validate_package(&input, call_items)
+        let pruning_items = input
+            .pruning
+            .dynamic_items_observed(control)
+            .map_err(pruning_error)?;
+        crate::validation::validate_package(&input, call_items.saturating_add(pruning_items))
             .map_err(FragmentPackageError::Structure)?;
         input
             .calls
@@ -109,7 +116,13 @@ impl FragmentPackage {
         if closure.entries().len() != input.parameters.entries().len() {
             return Err(FragmentPackageError::UnusedParameters);
         }
-        Ok(Self(input))
+        let package = Self(input);
+        package
+            .0
+            .pruning
+            .validate_package(&package, control)
+            .map_err(pruning_error)?;
+        Ok(package)
     }
 
     pub const fn version(&self) -> PlanVersionId {
@@ -130,6 +143,10 @@ impl FragmentPackage {
 
     pub const fn calls(&self) -> &FrozenFragmentCalls {
         &self.0.calls
+    }
+
+    pub const fn pruning(&self) -> &FrozenFragmentPruning {
+        &self.0.pruning
     }
 
     pub const fn cuts(&self) -> &FragmentCuts {
@@ -167,6 +184,7 @@ pub enum FragmentPackageError {
     Structure(ValidationErrors),
     ExpressionUses(RootUseBindingError),
     Calls(FrozenCallError),
+    Pruning(FrozenPruningError),
     Parameter(SemanticParameterError),
     UnusedParameters,
 }
@@ -177,6 +195,7 @@ impl fmt::Display for FragmentPackageError {
             Self::Structure(error) => error.fmt(f),
             Self::ExpressionUses(error) => error.fmt(f),
             Self::Calls(error) => error.fmt(f),
+            Self::Pruning(error) => error.fmt(f),
             Self::Parameter(error) => error.fmt(f),
             Self::UnusedParameters => {
                 f.write_str("semantic parameter table contains unused definitions")
@@ -186,9 +205,20 @@ impl fmt::Display for FragmentPackageError {
 }
 impl std::error::Error for FragmentPackageError {}
 
+fn pruning_error(error: FrozenPruningError) -> FragmentPackageError {
+    match error {
+        FrozenPruningError::Control(error) => FragmentPackageError::Control(error),
+        error => FragmentPackageError::Pruning(error),
+    }
+}
+
 /// Extract from the immutable complete-plan authority. No second global plan
 /// validation or executable peer graph is performed here. Boundary derivation
 /// is indexed once for all fragments; each output uses the BE constructor.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Extraction requires every explicit frozen table; no missing semantic facts are inferred."
+)]
 pub fn extract_fragment_packages(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
@@ -196,6 +226,7 @@ pub fn extract_fragment_packages(
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
     expression_uses: &BTreeMap<FragmentId, PhysicalRootUses>,
     calls: &BTreeMap<FragmentId, FrozenFragmentCalls>,
+    pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
     control
@@ -261,6 +292,12 @@ pub fn extract_fragment_packages(
                     .get(&fragment.id())
                     .ok_or(FragmentPackageExtractionError::MissingCalls(fragment.id()))?
                     .clone(),
+                pruning: pruning
+                    .get(&fragment.id())
+                    .ok_or(FragmentPackageExtractionError::MissingPruning(
+                        fragment.id(),
+                    ))?
+                    .clone(),
                 cuts: cuts
                     .remove(&fragment.id())
                     .ok_or(FragmentPackageExtractionError::BoundaryDerivation)?,
@@ -308,6 +345,9 @@ pub fn extract_fragment_packages(
     if calls.len() != outputs.len() || calls.keys().any(|id| !outputs.contains_key(id)) {
         return Err(FragmentPackageExtractionError::UnusedCalls);
     }
+    if pruning.len() != outputs.len() || pruning.keys().any(|id| !outputs.contains_key(id)) {
+        return Err(FragmentPackageExtractionError::UnusedPruning);
+    }
     Ok(outputs)
 }
 
@@ -325,6 +365,8 @@ pub enum FragmentPackageExtractionError {
     UnusedExpressionUses,
     MissingCalls(FragmentId),
     UnusedCalls,
+    MissingPruning(FragmentId),
+    UnusedPruning,
 }
 
 impl fmt::Display for FragmentPackageExtractionError {
@@ -354,6 +396,14 @@ impl fmt::Display for FragmentPackageExtractionError {
                 write!(f, "frozen calls are missing for fragment {}", id.get())
             }
             Self::UnusedCalls => f.write_str("frozen calls name an unused fragment"),
+            Self::MissingPruning(id) => write!(
+                f,
+                "frozen pruning declarations are missing for fragment {}",
+                id.get()
+            ),
+            Self::UnusedPruning => {
+                f.write_str("frozen pruning declarations name an unused fragment")
+            }
         }
     }
 }

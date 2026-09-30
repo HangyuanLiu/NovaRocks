@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use novarocks_connector_contract::{
     ConnectorReadRelationRecipeDraft, ConnectorValueType, FrozenConnectorRead, FrozenConnectorScan,
-    StaticScanAssignment, TupleDomain,
+    ScanColumnId, StaticScanAssignment, TupleDomain,
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase, ControlShape,
@@ -155,6 +155,20 @@ fn fixture_call_tables(
         .collect()
 }
 
+// Each test fragment explicitly declares no derived-domain witnesses.
+// This fixture table does not classify or authorize its provider predicates.
+fn fixture_pruning_tables(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FrozenFragmentPruning> {
+    plan.fragments()
+        .keys()
+        .map(|id| {
+            (
+                *id,
+                FrozenFragmentPruning::try_new(*id, Vec::new(), &Control).unwrap(),
+            )
+        })
+        .collect()
+}
+
 fn extract(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
@@ -163,7 +177,16 @@ fn extract(
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
     let controls = fixture_controls(plan);
     let calls = fixture_call_tables(plan, &controls);
-    extract_fragment_packages(plan, scans, parameters, writes, &controls, &calls, &Control)
+    extract_fragment_packages(
+        plan,
+        scans,
+        parameters,
+        writes,
+        &controls,
+        &calls,
+        &fixture_pruning_tables(plan),
+        &Control,
+    )
 }
 
 fn package_input(fragment: Fragment) -> FragmentPackageInput {
@@ -177,11 +200,13 @@ fn package_input_with_controls(
     expression_uses: PhysicalRootUses,
     calls: FrozenFragmentCalls,
 ) -> FragmentPackageInput {
+    let pruning = FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control).unwrap();
     FragmentPackageInput {
         version: version(),
         required: RequiredContracts::default(),
         expression_uses,
         calls,
+        pruning,
         fragment,
         cuts: FragmentCuts::default(),
         result: None,
@@ -209,6 +234,7 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
             &BTreeMap::new(),
             controls,
             &calls,
+            &fixture_pruning_tables(&plan),
             &Control,
         )
     };
@@ -230,6 +256,83 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
     assert_eq!(
         extract_with(&extra).unwrap_err(),
         FragmentPackageExtractionError::UnusedExpressionUses
+    );
+}
+
+#[test]
+fn extraction_requires_explicit_pruning_table_for_every_fragment() {
+    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    let plan = builder.finish().unwrap();
+    let controls = fixture_controls(&plan);
+    let calls = fixture_call_tables(&plan, &controls);
+    let parameters = SemanticParameters::default();
+    let pruning = fixture_pruning_tables(&plan);
+    let extract_with = |pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>| {
+        extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &parameters,
+            &BTreeMap::new(),
+            &controls,
+            &calls,
+            pruning,
+            &Control,
+        )
+    };
+    let packages = extract_with(&pruning).unwrap();
+    let package = &packages[&fragment.id()];
+    assert_eq!(package.pruning(), &pruning[&fragment.id()]);
+    assert_eq!(package.pruning().fragment(), fragment.id());
+    assert!(package.pruning().witnesses().is_empty());
+    assert_eq!(
+        extract_with(&BTreeMap::new()).unwrap_err(),
+        FragmentPackageExtractionError::MissingPruning(fragment.id())
+    );
+    let mut extra = pruning;
+    let extra_id = FragmentId::new(82);
+    extra.insert(
+        extra_id,
+        FrozenFragmentPruning::try_new(extra_id, Vec::new(), &Control).unwrap(),
+    );
+    assert_eq!(
+        extract_with(&extra).unwrap_err(),
+        FragmentPackageExtractionError::UnusedPruning
+    );
+}
+
+#[test]
+fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
+    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let wrong = FrozenFragmentPruning::try_new(FragmentId::new(82), Vec::new(), &Control).unwrap();
+    let mut input = package_input(fragment.clone());
+    input.pruning = wrong.clone();
+    assert_eq!(
+        FragmentPackage::try_new(input, &Control).unwrap_err(),
+        FragmentPackageError::Pruning(FrozenPruningError::WrongFragment)
+    );
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    let plan = builder.finish().unwrap();
+    let controls = fixture_controls(&plan);
+    let calls = fixture_call_tables(&plan, &controls);
+    // The map key is correct; the table's own exact fragment identity is not.
+    assert_eq!(
+        extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &SemanticParameters::default(),
+            &BTreeMap::new(),
+            &controls,
+            &calls,
+            &BTreeMap::from([(fragment.id(), wrong)]),
+            &Control,
+        )
+        .unwrap_err(),
+        FragmentPackageExtractionError::Local(FragmentPackageError::Pruning(
+            FrozenPruningError::WrongFragment
+        ))
     );
 }
 
@@ -485,6 +588,7 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
                     &BTreeMap::new(),
                     &controls,
                     &calls,
+                    &fixture_pruning_tables(&plan),
                     &control
                 )
                 .unwrap_err(),
@@ -864,6 +968,82 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
         extract(&plan, &extra, &parameters, &BTreeMap::new()),
         Err(FragmentPackageExtractionError::UnusedScan)
     ));
+}
+
+#[test]
+fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
+    use novarocks_connector_contract::{ConnectorValue, Domain};
+    let binding = connector_binding();
+    let column = ProviderColumnReference {
+        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
+    };
+    let fragment = finish_scan_relation(metadata_relation(&binding, column)).unwrap();
+    let original = frozen_scan(&fragment);
+    let scan = original.scan();
+    let enforced = TupleDomain::with_column_domains(BTreeMap::from([(
+        ScanColumnId::new(0),
+        Domain::single_value(ConnectorValue::BigInt(7)).unwrap(),
+    )]))
+    .unwrap();
+    let unenforced = TupleDomain::with_column_domains(BTreeMap::from([(
+        ScanColumnId::new(0),
+        Domain::single_value(ConnectorValue::BigInt(11)).unwrap(),
+    )]))
+    .unwrap();
+    let frozen = FrozenConnectorScan::try_new(
+        scan.recipe().clone(),
+        scan.assignments().to_vec(),
+        enforced.clone(),
+        unenforced.clone(),
+        None,
+        vec![],
+        scan.max_batch_rows(),
+        scan.max_batch_bytes(),
+        scan.work_source(),
+    )
+    .unwrap();
+    let read = public_read(&fragment, fragment.root(), frozen).unwrap();
+    let mut input = package_input(fragment.clone());
+    let uses = input.expression_uses.clone();
+    assert!(input.pruning.witnesses().is_empty());
+    input.scans.insert(fragment.root(), read.clone());
+    let package = FragmentPackage::try_new(input, &Control).unwrap();
+    assert!(package.pruning().witnesses().is_empty());
+    assert_eq!(package.fragment(), &fragment);
+    assert_eq!(package.expression_uses(), &uses);
+    assert_eq!(package.scans().len(), 1);
+    let retained = &package.scans()[&fragment.root()];
+    assert_eq!(retained, &read);
+    assert_eq!(retained.scan().enforced_predicate(), &enforced);
+    assert_eq!(retained.scan().unenforced_predicate(), &unenforced);
+    // Empty structural declarations retain these actual owner-frozen facts;
+    // they establish neither implication nor runtime pruning permission.
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    let plan = builder.finish().unwrap();
+    let packages = extract(
+        &plan,
+        &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
+        &SemanticParameters::default(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let extracted = &packages[&fragment.id()];
+    assert!(extracted.pruning().witnesses().is_empty());
+    assert_eq!(extracted.fragment(), &fragment);
+    assert_eq!(extracted.expression_uses(), &uses);
+    assert_eq!(
+        extracted.scans()[&fragment.root()]
+            .scan()
+            .enforced_predicate(),
+        &enforced
+    );
+    assert_eq!(
+        extracted.scans()[&fragment.root()]
+            .scan()
+            .unenforced_predicate(),
+        &unenforced
+    );
 }
 
 #[test]
@@ -1271,6 +1451,7 @@ fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls()
             &BTreeMap::new(),
             &controls,
             calls,
+            &fixture_pruning_tables(&plan),
             &Control,
         )
     };
@@ -1406,6 +1587,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
         &BTreeMap::new(),
         &BTreeMap::from([(FragmentId::new(81), uses)]),
         &BTreeMap::from([(FragmentId::new(81), calls)]),
+        &fixture_pruning_tables(&plan),
         &Control,
     )
     .unwrap();
@@ -1515,6 +1697,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
         &BTreeMap::new(),
         &controls,
         &tables,
+        &fixture_pruning_tables(&plan),
         &Control,
     )
     .unwrap();
@@ -1539,6 +1722,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
             &BTreeMap::new(),
             &controls,
             &tables,
+            &fixture_pruning_tables(&plan),
             &Control
         ),
         Err(FragmentPackageExtractionError::Parameter(_))

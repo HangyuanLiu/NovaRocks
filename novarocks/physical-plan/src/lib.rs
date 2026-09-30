@@ -25,6 +25,7 @@ mod builder;
 mod expression;
 mod expression_site;
 mod frozen_calls;
+mod frozen_pruning;
 mod identity;
 mod package;
 mod plan;
@@ -38,6 +39,7 @@ pub use builder::*;
 pub use expression::*;
 pub use expression_site::*;
 pub use frozen_calls::*;
+pub use frozen_pruning::*;
 pub use identity::*;
 pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal};
 pub use novarocks_type_contract::FunctionValueType as ValueType;
@@ -68,7 +70,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 10;
+pub const PLAN_CONTRACT_REVISION: u32 = 11;
 
 #[cfg(test)]
 mod tests;

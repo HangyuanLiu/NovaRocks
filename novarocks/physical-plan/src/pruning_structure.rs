@@ -21,13 +21,14 @@
 //! must be checked by the FE before a validated pruning consumer can exist.
 
 use crate::{
-    ExprKind, ExpressionRootSite, FragmentId, FragmentPackage, NodeId, NodeKind,
-    PredicateConjunctSource, PredicateSourceError, ProviderReadOccurrenceId, ValueId, ValueOrigin,
+    ExprKind, FragmentId, FragmentPackage, NodeId, NodeKind, PredicateConjunctSource,
+    PredicateResponsibilityRef, PredicateSourceError, ProviderReadOccurrenceId, ValueId,
+    ValueOrigin,
 };
 use novarocks_connector_contract::{FrozenConnectorRead, ScanColumnId, TupleDomain};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, MAX_CONTROL_DEPTH,
-    MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
+    MAX_CONTROL_DEPTH, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -70,7 +71,11 @@ pub struct PruningColumnTrace {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PruningSourceWitness {
-    pub site: ExpressionRootSite,
+    /// Exact original p root; this is a reference, not movement permission.
+    pub responsibility: PredicateResponsibilityRef,
+    /// The claimed selected conjunct occurrence, including demand and domain.
+    /// Reconstructed from the actual root/path before any structural use.
+    pub context: ExpressionEffectContext,
     pub conjunct_path: Box<[u32]>,
     pub input_path: Box<[PruningInputEdge]>,
     pub columns: Box<[PruningColumnTrace]>,
@@ -93,6 +98,9 @@ pub enum PruningStructureError {
     InvalidFragment,
     InvalidScan,
     InvalidOccurrence,
+    WrongResponsibility,
+    WrongContext,
+    WrongSnapshot,
     InvalidPath,
     SharedLocalProducer,
     DuplicateSource,
@@ -141,7 +149,23 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
         control: &dyn PureCompileControl,
     ) -> Result<Self, PruningStructureError> {
         let mut work = PruningWork::try_new(control)?;
-        preflight(witness, &mut work)?;
+        let index = PruningConsumerIndex::try_new(package, &mut work)?;
+        let checked = Self::try_new_indexed(package, witness, &index, control, &mut work)?;
+        work.finish()?;
+        Ok(checked)
+    }
+
+    pub(crate) fn try_new_indexed(
+        package: &'package FragmentPackage,
+        witness: &'witness PruningDomainWitness,
+        index: &PruningConsumerIndex<'_>,
+        control: &dyn PureCompileControl,
+        work: &mut PruningWork<'_>,
+    ) -> Result<Self, PruningStructureError> {
+        if !std::ptr::eq(index.package, package) {
+            return Err(PruningStructureError::WrongSnapshot);
+        }
+        preflight(witness, work)?;
         let fragment = package.fragment();
         if witness.target.fragment != fragment.id() {
             return Err(PruningStructureError::InvalidFragment);
@@ -182,14 +206,20 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
             let checked = PredicateConjunctSource::try_new(
                 fragment,
                 package.expression_uses(),
-                source.site,
+                source.responsibility.site,
                 conjunct_path,
                 control,
             )?;
+            if checked.responsibility().anchor() != source.responsibility {
+                return Err(PruningStructureError::WrongResponsibility);
+            }
+            if checked.context() != source.context {
+                return Err(PruningStructureError::WrongContext);
+            }
             if !source_sites.insert(checked.context().use_id) {
                 return Err(PruningStructureError::DuplicateSource);
             }
-            let mut current = source.site.node;
+            let mut current = source.responsibility.site.node;
             for edge in &source.input_path {
                 if edge.consumer != current || edge.producer == current {
                     return Err(PruningStructureError::InvalidPath);
@@ -229,9 +259,9 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
                 }
                 let source_node = fragment
                     .nodes()
-                    .get(&source.site.node)
+                    .get(&source.responsibility.site.node)
                     .ok_or(PruningStructureError::InvalidPath)?;
-                contains_value(&source_node.output.columns, trace.values[0], &mut work)?;
+                contains_value(&source_node.output.columns, trace.values[0], work)?;
                 for (edge, pair) in source.input_path.iter().zip(trace.values.windows(2)) {
                     let parent = fragment
                         .nodes()
@@ -241,9 +271,9 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
                         .nodes()
                         .get(&edge.producer)
                         .ok_or(PruningStructureError::InvalidPath)?;
-                    contains_value(&parent.output.columns, pair[0], &mut work)?;
-                    contains_value(&child.output.columns, pair[1], &mut work)?;
-                    if !actual_transport(fragment, parent, *edge, pair[0], pair[1], &mut work)? {
+                    contains_value(&parent.output.columns, pair[0], work)?;
+                    contains_value(&child.output.columns, pair[1], work)?;
+                    if !actual_transport(fragment, parent, *edge, pair[0], pair[1], work)? {
                         return Err(PruningStructureError::InvalidTransport);
                     }
                 }
@@ -253,17 +283,12 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
             sources.push(checked);
             work.step()?;
         }
-        // Inspect every actual input occurrence once; do not deduplicate parent
-        // IDs or do a source-path by whole-plan Cartesian traversal.
-        for consumer in fragment.nodes().values() {
-            for (ordinal, producer) in consumer.inputs.iter().enumerate() {
-                if let Some(expected) = expected_inputs.get(producer)
-                    && (expected.consumer != consumer.id
-                        || expected.input_ordinal as usize != ordinal)
-                {
-                    return Err(PruningStructureError::SharedLocalProducer);
-                }
-                work.step()?;
+        // This index belongs to this exact package and is shared by the
+        // complete declaration table. Repeated actual input occurrences are
+        // retained as ambiguity, rather than deduplicated by parent identity.
+        for (producer, expected) in expected_inputs {
+            if index.inputs.get(&producer) != Some(&Some(expected)) {
+                return Err(PruningStructureError::SharedLocalProducer);
             }
             work.step()?;
         }
@@ -275,7 +300,6 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
                 work.step()?;
             }
         }
-        work.finish()?;
         Ok(Self {
             package,
             witness,
@@ -301,16 +325,56 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
     }
 }
 
+/// Indexed actual local consumers, built once under the table's work budget.
+/// An ambiguous entry records multiple input occurrences, even on one parent.
+pub(crate) struct PruningConsumerIndex<'package> {
+    package: &'package FragmentPackage,
+    inputs: BTreeMap<NodeId, Option<PruningInputEdge>>,
+}
+impl<'package> PruningConsumerIndex<'package> {
+    pub(crate) fn try_new(
+        package: &'package FragmentPackage,
+        work: &mut PruningWork<'_>,
+    ) -> Result<Self, PruningStructureError> {
+        let fragment = package.fragment();
+        let mut inputs = BTreeMap::new();
+        for consumer in fragment.nodes().values() {
+            for (ordinal, producer) in consumer.inputs.iter().enumerate() {
+                let input_ordinal =
+                    u32::try_from(ordinal).map_err(|_| PruningStructureError::TooLarge)?;
+                let edge = PruningInputEdge {
+                    consumer: consumer.id,
+                    input_ordinal,
+                    producer: *producer,
+                };
+                match inputs.entry(*producer) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(edge));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
+                work.step()?;
+            }
+            work.step()?;
+        }
+        Ok(Self { package, inputs })
+    }
+}
+
 /// Local structural proof fuel. Exhaustion declines this proof; it is not a
 /// new whole-plan admission limit or a memory allowance. Nested conjunct-source
 /// work is independently observed and preflighted by the same reference bound.
 pub const MAX_PRUNING_STRUCTURE_WORK: usize = crate::MAX_FRAGMENT_DYNAMIC_ITEMS;
-struct PruningWork<'a> {
+pub(crate) struct PruningWork<'a> {
     observed: CompileCheckpoints<'a>,
     units: usize,
 }
 impl<'a> PruningWork<'a> {
-    fn try_new(control: &'a dyn PureCompileControl) -> Result<Self, PruningStructureError> {
+    pub(crate) fn try_new(
+        control: &'a dyn PureCompileControl,
+    ) -> Result<Self, PruningStructureError> {
         Ok(Self {
             observed: CompileCheckpoints::try_new(control, CompilePhase::Validate)?,
             units: 0,
@@ -324,7 +388,7 @@ impl<'a> PruningWork<'a> {
         self.observed.step()?;
         Ok(())
     }
-    fn finish(self) -> Result<(), PruningStructureError> {
+    pub(crate) fn finish(self) -> Result<(), PruningStructureError> {
         self.observed.finish()?;
         Ok(())
     }

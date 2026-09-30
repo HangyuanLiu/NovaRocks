@@ -157,3 +157,52 @@ message ProofScope {
     uint32 domain_id = 2;
   }
 }
+
+// Mandatory local pruning declarations from the actual frozen scan fields.
+// Paths and roots are identities in this package, never a safe/implication
+// assertion. Exact effects, legal transforms and FE global consumer coverage
+// remain separate admission obligations; these messages mint no permission.
+message FrozenPruning {
+  repeated PruningDomainWitness witnesses = 1;
+}
+message PruningDomainWitness {
+  PruningDomainSite target = 1;
+  repeated PruningSourceWitness sources = 2;
+}
+message PruningDomainSite {
+  optional uint32 fragment_id = 1;
+  optional uint32 scan_id = 2;
+  optional uint32 occurrence_id = 3;
+  PruningDomainField field = 4;
+}
+enum PruningDomainField {
+  PRUNING_DOMAIN_FIELD_UNSPECIFIED = 0;
+  PRUNING_DOMAIN_FIELD_ENFORCED = 1;
+  PRUNING_DOMAIN_FIELD_UNENFORCED = 2;
+}
+message PredicateResponsibilityRef {
+  optional uint32 fragment_id = 1;
+  novarocks.physical_control_v2.RootSite site = 2;
+  optional uint32 use_id = 3;
+}
+message PruningSourceWitness {
+  PredicateResponsibilityRef responsibility = 1;
+  EffectContext context = 2;
+  // Ordered child positions in the original positive conjunction occurrence.
+  repeated uint32 conjunct_path = 3;
+  repeated PruningInputEdge input_path = 4;
+  repeated PruningColumnTrace columns = 5;
+}
+message PruningInputEdge {
+  optional uint32 consumer_id = 1;
+  // Real consumer input position. Zero is valid; presence is not an identity.
+  uint32 input_ordinal = 2;
+  optional uint32 producer_id = 3;
+}
+message PruningColumnTrace {
+  // ScanColumnId is an ordinal in the exact canonical assignment table.
+  // Encoding its host usize requires checked conversion and column bounds.
+  uint32 column_ordinal = 1;
+  // Source-to-scan path order, including repeated/zero/MAX sparse values.
+  repeated uint32 value_ids = 2;
+}

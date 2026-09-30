@@ -341,6 +341,14 @@ fn semantics_descriptor_is_nonrecursive_and_every_actual_layout_is_registered() 
         ),
         2
     );
+    assert_eq!(
+        depth(
+            pool.get_message_by_name("novarocks.physical_semantics_v2.FrozenPruning")
+                .unwrap(),
+            &mut BTreeSet::new()
+        ),
+        6
+    );
     let layouts = generated_resource_layouts()
         .filter(|layout| {
             layout
@@ -413,6 +421,269 @@ fn semantics_descriptor_is_nonrecursive_and_every_actual_layout_is_registered() 
     dimensions::<v2::argument_control::Kind>();
     dimensions::<v2::ProofScope>();
     dimensions::<v2::proof_scope::Kind>();
+    dimensions::<v2::FrozenPruning>();
+    dimensions::<v2::PruningDomainWitness>();
+    dimensions::<v2::PruningDomainSite>();
+    dimensions::<v2::PredicateResponsibilityRef>();
+    dimensions::<v2::PruningSourceWitness>();
+    dimensions::<v2::PruningInputEdge>();
+    dimensions::<v2::PruningColumnTrace>();
     // Actual Rust layout coverage is an input to later resource modelling;
     // it does not prove bounded decoding allocations or a complete codec.
+}
+
+fn pruning_witness(id: u32, field: v2::PruningDomainField) -> v2::PruningDomainWitness {
+    v2::PruningDomainWitness {
+        target: Some(v2::PruningDomainSite {
+            fragment_id: Some(id),
+            scan_id: Some(id),
+            occurrence_id: Some(id),
+            field: field as i32,
+        }),
+        sources: vec![v2::PruningSourceWitness {
+            responsibility: Some(v2::PredicateResponsibilityRef {
+                fragment_id: Some(id),
+                site: Some(control::RootSite {
+                    node_id: Some(id),
+                    role: Some(control::root_site::Role::FilterPredicate(0)),
+                }),
+                use_id: Some(id),
+            }),
+            context: Some(v2::EffectContext {
+                use_id: Some(id),
+                domain_id: Some(id),
+                demand: control::EvaluationDemand::TruthOnly as i32,
+            }),
+            conjunct_path: vec![0, 2, 0],
+            input_path: vec![
+                v2::PruningInputEdge {
+                    consumer_id: Some(id),
+                    input_ordinal: 0,
+                    producer_id: Some(0),
+                },
+                v2::PruningInputEdge {
+                    consumer_id: Some(0),
+                    input_ordinal: 1,
+                    producer_id: Some(u32::MAX),
+                },
+            ],
+            columns: vec![
+                v2::PruningColumnTrace {
+                    column_ordinal: 0,
+                    value_ids: vec![0, u32::MAX, 0],
+                },
+                v2::PruningColumnTrace {
+                    column_ordinal: 1,
+                    value_ids: vec![u32::MAX, u32::MAX, 0],
+                },
+            ],
+        }],
+    }
+}
+
+#[test]
+fn pruning_retains_complete_typed_roots_context_and_ordered_paths() {
+    let pruning = v2::FrozenPruning {
+        witnesses: vec![
+            pruning_witness(0, v2::PruningDomainField::Enforced),
+            pruning_witness(u32::MAX, v2::PruningDomainField::Unenforced),
+        ],
+    };
+    roundtrip(&pruning);
+    roundtrip(&v2::FrozenPruning::default());
+    let source = &pruning.witnesses[0].sources[0];
+    let mut reordered = source.clone();
+    reordered.input_path.reverse();
+    assert_ne!(source.encode_to_vec(), reordered.encode_to_vec());
+    let mut reordered = source.clone();
+    reordered.columns.reverse();
+    assert_ne!(source.encode_to_vec(), reordered.encode_to_vec());
+    let mut changed = source.clone();
+    changed.conjunct_path[1] = 0;
+    assert_ne!(source.encode_to_vec(), changed.encode_to_vec());
+    let mut changed = source.clone();
+    changed.columns[0].value_ids.pop();
+    assert_ne!(source.encode_to_vec(), changed.encode_to_vec());
+    let mut changed = source.clone();
+    changed
+        .responsibility
+        .as_mut()
+        .unwrap()
+        .site
+        .as_mut()
+        .unwrap()
+        .role = Some(control::root_site::Role::ScanResidual(0));
+    assert_ne!(source.encode_to_vec(), changed.encode_to_vec());
+    let mut changed = source.clone();
+    changed.context.as_mut().unwrap().demand = control::EvaluationDemand::Value as i32;
+    assert_ne!(source.encode_to_vec(), changed.encode_to_vec());
+    // This is a representation fixture; sparse references and a path alone
+    // do not prove that these sources, domains or transforms are admissible.
+}
+
+#[test]
+fn pruning_reference_presence_and_unspecified_defaults_cannot_be_confused() {
+    for id in [0, u32::MAX] {
+        let witness = pruning_witness(id, v2::PruningDomainField::Enforced);
+        let target = witness.target.unwrap();
+        roundtrip(&target);
+        for absent in [
+            v2::PruningDomainSite {
+                fragment_id: None,
+                ..target
+            },
+            v2::PruningDomainSite {
+                scan_id: None,
+                ..target
+            },
+            v2::PruningDomainSite {
+                occurrence_id: None,
+                ..target
+            },
+        ] {
+            roundtrip(&absent);
+            assert_ne!(target.encode_to_vec(), absent.encode_to_vec());
+        }
+        let reference = witness.sources[0].responsibility.as_ref().unwrap();
+        let root = reference.site.unwrap();
+        roundtrip(&root);
+        assert_ne!(
+            root.encode_to_vec(),
+            control::RootSite {
+                node_id: None,
+                ..root
+            }
+            .encode_to_vec()
+        );
+        for absent in [
+            v2::PredicateResponsibilityRef {
+                fragment_id: None,
+                ..*reference
+            },
+            v2::PredicateResponsibilityRef {
+                use_id: None,
+                ..*reference
+            },
+            v2::PredicateResponsibilityRef {
+                site: None,
+                ..*reference
+            },
+        ] {
+            roundtrip(&absent);
+            assert_ne!(reference.encode_to_vec(), absent.encode_to_vec());
+        }
+        let edge = v2::PruningInputEdge {
+            consumer_id: Some(id),
+            input_ordinal: 0,
+            producer_id: Some(id),
+        };
+        for absent in [
+            v2::PruningInputEdge {
+                consumer_id: None,
+                ..edge
+            },
+            v2::PruningInputEdge {
+                producer_id: None,
+                ..edge
+            },
+        ] {
+            roundtrip(&absent);
+            assert_ne!(edge.encode_to_vec(), absent.encode_to_vec());
+        }
+    }
+    let default = v2::PruningDomainSite::default();
+    roundtrip(&default);
+    assert_eq!(default.field, v2::PruningDomainField::Unspecified as i32);
+    assert!(
+        default.fragment_id.is_none()
+            && default.scan_id.is_none()
+            && default.occurrence_id.is_none()
+    );
+    assert_ne!(default.field, v2::PruningDomainField::Enforced as i32);
+    assert_ne!(default.field, v2::PruningDomainField::Unenforced as i32);
+    assert!(v2::PruningDomainField::try_from(99).is_err());
+    let unknown = v2::PruningDomainSite {
+        field: 99,
+        ..default
+    };
+    roundtrip(&unknown);
+    // Prost preserves missing references and unknown enum numbers. The later
+    // typed decoder must reject them; no defaulting or admission is tested here.
+}
+
+#[test]
+fn pruning_descriptor_exposes_only_exact_references_and_flat_path_fields() {
+    let pool = pool();
+    for (message, fields) in [
+        (
+            "PruningDomainSite",
+            &["fragment_id", "scan_id", "occurrence_id"][..],
+        ),
+        (
+            "PredicateResponsibilityRef",
+            &["fragment_id", "site", "use_id"][..],
+        ),
+        ("PruningSourceWitness", &["responsibility", "context"][..]),
+        ("PruningInputEdge", &["consumer_id", "producer_id"][..]),
+    ] {
+        let descriptor = pool
+            .get_message_by_name(&format!("novarocks.physical_semantics_v2.{message}"))
+            .unwrap();
+        for name in fields {
+            let field = descriptor.get_field_by_name(name).unwrap();
+            assert!(field.supports_presence(), "{}", field.full_name());
+        }
+    }
+    for name in [
+        "FrozenPruning",
+        "PruningDomainWitness",
+        "PruningDomainSite",
+        "PredicateResponsibilityRef",
+        "PruningSourceWitness",
+        "PruningInputEdge",
+        "PruningColumnTrace",
+    ] {
+        let message = pool
+            .get_message_by_name(&format!("novarocks.physical_semantics_v2.{name}"))
+            .unwrap();
+        assert!(
+            !message
+                .fields()
+                .any(|field| matches!(field.kind(), Kind::Bool))
+        );
+        assert!(
+            !message
+                .fields()
+                .any(|field| matches!(field.name(), "safe" | "implication" | "legal_transform"))
+        );
+    }
+    for (message, field) in [
+        ("PruningSourceWitness", "conjunct_path"),
+        ("PruningColumnTrace", "value_ids"),
+    ] {
+        let descriptor = pool
+            .get_message_by_name(&format!("novarocks.physical_semantics_v2.{message}"))
+            .unwrap();
+        let field = descriptor.get_field_by_name(field).unwrap();
+        assert_eq!(field.cardinality(), prost_reflect::Cardinality::Repeated);
+        assert!(matches!(field.kind(), Kind::Uint32));
+        assert!(field.is_packed());
+    }
+    let site = pool
+        .get_message_by_name("novarocks.physical_semantics_v2.PruningDomainSite")
+        .unwrap();
+    let Kind::Enum(field) = site.get_field_by_name("field").unwrap().kind() else {
+        panic!("target field requires a closed enum")
+    };
+    assert_eq!(
+        field
+            .values()
+            .map(|value| (value.number(), value.name().to_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "PRUNING_DOMAIN_FIELD_UNSPECIFIED".into()),
+            (1, "PRUNING_DOMAIN_FIELD_ENFORCED".into()),
+            (2, "PRUNING_DOMAIN_FIELD_UNENFORCED".into()),
+        ]
+    );
 }
