@@ -44,6 +44,9 @@ pub const MAX_CONTROL_USE_REFERENCES: usize = 65_536;
 pub enum ControlShape {
     Eager,
     TypeOnly,
+    /// The exact higher-order call has already established the invocation
+    /// guard. The lexical lambda wrapper passes demand to its one body.
+    LambdaBody,
     Conjunction,
     Disjunction,
     If,
@@ -310,6 +313,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
     let valid = match shape {
         ControlShape::Eager => true,
         ControlShape::TypeOnly => count == 0,
+        ControlShape::LambdaBody => count == 1,
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
@@ -335,6 +339,7 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
     match shape {
         ControlShape::Eager
         | ControlShape::TypeOnly
+        | ControlShape::LambdaBody
         | ControlShape::Conjunction
         | ControlShape::Disjunction => None,
         ControlShape::If => match ordinal {
@@ -376,7 +381,7 @@ fn control_argument_demand(
     use crate::EvaluationDemand::{TruthOnly, Value};
     match shape {
         ControlShape::Eager | ControlShape::TypeOnly | ControlShape::Coalesce => Value,
-        ControlShape::Conjunction | ControlShape::Disjunction => owner,
+        ControlShape::Conjunction | ControlShape::Disjunction | ControlShape::LambdaBody => owner,
         ControlShape::If => {
             if ordinal == 0 {
                 TruthOnly
@@ -437,6 +442,31 @@ mod tests {
     use super::*;
     use crate::{EvaluationDemand, MAX_UNOBSERVED_COMPILE_WORK};
     use std::{cell::Cell, sync::Mutex};
+
+    #[test]
+    fn lambda_wrapper_preserves_body_demand_without_another_guard() {
+        for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
+            assert_eq!(
+                control_argument_semantics(ControlShape::LambdaBody, 1, 0, demand),
+                Ok((demand, None))
+            );
+        }
+        for count in [0, 2] {
+            assert_eq!(
+                control_argument_semantics(
+                    ControlShape::LambdaBody,
+                    count,
+                    0,
+                    EvaluationDemand::TruthOnly
+                ),
+                Err(ExpressionControlFlowError::InvalidControlShape)
+            );
+        }
+        assert_eq!(
+            control_argument_semantics(ControlShape::LambdaBody, 1, 1, EvaluationDemand::TruthOnly),
+            Err(ExpressionControlFlowError::InvalidReference)
+        );
+    }
 
     struct Definitions {
         count: usize,

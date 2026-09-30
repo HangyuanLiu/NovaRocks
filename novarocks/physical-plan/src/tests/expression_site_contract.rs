@@ -289,7 +289,6 @@ fn root_binding_requires_exact_complete_coverage_definition_and_demand() {
     let fragment = fragment(NodeKind::Filter {
         predicates: Box::from([expr(), expr()]),
     });
-    let roots = uses(&fragment);
     let bindings = vec![
         (
             site(FilterPredicate { predicate: 0 }),
@@ -305,36 +304,35 @@ fn root_binding_requires_exact_complete_coverage_definition_and_demand() {
         &[(1000, expr(), TruthOnly), (u32::MAX, expr(), TruthOnly)],
     );
     let bound =
-        PhysicalRootUses::try_new(roots.clone(), flow.clone(), bindings.clone(), &control())
-            .unwrap();
+        PhysicalRootUses::try_new(&fragment, flow.clone(), bindings.clone(), &control()).unwrap();
     assert_eq!(bound.bindings().len(), 2);
     assert_eq!(bound.flow(), &flow);
     assert_eq!(
-        PhysicalRootUses::try_new(roots.clone(), flow.clone(), vec![], &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow.clone(), vec![], &control()).unwrap_err(),
         RootUseBindingError::IncompleteCoverage
     );
     let mut shared = bindings.clone();
     shared[1].1 = shared[0].1;
     assert_eq!(
-        PhysicalRootUses::try_new(roots.clone(), flow.clone(), shared, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow.clone(), shared, &control()).unwrap_err(),
         RootUseBindingError::SharedUse
     );
     let mut duplicate = bindings.clone();
     duplicate[1].0 = duplicate[0].0;
     assert_eq!(
-        PhysicalRootUses::try_new(roots.clone(), flow.clone(), duplicate, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow.clone(), duplicate, &control()).unwrap_err(),
         RootUseBindingError::DuplicateSite
     );
     let mut wrong_site = bindings.clone();
     wrong_site[0].0.role = ProjectOutput { expression: 0 };
     assert_eq!(
-        PhysicalRootUses::try_new(roots.clone(), flow.clone(), wrong_site, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow.clone(), wrong_site, &control()).unwrap_err(),
         RootUseBindingError::InvalidSite
     );
     let mut wrong_use = bindings.clone();
     wrong_use[0].1 = ExpressionUseId::new(91);
     assert_eq!(
-        PhysicalRootUses::try_new(roots.clone(), flow.clone(), wrong_use, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow.clone(), wrong_use, &control()).unwrap_err(),
         RootUseBindingError::InvalidUse
     );
     let wrong_definition = graph(
@@ -345,13 +343,8 @@ fn root_binding_requires_exact_complete_coverage_definition_and_demand() {
         ],
     );
     assert_eq!(
-        PhysicalRootUses::try_new(
-            roots.clone(),
-            wrong_definition,
-            bindings.clone(),
-            &control()
-        )
-        .unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, wrong_definition, bindings.clone(), &control())
+            .unwrap_err(),
         RootUseBindingError::WrongDefinition
     );
     let wrong_demand = graph(
@@ -359,7 +352,7 @@ fn root_binding_requires_exact_complete_coverage_definition_and_demand() {
         &[(1000, expr(), Value), (u32::MAX, expr(), TruthOnly)],
     );
     assert_eq!(
-        PhysicalRootUses::try_new(roots, wrong_demand, bindings, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, wrong_demand, bindings, &control()).unwrap_err(),
         RootUseBindingError::WrongDemand
     );
 }
@@ -532,7 +525,7 @@ fn an_argument_use_cannot_replace_an_operator_root() {
         ),
     ];
     assert_eq!(
-        PhysicalRootUses::try_new(uses(&fragment), flow, bindings, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow, bindings, &control()).unwrap_err(),
         RootUseBindingError::InvalidUse
     );
 }
@@ -629,7 +622,7 @@ fn a_guarded_disconnected_use_cannot_become_an_operator_root() {
         ),
     ];
     assert_eq!(
-        PhysicalRootUses::try_new(uses(&fragment), flow, bindings, &control()).unwrap_err(),
+        PhysicalRootUses::try_new(&fragment, flow, bindings, &control()).unwrap_err(),
         RootUseBindingError::GuardedRoot
     );
 }
@@ -664,7 +657,11 @@ fn conjunct_fragment() -> Fragment {
         runtime_filters: source.runtime_filters().into(),
     })
 }
-fn conjunct_uses(fragment: &Fragment, eager_root: bool, swapped: bool) -> PhysicalRootUses {
+fn conjunct_uses(
+    fragment: &Fragment,
+    eager_root: bool,
+    swapped: bool,
+) -> Result<PhysicalRootUses, RootUseBindingError> {
     let domain = EvaluationDomainId::new(0);
     let demand = if eager_root {
         EvaluationDemand::Value
@@ -721,7 +718,7 @@ fn conjunct_uses(fragment: &Fragment, eager_root: bool, swapped: bool) -> Physic
     )
     .unwrap();
     PhysicalRootUses::try_new(
-        uses(fragment),
+        fragment,
         flow,
         vec![(
             site(ExpressionRootRole::FilterPredicate { predicate: 0 }),
@@ -729,12 +726,11 @@ fn conjunct_uses(fragment: &Fragment, eager_root: bool, swapped: bool) -> Physic
         )],
         &control(),
     )
-    .unwrap()
 }
 #[test]
 fn positive_conjunct_sources_keep_actual_use_occurrences_and_nullable_truth_demand() {
     let fragment = conjunct_fragment();
-    let roots = conjunct_uses(&fragment, false, false);
+    let roots = conjunct_uses(&fragment, false, false).unwrap();
     let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
     let identity =
         PredicateConjunctSource::try_new(&fragment, &roots, site, vec![], &control()).unwrap();
@@ -780,19 +776,18 @@ fn positive_conjunct_sources_keep_actual_use_occurrences_and_nullable_truth_dema
 #[test]
 fn a_predicate_source_cannot_cross_forged_control_or_reordered_use_edges() {
     let fragment = conjunct_fragment();
-    let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
-    let eager = conjunct_uses(&fragment, true, false);
+    // Intrinsic correspondence now rejects both before a predicate witness
+    // can be constructed; an invalid graph is not a usable root authority.
     assert_eq!(
-        PredicateConjunctSource::try_new(&fragment, &eager, site, vec![0], &control()).unwrap_err(),
-        PredicateSourceError::WrongControl
+        conjunct_uses(&fragment, true, false).unwrap_err(),
+        RootUseBindingError::WrongControl
     );
-    let swapped = conjunct_uses(&fragment, false, true);
     assert_eq!(
-        PredicateConjunctSource::try_new(&fragment, &swapped, site, vec![0], &control())
-            .unwrap_err(),
-        PredicateSourceError::WrongArguments
+        conjunct_uses(&fragment, false, true).unwrap_err(),
+        RootUseBindingError::WrongArguments
     );
 }
+
 #[test]
 fn truth_only_change_condition_does_not_grant_relation_search_responsibility() {
     let fragment = fragment(NodeKind::ChangeEventExpand {
@@ -805,7 +800,7 @@ fn truth_only_change_condition_does_not_grant_relation_search_responsibility() {
     });
     let site = site(ExpressionRootRole::ChangePredicate { event: 0 });
     let roots = PhysicalRootUses::try_new(
-        uses(&fragment),
+        &fragment,
         graph(&fragment, &[(0, expr(), EvaluationDemand::TruthOnly)]),
         vec![(site, ExpressionUseId::new(0))],
         &control(),
@@ -820,7 +815,7 @@ fn truth_only_change_condition_does_not_grant_relation_search_responsibility() {
 #[test]
 fn source_responsibility_rechecks_the_actual_fragment_field_and_boolean_type() {
     let source = conjunct_fragment();
-    let roots = conjunct_uses(&source, false, false);
+    let roots = conjunct_uses(&source, false, false).unwrap();
     let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
     let clone = |id, nodes, expressions| {
         Fragment::from(FragmentParts {
@@ -928,7 +923,7 @@ fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
         .unwrap();
         let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
         let roots = PhysicalRootUses::try_new(
-            uses(&fragment),
+            &fragment,
             flow,
             vec![(site, ExpressionUseId::new(0))],
             &control(),
@@ -1009,7 +1004,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
     .unwrap();
     let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
     let roots = PhysicalRootUses::try_new(
-        uses(&fragment),
+        &fragment,
         flow,
         vec![(site, ExpressionUseId::new(0))],
         &control(),

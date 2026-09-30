@@ -556,9 +556,9 @@ impl PhysicalExpressionRoots {
     }
 }
 
-/// Root-use binding to one exact immutable control graph. This validates the
-/// operator root correspondence only; the compiler must separately validate
-/// definition control shapes, ordered children and accurate function owners.
+/// Root-use binding and intrinsic definition correspondence in one fragment.
+/// The pure compiler separately validates exact installed function controls
+/// and operator/lifecycle row domains; an intrinsic shape proves neither.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalRootUses {
     roots: PhysicalExpressionRoots,
@@ -576,6 +576,9 @@ pub enum RootUseBindingError {
     WrongDefinition,
     WrongDemand,
     GuardedRoot,
+    Roots(ExpressionRootError),
+    WrongControl,
+    WrongArguments,
 }
 impl fmt::Display for RootUseBindingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -590,12 +593,17 @@ impl From<CompileControlError> for RootUseBindingError {
 }
 impl PhysicalRootUses {
     pub fn try_new(
-        roots: PhysicalExpressionRoots,
+        fragment: &Fragment,
         flow: novarocks_type_contract::ExpressionControlFlow<crate::ExprId>,
         bindings: Vec<(ExpressionRootSite, novarocks_type_contract::ExpressionUseId)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, RootUseBindingError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let roots =
+            PhysicalExpressionRoots::try_new(fragment, control).map_err(|error| match error {
+                ExpressionRootError::Control(error) => RootUseBindingError::Control(error),
+                error => RootUseBindingError::Roots(error),
+            })?;
         if bindings.len() != roots.sites.len() || bindings.len() != flow.root_use_ids().len() {
             return Err(RootUseBindingError::IncompleteCoverage);
         }
@@ -628,6 +636,7 @@ impl PhysicalRootUses {
             }
             work.step()?;
         }
+        validate_definition_correspondence(fragment, &flow, &mut work)?;
         work.finish()?;
         Ok(Self {
             roots,
@@ -646,4 +655,101 @@ impl PhysicalRootUses {
     ) -> &BTreeMap<ExpressionRootSite, novarocks_type_contract::ExpressionUseId> {
         &self.bindings
     }
+}
+
+fn validate_definition_correspondence(
+    fragment: &Fragment,
+    flow: &novarocks_type_contract::ExpressionControlFlow<crate::ExprId>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), RootUseBindingError> {
+    use crate::ExprKind;
+    use novarocks_type_contract::ControlShape;
+    for invocation in flow.uses().values() {
+        let definition = fragment
+            .expressions()
+            .get(invocation.definition)
+            .ok_or(RootUseBindingError::WrongDefinition)?;
+        if invocation.context.demand == novarocks_type_contract::EvaluationDemand::TruthOnly
+            && (definition.ty.data_type != arrow_schema::DataType::Boolean
+                || definition.ty.logical_type
+                    != novarocks_type_contract::ValueLogicalType::Physical)
+        {
+            return Err(RootUseBindingError::WrongDemand);
+        }
+        let intrinsic = match &definition.kind {
+            ExprKind::Conjunction { .. } => Some(ControlShape::Conjunction),
+            ExprKind::Disjunction { .. } => Some(ControlShape::Disjunction),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => Some(ControlShape::Case {
+                simple: operand.is_some(),
+                arms: u32::try_from(when_then.len())
+                    .map_err(|_| RootUseBindingError::WrongArguments)?,
+                has_else: else_expr.is_some(),
+            }),
+            ExprKind::Lambda { .. } => Some(ControlShape::LambdaBody),
+            ExprKind::FunctionCall { .. } => None,
+            ExprKind::Value(_)
+            | ExprKind::LambdaParameter { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::Unary { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Cast { .. }
+            | ExprKind::IsNull { .. }
+            | ExprKind::InList { .. }
+            | ExprKind::Between { .. }
+            | ExprKind::Like { .. }
+            | ExprKind::IsTruthValue { .. }
+            | ExprKind::WindowCall { .. } => Some(ControlShape::Eager),
+        };
+        if intrinsic.is_some_and(|expected| invocation.control != expected)
+            || (intrinsic.is_none()
+                && matches!(
+                    invocation.control,
+                    ControlShape::Conjunction
+                        | ControlShape::Disjunction
+                        | ControlShape::LambdaBody
+                ))
+        {
+            return Err(RootUseBindingError::WrongControl);
+        }
+        let mut ordinal = 0usize;
+        // TypeOnly static arguments still belong to the checked definition,
+        // but they are not runtime argument invocations.
+        if !matches!(
+            (&definition.kind, invocation.control),
+            (ExprKind::FunctionCall { .. }, ControlShape::TypeOnly)
+        ) {
+            definition
+                .kind
+                .expression_references_observed(|definition| {
+                    work.step()?;
+                    let argument = invocation
+                        .arguments
+                        .get(ordinal)
+                        .ok_or(RootUseBindingError::WrongArguments)?;
+                    if flow.uses()[argument].definition != definition {
+                        return Err(RootUseBindingError::WrongArguments);
+                    }
+                    ordinal += 1;
+                    Ok(())
+                })?;
+        }
+        if ordinal != invocation.arguments.len() {
+            return Err(RootUseBindingError::WrongArguments);
+        }
+        if let (ExprKind::FunctionCall { args, .. }, ControlShape::HigherOrder { body_ordinal, .. }) =
+            (&definition.kind, invocation.control)
+            && !args
+                .get(body_ordinal as usize)
+                .and_then(|id| fragment.expressions().get(*id))
+                .is_some_and(|body| matches!(body.kind, ExprKind::Lambda { .. }))
+        {
+            return Err(RootUseBindingError::WrongArguments);
+        }
+        work.step()?;
+    }
+    Ok(())
 }

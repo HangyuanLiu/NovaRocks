@@ -305,38 +305,70 @@ pub enum ExprKind {
 
 impl ExprKind {
     pub(crate) fn expression_references(&self, output: &mut Vec<ExprId>) {
+        let result = self.expression_references_observed::<std::convert::Infallible>(|id| {
+            output.push(id);
+            Ok(())
+        });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+    /// Visit actual ordered children without copying the DAG edge table.
+    pub(crate) fn expression_references_observed<E>(
+        &self,
+        mut visit: impl FnMut(ExprId) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
             Self::Value(_) | Self::LambdaParameter { .. } | Self::Literal(_) => {}
             Self::Unary { expr, .. }
             | Self::Cast { expr, .. }
             | Self::IsNull { expr, .. }
-            | Self::IsTruthValue { expr, .. } => output.push(*expr),
-            Self::Binary { left, right, .. } => output.extend([*left, *right]),
-            Self::Conjunction { args } | Self::Disjunction { args } => {
-                output.extend(args.iter().copied());
+            | Self::IsTruthValue { expr, .. } => visit(*expr)?,
+            Self::Binary { left, right, .. } => {
+                visit(*left)?;
+                visit(*right)?;
             }
-            Self::FunctionCall { args, .. } => {
-                output.extend(args.iter().copied());
+            Self::Conjunction { args }
+            | Self::Disjunction { args }
+            | Self::FunctionCall { args, .. } => {
+                for id in args {
+                    visit(*id)?;
+                }
             }
-            Self::Lambda { body, .. } => output.push(*body),
+            Self::Lambda { body, .. } => visit(*body)?,
             Self::InList { expr, list, .. } => {
-                output.push(*expr);
-                output.extend(list.iter().copied());
+                visit(*expr)?;
+                for id in list {
+                    visit(*id)?;
+                }
             }
             Self::Between {
                 expr, low, high, ..
-            } => output.extend([*expr, *low, *high]),
-            Self::Like { expr, pattern, .. } => output.extend([*expr, *pattern]),
+            } => {
+                visit(*expr)?;
+                visit(*low)?;
+                visit(*high)?;
+            }
+            Self::Like { expr, pattern, .. } => {
+                visit(*expr)?;
+                visit(*pattern)?;
+            }
             Self::Case {
                 operand,
                 when_then,
                 else_expr,
             } => {
-                output.extend(*operand);
-                for (when, then) in when_then {
-                    output.extend([*when, *then]);
+                if let Some(id) = operand {
+                    visit(*id)?;
                 }
-                output.extend(*else_expr);
+                for (when, then) in when_then {
+                    visit(*when)?;
+                    visit(*then)?;
+                }
+                if let Some(id) = else_expr {
+                    visit(*id)?;
+                }
             }
             Self::WindowCall {
                 args,
@@ -344,17 +376,22 @@ impl ExprKind {
                 frame,
                 ..
             } => {
-                output.extend(args.iter().copied());
-                output.extend(function_order_by.iter().map(|item| item.expr));
+                for id in args {
+                    visit(*id)?;
+                }
+                for item in function_order_by {
+                    visit(item.expr)?;
+                }
                 if let Some(frame) = frame {
                     for bound in [&frame.start, &frame.end] {
-                        if let WindowBound::Preceding(expr) | WindowBound::Following(expr) = bound {
-                            output.push(*expr);
+                        if let WindowBound::Preceding(id) | WindowBound::Following(id) = bound {
+                            visit(*id)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 

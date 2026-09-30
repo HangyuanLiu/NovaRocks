@@ -560,6 +560,7 @@ mod tests {
             }
             assert!(!control.matches_scalar_shape(ControlShape::Conjunction));
             assert!(!control.matches_scalar_shape(ControlShape::Disjunction));
+            assert!(!control.matches_scalar_shape(ControlShape::LambdaBody));
             assert!(!control.matches_scalar_shape(ControlShape::HigherOrder {
                 body_ordinal: 1,
                 body_demand: EvaluationDemand::Value

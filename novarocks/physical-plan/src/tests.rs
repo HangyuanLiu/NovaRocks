@@ -28,6 +28,7 @@ use super::*;
 mod aggregate_sequence_contract;
 mod artifact_provenance_contract;
 mod contract_regressions;
+mod definition_control_contract;
 mod exchange_occurrence_contract;
 mod expression_site_contract;
 mod ordering_window_assertion_contract;
