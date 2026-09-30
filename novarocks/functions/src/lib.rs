@@ -30,6 +30,7 @@ use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
 mod aggregate_call;
+mod aggregate_kernel;
 mod binding;
 mod call_contract;
 mod effect_refinement;
@@ -38,10 +39,12 @@ mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
 mod scalar_kernel;
+mod specialization;
 mod table_call;
 mod window_call;
 
 pub use aggregate_call::*;
+pub use aggregate_kernel::*;
 pub use binding::*;
 pub use call_contract::*;
 pub use effect_refinement::*;
@@ -54,6 +57,7 @@ pub use novarocks_type_contract::{
     FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
 };
 pub use scalar_kernel::*;
+pub use specialization::FunctionSpecializationFailure;
 pub use table_call::*;
 pub use window_call::*;
 

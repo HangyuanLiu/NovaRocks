@@ -22,16 +22,16 @@ use std::{fmt, sync::Arc};
 
 use arrow_array::new_empty_array;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    ExpressionEffectContext, FunctionIntrinsicRowError, FunctionKind, FunctionValueType,
-    PureCompileControl, SemanticParameters,
+    ArgumentControl, CallEffects, CompilePhase, DecimalOverflowPolicy, ExpressionEffectContext,
+    FunctionIntrinsicRowError, FunctionKind, FunctionValueType, PureCompileControl,
+    SemanticParameters,
 };
 
 use crate::{
-    CallEffectInput, CallEffectRefinementError, EvaluatedArgument, FunctionArgumentType,
-    FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionEffectOwner,
-    FunctionId, FunctionResultType, KernelEvaluationControl, KernelFailure, RefinedCallEffects,
-    ScopedExpressionEffects, SelectedValues, Selection,
+    CallEffectInput, EvaluatedArgument, FunctionArgumentType, FunctionBindingError,
+    FunctionBindingResolver, FunctionBindingSelection, FunctionEffectOwner, FunctionId,
+    FunctionResultType, FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure,
+    RefinedCallEffects, ScopedExpressionEffects, SelectedValues, Selection,
 };
 
 use crate::kernel_control::{internal, invalid};
@@ -154,27 +154,6 @@ pub trait PureScalarImplementation:
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure>;
 }
 
-#[derive(Debug)]
-pub enum ScalarSpecializationFailure {
-    Binding(FunctionBindingError),
-    Effects(novarocks_type_contract::EffectContractError),
-    Control(CompileControlError),
-    Kernel(KernelFailure),
-    InvalidInput(&'static str),
-}
-impl fmt::Display for ScalarSpecializationFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Binding(e) => fmt::Display::fmt(e, f),
-            Self::Effects(e) => fmt::Display::fmt(e, f),
-            Self::Control(e) => fmt::Display::fmt(e, f),
-            Self::Kernel(e) => fmt::Display::fmt(e, f),
-            Self::InvalidInput(e) => f.write_str(e),
-        }
-    }
-}
-impl std::error::Error for ScalarSpecializationFailure {}
-
 /// One exact-owner preparation and complete use effects. The temporary
 /// refinement receipt and compile control are never retained in this result.
 #[derive(Debug)]
@@ -203,7 +182,7 @@ pub fn specialize_scalar<O: PureScalarImplementation + ?Sized>(
     selected: Arc<FunctionBindingSelection>,
     arguments: ScopedExpressionEffects,
     control: &dyn PureCompileControl,
-) -> Result<ScalarSpecialization, ScalarSpecializationFailure> {
+) -> Result<ScalarSpecialization, FunctionSpecializationFailure> {
     specialize_scalar_once(owner, input, selected, None, arguments, control)
 }
 
@@ -217,7 +196,7 @@ pub fn specialize_frozen_scalar<O: PureScalarImplementation + ?Sized>(
     frozen: &CallEffects,
     arguments: ScopedExpressionEffects,
     control: &dyn PureCompileControl,
-) -> Result<ScalarSpecialization, ScalarSpecializationFailure> {
+) -> Result<ScalarSpecialization, FunctionSpecializationFailure> {
     specialize_scalar_once(owner, input, selected, Some(frozen), arguments, control)
 }
 
@@ -228,40 +207,25 @@ fn specialize_scalar_once<O: PureScalarImplementation + ?Sized>(
     frozen: Option<&CallEffects>,
     arguments: ScopedExpressionEffects,
     control: &dyn PureCompileControl,
-) -> Result<ScalarSpecialization, ScalarSpecializationFailure> {
-    control
-        .checkpoint(CompilePhase::FunctionSpecialization, 0)
-        .map_err(ScalarSpecializationFailure::Control)?;
-    let receipt = match frozen {
-        Some(frozen) => crate::validate_frozen_call_effects(owner, input, frozen, control),
-        None => crate::refine_call_effects(owner, input, control),
-    }
-    .map_err(|error| match error {
-        CallEffectRefinementError::Owner(error) => ScalarSpecializationFailure::Binding(error),
-        CallEffectRefinementError::Control(error) => ScalarSpecializationFailure::Control(error),
-        CallEffectRefinementError::Contract(error) => ScalarSpecializationFailure::Effects(error),
-        CallEffectRefinementError::InvalidInput(error) => {
-            ScalarSpecializationFailure::InvalidInput(error)
-        }
-    })?;
-    let effects = receipt
-        .compose_for_use(input, arguments)
-        .map_err(ScalarSpecializationFailure::Effects)?;
+) -> Result<ScalarSpecialization, FunctionSpecializationFailure> {
+    let (receipt, effects) = crate::specialization::refine_once_for_specialization(
+        owner, input, frozen, arguments, control,
+    )?;
     let contract = Arc::new(
         ScalarCallContract::from_refined(input, &receipt, selected, control)
-            .map_err(ScalarSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::Kernel)?,
     );
     let prepared = owner
         .prepare_scalar(input, contract.clone(), control)
-        .map_err(ScalarSpecializationFailure::Kernel)?;
+        .map_err(FunctionSpecializationFailure::Kernel)?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
-        return Err(ScalarSpecializationFailure::Kernel(internal(
+        return Err(FunctionSpecializationFailure::Kernel(internal(
             "scalar preparation replaced its exact immutable contract",
         )));
     }
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
-        .map_err(ScalarSpecializationFailure::Control)?;
+        .map_err(FunctionSpecializationFailure::Control)?;
     Ok(ScalarSpecialization { prepared, effects })
 }
 

@@ -24,8 +24,9 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, EvaluationDemand, EvaluationDomainId, ExpressionUseId, FunctionFailureBehavior,
-    FunctionInstanceState, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
+    CallProofScope, CompileControlError, EvaluationDemand, EvaluationDomainId, ExpressionUseId,
+    FunctionFailureBehavior, FunctionInstanceState, FunctionNullBehavior, FunctionVolatility,
+    ObservableEffects,
 };
 use std::sync::{
     Mutex,
@@ -674,7 +675,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
         if wrong_contract {
             assert!(matches!(
                 prepared,
-                Err(ScalarSpecializationFailure::Kernel(
+                Err(FunctionSpecializationFailure::Kernel(
                     KernelFailure::Internal(_)
                 ))
             ));

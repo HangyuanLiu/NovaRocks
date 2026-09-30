@@ -23,10 +23,11 @@ use crate::{
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, EffectContractError, EvaluationDemand, EvaluationDomainId,
-    ExpressionEffects, ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior,
-    FunctionInstanceState, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    CallProofScope, CompileCheckpoints, CompileControlError, EffectContractError, EvaluationDemand,
+    EvaluationDomainId, ExpressionEffects, ExpressionUseId, FunctionEffectDeclaration,
+    FunctionFailureBehavior, FunctionInstanceState, FunctionNullBehavior, FunctionVolatility,
+    ObservableEffects, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+    SemanticParameterValue,
 };
 use std::{
     sync::{
@@ -499,7 +500,7 @@ fn every_frozen_effect_field_and_environment_reference_is_compared_before_prepar
         assert!(
             matches!(
                 error,
-                ScalarSpecializationFailure::InvalidInput(
+                FunctionSpecializationFailure::InvalidInput(
                     "frozen call effects differ from exact local refinement"
                 )
             ),
@@ -551,7 +552,7 @@ fn child_summary_use_domain_and_demand_mismatches_fail_before_prepare() {
             };
             assert!(matches!(
                 error,
-                ScalarSpecializationFailure::Effects(EffectContractError::CallIdentityMismatch)
+                FunctionSpecializationFailure::Effects(EffectContractError::CallIdentityMismatch)
             ));
             owner.assert_calls(1, 0);
         }
@@ -589,7 +590,7 @@ fn a_value_equal_foreign_signature_arc_is_not_the_exact_selected_owner() {
         };
         assert!(matches!(
             error,
-            ScalarSpecializationFailure::Kernel(KernelFailure::InvalidProgram(_))
+            FunctionSpecializationFailure::Kernel(KernelFailure::InvalidProgram(_))
         ));
         owner.assert_calls(1, 0);
     }
@@ -624,7 +625,7 @@ fn preparation_cannot_replace_even_a_value_equal_immutable_call_contract() {
         };
         assert!(matches!(
             error,
-            ScalarSpecializationFailure::Kernel(KernelFailure::Internal(_))
+            FunctionSpecializationFailure::Kernel(KernelFailure::Internal(_))
         ));
         owner.assert_calls(1, 1);
     }
@@ -743,7 +744,7 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
                         .unwrap_err()
                 };
                 assert!(
-                    matches!(error,ScalarSpecializationFailure::Control(actual) if actual==failure)
+                    matches!(error,FunctionSpecializationFailure::Control(actual) if actual==failure)
                 );
                 owner.assert_calls(usize::from(stage.is_some()), 0);
                 let work = control.work.lock().unwrap();
@@ -775,7 +776,7 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
                     .unwrap_err()
             };
             assert!(
-                matches!(error,ScalarSpecializationFailure::Control(actual) if actual==failure)
+                matches!(error,FunctionSpecializationFailure::Control(actual) if actual==failure)
             );
             owner.assert_calls(0, 0);
             assert_eq!(*control.work.lock().unwrap(), [0, 0, 256]);
@@ -814,7 +815,7 @@ fn bounded_prepare_control_failures_are_outer_kernel_failures_and_allocate_no_in
             )
             .unwrap_err();
             assert!(
-                matches!(error,ScalarSpecializationFailure::Kernel(actual) if actual==expected)
+                matches!(error,FunctionSpecializationFailure::Kernel(actual) if actual==expected)
             );
             owner.assert_calls(1, 1);
             assert!(
