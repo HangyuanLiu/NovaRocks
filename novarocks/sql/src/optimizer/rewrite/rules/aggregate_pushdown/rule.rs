@@ -17,6 +17,7 @@
 
 //! AggregatePushdownRule entry point.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -48,7 +49,11 @@ impl RewriteRule for AggregatePushdownRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         // Extract the aggregate op; return Unchanged if shape doesn't match.
         let agg = match expr.op {
             Operator::LogicalAggregate(ref a) => a.clone(),
@@ -59,14 +64,15 @@ impl RewriteRule for AggregatePushdownRule {
         let stats_input = ctx
             .query_stats_input()
             .cloned()
-            .ok_or_else(|| "AggregatePushdown requires OptimizerStatsInput".to_string())?;
+            .ok_or_else(|| "AggregatePushdown requires OptimizerStatsInput".to_string())
+            .map_err(SqlCompileError::Compilation)?;
 
         // Phase 1: read-only borrow for collection and cost gating.
         let push = {
             let arena = arena_rc.borrow();
             let push = super::collector::collect_push_plan(&agg, expr.unary_input(), &arena);
             if let Some(ref p) = push
-                && !super::cost::should_push(p, &arena, &stats_input)
+                && !super::cost::should_push(p, &arena, &stats_input, &ctx.control_view())?
             {
                 return Ok(RewriteResult::Unchanged);
             }
@@ -79,18 +85,22 @@ impl RewriteRule for AggregatePushdownRule {
         // Phase 2: mutable borrow for rewriting.
         let factory = ctx
             .column_ref_factory()
-            .ok_or_else(|| "AggregatePushdown requires ColumnRefFactory".to_string())?;
+            .ok_or_else(|| "AggregatePushdown requires ColumnRefFactory".to_string())
+            .map_err(SqlCompileError::Compilation)?;
         let mut factory = factory.borrow_mut();
         let mut arena = arena_rc.borrow_mut();
 
-        Ok(RewriteResult::Changed(super::rewriter::rewrite(
-            &agg,
-            expr.unary_input(),
-            push,
-            &mut factory,
-            &mut arena,
-            ctx.function_catalog(),
-        )?))
+        Ok(RewriteResult::Changed(
+            super::rewriter::rewrite(
+                &agg,
+                expr.unary_input(),
+                push,
+                &mut factory,
+                &mut arena,
+                ctx.function_catalog(),
+            )
+            .map_err(SqlCompileError::Compilation)?,
+        ))
     }
 }
 

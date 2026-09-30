@@ -22,6 +22,7 @@
 //! this rule appends a refresh-only target scan and LEFT JOINs it for DELETE
 //! rows before the sink boundary.
 
+use crate::compiler::SqlCompileError;
 use crate::planner::vocabulary::ApplyKeySource;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,7 +88,11 @@ impl LogicalRewriteRule for InjectTargetLocatorJoinRule {
         matches!(target_locator_join_input(&plan, ctx), Ok(Some(_)) | Err(_))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let Some(input) = target_locator_join_input(&plan, ctx)? else {

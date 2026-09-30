@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 
 use crate::column_id::{ColumnId, ColumnRefFactory};
@@ -79,7 +80,11 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
         }
     }
 
-    fn apply(&self, mut expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        mut expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let Some(factory) = ctx.column_ref_factory().cloned() else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -101,7 +106,8 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                     filter_op.predicate,
                     input,
                     &mut factory,
-                )?;
+                )
+                .map_err(SqlCompileError::Compilation)?;
                 let changed = new_predicate.is_some();
                 if let Some(new_pred_id) = new_predicate {
                     expr.op = Operator::LogicalFilter(FilterOp {
@@ -123,7 +129,8 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 let mut arena = arena_rc.borrow_mut();
                 for item in &mut items {
                     if let Some(new_expr) =
-                        rewrite_variant_request_scalar(&mut arena, item.expr, input, &mut factory)?
+                        rewrite_variant_request_scalar(&mut arena, item.expr, input, &mut factory)
+                            .map_err(SqlCompileError::Compilation)?
                     {
                         item.expr = new_expr;
                         changed = true;
@@ -146,7 +153,8 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 // Temporarily take it out, mutate, put back.
                 let mut scan = scan_op;
                 let changed =
-                    rewrite_scan_predicates(&mut scan, &mut factory, &mut arena_rc.borrow_mut())?;
+                    rewrite_scan_predicates(&mut scan, &mut factory, &mut arena_rc.borrow_mut())
+                        .map_err(SqlCompileError::Compilation)?;
                 if changed {
                     expr.op = Operator::LogicalScan(scan);
                 }

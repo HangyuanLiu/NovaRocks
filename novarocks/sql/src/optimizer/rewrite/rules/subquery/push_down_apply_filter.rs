@@ -26,6 +26,7 @@
 //! were correlated). `need_check_max_rows` stays `true` — no aggregate
 //! means `ScalarApplyToJoin`'s with-check branch must add the row guard.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use super::decorrelate_util::{all_binary_eq_opt, orient_eq_opt, partition_conjuncts_opt};
@@ -56,10 +57,14 @@ impl LogicalRewriteRule for PushDownApplyFilter {
         matches_expr(expr, &arena.borrow())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena)? {
+        match apply_expr(expr, &mut arena).map_err(SqlCompileError::Compilation)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }

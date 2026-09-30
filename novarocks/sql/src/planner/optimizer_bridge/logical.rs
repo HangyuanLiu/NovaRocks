@@ -725,7 +725,7 @@ mod tests {
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
         let opt_expr =
             try_to_optimizer_expr(plan, &mut memo.scalars).expect("logical plan to opt expr");
-        opt_expr_to_memo(&opt_expr, memo)
+        opt_expr_to_memo(&opt_expr, memo, crate::optimizer::test_optimizer_control()).unwrap()
     }
 
     fn dummy_table_def() -> TableDef {
@@ -888,7 +888,12 @@ mod tests {
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &std::collections::HashMap::new(),
             );
-        crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
+        crate::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &stats_input,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let output_columns = &memo.groups[root]
             .logical_props

@@ -21,6 +21,7 @@
 //! Parent requirements are ColumnId-based, so the rule can prune unused window
 //! expressions without falling back to output names or output layout positions.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::analysis::OutputColumn;
@@ -114,7 +115,11 @@ impl LogicalRewriteRule for PruneWindowColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -131,15 +136,16 @@ impl LogicalRewriteRule for PruneWindowColumns {
         let input = children.remove(0);
         let original_window_expr_len = node.window_exprs.len();
         let original_output_len = node.output_columns.len();
-        let window_ids = validate_window_output_contract(&node)?;
+        let window_ids =
+            validate_window_output_contract(&node).map_err(SqlCompileError::Compilation)?;
 
         let child_output_ids = collect_output_ids_opt(&input);
         for id in &needed {
             if !child_output_ids.contains(id) && !window_ids.contains(id) {
-                return Err(format!(
+                return Err(SqlCompileError::Compilation(format!(
                     "required window output column id {} is not produced by WindowOp",
                     id.0
-                ));
+                )));
             }
         }
 
@@ -174,7 +180,8 @@ impl LogicalRewriteRule for PruneWindowColumns {
                         && needed.contains(&column.column_id))
             })
             .collect();
-        validate_retained_required_outputs(&needed, &retained_output_columns)?;
+        validate_retained_required_outputs(&needed, &retained_output_columns)
+            .map_err(SqlCompileError::Compilation)?;
 
         if retained_window_exprs.len() == original_window_expr_len
             && retained_output_columns.len() == original_output_len
@@ -381,6 +388,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("required window output column id 999 is not produced by WindowOp"));
     }
@@ -405,6 +415,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(
             err.contains("required window output column id 1 is missing from retained WindowOp")
@@ -428,6 +441,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("PruneWindowColumns found UNSET window output_column_id"));
     }
@@ -450,6 +466,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("window output column id 101 missing from WindowOp.output_columns"));
     }
@@ -472,6 +491,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("duplicate window output column id 101"));
     }
@@ -494,6 +516,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneWindowColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("duplicate window output column id 101"));
     }

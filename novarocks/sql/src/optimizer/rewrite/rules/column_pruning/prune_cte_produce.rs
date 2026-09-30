@@ -18,6 +18,7 @@
 //! PruneCTEProduceColumns trims logical CTE produce outputs in producer
 //! ColumnId space.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -49,7 +50,11 @@ impl LogicalRewriteRule for PruneCTEProduceColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,

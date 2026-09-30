@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
@@ -82,7 +83,11 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result_mut(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -189,7 +194,11 @@ impl LogicalRewriteRule for InjectJoinApplyKeyRule {
             || project_needs_join_refresh_internal_outputs(&plan)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result_mut(expr, ctx, |plan, ctx| {
             if project_needs_join_refresh_internal_outputs(&plan) {
                 return Ok(PlanRewriteResult::Changed(
@@ -224,7 +233,11 @@ impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
             && is_join_refresh_descriptor_candidate_context(ctx)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result_mut(expr, ctx, |plan, ctx| {
             record_join_refresh_descriptor(ctx, &plan)?;
             Ok(PlanRewriteResult::Unchanged)
@@ -1567,7 +1580,11 @@ impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
         plan_contains_unsupported_join(&plan, &change_stream)
     }
 
-    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        _expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
             "UnsupportedJoinKindCheck",
             "incremental apply reached an unsupported join kind (only inner/cross are incrementalizable) — this is a bug: rewrite should have rejected it".to_string(),
@@ -1879,6 +1896,9 @@ mod tests {
         let arena_rc = ctx.scalar_arena();
         let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let err = rule.apply(expr, &mut ctx).expect_err("outer must reject");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("inner/cross"), "unexpected: {err}");
     }
 

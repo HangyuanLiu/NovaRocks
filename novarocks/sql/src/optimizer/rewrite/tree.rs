@@ -96,7 +96,9 @@ fn apply_rule_to_node(
     let start = Instant::now();
     let applied = rule.apply(plan, ctx);
     // A request stop is never a rule diagnostic or a rejected candidate.
-    ctx.check_deadline(rule_name)?;
+    if applied.is_ok() {
+        ctx.check_deadline(rule_name)?;
+    }
     match applied {
         Ok(RewriteResult::Unchanged) => Ok((original, false)),
         Ok(RewriteResult::Changed(next)) => {
@@ -113,10 +115,12 @@ fn apply_rule_to_node(
                 RewriteFailurePolicy::FailFast => Err(SqlCompileError::Compilation(message)),
             }
         }
-        Err(message) => {
-            ctx.trace_mut()
-                .rule_failed(phase, rule_name, message.clone());
-            Err(SqlCompileError::Compilation(message))
+        Err(error) => {
+            if let SqlCompileError::Compilation(message) = &error {
+                ctx.trace_mut()
+                    .rule_failed(phase, rule_name, message.clone());
+            }
+            Err(error)
         }
     }
 }
@@ -151,6 +155,7 @@ fn rewrite_plan_list(
 
 #[cfg(test)]
 mod tests {
+    use crate::compiler::SqlCompileError;
     use arrow::datatypes::DataType;
 
     use super::rewrite_with_rule;
@@ -186,7 +191,7 @@ mod tests {
             &self,
             mut expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             let Operator::LogicalScan(ref mut op) = expr.op else {
                 return Ok(RewriteResult::Unchanged);
             };
@@ -218,7 +223,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
                 self.name(),
                 "project rejected",
@@ -299,7 +304,7 @@ mod tests {
                 &self,
                 _expr: OptExpr,
                 _ctx: &mut RewriteContext,
-            ) -> Result<RewriteResult, String> {
+            ) -> Result<RewriteResult, SqlCompileError> {
                 Ok(RewriteResult::Unchanged)
             }
         }
@@ -479,7 +484,7 @@ mod tests {
                 &self,
                 _expr: OptExpr,
                 _ctx: &mut RewriteContext,
-            ) -> Result<RewriteResult, String> {
+            ) -> Result<RewriteResult, SqlCompileError> {
                 Ok(RewriteResult::Unchanged)
             }
         }
@@ -636,6 +641,75 @@ mod tests {
     struct NeverMatches {
         visits: std::sync::atomic::AtomicUsize,
     }
+
+    #[test]
+    fn one_shot_rule_control_failure_survives_successful_followup_checkpoint() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct OneShotControl {
+            failure: CompileControlError,
+            fired: AtomicBool,
+            successful_after_failure: AtomicUsize,
+        }
+        impl PureCompileControl for OneShotControl {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                if units == 17 && !self.fired.swap(true, Ordering::SeqCst) {
+                    return Err(self.failure);
+                }
+                if self.fired.load(Ordering::SeqCst) {
+                    self.successful_after_failure.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+        struct ControlledRule;
+        impl LogicalRewriteRule for ControlledRule {
+            fn name(&self) -> &'static str {
+                "ControlledRule"
+            }
+            fn phase(&self) -> RewritePhase {
+                RewritePhase::LogicalNormalize
+            }
+            fn matches(&self, _: &OptExpr, _: &RewriteContext) -> bool {
+                true
+            }
+            fn apply(
+                &self,
+                _: OptExpr,
+                ctx: &mut RewriteContext,
+            ) -> Result<RewriteResult, SqlCompileError> {
+                ctx.control_view().checkpoint(CompilePhase::Validate, 17)?;
+                panic!("one-shot control must stop the actual rule")
+            }
+        }
+
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = OneShotControl {
+                failure,
+                fired: AtomicBool::new(false),
+                successful_after_failure: AtomicUsize::new(0),
+            };
+            let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+            let input = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                rows: vec![vec![]],
+                columns: vec![],
+            }));
+            let error = rewrite_with_rule(input, &ControlledRule, &mut ctx).unwrap_err();
+            assert_eq!(error, SqlCompileError::from(failure));
+            assert!(control.fired.load(Ordering::SeqCst));
+            control.checkpoint(CompilePhase::Validate, 0).unwrap();
+            assert_eq!(control.successful_after_failure.load(Ordering::SeqCst), 1);
+            assert!(!ctx.trace().events().iter().any(|event| matches!(
+                event,
+                RewriteTraceEvent::RuleFailed { .. } | RewriteTraceEvent::RuleRejected { .. }
+            )));
+        }
+    }
     impl LogicalRewriteRule for NeverMatches {
         fn name(&self) -> &'static str {
             "NeverMatches"
@@ -648,7 +722,11 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             false
         }
-        fn apply(&self, _: OptExpr, _: &mut RewriteContext) -> Result<RewriteResult, String> {
+        fn apply(
+            &self,
+            _: OptExpr,
+            _: &mut RewriteContext,
+        ) -> Result<RewriteResult, SqlCompileError> {
             panic!("structurally unmatched rule must never run")
         }
     }

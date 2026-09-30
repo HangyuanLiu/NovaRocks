@@ -23,6 +23,7 @@
 //! rewrite rules can build row-identity apply keys from real plan outputs. It
 //! is never exposed to user-visible output.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 
 use crate::analysis::OutputColumn;
@@ -109,7 +110,11 @@ impl LogicalRewriteRule for InjectRowIdRule {
         }
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind,

@@ -23,6 +23,7 @@
 //! precondition failure returns `Unchanged` so `ScalarApplyToJoin` produces the
 //! M1 join form. Never errors (the join form is always a valid fallback).
 
+use crate::compiler::SqlCompileError;
 use std::collections::{HashMap, HashSet};
 
 use super::scalar_utils;
@@ -85,10 +86,14 @@ impl LogicalRewriteRule for ApplyToWindow {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_plan_inner(expr, ctx, &mut arena)? {
+        match apply_plan_inner(expr, ctx, &mut arena).map_err(SqlCompileError::Compilation)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }

@@ -498,7 +498,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c1_eq_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
         assert_eq!(graph.atoms, vec![a, b, c], "left-to-right atom order");
@@ -536,7 +542,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c1_eq_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let graph = flatten_join_chain(&mut memo, root).expect("chain over {LO, C}");
         assert_eq!(
@@ -565,7 +577,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(b)),
             op: inner(cond),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // A single-relation predicate inside the join condition makes the chain
         // non-reorderable (we never drop predicates); flatten returns None and
@@ -595,7 +613,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_eq_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let graph = flatten_join_chain(&mut memo, root).expect("3-atom chain flattens");
 
         // Literal edges only connect A-B and B-C; no literal A-C edge exists.
@@ -640,7 +664,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_eq_c4),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut root_props =
             LogicalProperties::new(vec![out_col(1), out_col(2), out_col(3), out_col(4)], 50.0);
         root_props
@@ -688,7 +718,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_eq_c4),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut root_props =
             LogicalProperties::new(vec![out_col(1), out_col(2), out_col(3), out_col(4)], 50.0);
         root_props
@@ -727,7 +763,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(c)),
             op: inner(c2_null_safe_c3),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         memo.groups[root].logical_props = Some(LogicalProperties::new(
             vec![out_col(1), out_col(2), out_col(3)],
             50.0,
@@ -755,7 +797,13 @@ mod tests {
             right: Box::new(JoinTree::Leaf(b)),
             op: inner(c1_eq_c2),
         };
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let graph = flatten_join_chain(&mut memo, root).expect("2-atom chain flattens");
         assert_eq!(graph.equi_classes.len(), 1, "one 2-atom class");
         assert!(graph.equi_classes[0].straddles(0b01, 0b10));

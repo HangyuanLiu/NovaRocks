@@ -21,6 +21,7 @@
 //! pushed to the scan by the existing PredicatePushdownPostJoin pushdown rules
 //! running in the same fixed-point loop.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
@@ -77,7 +78,11 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -380,7 +385,7 @@ mod tests {
     }
 
     /// Returns (left_child_is_filter, right_child_is_filter) for the rule's output.
-    fn side_filters(out: Result<RewriteResult, String>) -> (bool, bool) {
+    fn side_filters(out: Result<RewriteResult, SqlCompileError>) -> (bool, bool) {
         match out.unwrap() {
             RewriteResult::Unchanged => (false, false),
             RewriteResult::Changed(plan) => {

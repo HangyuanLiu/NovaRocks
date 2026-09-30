@@ -32,6 +32,7 @@
 //!
 //! Spec: `docs/design/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -982,7 +983,11 @@ impl LogicalRewriteRule for TagRequiredColumns {
         subtree_untagged(expr)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena_rc = ctx.scalar_arena();
         let arena = arena_rc.borrow();
         let tagged = tag_required_columns(expr, &arena, None);

@@ -26,6 +26,7 @@ use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
 use crate::common::ApplyKind;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{ApplyOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -59,10 +60,14 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena)? {
+        match apply_expr(expr, &mut arena).map_err(SqlCompileError::Compilation)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }

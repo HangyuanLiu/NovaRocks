@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 
 use crate::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -64,7 +65,11 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
             )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -255,7 +260,11 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -668,6 +677,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("aggregate branch must be rejected");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Aggregate"
@@ -693,6 +705,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("join branch must be rejected");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Join"
@@ -711,6 +726,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("UNION DISTINCT must not be rewritten as UNION ALL");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV top-level union delta rewrite supports UNION ALL only"

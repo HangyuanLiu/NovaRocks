@@ -17,10 +17,12 @@
 
 //! Aggregate pushdown cost gate — NDV bucketing + row-count threshold.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::statistics::Confidence;
 use crate::optimizer::stats::derive_opt_expr_statistics;
 use crate::optimizer::stats_input::OptimizerStatsInput;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 use super::context::PushPlan;
 
@@ -34,32 +36,49 @@ pub(crate) fn should_push(
     plan: &PushPlan,
     arena: &ScalarArena,
     stats_input: &OptimizerStatsInput,
-) -> bool {
-    let stats = derive_opt_expr_statistics(&plan.target_subtree, arena, stats_input);
+    control: &dyn PureCompileControl,
+) -> Result<bool, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let stats = derive_opt_expr_statistics(&plan.target_subtree, arena, stats_input, control)?;
     let row_count = stats.output_row_count;
     if row_count <= 1.0 {
         // Trivially small subtree; partial buys nothing.
-        return false;
+        work.finish()?;
+        return Ok(false);
     }
 
-    let mut ndvs: Vec<Option<f64>> = plan
+    let mut ndvs = Vec::new();
+    for gb_id in plan
         .partial_groupby
         .iter()
-        .map(|gb_id| ndv_for_group_expr(arena, *gb_id, &stats, row_count))
-        .collect();
-    ndvs.extend(
-        plan.partial_extra_groupby
-            .iter()
-            .map(|gb_id| ndv_for_group_expr(arena, *gb_id, &stats, row_count)),
-    );
-
-    if ndvs.iter().any(|n| n.is_none()) {
-        // Fallback: push only if the target is "big enough".
-        return row_count >= UNKNOWN_NDV_ROW_THRESHOLD;
+        .chain(&plan.partial_extra_groupby)
+    {
+        work.step()?;
+        ndvs.push(ndv_for_group_expr(arena, *gb_id, &stats, row_count));
     }
 
-    let joint_ndv: f64 = ndvs.iter().flatten().product::<f64>().min(row_count);
-    joint_ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO
+    let mut unknown = false;
+    for ndv in &ndvs {
+        work.step()?;
+        if ndv.is_none() {
+            unknown = true;
+            break;
+        }
+    }
+    if unknown {
+        // Fallback: push only if the target is "big enough".
+        work.finish()?;
+        return Ok(row_count >= UNKNOWN_NDV_ROW_THRESHOLD);
+    }
+
+    let mut joint_ndv: f64 = 1.0;
+    for ndv in ndvs.into_iter().flatten() {
+        work.step()?;
+        joint_ndv *= ndv;
+    }
+    let joint_ndv = joint_ndv.min(row_count);
+    work.finish()?;
+    Ok(joint_ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO)
 }
 
 fn ndv_for_group_expr(
@@ -87,6 +106,16 @@ fn ndv_for_group_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn should_push(plan: &PushPlan, arena: &ScalarArena, input: &OptimizerStatsInput) -> bool {
+        super::should_push(
+            plan,
+            arena,
+            input,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+    }
     use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::column_id::ColumnId;
     use crate::optimizer::operator::{Operator, ScanOp};

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 
 use crate::analysis::OutputColumn;
@@ -67,7 +68,11 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind,
@@ -448,6 +453,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("scan branch must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("supports only aggregate or Project-over-Aggregate branches"),
             "unexpected error: {err}"

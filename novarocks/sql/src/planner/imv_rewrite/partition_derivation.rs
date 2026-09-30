@@ -23,6 +23,7 @@
 //! flows from plan-time manifest derivation, so this rule never changes the
 //! plan and never fails the rewrite.
 
+use crate::compiler::SqlCompileError;
 use crate::compiler::mv_rewrite::{
     SqlImvExpressionKind, SqlImvPartitionDerivationField, SqlImvPartitionDerivationSpec,
     SqlImvPartitionTransform, SqlImvSchemaContract,
@@ -55,10 +56,15 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
         })
     }
 
-    fn apply(&self, _expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        _expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let ext = ctx
             .extension::<ImvExtension>()
-            .ok_or("DerivePartitionSpec requires ImvExtension")?
+            .ok_or_else(|| "DerivePartitionSpec requires ImvExtension".to_string())
+            .map_err(SqlCompileError::Compilation)?
             .clone();
 
         let outcome = match resolve_partition_derivation_spec(&ext.snapshot.schema_contract) {

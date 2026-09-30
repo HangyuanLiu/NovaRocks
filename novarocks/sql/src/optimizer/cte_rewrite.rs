@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+
 use crate::common::CteId;
 use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
@@ -28,76 +31,152 @@ pub(crate) struct CTEContext {
     pub consume_count: HashMap<CteId, usize>,
 }
 
-pub(crate) fn collect_cte_counts(expr: &OptExpr) -> CTEContext {
-    fn visit(expr: &OptExpr, ctx: &mut CTEContext) {
+// One counter belongs to the complete invocation, including replacement
+// traversal and output adaptation. It observes the caller's policy; it is not
+// a separate work allowance or memory wallet.
+struct CteWork<'a> {
+    control: &'a dyn PureCompileControl,
+    checkpoints: CompileCheckpoints<'a>,
+}
+impl<'a> CteWork<'a> {
+    fn try_new(control: &'a dyn PureCompileControl) -> Result<Self, SqlCompileError> {
+        Ok(Self {
+            control,
+            checkpoints: CompileCheckpoints::try_new(control, CompilePhase::Validate)?,
+        })
+    }
+    fn step(&mut self) -> Result<(), SqlCompileError> {
+        self.checkpoints.step().map_err(SqlCompileError::from)
+    }
+    fn finish(self) -> Result<(), SqlCompileError> {
+        self.checkpoints.finish().map_err(SqlCompileError::from)
+    }
+    // Scalar interning and nested Arrow comparisons/operator payload clones remain opaque
+    // owner operations. These observations do not prove internal cooperation.
+    fn opaque<T>(&mut self, operation: impl FnOnce() -> T) -> Result<T, SqlCompileError> {
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
+        let value = operation();
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
+        self.step()?;
+        Ok(value)
+    }
+}
+
+pub(crate) fn collect_cte_counts(
+    expr: &OptExpr,
+    control: &dyn PureCompileControl,
+) -> Result<CTEContext, SqlCompileError> {
+    let mut work = CteWork::try_new(control)?;
+    let mut ctx = CTEContext::default();
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        work.step()?;
         match &expr.op {
             Operator::LogicalCTEAnchor(node) => {
                 ctx.produces.insert(node.cte_id);
-                for child in &expr.children {
-                    visit(child, ctx);
-                }
             }
             Operator::LogicalCTEConsume(node) => {
-                *ctx.consume_count.entry(node.cte_id).or_insert(0) += 1;
+                let count = ctx.consume_count.entry(node.cte_id).or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .ok_or(SqlCompileError::ResourceExhausted)?;
+                // A consume is a leaf in the existing count contract.
+                continue;
             }
             Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-                panic!("imv marker leaked into non-IMV plan");
+                return Err(SqlCompileError::Compilation(
+                    "imv marker leaked into non-IMV plan".to_string(),
+                ));
             }
-            _ => {
-                for child in &expr.children {
-                    visit(child, ctx);
-                }
-            }
+            _ => {}
+        }
+        // Reverse push preserves the original left-to-right visit order.
+        for child in expr.children.iter().rev() {
+            work.step()?;
+            pending.push(child);
         }
     }
-
-    let mut ctx = CTEContext::default();
-    visit(expr, &mut ctx);
-    ctx
+    work.finish()?;
+    Ok(ctx)
 }
 
 pub(crate) fn inline_single_use_ctes(
+    expr: OptExpr,
+    ctx: &CTEContext,
+    scalars: &mut ScalarArena,
+    control: &dyn PureCompileControl,
+) -> Result<OptExpr, SqlCompileError> {
+    let mut work = CteWork::try_new(control)?;
+    let output = inline_ctes(expr, ctx, scalars, &mut work)?;
+    work.finish()?;
+    Ok(output)
+}
+
+fn inline_ctes(
     mut expr: OptExpr,
     ctx: &CTEContext,
     scalars: &mut ScalarArena,
-) -> Result<OptExpr, String> {
+    work: &mut CteWork<'_>,
+) -> Result<OptExpr, SqlCompileError> {
+    work.step()?;
     match &expr.op {
         Operator::LogicalCTEAnchor(node) => {
             let cte_id = node.cte_id;
             let mut children = std::mem::take(&mut expr.children);
-            let produce = inline_single_use_ctes(children.remove(0), ctx, scalars)?;
-            let consumer = inline_single_use_ctes(children.remove(0), ctx, scalars)?;
+            let produce = inline_ctes(children.remove(0), ctx, scalars, work)?;
+            let consumer = inline_ctes(children.remove(0), ctx, scalars, work)?;
             let consume_count = ctx.consume_count.get(&cte_id).copied().unwrap_or(0);
-
-            // Inline single-use CTEs. Multi-consume CTEs use the CTE
-            // Produce/Consume path with MultiCast exchange.
+            // Preserve the existing single-use versus MultiCast decision.
             if ctx.produces.contains(&cte_id) && consume_count <= 1 {
-                let produce_input = if matches!(
-                    &produce.op,
-                    Operator::LogicalCTEProduce(produce_node) if produce_node.cte_id == cte_id
-                ) {
+                let produce_input = if matches!(&produce.op,
+                    Operator::LogicalCTEProduce(node) if node.cte_id == cte_id)
+                {
                     into_single_child(produce)
                 } else {
                     produce
                 };
-                replace_cte_consume(consumer, cte_id, &produce_input, scalars)
+                replace_cte_consume(consumer, cte_id, &produce_input, scalars, work)
             } else {
                 expr.children = vec![produce, consumer];
                 Ok(expr)
             }
         }
-        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
-        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => Err(
+            SqlCompileError::Compilation("imv marker leaked into non-IMV plan".to_string()),
+        ),
         _ => {
-            expr.children = expr
-                .children
-                .into_iter()
-                .map(|child| inline_single_use_ctes(child, ctx, scalars))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut children = Vec::with_capacity(expr.children.len());
+            for child in std::mem::take(&mut expr.children) {
+                children.push(inline_ctes(child, ctx, scalars, work)?);
+            }
+            expr.children = children;
             Ok(expr)
         }
     }
+}
+
+fn clone_replacement(expr: &OptExpr, work: &mut CteWork<'_>) -> Result<OptExpr, SqlCompileError> {
+    work.step()?;
+    let op = work.opaque(|| expr.op.clone())?;
+    let required_output_columns = if let Some(columns) = &expr.required_output_columns {
+        let mut cloned = HashSet::with_capacity(columns.len());
+        for column in columns {
+            work.step()?;
+            cloned.insert(*column);
+        }
+        Some(cloned)
+    } else {
+        None
+    };
+    let mut children = Vec::with_capacity(expr.children.len());
+    for child in &expr.children {
+        children.push(clone_replacement(child, work)?);
+    }
+    Ok(OptExpr {
+        op,
+        children,
+        required_output_columns,
+    })
 }
 
 fn replace_cte_consume(
@@ -105,28 +184,38 @@ fn replace_cte_consume(
     cte_id: CteId,
     replacement: &OptExpr,
     scalars: &mut ScalarArena,
-) -> Result<OptExpr, String> {
+    work: &mut CteWork<'_>,
+) -> Result<OptExpr, SqlCompileError> {
+    work.step()?;
     match &expr.op {
         Operator::LogicalCTEConsume(node) if node.cte_id == cte_id => {
-            node.validate_mapping()?;
+            work.opaque(|| node.validate_mapping())?
+                .map_err(SqlCompileError::Compilation)?;
             adapt_cte_replacement_output_with_qualifier(
-                replacement.clone(),
+                clone_replacement(replacement, work)?,
                 &node.output_columns,
                 &node.producer_column_ids,
                 Some(&node.alias),
                 scalars,
+                work,
             )
         }
         Operator::LogicalCTEConsume(_) => Ok(expr),
-        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
-        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => Err(
+            SqlCompileError::Compilation("imv marker leaked into non-IMV plan".to_string()),
+        ),
         _ => {
-            expr.children = expr
-                .children
-                .into_iter()
-                .map(|child| replace_cte_consume(child, cte_id, replacement, scalars))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut children = Vec::with_capacity(expr.children.len());
+            for child in std::mem::take(&mut expr.children) {
+                children.push(replace_cte_consume(
+                    child,
+                    cte_id,
+                    replacement,
+                    scalars,
+                    work,
+                )?);
+            }
+            expr.children = children;
             Ok(expr)
         }
     }
@@ -135,6 +224,126 @@ fn replace_cte_consume(
 fn into_single_child(mut expr: OptExpr) -> OptExpr {
     assert_eq!(expr.children.len(), 1, "expected one logical plan child");
     expr.children.remove(0)
+}
+
+fn clone_columns(
+    columns: &[OutputColumn],
+    work: &mut CteWork<'_>,
+) -> Result<Vec<OutputColumn>, SqlCompileError> {
+    let mut output = Vec::with_capacity(columns.len());
+    for column in columns {
+        output.push(work.opaque(|| column.clone())?);
+    }
+    Ok(output)
+}
+
+fn opt_expr_output_columns(
+    expr: &OptExpr,
+    scalars: &ScalarArena,
+    work: &mut CteWork<'_>,
+) -> Result<Vec<OutputColumn>, SqlCompileError> {
+    work.step()?;
+    match &expr.op {
+        Operator::LogicalScan(node) => clone_columns(&node.columns, work),
+        Operator::LogicalFilter(_)
+        | Operator::LogicalSort(_)
+        | Operator::LogicalLimit(_)
+        | Operator::LogicalTopN(_)
+        | Operator::LogicalRepeat(_)
+        | Operator::LogicalAssertOneRow(_) => {
+            opt_expr_output_columns(expr.unary_input(), scalars, work)
+        }
+        Operator::LogicalProject(node) => {
+            let mut columns = Vec::with_capacity(node.items.len());
+            for item in &node.items {
+                columns.push(work.opaque(|| OutputColumn {
+                    column_id: item.output_column_id,
+                    name: item.output_name.clone(),
+                    data_type: scalars.data_type(item.expr).clone(),
+                    nullable: scalars.nullable(item.expr),
+                    is_internal: false,
+                })?);
+            }
+            Ok(columns)
+        }
+        Operator::LogicalAggregate(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalJoin(node) => {
+            let left = opt_expr_output_columns(expr.left(), scalars, work)?;
+            let right = opt_expr_output_columns(expr.right(), scalars, work)?;
+            join_output_columns(node.join_type, left, right, work)
+        }
+        Operator::LogicalUnion(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalIntersect(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalExcept(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalValues(node) => clone_columns(&node.columns, work),
+        Operator::LogicalGenerateSeries(node) => work.opaque(|| {
+            vec![OutputColumn {
+                column_id: node.output_column_id,
+                name: node.column_name.clone(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }]
+        }),
+        Operator::LogicalTableFunction(node) => {
+            let mut columns = opt_expr_output_columns(expr.unary_input(), scalars, work)?;
+            for column in &node.output_columns {
+                columns.push(work.opaque(|| column.clone())?);
+            }
+            Ok(columns)
+        }
+        Operator::LogicalWindow(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalCTEAnchor(_) => opt_expr_output_columns(expr.child(1), scalars, work),
+        Operator::LogicalCTEProduce(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalCTEConsume(node) => clone_columns(&node.output_columns, work),
+        Operator::LogicalApply(node) => {
+            let mut columns = opt_expr_output_columns(expr.left(), scalars, work)?;
+            columns.push(work.opaque(|| node.output_column.clone())?);
+            Ok(columns)
+        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            Err(SqlCompileError::Compilation(
+                "imv marker leaked into non-IMV planner output adaptation".to_string(),
+            ))
+        }
+        other => Err(SqlCompileError::Compilation(format!(
+            "physical operator leaked into CTE output adaptation: {other:?}"
+        ))),
+    }
+}
+
+fn join_output_columns(
+    join_type: JoinKind,
+    mut left: Vec<OutputColumn>,
+    mut right: Vec<OutputColumn>,
+    work: &mut CteWork<'_>,
+) -> Result<Vec<OutputColumn>, SqlCompileError> {
+    match join_type {
+        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => return Ok(left),
+        JoinKind::RightSemi | JoinKind::RightAnti => return Ok(right),
+        JoinKind::LeftOuter => make_nullable(&mut right, work)?,
+        JoinKind::RightOuter => make_nullable(&mut left, work)?,
+        JoinKind::FullOuter => {
+            make_nullable(&mut left, work)?;
+            make_nullable(&mut right, work)?;
+        }
+        JoinKind::Inner | JoinKind::Cross => {}
+    }
+    for column in right {
+        work.step()?;
+        left.push(column);
+    }
+    Ok(left)
+}
+fn make_nullable(
+    columns: &mut [OutputColumn],
+    work: &mut CteWork<'_>,
+) -> Result<(), SqlCompileError> {
+    for column in columns {
+        work.step()?;
+        column.nullable = true;
+    }
+    Ok(())
 }
 
 #[allow(
@@ -146,22 +355,26 @@ fn adapt_opt_expr_output_with_qualifier(
     target_output_columns: &[OutputColumn],
     output_qualifier: Option<&str>,
     scalars: &mut ScalarArena,
-) -> Result<OptExpr, String> {
-    let source_output_columns = opt_expr_output_columns(&input, scalars)?;
+    work: &mut CteWork<'_>,
+) -> Result<OptExpr, SqlCompileError> {
+    let source_output_columns = opt_expr_output_columns(&input, scalars, work)?;
     if source_output_columns.len() != target_output_columns.len() {
-        return Err(format!(
+        return Err(SqlCompileError::Compilation(format!(
             "output column count mismatch while adapting subquery/CTE output: child has {}, target has {}",
             source_output_columns.len(),
             target_output_columns.len()
-        ));
+        )));
     }
 
-    if source_output_columns
-        .iter()
-        .zip(target_output_columns.iter())
-        .all(|(source, target)| output_column_metadata_equal(source, target))
-        && output_qualifier.is_none()
-    {
+    let mut metadata_equal = true;
+    for (source, target) in source_output_columns.iter().zip(target_output_columns) {
+        work.step()?;
+        if !work.opaque(|| output_column_metadata_equal(source, target))? {
+            metadata_equal = false;
+            break;
+        }
+    }
+    if metadata_equal && output_qualifier.is_none() {
         return Ok(input);
     }
 
@@ -170,35 +383,38 @@ fn adapt_opt_expr_output_with_qualifier(
         .iter()
         .zip(target_output_columns.iter())
     {
-        if source.data_type != target.data_type {
-            return Err(format!(
+        work.step()?;
+        if work.opaque(|| source.data_type != target.data_type)? {
+            return Err(SqlCompileError::Compilation(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
                 target.name, source.data_type, target.data_type
-            ));
+            )));
         }
         if source.nullable && !target.nullable {
-            return Err(format!(
+            return Err(SqlCompileError::Compilation(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
                 target.name, source.nullable, target.nullable
-            ));
+            )));
         }
-        scalars.remember_source_column_display(source.column_id, None, source.name.clone());
-        let expr = scalars.intern(
-            ScalarNode::ColumnRef(source.column_id),
-            source.data_type.clone(),
-            target.nullable,
-        );
-        let expr_display = Some(ColumnDisplay {
-            qualifier: None,
-            column: source.name.clone(),
-        });
-        scalars.remember_project_output_display(target.column_id, None, target.name.clone());
-        items.push(ScalarProjectItem {
-            expr,
-            output_name: target.name.clone(),
-            output_column_id: target.column_id,
-            expr_display,
-        });
+        items.push(work.opaque(|| {
+            scalars.remember_source_column_display(source.column_id, None, source.name.clone());
+            let expr = scalars.intern(
+                ScalarNode::ColumnRef(source.column_id),
+                source.data_type.clone(),
+                target.nullable,
+            );
+            let expr_display = Some(ColumnDisplay {
+                qualifier: None,
+                column: source.name.clone(),
+            });
+            scalars.remember_project_output_display(target.column_id, None, target.name.clone());
+            ScalarProjectItem {
+                expr,
+                output_name: target.name.clone(),
+                output_column_id: target.column_id,
+                expr_display,
+            }
+        })?);
     }
 
     Ok(OptExpr::new(
@@ -216,56 +432,67 @@ fn adapt_cte_replacement_output_with_qualifier(
     producer_column_ids: &[crate::column_id::ColumnId],
     output_qualifier: Option<&str>,
     scalars: &mut ScalarArena,
-) -> Result<OptExpr, String> {
+    work: &mut CteWork<'_>,
+) -> Result<OptExpr, SqlCompileError> {
     if target_output_columns.len() != producer_column_ids.len() {
-        return Err(format!(
+        return Err(SqlCompileError::Compilation(format!(
             "CTE output/producers arity mismatch while adapting inline replacement: output has {}, producers has {}",
             target_output_columns.len(),
             producer_column_ids.len()
-        ));
+        )));
     }
 
-    let source_output_columns = opt_expr_output_columns(&input, scalars)?;
+    let source_output_columns = opt_expr_output_columns(&input, scalars, work)?;
     let mut items = Vec::with_capacity(target_output_columns.len());
     for (target, producer_column_id) in target_output_columns.iter().zip(producer_column_ids) {
-        let source = source_output_columns
-            .iter()
-            .find(|source| source.column_id == *producer_column_id)
+        work.step()?;
+        let mut matched = None;
+        for source in &source_output_columns {
+            work.step()?;
+            if source.column_id == *producer_column_id {
+                matched = Some(source);
+                break;
+            }
+        }
+        let source = matched
             .ok_or_else(|| {
                 format!(
                     "CTE inline replacement missing producer column {} for output '{}'",
                     producer_column_id.0, target.name
                 )
-            })?;
-        if source.data_type != target.data_type {
-            return Err(format!(
+            })
+            .map_err(SqlCompileError::Compilation)?;
+        if work.opaque(|| source.data_type != target.data_type)? {
+            return Err(SqlCompileError::Compilation(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
                 target.name, source.data_type, target.data_type
-            ));
+            )));
         }
         if source.nullable && !target.nullable {
-            return Err(format!(
+            return Err(SqlCompileError::Compilation(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
                 target.name, source.nullable, target.nullable
-            ));
+            )));
         }
-        scalars.remember_source_column_display(source.column_id, None, source.name.clone());
-        let expr = scalars.intern(
-            ScalarNode::ColumnRef(source.column_id),
-            source.data_type.clone(),
-            target.nullable,
-        );
-        let expr_display = Some(ColumnDisplay {
-            qualifier: None,
-            column: source.name.clone(),
-        });
-        scalars.remember_project_output_display(target.column_id, None, target.name.clone());
-        items.push(ScalarProjectItem {
-            expr,
-            output_name: target.name.clone(),
-            output_column_id: target.column_id,
-            expr_display,
-        });
+        items.push(work.opaque(|| {
+            scalars.remember_source_column_display(source.column_id, None, source.name.clone());
+            let expr = scalars.intern(
+                ScalarNode::ColumnRef(source.column_id),
+                source.data_type.clone(),
+                target.nullable,
+            );
+            let expr_display = Some(ColumnDisplay {
+                qualifier: None,
+                column: source.name.clone(),
+            });
+            scalars.remember_project_output_display(target.column_id, None, target.name.clone());
+            ScalarProjectItem {
+                expr,
+                output_name: target.name.clone(),
+                output_column_id: target.column_id,
+                expr_display,
+            }
+        })?);
     }
 
     Ok(OptExpr::new(
@@ -275,69 +502,6 @@ fn adapt_cte_replacement_output_with_qualifier(
         }),
         vec![input],
     ))
-}
-
-fn opt_expr_output_columns(
-    expr: &OptExpr,
-    scalars: &ScalarArena,
-) -> Result<Vec<OutputColumn>, String> {
-    match &expr.op {
-        Operator::LogicalScan(node) => Ok(node.columns.clone()),
-        Operator::LogicalFilter(_)
-        | Operator::LogicalSort(_)
-        | Operator::LogicalLimit(_)
-        | Operator::LogicalTopN(_)
-        | Operator::LogicalRepeat(_)
-        | Operator::LogicalAssertOneRow(_) => opt_expr_output_columns(expr.unary_input(), scalars),
-        Operator::LogicalProject(node) => Ok(node
-            .items
-            .iter()
-            .map(|item| OutputColumn {
-                column_id: item.output_column_id,
-                name: item.output_name.clone(),
-                data_type: scalars.data_type(item.expr).clone(),
-                nullable: scalars.nullable(item.expr),
-                is_internal: false,
-            })
-            .collect()),
-        Operator::LogicalAggregate(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalJoin(node) => {
-            let left = opt_expr_output_columns(expr.left(), scalars)?;
-            let right = opt_expr_output_columns(expr.right(), scalars)?;
-            Ok(join_output_columns(node.join_type, left, right))
-        }
-        Operator::LogicalUnion(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalIntersect(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalExcept(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalValues(node) => Ok(node.columns.clone()),
-        Operator::LogicalGenerateSeries(node) => Ok(vec![OutputColumn {
-            column_id: node.output_column_id,
-            name: node.column_name.clone(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        }]),
-        Operator::LogicalTableFunction(node) => {
-            let mut columns = opt_expr_output_columns(expr.unary_input(), scalars)?;
-            columns.extend(node.output_columns.clone());
-            Ok(columns)
-        }
-        Operator::LogicalWindow(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalCTEAnchor(_) => opt_expr_output_columns(expr.child(1), scalars),
-        Operator::LogicalCTEProduce(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalCTEConsume(node) => Ok(node.output_columns.clone()),
-        Operator::LogicalApply(node) => {
-            let mut columns = opt_expr_output_columns(expr.left(), scalars)?;
-            columns.push(node.output_column.clone());
-            Ok(columns)
-        }
-        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-            Err("imv marker leaked into non-IMV planner output adaptation".to_string())
-        }
-        other => Err(format!(
-            "physical operator leaked into CTE output adaptation: {other:?}"
-        )),
-    }
 }
 
 #[allow(
@@ -350,44 +514,6 @@ fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bo
         && left.data_type == right.data_type
         && left.nullable == right.nullable
         && left.is_internal == right.is_internal
-}
-
-fn join_output_columns(
-    join_type: JoinKind,
-    left: Vec<OutputColumn>,
-    right: Vec<OutputColumn>,
-) -> Vec<OutputColumn> {
-    match join_type {
-        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
-        JoinKind::RightSemi | JoinKind::RightAnti => right,
-        JoinKind::LeftOuter => {
-            let mut out = left;
-            out.extend(make_nullable(right));
-            out
-        }
-        JoinKind::RightOuter => {
-            let mut out = make_nullable(left);
-            out.extend(right);
-            out
-        }
-        JoinKind::FullOuter => {
-            let mut out = make_nullable(left);
-            out.extend(make_nullable(right));
-            out
-        }
-        JoinKind::Inner | JoinKind::Cross => {
-            let mut out = left;
-            out.extend(right);
-            out
-        }
-    }
-}
-
-fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
-    for column in &mut columns {
-        column.nullable = true;
-    }
-    columns
 }
 
 #[cfg(test)]
@@ -403,6 +529,10 @@ mod tests {
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_types::schema::ColumnDef;
+
+    fn test_control() -> &'static dyn PureCompileControl {
+        crate::optimizer::rewrite::context::unbounded_rewrite_test_control()
+    }
 
     fn scan_plan() -> OptExpr {
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
@@ -519,12 +649,15 @@ mod tests {
     ) -> Result<Vec<OutputColumn>, String> {
         let mut memo = crate::optimizer::Memo::new();
         memo.scalars = arena.clone();
-        let root_group = crate::optimizer::memo_copy::opt_expr_to_memo(plan, &mut memo);
+        let root_group =
+            crate::optimizer::memo_copy::opt_expr_to_memo(plan, &mut memo, test_control())
+                .map_err(|error| error.to_string())?;
         let stats_input =
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),
             );
-        crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
+        crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input, test_control())
+            .map_err(|error| error.to_string())?;
         Ok(memo.groups[root_group]
             .logical_props
             .as_ref()
@@ -549,7 +682,7 @@ mod tests {
     fn test_collect_cte_counts_counts_consumes() {
         let plan = cte_anchor(1, cte_produce(1, scan_plan()), consume_plan(1, "t"));
 
-        let ctx = collect_cte_counts(&plan);
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
         assert!(ctx.produces.contains(&1));
         assert_eq!(ctx.consume_count.get(&1), Some(&1));
     }
@@ -558,10 +691,10 @@ mod tests {
     fn test_inline_single_use_cte_removes_anchor_without_alias_node() {
         let plan = cte_anchor(1, cte_produce(1, scan_plan()), consume_plan(1, "t"));
 
-        let ctx = collect_cte_counts(&plan);
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
         let mut arena = scalar_arena();
-        let rewritten =
-            inline_single_use_ctes(plan, &ctx, &mut arena).expect("inline should succeed");
+        let rewritten = inline_single_use_ctes(plan, &ctx, &mut arena, test_control())
+            .expect("inline should succeed");
         assert!(matches!(
             &rewritten.op,
             Operator::LogicalScan(_) | Operator::LogicalProject(_)
@@ -583,10 +716,10 @@ mod tests {
             ),
         );
 
-        let ctx = collect_cte_counts(&plan);
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
         let mut arena = scalar_arena();
-        let rewritten =
-            inline_single_use_ctes(plan, &ctx, &mut arena).expect("inline should succeed");
+        let rewritten = inline_single_use_ctes(plan, &ctx, &mut arena, test_control())
+            .expect("inline should succeed");
 
         let output = opt_output_columns(&rewritten, &arena)
             .expect("rewritten output columns should be derivable");
@@ -660,10 +793,10 @@ mod tests {
         }));
         let plan = cte_anchor(1, produce, consume);
 
-        let ctx = collect_cte_counts(&plan);
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
         let mut arena = scalar_arena();
-        let rewritten =
-            inline_single_use_ctes(plan, &ctx, &mut arena).expect("inline should succeed");
+        let rewritten = inline_single_use_ctes(plan, &ctx, &mut arena, test_control())
+            .expect("inline should succeed");
 
         let Operator::LogicalProject(project) = &rewritten.op else {
             panic!("expected Project adapter");
@@ -699,12 +832,12 @@ mod tests {
             union(vec![consume_plan(1, "t1"), consume_plan(1, "t2")]),
         );
 
-        let ctx = collect_cte_counts(&plan);
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
         assert_eq!(ctx.consume_count.get(&1), Some(&2));
 
         let mut arena = scalar_arena();
-        let rewritten =
-            inline_single_use_ctes(plan, &ctx, &mut arena).expect("inline should succeed");
+        let rewritten = inline_single_use_ctes(plan, &ctx, &mut arena, test_control())
+            .expect("inline should succeed");
         assert!(matches!(&rewritten.op, Operator::LogicalCTEAnchor(_)));
     }
 
@@ -723,13 +856,13 @@ mod tests {
             ),
         );
 
-        let ctx = collect_cte_counts(&plan);
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
         assert_eq!(ctx.consume_count.get(&1), Some(&1));
         assert_eq!(ctx.consume_count.get(&2), Some(&2));
 
         let mut arena = scalar_arena();
-        let rewritten =
-            inline_single_use_ctes(plan, &ctx, &mut arena).expect("inline should succeed");
+        let rewritten = inline_single_use_ctes(plan, &ctx, &mut arena, test_control())
+            .expect("inline should succeed");
 
         match &rewritten.op {
             Operator::LogicalCTEAnchor(anchor) => {
@@ -757,8 +890,10 @@ mod tests {
         );
 
         let mut arena = scalar_arena();
-        let rewritten =
-            replace_cte_consume(plan, 1, &scan_plan(), &mut arena).expect("replace should succeed");
+        let mut work = CteWork::try_new(test_control()).unwrap();
+        let rewritten = replace_cte_consume(plan, 1, &scan_plan(), &mut arena, &mut work)
+            .expect("replace should succeed");
+        work.finish().unwrap();
 
         match &rewritten.op {
             Operator::LogicalCTEAnchor(_) => match &rewritten.child(1).op {
@@ -777,5 +912,218 @@ mod tests {
             },
             other => panic!("expected outer anchor, got {other:?}"),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum StopPoint {
+        Entry,
+        Batch(usize),
+        Finish,
+    }
+    struct ObservedControl {
+        units: std::sync::Mutex<Vec<u32>>,
+        stop: Option<(StopPoint, novarocks_type_contract::CompileControlError)>,
+    }
+    impl PureCompileControl for ObservedControl {
+        fn checkpoint(
+            &self,
+            _: CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            let mut observations = self.units.lock().unwrap();
+            observations.push(units);
+            if let Some((point, error)) = self.stop {
+                let stop = match point {
+                    StopPoint::Entry => units == 0,
+                    StopPoint::Batch(ordinal) => {
+                        units == 256
+                            && observations.iter().filter(|units| **units == 256).count() == ordinal
+                    }
+                    StopPoint::Finish => units > 0 && units < 256,
+                };
+                if stop {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+    }
+    fn observed_control(
+        stop: Option<(StopPoint, novarocks_type_contract::CompileControlError)>,
+    ) -> ObservedControl {
+        ObservedControl {
+            units: Default::default(),
+            stop,
+        }
+    }
+    fn wide_multi_consume() -> OptExpr {
+        cte_anchor(
+            1,
+            cte_produce(1, scan_plan()),
+            union(
+                (0..320)
+                    .map(|ordinal| consume_plan(1, &format!("c{ordinal}")))
+                    .collect(),
+            ),
+        )
+    }
+    #[test]
+    fn wide_cte_counts_and_inline_visit_all_actual_nodes_and_edges() {
+        let control = observed_control(None);
+        let plan = wide_multi_consume();
+        let ctx = collect_cte_counts(&plan, &control).unwrap();
+        assert_eq!(ctx.consume_count.get(&1), Some(&320));
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 256, 256, 135]);
+        let control = observed_control(None);
+        let rewritten = inline_single_use_ctes(plan, &ctx, &mut scalar_arena(), &control).unwrap();
+        assert!(matches!(rewritten.op, Operator::LogicalCTEAnchor(_)));
+        assert_eq!(rewritten.child(1).children.len(), 320);
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 256, 68]);
+    }
+    #[test]
+    fn cte_count_and_inline_keep_three_control_categories_at_all_boundaries() {
+        use novarocks_type_contract::CompileControlError as Error;
+        let ctx = collect_cte_counts(&wide_multi_consume(), test_control()).unwrap();
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            for point in [StopPoint::Entry, StopPoint::Batch(1), StopPoint::Finish] {
+                let control = observed_control(Some((point, error)));
+                let failure = collect_cte_counts(&wide_multi_consume(), &control).unwrap_err();
+                assert_eq!(failure, SqlCompileError::from(error));
+                assert!(
+                    control
+                        .units
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|units| *units <= 256)
+                );
+                let control = observed_control(Some((point, error)));
+                let failure = inline_single_use_ctes(
+                    wide_multi_consume(),
+                    &ctx,
+                    &mut scalar_arena(),
+                    &control,
+                )
+                .unwrap_err();
+                assert_eq!(failure, SqlCompileError::from(error));
+                let units = control.units.lock().unwrap();
+                assert!(units.iter().all(|units| *units <= 256));
+                if matches!(point, StopPoint::Entry) {
+                    assert_eq!(*units, vec![0]);
+                }
+                if matches!(point, StopPoint::Batch(1)) {
+                    assert_eq!(*units, vec![0, 256]);
+                }
+            }
+        }
+    }
+    #[test]
+    fn cte_replacement_clone_observes_control_inside_actual_child_traversal() {
+        use novarocks_type_contract::CompileControlError as Error;
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            let input = OptExpr::new(
+                Operator::LogicalUnion(UnionOp {
+                    all: true,
+                    output_columns: output_columns(),
+                    child_output_columns: vec![output_columns(); 320],
+                }),
+                (0..320).map(|_| scan_plan()).collect(),
+            );
+            let plan = cte_anchor(1, cte_produce(1, input), consume_plan(1, "c"));
+            let ctx = collect_cte_counts(&plan, test_control()).unwrap();
+            // The first 256-work checkpoint is in normal inlining; the
+            // second is in the actual replacement clone's child traversal.
+            let control = observed_control(Some((StopPoint::Batch(2), error)));
+            let failure =
+                inline_single_use_ctes(plan, &ctx, &mut scalar_arena(), &control).unwrap_err();
+            assert_eq!(failure, SqlCompileError::from(error));
+            assert_eq!(
+                control
+                    .units
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|units| **units == 256)
+                    .count(),
+                2
+            );
+        }
+    }
+    #[test]
+    fn cte_adaptation_observes_control_during_wide_output_mapping() {
+        use novarocks_type_contract::CompileControlError as Error;
+        let columns = (0..320)
+            .map(|ordinal| OutputColumn {
+                column_id: ColumnId::new_for_test(ordinal + 1),
+                name: format!("v{ordinal}"),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            let input = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: columns.clone(),
+            }));
+            let control = observed_control(Some((StopPoint::Batch(1), error)));
+            let mut work = CteWork::try_new(&control).unwrap();
+            let failure = adapt_cte_replacement_output_with_qualifier(
+                input,
+                &columns,
+                &columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect::<Vec<_>>(),
+                Some("c"),
+                &mut scalar_arena(),
+                &mut work,
+            )
+            .unwrap_err();
+            assert_eq!(failure, SqlCompileError::from(error));
+            assert_eq!(control.units.lock().unwrap().last(), Some(&256));
+        }
+    }
+    #[test]
+    fn cte_mapping_semantic_failure_stays_compilation() {
+        let plan = cte_anchor(
+            1,
+            cte_produce(1, scan_plan()),
+            consume_plan_with_output_columns(1, "c", output_columns(), vec![]),
+        );
+        let ctx = collect_cte_counts(&plan, test_control()).unwrap();
+        let failure =
+            inline_single_use_ctes(plan, &ctx, &mut scalar_arena(), test_control()).unwrap_err();
+        assert_eq!(
+            failure,
+            SqlCompileError::Compilation(
+                "CTEConsume output/producers arity mismatch for cte_id=1".to_string()
+            )
+        );
+    }
+    #[test]
+    fn count_and_inline_products_do_not_retain_the_borrowed_control() {
+        let owner = std::sync::Arc::new(observed_control(None));
+        let weak = std::sync::Arc::downgrade(&owner);
+        let plan = cte_anchor(1, cte_produce(1, scan_plan()), consume_plan(1, "c"));
+        let ctx = collect_cte_counts(&plan, owner.as_ref()).unwrap();
+        let output =
+            inline_single_use_ctes(plan, &ctx, &mut scalar_arena(), owner.as_ref()).unwrap();
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(ctx.consume_count.get(&1), Some(&1));
+        assert!(matches!(output.op, Operator::LogicalProject(_)));
     }
 }

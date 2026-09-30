@@ -35,6 +35,7 @@
 
 use crate::column_id::ColumnId;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -72,7 +73,11 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         ) && j.condition.is_some()
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,

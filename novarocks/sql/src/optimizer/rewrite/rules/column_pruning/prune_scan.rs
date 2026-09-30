@@ -23,6 +23,7 @@
 //! Also unions in any columns referenced by pushed-down predicates so that
 //! predicate evaluation is not broken by column pruning.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -160,7 +161,11 @@ impl LogicalRewriteRule for PruneScanColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,

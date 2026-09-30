@@ -27,6 +27,7 @@
 //! position-restricted required set, and the branches' own prune rules handle
 //! their pruning independently.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
@@ -65,7 +66,11 @@ impl LogicalRewriteRule for PruneUnionColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,

@@ -28,6 +28,7 @@ use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
 use crate::common::ApplyKind;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{ApplyOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -61,11 +62,17 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let function_catalog = ctx.function_catalog().snapshot();
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, function_catalog.as_ref(), &mut arena)? {
+        match apply_expr(expr, function_catalog.as_ref(), &mut arena)
+            .map_err(SqlCompileError::Compilation)?
+        {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -642,6 +649,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("missing inner output column id must error");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("c999"), "unexpected error: {err}");
         assert!(err.contains("c3"), "unexpected error: {err}");

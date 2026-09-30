@@ -305,7 +305,12 @@ impl<'a> SearchContext<'a> {
         // (hash join reorder shapes, aggregate) are costed from child_stats and
         // do not read own_stats. So the single per-group collapsed statistic is
         // the correct, value-identical input — read it once per group.
-        let own_stats = stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
+        let own_stats = stats_for_group(
+            &memo.groups[group_id],
+            memo,
+            &self.stats_input,
+            self.control,
+        )?;
 
         for expr_idx in 0..num_physical {
             work.step()?;
@@ -330,10 +335,18 @@ impl<'a> SearchContext<'a> {
                     && let (Some(&probe_group_id), Some(&build_group_id)) =
                         (expr.children.first(), expr.children.get(1))
                 {
-                    let probe_stats =
-                        stats_for_group(&memo.groups[probe_group_id], memo, &self.stats_input);
-                    let build_stats =
-                        stats_for_group(&memo.groups[build_group_id], memo, &self.stats_input);
+                    let probe_stats = stats_for_group(
+                        &memo.groups[probe_group_id],
+                        memo,
+                        &self.stats_input,
+                        self.control,
+                    )?;
+                    let build_stats = stats_for_group(
+                        &memo.groups[build_group_id],
+                        memo,
+                        &self.stats_input,
+                        self.control,
+                    )?;
                     let feas = super::cost::broadcast_is_feasible(
                         &probe_stats,
                         &build_stats,
@@ -351,7 +364,8 @@ impl<'a> SearchContext<'a> {
                         &memo.groups[cg],
                         memo,
                         &self.stats_input,
-                    ));
+                        self.control,
+                    )?);
                 }
                 let mut child_stats_refs = Vec::with_capacity(child_stats_vec.len());
                 for stats in &child_stats_vec {
@@ -416,8 +430,12 @@ impl<'a> SearchContext<'a> {
                         if enforcers.is_empty() {
                             continue;
                         }
-                        let group_stats =
-                            stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
+                        let group_stats = stats_for_group(
+                            &memo.groups[group_id],
+                            memo,
+                            &self.stats_input,
+                            self.control,
+                        )?;
                         let mut candidate_materialized_enforcer_estimate: Option<CostEstimate> =
                             None;
                         for enforcer in &enforcers {
@@ -581,32 +599,39 @@ fn stats_for_group(
     group: &super::memo::Group,
     memo: &Memo,
     stats_input: &OptimizerStatsInput,
-) -> crate::optimizer::statistics::Statistics {
+    control: &dyn PureCompileControl,
+) -> Result<crate::optimizer::statistics::Statistics, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     // Try logical props first (set by derive_group_statistics). Once Site 1
     // (derive_group_statistics_for) is argmax-correct, this cache already holds
     // the lexicographic-argmax representative's stats.
     if let Some(ref lp) = group.logical_props {
-        return crate::optimizer::statistics::Statistics {
+        let result = crate::optimizer::statistics::Statistics {
             output_row_count: lp.row_count,
             row_count_confidence: lp.row_count_confidence,
             column_statistics: lp.column_statistics.clone(),
         };
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        return Ok(result);
     }
 
     // Defensive fallback (should not happen in practice — logical_props is
     // populated by derive_group_statistics): re-pick the representative via the
     // same shared argmax helper Site 1 uses, so this path stays consistent
     // rather than re-deriving from first().
-    crate::optimizer::stats::pick_group_representative(memo, group.id, stats_input)
-        .map(|(_, stats)| stats)
-        .unwrap_or_else(|| {
-            // Empty group — should not happen in practice.
-            crate::optimizer::statistics::Statistics {
-                output_row_count: 1.0,
-                row_count_confidence: crate::optimizer::statistics::Confidence::Fallback,
-                column_statistics: HashMap::new(),
-            }
-        })
+    let result =
+        crate::optimizer::stats::pick_group_representative(memo, group.id, stats_input, control)?
+            .map(|(_, stats)| stats)
+            .unwrap_or_else(|| {
+                // Empty group — should not happen in practice.
+                crate::optimizer::statistics::Statistics {
+                    output_row_count: 1.0,
+                    row_count_confidence: crate::optimizer::statistics::Confidence::Fallback,
+                    column_statistics: HashMap::new(),
+                }
+            });
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,7 +1079,8 @@ mod tests {
             .physical_exprs
             .get(winner.expr_index)
             .expect("winner expression");
-        let own_stats = stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input);
+        let own_stats =
+            stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input, ctx.control).unwrap();
         let child_outputs: Vec<&PhysicalPropertySet> = Vec::new();
         let child_stats: Vec<&crate::optimizer::statistics::Statistics> = Vec::new();
         let scan_input = CostInput {
@@ -1104,7 +1130,8 @@ mod tests {
             .physical_exprs
             .get(winner.expr_index)
             .expect("winner expression");
-        let own_stats = stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input);
+        let own_stats =
+            stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input, ctx.control).unwrap();
         let child_outputs: Vec<&PhysicalPropertySet> = Vec::new();
         let child_stats: Vec<&crate::optimizer::statistics::Statistics> = Vec::new();
         let scan_input = CostInput {
@@ -1223,8 +1250,10 @@ mod tests {
             .physical_exprs
             .get(parent_winner.expr_index)
             .expect("parent winner expression");
-        let own_stats = stats_for_group(&memo.groups[root], &memo, &ctx.stats_input);
-        let child_stats = stats_for_group(&memo.groups[child], &memo, &ctx.stats_input);
+        let own_stats =
+            stats_for_group(&memo.groups[root], &memo, &ctx.stats_input, ctx.control).unwrap();
+        let child_stats =
+            stats_for_group(&memo.groups[child], &memo, &ctx.stats_input, ctx.control).unwrap();
         let child_stats_refs = vec![&child_stats];
         let child_output_refs = vec![&child_winner.output];
         let parent_input = CostInput {
@@ -2129,6 +2158,15 @@ mod control_tests {
             );
         }
         assert_eq!(memo.groups[group].physical_exprs.len(), count);
+        // Prepare real group statistics before the observed search so this
+        // test reaches the physical candidate loop rather than interrupting
+        // the new representative-derivation fallback first.
+        crate::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &stats(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         (memo, group)
     }
 
@@ -2222,6 +2260,8 @@ mod control_tests {
                 *control.observed.lock().unwrap(),
                 vec![
                     (CompilePhase::Validate, 0),
+                    (CompilePhase::Validate, 0),
+                    (CompilePhase::Validate, 0),
                     (CompilePhase::Validate, MAX_UNOBSERVED_COMPILE_WORK),
                 ]
             );
@@ -2239,7 +2279,13 @@ mod control_tests {
 
     #[test]
     fn final_control_failure_does_not_publish_computed_or_infeasible_winners() {
-        let (memo, group) = super::tests::single_scan_memo();
+        let (mut memo, group) = super::tests::single_scan_memo();
+        crate::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &stats(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let (logical, logical_group) = logical_only_scan();
         let required = PhysicalPropertySet::any();
         for error in errors() {
@@ -2252,9 +2298,13 @@ mod control_tests {
             assert!(search.winners.is_empty());
             assert!(search.in_progress.is_empty());
             let observed = control.observed.lock().unwrap();
-            assert_eq!(observed.len(), 2);
-            assert_eq!(observed[0], (CompilePhase::Validate, 0));
-            assert!(observed[1].1 > 0 && observed[1].1 < MAX_UNOBSERVED_COMPILE_WORK);
+            assert_eq!(observed.len(), 4);
+            assert!(
+                observed[..3]
+                    .iter()
+                    .all(|event| *event == (CompilePhase::Validate, 0))
+            );
+            assert!(observed[3].1 > 0 && observed[3].1 < MAX_UNOBSERVED_COMPILE_WORK);
             drop(observed);
 
             let empty_control = Control::new(error, 4);
@@ -2303,5 +2353,104 @@ mod control_tests {
                 .iter()
                 .any(|(_, units)| { *units == MAX_UNOBSERVED_COMPILE_WORK })
         );
+    }
+}
+
+#[cfg(test)]
+mod statistics_control_tests {
+    use super::*;
+    use crate::optimizer::memo::{LogicalProperties, MExpr};
+    use crate::optimizer::operator::ValuesOp;
+    use novarocks_type_contract::CompileControlError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Once {
+        remaining: AtomicBool,
+        error: CompileControlError,
+    }
+    impl PureCompileControl for Once {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            if units == 256 && self.remaining.swap(false, Ordering::Relaxed) {
+                Err(self.error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[test]
+    fn search_statistics_control_one_shot_failure_is_not_empty_group_fallback() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = Memo::new();
+            let root = memo.new_group(MExpr {
+                id: 0,
+                op: Operator::LogicalValues(ValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            for id in 1..320 {
+                memo.add_expr_to_group(
+                    root,
+                    MExpr {
+                        id,
+                        op: Operator::LogicalValues(ValuesOp {
+                            rows: vec![],
+                            columns: vec![],
+                        }),
+                        children: vec![],
+                    },
+                );
+            }
+            let control = Once {
+                remaining: AtomicBool::new(true),
+                error,
+            };
+            let stats_input = OptimizerStatsInput::from_test_table_statistics(&HashMap::new());
+            let result = stats_for_group(&memo.groups[root], &memo, &stats_input, &control);
+            assert!(matches!(
+                (result, error),
+                (
+                    Err(SqlCompileError::Cancelled),
+                    CompileControlError::Cancelled
+                ) | (
+                    Err(SqlCompileError::DeadlineExceeded),
+                    CompileControlError::DeadlineExceeded
+                ) | (
+                    Err(SqlCompileError::ResourceExhausted),
+                    CompileControlError::ResourceExhausted
+                )
+            ));
+            control.checkpoint(CompilePhase::Validate, 256).unwrap();
+            assert!(memo.groups[root].logical_props.is_none());
+        }
+    }
+    #[test]
+    fn search_statistics_control_keeps_empty_group_and_cached_statistics_distinct() {
+        let mut memo = Memo::new();
+        let root = memo.new_group(MExpr {
+            id: 0,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        memo.groups[root].logical_exprs.clear();
+        let stats_input = OptimizerStatsInput::from_test_table_statistics(&HashMap::new());
+        let control = crate::optimizer::test_optimizer_control();
+        let empty = stats_for_group(&memo.groups[root], &memo, &stats_input, control).unwrap();
+        assert_eq!(empty.output_row_count, 1.0);
+        assert_eq!(
+            empty.row_count_confidence,
+            crate::optimizer::statistics::Confidence::Fallback
+        );
+        memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 73.0));
+        let cached = stats_for_group(&memo.groups[root], &memo, &stats_input, control).unwrap();
+        assert_eq!(cached.output_row_count, 73.0);
     }
 }

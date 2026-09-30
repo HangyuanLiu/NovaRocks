@@ -26,6 +26,7 @@
 //! predicates.
 
 use crate::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
@@ -391,7 +392,11 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         }
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |mut plan, ctx| {
             let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
                 return Ok(PlanRewriteResult::Unchanged);
@@ -480,7 +485,11 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         }
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |mut plan, ctx| {
             // Diagnostic: the delta base under an unsupported node, if any. Computed
             // up-front from `&plan` so the fail-fast arms can name the offending
@@ -1403,6 +1412,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 4"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1425,6 +1437,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Join must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("delta-pushdown fixpoint"),
             "unexpected error: {err}"
@@ -1451,6 +1466,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1565,6 +1583,9 @@ mod tests {
         let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1773,6 +1794,9 @@ mod tests {
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }

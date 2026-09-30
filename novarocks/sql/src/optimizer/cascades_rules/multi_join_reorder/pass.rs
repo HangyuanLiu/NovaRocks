@@ -26,6 +26,10 @@
 
 use std::collections::HashSet;
 
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+
+use crate::compiler::SqlCompileError;
+
 use crate::common::JoinKind;
 use crate::optimizer::memo::{GroupId, JoinTree, MExpr, Memo};
 use crate::optimizer::operator::{LogicalJoinOp, Operator};
@@ -78,16 +82,38 @@ impl ReorderOptions {
 }
 
 /// Inject multi-candidate join orders into every reorderable inner/cross chain.
+/// The pass owns one counter for its traversals; it observes the caller's
+/// existing policy rather than introducing a separate work or memory allowance.
 pub(crate) fn run_multi_join_reorder(
     memo: &mut Memo,
     opts: &ReorderOptions,
     stats_input: &OptimizerStatsInput,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     // Snapshot the chain roots before injecting, so the new alternative groups
     // (appended at higher indices) are not themselves reprocessed.
-    for root in find_chain_roots(memo) {
-        reorder_chain(memo, root, opts, stats_input);
+    for root in find_chain_roots(memo, &mut work, control)? {
+        work.step()?;
+        reorder_chain(memo, root, opts, stats_input, &mut work, control)?;
     }
+    work.finish()?;
+    Ok(())
+}
+
+// Flattening, order enumeration, operator debug formatting, and memo insertion
+// remain opaque owner operations. Before/after observations do not prove that
+// their internal traversals are cooperative.
+fn observe_opaque<T>(
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+    operation: impl FnOnce() -> T,
+) -> Result<T, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let value = operation();
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    work.step()?;
+    Ok(value)
 }
 
 fn reorder_chain(
@@ -95,34 +121,43 @@ fn reorder_chain(
     root: GroupId,
     opts: &ReorderOptions,
     stats_input: &OptimizerStatsInput,
-) {
-    let Some(graph) = flatten_join_chain(memo, root) else {
-        return;
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let Some(graph) = observe_opaque(work, control, || flatten_join_chain(memo, root))? else {
+        return Ok(());
     };
     let n = graph.atom_count();
     // Small chains stay with JoinAssociativity; oversized chains are skipped.
     if n <= opts.max_reorder_node_use_exhaustive || n > opts.max_reorder_node {
-        return;
+        return Ok(());
     }
     // This chain is reorder-owned: record its join groups so explore's
     // JoinAssociativity skips them and does not re-enumerate the orders we are
     // about to inject (D2: reorder/associativity mutual exclusion).
-    memo.reorder_owned_groups
-        .extend(graph.chain_join_groups.iter().copied());
+    for &group in &graph.chain_join_groups {
+        work.step()?;
+        memo.reorder_owned_groups.insert(group);
+    }
     // Degrade to LeftDeep-only when base statistics are unknown (StarRocks
-    // `Utils.hasUnknownColumnsStats`).
+    // `Utils.hasUnknownColumnsStats`). Preserve the original short circuit.
     let mut caps = opts.caps();
-    if graph
-        .atom_stats
-        .iter()
-        .any(|s| s.row_count_confidence == Confidence::Fallback)
-    {
-        caps.enable_dp = false;
-        caps.enable_greedy = false;
+    for stats in &graph.atom_stats {
+        work.step()?;
+        if stats.row_count_confidence == Confidence::Fallback {
+            caps.enable_dp = false;
+            caps.enable_greedy = false;
+            break;
+        }
     }
-    for tree in enumerate_orders(&graph, caps, &mut memo.scalars) {
-        inject_candidate(memo, root, tree, stats_input);
+    let candidates = observe_opaque(work, control, || {
+        enumerate_orders(&graph, caps, &mut memo.scalars)
+    })?;
+    for tree in candidates {
+        work.step()?;
+        inject_candidate(memo, root, tree, stats_input, work, control)?;
     }
+    Ok(())
 }
 
 /// Materialize a candidate order's sub-trees into the memo and add its root join
@@ -132,58 +167,79 @@ fn inject_candidate(
     root: GroupId,
     tree: JoinTree,
     stats_input: &OptimizerStatsInput,
-) {
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     let JoinTree::Join { left, right, op } = tree else {
-        return; // a reorder candidate over >= 2 atoms is always a join
+        return Ok(()); // a reorder candidate over >= 2 atoms is always a join
     };
-    let left_id = copy_in_join_tree(memo, &left, stats_input);
-    let right_id = copy_in_join_tree(memo, &right, stats_input);
+    let left_id = copy_in_join_tree(memo, &left, stats_input, control)?;
+    let right_id = copy_in_join_tree(memo, &right, stats_input, control)?;
     let new_op = Operator::LogicalJoin(op);
     let children = vec![left_id, right_id];
-    let already_present = memo.groups[root]
-        .logical_exprs
-        .iter()
-        .any(|e| e.children == children && format!("{:?}", e.op) == format!("{new_op:?}"));
-    if already_present {
-        return;
+    for expression in &memo.groups[root].logical_exprs {
+        work.step()?;
+        // Candidate roots always have exactly two ordered children. A different
+        // arity cannot match, so no unbounded vector comparison is needed here.
+        if expression.children.len() == children.len()
+            && expression.children == children
+            && observe_opaque(work, control, || {
+                format!("{:?}", expression.op) == format!("{new_op:?}")
+            })?
+        {
+            return Ok(());
+        }
     }
-    let id = memo.next_expr_id();
-    memo.add_expr_to_group(
-        root,
-        MExpr {
-            id,
-            op: new_op,
-            children,
-        },
-    );
+    let id = crate::optimizer::next_expr_id_observed(memo, work)?;
+    observe_opaque(work, control, || {
+        memo.add_expr_to_group(
+            root,
+            MExpr {
+                id,
+                op: new_op,
+                children,
+            },
+        );
+    })?;
+    Ok(())
 }
 
 /// Chain roots: inner/cross join groups that are not themselves the inner/cross
 /// join child of another inner/cross join. Each maximal chain is reordered once;
 /// chains nested under non-join atoms (e.g. under an aggregate) are still found
 /// because their root is not a join's child.
-fn find_chain_roots(memo: &Memo) -> Vec<GroupId> {
+fn find_chain_roots(
+    memo: &Memo,
+    work: &mut CompileCheckpoints<'_>,
+    _control: &dyn PureCompileControl,
+) -> Result<Vec<GroupId>, SqlCompileError> {
     let mut mid_chain: HashSet<GroupId> = HashSet::new();
     for group in &memo.groups {
+        work.step()?;
         if let Some(expr) = group.logical_exprs.first()
             && is_inner_cross_join_op(&expr.op)
         {
             for &child in &expr.children {
+                work.step()?;
                 if child_is_inner_cross_join(memo, child) {
                     mid_chain.insert(child);
                 }
             }
         }
     }
-    (0..memo.groups.len())
-        .filter(|g| {
-            !mid_chain.contains(g)
-                && memo.groups[*g]
-                    .logical_exprs
-                    .first()
-                    .is_some_and(|e| is_inner_cross_join_op(&e.op))
-        })
-        .collect()
+    let mut roots = Vec::new();
+    for (group_id, group) in memo.groups.iter().enumerate() {
+        work.step()?;
+        if !mid_chain.contains(&group_id)
+            && group
+                .logical_exprs
+                .first()
+                .is_some_and(|e| is_inner_cross_join_op(&e.op))
+        {
+            roots.push(group_id);
+        }
+    }
+    Ok(roots)
 }
 
 fn is_inner_cross_join_op(op: &Operator) -> bool {
@@ -212,6 +268,10 @@ mod tests {
     use crate::optimizer::stats_input::OptimizerStatsInput;
     use crate::planner::optimizer_bridge::scalar::intern_typed;
     use std::collections::HashMap;
+
+    fn test_control() -> &'static dyn PureCompileControl {
+        crate::optimizer::test_optimizer_control()
+    }
 
     fn empty_stats_input() -> OptimizerStatsInput {
         OptimizerStatsInput::from_test_table_statistics(&HashMap::new())
@@ -297,7 +357,7 @@ mod tests {
                 op: inner(memo, eq(col(i as u32), col(i as u32 + 1))),
             };
         }
-        copy_in_join_tree(memo, &tree, &empty_stats_input())
+        copy_in_join_tree(memo, &tree, &empty_stats_input(), test_control()).unwrap()
     }
 
     #[test]
@@ -307,7 +367,13 @@ mod tests {
         let before = memo.groups[root].logical_exprs.len();
         assert_eq!(before, 1, "root starts with the single converted order");
 
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            test_control(),
+        )
+        .unwrap();
 
         let after = memo.groups[root].logical_exprs.len();
         assert!(
@@ -330,7 +396,13 @@ mod tests {
         // join groups are recorded so explore's JoinAssociativity skips them (D2).
         let mut memo = Memo::new();
         let root = build_path_chain(&mut memo, 6, Confidence::Estimated);
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            test_control(),
+        )
+        .unwrap();
         assert!(
             memo.reorder_owned_groups.contains(&root),
             "the chain root must be marked reorder-owned"
@@ -348,7 +420,13 @@ mod tests {
         // must NOT be marked reorder-owned.
         let mut memo = Memo::new();
         build_path_chain(&mut memo, 3, Confidence::Estimated);
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            test_control(),
+        )
+        .unwrap();
         assert!(
             memo.reorder_owned_groups.is_empty(),
             "small chain must not be reorder-owned, got {:?}",
@@ -364,7 +442,13 @@ mod tests {
         let before = memo.groups[root].logical_exprs.len();
         let groups_before = memo.groups.len();
 
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            test_control(),
+        )
+        .unwrap();
 
         assert_eq!(
             memo.groups[root].logical_exprs.len(),
@@ -386,12 +470,253 @@ mod tests {
         let root = build_path_chain(&mut memo, 6, Confidence::Fallback);
         let before = memo.groups[root].logical_exprs.len();
 
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            test_control(),
+        )
+        .unwrap();
 
         let added = memo.groups[root].logical_exprs.len() - before;
         assert!(
             added <= 1,
             "unknown-stats chain should add at most the LeftDeep order, added {added}"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum StopPoint {
+        Entry,
+        Batch,
+        Finish,
+    }
+    struct ObservedControl {
+        units: std::sync::Mutex<Vec<u32>>,
+        stop: Option<(StopPoint, novarocks_type_contract::CompileControlError)>,
+    }
+    impl PureCompileControl for ObservedControl {
+        fn checkpoint(
+            &self,
+            _: CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            let mut observations = self.units.lock().unwrap();
+            observations.push(units);
+            if let Some((point, error)) = self.stop {
+                let stop = match point {
+                    StopPoint::Entry => observations.len() == 1,
+                    StopPoint::Batch => units == 256,
+                    StopPoint::Finish => units > 0 && units < 256,
+                };
+                if stop {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+    }
+    fn observed_control(
+        stop: Option<(StopPoint, novarocks_type_contract::CompileControlError)>,
+    ) -> ObservedControl {
+        ObservedControl {
+            units: Default::default(),
+            stop,
+        }
+    }
+    fn wide_leaf_memo() -> Memo {
+        let mut memo = Memo::new();
+        for column in 1..=320 {
+            leaf(&mut memo, column, 100.0, Confidence::Estimated);
+        }
+        memo
+    }
+    #[test]
+    fn pass_observes_both_real_group_scans_and_final_pending_work() {
+        let mut memo = wide_leaf_memo();
+        let control = observed_control(None);
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 256, 256, 128]);
+        assert_eq!(memo.groups.len(), 320);
+        assert!(memo.reorder_owned_groups.is_empty());
+    }
+    #[test]
+    fn pass_keeps_three_typed_controls_at_entry_mid_scan_and_finish() {
+        use novarocks_type_contract::CompileControlError as Error;
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            for point in [StopPoint::Entry, StopPoint::Batch, StopPoint::Finish] {
+                let control = observed_control(Some((point, error)));
+                let mut memo = wide_leaf_memo();
+                let failure = run_multi_join_reorder(
+                    &mut memo,
+                    &ReorderOptions::default(),
+                    &empty_stats_input(),
+                    &control,
+                )
+                .unwrap_err();
+                assert_eq!(failure, SqlCompileError::from(error));
+                let units = control.units.lock().unwrap();
+                assert!(units.iter().all(|units| *units <= 256));
+                match point {
+                    StopPoint::Entry => assert_eq!(*units, vec![0]),
+                    StopPoint::Batch => assert_eq!(*units, vec![0, 256]),
+                    StopPoint::Finish => assert_eq!(*units, vec![0, 256, 256, 128]),
+                }
+            }
+        }
+    }
+    #[test]
+    fn roots_preserve_real_ordered_edges_and_non_inner_parent_boundary() {
+        let mut memo = Memo::new();
+        let first = build_path_chain(&mut memo, 3, Confidence::Estimated);
+        let second = build_path_chain(&mut memo, 6, Confidence::Estimated);
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::LeftOuter,
+                condition: None,
+            }),
+            children: vec![first, second],
+        });
+        let control = observed_control(None);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let roots = find_chain_roots(&memo, &mut work, &control).unwrap();
+        work.finish().unwrap();
+        // The outer join is a strong chain boundary. Each inner maximal chain
+        // remains a root, in the same ascending actual group order.
+        assert_eq!(roots, vec![first, second]);
+        let edge_count = memo
+            .groups
+            .iter()
+            .filter_map(|group| group.logical_exprs.first())
+            .filter(|expression| is_inner_cross_join_op(&expression.op))
+            .map(|expression| expression.children.len())
+            .sum::<usize>();
+        assert_eq!(
+            control.units.lock().unwrap().iter().sum::<u32>() as usize,
+            memo.groups.len() * 2 + edge_count
+        );
+    }
+    fn candidate_comparison_fixture() -> (Memo, GroupId, JoinTree) {
+        let mut memo = Memo::new();
+        let left = leaf(&mut memo, 1, 100.0, Confidence::Estimated);
+        let right = leaf(&mut memo, 2, 100.0, Confidence::Estimated);
+        // INNER without a predicate and CROSS are equivalent here. The memo
+        // has many actual alternatives before the exact INNER candidate.
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            children: vec![left, right],
+        });
+        for _ in 1..320 {
+            let id = memo.next_expr_id();
+            memo.groups[root].logical_exprs.push(MExpr {
+                id,
+                op: Operator::LogicalJoin(LogicalJoinOp {
+                    join_type: JoinKind::Cross,
+                    condition: None,
+                }),
+                children: vec![left, right],
+            });
+        }
+        let op = LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        };
+        let id = memo.next_expr_id();
+        memo.groups[root].logical_exprs.push(MExpr {
+            id,
+            op: Operator::LogicalJoin(op.clone()),
+            children: vec![left, right],
+        });
+        let candidate = JoinTree::Join {
+            left: Box::new(JoinTree::Leaf(left)),
+            right: Box::new(JoinTree::Leaf(right)),
+            op,
+        };
+        (memo, root, candidate)
+    }
+    #[test]
+    fn candidate_dedup_compares_actual_alternatives_cooperatively() {
+        use novarocks_type_contract::CompileControlError as Error;
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            let (mut memo, root, candidate) = candidate_comparison_fixture();
+            let control = observed_control(Some((StopPoint::Batch, error)));
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let failure = inject_candidate(
+                &mut memo,
+                root,
+                candidate,
+                &empty_stats_input(),
+                &mut work,
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(failure, SqlCompileError::from(error));
+            assert!(control.units.lock().unwrap().contains(&256));
+            assert_eq!(memo.groups.len(), 3);
+            assert_eq!(memo.groups[root].logical_exprs.len(), 321);
+        }
+        let (mut memo, root, candidate) = candidate_comparison_fixture();
+        let control = observed_control(None);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        inject_candidate(
+            &mut memo,
+            root,
+            candidate,
+            &empty_stats_input(),
+            &mut work,
+            &control,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        assert_eq!(
+            memo.groups[root].logical_exprs.len(),
+            321,
+            "the last exact candidate is reused"
+        );
+        assert_eq!(memo.groups.len(), 3);
+        assert!(
+            control
+                .units
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|units| *units <= 256)
+        );
+    }
+    #[test]
+    fn empty_pass_observes_entry_and_finish_and_memo_does_not_retain_control() {
+        let mut memo = Memo::new();
+        let control = std::sync::Arc::new(observed_control(None));
+        let weak = std::sync::Arc::downgrade(&control);
+        run_multi_join_reorder(
+            &mut memo,
+            &ReorderOptions::default(),
+            &empty_stats_input(),
+            control.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 0]);
+        drop(control);
+        assert!(weak.upgrade().is_none());
+        assert!(memo.groups.is_empty());
     }
 }

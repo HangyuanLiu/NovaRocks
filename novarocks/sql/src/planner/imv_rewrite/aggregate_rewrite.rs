@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 use std::collections::HashSet;
 
@@ -88,7 +89,11 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -3090,6 +3095,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("empty GROUP BY must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV aggregate rewrite requires at least one GROUP BY key"
@@ -3110,6 +3118,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("distinct aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV aggregate rewrite does not support SELECT DISTINCT"
@@ -3935,6 +3946,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("state column count mismatch must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("aggregate state column count"),
             "unexpected error: {err}"
@@ -3956,6 +3970,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("non-binary state column must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("must have binary type signature"),
             "unexpected error: {err}"
@@ -3974,6 +3991,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("missing hidden retraction count state must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("requires a retraction-count or COUNT(*) state column"),
             "unexpected error: {err}"

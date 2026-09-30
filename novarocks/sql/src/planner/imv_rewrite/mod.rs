@@ -61,7 +61,7 @@ pub(crate) fn bridge_apply_result<F>(
     expr: crate::optimizer::opt_expr::OptExpr,
     ctx: &crate::optimizer::rewrite::context::RewriteContext,
     f: F,
-) -> Result<crate::optimizer::rewrite::result::RewriteResult, String>
+) -> Result<crate::optimizer::rewrite::result::RewriteResult, crate::compiler::SqlCompileError>
 where
     F: FnOnce(
         crate::planner::logical::LogicalPlanNode,
@@ -69,7 +69,7 @@ where
     ) -> Result<PlanRewriteResult, String>,
 {
     let plan = opt_expr_to_plan(expr, ctx);
-    let result = f(plan, ctx)?;
+    let result = f(plan, ctx).map_err(crate::compiler::SqlCompileError::Compilation)?;
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {
@@ -94,7 +94,7 @@ pub(crate) fn bridge_apply_result_mut<F>(
     expr: crate::optimizer::opt_expr::OptExpr,
     ctx: &mut crate::optimizer::rewrite::context::RewriteContext,
     f: F,
-) -> Result<crate::optimizer::rewrite::result::RewriteResult, String>
+) -> Result<crate::optimizer::rewrite::result::RewriteResult, crate::compiler::SqlCompileError>
 where
     F: FnOnce(
         crate::planner::logical::LogicalPlanNode,
@@ -102,7 +102,7 @@ where
     ) -> Result<PlanRewriteResult, String>,
 {
     let plan = opt_expr_to_plan(expr, ctx);
-    let result = f(plan, ctx)?;
+    let result = f(plan, ctx).map_err(crate::compiler::SqlCompileError::Compilation)?;
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {

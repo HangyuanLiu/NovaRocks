@@ -22,6 +22,7 @@
 //! sink reads this column by name to locate target rows for DELETE. Fires once
 //! at the root; idempotent.
 
+use crate::compiler::SqlCompileError;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -158,7 +159,11 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         root_row_id_ref(&plan).is_some() && !output_has_apply_key(&plan)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let Some((row_id_col, row_id_name, row_id_type, row_id_nullable)) =
@@ -465,6 +470,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("non-Project root must fail fast");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("expected root Project"),
             "unexpected error: {err}"

@@ -30,6 +30,7 @@
 //! `Cast(Literal)` has already collapsed into a bare literal by the time
 //! static-predicate extraction inspects the plan.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
@@ -179,7 +180,11 @@ impl LogicalRewriteRule for FoldConstant {
         ctx.constant_evaluator().is_some() && operator_has_scalars(&expr.op)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let Some(evaluator) = ctx.constant_evaluator() else {
             return Ok(RewriteResult::Unchanged);
         };

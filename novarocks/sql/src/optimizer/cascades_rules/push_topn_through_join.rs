@@ -968,7 +968,12 @@ mod tests {
             has_physical_hash_join_with_pushed_preserved_topn(&memo),
             "pushed join must stay hash-join implementable before post-explore stats derivation"
         );
-        crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
+        crate::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &stats_input,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let required = PhysicalPropertySet::gather();
         let mut ctx = crate::optimizer::search::SearchContext::new_with_options_for_test(

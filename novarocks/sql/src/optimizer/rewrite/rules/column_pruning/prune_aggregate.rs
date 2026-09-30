@@ -22,6 +22,7 @@
 //! aggregate calls by ColumnId while preserving the complete group-key layout
 //! needed by physical property derivation and codegen.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -52,7 +53,11 @@ impl LogicalRewriteRule for PruneAggregateColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -69,7 +74,8 @@ impl LogicalRewriteRule for PruneAggregateColumns {
 
         node.output_layout
             .validate_aggregate_calls(&node.aggregates, node.is_merge.len())
-            .map_err(|err| format!("PruneAggregateColumns {err}"))?;
+            .map_err(|err| format!("PruneAggregateColumns {err}"))
+            .map_err(SqlCompileError::Compilation)?;
 
         let original_output_ids = node
             .output_columns
@@ -95,10 +101,10 @@ impl LogicalRewriteRule for PruneAggregateColumns {
             .zip(node.output_layout.aggregate_columns.into_iter())
         {
             if aggregate.output_column_id != layout_column.column_id {
-                return Err(format!(
+                return Err(SqlCompileError::Compilation(format!(
                     "aggregate output layout mismatch: spec id {} != layout id {}",
                     aggregate.output_column_id.0, layout_column.column_id.0
-                ));
+                )));
             }
             if needed.contains(&aggregate.output_column_id) {
                 retained_aggregate_columns.push(layout_column);
@@ -122,7 +128,8 @@ impl LogicalRewriteRule for PruneAggregateColumns {
                 .or_else(|| node.output_layout.aggregate_columns.first())
                 .ok_or_else(|| {
                     "AggregateOutputLayout must expose at least one fallback output".to_string()
-                })?
+                })
+                .map_err(SqlCompileError::Compilation)?
                 .clone();
             node.output_columns.push(fallback);
         }
@@ -401,6 +408,9 @@ mod tests {
         expr.required_output_columns = Some(needed);
 
         let err = PruneAggregateColumns.apply(expr, &mut ctx()).unwrap_err();
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("aggregate output layout mismatch"));
     }
 

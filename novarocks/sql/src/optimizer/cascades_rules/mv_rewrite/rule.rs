@@ -770,7 +770,12 @@ mod tests {
             &mut memo.scalars,
         )
         .expect("logical plan to opt expr");
-        crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
+        crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn spjg_descriptor_for_test(plan: &LogicalPlanNode) -> (SpjgDescriptor, ScalarArena) {

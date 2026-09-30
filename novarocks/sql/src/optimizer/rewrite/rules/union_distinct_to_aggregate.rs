@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::logical_props::make_column_ref_expr;
 use crate::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp, Operator, UnionOp};
 use crate::optimizer::opt_expr::OptExpr;
@@ -46,7 +47,11 @@ impl LogicalRewriteRule for UnionDistinctToAggregate {
         matches!(&expr.op, Operator::LogicalUnion(op) if !op.all)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,

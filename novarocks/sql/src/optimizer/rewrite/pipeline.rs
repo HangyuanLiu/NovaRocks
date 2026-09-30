@@ -153,6 +153,7 @@ impl RewritePipeline {
 
 #[cfg(test)]
 mod tests {
+    use crate::compiler::SqlCompileError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -187,7 +188,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Unchanged)
         }
     }
@@ -211,8 +212,8 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
-            Err("boom".to_string())
+        ) -> Result<RewriteResult, SqlCompileError> {
+            Err(SqlCompileError::Compilation("boom".to_string()))
         }
     }
 
@@ -235,7 +236,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
                 self.name(),
                 "not supported",
@@ -262,7 +263,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Changed(OptExpr::new(
                 Operator::LogicalGenerateSeries(GenerateSeriesOp {
                     start: 1,
@@ -296,7 +297,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Changed(empty_values_plan()))
         }
     }
@@ -565,7 +566,11 @@ mod tests {
             fn matches(&self, _: &OptExpr, _: &RewriteContext) -> bool {
                 true
             }
-            fn apply(&self, _: OptExpr, _: &mut RewriteContext) -> Result<RewriteResult, String> {
+            fn apply(
+                &self,
+                _: OptExpr,
+                _: &mut RewriteContext,
+            ) -> Result<RewriteResult, SqlCompileError> {
                 self.0.stopped.store(true, Ordering::SeqCst);
                 Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
                     self.name(),

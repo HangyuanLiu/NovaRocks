@@ -1623,7 +1623,12 @@ mod tests {
             &mut memo.scalars,
         )
         .expect("logical plan to opt expr");
-        let root = crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, &mut memo);
+        let root = crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            &mut memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let root_expr = memo.groups[root].logical_exprs[0].clone();
         (memo, root_expr)
     }
@@ -1807,7 +1812,12 @@ mod tests {
             &mut memo.scalars,
         )
         .expect("logical plan to opt expr");
-        let scan_gid = crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, &mut memo);
+        let scan_gid = crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            &mut memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);
         let aggregates = intern_aggregate_calls(
             &mut memo.scalars,

@@ -25,6 +25,7 @@
 //! here unless an earlier rewrite consumed them. Join is handled by
 //! `RewriteJoinDeltaRule` in the same stage's fixpoint.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -66,7 +67,11 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, _ctx| apply_plan(plan))
     }
 }
@@ -389,6 +394,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
             "unexpected error: {err}"
@@ -419,6 +427,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("Iceberg IMV rewrite does not support this union shape"),
             "unexpected error: {err}"
@@ -501,6 +512,9 @@ mod tests {
         let err = rule
             .apply(nested_expr, &mut ctx)
             .expect_err("aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
             "got: {err}"

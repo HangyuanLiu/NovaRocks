@@ -22,6 +22,7 @@
 //! auto-fill placeholder item (`const 1 AS auto_fill_<id>`) is inserted using
 //! a freshly minted ColumnId from the ColumnRefFactory in context (Gap 2).
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
@@ -80,7 +81,11 @@ impl LogicalRewriteRule for PruneProjectColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,

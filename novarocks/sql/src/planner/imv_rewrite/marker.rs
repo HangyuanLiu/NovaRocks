@@ -22,6 +22,7 @@
 //! stage of the IMV pipeline wraps the root; the `imv-validation` stage
 //! rejects any plan that still carries a marker afterwards.
 
+use crate::compiler::SqlCompileError;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::optimizer::operator::{ImvDeltaOp, Operator};
@@ -93,7 +94,11 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.wrapped.store(true, Ordering::SeqCst);
         Ok(RewriteResult::Changed(OptExpr::new(
             Operator::LogicalImvDelta(ImvDeltaOp {
@@ -135,7 +140,11 @@ impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
         plan_contains_imv_marker(&plan)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let plan = opt_expr_to_plan(expr, ctx);
         let markers = collect_marker_kinds(&plan);
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(

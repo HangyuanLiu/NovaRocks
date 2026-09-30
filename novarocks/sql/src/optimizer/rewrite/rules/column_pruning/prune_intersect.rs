@@ -21,6 +21,7 @@
 //! in row equality. Column pruning cannot remove set-key positions even when
 //! the parent only needs row existence (for example `COUNT(*)` over the set).
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -51,7 +52,11 @@ impl LogicalRewriteRule for PruneIntersectColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let Operator::LogicalIntersect(_) = expr.op else {
             unreachable!()
         };

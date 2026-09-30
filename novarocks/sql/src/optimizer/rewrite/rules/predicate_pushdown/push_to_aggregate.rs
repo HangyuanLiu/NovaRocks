@@ -28,6 +28,7 @@
 //!
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -74,7 +75,11 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         !aggregate_child_is_repeat(input.unary_input())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,

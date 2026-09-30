@@ -21,6 +21,7 @@
 //! derivation operate directly on memo-owned `ScalarId`s, and tree construction
 //! remains local to the `OptExpr` rewrite path.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -63,7 +64,11 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
             || matches!(&expr.op, Operator::LogicalJoin(join) if join.condition.is_some())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
         let throws = match &expr.op {

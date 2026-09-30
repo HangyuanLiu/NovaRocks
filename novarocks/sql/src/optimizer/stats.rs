@@ -21,6 +21,8 @@
 //! Memo operators (`MExpr`) and reads child statistics from group logical
 //! properties instead of recursing the `LogicalPlanNode` tree.
 
+use crate::compiler::SqlCompileError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use std::collections::HashMap;
 
 use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
@@ -666,13 +668,18 @@ pub(crate) fn derive_opt_expr_statistics(
     expr: &OptExpr,
     arena: &ScalarArena,
     stats_input: &OptimizerStatsInput,
-) -> Statistics {
+    control: &dyn PureCompileControl,
+) -> Result<Statistics, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     let mut memo = Memo::new();
-    // Donate a clone of the caller's arena so the memo can materialize scalars.
+    // The arena clone remains opaque; this is observation around the existing
+    // operation, not a claim of cooperative work inside its allocations.
     memo.scalars = arena.clone();
-    let root_group = super::memo_copy::opt_expr_to_memo(expr, &mut memo);
-    derive_group_statistics(&mut memo, stats_input);
-    memo.groups
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let root_group = super::memo_copy::opt_expr_to_memo(expr, &mut memo, control)?;
+    derive_group_statistics(&mut memo, stats_input, control)?;
+    let result = memo
+        .groups
         .get(root_group)
         .and_then(|group| group.logical_props.as_ref())
         .map(|props| Statistics {
@@ -684,7 +691,9 @@ pub(crate) fn derive_opt_expr_statistics(
             output_row_count: 1.0,
             row_count_confidence: Confidence::Fallback,
             column_statistics: HashMap::new(),
-        })
+        });
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(result)
 }
 
 const DEFAULT_EXPR_NDV: f64 = 10.0;
@@ -1048,8 +1057,14 @@ fn aggregate_group_column_statistics_scalar(
 /// before their parents, group 0 is the deepest leaf and the last group
 /// is the root. This guarantees that all child groups have their
 /// `logical_props` set before any parent group is processed.
-pub(crate) fn derive_group_statistics(memo: &mut Memo, stats_input: &OptimizerStatsInput) {
+pub(crate) fn derive_group_statistics(
+    memo: &mut Memo,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     for group_idx in 0..memo.groups.len() {
+        work.step()?;
         // Memoized derive: a group's logical_props are computed exactly once,
         // when first needed (StarRocks isStatsDerived semantics). Under the
         // per-group argmax collapse (`pick_group_representative`), a group's
@@ -1080,8 +1095,12 @@ pub(crate) fn derive_group_statistics(memo: &mut Memo, stats_input: &OptimizerSt
         if memo.groups[group_idx].logical_props.is_some() {
             continue;
         }
-        derive_group_statistics_for(memo, group_idx, stats_input);
+        let candidate = derive_group_candidate(memo, group_idx, stats_input, control, &mut work)?;
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        memo.groups[group_idx].logical_props = Some(candidate);
     }
+    work.finish()?;
+    Ok(())
 }
 
 /// Derive and store [`super::memo::LogicalProperties`] for a single group. The
@@ -1102,7 +1121,26 @@ pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
     stats_input: &OptimizerStatsInput,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let candidate = derive_group_candidate(memo, group_idx, stats_input, control, &mut work)?;
+    // Retain the previously published properties on every failure, including
+    // an interruption while observing a short candidate's final work batch.
+    work.finish()?;
+    memo.groups[group_idx].logical_props = Some(candidate);
+    Ok(())
+}
+
+fn derive_group_candidate(
+    memo: &Memo,
+    group_idx: usize,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<super::memo::LogicalProperties, SqlCompileError> {
+    work.step()?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
     // Output columns are a group-level invariant: all members of a memo group
     // are logically equivalent and expose the identical output columns, so
     // picking them via `first()` here is consistent with the argmax-chosen
@@ -1117,27 +1155,33 @@ pub(crate) fn derive_group_statistics_for(
     // `derive_for_expr` with the chosen member; `derive_for_group` would re-pick
     // `first()` internally and break member-consistency when argmax selects a
     // non-first member.
-    if let Some((chosen, stats)) = pick_group_representative(memo, group_idx, stats_input) {
-        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_expr(
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let candidate = if let Some((chosen, stats)) =
+        pick_group_representative_observed(memo, group_idx, stats_input, control, work)?
+    {
+        super::logical_props::derive_for_expr(
             &chosen,
             memo,
             output_columns,
             stats.output_row_count,
             stats.row_count_confidence,
             stats.column_statistics,
-        ));
+        )
     } else {
         // Empty group: keep today's behavior — default statistics plus
         // `derive_for_group`, which handles the no-member case correctly.
-        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
+        super::logical_props::derive_for_group(
             memo,
             group_idx,
             output_columns,
             1.0,
             Confidence::Fallback,
             HashMap::new(),
-        ));
-    }
+        )
+    };
+    // Structural-property derivation is still an opaque existing helper.
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(candidate)
 }
 
 /// Pick a group's representative member by source-confidence argmax:
@@ -1158,60 +1202,104 @@ pub(crate) fn pick_group_representative(
     memo: &Memo,
     group_idx: usize,
     stats_input: &OptimizerStatsInput,
-) -> Option<(MExpr, Statistics)> {
-    // Build the member list as logical_exprs then physical_exprs. Cloning each
-    // member releases the borrow on `memo.groups[..]`, so we can pass `memo`
-    // immutably to `derive_statistics` below.
-    let members: Vec<MExpr> = {
-        let group = &memo.groups[group_idx];
-        group
-            .logical_exprs
-            .iter()
-            .chain(group.physical_exprs.iter())
-            .cloned()
-            .collect()
-    };
-
-    let mut iter = members.into_iter();
-    let first = iter.next()?;
-    let first_stats = derive_statistics(&first, memo, stats_input);
-    let first_key = first_stats.row_count_confidence;
-    let mut best = (first, first_stats, first_key);
-
-    for cand in iter {
-        let cand_stats = derive_statistics(&cand, memo, stats_input);
-        let cand_key = cand_stats.row_count_confidence;
-        // Strict-greater replacement: replace only on a strict improvement so
-        // ties keep the lower index (canonical-first / zero-regression).
-        let replace = cand_key > best.2
-            || (cand_key == best.2
-                && inner_join_conjunct_count(&cand.op, &memo.scalars)
-                    .zip(inner_join_conjunct_count(&best.0.op, &memo.scalars))
-                    .is_some_and(|(cand_conj, best_conj)| cand_conj < best_conj));
-        if replace {
-            best = (cand, cand_stats, cand_key);
-        }
-    }
-
-    Some((best.0, best.1))
+    control: &dyn PureCompileControl,
+) -> Result<Option<(MExpr, Statistics)>, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result =
+        pick_group_representative_observed(memo, group_idx, stats_input, control, &mut work)?;
+    work.finish()?;
+    Ok(result)
 }
 
-/// Conjunct count of an INNER `LogicalJoin`'s condition (an AND-tree split into
-/// conjuncts), used as the FFewerConj sub-tie-break. Returns `None` for any
-/// operator that is not an inner LogicalJoin, so the tie-break only fires when
-/// BOTH tied members are inner joins (GPORCA FFewerConj semantics).
-fn inner_join_conjunct_count(op: &Operator, scalars: &ScalarArena) -> Option<usize> {
-    match op {
-        Operator::LogicalJoin(join) if join.join_type == JoinKind::Inner => match join.condition {
-            Some(sid) => {
-                let mut conjuncts = Vec::new();
-                flatten_and_scalar(scalars, sid, &mut conjuncts);
-                Some(conjuncts.len())
+fn pick_group_representative_observed(
+    memo: &Memo,
+    group_idx: usize,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(MExpr, Statistics)>, SqlCompileError> {
+    let group = &memo.groups[group_idx];
+    let mut best: Option<(&MExpr, Statistics)> = None;
+    // Visit the original members directly in the same canonical order. Avoid
+    // cloning an entire member list before the first bounded observation.
+    for cand in group
+        .logical_exprs
+        .iter()
+        .chain(group.physical_exprs.iter())
+    {
+        work.step()?;
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        let cand_stats = derive_statistics(cand, memo, stats_input);
+        // Existing per-expression statistics still contain opaque helpers.
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        let replace = match &best {
+            None => true,
+            Some((incumbent, incumbent_stats)) => {
+                let cand_key = cand_stats.row_count_confidence;
+                let best_key = incumbent_stats.row_count_confidence;
+                if cand_key > best_key {
+                    true
+                } else if cand_key == best_key {
+                    inner_join_conjunct_count(&cand.op, &memo.scalars, work)?
+                        .zip(inner_join_conjunct_count(
+                            &incumbent.op,
+                            &memo.scalars,
+                            work,
+                        )?)
+                        .is_some_and(|(cand_conj, best_conj)| cand_conj < best_conj)
+                } else {
+                    false
+                }
             }
-            None => Some(0),
-        },
-        _ => None,
+        };
+        if replace {
+            best = Some((cand, cand_stats));
+        }
     }
+    let result = best.map(|(expr, stats)| (expr.clone(), stats));
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(result)
+}
+
+/// Count real scalar conjuncts in an inner join, preserving the original
+/// source-confidence tie break without a temporary flattened predicate list.
+fn inner_join_conjunct_count(
+    op: &Operator,
+    scalars: &ScalarArena,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<usize>, SqlCompileError> {
+    let Operator::LogicalJoin(join) = op else {
+        return Ok(None);
+    };
+    if join.join_type != JoinKind::Inner {
+        return Ok(None);
+    }
+    let Some(root) = join.condition else {
+        return Ok(Some(0));
+    };
+    let mut stack = vec![root];
+    let mut count = 0usize;
+    while let Some(id) = stack.pop() {
+        work.step()?;
+        match scalars.node(id) {
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left,
+                right,
+                ..
+            } => {
+                stack.push(*right);
+                stack.push(*left);
+            }
+            ScalarNode::Nested(inner) => stack.push(*inner),
+            _ => {
+                count = count
+                    .checked_add(1)
+                    .ok_or(SqlCompileError::ResourceExhausted)?
+            }
+        }
+    }
+    Ok(Some(count))
 }
 
 /// Materialize a [`JoinTree`] candidate order bottom-up into the memo, returning
@@ -1223,23 +1311,40 @@ pub(crate) fn copy_in_join_tree(
     memo: &mut Memo,
     tree: &JoinTree,
     stats_input: &OptimizerStatsInput,
-) -> GroupId {
+    control: &dyn PureCompileControl,
+) -> Result<GroupId, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let group = copy_in_join_tree_observed(memo, tree, stats_input, control, &mut work)?;
+    work.finish()?;
+    Ok(group)
+}
+
+fn copy_in_join_tree_observed(
+    memo: &mut Memo,
+    tree: &JoinTree,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<GroupId, SqlCompileError> {
+    work.step()?;
     match tree {
-        JoinTree::Leaf(group_id) => *group_id,
+        JoinTree::Leaf(group_id) => Ok(*group_id),
         JoinTree::Join { left, right, op } => {
             // Recurse children first so child group ids are always allocated
             // before the parent (the bottom-up invariant M2 relies on).
-            let left_id = copy_in_join_tree(memo, left, stats_input);
-            let right_id = copy_in_join_tree(memo, right, stats_input);
+            let left_id = copy_in_join_tree_observed(memo, left, stats_input, control, work)?;
+            let right_id = copy_in_join_tree_observed(memo, right, stats_input, control, work)?;
             let operator = Operator::LogicalJoin(op.clone());
             // Dedup: reuse an existing group for the same operator + child
             // groups, so candidates sharing intermediate sub-joins do not mint
             // duplicate groups.
+            control.checkpoint(CompilePhase::Validate, 0)?;
             let key = (format!("{operator:?}"), vec![left_id, right_id]);
+            control.checkpoint(CompilePhase::Validate, 0)?;
             if let Some(&existing) = memo.join_group_index.get(&key) {
-                return existing;
+                return Ok(existing);
             }
-            let id = memo.next_expr_id();
+            let id = super::next_expr_id_observed(memo, work)?;
             let group_id = memo.new_group(MExpr {
                 id,
                 op: operator,
@@ -1252,9 +1357,9 @@ pub(crate) fn copy_in_join_tree(
             // Stamp statistics immediately: implement() runs before the bulk
             // re-derive (mod.rs), and JoinToHashJoin reads child column ids from
             // logical_props — without this a bushy join degrades to NestLoop (M1).
-            derive_group_statistics_for(memo, group_id, stats_input);
+            derive_group_statistics_for(memo, group_id, stats_input, control)?;
             memo.join_group_index.insert(key, group_id);
-            group_id
+            Ok(group_id)
         }
     }
 }
@@ -2495,7 +2600,12 @@ mod tests {
         )
         .expect("logical plan to opt expr");
         bind_test_scan_refs(&mut opt_expr);
-        crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
+        crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn bind_test_scan_refs(expr: &mut OptExpr) {
@@ -2782,7 +2892,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Neutral fallback rows = 100000; unknown-column eq selectivity
         // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
@@ -2798,7 +2913,13 @@ mod tests {
         for table_name in ["store_sales", "tiny_dim"] {
             let stats_ref = StatsRef::new(42);
             let scan = bound_scan_opt_expr(table_name, &["k"], stats_ref);
-            let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+            let stats = derive_opt_expr_statistics(
+                &scan,
+                &ScalarArena::new(),
+                &stats_input,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
 
             assert!((stats.output_row_count - MISSING_BASE_ROW_COUNT_FALLBACK).abs() < 1.0);
             assert_eq!(stats.row_count_confidence, Confidence::Fallback);
@@ -2824,7 +2945,13 @@ mod tests {
         );
         let scan = bound_scan_opt_expr("misleading_sales_table", &["k"], stats_ref);
         let stats_input = OptimizerStatsInput::from_query_stats(&snapshot);
-        let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+        let stats = derive_opt_expr_statistics(
+            &scan,
+            &ScalarArena::new(),
+            &stats_input,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!((stats.output_row_count - 2.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -2849,7 +2976,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -2878,7 +3010,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -2895,7 +3032,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count, 1.0);
@@ -3976,7 +4118,12 @@ mod tests {
         let plan = scan_plan("orders", &["id"]);
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -4000,7 +4147,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Scan group (0): 10000 rows
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -4911,7 +5063,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Join group should have stats derived.
         let join_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -4946,7 +5103,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
         // so output = min(5, 100000) = 5.
@@ -4972,7 +5134,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((limit_props.row_count - 10.0).abs() < 0.01);
@@ -5026,7 +5193,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Group 0: Scan (250000 rows from table stats)
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -5276,7 +5448,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Group 2: CTEConsume — must now carry the producer's column statistics.
         let consume_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -5317,7 +5494,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &empty_stats_input());
+        derive_group_statistics(
+            &mut memo,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
@@ -5501,7 +5683,13 @@ mod tests {
         let tree = abc_join_tree(a, b, c);
 
         let groups_before = memo.groups.len();
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Two new groups materialized: (A join B) and the root.
         assert_eq!(memo.groups.len(), groups_before + 2);
@@ -5527,11 +5715,23 @@ mod tests {
         let c = join_leaf_group(&mut memo, 3, 50.0, 500.0);
         let tree = abc_join_tree(a, b, c);
 
-        let r1 = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let r1 = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let after_first = memo.groups.len();
         // Re-materializing the identical tree reuses every group: same root,
         // zero new groups (dedup via join_group_index).
-        let r2 = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let r2 = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_eq!(r1, r2, "identical tree must dedup to the same root group");
         assert_eq!(
             memo.groups.len(),
@@ -5569,7 +5769,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &empty_stats_input());
+        derive_group_statistics(
+            &mut memo,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[1].logical_props.as_ref().unwrap();
         assert_eq!(props.output_columns.len(), 1);
@@ -5669,7 +5874,12 @@ mod tests {
         });
         assert!(memo.groups[group_b].logical_props.is_none());
 
-        derive_group_statistics(&mut memo, &empty_stats_input());
+        derive_group_statistics(
+            &mut memo,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Group A was memoized/skipped — sentinel preserved (NOT recomputed to 0).
         assert_eq!(
@@ -5738,9 +5948,14 @@ mod tests {
         );
 
         // argmax must pick the Exact member (index 1), not first().
-        let (chosen, stats) =
-            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
-                .expect("non-empty group");
+        let (chosen, stats) = pick_group_representative(
+            &memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .expect("non-empty group");
         assert_eq!(
             stats.row_count_confidence,
             Confidence::Exact,
@@ -5757,7 +5972,13 @@ mod tests {
         );
 
         // The cached logical_props (Site 1) must reflect the same argmax pick.
-        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics_for(
+            &mut memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let props = memo.groups[group].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count_confidence, Confidence::Exact);
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -5779,9 +6000,14 @@ mod tests {
         let group = memo.new_group(scan_mexpr("eq_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("eq_tbl", "b"));
 
-        let (chosen, _) =
-            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
-                .expect("non-empty group");
+        let (chosen, _) = pick_group_representative(
+            &memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .expect("non-empty group");
         // Lowest index wins the tie → the "a" scan (logical_exprs[0]).
         assert!(
             matches!(&chosen.op, Operator::LogicalScan(s)
@@ -5807,7 +6033,13 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("consistent_tbl", "a"));
 
-        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics_for(
+            &mut memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let props = memo.groups[group].logical_props.as_ref().unwrap();
 
         // Row-level props come from the argmax (Exact) member.
@@ -5914,9 +6146,14 @@ mod tests {
             },
         );
 
-        let (chosen, _) =
-            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
-                .expect("non-empty group");
+        let (chosen, _) = pick_group_representative(
+            &memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .expect("non-empty group");
         match &chosen.op {
             Operator::LogicalJoin(j) => {
                 let sid = j.condition.expect("join has a condition");
@@ -5955,7 +6192,12 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
 
         // ── Step 2: derive via the bulk pass (first derivation). ──────────
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // The group now has cached props — single member is Fallback.
         let props = memo.groups[group]
@@ -5975,7 +6217,12 @@ mod tests {
 
         // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
         // The guard sees `logical_props.is_some()` and does not re-run argmax.
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let props_after_bulk = memo.groups[group]
             .logical_props
             .as_ref()
@@ -5989,7 +6236,13 @@ mod tests {
 
         // ── Step 5: fix — eager re-derive via derive_group_statistics_for. ─
         // This is what a real producer MUST call at append time.
-        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics_for(
+            &mut memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props_after_eager = memo.groups[group]
             .logical_props
@@ -6221,6 +6474,195 @@ mod sort_partition_limit_tests {
         assert!(
             (result - 50.0).abs() < 1e-9,
             "expected 50.0 with default NDV, got {result}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::optimizer::memo::LogicalProperties;
+    use crate::optimizer::operator::ValuesOp;
+    use novarocks_type_contract::CompileControlError;
+    use std::sync::Mutex;
+
+    struct Control {
+        units: Mutex<Vec<u32>>,
+        fail: Option<CompileControlError>,
+        trigger: u32,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            self.units.lock().unwrap().push(units);
+            if units == self.trigger {
+                self.fail.map_or(Ok(()), Err)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn owner(trigger: u32, fail: Option<CompileControlError>) -> Control {
+        Control {
+            units: Mutex::new(vec![]),
+            fail,
+            trigger,
+        }
+    }
+    fn input() -> OptimizerStatsInput {
+        OptimizerStatsInput::from_test_table_statistics(&HashMap::new())
+    }
+    fn values(id: usize, rows: usize) -> MExpr {
+        MExpr {
+            id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![vec![]; rows],
+                columns: vec![],
+            }),
+            children: vec![],
+        }
+    }
+    fn assert_class(error: SqlCompileError, expected: CompileControlError) {
+        assert!(matches!(
+            (error, expected),
+            (SqlCompileError::Cancelled, CompileControlError::Cancelled)
+                | (
+                    SqlCompileError::DeadlineExceeded,
+                    CompileControlError::DeadlineExceeded
+                )
+                | (
+                    SqlCompileError::ResourceExhausted,
+                    CompileControlError::ResourceExhausted
+                )
+        ));
+    }
+    #[test]
+    fn statistics_control_entry_preserves_errors_even_for_empty_or_cached_groups() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = Memo::new();
+            let root = memo.new_group(values(0, 0));
+            memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 999.0));
+            let control = owner(0, Some(error));
+            assert_class(
+                derive_group_statistics(&mut memo, &input(), &control).unwrap_err(),
+                error,
+            );
+            memo.groups[root].logical_exprs.clear();
+            assert_class(
+                pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+            assert_class(
+                copy_in_join_tree(&mut memo, &JoinTree::Leaf(root), &input(), &control)
+                    .unwrap_err(),
+                error,
+            );
+            assert_eq!(
+                memo.groups[root].logical_props.as_ref().unwrap().row_count,
+                999.0
+            );
+        }
+    }
+    #[test]
+    fn statistics_control_observes_real_members_and_preserves_canonical_ties() {
+        let mut memo = Memo::new();
+        let root = memo.new_group(values(0, 5));
+        for id in 1..320 {
+            memo.add_expr_to_group(root, values(id, 9));
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = owner(256, Some(error));
+            assert_class(
+                pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+            assert_eq!(
+                control
+                    .units
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|u| *u > 0)
+                    .collect::<Vec<_>>(),
+                vec![256]
+            );
+        }
+        let control = owner(256, None);
+        let (chosen, stats) = pick_group_representative(&memo, root, &input(), &control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.id, 0);
+        assert_eq!(stats.output_row_count, 5.0);
+        assert_eq!(
+            control
+                .units
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|u| *u > 0)
+                .collect::<Vec<_>>(),
+            vec![256, 64]
+        );
+    }
+    #[test]
+    fn statistics_control_late_finish_keeps_previously_published_properties() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = Memo::new();
+            let root = memo.new_group(values(0, 7));
+            memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 999.0));
+            let control = owner(2, Some(error));
+            assert_class(
+                derive_group_statistics_for(&mut memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+            assert_eq!(
+                memo.groups[root].logical_props.as_ref().unwrap().row_count,
+                999.0
+            );
+            derive_group_statistics_for(
+                &mut memo,
+                root,
+                &input(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(
+                memo.groups[root].logical_props.as_ref().unwrap().row_count,
+                7.0
+            );
+        }
+    }
+    #[test]
+    fn statistics_control_observes_actual_cached_group_walk_and_short_finish() {
+        let mut memo = Memo::new();
+        for id in 0..320 {
+            let group = memo.new_group(values(id, 0));
+            memo.groups[group].logical_props = Some(LogicalProperties::new(vec![], id as f64));
+        }
+        let control = owner(256, Some(CompileControlError::ResourceExhausted));
+        assert!(matches!(
+            derive_group_statistics(&mut memo, &input(), &control),
+            Err(SqlCompileError::ResourceExhausted)
+        ));
+        let control = owner(256, None);
+        derive_group_statistics(&mut memo, &input(), &control).unwrap();
+        assert_eq!(control.units.lock().unwrap().clone(), vec![0, 256, 64]);
+        assert_eq!(
+            memo.groups[319].logical_props.as_ref().unwrap().row_count,
+            319.0
         );
     }
 }

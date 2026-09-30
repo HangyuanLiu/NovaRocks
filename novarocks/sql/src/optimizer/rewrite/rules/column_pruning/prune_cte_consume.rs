@@ -18,6 +18,7 @@
 //! PruneCTEConsumeColumns trims logical CTE consume outputs while preserving
 //! each consumer output column's mapped producer column id.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -48,7 +49,11 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -57,7 +62,8 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
         let Operator::LogicalCTEConsume(mut node) = op else {
             unreachable!();
         };
-        node.validate_mapping()?;
+        node.validate_mapping()
+            .map_err(SqlCompileError::Compilation)?;
         let Some(needed) = required_output_columns.as_ref() else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -75,10 +81,10 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
             .collect::<Vec<_>>();
         if kept.is_empty() {
             let Some(first) = original_pairs.first().cloned() else {
-                return Err(format!(
+                return Err(SqlCompileError::Compilation(format!(
                     "CTEConsume has no output columns for cte_id={}",
                     node.cte_id
-                ));
+                )));
             };
             kept.push(first);
         }

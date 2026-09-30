@@ -23,6 +23,7 @@
 //!
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::optimizer::operator::Operator;
@@ -63,7 +64,11 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,

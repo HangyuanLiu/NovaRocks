@@ -32,6 +32,7 @@
 //!   then a `Project` that maps the Apply output column to `anyval` and adds an
 //!   internal `assert_true(cnt IS NULL OR cnt <= 1, ...)` per-group row-check.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
@@ -75,10 +76,14 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_opt(expr, ctx, &mut arena)? {
+        match apply_opt(expr, ctx, &mut arena).map_err(SqlCompileError::Compilation)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }

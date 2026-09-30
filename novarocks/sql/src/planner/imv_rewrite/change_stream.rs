@@ -21,6 +21,7 @@
 //! rules for downstream consumers that need to know whether the rewritten
 //! plan contains an aggregate change stream.
 
+use crate::compiler::SqlCompileError;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::analysis::{ExprKind, JoinKind, OutputColumn, TypedExpr};
@@ -160,14 +161,19 @@ impl LogicalRewriteRule for BuildChangeStreamDescriptorRule {
                 .is_some_and(|ext| ext.annotation.change_stream.aggregate.is_none())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
         let descriptor = build_change_stream_descriptor(&plan);
         if descriptor.has_aggregate() {
             let ext = ctx
                 .extension::<ImvExtension>()
-                .ok_or("BuildChangeStreamDescriptor requires ImvExtension")?
+                .ok_or_else(|| "BuildChangeStreamDescriptor requires ImvExtension".to_string())
+                .map_err(SqlCompileError::Compilation)?
                 .clone();
             let mut annotation = ext.annotation.clone();
             annotation.change_stream.aggregate = descriptor.aggregate;
@@ -209,12 +215,17 @@ impl LogicalRewriteRule for ValidateChangeStreamDescriptorRule {
                 .is_some_and(|ext| ext.annotation.change_stream.has_aggregate())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
         let ext = ctx
             .extension::<ImvExtension>()
-            .ok_or("ValidateChangeStreamDescriptor requires ImvExtension")?;
+            .ok_or_else(|| "ValidateChangeStreamDescriptor requires ImvExtension".to_string())
+            .map_err(SqlCompileError::Compilation)?;
         match ext.annotation.change_stream.validate_against_plan(&plan) {
             Ok(()) => Ok(RewriteResult::Unchanged),
             Err(message) => Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(

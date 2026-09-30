@@ -22,6 +22,7 @@
 //! `+1` for inserts/upserts and `-1` for deletes at runtime, and is never
 //! exposed to user-visible output.
 
+use crate::compiler::SqlCompileError;
 use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
@@ -130,7 +131,11 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
         !self.fired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
         let change_stream = ctx

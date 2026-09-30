@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -121,7 +122,11 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         // --- Step 1: Destructure Filter -> optional Project -> Window -> Sort ---
         let Operator::LogicalFilter(ref filter_op) = expr.op else {
             return Ok(RewriteResult::Unchanged);

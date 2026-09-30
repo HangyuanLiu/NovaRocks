@@ -1795,7 +1795,7 @@ pub(crate) mod tests {
             &self,
             _expr: crate::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Unchanged)
         }
     }
@@ -1925,7 +1925,7 @@ pub(crate) mod tests {
             &self,
             _expr: crate::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Unchanged)
         }
     }
@@ -2023,8 +2023,10 @@ pub(crate) mod tests {
             &self,
             _expr: crate::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
-            Err("synthetic failure".to_string())
+        ) -> Result<RewriteResult, SqlCompileError> {
+            Err(SqlCompileError::Compilation(
+                "synthetic failure".to_string(),
+            ))
         }
     }
 

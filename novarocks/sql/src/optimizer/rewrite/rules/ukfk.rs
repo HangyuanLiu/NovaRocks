@@ -17,6 +17,7 @@
 
 //! UK/FK-based logical rewrites over frozen SQL table facts.
 
+use crate::compiler::SqlCompileError;
 use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
@@ -68,7 +69,11 @@ impl LogicalRewriteRule for PruneUkFkJoin {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let settings = ctx.session_settings();
         let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
@@ -106,11 +111,14 @@ impl LogicalRewriteRule for PruneUkFkJoin {
         let arena_rc = ctx.scalar_arena();
 
         let retained_side =
-            match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())? {
+            match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())
+                .map_err(SqlCompileError::Compilation)?
+            {
                 Some(s) => s,
                 None => return Ok(RewriteResult::Unchanged),
             };
-        let eq_pairs = join_equality_pairs(&join, &left, &right, &arena_rc.borrow())?;
+        let eq_pairs = join_equality_pairs(&join, &left, &right, &arena_rc.borrow())
+            .map_err(SqlCompileError::Compilation)?;
         if eq_pairs.is_empty() {
             return Ok(RewriteResult::Unchanged);
         }
@@ -194,7 +202,11 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let settings = ctx.session_settings();
         if !settings.enable_eliminate_agg {
             return Ok(RewriteResult::Unchanged);

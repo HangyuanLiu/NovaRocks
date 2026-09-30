@@ -292,11 +292,10 @@ fn optimize_with_root_property(
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
     control.checkpoint(CompilePhase::Validate, 0)?;
-    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten_expr);
+    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten_expr, control)?;
     let rewritten_expr = {
         let mut scalar_arena = arena.borrow_mut();
-        cte_rewrite::inline_single_use_ctes(rewritten_expr, &cte_ctx, &mut scalar_arena)
-            .map_err(SqlCompileError::Compilation)?
+        cte_rewrite::inline_single_use_ctes(rewritten_expr, &cte_ctx, &mut scalar_arena, control)?
     };
 
     // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
@@ -321,11 +320,11 @@ fn optimize_with_root_property(
     memo.function_catalog = Some(function_catalog);
     memo.factory = factory;
     memo.scalars = arena.borrow().clone();
-    let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo);
+    let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo, control)?;
 
     // 6. Derive initial statistics.
     control.checkpoint(CompilePhase::Validate, 0)?;
-    stats::derive_group_statistics(&mut memo, &stats_input);
+    stats::derive_group_statistics(&mut memo, &stats_input, control)?;
 
     // 6b. In-memo multi-candidate join reorder (StarRocks-aligned, one-shot):
     //     inject alternative join orders into each reorderable inner/cross
@@ -340,7 +339,8 @@ fn optimize_with_root_property(
             &mut memo,
             &options.reorder,
             &stats_input,
-        );
+            control,
+        )?;
     }
 
     control.checkpoint(CompilePhase::Validate, 0)?;
@@ -364,7 +364,7 @@ fn optimize_with_root_property(
 
     // 9. Re-derive statistics for any newly created groups (e.g. from AggSplit).
     control.checkpoint(CompilePhase::Validate, 0)?;
-    stats::derive_group_statistics(&mut memo, &stats_input);
+    stats::derive_group_statistics(&mut memo, &stats_input, control)?;
 
     control.checkpoint(CompilePhase::Validate, 0)?;
 
@@ -513,7 +513,7 @@ impl PureCompileControl for OptimizerControl<'_> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn test_optimizer_control() -> &'static dyn PureCompileControl {
+pub(crate) fn test_optimizer_control() -> &'static dyn PureCompileControl {
     static CONTROL: std::sync::LazyLock<crate::compiler::SqlCompileControl> =
         std::sync::LazyLock::new(crate::compiler::SqlCompileControl::unbounded);
     &*CONTROL
