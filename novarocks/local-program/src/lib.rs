@@ -23,6 +23,7 @@
 
 mod contract;
 mod control_flow;
+mod expression_roots;
 mod expressions;
 mod layout;
 mod program;
@@ -38,6 +39,7 @@ pub use contract::{
     RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
 };
 pub use control_flow::*;
+pub use expression_roots::*;
 pub use expressions::{
     ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH, MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
     MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind, StaticExprNode, StaticExpressionError,

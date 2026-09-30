@@ -62,6 +62,9 @@ impl ProgramControlFlow {
     pub fn uses(&self) -> &BTreeMap<ExpressionUseId, ProgramExpressionUse> {
         self.0.uses()
     }
+    pub const fn use_reference_count(&self) -> usize {
+        self.0.use_reference_count()
+    }
 }
 #[cfg(test)]
 mod tests {
