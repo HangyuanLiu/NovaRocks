@@ -55,7 +55,7 @@ code-anchors:
 
 删除未使用的 Reservation、Charge、wait/reclaim/pressure 框架、memory-arrow 及其旧模型/基准，不保留兼容钱包。ExplicitGrant、ExternalBound 与 HolderPin 按独立域语义重建。核心 normal 依赖为空；dev 依赖不引入 first-party/Arrow/Tokio，StateStore 不闭包包含内存能力。
 
-保留 ADR-0148 的唯一进程权威、两级覆盖和观察事实，替换其旧余额/Arrow charge/通用仲裁框架。ADR-0160 的谱系与叶子实现整体退出。ADR-0163 的 jemalloc、CountingAllocator、cgroup 和物理观察保持独立。当前 Worker/Native 只消费账户与 Work policy，实际业务分配接线仍由 M02b/M03 交付，不能据本条声称全查询已经硬治理。
+保留 ADR-0148 的唯一进程权威、两级覆盖和观察事实，替换其旧余额/Arrow charge/通用仲裁框架。ADR-0160 的谱系与叶子实现整体退出。ADR-0163 的 jemalloc、CountingAllocator、cgroup 和物理观察保持独立。当前 Worker/Native 只消费账户与 Work policy，实际业务分配接线仍需由归属 allocator 与执行安全点接入交付，不能据本条声称全查询已经硬治理。
 
 ## 验证与限制
 
@@ -63,7 +63,7 @@ code-anchors:
 
 性能入口保存固定 manifest、全部解析输入、真实 storage/工作集、原始 iteration 样本、父/root 余额交互以及实际资格门/账本等待和持有统计。锁等待/持有尾部使用有界对数直方图，报告桶上界与 overflow，不能冒充精确逐次样本。原生 Linux 独占性能验收由用户后续手动执行；macOS correctness smoke 不代表成本门通过。
 
-本条定义中立 teardown deadline 输入，不证明各生产 I/O owner 已交付退出上界。M02b/M03 接入安全点与 allocator，M08b 独立驱动回收，M10/M11 消费完整分类/新鲜收据并验证有界政策推进。
+本条定义中立 teardown deadline 输入，不证明各生产 I/O owner 已交付退出上界。归属 allocator 与执行安全点负责分配接入，进程反馈 owner 独立驱动回收，集群压力与仲裁 owner 消费完整分类/新鲜收据并验证有界政策推进。
 
 ## 接受的妥协（诚实记录）
 
