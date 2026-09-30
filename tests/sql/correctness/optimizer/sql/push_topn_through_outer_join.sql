@@ -21,6 +21,14 @@
 -- preserved-side ORDER BY can push a TopN below the join. RIGHT OUTER JOIN
 -- remains fail-closed until preserved-side aliases are executable across
 -- exchanges; null-producing-side and disabled-rule cases must not push.
+-- Golden derivation: PushTopNThroughJoin::preserved_child_index admits only
+-- LEFT OUTER. Query 11 must retain TOP-N -> GATHER -> LOCAL TOP-N -> PROJECT
+-- -> PARTITIONED RIGHT OUTER JOIN with two hash exchanges and rows=1004;
+-- no TopN belongs below that join. append_exchange retains l.id/r.id and
+-- r.payload. lower_join_outputs creates new NullExtended left values named
+-- id/score, so only the preserved r.payload stays qualified in its PROJECT.
+-- Query 10 keeps its pushed left TopN; queries 13/15/16 keep their existing
+-- non-pushed plans. No operator, RF binding, sort direction or estimate changes.
 
 DROP TABLE IF EXISTS ${case_db}.topn_outer_left;
 DROP TABLE IF EXISTS ${case_db}.topn_outer_right;

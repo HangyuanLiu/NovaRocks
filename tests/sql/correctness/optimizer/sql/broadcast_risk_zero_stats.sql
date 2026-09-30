@@ -16,6 +16,11 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution
+-- Golden derivation: the probe's identity projects reuse generate_series,
+-- while generate_series + 0 creates the build's separately named k value.
+-- Thus the join/import names become generate_series = k, not k = k.
+-- Preserve build filters/projections, both hash exchanges, partitioned join,
+-- and the 11250000000000 estimate; no row-count or broadcast policy changes.
 CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
 SET cbo_broadcast_backend_count = 3;

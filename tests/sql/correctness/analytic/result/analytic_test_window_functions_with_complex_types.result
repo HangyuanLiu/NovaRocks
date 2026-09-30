@@ -501,9 +501,9 @@ NULL
 -- query 68
 wv
 127
-128
-128
-128
+NULL
+NULL
+NULL
 NULL
 
 -- query 69
@@ -992,9 +992,9 @@ NULL
 
 -- query 133
 wv
-128
-128
-128
+NULL
+NULL
+NULL
 NULL
 NULL
 
@@ -1254,9 +1254,9 @@ NULL
 wv
 NULL
 127
-128
-128
-128
+NULL
+NULL
+NULL
 
 -- query 175
 wv
@@ -1501,3 +1501,19 @@ NULL
 NULL
 NULL
 NULL
+
+-- query 214
+k1	c1	is_null
+2024-01-01	127	0
+2024-01-02	NULL	1
+2024-01-03	NULL	1
+2024-01-04	NULL	1
+2024-01-05	NULL	1
+
+-- query 215
+upper_valid	upper_overflow	lower_valid	lower_overflow
+127	NULL	-128	NULL
+
+-- query 216
+row_count	valid_count	null_count
+5	1	4

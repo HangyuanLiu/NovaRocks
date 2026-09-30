@@ -946,7 +946,17 @@ impl AggregateFunction for ArrayAggAgg {
         };
 
         let arg_types = extract_arg_types(input_type);
-        let item_type = if input_is_intermediate {
+        // A STRUCT can be the aggregate value itself, not just a legacy
+        // value/ORDER-BY channel wrapper. The selected output's item type is
+        // authoritative in both update and merge phases; inspecting field[0]
+        // would silently discard the other fields of a ROW value.
+        let item_type = if let Some(DataType::List(field)) = func
+            .types
+            .as_ref()
+            .and_then(|types| types.output_type.as_ref())
+        {
+            field.data_type().clone()
+        } else if input_is_intermediate {
             first_item_type_from_intermediate_input(input_type)?
         } else if matches!(kind, AggKind::ArrayUniqueAgg) {
             unique_item_type_from_update_input(input_type)?
@@ -1356,6 +1366,90 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn selected_struct_item_survives_update_and_merge() {
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let values: ArrayRef = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(9)])),
+                Arc::new(Int32Array::from(vec![None, Some(2)])),
+            ],
+            None,
+        ));
+        let item_type = DataType::Struct(fields);
+        let list_type = DataType::List(Arc::new(Field::new("item", item_type.clone(), true)));
+        let mut function = make_func("array_agg");
+        function.types = Some(crate::exec::node::aggregate::AggTypeSignature {
+            intermediate_type: Some(list_type.clone()),
+            output_type: Some(list_type.clone()),
+            input_arg_type: Some(item_type.clone()),
+        });
+        let spec = ArrayAggAgg
+            .build_spec_from_type(&function, Some(&item_type), false)
+            .unwrap();
+        assert_eq!(spec.output_type, list_type);
+        assert_eq!(spec.input_arg_type, Some(item_type.clone()));
+        let mut update_state = MaybeUninit::<ArrayAggState>::uninit();
+        let update_ptr = update_state.as_mut_ptr() as AggStatePtr;
+        ArrayAggAgg
+            .init_state_with_tracker(
+                &spec,
+                update_ptr as *mut u8,
+                Some(MemTracker::new_root("array-agg-struct-update")),
+            )
+            .unwrap();
+        ArrayAggAgg
+            .update_batch(
+                &spec,
+                0,
+                &[update_ptr, update_ptr],
+                &AggInputView::Any(&values),
+            )
+            .unwrap();
+        let intermediate = ArrayAggAgg
+            .build_array(&spec, 0, &[update_ptr], true)
+            .unwrap();
+        ArrayAggAgg.drop_state(&spec, update_ptr as *mut u8);
+
+        let merge_spec = ArrayAggAgg
+            .build_spec_from_type(&function, Some(&list_type), true)
+            .unwrap();
+        assert_eq!(merge_spec.output_type, list_type);
+        assert_eq!(merge_spec.input_arg_type, Some(item_type));
+        let mut merge_state = MaybeUninit::<ArrayAggState>::uninit();
+        let merge_ptr = merge_state.as_mut_ptr() as AggStatePtr;
+        ArrayAggAgg
+            .init_state_with_tracker(
+                &merge_spec,
+                merge_ptr as *mut u8,
+                Some(MemTracker::new_root("array-agg-struct-merge")),
+            )
+            .unwrap();
+        ArrayAggAgg
+            .merge_batch(
+                &merge_spec,
+                0,
+                &[merge_ptr],
+                &AggInputView::Any(&intermediate),
+            )
+            .unwrap();
+        let result = ArrayAggAgg
+            .build_array(&merge_spec, 0, &[merge_ptr], false)
+            .unwrap();
+        ArrayAggAgg.drop_state(&merge_spec, merge_ptr as *mut u8);
+        let result = result
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(result.data_type(), values.data_type());
+        assert_eq!(result.to_data(), values.to_data());
     }
 
     fn map_type_i32_utf8(key_nullable: bool) -> DataType {

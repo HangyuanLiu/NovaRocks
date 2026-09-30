@@ -51,7 +51,7 @@ insert into ${case_db}.sc2 values (5, [15,25,35,45], [map{3: 550}, map{505: 501}
 select * from ${case_db}.sc2 where array1 is null order by v1;
 
 -- query 3
--- Paired internal NULL elements compare equal; outer NULL still follows SQL NULL semantics.
+-- Ordinary equality is UNKNOWN for internal NULLs; WHERE retains only TRUE.
 select * from ${case_db}.sc2 where array1 = [11,null,31,41] order by v1;
 
 -- query 4
@@ -411,3 +411,18 @@ select map{1:1,null:2} = map{null:3,1:null};
 
 -- query 117
 select map{1:1,null:2} != map{null:3,1:null};
+
+-- query 118
+-- A definite mismatch dominates UNKNOWN, even after a NULL field or value.
+select row(cast(null as int), 1) = row(cast(null as int), 2) as struct_eq,
+       row(cast(null as int), 1) != row(cast(null as int), 2) as struct_ne,
+       map{1:null,2:3} = map{1:null,2:4} as map_eq,
+       map{1:null,2:3} != map{1:null,2:4} as map_ne,
+       row(1,cast(null as int)) = row(1,cast(null as int)) as struct_unknown,
+       row(1,cast(null as int)) <=> row(1,cast(null as int)) as struct_safe,
+       map{1:null,2:3} <=> map{1:null,2:3} as map_safe;
+
+-- query 119
+-- The stored column is an independent oracle for both NULL depths.
+select v1, array1 = array1 as eq, array1 != array1 as ne, array1 <=> array1 as safe
+from ${case_db}.sc2 order by v1, eq;

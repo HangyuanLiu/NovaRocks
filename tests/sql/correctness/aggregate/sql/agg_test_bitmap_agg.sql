@@ -90,7 +90,11 @@ USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c5))) FROM t1;
 
 -- query 14
--- @expect_error=to_bitmap expects
+-- The scalar overload is rejected during analysis, before aggregate execution.
+-- @expect_error_tier=drift
+-- @expect_sql_code=sql.analyze.type_mismatch
+-- @expect_sql_phase=Analyze
+-- @expect_error=no matching declared overload
 USE ${case_db};
 SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c6))) FROM t1;
 

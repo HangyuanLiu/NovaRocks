@@ -1843,6 +1843,21 @@ impl<'a> AnalyzerContext<'a> {
             ));
         }
 
+        if value_form
+            && matches!(
+                lhs_typed.data_type,
+                DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+            )
+        {
+            return self.rewrite_composite_in_value_form(
+                select,
+                resolved_sub,
+                lhs_typed,
+                sq_info.id,
+                negated,
+            );
+        }
+
         // Build per-column equality conjuncts. For a single-column IN this
         // collapses to the original behaviour; for `(a, b) IN (SELECT c, d
         // ...)` we get `a = c AND b = d` (or the null-aware variant for
@@ -2128,6 +2143,232 @@ impl<'a> AnalyzerContext<'a> {
             Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
         }
 
+        Ok(())
+    }
+
+    /// A global build-NULL marker is insufficient for composite equality:
+    /// UNKNOWN depends on each probe/build pair, and a definite mismatch wins
+    /// over a NULL leaf. Collect the uncorrelated build once, then reduce exact
+    /// comparisons with ANY_MATCH (TRUE wins over UNKNOWN). The scalar build
+    /// relation preserves outer duplicates and also produces a row when empty.
+    fn rewrite_composite_in_value_form(
+        &self,
+        select: &mut ResolvedSelect,
+        source: ResolvedQuery,
+        lhs: TypedExpr,
+        sq_id: usize,
+        negated: bool,
+    ) -> Result<(), AnalyzeError> {
+        use super::resolve_expr::{cast_null_preserving_target_type, resolved_scalar_call_at};
+        use novarocks_functions::FunctionResultType;
+        use novarocks_type_contract::DecimalOverflowPolicy;
+
+        let span = novarocks_parser::Span::new(0, 0);
+        let clause = locate_scalar_placeholder_clause(select, sq_id).ok_or_else(|| {
+            AnalyzeError::unsupported_query_shape(
+                "composite IN value requires a clause-owned scalar Apply insertion point",
+                span,
+            )
+        })?;
+        let alias = format!("__sq_values_{sq_id}");
+        let name = format!("__in_values_{sq_id}");
+        let output = &source.output_columns[0];
+        let argument = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: output.column_id,
+                qualifier: None,
+                column: output.name.clone(),
+            },
+            data_type: output.data_type.clone(),
+            nullable: output.nullable,
+        };
+        let resolved = super::resolve_expr::resolve_aggregate_function_call(
+            self.function_catalog,
+            "array_agg",
+            std::slice::from_ref(&argument),
+            span,
+        )?;
+        let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
+            unreachable!("array_agg has a scalar result");
+        };
+        let result = result.clone();
+        let column_id = self.alloc_column_id(None, name.clone(), result.data_type.clone(), true);
+        let collection_output = OutputColumn {
+            column_id,
+            name: name.clone(),
+            data_type: result.data_type.clone(),
+            nullable: true,
+            is_internal: true,
+        };
+        // ARRAY_REPEAT evaluates the probe once in its owning clause's row
+        // domain, before ARRAY_MAP expands candidates. A projection below FROM
+        // would evaluate HAVING/aggregate probes before grouping, and a probe
+        // embedded in the lambda would run once per candidate instead.
+        let probe_param = LambdaParam {
+            name: format!("__in_probe_{sq_id}"),
+            slot_id: self.alloc_lambda_slot_id(),
+            data_type: lhs.data_type.clone(),
+            nullable: lhs.nullable,
+        };
+        let probe = TypedExpr {
+            kind: ExprKind::LambdaParamRef {
+                name: probe_param.name.clone(),
+                slot_id: probe_param.slot_id,
+            },
+            data_type: lhs.data_type.clone(),
+            nullable: lhs.nullable,
+        };
+        let param = LambdaParam {
+            name: format!("__in_item_{sq_id}"),
+            slot_id: self.alloc_lambda_slot_id(),
+            data_type: output.data_type.clone(),
+            nullable: output.nullable,
+        };
+        let item = TypedExpr {
+            kind: ExprKind::LambdaParamRef {
+                name: param.name.clone(),
+                slot_id: param.slot_id,
+            },
+            data_type: param.data_type.clone(),
+            nullable: param.nullable,
+        };
+        let (probe, item) =
+            match novarocks_types::comparison_common_type(&probe.data_type, &item.data_type)
+                .map_err(|message| AnalyzeError::type_mismatch(message, span))?
+            {
+                Some(common) => (
+                    cast_null_preserving_target_type(
+                        probe,
+                        &common,
+                        DecimalOverflowPolicy::OutputNull,
+                    ),
+                    cast_null_preserving_target_type(
+                        item,
+                        &common,
+                        DecimalOverflowPolicy::OutputNull,
+                    ),
+                ),
+                None => (probe, item),
+            };
+        let comparison = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(probe),
+                op: BinOp::Eq,
+                right: Box::new(item),
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+        let lambda = TypedExpr {
+            kind: ExprKind::LambdaFunction {
+                params: vec![probe_param, param],
+                body: Box::new(comparison),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+        let values = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: name.clone(),
+            },
+            data_type: result.data_type.clone(),
+            nullable: collection_output.nullable,
+        };
+        let length = resolved_scalar_call_at(
+            self.function_catalog,
+            "cardinality",
+            vec![values.clone()],
+            span,
+        )?;
+        let probes = resolved_scalar_call_at(
+            self.function_catalog,
+            "array_repeat",
+            vec![lhs, length],
+            span,
+        )?;
+        let mapped = resolved_scalar_call_at(
+            self.function_catalog,
+            "array_map",
+            vec![lambda, probes, values],
+            span,
+        )?;
+        // ARRAY_AGG emits a non-null empty list for zero input rows;
+        // ANY_MATCH reduces that list to FALSE even for a NULL probe.
+        let mut replacement =
+            resolved_scalar_call_at(self.function_catalog, "any_match", vec![mapped], span)?;
+        if negated {
+            replacement = TypedExpr {
+                kind: ExprKind::UnaryOp {
+                    op: UnOp::Not,
+                    expr: Box::new(replacement),
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            };
+        }
+        let source_outputs = source.output_columns.clone();
+        let mut inner_output = collection_output.clone();
+        inner_output.column_id = self.alloc_column_id(
+            Some(alias),
+            name.clone(),
+            result.data_type.clone(),
+            result.nullable,
+        );
+        inner_output.nullable = result.nullable;
+        let query = ResolvedQuery {
+            body: QueryBody::Select(ResolvedSelect {
+                from: Some(Relation::Subquery {
+                    query: Box::new(source),
+                    alias: format!("__sq_values_src_{sq_id}"),
+                    output_columns: source_outputs,
+                }),
+                filter: None,
+                group_by: vec![],
+                having: None,
+                projection: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::AggregateCall {
+                            name: "array_agg".to_string(),
+                            args: vec![argument],
+                            distinct: false,
+                            order_by: vec![],
+                            resolved,
+                        },
+                        data_type: result.data_type,
+                        nullable: result.nullable,
+                    },
+                    output_name: name,
+                    output_column_id: inner_output.column_id,
+                }],
+                has_aggregation: true,
+                distinct: false,
+                repeat: None,
+                apply_specs: vec![],
+                predicate_apply_specs: vec![],
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_columns: vec![inner_output],
+            local_cte_ids: vec![],
+        };
+        // Reuse the scalar Apply's clause boundary: HAVING and projection
+        // collections must be installed after Aggregate, never as group keys.
+        select.apply_specs.push(ApplyScalarSpec {
+            subquery_id: sq_id,
+            clause,
+            output_column: collection_output,
+            inner: query,
+            correlation_column_ids: vec![],
+            need_check_max_rows: false,
+            subquery_text: "composite IN build collection".to_string(),
+        });
+        Self::replace_placeholder_in_filter(&mut select.filter, sq_id, &replacement);
+        Self::replace_placeholder_in_filter(&mut select.having, sq_id, &replacement);
+        Self::replace_placeholder_in_projection(&mut select.projection, sq_id, &replacement);
         Ok(())
     }
 
@@ -5205,6 +5446,96 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composite_in_evaluates_volatile_probe_outside_candidate_lambda() {
+        let statements = novarocks_parser::parse("SELECT [random()] IN (SELECT [0.0])").unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        let (resolved, _, _) = super::super::analyze_with_function_catalog(
+            query,
+            &catalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .unwrap();
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("select");
+        };
+        let ExprKind::FunctionCall { name, args, .. } = &select.projection[0].expr.kind else {
+            panic!("reduction");
+        };
+        assert_eq!(name, "any_match");
+        let ExprKind::FunctionCall { name, args, .. } = &args[0].kind else {
+            panic!("map");
+        };
+        assert_eq!(name, "array_map");
+        let ExprKind::FunctionCall {
+            name,
+            args: probe_args,
+            ..
+        } = &args[1].kind
+        else {
+            panic!("probe repetition");
+        };
+        assert_eq!(name, "array_repeat");
+        assert!(format!("{:?}", probe_args[0].kind).contains("Volatile"));
+        let ExprKind::LambdaFunction { body, .. } = &args[0].kind else {
+            panic!("lambda");
+        };
+        let ExprKind::BinaryOp { left, .. } = &body.kind else {
+            panic!("comparison");
+        };
+        assert!(matches!(left.kind, ExprKind::LambdaParamRef { .. }));
+        assert!(!format!("{:?}", body.kind).contains("Volatile"));
+    }
+
+    #[test]
+    fn composite_in_collection_uses_owning_clause_apply_boundary() {
+        for (sql, clause) in [
+            (
+                "SELECT x, count(*) FROM (VALUES (1),(2)) t(x) GROUP BY x HAVING [x] IN (SELECT [1]) OR count(*) = 0",
+                ApplyClause::Having,
+            ),
+            (
+                "SELECT [count(*)] IN (SELECT [2]) FROM (VALUES (1),(2)) t(x)",
+                ApplyClause::Projection,
+            ),
+            (
+                "SELECT sum(CASE WHEN [x] IN (SELECT [1]) THEN 1 ELSE 0 END) FROM (VALUES (1),(2)) t(x)",
+                ApplyClause::AggregateInput,
+            ),
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+            let (resolved, _, _) = super::super::analyze_with_function_catalog(
+                query,
+                &catalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap();
+            let QueryBody::Select(select) = resolved.body else {
+                panic!("select");
+            };
+            let [spec] = select.apply_specs.as_slice() else {
+                panic!("one clause-owned collection");
+            };
+            assert_eq!(spec.clause, clause);
+            assert!(!spec.need_check_max_rows);
+            assert!(spec.correlation_column_ids.is_empty());
+            assert_ne!(
+                spec.output_column.column_id,
+                spec.inner.output_columns[0].column_id
+            );
+            assert!(select.has_aggregation);
+        }
+    }
 
     #[test]
     fn coerce_where_to_bool_keeps_numeric_truthiness_as_ne_zero() {

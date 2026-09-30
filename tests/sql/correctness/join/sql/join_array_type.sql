@@ -97,10 +97,11 @@ SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 < t.i_1 ORDER BY 1, 2;
 
 -- ============================================================
--- INNER JOIN: Array<String> = Array<DECIMAL> (all return empty - type mismatch)
+-- INNER JOIN: Array<String> = Array<DECIMAL> (FE common item type is STRING)
 -- ============================================================
 -- query 8
 -- @order_sensitive=true
+-- Decimal items retain scale when cast to STRING: '1' differs from '1.00'.
 SELECT s.s_1, t.d_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 = t.d_1 ORDER BY 1, 2;
 
 -- ============================================================
@@ -208,6 +209,7 @@ SELECT s_1 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.a
 
 -- query 26
 -- @order_sensitive=true
+-- Same STRING item promotion as query 8; no seeded pair compares TRUE.
 SELECT s_1 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.array_test t WHERE t.s_1 = s.d_1) ORDER BY 1;
 
 -- ============================================================
@@ -273,15 +275,15 @@ SELECT pk FROM ${case_db}.array_test s WHERE pk NOT IN (SELECT i_0 FROM ${case_d
 -- ============================================================
 -- query 36
 -- @order_sensitive=true
-SELECT ai_1 IN (SELECT ai_1 FROM ${case_db}.array_test t) FROM ${case_db}.array_test s ORDER BY 1;
+SELECT ai_1 IN (SELECT ai_1 FROM ${case_db}.array_test t) AS membership FROM ${case_db}.array_test s ORDER BY 1;
 
 -- query 37
 -- @order_sensitive=true
-SELECT d_1 NOT IN (SELECT d_2 FROM ${case_db}.array_test t) FROM ${case_db}.array_test s ORDER BY 1;
+SELECT d_1 NOT IN (SELECT d_2 FROM ${case_db}.array_test t) AS membership FROM ${case_db}.array_test s ORDER BY 1;
 
 -- query 38
 -- @order_sensitive=true
-SELECT ai_1 NOT IN (SELECT ai_1 FROM ${case_db}.array_test t) FROM ${case_db}.array_test s ORDER BY 1;
+SELECT ai_1 NOT IN (SELECT ai_1 FROM ${case_db}.array_test t) AS membership FROM ${case_db}.array_test s ORDER BY 1;
 
 -- ============================================================
 -- FE error: nested array left join incompatible types
@@ -380,3 +382,19 @@ SELECT s.aad_1, t.aad_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_
 -- query 52
 -- @order_sensitive=true
 SELECT s.i_1, t.d_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON array_map(x -> x*3, s.i_1) = array_map(x-> x*3 + 1, t.d_1) ORDER BY 1, 2;
+
+-- query 53
+-- Internal and outer NULLs are UNKNOWN for =/!=, but equal under <=>.
+SELECT pk, ai_1 = ai_1 AS eq, ai_1 != ai_1 AS ne, ai_1 <=> ai_1 AS safe
+FROM ${case_db}.array_test ORDER BY pk;
+
+-- query 54
+-- Pin identities: outer NULL (3,2), internal NULL (6,6), valid (5,5).
+SELECT s.pk AS probe_pk, t.pk AS build_pk
+FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 <=> t.i_1
+ORDER BY s.pk, t.pk;
+
+-- query 55
+SELECT s.pk AS probe_pk, t.pk AS build_pk
+FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 = t.i_1
+ORDER BY s.pk, t.pk;
