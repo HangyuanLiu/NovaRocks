@@ -228,6 +228,7 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         for sq_info in subqueries {
+            self.check_control()?;
             // Subqueries can appear in three locations:
             //   1. WHERE / HAVING / projection clauses that can be represented
             //      as Apply specs.
@@ -1563,6 +1564,7 @@ impl<'a> AnalyzerContext<'a> {
                 let corr_cond = {
                     let mut c = build_corr_cond(&corr_preds[0]);
                     for pred in &corr_preds[1..] {
+                        self.check_control()?;
                         c = TypedExpr {
                             data_type: DataType::Boolean,
                             nullable: false,
@@ -1769,6 +1771,7 @@ impl<'a> AnalyzerContext<'a> {
             .iter()
             .zip(resolved_sub.output_columns.iter())
         {
+            self.check_control()?;
             if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
                 &lhs_i.data_type,
                 &sub_col.data_type,
@@ -1864,6 +1867,7 @@ impl<'a> AnalyzerContext<'a> {
         // NOT IN).
         let mut eq_conjuncts: Vec<TypedExpr> = Vec::with_capacity(lhs_typed_list.len());
         for (idx, lhs_i) in lhs_typed_list.iter().enumerate() {
+            self.check_control()?;
             let sub_col = &resolved_sub.output_columns[idx];
             let lhs_name_lower = match &lhs_i.kind {
                 ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
@@ -1909,6 +1913,7 @@ impl<'a> AnalyzerContext<'a> {
             let mut iter = eq_conjuncts.into_iter();
             let mut acc = iter.next().expect("at least one IN column");
             for next in iter {
+                self.check_control()?;
                 acc = TypedExpr {
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1928,6 +1933,7 @@ impl<'a> AnalyzerContext<'a> {
         // explicit references (e.g. in IN-inside-OR's match-indicator
         // wrapping below) can resolve.
         for sub_col in &resolved_sub.output_columns {
+            self.check_control()?;
             scope.add_column_with_id(
                 Some(&sq_alias),
                 &sub_col.name,
@@ -2679,6 +2685,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            control: self.control,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -2820,6 +2827,7 @@ impl<'a> AnalyzerContext<'a> {
             let first = iter.next().unwrap();
             let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
             for twj in iter {
+                self.check_control()?;
                 // Comma-separated FROM entries are implicit CROSS JOINs.
                 // Expose the accumulated left-hand scope so that table-valued
                 // functions like `unnest(...)` can reference earlier sibling
@@ -2862,6 +2870,7 @@ impl<'a> AnalyzerContext<'a> {
             &inner_scope,
         )?;
         for item in &mut projection {
+            self.check_control()?;
             item.expr =
                 qualify_inner_shadowing_column_refs(item.expr.clone(), &inner_scope, outer_scope);
         }
@@ -2881,15 +2890,18 @@ impl<'a> AnalyzerContext<'a> {
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in &group_by_exprs {
+            self.check_control()?;
             match self.analyze_expr(gb_expr, &merged_scope) {
                 Ok(typed) => group_by.push(qualify_inner_shadowing_column_refs(
                     typed,
                     &inner_scope,
                     outer_scope,
                 )),
+                Err(error) if error.control_error().is_some() => return Err(error),
                 Err(_) => {
                     let mut alias_scope = merged_scope.clone();
                     for item in &projection {
+                        self.check_control()?;
                         alias_scope.add_column_with_id(
                             None,
                             &item.output_name,
@@ -2922,9 +2934,11 @@ impl<'a> AnalyzerContext<'a> {
                         &inner_scope,
                         outer_scope,
                     )),
+                    Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
                         let mut alias_scope = merged_scope.clone();
                         for item in &projection {
+                            self.check_control()?;
                             alias_scope.add_column_with_id(
                                 None,
                                 &item.output_name,
@@ -2966,6 +2980,7 @@ impl<'a> AnalyzerContext<'a> {
         if !nested_sqs.is_empty() {
             let mut mutable_inner = inner_scope.clone();
             for sq_info in nested_sqs {
+                self.check_control()?;
                 self.rewrite_single_subquery(&mut resolved_select, &mut mutable_inner, sq_info)?;
             }
         }
@@ -2989,6 +3004,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut extra_projection: Vec<ProjectItem> = Vec::new();
 
         for (idx, pred) in correlated_cols.iter().enumerate() {
+            self.check_control()?;
             let inner_col = &pred.inner_col;
             let outer_col = &pred.outer_col;
 
@@ -3047,11 +3063,13 @@ impl<'a> AnalyzerContext<'a> {
         let mut modified = resolved;
         if let QueryBody::Select(ref mut sel) = modified.body {
             for gb in &extra_group_by {
+                self.check_control()?;
                 sel.group_by.push(gb.clone());
             }
             sel.has_aggregation = true;
 
             for proj in &extra_projection {
+                self.check_control()?;
                 sel.projection.push(proj.clone());
             }
 
@@ -3061,6 +3079,7 @@ impl<'a> AnalyzerContext<'a> {
             }
         }
         for out_col in &extra_output {
+            self.check_control()?;
             modified.output_columns.push(out_col.clone());
         }
 
@@ -3088,6 +3107,7 @@ impl<'a> AnalyzerContext<'a> {
             scope.merge(outer_scope);
 
             for sq_info in nested_sqs {
+                self.check_control()?;
                 self.rewrite_single_subquery(sel, &mut scope, sq_info)?;
             }
         }
@@ -5459,6 +5479,7 @@ mod tests {
             &catalog,
             "default",
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         let QueryBody::Select(select) = resolved.body else {
@@ -5518,6 +5539,7 @@ mod tests {
                 &catalog,
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
             let QueryBody::Select(select) = resolved.body else {

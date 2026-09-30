@@ -173,7 +173,9 @@ impl<'a> super::AnalyzerContext<'a> {
         expr: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        self.check_control()?;
         let resolved = self.analyze_expr_impl(expr, scope)?;
+        self.check_control()?;
         if self.sql_semantics.sql_mode().decimal_overflow_policy()
             == novarocks_type_contract::DecimalOverflowPolicy::ReportError
         {
@@ -6546,6 +6548,7 @@ mod tests {
             catalog,
             "default",
             function_catalog,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .map_err(|error| error.to_string())?;
         let QueryBody::Select(select) = resolved.body else {
@@ -8136,6 +8139,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 &crate::sql_mode::SqlSemanticSettings::default()
                     .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode)),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .map(|(query, _, _)| query)
         }
@@ -8423,6 +8427,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 &crate::sql_mode::SqlSemanticSettings::default()
                     .with_decimal_overflow_to_double(enabled),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )?;
             let QueryBody::Select(select) = query.body else {
                 panic!("select");
@@ -8530,6 +8535,7 @@ mod tests {
                     "default",
                     crate::functions::builtin_sql_function_catalog(),
                     &crate::sql_mode::SqlSemanticSettings::default(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             (query, registry)
@@ -8667,6 +8673,7 @@ mod tests {
                     "default",
                     crate::functions::builtin_sql_function_catalog(),
                     &crate::sql_mode::SqlSemanticSettings::default(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             (query, registry)
@@ -8765,6 +8772,7 @@ mod tests {
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
                 &crate::sql_mode::SqlSemanticSettings::default(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap_err();
             assert!(

@@ -51,6 +51,29 @@ pub fn sql_cancellation_observation(
     Arc::new(QueryCancellationObservation::new(view))
 }
 
+struct ConnectorCancellationObservation {
+    stop: novarocks_spi::connector::ConnectorStopView,
+}
+
+impl SqlCancellationObservation for ConnectorCancellationObservation {
+    fn is_cancelled(&self) -> bool {
+        self.stop.is_stopped()
+    }
+}
+
+/// Project only the admitted request's existing deadline and stop authority.
+/// SQL compilation receives no Connector admission or storage capability.
+pub(crate) fn sql_compile_control_from_connector_request(
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> novarocks_sql::compiler::SqlCompileControl {
+    novarocks_sql::compiler::SqlCompileControl::new(
+        Some(context.deadline()),
+        Arc::new(ConnectorCancellationObservation {
+            stop: context.stop().clone(),
+        }),
+    )
+}
+
 #[allow(
     dead_code,
     reason = "Post-compile planning inputs remain explicit for target-gated native assembly callers."
@@ -69,4 +92,39 @@ pub(crate) struct PostCompilePlanningContext<'a> {
 pub(crate) struct QueryPlanningInputs<'a> {
     pub(crate) analyze_request: SqlAnalyzeRequest<'a>,
     pub(crate) post_compile: PostCompilePlanningContext<'a>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sql_compile_control_from_connector_request;
+    use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn connector_compile_projection_observes_the_same_stop_and_deadline() {
+        let stop = ConnectorStopOwner::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let context = ConnectorRequestContext::try_new(deadline, stop.view(), 1, 1).unwrap();
+        let control = sql_compile_control_from_connector_request(&context);
+        assert_eq!(control.deadline(), Some(deadline));
+        assert_eq!(control.checkpoint(CompilePhase::Validate, 0), Ok(()));
+        drop(context);
+        stop.request_stop();
+        assert_eq!(
+            control.checkpoint(CompilePhase::Validate, 256),
+            Err(CompileControlError::Cancelled)
+        );
+
+        let expired = Instant::now() - Duration::from_secs(1);
+        let context =
+            ConnectorRequestContext::try_new(expired, ConnectorStopOwner::new().view(), 1, 1)
+                .unwrap();
+        let control = sql_compile_control_from_connector_request(&context);
+        assert_eq!(control.deadline(), Some(expired));
+        assert_eq!(
+            control.checkpoint(CompilePhase::Validate, 0),
+            Err(CompileControlError::DeadlineExceeded)
+        );
+    }
 }

@@ -361,12 +361,16 @@ impl ViewEngine for FrontendViewEngine {
                 novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
                 self.catalog_application(),
             );
+        let control =
+            crate::query_execution::planning::sql_compile_control_from_connector_request(context);
         let columns = novarocks_sql::planning::catalog::analyze_view_query(
             query,
             &provider,
             database,
             self.function_catalog(),
-        )?
+            &control,
+        )
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|column| {
             Ok(ViewColumnDefinition {

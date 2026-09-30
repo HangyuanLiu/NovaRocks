@@ -43,10 +43,24 @@ impl<'a> super::AnalyzerContext<'a> {
         twj: &ast::TableWithJoins,
         outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
-        let (mut current_rel, mut current_scope) =
+        let (current_rel, current_scope) =
             self.analyze_table_factor_with_outer(&twj.relation, outer_scope)?;
+        self.analyze_joins_after_base(twj, current_rel, current_scope)
+    }
 
+    // Resolve the recursive base relation before creating join-tail locals.
+    // This separation must survive inlining so nested derived FROM clauses
+    // retain only the small dispatcher while their children are analyzed.
+    #[inline(never)]
+    fn analyze_joins_after_base(
+        &self,
+        twj: &ast::TableWithJoins,
+        mut current_rel: Relation,
+        mut current_scope: AnalyzerScope,
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        self.check_control()?;
         for join in &twj.joins {
+            self.check_control()?;
             let (right_rel, mut right_scope) =
                 self.analyze_table_factor_with_outer(&join.relation, Some(&current_scope))?;
 
@@ -76,6 +90,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     // child's scope.
                     let mut conds = Vec::new();
                     for col_obj in columns {
+                        self.check_control()?;
                         let col_name = col_obj.value.clone();
                         let (left_id, left_dt, left_nullable) = current_scope
                             .resolve(None, &col_name)
@@ -135,6 +150,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     } else {
                         let mut result = conds.pop().unwrap();
                         while let Some(prev) = conds.pop() {
+                            self.check_control()?;
                             result = TypedExpr {
                                 data_type: DataType::Boolean,
                                 nullable: false,
@@ -207,6 +223,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         {
                             let mut out = Vec::new();
                             for c in using_cols_ast {
+                                self.check_control()?;
                                 let name = c.value.clone();
                                 let name_lower = name.to_lowercase();
                                 let left_q = current_scope
@@ -269,6 +286,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         current_scope.apply_using_layout(&using_names, prefer_right);
                         if let Some(quals) = coalesce_quals {
                             for (col, l_q, r_q) in &quals {
+                                self.check_control()?;
                                 current_scope
                                     .register_full_outer_using_coalesce(
                                         self.function_catalog,
@@ -293,6 +311,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             // require equality, so the chained value is
                             // still correct.
                             for c in using_cols_ast {
+                                self.check_control()?;
                                 current_scope.clear_computed_column(&c.value);
                             }
                         }
@@ -459,11 +478,17 @@ impl<'a> super::AnalyzerContext<'a> {
                         // WITH definition; if multiple consumes shared them,
                         // downstream operators could not tell aliases apart
                         // (e.g. `cte a, cte b WHERE a.x=1 AND b.x=2`).
-                        let producer_column_ids: Vec<ColumnId> =
-                            producer_columns.iter().map(|col| col.column_id).collect();
+                        let producer_column_ids: Vec<ColumnId> = producer_columns
+                            .iter()
+                            .map(|col| {
+                                self.check_control()?;
+                                Ok(col.column_id)
+                            })
+                            .collect::<Result<Vec<_>, AnalyzeError>>()?;
                         let output_columns: Vec<OutputColumn> = producer_columns
                             .into_iter()
                             .map(|col| {
+                                self.check_control()?;
                                 let logical_type =
                                     self.factory.borrow().logical_type(col.column_id);
                                 let json_list = self
@@ -482,17 +507,18 @@ impl<'a> super::AnalyzerContext<'a> {
                                 self.factory
                                     .borrow_mut()
                                     .set_json_list_provenance(new_id, json_list);
-                                OutputColumn {
+                                Ok(OutputColumn {
                                     column_id: new_id,
                                     name: col.name,
                                     data_type: col.data_type,
                                     nullable: col.nullable,
                                     is_internal: false,
-                                }
+                                })
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, AnalyzeError>>()?;
                         let mut scope = self.new_scope();
                         for col in &output_columns {
+                            self.check_control()?;
                             scope.add_column_with_id(
                                 Some(&alias_name),
                                 &col.name,
@@ -577,6 +603,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 // equivalence specs remain valid across the alias boundary.
                 let mut scope = self.new_scope();
                 for col in &output_columns {
+                    self.check_control()?;
                     scope.add_column_with_id(
                         Some(&alias_name),
                         &col.name,
@@ -680,6 +707,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let mut scope = self.new_scope();
 
         for (idx, expr) in array_exprs.iter().enumerate() {
+            self.check_control()?;
             let typed = self.analyze_expr(expr, outer_scope)?;
             let DataType::List(item_field) = &typed.data_type else {
                 return Err(AnalyzeError::invalid_argument(
@@ -830,6 +858,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut end_v: Option<Option<i64>> = None;
             let mut step_v: Option<Option<i64>> = None;
             for arg in arguments {
+                self.check_control()?;
                 let Some((name, expr)) = generate_series_named_arg(arg) else {
                     return Err(AnalyzeError::invalid_argument(
                         "Unknown table function: generate_series",

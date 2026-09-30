@@ -513,20 +513,51 @@ impl SqlCompileControl {
     }
 
     pub(crate) fn check(&self) -> Result<(), SqlCompileError> {
+        novarocks_type_contract::PureCompileControl::checkpoint(
+            self,
+            novarocks_type_contract::CompilePhase::Validate,
+            0,
+        )
+        .map_err(Self::compile_error)
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn compile_error(error: novarocks_type_contract::CompileControlError) -> SqlCompileError {
+        match error {
+            novarocks_type_contract::CompileControlError::Cancelled => SqlCompileError::Cancelled,
+            novarocks_type_contract::CompileControlError::DeadlineExceeded => {
+                SqlCompileError::DeadlineExceeded
+            }
+            novarocks_type_contract::CompileControlError::ResourceExhausted => {
+                SqlCompileError::ResourceExhausted
+            }
+        }
+    }
+}
+
+impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
+    fn checkpoint(
+        &self,
+        _phase: novarocks_type_contract::CompilePhase,
+        _work_units: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        use novarocks_type_contract::CompileControlError;
+        // Request control observes the existing cancellation/deadline source.
+        // Structural/work admission remains with the operation's policy; no
+        // independent optimizer or constant-factory wallet is created here.
         if self.cancellation.is_cancelled() {
-            return Err(SqlCompileError::Cancelled);
+            return Err(CompileControlError::Cancelled);
         }
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(SqlCompileError::DeadlineExceeded);
+            return Err(CompileControlError::DeadlineExceeded);
         }
         Ok(())
-    }
-
-    pub const fn deadline(&self) -> Option<Instant> {
-        self.deadline
     }
 }
 
@@ -761,35 +792,38 @@ pub struct SqlMvRefreshAnalysisContext<'a> {
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
+    pub control: SqlCompileControl,
 }
 
 /// Analyze a prepared MV query without exposing analyzer nodes, CTE state, or
 /// the column-id factory to application code.
 pub fn analyze_mv_refresh_input(
     context: SqlMvRefreshAnalysisContext<'_>,
-) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> {
+) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, SqlCompileError> {
     let SqlMvRefreshAnalysisContext {
         query,
         current_database,
         catalog,
         functions,
+        control,
     } = context;
-    // The public MV-refresh facade still returns String while its frontend
-    // owner is outside SQLP-7. Keep the typed parser rejection intact until
-    // that boundary; no category is inferred from this message.
+    control.check()?;
+    // Keep typed analysis/control failures intact at the compiler boundary.
     crate::sql_mode::validate_persisted_query_semantics(
         &query,
         &crate::sql_mode::SqlSemanticSettings::default(),
-    )?;
+    )
+    .map_err(SqlCompileError::Compilation)?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
-        .map_err(|error| error.to_string())?;
+        .map_err(SqlCompileError::from)?;
     let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
         &query,
         catalog.planner_table_provider(),
         &current_database,
         functions,
+        &control,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(SqlCompileError::from)?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 
@@ -926,9 +960,19 @@ impl SqlCompileOutput {
 pub enum SqlCompileError {
     Cancelled,
     DeadlineExceeded,
+    ResourceExhausted,
     InvalidRequest(String),
     Analyze(AnalyzeError),
     Compilation(String),
+}
+
+impl From<AnalyzeError> for SqlCompileError {
+    fn from(error: AnalyzeError) -> Self {
+        match error.control_error() {
+            Some(error) => SqlCompileControl::compile_error(error),
+            None => Self::Analyze(error),
+        }
+    }
 }
 
 impl std::fmt::Display for SqlCompileError {
@@ -936,6 +980,7 @@ impl std::fmt::Display for SqlCompileError {
         match self {
             Self::Cancelled => f.write_str("SQL compilation was cancelled"),
             Self::DeadlineExceeded => f.write_str("SQL compilation deadline exceeded"),
+            Self::ResourceExhausted => f.write_str("SQL compilation resource budget was exhausted"),
             Self::InvalidRequest(error) | Self::Compilation(error) => f.write_str(error),
             Self::Analyze(error) => error.fmt(f),
         }
@@ -1029,8 +1074,9 @@ impl SqlCompiler {
                         &request.session.current_database,
                         functions,
                         &request.session.sql_semantics,
+                        &request.control,
                     )
-                    .map_err(SqlCompileError::Analyze)?;
+                    .map_err(SqlCompileError::from)?;
                 request.check_control()?;
                 let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
                     .map_err(SqlCompileError::Compilation)?;
@@ -1039,24 +1085,24 @@ impl SqlCompiler {
                         &request.session.sql_semantics,
                         &query,
                     )
-                    .map_err(SqlCompileError::Analyze)?
+                    .map_err(SqlCompileError::from)?
                         || crate::sql_mode::query_uses_decimal_overflow_to_double(
                             &request.session.sql_semantics,
                             &query,
                         )
-                        .map_err(SqlCompileError::Analyze)?
+                        .map_err(SqlCompileError::from)?
                         || crate::sql_mode::query_uses_error_if_overflow(
                             &request.session.sql_semantics,
                             &query,
                         )
-                        .map_err(SqlCompileError::Analyze)?;
+                        .map_err(SqlCompileError::from)?;
                 (
                     logical_plan,
                     factory,
                     false,
                     consumer_requires_semantic_snapshot,
                     crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
-                        .map_err(SqlCompileError::Analyze)?
+                        .map_err(SqlCompileError::from)?
                         .sql_mode()
                         .allow_throw_exception(),
                 )
@@ -1598,6 +1644,58 @@ mod tests {
         )
     }
 
+    #[test]
+    fn sql_request_control_is_the_pure_control_observation() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        let cancellation = Arc::new(Cancellation::default());
+        let request_control = control(None, &cancellation);
+        for units in [0, 256] {
+            request_control
+                .checkpoint(CompilePhase::FunctionSpecialization, units)
+                .unwrap();
+        }
+        cancellation.request();
+        assert_eq!(
+            request_control.checkpoint(CompilePhase::Validate, 256),
+            Err(CompileControlError::Cancelled)
+        );
+        assert_eq!(request_control.check(), Err(SqlCompileError::Cancelled));
+        let active = Arc::new(Cancellation::default());
+        let expired = control(Some(Instant::now() - Duration::from_secs(1)), &active);
+        assert_eq!(
+            expired.checkpoint(CompilePhase::Validate, 0),
+            Err(CompileControlError::DeadlineExceeded)
+        );
+        assert_eq!(expired.check(), Err(SqlCompileError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn analyzer_control_keeps_all_outer_categories_and_semantic_errors() {
+        use novarocks_type_contract::CompileControlError;
+        for (cause, expected) in [
+            (CompileControlError::Cancelled, SqlCompileError::Cancelled),
+            (
+                CompileControlError::DeadlineExceeded,
+                SqlCompileError::DeadlineExceeded,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                SqlCompileError::ResourceExhausted,
+            ),
+        ] {
+            let error = AnalyzeError::control(cause);
+            assert_eq!(error.control_error(), Some(cause));
+            assert!(error.span().is_none());
+            assert_eq!(SqlCompileError::from(error), expected);
+        }
+        let error = AnalyzeError::internal("ordinary analysis invariant");
+        assert_eq!(error.control_error(), None);
+        assert_eq!(
+            SqlCompileError::from(error.clone()),
+            SqlCompileError::Analyze(error)
+        );
+    }
+
     fn request(control: SqlCompileControl) -> SqlAnalyzeRequest<'static> {
         SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1"),
@@ -1982,13 +2080,14 @@ mod tests {
             current_database: "db".to_string(),
             catalog: &catalog,
             functions: &functions,
+            control: SqlCompileControl::unbounded(),
         })
         .err()
         .expect("unsupported persisted semantics");
-        assert!(error.starts_with("Unsupported:"));
-        assert!(error.contains("GROUP_CONCAT_LEGACY"));
+        assert!(error.to_string().starts_with("Unsupported:"));
+        assert!(error.to_string().contains("GROUP_CONCAT_LEGACY"));
         assert!(
-            !error.contains("missing_table"),
+            !error.to_string().contains("missing_table"),
             "guard precedes analyzer table materialization"
         );
     }
@@ -2026,6 +2125,7 @@ mod tests {
             current_database: "db".to_string(),
             catalog: &catalog,
             functions: &functions,
+            control: SqlCompileControl::unbounded(),
         })
         .expect("analyze MV query through opaque terminal");
 
@@ -2034,7 +2134,8 @@ mod tests {
         assert_eq!(facts.output_columns[0].name, "order_id");
         let _: fn(
             SqlMvRefreshAnalysisContext<'_>,
-        ) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> =
+        )
+            -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, SqlCompileError> =
             analyze_mv_refresh_input;
     }
 
@@ -2052,10 +2153,11 @@ mod tests {
             current_database: "db".to_string(),
             catalog: &catalog,
             functions: &functions,
+            control: SqlCompileControl::unbounded(),
         })
         .expect_err("unregistered MV table must not analyze");
         assert!(
-            error.contains("missing_orders"),
+            error.to_string().contains("missing_orders"),
             "missing-table error must retain SQL analyzer context: {error}"
         );
     }

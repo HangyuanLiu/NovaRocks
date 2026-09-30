@@ -324,6 +324,7 @@ pub fn analyze_mv_select_with_provider(
     current_database: &str,
     query: &novarocks_parser::ast::Query,
     functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
+    control: novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvAnalysis, String> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
@@ -334,8 +335,10 @@ pub fn analyze_mv_select_with_provider(
             current_database: current_database.to_string(),
             catalog: &catalog,
             functions,
+            control,
         },
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let output_columns = refresh_input.analysis_facts().output_columns;
     Ok(MvAnalysis {
         resolved_refs: prepared.resolved_refs().to_vec(),

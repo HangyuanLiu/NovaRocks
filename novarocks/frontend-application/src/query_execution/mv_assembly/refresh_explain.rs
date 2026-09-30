@@ -117,24 +117,11 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             catalog: &catalog,
             functions: ports.function_catalog().as_ref(),
             constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-            control: novarocks_sql::compiler::SqlCompileControl::new(
-                Some(connector_context.deadline()),
-                Arc::new(MvRefreshConnectorStopObservation {
-                    stop: connector_context.stop().clone(),
-                }),
+            control: crate::query_execution::planning::sql_compile_control_from_connector_request(
+                connector_context,
             ),
             level,
         },
     )
     .map_err(|error| error.to_string())
-}
-
-struct MvRefreshConnectorStopObservation {
-    stop: novarocks_spi::connector::ConnectorStopView,
-}
-
-impl novarocks_sql::compiler::SqlCancellationObservation for MvRefreshConnectorStopObservation {
-    fn is_cancelled(&self) -> bool {
-        self.stop.is_stopped()
-    }
 }

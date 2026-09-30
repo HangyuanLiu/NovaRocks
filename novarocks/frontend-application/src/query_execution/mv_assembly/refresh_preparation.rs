@@ -266,6 +266,9 @@ fn build_aggregate_layout_for_refresh_select_sql(
         current_database,
         &visible_query,
         ports.function_catalog().as_ref(),
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        ),
     )?;
     let facts = visible_analysis
         .refresh_input
@@ -593,6 +596,9 @@ fn prepare_managed_repartition_transition(
         current_database,
         &query,
         source.function_catalog().as_ref(),
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        ),
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
     if derive_fragment_property(&analysis)?.is_composed_aggregate_schema_contract_fallback() {

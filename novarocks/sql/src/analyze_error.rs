@@ -133,6 +133,7 @@ pub struct AnalyzeError {
     kind: AnalyzeErrorKind,
     message: String,
     span: Option<Span>,
+    control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl AnalyzeError {
@@ -141,6 +142,7 @@ impl AnalyzeError {
             kind,
             message: message.into(),
             span: Some(span),
+            control: None,
         }
     }
 
@@ -187,7 +189,23 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: message.into(),
             span: None,
+            control: None,
         }
+    }
+
+    /// Preserve outer compilation control across the analyzer boundary.
+    /// Compiler callers extract this category before user-error projection.
+    pub fn control(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self {
+            kind: AnalyzeErrorKind::Internal,
+            message: error.to_string(),
+            span: None,
+            control: Some(error),
+        }
+    }
+
+    pub const fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.control
     }
 
     pub const fn kind(&self) -> AnalyzeErrorKind {

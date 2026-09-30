@@ -155,7 +155,7 @@ impl SqlFinalPlanCompileRequest {
             super::parse_query(&statement)?,
             &session.sql_semantics,
         )
-        .map_err(SqlCompileError::Analyze)?;
+        .map_err(SqlCompileError::from)?;
         let common = FinalPlanCommon {
             version,
             intent,
@@ -173,17 +173,17 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_uses_group_concat_legacy(&common.session.sql_semantics, &query)
-                .map_err(SqlCompileError::Analyze)?
+                .map_err(SqlCompileError::from)?
                 || crate::sql_mode::query_uses_decimal_overflow_to_double(
                     &common.session.sql_semantics,
                     &query,
                 )
-                .map_err(SqlCompileError::Analyze)?
+                .map_err(SqlCompileError::from)?
                 || crate::sql_mode::query_uses_error_if_overflow(
                     &common.session.sql_semantics,
                     &query,
                 )
-                .map_err(SqlCompileError::Analyze)?;
+                .map_err(SqlCompileError::from)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
         let initial_catalog = CatalogCompletionState::try_new(

@@ -3153,6 +3153,7 @@ pub(crate) fn analyze_candidates(
             definition,
             &candidate_factory,
             functions,
+            control,
         ) {
             Ok(Some(candidate)) => {
                 candidate_factory = candidate.factory_after_analysis.clone();
@@ -3160,6 +3161,11 @@ pub(crate) fn analyze_candidates(
                 entries.push(SqlMvRewriteAnalysisEntry::Candidate(candidate));
             }
             Ok(None) => entries.push(SqlMvRewriteAnalysisEntry::Ignored),
+            Err(
+                error @ (crate::compiler::SqlCompileError::Cancelled
+                | crate::compiler::SqlCompileError::DeadlineExceeded
+                | crate::compiler::SqlCompileError::ResourceExhausted),
+            ) => return Err(error),
             Err(error) => entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(
                 SqlMvRewriteDiagnostic {
                     mv_id: Some(definition.mv_id),
@@ -3220,8 +3226,10 @@ fn build_candidate(
     definition: &MvRewriteDefinition,
     factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
-) -> Result<Option<AnalyzedMvRewriteCandidate>, String> {
-    if !definition_is_fresh(definition)? {
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<Option<AnalyzedMvRewriteCandidate>, crate::compiler::SqlCompileError> {
+    use crate::compiler::SqlCompileError;
+    if !definition_is_fresh(definition).map_err(SqlCompileError::Compilation)? {
         return Ok(None);
     }
 
@@ -3235,17 +3243,22 @@ fn build_candidate(
         &definition.resolution.default_namespace,
         factory.clone(),
         functions,
+        control,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(SqlCompileError::from)?;
     let mut returned = returned;
-    let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned)?;
-    validate_definition_sources(&mv_logical, &definition.sources)?;
+    let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned)
+        .map_err(SqlCompileError::Compilation)?;
+    validate_definition_sources(&mv_logical, &definition.sources)
+        .map_err(SqlCompileError::Compilation)?;
     let mut mv_scalars = crate::optimizer::scalar::ScalarArena::new();
     let mv_opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &mv_logical,
         &mut mv_scalars,
-    )?;
-    let mv = SpjgDescriptor::from_opt_expr(&mv_opt_expr, &mut mv_scalars)?;
+    )
+    .map_err(SqlCompileError::Compilation)?;
+    let mv = SpjgDescriptor::from_opt_expr(&mv_opt_expr, &mut mv_scalars)
+        .map_err(SqlCompileError::Compilation)?;
     if mv.joins.is_some() {
         return Ok(None);
     }
@@ -3257,15 +3270,16 @@ fn build_candidate(
         .iter()
         .any(|source| source.table.fqn() == scan_fqn)
     {
-        return Err(format!(
+        return Err(SqlCompileError::Compilation(format!(
             "mv select resolved to {scan_fqn}, not in recorded base refs"
-        ));
+        )));
     }
     let Some(target) = &definition.target else {
         return Ok(None);
     };
     let target_table = analyzer_catalog
-        .resolve_table_for_analysis(Some(&target.catalog), &target.namespace, &target.table)?
+        .resolve_table_for_analysis(Some(&target.catalog), &target.namespace, &target.table)
+        .map_err(SqlCompileError::Compilation)?
         .planner;
     let mut names = mv
         .outputs
@@ -3661,6 +3675,7 @@ mod tests {
             catalog,
             "db",
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("analyze main query");
         let logical =
@@ -3860,7 +3875,8 @@ mod tests {
                 "another_database",
                 &definition,
                 &ColumnRefFactory::new(),
-                crate::functions::builtin_sql_function_catalog()
+                crate::functions::builtin_sql_function_catalog(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
             .is_some()

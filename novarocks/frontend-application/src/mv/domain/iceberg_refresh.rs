@@ -948,6 +948,9 @@ fn prepare_iceberg_mv_create_with_ports(
         current_database,
         &canonical_select_query,
         ports.function_catalog().as_ref(),
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        ),
     )?;
     let refresh_contract = derive_imv_refresh_contract(&analysis)?;
     let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());

@@ -97,6 +97,7 @@ pub(crate) fn analyze(
         catalog,
         current_database,
         crate::functions::builtin_sql_function_catalog(),
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
 
@@ -107,6 +108,7 @@ pub(crate) fn analyze_with_function_catalog(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -121,6 +123,7 @@ pub(crate) fn analyze_with_function_catalog(
         current_database,
         crate::column_id::ColumnRefFactory::new(),
         function_catalog,
+        control,
     )
 }
 
@@ -131,6 +134,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -146,6 +150,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
         crate::column_id::ColumnRefFactory::new(),
         function_catalog,
         sql_semantics,
+        control,
     )
 }
 
@@ -163,6 +168,7 @@ pub(crate) fn analyze_with_factory(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -177,6 +183,7 @@ pub(crate) fn analyze_with_factory(
         current_database,
         factory,
         crate::functions::builtin_sql_function_catalog(),
+        control,
     )
 }
 
@@ -188,6 +195,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -203,6 +211,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         factory,
         function_catalog,
         &crate::sql_mode::SqlSemanticSettings::default(),
+        control,
     )
 }
 
@@ -213,6 +222,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -221,6 +231,12 @@ fn analyze_with_factory_and_function_catalog_inner(
     ),
     AnalyzeError,
 > {
+    novarocks_type_contract::PureCompileControl::checkpoint(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+        0,
+    )
+    .map_err(AnalyzeError::control)?;
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze(query)?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
@@ -228,6 +244,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         catalog,
         current_database,
         function_catalog,
+        control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
@@ -238,6 +255,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
     };
     let resolved = ctx.analyze_query(&query)?;
+    ctx.check_control()?;
     let registry = ctx.cte_registry.into_inner();
     let col_factory = std::rc::Rc::try_unwrap(factory)
         .map(|cell| cell.into_inner())
@@ -250,6 +268,7 @@ fn analyze_with_factory_and_function_catalog_inner(
 // ---------------------------------------------------------------------------
 
 pub(super) struct AnalyzerContext<'a> {
+    pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
@@ -274,6 +293,15 @@ pub(super) struct AnalyzerContext<'a> {
 }
 
 impl<'a> AnalyzerContext<'a> {
+    pub(super) fn check_control(&self) -> Result<(), AnalyzeError> {
+        novarocks_type_contract::PureCompileControl::checkpoint(
+            self.control,
+            novarocks_type_contract::CompilePhase::Validate,
+            0,
+        )
+        .map_err(AnalyzeError::control)
+    }
+
     fn with_sql_semantics_scope<T>(
         &self,
         settings: crate::sql_mode::SqlSemanticSettings,
@@ -283,6 +311,7 @@ impl<'a> AnalyzerContext<'a> {
             return analyze(self);
         }
         let child = AnalyzerContext {
+            control: self.control,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -351,14 +380,13 @@ impl<'a> AnalyzerContext<'a> {
         with_clause: &ast::With,
     ) -> Result<(AnalyzerContext<'a>, Vec<crate::analysis::cte::CteId>), AnalyzeError> {
         let mut pending_ctes = self.pending_ctes.clone();
-        pending_ctes.extend(
-            with_clause
-                .ctes
-                .iter()
-                .map(|cte| cte.name.value.to_lowercase()),
-        );
+        for cte in &with_clause.ctes {
+            self.check_control()?;
+            pending_ctes.insert(cte.name.value.to_lowercase());
+        }
 
         let mut child_ctx = AnalyzerContext {
+            control: self.control,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -374,6 +402,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut local_cte_ids = Vec::with_capacity(with_clause.ctes.len());
 
         for cte in &with_clause.ctes {
+            self.check_control()?;
             let name = cte.name.value.to_lowercase();
             pending_ctes.remove(&name);
             child_ctx.pending_ctes = pending_ctes.clone();
@@ -381,12 +410,16 @@ impl<'a> AnalyzerContext<'a> {
             let col_aliases: Vec<String> = cte
                 .columns
                 .iter()
-                .map(|ident| ident.value.clone())
-                .collect();
+                .map(|ident| {
+                    self.check_control()?;
+                    Ok(ident.value.clone())
+                })
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
 
             let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
             if !col_aliases.is_empty() {
                 for (idx, alias_name) in col_aliases.iter().enumerate() {
+                    self.check_control()?;
                     if let Some(col) = resolved_cte.output_columns.get_mut(idx) {
                         col.name = alias_name.clone();
                     }
@@ -409,6 +442,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Top-level query analysis.
     fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, AnalyzeError> {
+        self.check_control()?;
         let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
         self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_query_in_semantic_scope(query))
     }
@@ -493,6 +527,7 @@ impl<'a> AnalyzerContext<'a> {
             let mut pending = vec![set_expr];
             let mut operands = Vec::new();
             while let Some(current) = pending.pop() {
+                self.check_control()?;
                 match current {
                     ast::SetExpr::SetOperation(operation)
                         if operation.operator == ast::SetOperator::Union
@@ -508,19 +543,21 @@ impl<'a> AnalyzerContext<'a> {
             let operations = operands
                 .into_iter()
                 .map(|right| {
-                    (
+                    self.check_control()?;
+                    Ok((
                         ast::SetOperator::Union,
                         ast::SetQuantifier::All,
                         right,
                         set_expr.span(),
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
             (first, operations)
         } else {
             let mut operations = Vec::new();
             let mut leftmost = set_expr;
             while let ast::SetExpr::SetOperation(operation) = leftmost {
+                self.check_control()?;
                 operations.push((
                     operation.operator,
                     operation.quantifier,
@@ -534,6 +571,7 @@ impl<'a> AnalyzerContext<'a> {
         };
         let mut left_query = self.analyze_set_operand(leftmost)?;
         for (operator, quantifier, right, span) in operations {
+            self.check_control()?;
             let right_query = self.analyze_set_operand(right)?;
             let left_cols = &left_query.output_columns;
             let right_cols = &right_query.output_columns;
@@ -549,6 +587,7 @@ impl<'a> AnalyzerContext<'a> {
             }
             let mut output_cols = Vec::with_capacity(left_cols.len());
             for (lc, rc) in left_cols.iter().zip(right_cols) {
+                self.check_control()?;
                 let dt = wider_type(&lc.data_type, &rc.data_type);
                 let column_id = self.alloc_column_id(
                     None,
@@ -637,6 +676,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut column_types: Vec<DataType> = Vec::new();
 
         for row in &values.rows {
+            self.check_control()?;
             let mut resolved_row = Vec::with_capacity(row.len());
             for (col_idx, expr) in row.iter().enumerate() {
                 let typed = self.analyze_expr(expr, &scope)?;
@@ -654,6 +694,7 @@ impl<'a> AnalyzerContext<'a> {
             .iter()
             .enumerate()
             .map(|(i, dt)| {
+                self.check_control()?;
                 let name = format!("column_{i}");
                 let column_id = self.alloc_column_id(None, name.clone(), dt.clone(), true);
                 let mut all_json = true;
@@ -661,6 +702,7 @@ impl<'a> AnalyzerContext<'a> {
                 let mut all_json_list = true;
                 let mut saw_json_list = false;
                 for (source_row, typed_row) in values.rows.iter().zip(&resolved_rows) {
+                    self.check_control()?;
                     let (Some(source), Some(typed)) = (source_row.get(i), typed_row.get(i)) else {
                         all_json = false;
                         all_json_list = false;
@@ -691,15 +733,15 @@ impl<'a> AnalyzerContext<'a> {
                 self.factory
                     .borrow_mut()
                     .set_json_list_provenance(column_id, all_json_list && saw_json_list);
-                OutputColumn {
+                Ok(OutputColumn {
                     column_id,
                     name,
                     data_type: dt.clone(),
                     nullable: true,
                     is_internal: false,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnalyzeError>>()?;
 
         Ok((
             ResolvedValues {
@@ -752,6 +794,18 @@ impl<'a> AnalyzerContext<'a> {
             (Some(current_rel), current_scope)
         };
 
+        self.analyze_select_after_from(select, from, scope)
+    }
+
+    // Keep the SELECT tail out of the recursive FROM-dispatch frame. Nested
+    // derived relations finish resolving before these large locals exist.
+    #[inline(never)]
+    fn analyze_select_after_from(
+        &self,
+        select: &ast::Select,
+        from: Option<Relation>,
+        scope: AnalyzerScope,
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- WHERE clause ---
         let filter = match &select.selection {
             Some(expr) => Some(super::analyzer::subquery_rewrite::coerce_where_to_bool(
@@ -839,6 +893,7 @@ impl<'a> AnalyzerContext<'a> {
                     }
                     group_by.push(typed);
                 }
+                Err(error) if error.control_error().is_some() => return Err(error),
                 Err(_) => {
                     // Try SELECT aliases: GROUP BY alias_name
                     let mut alias_scope = scope.clone();
@@ -891,10 +946,12 @@ impl<'a> AnalyzerContext<'a> {
                 let analyzed = self.analyze_expr(expr, &scope);
                 match analyzed {
                     Ok(h) => Some(h),
+                    Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
                         // Maybe references a SELECT alias — build alias scope
                         let mut alias_scope = scope.clone();
                         for item in &projection {
+                            self.check_control()?;
                             alias_scope.add_column(
                                 None,
                                 &item.output_name,
@@ -1643,6 +1700,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut effective_scope = scope.clone();
 
         for item in items {
+            self.check_control()?;
             match item {
                 ast::SelectItem::UnnamedExpr(expr) => {
                     let typed = self.analyze_expr(expr, &effective_scope)?;
@@ -1738,6 +1796,7 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 ast::SelectItem::Wildcard { .. } => {
                     for (qualifier, col_name, col_id, data_type, nullable) in scope.iter_columns() {
+                        self.check_control()?;
                         // FULL OUTER USING columns are exposed as a synthetic
                         // `COALESCE(left.col, right.col)` expression. SELECT *
                         // expansion must use that expression instead of the
@@ -1799,6 +1858,7 @@ impl<'a> AnalyzerContext<'a> {
                             .flatten(),
                         )
                     {
+                        self.check_control()?;
                         found = true;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
@@ -1849,11 +1909,13 @@ impl<'a> AnalyzerContext<'a> {
         let mut output_columns = Vec::new();
 
         for item in items {
+            self.check_control()?;
             match item {
                 ast::SelectItem::Wildcard { .. } => {
                     for (qualifier, col_name, col_id, data_type, nullable) in
                         wildcard_scope.iter_columns()
                     {
+                        self.check_control()?;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
                                 column_id: *col_id,
@@ -2234,6 +2296,7 @@ impl<'a> AnalyzerContext<'a> {
                                     typed
                                 }
                             }
+                            Err(error) if error.control_error().is_some() => return Err(error),
                             Err(proj_err) => {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
@@ -2241,6 +2304,9 @@ impl<'a> AnalyzerContext<'a> {
                                         match self.analyze_expr(&ob.expr, &from_scope) {
                                             Ok(typed) => self
                                                 .substitute_select_aliases(typed, &sel.projection),
+                                            Err(error) if error.control_error().is_some() => {
+                                                return Err(error);
+                                            }
                                             Err(_) => {
                                                 let mut alias_scope = from_scope.clone();
                                                 for item in &sel.projection {
@@ -2262,6 +2328,11 @@ impl<'a> AnalyzerContext<'a> {
                                                         typed,
                                                         &sel.projection,
                                                     ),
+                                                    Err(error)
+                                                        if error.control_error().is_some() =>
+                                                    {
+                                                        return Err(error);
+                                                    }
                                                     Err(_) => return Err(proj_err),
                                                 }
                                             }
@@ -3236,6 +3307,179 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
+
+    struct AnalysisObservation {
+        checks: std::sync::atomic::AtomicUsize,
+        cancel_at: usize,
+    }
+    impl crate::compiler::SqlCancellationObservation for AnalysisObservation {
+        fn is_cancelled(&self) -> bool {
+            self.checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                >= self.cancel_at
+        }
+    }
+
+    #[test]
+    fn request_control_is_observed_inside_cte_subquery_and_lambda_analysis() {
+        for sql in [
+            "WITH c AS (SELECT 1 AS k) SELECT k + 2 FROM c",
+            "SELECT (SELECT 1) + 2",
+            "SELECT array_map(x -> x + 1, [1, 2])",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let active = std::sync::Arc::new(AnalysisObservation {
+                checks: std::sync::atomic::AtomicUsize::new(0),
+                cancel_at: usize::MAX,
+            });
+            let control = crate::compiler::SqlCompileControl::new(None, active.clone());
+            analyze_with_function_catalog(
+                &query,
+                &TestCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &control,
+            )
+            .unwrap();
+            let checks = active.checks.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                checks > 4,
+                "actual nested expression work must observe request control: {sql}"
+            );
+            let cancel = std::sync::Arc::new(AnalysisObservation {
+                checks: std::sync::atomic::AtomicUsize::new(0),
+                cancel_at: checks / 2,
+            });
+            let control = crate::compiler::SqlCompileControl::new(None, cancel.clone());
+            let error = analyze_with_function_catalog(
+                &query,
+                &TestCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.control_error(),
+                Some(novarocks_type_contract::CompileControlError::Cancelled)
+            );
+            assert_eq!(
+                crate::compiler::SqlCompileError::from(error),
+                crate::compiler::SqlCompileError::Cancelled
+            );
+            assert_eq!(
+                cancel.checks.load(std::sync::atomic::Ordering::SeqCst),
+                checks / 2 + 1,
+                "control failure must not retry lexical scopes"
+            );
+        }
+    }
+
+    fn successful_analysis_checks(sql: &str) -> usize {
+        let query = parse_native_query(sql).unwrap();
+        let observation = std::sync::Arc::new(AnalysisObservation {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at: usize::MAX,
+        });
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        analyze_with_function_catalog(
+            &query,
+            &TestCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap();
+        observation.checks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn assert_analysis_stops_at_cancel(sql: &str, cancel_at: usize) {
+        let query = parse_native_query(sql).unwrap();
+        let observation = std::sync::Arc::new(AnalysisObservation {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at,
+        });
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        let error = analyze_with_function_catalog(
+            &query,
+            &TestCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.control_error(),
+            Some(novarocks_type_contract::CompileControlError::Cancelled)
+        );
+        assert_eq!(
+            observation.checks.load(std::sync::atomic::Ordering::SeqCst),
+            cancel_at + 1,
+            "typed cancellation must leave analysis without another observation"
+        );
+    }
+
+    #[test]
+    fn having_control_failure_does_not_retry_the_select_alias_scope() {
+        let prefix_checks = successful_analysis_checks("SELECT 1 AS total");
+        let sql = "SELECT 1 AS total HAVING total > 0";
+        assert!(successful_analysis_checks(sql) > prefix_checks);
+        // The prefix's final checkpoint is replaced by the first HAVING
+        // expression checkpoint. This reaches HAVING itself, before its
+        // legitimate name-resolution failure can trigger alias substitution.
+        assert_analysis_stops_at_cancel(sql, prefix_checks - 1);
+    }
+
+    #[test]
+    fn wide_qualified_wildcard_observes_control_during_column_expansion() {
+        let columns = (0..320)
+            .map(|index| format!("1 AS c{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let from = format!("FROM (SELECT {columns}) AS w");
+        let narrow_checks = successful_analysis_checks(&format!("SELECT 1 {from}"));
+        let sql = format!("SELECT w.* {from}");
+        let checks = successful_analysis_checks(&sql);
+        assert!(checks >= narrow_checks + 256);
+        // All derived-column expressions have completed; the remaining tail
+        // is the actual qualified wildcard expansion and final checkpoints.
+        assert_analysis_stops_at_cancel(&sql, checks - 128);
+    }
+
+    #[test]
+    fn values_rectangular_provenance_pass_observes_control_between_cells() {
+        let row = format!("({})", vec!["1"; 16].join(", "));
+        let sql = format!("VALUES {}", vec![row; 40].join(", "));
+        let checks = successful_analysis_checks(&sql);
+        assert!(checks > 16 * 40);
+        // After expression analysis, the provenance pass examines the full
+        // rectangle again. Cancellation here exercises that pass's own
+        // observation rather than a literal-expression checkpoint.
+        assert_analysis_stops_at_cancel(&sql, checks - 128);
+    }
+
+    #[test]
+    fn analyzed_products_do_not_retain_the_borrowed_request_control() {
+        let observation = std::sync::Arc::new(AnalysisObservation {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at: usize::MAX,
+        });
+        let weak = std::sync::Arc::downgrade(&observation);
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        let query = parse_native_query("SELECT 1").unwrap();
+        let products = analyze_with_function_catalog(
+            &query,
+            &TestCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap();
+        drop(control);
+        drop(observation);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(products.0.output_columns.len(), 1);
+    }
 
     fn sql_test_scan_source(
         catalog: &str,
@@ -6415,8 +6659,14 @@ mod tests {
         assert_eq!(factory.peek_next_id(), 4);
 
         let query = parse_native_query("SELECT 1 + 1 AS x").expect("parse");
-        let (_resolved, _ctes, out_factory) =
-            analyze_with_factory(&query, &TestCatalog, "db", factory).expect("analyze");
+        let (_resolved, _ctes, out_factory) = analyze_with_factory(
+            &query,
+            &TestCatalog,
+            "db",
+            factory,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("analyze");
         // The analysis must have allocated its ids on top of the seeded ones.
         assert!(out_factory.peek_next_id() > 4);
         assert_eq!(out_factory.get(crate::column_id::ColumnId(1)).name, "seed0");

@@ -319,6 +319,7 @@ pub enum FinalPlanCompletionError {
         reason: Arc<str>,
     },
     DeadlineExceeded,
+    ResourceExhausted,
     Compiler {
         message: Arc<str>,
     },
@@ -357,6 +358,9 @@ impl fmt::Display for FinalPlanCompletionError {
             Self::DeadlineExceeded => {
                 formatter.write_str("final plan completion deadline exceeded")
             }
+            Self::ResourceExhausted => {
+                formatter.write_str("final plan completion resource budget was exhausted")
+            }
             Self::Analyze { error } => error.fmt(formatter),
         }
     }
@@ -385,6 +389,9 @@ fn compiler_error(error: novarocks_sql::compiler::SqlCompileError) -> FinalPlanC
         }
         novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
             FinalPlanCompletionError::DeadlineExceeded
+        }
+        novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+            FinalPlanCompletionError::ResourceExhausted
         }
         novarocks_sql::compiler::SqlCompileError::Analyze(error) => {
             FinalPlanCompletionError::Analyze { error }
@@ -423,6 +430,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn compiler_control_errors_keep_their_completion_category() {
+        use novarocks_sql::compiler::SqlCompileError;
+        assert!(matches!(
+            compiler_error(SqlCompileError::Cancelled),
+            FinalPlanCompletionError::Cancelled { .. }
+        ));
+        assert_eq!(
+            compiler_error(SqlCompileError::DeadlineExceeded),
+            FinalPlanCompletionError::DeadlineExceeded
+        );
+        assert_eq!(
+            compiler_error(SqlCompileError::ResourceExhausted),
+            FinalPlanCompletionError::ResourceExhausted
+        );
+    }
 
     struct NoFactSource {
         calls: AtomicUsize,
