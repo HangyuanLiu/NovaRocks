@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use novarocks_connector_contract::{
-    ConnectorWriteRecipeDraft, FrozenConnectorScan, WriteTargetOrdinal,
+    ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal,
 };
 use novarocks_type_contract::{SemanticParameterError, SemanticParameterRef, SemanticParameters};
 
@@ -44,7 +44,7 @@ pub struct FragmentPackageInput {
     pub parameters: SemanticParameters,
     /// Additional provider public facts paired with exact physical scan nodes.
     /// The recipe is a structurally checked draft, not a capability proof.
-    pub scans: BTreeMap<NodeId, FrozenConnectorScan>,
+    pub scans: BTreeMap<NodeId, FrozenConnectorRead>,
     pub writes: BTreeMap<NodeId, ConnectorWriteRecipeDraft>,
     pub annotations: Box<[PlanAnnotation]>,
 }
@@ -82,7 +82,7 @@ impl FragmentPackage {
         &self.0.parameters
     }
 
-    pub fn scans(&self) -> &BTreeMap<NodeId, FrozenConnectorScan> {
+    pub fn scans(&self) -> &BTreeMap<NodeId, FrozenConnectorRead> {
         &self.0.scans
     }
 
@@ -104,7 +104,7 @@ impl FragmentPackage {
 /// is indexed once for all fragments; each output uses the BE constructor.
 pub fn extract_fragment_packages(
     plan: &PhysicalPlan,
-    scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorScan>,
+    scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
     parameters: &SemanticParameters,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {

@@ -100,6 +100,14 @@ impl StaticScanDynamicFilter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorScan<R> {
     recipe: R,
+    facts: Arc<ConnectorScanFacts>,
+    retained_bytes: usize,
+}
+
+// Validated once. Provider canonicalization shares these immutable public
+// facts instead of cloning/revalidating predicate and expression trees.
+#[derive(Debug, Eq, PartialEq)]
+struct ConnectorScanFacts {
     assignments: Arc<[StaticScanAssignment]>,
     enforced_predicate: TupleDomain<ScanColumnId>,
     unenforced_predicate: TupleDomain<ScanColumnId>,
@@ -108,7 +116,6 @@ pub struct ConnectorScan<R> {
     max_batch_rows: NonZeroU64,
     max_batch_bytes: NonZeroU64,
     work_source: ConnectorReadWorkSource,
-    retained_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,7 +241,13 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
         {
             return Err(StaticConnectorScanError::WholeRelationRequiresSystemTable);
         }
-        let mut retained = recipe.as_ref().charged_bytes();
+        let mut retained = recipe
+            .as_ref()
+            .charged_bytes()
+            .checked_add(
+                std::mem::size_of::<ConnectorScanFacts>() + 2 * std::mem::size_of::<usize>(),
+            )
+            .ok_or(StaticConnectorScanError::TooManyRetainedBytes)?;
         let assignment_bytes = assignments
             .iter()
             .try_fold(0usize, |total, assignment| {
@@ -269,14 +282,16 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
         }
         Ok(Self {
             recipe,
-            assignments: Arc::from(assignments),
-            enforced_predicate,
-            unenforced_predicate,
-            remaining_expression,
-            dynamic_filters: Arc::from(dynamic_filters),
-            max_batch_rows,
-            max_batch_bytes,
-            work_source,
+            facts: Arc::new(ConnectorScanFacts {
+                assignments: assignments.into_boxed_slice().into(),
+                enforced_predicate,
+                unenforced_predicate,
+                remaining_expression: remaining_expression.as_ref().map(owned_expression),
+                dynamic_filters: dynamic_filters.into_boxed_slice().into(),
+                max_batch_rows,
+                max_batch_bytes,
+                work_source,
+            }),
             retained_bytes: retained,
         })
     }
@@ -286,41 +301,102 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
     }
 
     pub fn assignments(&self) -> &[StaticScanAssignment] {
-        &self.assignments
+        &self.facts.assignments
     }
 
-    pub const fn enforced_predicate(&self) -> &TupleDomain<ScanColumnId> {
-        &self.enforced_predicate
+    pub fn enforced_predicate(&self) -> &TupleDomain<ScanColumnId> {
+        &self.facts.enforced_predicate
     }
 
-    pub const fn unenforced_predicate(&self) -> &TupleDomain<ScanColumnId> {
-        &self.unenforced_predicate
+    pub fn unenforced_predicate(&self) -> &TupleDomain<ScanColumnId> {
+        &self.facts.unenforced_predicate
     }
 
-    pub const fn remaining_expression(&self) -> Option<&ConnectorExpression> {
-        self.remaining_expression.as_ref()
+    pub fn remaining_expression(&self) -> Option<&ConnectorExpression> {
+        self.facts.remaining_expression.as_ref()
     }
 
     pub fn dynamic_filters(&self) -> &[StaticScanDynamicFilter] {
-        &self.dynamic_filters
+        &self.facts.dynamic_filters
     }
 
-    pub const fn max_batch_rows(&self) -> NonZeroU64 {
-        self.max_batch_rows
+    pub fn max_batch_rows(&self) -> NonZeroU64 {
+        self.facts.max_batch_rows
     }
 
-    pub const fn max_batch_bytes(&self) -> NonZeroU64 {
-        self.max_batch_bytes
+    pub fn max_batch_bytes(&self) -> NonZeroU64 {
+        self.facts.max_batch_bytes
     }
 
-    pub const fn work_source(&self) -> ConnectorReadWorkSource {
-        self.work_source
+    pub fn work_source(&self) -> ConnectorReadWorkSource {
+        self.facts.work_source
     }
 
     /// The checked conservative charge computed from these frozen facts.
     /// A containing package must still enforce its cumulative budget.
-    pub const fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+}
+
+impl FrozenConnectorScan {
+    /// The caller first checks exact canonical public headers. Only private
+    /// recipe bytes change; validated public backing remains shared.
+    pub(crate) fn try_replace_private_recipe(
+        &self,
+        recipe: ConnectorReadRelationRecipeDraft,
+    ) -> Result<Self, StaticConnectorScanError> {
+        let retained_bytes = self
+            .retained_bytes
+            .checked_sub(self.recipe.charged_bytes())
+            .and_then(|bytes| bytes.checked_add(recipe.charged_bytes()))
+            .ok_or(StaticConnectorScanError::TooManyRetainedBytes)?;
+        if retained_bytes > MAX_STATIC_SCAN_RETAINED_BYTES {
+            return Err(StaticConnectorScanError::TooManyRetainedBytes);
+        }
+        Ok(Self {
+            recipe,
+            facts: self.facts.clone(),
+            retained_bytes,
+        })
+    }
+}
+
+// Node/depth and cumulative byte preflight precede this bounded recursive copy.
+// In particular, a Call must not retain an input Vec's unused capacity.
+fn owned_expression(expression: &ConnectorExpression) -> ConnectorExpression {
+    match expression {
+        ConnectorExpression::Constant { value, value_type } => ConnectorExpression::Constant {
+            value: value.clone(),
+            value_type: *value_type,
+        },
+        ConnectorExpression::Variable { name, value_type } => ConnectorExpression::Variable {
+            name: name.clone(),
+            value_type: *value_type,
+        },
+        ConnectorExpression::FieldDereference {
+            target,
+            field_index,
+            value_type,
+        } => ConnectorExpression::FieldDereference {
+            target: Box::new(owned_expression(target)),
+            field_index: *field_index,
+            value_type: *value_type,
+        },
+        ConnectorExpression::Call {
+            function,
+            value_type,
+            arguments,
+        } => ConnectorExpression::Call {
+            function: function.clone(),
+            value_type: *value_type,
+            arguments: arguments
+                .iter()
+                .map(owned_expression)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .into_vec(),
+        },
     }
 }
 
@@ -436,6 +512,39 @@ mod tests {
         )
         .unwrap();
         ConnectorReadRelationRecipe::try_compile_with_provider(&draft, &IdentityCompiler).unwrap()
+    }
+
+    #[test]
+    fn frozen_expression_trims_unused_call_capacity() {
+        let mut arguments = Vec::with_capacity(100_000);
+        arguments.push(ConnectorExpression::constant_true());
+        let scan = FrozenConnectorScan::try_new(
+            recipe().draft().clone(),
+            vec![StaticScanAssignment::new(
+                Arc::from("v"),
+                ConnectorValueType::BigInt,
+            )],
+            TupleDomain::all(),
+            TupleDomain::all(),
+            Some(ConnectorExpression::Call {
+                function: crate::ConnectorFunctionName::try_new("fixture").unwrap(),
+                value_type: ConnectorValueType::Boolean,
+                arguments,
+            }),
+            vec![],
+            NonZeroU64::new(1).unwrap(),
+            NonZeroU64::new(1).unwrap(),
+            ConnectorReadWorkSource::RuntimeSplits,
+        )
+        .unwrap();
+        let Some(ConnectorExpression::Call { arguments, .. }) = scan.remaining_expression() else {
+            panic!("expected call")
+        };
+        assert_eq!(arguments.capacity(), 1);
+        let canonical = scan
+            .try_replace_private_recipe(scan.recipe().clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&scan.facts, &canonical.facts));
     }
 
     #[test]

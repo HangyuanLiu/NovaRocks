@@ -29,8 +29,11 @@ mod mutation;
 mod predicate;
 mod read;
 mod read_facts;
+mod read_program;
+mod read_public;
 mod recipe;
 mod scan;
+mod schema;
 mod type_projection;
 mod value;
 mod write;
@@ -63,6 +66,11 @@ pub use read_facts::{
     ConnectorReadSortDirection, ConnectorReadStaticFacts, MAX_READ_COVERAGE_EVIDENCE_BYTES,
     MAX_READ_INPUT_VERSION_BYTES, MAX_READ_PROPERTY_KEYS,
 };
+pub use read_program::{
+    ConnectorReadProgramCompileError, ConnectorReadProgramCompiler, ConnectorReadProgramRecipe,
+    FrozenConnectorRead,
+};
+pub use read_public::ConnectorReadPublicFacts;
 pub use recipe::{
     ConnectorReadRecipeSplit, ConnectorReadRecipeSplitDraft, ConnectorReadRecipeSplitFacts,
     ConnectorReadRecipeSplitKind, ConnectorReadRelationRecipe,

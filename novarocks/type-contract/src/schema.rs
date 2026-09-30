@@ -16,6 +16,13 @@
 
 use arrow_schema::{DataType, Field, Schema};
 
+pub const MAX_ARROW_FIELD_NAME_BYTES: usize = 1024;
+pub const MAX_ARROW_FIELD_METADATA_ENTRIES: usize = 256;
+pub const MAX_ARROW_FIELD_METADATA_KEY_BYTES: usize = 1024;
+pub const MAX_ARROW_FIELD_METADATA_VALUE_BYTES: usize = 16 * 1024;
+pub const MAX_ARROW_FIELD_METADATA_BYTES: usize = 64 * 1024;
+pub const MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES: usize = 1024;
+
 /// Compare every Arrow physical field attribute recursively. Arrow's built-in
 /// `Field::eq` deliberately ignores dictionary ids and dictionary ordering,
 /// which is appropriate for logical schema compatibility but not for a frozen

@@ -431,19 +431,42 @@ impl ConnectorReadRelationRecipe {
         let canonical = compiler
             .compile_private(draft)
             .map_err(ConnectorReadRelationRecipeCompileError::Provider)?;
+        Self::validate_canonical_public_headers(draft, &canonical)
+            .map_err(ConnectorReadRelationRecipeCompileError::Contract)?;
+        Ok(Self(canonical))
+    }
+
+    pub(crate) fn validate_canonical_public_headers(
+        draft: &ConnectorReadRelationRecipeDraft,
+        canonical: &ConnectorReadRelationRecipeDraft,
+    ) -> Result<(), ConnectorReadRelationRecipeError> {
+        Self::validate_canonical_header_shape(draft, canonical)?;
+        if canonical
+            .columns
+            .iter()
+            .zip(draft.columns.iter())
+            .any(|(canonical, original)| canonical.header() != original.header())
+        {
+            return Err(ConnectorReadRelationRecipeError::PublicFactsMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_canonical_header_shape(
+        draft: &ConnectorReadRelationRecipeDraft,
+        canonical: &ConnectorReadRelationRecipeDraft,
+    ) -> Result<(), ConnectorReadRelationRecipeError> {
         if canonical.binding != draft.binding {
-            return Err(ConnectorReadRelationRecipeCompileError::Contract(
-                ConnectorReadRelationRecipeError::BindingMismatch,
-            ));
+            return Err(ConnectorReadRelationRecipeError::BindingMismatch);
         }
         if canonical.relation.kind() != draft.relation.kind()
             || canonical.columns.len() != draft.columns.len()
+            || canonical.relation.table().header() != draft.relation.table().header()
+            || canonical.relation.view().header() != draft.relation.view().header()
         {
-            return Err(ConnectorReadRelationRecipeCompileError::Contract(
-                ConnectorReadRelationRecipeError::PublicFactsMismatch,
-            ));
+            return Err(ConnectorReadRelationRecipeError::PublicFactsMismatch);
         }
-        Ok(Self(canonical))
+        Ok(())
     }
 
     pub const fn draft(&self) -> &ConnectorReadRelationRecipeDraft {

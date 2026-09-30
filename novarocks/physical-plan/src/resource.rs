@@ -44,12 +44,18 @@ pub const MAX_PLAN_DERIVED_CUT_ITEMS: usize = 32 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_DATA_TYPE_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
 pub const MAX_DATA_TYPE_NODES: usize = novarocks_type_contract::MAX_VALUE_TYPE_NODES;
-pub const MAX_DATA_TYPE_FIELD_NAME_BYTES: usize = 1_024;
-pub const MAX_DATA_TYPE_FIELD_METADATA_ENTRIES: usize = 256;
-pub const MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES: usize = 1_024;
-pub const MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES: usize = 16 * 1024;
-pub const MAX_DATA_TYPE_FIELD_METADATA_BYTES: usize = 64 * 1024;
-pub const MAX_TIMESTAMP_TIMEZONE_BYTES: usize = 1_024;
+pub const MAX_DATA_TYPE_FIELD_NAME_BYTES: usize =
+    novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES;
+pub const MAX_DATA_TYPE_FIELD_METADATA_ENTRIES: usize =
+    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_ENTRIES;
+pub const MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES: usize =
+    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_KEY_BYTES;
+pub const MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES: usize =
+    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES;
+pub const MAX_DATA_TYPE_FIELD_METADATA_BYTES: usize =
+    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_BYTES;
+pub const MAX_TIMESTAMP_TIMEZONE_BYTES: usize =
+    novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES;
 pub const MAX_FIXED_SIZE_LENGTH: i32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]

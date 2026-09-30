@@ -106,7 +106,7 @@ impl ConnectorWriteInputShape {
             fields
                 .iter()
                 .map(|binding| {
-                    crate::write_schema::owned_write_field(binding.field())
+                    crate::schema::owned_field(binding.field())
                         .map(|field| ConnectorWriteFieldBinding::new(binding.token(), field))
                 })
                 .collect::<Result<Vec<_>, _>>()

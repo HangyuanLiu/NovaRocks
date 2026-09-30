@@ -28,7 +28,7 @@ pub(crate) fn validate_package(input: &FragmentPackageInput) -> Result<(), Valid
     usage.add_items(input.scans.len());
     for scan in input.scans.values() {
         usage.add_bytes(scan.retained_bytes());
-        usage.add_items(scan.assignments().len());
+        usage.add_items(scan.scan().assignments().len());
     }
     usage.add_items(input.writes.len());
     for write in input.writes.values() {
@@ -157,6 +157,32 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
             ));
             continue;
         };
+        let frozen = scan;
+        let scan = frozen.scan();
+        let public = frozen.public_facts();
+        let metadata_matches = match relation.as_ref() {
+            crate::Relation::Data(_) => public.metadata_kind().is_none(),
+            crate::Relation::Metadata(metadata) => {
+                public
+                    .metadata_kind()
+                    .is_some_and(|kind| kind.as_str() == metadata.kind.as_str())
+                    && public.source().coverage_evidence() == metadata.coverage_evidence.as_ref()
+            }
+        };
+        if public.source().input_version() != &relation.read().input_version
+            || public.source().selection_digest() != relation.source_binding().selection_digest
+            || !metadata_matches
+            || public.schema().fields().len() != relation.schema().len()
+            || !relation
+                .schema()
+                .iter()
+                .enumerate()
+                .all(|(ordinal, field)| public.matches_value_type(ordinal, &field.ty))
+        {
+            errors.push(ValidationError::new(&path,
+                "frozen read public version, selection, metadata or exact schema differs from its physical relation"));
+        }
+        validate_public_read_properties(frozen, relation, provider_outputs, &path, errors);
         let recipe = scan.recipe();
         if recipe.binding() != &relation.read().binding
             || recipe.relation() != &relation.read().relation
@@ -308,5 +334,64 @@ fn validate_package_writes(input: &FragmentPackageInput, errors: &mut Validation
                 "frozen write facts name a missing or non-writer node",
             ));
         }
+    }
+}
+
+fn validate_public_read_properties(
+    frozen: &novarocks_connector_contract::FrozenConnectorRead,
+    relation: &crate::Relation,
+    outputs: &[(crate::ProviderColumnReference, crate::ValueId)],
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    use novarocks_connector_contract::{
+        ConnectorReadDistribution, ConnectorReadNullOrdering, ConnectorReadSortDirection,
+        ConnectorReadWorkSource,
+    };
+    let public = frozen.public_facts().source().properties();
+    let physical = relation.provided_properties();
+    let distribution_matches =
+        if frozen.scan().work_source() == ConnectorReadWorkSource::WholeRelation {
+            physical.distribution == crate::Distribution::Singleton
+        } else {
+            match (public.distribution(), &physical.distribution) {
+                (ConnectorReadDistribution::Unconstrained, crate::Distribution::Unconstrained)
+                | (ConnectorReadDistribution::Singleton, crate::Distribution::Singleton)
+                | (ConnectorReadDistribution::RoundRobin, crate::Distribution::RoundRobin) => true,
+                // The current provider contract has no exact plan partition-count
+                // identity for these facts; FE negotiation rejects them as well.
+                _ => false,
+            }
+        };
+    let ordering_matches = public.ordering().len() == physical.ordering.len()
+        && public
+            .ordering()
+            .iter()
+            .zip(&physical.ordering)
+            .all(|(public, physical)| {
+                outputs
+                    .get(public.column().index())
+                    .is_some_and(|(_, value)| *value == physical.value)
+                    && matches!(
+                        (public.direction(), physical.direction),
+                        (
+                            ConnectorReadSortDirection::Ascending,
+                            crate::SortDirection::Ascending
+                        ) | (
+                            ConnectorReadSortDirection::Descending,
+                            crate::SortDirection::Descending
+                        )
+                    )
+                    && matches!(
+                        (public.null_ordering(), physical.null_ordering),
+                        (ConnectorReadNullOrdering::First, crate::NullOrdering::First)
+                            | (ConnectorReadNullOrdering::Last, crate::NullOrdering::Last)
+                    )
+            });
+    if !distribution_matches || !ordering_matches {
+        errors.push(ValidationError::new(
+            path,
+            "frozen read source properties differ from their exact physical column projection",
+        ));
     }
 }

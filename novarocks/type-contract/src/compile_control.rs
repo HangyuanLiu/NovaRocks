@@ -14,7 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_schema::{DataType, Field};
 use std::fmt;
 
 /// Cooperative control of pure preparation. A caller owns clocks, cancellation

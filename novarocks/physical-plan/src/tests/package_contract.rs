@@ -20,7 +20,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use novarocks_connector_contract::{
-    ConnectorReadRelationRecipeDraft, ConnectorValueType, FrozenConnectorScan,
+    ConnectorReadRelationRecipeDraft, ConnectorValueType, FrozenConnectorRead, FrozenConnectorScan,
     StaticScanAssignment, TupleDomain,
 };
 use novarocks_type_contract::{SemanticParameterId, SemanticParameterValue, SemanticParameters};
@@ -41,7 +41,7 @@ fn package_input(fragment: Fragment) -> FragmentPackageInput {
     }
 }
 
-fn frozen_scan(fragment: &Fragment) -> FrozenConnectorScan {
+fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
     let NodeKind::Scan {
         relation,
         read_budget,
@@ -61,7 +61,7 @@ fn frozen_scan(fragment: &Fragment) -> FrozenConnectorScan {
             .collect(),
     )
     .unwrap();
-    FrozenConnectorScan::try_new(
+    let scan = FrozenConnectorScan::try_new(
         draft,
         vec![StaticScanAssignment::new(
             Arc::from("v"),
@@ -75,7 +75,92 @@ fn frozen_scan(fragment: &Fragment) -> FrozenConnectorScan {
         NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
         relation.work_source(),
     )
-    .unwrap()
+    .unwrap();
+    public_read(fragment, fragment.root(), scan).unwrap()
+}
+
+fn public_read(
+    fragment: &Fragment,
+    scan_id: NodeId,
+    scan: FrozenConnectorScan,
+) -> Result<FrozenConnectorRead, novarocks_connector_contract::ConnectorError> {
+    use novarocks_connector_contract::*;
+    let NodeKind::Scan {
+        relation,
+        provider_outputs,
+        ..
+    } = &fragment.nodes()[&scan_id].kind
+    else {
+        unreachable!()
+    };
+    let properties = relation.provided_properties();
+    let distribution = match properties.distribution {
+        Distribution::Unconstrained => ConnectorReadDistribution::Unconstrained,
+        Distribution::Singleton => ConnectorReadDistribution::Singleton,
+        Distribution::RoundRobin => ConnectorReadDistribution::RoundRobin,
+        _ => unreachable!("fixture uses no provider partitioned guarantee"),
+    };
+    let ordering = properties
+        .ordering
+        .iter()
+        .map(|key| {
+            ConnectorReadOrderingKey::new(
+                ScanColumnId::new(
+                    provider_outputs
+                        .iter()
+                        .position(|(_, value)| *value == key.value)
+                        .unwrap(),
+                ),
+                match key.direction {
+                    SortDirection::Ascending => ConnectorReadSortDirection::Ascending,
+                    SortDirection::Descending => ConnectorReadSortDirection::Descending,
+                },
+                match key.null_ordering {
+                    NullOrdering::First => ConnectorReadNullOrdering::First,
+                    NullOrdering::Last => ConnectorReadNullOrdering::Last,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let (kind, coverage) = match relation.as_ref() {
+        Relation::Data(_) => (None, vec![]),
+        Relation::Metadata(metadata) => (
+            Some(ConnectorReadMetadataKind::try_new(metadata.kind.as_str())?),
+            metadata.coverage_evidence.to_vec(),
+        ),
+    };
+    let facts = ConnectorReadStaticFacts::try_new(
+        relation.read().input_version.clone(),
+        relation.source_binding().selection_digest,
+        ConnectorReadProperties::try_new(distribution, ordering)?,
+        ConnectorReadArtifactCoverage::NoArtifactInputs,
+        coverage,
+    )?;
+    let schema = arrow_schema::Schema::new(
+        relation
+            .schema()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, field)| {
+                arrow_schema::Field::new(
+                    format!("v{ordinal}"),
+                    field.ty.data_type.clone(),
+                    field.ty.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let public = ConnectorReadPublicFacts::try_new(
+        facts,
+        kind,
+        schema,
+        relation
+            .schema()
+            .iter()
+            .map(|field| field.ty.logical_type)
+            .collect(),
+    )?;
+    FrozenConnectorRead::try_new(scan, public)
 }
 
 #[test]
@@ -151,13 +236,99 @@ fn package_refuses_missing_or_wrong_scan_node_facts() {
 }
 
 #[test]
+fn package_refuses_complete_public_source_drift() {
+    use novarocks_connector_contract::*;
+    let binding = connector_binding();
+    let column = ProviderColumnReference {
+        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
+    };
+    let fragment = finish_scan_relation(metadata_relation(&binding, column)).unwrap();
+    let original = frozen_scan(&fragment);
+    for mutation in 0..7 {
+        let public = original.public_facts();
+        let source = public.source();
+        let properties = if mutation == 4 {
+            ConnectorReadProperties::try_new(ConnectorReadDistribution::RoundRobin, vec![]).unwrap()
+        } else if mutation == 5 {
+            ConnectorReadProperties::try_new(
+                source.properties().distribution().clone(),
+                vec![ConnectorReadOrderingKey::new(
+                    ScanColumnId::new(0),
+                    ConnectorReadSortDirection::Ascending,
+                    ConnectorReadNullOrdering::First,
+                )],
+            )
+            .unwrap()
+        } else {
+            source.properties().clone()
+        };
+        let source = ConnectorReadStaticFacts::try_new(
+            if mutation == 0 {
+                {
+                    let mut bytes = source.input_version().as_bytes().to_vec();
+                    bytes[0] ^= 1;
+                    ConnectorReadInputVersion::try_new(bytes).unwrap()
+                }
+            } else {
+                source.input_version().clone()
+            },
+            if mutation == 1 {
+                let mut digest = source.selection_digest();
+                digest[0] ^= 1;
+                digest
+            } else {
+                source.selection_digest()
+            },
+            properties,
+            source.artifact_coverage().clone(),
+            if mutation == 3 {
+                let mut bytes = source.coverage_evidence().to_vec();
+                bytes[0] ^= 1;
+                bytes
+            } else {
+                source.coverage_evidence().to_vec()
+            },
+        )
+        .unwrap();
+        let schema = if mutation == 6 {
+            arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "v0",
+                DataType::Int64,
+                !public.schema().field(0).is_nullable(),
+            )])
+        } else {
+            public.schema().clone()
+        };
+        let public = ConnectorReadPublicFacts::try_new(
+            source,
+            if mutation == 2 {
+                Some(ConnectorReadMetadataKind::try_new("other").unwrap())
+            } else {
+                public.metadata_kind().cloned()
+            },
+            schema,
+            public.logical_types().to_vec(),
+        )
+        .unwrap();
+        let scan = FrozenConnectorRead::try_new(original.scan().clone(), public).unwrap();
+        let mut input = package_input(fragment.clone());
+        input.scans.insert(fragment.root(), scan);
+        assert!(
+            FragmentPackage::try_new(input).is_err(),
+            "accepted public source drift {mutation}"
+        );
+    }
+}
+
+#[test]
 fn package_refuses_exact_relation_and_batch_contract_drift() {
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
     };
     let fragment = finish_scan_relation(metadata_relation(&binding, column)).unwrap();
-    let scan = frozen_scan(&fragment);
+    let frozen = frozen_scan(&fragment);
+    let scan = frozen.scan();
     let recipe = scan.recipe();
     for mutation in 0..4 {
         let mut columns = recipe.columns().to_vec();
@@ -197,8 +368,13 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
             },
         )
         .unwrap();
+        let malformed = public_read(&fragment, fragment.root(), malformed);
+        if mutation == 3 {
+            assert!(malformed.is_err());
+            continue;
+        }
         let mut input = package_input(fragment.clone());
-        input.scans.insert(fragment.root(), malformed);
+        input.scans.insert(fragment.root(), malformed.unwrap());
         assert!(
             FragmentPackage::try_new(input).is_err(),
             "mutation {mutation}"
@@ -350,7 +526,9 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
             relation.work_source(),
         )
         .unwrap();
-        input.scans.insert(scan_id, scan);
+        input
+            .scans
+            .insert(scan_id, public_read(&fragment, scan_id, scan).unwrap());
         let result = FragmentPackage::try_new(input.clone());
         assert_eq!(result.is_ok(), accepted, "{variable}: {result:?}");
     }

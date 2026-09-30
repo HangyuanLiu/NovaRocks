@@ -59,7 +59,12 @@ pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
     PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
 };
-pub use schema::{arrow_data_types_exact, arrow_fields_exact, arrow_schemas_exact};
+pub use schema::{
+    MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
+    MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
+    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, arrow_data_types_exact,
+    arrow_fields_exact, arrow_schemas_exact,
+};
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
