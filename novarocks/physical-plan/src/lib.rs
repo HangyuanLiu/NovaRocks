@@ -28,6 +28,7 @@ mod expression_site;
 mod identity;
 mod package;
 mod plan;
+mod predicate;
 mod relation;
 mod resource;
 mod validation;
@@ -49,6 +50,7 @@ pub use novarocks_type_contract::{
 };
 pub use package::*;
 pub use plan::*;
+pub use predicate::*;
 pub use relation::*;
 pub use resource::{
     MAX_ANNOTATION_BYTES, MAX_ANNOTATION_KEY_BYTES, MAX_ANNOTATION_VALUE_BYTES, MAX_ANNOTATIONS,

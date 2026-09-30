@@ -633,3 +633,426 @@ fn a_guarded_disconnected_use_cannot_become_an_operator_root() {
         RootUseBindingError::GuardedRoot
     );
 }
+
+fn conjunct_fragment() -> Fragment {
+    let source = fragment(NodeKind::Filter {
+        predicates: Box::from([ExprId::new(5000)]),
+    });
+    let mut expressions = source.expressions().clone();
+    for (id, args) in [
+        (ExprId::new(5000), vec![alternate(), expr()]),
+        (alternate(), vec![expr(), expr()]),
+    ] {
+        expressions.insert(ExprNode {
+            id,
+            owner: node(),
+            lambda_scope: None,
+            ty: ty(DataType::Boolean, true),
+            kind: ExprKind::Conjunction {
+                args: args.into_boxed_slice(),
+            },
+        });
+    }
+    Fragment::from(FragmentParts {
+        id: source.id(),
+        root: source.root(),
+        values: source.values().clone(),
+        expressions,
+        nodes: source.nodes().clone(),
+        sink: source.sink().clone(),
+        dop_domain: source.dop_domain(),
+        runtime_filters: source.runtime_filters().into(),
+    })
+}
+fn conjunct_uses(fragment: &Fragment, eager_root: bool, swapped: bool) -> PhysicalRootUses {
+    let domain = EvaluationDomainId::new(0);
+    let demand = if eager_root {
+        EvaluationDemand::Value
+    } else {
+        EvaluationDemand::TruthOnly
+    };
+    let invoke = |id, definition, control, arguments, demand| ExpressionInvocation {
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(id),
+            domain,
+            demand,
+        },
+        definition,
+        control,
+        arguments,
+    };
+    let arguments = if swapped {
+        vec![ExpressionUseId::new(52), ExpressionUseId::new(51)]
+    } else {
+        vec![ExpressionUseId::new(51), ExpressionUseId::new(52)]
+    };
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        vec![
+            invoke(
+                50,
+                ExprId::new(5000),
+                if eager_root {
+                    ControlShape::Eager
+                } else {
+                    ControlShape::Conjunction
+                },
+                arguments.into_boxed_slice(),
+                EvaluationDemand::TruthOnly,
+            ),
+            invoke(
+                51,
+                alternate(),
+                ControlShape::Conjunction,
+                Box::from([ExpressionUseId::new(53), ExpressionUseId::new(54)]),
+                demand,
+            ),
+            invoke(52, expr(), ControlShape::Eager, Box::default(), demand),
+            invoke(53, expr(), ControlShape::Eager, Box::default(), demand),
+            invoke(54, expr(), ControlShape::Eager, Box::default(), demand),
+        ],
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &control(),
+    )
+    .unwrap();
+    PhysicalRootUses::try_new(
+        uses(fragment),
+        flow,
+        vec![(
+            site(ExpressionRootRole::FilterPredicate { predicate: 0 }),
+            ExpressionUseId::new(50),
+        )],
+        &control(),
+    )
+    .unwrap()
+}
+#[test]
+fn positive_conjunct_sources_keep_actual_use_occurrences_and_nullable_truth_demand() {
+    let fragment = conjunct_fragment();
+    let roots = conjunct_uses(&fragment, false, false);
+    let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
+    let identity =
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![], &control()).unwrap();
+    assert_eq!(identity.definition(), ExprId::new(5000));
+    assert_eq!(identity.context().use_id, ExpressionUseId::new(50));
+    let nested =
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0, 1], &control()).unwrap();
+    let repeated =
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![1], &control()).unwrap();
+    assert_eq!(nested.definition(), repeated.definition());
+    assert_ne!(nested.context().use_id, repeated.context().use_id);
+    assert_eq!(nested.context().demand, EvaluationDemand::TruthOnly);
+    assert_eq!(nested.argument_ordinals(), &[0, 1]);
+    assert_eq!(
+        nested.responsibility().anchor(),
+        PredicateResponsibilityRef {
+            fragment: fragment.id(),
+            site,
+            use_id: ExpressionUseId::new(50)
+        }
+    );
+    assert_eq!(
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![2], &control()).unwrap_err(),
+        PredicateSourceError::InvalidArgument
+    );
+    assert_eq!(
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![1, 0], &control())
+            .unwrap_err(),
+        PredicateSourceError::NotPositiveConjunction
+    );
+    assert_eq!(
+        PredicateConjunctSource::try_new(
+            &fragment,
+            &roots,
+            site,
+            vec![0; novarocks_type_contract::MAX_CONTROL_DEPTH],
+            &control()
+        )
+        .unwrap_err(),
+        PredicateSourceError::TooDeep
+    );
+}
+#[test]
+fn a_predicate_source_cannot_cross_forged_control_or_reordered_use_edges() {
+    let fragment = conjunct_fragment();
+    let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
+    let eager = conjunct_uses(&fragment, true, false);
+    assert_eq!(
+        PredicateConjunctSource::try_new(&fragment, &eager, site, vec![0], &control()).unwrap_err(),
+        PredicateSourceError::WrongControl
+    );
+    let swapped = conjunct_uses(&fragment, false, true);
+    assert_eq!(
+        PredicateConjunctSource::try_new(&fragment, &swapped, site, vec![0], &control())
+            .unwrap_err(),
+        PredicateSourceError::WrongArguments
+    );
+}
+#[test]
+fn truth_only_change_condition_does_not_grant_relation_search_responsibility() {
+    let fragment = fragment(NodeKind::ChangeEventExpand {
+        events: Box::from([ChangeEventSpec {
+            predicate: Some(expr()),
+            effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
+            assignments: Box::default(),
+        }]),
+        effect_output: ValueId::new(0),
+    });
+    let site = site(ExpressionRootRole::ChangePredicate { event: 0 });
+    let roots = PhysicalRootUses::try_new(
+        uses(&fragment),
+        graph(&fragment, &[(0, expr(), EvaluationDemand::TruthOnly)]),
+        vec![(site, ExpressionUseId::new(0))],
+        &control(),
+    )
+    .unwrap();
+    assert_eq!(
+        ExactPredicateResponsibility::try_new(&fragment, &roots, site, &control()).unwrap_err(),
+        PredicateSourceError::NotSearchPredicate
+    );
+}
+
+#[test]
+fn source_responsibility_rechecks_the_actual_fragment_field_and_boolean_type() {
+    let source = conjunct_fragment();
+    let roots = conjunct_uses(&source, false, false);
+    let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
+    let clone = |id, nodes, expressions| {
+        Fragment::from(FragmentParts {
+            id,
+            root: source.root(),
+            values: source.values().clone(),
+            expressions,
+            nodes,
+            sink: source.sink().clone(),
+            dop_domain: source.dop_domain(),
+            runtime_filters: source.runtime_filters().into(),
+        })
+    };
+    let different_fragment = clone(
+        FragmentId::new(20),
+        source.nodes().clone(),
+        source.expressions().clone(),
+    );
+    assert_eq!(
+        ExactPredicateResponsibility::try_new(&different_fragment, &roots, site, &control())
+            .unwrap_err(),
+        PredicateSourceError::InvalidFragment
+    );
+    let mut nodes = source.nodes().clone();
+    nodes.get_mut(&node()).unwrap().kind = NodeKind::Filter {
+        predicates: Box::from([expr()]),
+    };
+    let different_field = clone(source.id(), nodes, source.expressions().clone());
+    assert_eq!(
+        ExactPredicateResponsibility::try_new(&different_field, &roots, site, &control())
+            .unwrap_err(),
+        PredicateSourceError::InvalidUse
+    );
+    let mut definitions = source.expressions().clone();
+    let mut non_boolean = definitions.get(ExprId::new(5000)).unwrap().clone();
+    non_boolean.ty = ty(DataType::Int64, false);
+    definitions.insert(non_boolean);
+    let different_type = clone(source.id(), source.nodes().clone(), definitions);
+    assert_eq!(
+        ExactPredicateResponsibility::try_new(&different_type, &roots, site, &control())
+            .unwrap_err(),
+        PredicateSourceError::NotBoolean
+    );
+}
+#[test]
+fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
+    for null_testing in [false, true] {
+        let source = fragment(NodeKind::Filter {
+            predicates: Box::from([alternate()]),
+        });
+        let mut expressions = source.expressions().clone();
+        let mut parent = expressions.get(alternate()).unwrap().clone();
+        parent.kind = if null_testing {
+            ExprKind::IsNull {
+                expr: expr(),
+                negated: false,
+            }
+        } else {
+            ExprKind::Unary {
+                op: UnaryOperator::Not,
+                expr: expr(),
+            }
+        };
+        expressions.insert(parent);
+        let fragment = Fragment::from(FragmentParts {
+            id: source.id(),
+            root: source.root(),
+            values: source.values().clone(),
+            expressions,
+            nodes: source.nodes().clone(),
+            sink: source.sink().clone(),
+            dop_domain: source.dop_domain(),
+            runtime_filters: source.runtime_filters().into(),
+        });
+        let domain = EvaluationDomainId::new(0);
+        let invoke = |id, definition, demand, arguments| ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: ExpressionUseId::new(id),
+                domain,
+                demand,
+            },
+            definition,
+            control: ControlShape::Eager,
+            arguments,
+        };
+        let flow = ExpressionControlFlow::try_new(
+            vec![ExpressionEvaluationDomain {
+                id: domain,
+                parent: None,
+                guard: None,
+            }],
+            vec![
+                invoke(
+                    0,
+                    alternate(),
+                    EvaluationDemand::TruthOnly,
+                    Box::from([ExpressionUseId::new(1)]),
+                ),
+                invoke(1, expr(), EvaluationDemand::Value, Box::default()),
+            ],
+            fragment.expressions(),
+            CompilePhase::Validate,
+            &control(),
+        )
+        .unwrap();
+        let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
+        let roots = PhysicalRootUses::try_new(
+            uses(&fragment),
+            flow,
+            vec![(site, ExpressionUseId::new(0))],
+            &control(),
+        )
+        .unwrap();
+        assert_eq!(
+            PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0], &control())
+                .unwrap_err(),
+            PredicateSourceError::NotPositiveConjunction
+        );
+    }
+}
+
+#[test]
+fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
+    let source = fragment(NodeKind::Filter {
+        predicates: Box::from([ExprId::new(0)]),
+    });
+    let mut expressions = source.expressions().clone();
+    let depth = novarocks_type_contract::MAX_CONTROL_DEPTH;
+    for index in 0..depth as u32 {
+        expressions.insert(ExprNode {
+            id: ExprId::new(index),
+            owner: node(),
+            lambda_scope: None,
+            ty: ty(DataType::Boolean, true),
+            kind: if index as usize + 1 == depth {
+                ExprKind::Literal(LiteralValue::Null)
+            } else {
+                ExprKind::Conjunction {
+                    args: Box::from([ExprId::new(index + 1)]),
+                }
+            },
+        });
+    }
+    let fragment = Fragment::from(FragmentParts {
+        id: source.id(),
+        root: source.root(),
+        values: source.values().clone(),
+        expressions,
+        nodes: source.nodes().clone(),
+        sink: source.sink().clone(),
+        dop_domain: source.dop_domain(),
+        runtime_filters: source.runtime_filters().into(),
+    });
+    let domain = EvaluationDomainId::new(0);
+    let invocations = (0..depth as u32)
+        .map(|index| ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: ExpressionUseId::new(index),
+                domain,
+                demand: EvaluationDemand::TruthOnly,
+            },
+            definition: ExprId::new(index),
+            control: if index as usize + 1 == depth {
+                ControlShape::Eager
+            } else {
+                ControlShape::Conjunction
+            },
+            arguments: if index as usize + 1 == depth {
+                Box::default()
+            } else {
+                Box::from([ExpressionUseId::new(index + 1)])
+            },
+        })
+        .collect();
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &control(),
+    )
+    .unwrap();
+    let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
+    let roots = PhysicalRootUses::try_new(
+        uses(&fragment),
+        flow,
+        vec![(site, ExpressionUseId::new(0))],
+        &control(),
+    )
+    .unwrap();
+    let near =
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0; depth - 1], &control())
+            .unwrap();
+    assert_eq!(near.definition(), ExprId::new(depth as u32 - 1));
+    assert!(
+        fragment
+            .expressions()
+            .get(near.definition())
+            .unwrap()
+            .ty
+            .nullable
+    );
+    assert_eq!(
+        PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0; depth], &control())
+            .unwrap_err(),
+        PredicateSourceError::TooDeep
+    );
+    for failure in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let owner = Control {
+            observations: Mutex::default(),
+            fail: Some(failure),
+        };
+        assert_eq!(
+            PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0; depth - 1], &owner)
+                .unwrap_err(),
+            PredicateSourceError::Control(failure)
+        );
+        assert!(
+            owner
+                .observations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(phase, work)| *phase == CompilePhase::Validate && *work <= 256)
+        );
+    }
+}
