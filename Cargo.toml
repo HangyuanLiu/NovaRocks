@@ -73,10 +73,13 @@ opendal = "0.55"
 paimon = { version = "=0.3.0", default-features = false }
 parquet = "58.2.0"
 prometheus = "0.13"
+proc-macro2 = "1"
 prost = "0.13"
 prost-build = "0.13"
 prost-reflect = "0.14"
+prost-types = "0.13"
 protoc-bin-vendored = "3"
+quote = "1"
 rand = "0.8"
 rcgen = "0.13"
 regex = "1.10"
@@ -88,6 +91,7 @@ serde = "1"
 serde_bytes = "0.11"
 serde_json = "1"
 sha2 = "0.10"
+syn = { version = "2", features = ["full"] }
 tempfile = "3"
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 tikv-jemallocator = { version = "0.7", features = ["stats"] }

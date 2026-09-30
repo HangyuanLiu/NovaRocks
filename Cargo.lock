@@ -4179,10 +4179,14 @@ name = "novarocks-proto-models"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "proc-macro2",
  "prost 0.13.5",
  "prost-build",
  "prost-reflect",
+ "prost-types 0.13.5",
  "protoc-bin-vendored",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

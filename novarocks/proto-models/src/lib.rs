@@ -6,6 +6,10 @@
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 
+pub mod resource_layout;
+
+include!(concat!(env!("OUT_DIR"), "/resource_layout_registry.rs"));
+
 /// File descriptor set generated from the canonical repository-level IDL.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin"));
