@@ -20,6 +20,14 @@
 -- Lock in dimensional CBO cost output for scan/filter, join, and TopN plans.
 -- The EXPLAIN COSTS statements are recorded directly in the golden result;
 -- do not use @explain_contains here because that directive reruns EXPLAIN VERBOSE.
+-- Golden derivation: stats_input::QueryStatsSnapshot::display_rows and
+-- completed_tree::render_completed_plan_tree print one TABLE STATS row for
+-- each base scan binding at COSTS level. All three queries have one binding
+-- (ref=0); GENERATE_SERIES contributes none. INSERT supplies 1000 rows with
+-- no deletes, so manifest row-count evidence is Exact/IcebergManifest and
+-- the label is the full iceberg_opt.case_db.cost_model_explain_t identity.
+-- This adds one provenance row per query; preserve the old operators,
+-- 990/100/10 output estimates, broadcast sizing, and both TopN phases.
 SET cbo_broadcast_backend_count = 3;
 DROP TABLE IF EXISTS ${case_db}.cost_model_explain_t;
 CREATE TABLE ${case_db}.cost_model_explain_t (k INT, v INT);

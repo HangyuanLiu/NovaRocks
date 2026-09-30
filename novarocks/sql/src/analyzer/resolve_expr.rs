@@ -3942,6 +3942,9 @@ impl<'a> super::AnalyzerContext<'a> {
                         .iter()
                         .any(|item| self.expr_contains_aggregate(item))
             }
+            // The probe is in this SELECT's domain; aggregates inside the
+            // subquery belong to its own SELECT and must not leak outward.
+            ast::Expr::InSubquery(in_subquery) => self.expr_contains_aggregate(&in_subquery.expr),
             ast::Expr::Between(between) => {
                 self.expr_contains_aggregate(&between.expr)
                     || self.expr_contains_aggregate(&between.low)
@@ -4613,7 +4616,7 @@ fn normalize_array_generate_arguments(
     Ok(())
 }
 
-fn cast_null_preserving_target_type(
+pub(super) fn cast_null_preserving_target_type(
     expr: TypedExpr,
     target: &DataType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -4822,7 +4825,7 @@ pub(super) fn resolve_scalar_binding_at(
         .map_err(|message| AnalyzeError::type_mismatch(message, span))
 }
 
-fn resolved_scalar_call_at(
+pub(super) fn resolved_scalar_call_at(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: Vec<TypedExpr>,

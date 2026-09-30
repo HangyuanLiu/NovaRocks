@@ -199,26 +199,20 @@ ORDER BY t.pk;
 -- ========== IN / NOT IN as expression (boolean output) ==========
 
 -- query 25
--- FE generates a column alias containing ${case_db}, which is dynamic; skip result snapshot
--- and verify row count + key values via wrapper.
--- @skip_result_check=true
-SELECT map0 IN (SELECT map0 FROM ${case_db}.map_test s) FROM ${case_db}.map_test ORDER BY 1;
+-- Stable aliases and row identities make UNKNOWN observable in the snapshot.
+SELECT pk, map0 IN (SELECT map0 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
 -- query 26
--- @skip_result_check=true
-SELECT map5 IN (SELECT map5 FROM ${case_db}.map_test s) FROM ${case_db}.map_test ORDER BY 1;
+SELECT pk, map5 IN (SELECT map5 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
 -- query 27
--- @skip_result_check=true
-SELECT map0 NOT IN (SELECT map0 FROM ${case_db}.map_test s) FROM ${case_db}.map_test ORDER BY 1;
+SELECT pk, map0 NOT IN (SELECT map0 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
 -- query 28
--- @skip_result_check=true
-SELECT map1 NOT IN (SELECT map0 FROM ${case_db}.map_test s) FROM ${case_db}.map_test ORDER BY 1;
+SELECT pk, map1 NOT IN (SELECT map0 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
 -- query 29
--- @skip_result_check=true
-SELECT map5 NOT IN (SELECT map5 FROM ${case_db}.map_test s) FROM ${case_db}.map_test ORDER BY 1;
+SELECT pk, map5 NOT IN (SELECT map5 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
 -- ========== map_apply in join predicate ==========
 
@@ -233,3 +227,15 @@ SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
   ON map_apply((k,v)->(k+1,v),s.map2) = map_apply((k,v)->(k+1,v),t.map2)
 ORDER BY t.pk;
+
+-- query 32
+-- Empty maps/arrays stay equal; nested NULL leaves stay UNKNOWN.
+SELECT pk, map2 = map2 AS eq, map2 != map2 AS ne, map2 <=> map2 AS safe,
+       map3 = map3 AS nested_eq, map3 <=> map3 AS nested_safe
+FROM ${case_db}.map_test ORDER BY pk;
+
+-- query 33
+-- Duplicate empty maps retain all four matches, not just one per value.
+SELECT t.pk AS probe_pk, s.pk AS build_pk
+FROM ${case_db}.map_test t JOIN ${case_db}.map_test s ON t.map5 = s.map5
+WHERE t.pk IN (1, 2) ORDER BY t.pk, s.pk;

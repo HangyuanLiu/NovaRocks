@@ -512,9 +512,15 @@ fn fold_scalar_uncached(
         ScalarNode::Nested(child) => {
             *child = fold_scalar_id(arena, *child, evaluator, memo);
         }
-        ScalarNode::FunctionCall { args, .. } => {
+        ScalarNode::FunctionCall { name, args, .. } => {
             for arg in args.iter_mut() {
-                *arg = fold_scalar_id(arena, *arg, evaluator, memo);
+                // TIME_TO_SEC distinguishes a SEC_TO_TIME result from a raw
+                // string. Folding that producer would erase its provenance.
+                *arg = if name == "time_to_sec" && has_sec_to_time_source(arena, *arg) {
+                    fold_sec_to_time_source(arena, *arg, evaluator, memo)
+                } else {
+                    fold_scalar_id(arena, *arg, evaluator, memo)
+                };
             }
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
@@ -584,6 +590,40 @@ fn fold_scalar_uncached(
     // fold step below reads the children back out of the arena.
     let rebuilt = arena.intern(node, data_type, nullable);
     try_fold_node(arena, rebuilt, evaluator).unwrap_or(rebuilt)
+}
+
+fn has_sec_to_time_source(arena: &ScalarArena, id: ScalarId) -> bool {
+    match arena.node(id) {
+        ScalarNode::FunctionCall { name, .. } => name == "sec_to_time",
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            has_sec_to_time_source(arena, *child)
+        }
+        _ => false,
+    }
+}
+
+/// Keep the source-sensitive path intact, while still folding the producer's
+/// numeric arguments. Do not memoize this contextual result: the same producer
+/// may independently be folded when it is another projection's root.
+fn fold_sec_to_time_source(
+    arena: &mut ScalarArena,
+    id: ScalarId,
+    evaluator: &'static dyn SqlConstantEvaluator,
+    memo: &mut HashMap<ScalarId, ScalarId>,
+) -> ScalarId {
+    let mut node = arena.node(id).clone();
+    match &mut node {
+        ScalarNode::FunctionCall { args, .. } => {
+            for arg in args {
+                *arg = fold_scalar_id(arena, *arg, evaluator, memo);
+            }
+        }
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            *child = fold_sec_to_time_source(arena, *child, evaluator, memo);
+        }
+        _ => unreachable!("source path was checked before folding"),
+    }
+    arena.intern(node, arena.data_type(id).clone(), arena.nullable(id))
 }
 
 /// Try to replace one node (whose children are already folded) with a literal.
@@ -976,6 +1016,90 @@ mod tests {
         assert_int_literal(&fixture, folded, 2);
         assert_eq!(fixture.data_type(folded), DataType::Int32);
         assert!(fixture.nullable(folded));
+    }
+
+    #[test]
+    fn preserves_sec_to_time_provenance_but_folds_its_numeric_argument() {
+        let mut fixture = Fixture::with_mode(FakeMode::Fold);
+        let negative = fixture.int_literal(-2);
+        let one = fixture.int_literal(1);
+        let seconds = fixture.binary(BinOp::Add, negative, one);
+        let source = fixture.function_call(
+            "sec_to_time",
+            vec![seconds],
+            false,
+            FunctionVolatility::Immutable,
+            DataType::Utf8,
+            true,
+        );
+        let cast_source = fixture.intern(
+            ScalarNode::Cast {
+                child: source,
+                target: DataType::Utf8,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            DataType::Utf8,
+            true,
+        );
+        let wrapped = fixture.intern(ScalarNode::Nested(cast_source), DataType::Utf8, true);
+        let consumer = fixture.function_call(
+            "time_to_sec",
+            vec![wrapped],
+            false,
+            FunctionVolatility::Immutable,
+            DataType::Int64,
+            true,
+        );
+
+        let rewritten = changed(fixture.apply(project(consumer)));
+        let ScalarNode::FunctionCall { args, .. } = fixture.node(project_expr(&rewritten)) else {
+            panic!("source-sensitive consumer must remain a call");
+        };
+        let ScalarNode::Nested(cast_source) = fixture.node(args[0]) else {
+            panic!("source wrapper must remain intact");
+        };
+        let ScalarNode::Cast { child: source, .. } = fixture.node(cast_source) else {
+            panic!("source cast must remain intact");
+        };
+        let ScalarNode::FunctionCall { name, args, .. } = fixture.node(source) else {
+            panic!("SEC_TO_TIME source must not become a string literal");
+        };
+        assert_eq!(name, "sec_to_time");
+        assert_int_literal(&fixture, args[0], -1);
+        assert_eq!(fixture.calls(), 1, "only the numeric argument is folded");
+    }
+
+    #[test]
+    fn shared_sec_to_time_can_fold_without_erasing_roundtrip_source() {
+        let fixture = Fixture::with_mode(FakeMode::Fold);
+        let seconds = fixture.int_literal(-1);
+        let source = fixture.function_call(
+            "sec_to_time",
+            vec![seconds],
+            false,
+            FunctionVolatility::Immutable,
+            DataType::Utf8,
+            true,
+        );
+        let consumer = fixture.function_call(
+            "time_to_sec",
+            vec![source],
+            false,
+            FunctionVolatility::Immutable,
+            DataType::Int64,
+            true,
+        );
+        let mut arena = fixture.arena.borrow_mut();
+        let mut memo = HashMap::new();
+        let evaluator = fixture.evaluator.unwrap();
+        let standalone = fold_scalar_id(&mut arena, source, evaluator, &mut memo);
+        let roundtrip = fold_scalar_id(&mut arena, consumer, evaluator, &mut memo);
+        assert!(matches!(arena.node(standalone), ScalarNode::Literal(_)));
+        let ScalarNode::FunctionCall { args, .. } = arena.node(roundtrip) else {
+            panic!("roundtrip must not reuse the standalone folded literal");
+        };
+        assert_eq!(args, &[source]);
+        assert_eq!(fixture.calls(), 1);
     }
 
     #[test]

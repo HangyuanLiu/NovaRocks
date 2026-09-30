@@ -75,7 +75,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 2
-    PARTITION: HASH_PARTITIONED (v0)
+    PARTITION: HASH_PARTITIONED (k)
 4:PROJECT [k] stats={rows=1000}
   5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
@@ -86,7 +86,7 @@ PLAN FRAGMENT 3
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 3
-    PARTITION: HASH_PARTITIONED (v1)
+    PARTITION: HASH_PARTITIONED (k)
 6:PROJECT [k] stats={rows=600}
   7:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
@@ -113,7 +113,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 2
-    PARTITION: HASH_PARTITIONED (v0)
+    PARTITION: HASH_PARTITIONED (k)
 4:PROJECT [k] stats={rows=1000}
   5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
@@ -124,7 +124,7 @@ PLAN FRAGMENT 3
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 3
-    PARTITION: HASH_PARTITIONED (v1)
+    PARTITION: HASH_PARTITIONED (k)
 6:PROJECT [k] stats={rows=600}
   7:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r

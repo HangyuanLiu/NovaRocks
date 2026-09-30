@@ -16,6 +16,9 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution
+-- Golden derivation: shuffle imports retain p.k, b.k, p.pad1 and p.pad2.
+-- Replace only old unqualified import names in query 15; the query 12
+-- broadcast plan, query 15 partitioned plan, and both 500000 results stay.
 CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_flip (k INT, pad1 VARCHAR(100), pad2 VARCHAR(100));

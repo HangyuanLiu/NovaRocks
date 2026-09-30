@@ -14,7 +14,7 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 3:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
-  4:HASH JOIN (PARTITIONED, INNER, eq: [k = k]) stats={rows=11250000000000}
+  4:HASH JOIN (PARTITIONED, INNER, eq: [generate_series = k]) stats={rows=11250000000000}
     5:HASH EXCHANGE
     6:HASH EXCHANGE
 PLAN FRAGMENT 2
@@ -22,7 +22,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
-    PARTITION: HASH_PARTITIONED (k)
+    PARTITION: HASH_PARTITIONED (generate_series)
 7:PROJECT [generate_series] stats={rows=1000000}
   8:PROJECT [generate_series] stats={rows=1000000}
     9:GENERATE_SERIES(1, 1000000, 1) stats={rows=1000000}

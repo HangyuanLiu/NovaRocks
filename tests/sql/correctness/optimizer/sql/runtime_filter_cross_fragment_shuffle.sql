@@ -21,6 +21,9 @@
 -- ANALYZE stats small joins default to BROADCAST, so force a partitioned join
 -- deterministically via cbo_broadcast_node_mem_budget_bytes = 0 (see
 -- runtime_filter_cross_exchange.sql for the BROADCAST-only companion case).
+-- Golden derivation: append_exchange retains p.k/b.k on the two hash sinks
+-- and join keys. Preserve the RF crossing from fragment 1/node 4 to
+-- fragment 2/node 7 with BlockingSnapshot and the four-row result.
 CREATE TABLE ${case_db}.rf_shuffle_probe (k INT, v INT);
 CREATE TABLE ${case_db}.rf_shuffle_build (k INT, v INT);
 INSERT INTO ${case_db}.rf_shuffle_probe VALUES (1, 1), (2, 2), (3, 3), (4, 4);
@@ -33,7 +36,8 @@ SET global_runtime_filter_probe_min_selectivity = 0.0;
 SET cbo_broadcast_node_mem_budget_bytes = 0;
 
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
--- @explain_contains=PARTITION: HASH_PARTITIONED (k)
+-- @explain_contains=PARTITION: HASH_PARTITIONED (p.k)
+-- @explain_contains=PARTITION: HASH_PARTITIONED (b.k)
 -- @explain_contains=consumer binding
 -- @explain_contains=expr = (p.k)
 -- @explain_not_contains=HASH JOIN (BROADCAST

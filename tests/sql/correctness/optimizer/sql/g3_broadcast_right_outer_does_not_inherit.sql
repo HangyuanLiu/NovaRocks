@@ -23,6 +23,11 @@
 --    than reuse the join output.
 -- 2. Regression guard against accidentally treating right-outer output as
 --    preserving the left-side partition contract.
+-- Golden derivation: input imports keep a.k/b.k and the preserved b.w value.
+-- lower_join_outputs creates new NullExtended a-side values named k/v, so
+-- the window still uses k/v; those names must not be globally qualified.
+-- Preserve the join's b.k distribution and the separate window k exchange:
+-- they are distinct partition contracts, with unchanged nodes and estimates.
 DROP TABLE IF EXISTS ${case_db}.g3_ro_left;
 DROP TABLE IF EXISTS ${case_db}.date_dim;
 CREATE TABLE ${case_db}.g3_ro_left  (k INT, v INT);

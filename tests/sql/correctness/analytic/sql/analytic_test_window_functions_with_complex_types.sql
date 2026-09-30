@@ -21,6 +21,8 @@
 --    (array, map, struct, json, varbinary, char, varchar, decimal, etc.).
 -- 2. Validate IGNORE NULLS variants for LEAD/LAG on complex columns.
 -- 3. Confirm that map, struct, varbinary, and json-with-wrong-default raise expected FE errors.
+-- Keep c1=128 as an overflow fixture: TINYINT is [-128,127], and OutputNull
+-- stores these three inputs as NULL before any window function is evaluated.
 
 -- query 1
 -- @skip_result_check=true
@@ -229,7 +231,7 @@ INSERT INTO ${case_db}.t1 VALUES
 SELECT FIRST_VALUE(c0) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 3
-SELECT FIRST_VALUE(c1) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT FIRST_VALUE(c1) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 4
 SELECT FIRST_VALUE(c2) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
@@ -433,7 +435,7 @@ SELECT FIRST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWE
 SELECT LAST_VALUE(c0) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 68
-SELECT LAST_VALUE(c1) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
+SELECT LAST_VALUE(c1) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 69
 SELECT LAST_VALUE(c2) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
@@ -635,7 +637,7 @@ SELECT LAST_VALUE(c25 IGNORE NULLS) OVER(PARTITION BY k1 ORDER BY c3 ROWS BETWEE
 SELECT LEAD(c0) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 
 -- query 133
-SELECT LEAD(c1) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
+SELECT LEAD(c1) OVER(ORDER BY k1) wv FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 134
 SELECT LEAD(c2) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
@@ -788,7 +790,7 @@ SELECT LEAD(c25 IGNORE NULLS, 5, -1) OVER(PARTITION BY k1 ORDER BY k1) AS wv FRO
 SELECT LAG(c0) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 
 -- query 174
-SELECT LAG(c1) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
+SELECT LAG(c1) OVER(ORDER BY k1) wv FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 175
 SELECT LAG(c2) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
@@ -935,3 +937,17 @@ SELECT LAG(c25 IGNORE NULLS, 3) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${c
 -- the default to the column type (intentional broader coverage), so the
 -- query succeeds; just confirm it runs.
 SELECT LAG(c25 IGNORE NULLS, 5, -1) OVER(PARTITION BY k1 ORDER BY k1) AS wv FROM ${case_db}.t1;
+
+-- query 214
+-- Direct column evidence separates INSERT narrowing from window evaluation.
+SELECT k1, c1, c1 IS NULL AS is_null FROM ${case_db}.t1 ORDER BY k1;
+
+-- query 215
+-- Both signed boundaries are valid; both adjacent out-of-range values become NULL.
+SELECT CAST(127 AS TINYINT) AS upper_valid, CAST(128 AS TINYINT) AS upper_overflow,
+       CAST(-128 AS TINYINT) AS lower_valid, CAST(-129 AS TINYINT) AS lower_overflow;
+
+-- query 216
+SELECT COUNT(*) AS row_count, COUNT(c1) AS valid_count,
+       SUM(CASE WHEN c1 IS NULL THEN 1 ELSE 0 END) AS null_count
+FROM ${case_db}.t1;

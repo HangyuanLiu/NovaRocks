@@ -1,5 +1,6 @@
 -- query 6
 Explain String
+TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -18,6 +19,7 @@ PLAN FRAGMENT 1
 
 -- query 7
 Explain String
+TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -45,6 +47,7 @@ PLAN FRAGMENT 2
 
 -- query 8
 Explain String
+TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
