@@ -32,11 +32,13 @@ use sha2::{Digest, Sha256};
 mod binding;
 mod effect_refinement;
 mod evaluation;
+mod lambda_rows;
 mod scalar_kernel;
 
 pub use binding::*;
 pub use effect_refinement::*;
 pub use evaluation::*;
+pub use lambda_rows::*;
 pub use novarocks_type_contract::{
     AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,

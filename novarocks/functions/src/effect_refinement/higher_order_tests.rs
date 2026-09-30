@@ -27,7 +27,7 @@ use novarocks_type_contract::{
     FunctionNullBehavior, FunctionVolatility, MAX_UNOBSERVED_COMPILE_WORK, ObservableEffects,
 };
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -43,6 +43,76 @@ fn value() -> FunctionArgument {
     FunctionArgument::Value {
         value_type: FunctionValueType::new(DataType::Int64, false),
         constant: None,
+    }
+}
+
+#[test]
+fn type_only_scalar_preparation_retains_lambda_types_without_body_value_demand() {
+    let mut fixture = Fixture::body(FunctionValueType::new(DataType::Boolean, true));
+    fixture.uses.fill(None);
+    let owner = Owner::new(&fixture, ArgumentControl::TypeOnly);
+    let selected = Arc::new(fixture.selected.clone());
+    let input = CallEffectInput {
+        selected: selected.as_ref(),
+        ..fixture.input()
+    };
+    let control = Control::default();
+    let receipt = refine_call_effects(&owner, input, &control).unwrap();
+    let contract =
+        crate::ScalarCallContract::from_refined(input, &receipt, selected.clone(), &control)
+            .unwrap();
+    assert_eq!(contract.selected().argument_types, selected.argument_types);
+    assert_eq!(
+        contract.effects().argument_control,
+        ArgumentControl::TypeOnly
+    );
+    assert_eq!(contract.value_argument_types().len(), 0);
+    assert_eq!(owner.calls(), 1);
+}
+
+#[test]
+fn type_only_preparation_rejects_malformed_or_unbounded_lambda_metadata() {
+    let malformed = FunctionValueType {
+        data_type: DataType::Boolean,
+        nullable: true,
+        logical_type: novarocks_type_contract::ValueLogicalType::LargeInt,
+    };
+    for (parameter_types, result_type, resource_failure) in [
+        (
+            vec![malformed.clone()],
+            FunctionValueType::new(DataType::Boolean, true),
+            false,
+        ),
+        (vec![], malformed, false),
+        (
+            vec![FunctionValueType::new(DataType::Int64, false); MAX_CALL_EFFECT_ARGUMENTS + 1],
+            FunctionValueType::new(DataType::Boolean, true),
+            true,
+        ),
+    ] {
+        let mut fixture = Fixture::new(vec![FunctionArgument::Lambda {
+            parameter_types: parameter_types.into_boxed_slice(),
+            result_type,
+        }]);
+        fixture.uses.fill(None);
+        let owner = Owner::new(&fixture, ArgumentControl::TypeOnly);
+        let selected = Arc::new(fixture.selected.clone());
+        let input = CallEffectInput {
+            selected: selected.as_ref(),
+            ..fixture.input()
+        };
+        let control = Control::default();
+        let receipt = refine_call_effects(&owner, input, &control).unwrap();
+        let result =
+            crate::ScalarCallContract::from_refined(input, &receipt, selected.clone(), &control);
+        if resource_failure {
+            assert_eq!(result, Err(crate::ScalarKernelFailure::ResourceExhausted));
+        } else {
+            assert!(matches!(
+                result,
+                Err(crate::ScalarKernelFailure::InvalidProgram(_))
+            ));
+        }
     }
 }
 

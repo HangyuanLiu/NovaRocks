@@ -140,12 +140,27 @@ impl ScalarCallContract {
         };
         validate_type_observed(result, &mut work)?;
         for argument in &input.selected.argument_types {
-            let FunctionArgumentType::Value(value) = argument else {
-                return Err(invalid(
-                    "ordinary scalar binding cannot consume lambda arguments",
-                ));
-            };
-            validate_type_observed(value, &mut work)?;
+            match argument {
+                FunctionArgumentType::Value(value) => validate_type_observed(value, &mut work)?,
+                FunctionArgumentType::Lambda {
+                    parameter_types,
+                    result_type,
+                } if receipt.facts().argument_control == ArgumentControl::TypeOnly => {
+                    if parameter_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                        return Err(ScalarKernelFailure::ResourceExhausted);
+                    }
+                    validate_type_observed(result_type, &mut work)?;
+                    for parameter in parameter_types {
+                        validate_type_observed(parameter, &mut work)?;
+                        work.step().map_err(compile_failure)?;
+                    }
+                }
+                FunctionArgumentType::Lambda { .. } => {
+                    return Err(invalid(
+                        "ordinary scalar binding cannot consume lambda values",
+                    ));
+                }
+            }
             work.step().map_err(compile_failure)?;
         }
         let parameters = input
@@ -197,7 +212,7 @@ impl ScalarCallContract {
         arguments.iter().map(|argument| match argument {
             FunctionArgumentType::Value(value) => value,
             FunctionArgumentType::Lambda { .. } => {
-                unreachable!("constructor accepts value arguments only")
+                unreachable!("type-only calls have no runtime value arguments")
             }
         })
     }
