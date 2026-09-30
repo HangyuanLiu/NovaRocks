@@ -575,7 +575,7 @@ mod tests {
         }
     }
 
-    fn ctx_with_factory() -> RewriteContext {
+    fn ctx_with_factory() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));

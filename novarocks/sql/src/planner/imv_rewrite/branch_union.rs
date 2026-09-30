@@ -820,7 +820,7 @@ mod tests {
 
     fn rewrite_context(
         snapshot: std::sync::Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(std::rc::Rc::new(
@@ -836,11 +836,11 @@ mod tests {
         ctx
     }
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         rewrite_context(crate::compiler::mv_rewrite::test_branch_union_snapshot())
     }
 
-    fn build_two_base_join_ctx() -> RewriteContext {
+    fn build_two_base_join_ctx() -> RewriteContext<'static> {
         rewrite_context(crate::compiler::mv_rewrite::test_region_join_snapshot())
     }
     fn root_delta(input: LogicalPlanNode) -> LogicalPlanNode {

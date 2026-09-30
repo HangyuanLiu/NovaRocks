@@ -22,7 +22,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+
 use crate::column_id::ColumnRefFactory;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::options::SessionOptimizerSettings;
 use crate::optimizer::rewrite::trace::RewriteTrace;
 use crate::optimizer::scalar::ScalarArena;
@@ -56,7 +59,8 @@ impl Default for RewritePolicy {
 }
 
 #[derive(Clone)]
-pub(crate) struct RewriteContext {
+pub(crate) struct RewriteContext<'a> {
+    control: &'a dyn PureCompileControl,
     #[allow(
         dead_code,
         reason = "Retained for staged SQL planner migration consumers and test helpers."
@@ -81,12 +85,14 @@ pub(crate) struct RewriteContext {
     function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
 }
 
-impl RewriteContext {
+impl<'a> RewriteContext<'a> {
     pub(crate) fn new(
         consumer: RewriteConsumer,
         session_settings: SessionOptimizerSettings,
+        control: &'a dyn PureCompileControl,
     ) -> Self {
         Self {
+            control,
             consumer,
             disabled_rules: session_settings.disabled_rules.iter().cloned().collect(),
             session_settings,
@@ -102,30 +108,46 @@ impl RewriteContext {
         }
     }
 
-    pub(crate) fn for_query_with_settings(session_settings: SessionOptimizerSettings) -> Self {
-        Self::new(RewriteConsumer::Query, session_settings)
+    pub(crate) fn for_query_with_settings(
+        session_settings: SessionOptimizerSettings,
+        control: &'a dyn PureCompileControl,
+    ) -> Self {
+        Self::new(RewriteConsumer::Query, session_settings, control)
     }
 
-    pub(crate) fn for_mv_refresh_with_settings(session_settings: SessionOptimizerSettings) -> Self {
-        let mut ctx = Self::new(RewriteConsumer::MaterializedViewRefresh, session_settings);
+    pub(crate) fn for_mv_refresh_with_settings(
+        session_settings: SessionOptimizerSettings,
+        control: &'a dyn PureCompileControl,
+    ) -> Self {
+        let mut ctx = Self::new(
+            RewriteConsumer::MaterializedViewRefresh,
+            session_settings,
+            control,
+        );
         ctx.policy.failure_policy = RewriteFailurePolicy::FailFast;
         ctx
     }
 
     #[cfg(test)]
     pub(crate) fn for_query(disabled_rules: impl IntoIterator<Item = String>) -> Self {
-        Self::for_query_with_settings(SessionOptimizerSettings {
-            disabled_rules: disabled_rules.into_iter().collect(),
-            ..Default::default()
-        })
+        Self::for_query_with_settings(
+            SessionOptimizerSettings {
+                disabled_rules: disabled_rules.into_iter().collect(),
+                ..Default::default()
+            },
+            unbounded_rewrite_test_control(),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn for_mv_refresh(disabled_rules: impl IntoIterator<Item = String>) -> Self {
-        Self::for_mv_refresh_with_settings(SessionOptimizerSettings {
-            disabled_rules: disabled_rules.into_iter().collect(),
-            ..Default::default()
-        })
+        Self::for_mv_refresh_with_settings(
+            SessionOptimizerSettings {
+                disabled_rules: disabled_rules.into_iter().collect(),
+                ..Default::default()
+            },
+            unbounded_rewrite_test_control(),
+        )
     }
 
     #[allow(
@@ -234,16 +256,46 @@ impl RewriteContext {
         )
     }
 
-    pub(crate) fn check_deadline(&self, operation: &str) -> Result<(), String> {
+    /// A temporary observation view; neither the request nor this view enters
+    /// the scalar arena, rewrite trace, or rewritten output.
+    pub(crate) fn control_view(&self) -> RewriteControl<'a> {
+        RewriteControl {
+            request: self.control,
+            deadline: self.deadline,
+        }
+    }
+
+    pub(crate) fn check_deadline(&self, _operation: &str) -> Result<(), SqlCompileError> {
+        self.control_view()
+            .checkpoint(CompilePhase::Validate, 0)
+            .map_err(crate::compiler::SqlCompileError::from)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RewriteControl<'a> {
+    request: &'a dyn PureCompileControl,
+    deadline: Option<Instant>,
+}
+
+impl PureCompileControl for RewriteControl<'_> {
+    fn checkpoint(&self, phase: CompilePhase, work_units: u32) -> Result<(), CompileControlError> {
+        self.request.checkpoint(phase, work_units)?;
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() > deadline)
         {
-            Err(format!("optimizer timeout during {operation}"))
-        } else {
-            Ok(())
+            return Err(CompileControlError::DeadlineExceeded);
         }
+        Ok(())
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn unbounded_rewrite_test_control() -> &'static dyn PureCompileControl {
+    static CONTROL: std::sync::LazyLock<crate::compiler::SqlCompileControl> =
+        std::sync::LazyLock::new(crate::compiler::SqlCompileControl::unbounded);
+    &*CONTROL
 }
 
 #[cfg(test)]
@@ -330,5 +382,18 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::default()));
         ctx.set_column_ref_factory(Rc::clone(&factory));
         assert!(ctx.column_ref_factory().is_some());
+    }
+
+    #[test]
+    fn existing_optimizer_deadline_is_typed_and_clone_borrows_same_request() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+        ctx.set_deadline(Instant::now() - std::time::Duration::from_millis(1));
+        let cloned = ctx.clone();
+        assert!(std::ptr::eq(ctx.control, cloned.control));
+        assert_eq!(
+            ctx.check_deadline("test"),
+            Err(SqlCompileError::DeadlineExceeded)
+        );
     }
 }

@@ -813,7 +813,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::planner::payload::{PlanFilterNode, PlanScanNode};
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         factory.borrow_mut().reserve_until(100);

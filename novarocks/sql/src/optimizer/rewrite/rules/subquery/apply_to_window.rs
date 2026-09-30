@@ -1047,7 +1047,7 @@ mod tests {
         )
     }
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
@@ -1059,7 +1059,7 @@ mod tests {
         factory
     }
 
-    fn ctx_with_factory() -> RewriteContext {
+    fn ctx_with_factory() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_column_ref_factory(column_ref_factory_for_fixtures());

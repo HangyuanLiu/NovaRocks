@@ -74,10 +74,11 @@ mod tests {
     use crate::optimizer::scalar::{ScalarArena, ScalarNode};
     use arrow::datatypes::DataType;
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }
 

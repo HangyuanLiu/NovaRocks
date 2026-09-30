@@ -298,7 +298,7 @@ mod tests {
     const OUTER_K: ColumnId = ColumnId(100); // t1.k as seen inside the subquery
     const APPLY_OUT: ColumnId = ColumnId(20); // the Apply's output column
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx

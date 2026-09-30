@@ -651,10 +651,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
         self.functions.or(self.owned_functions.as_deref())
     }
 
-    fn deadline(&self) -> Option<Instant> {
-        self.control.deadline()
-    }
-
     pub(crate) fn with_imv_rewrite(mut self, input: &'a SqlImvPlanningInput) -> Self {
         self.imv_rewrite = Some(input);
         self
@@ -1174,7 +1170,7 @@ impl SqlCompiler {
                         ),
                     snapshot: Arc::clone(input.snapshot()),
                     disabled_rules: settings.disabled_rules.clone(),
-                    deadline: request.deadline(),
+                    control: &request.control,
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
                     #[cfg(not(test))]
                     function_catalog: request
@@ -1186,8 +1182,7 @@ impl SqlCompiler {
                         })?
                         .snapshot(),
                 },
-            )
-            .map_err(|error| SqlCompileError::Compilation(format!("imv rewrite: {error}")))?;
+            )?;
             validate_imv_rewrite_outcome(input, &outcome)?;
             logical_plan = outcome.plan;
             change_stream = outcome.annotation.change_stream;
@@ -1311,6 +1306,7 @@ impl SqlCompiler {
                     &settings,
                     constant_evaluator,
                     Arc::clone(&function_catalog),
+                    &control,
                 ),
             ),
             None => crate::optimizer::optimize(
@@ -1323,10 +1319,10 @@ impl SqlCompiler {
                     &settings,
                     constant_evaluator,
                     Arc::clone(&function_catalog),
+                    &control,
                 ),
             ),
-        }
-        .map_err(SqlCompileError::Compilation)?;
+        }?;
         control.check()?;
 
         Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {

@@ -245,10 +245,11 @@ mod tests {
         }
     }
 
-    fn ctx_with_factory_and_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
+    fn ctx_with_factory_and_arena() -> (RewriteContext<'static>, Rc<RefCell<ScalarArena>>) {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         ctx.set_column_ref_factory(factory);

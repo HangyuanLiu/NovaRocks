@@ -816,7 +816,7 @@ mod tests {
 
     struct Fixture {
         arena: Rc<RefCell<ScalarArena>>,
-        ctx: RewriteContext,
+        ctx: RewriteContext<'static>,
         evaluator: Option<&'static FakeEvaluator>,
     }
 

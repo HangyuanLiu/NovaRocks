@@ -201,7 +201,7 @@ mod tests {
     const INNER_K: ColumnId = ColumnId(4);
     const IN_OUT: ColumnId = ColumnId(5);
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));

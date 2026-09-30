@@ -717,7 +717,7 @@ mod tests {
         );
     }
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),

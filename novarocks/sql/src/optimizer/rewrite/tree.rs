@@ -17,6 +17,9 @@
 
 use std::time::Instant;
 
+use crate::compiler::SqlCompileError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::{RewriteContext, RewriteFailurePolicy};
 use crate::optimizer::rewrite::result::RewriteResult;
@@ -26,10 +29,27 @@ pub(crate) fn rewrite_with_rule(
     plan: OptExpr,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(OptExpr, bool), String> {
+) -> Result<(OptExpr, bool), SqlCompileError> {
+    let control = ctx.control_view();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)
+        .map_err(crate::compiler::SqlCompileError::from)?;
+    let result = rewrite_with_rule_inner(plan, rule, ctx, &mut work)?;
+    work.finish()
+        .map_err(crate::compiler::SqlCompileError::from)?;
+    Ok(result)
+}
+
+fn rewrite_with_rule_inner(
+    plan: OptExpr,
+    rule: &dyn LogicalRewriteRule,
+    ctx: &mut RewriteContext,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(OptExpr, bool), SqlCompileError> {
+    work.step()
+        .map_err(crate::compiler::SqlCompileError::from)?;
     match rule.traversal() {
-        RewriteTraversal::TopDown => rewrite_top_down(plan, rule, ctx),
-        RewriteTraversal::BottomUp => rewrite_bottom_up(plan, rule, ctx),
+        RewriteTraversal::TopDown => rewrite_top_down(plan, rule, ctx, work),
+        RewriteTraversal::BottomUp => rewrite_bottom_up(plan, rule, ctx, work),
     }
 }
 
@@ -37,9 +57,10 @@ fn rewrite_top_down(
     plan: OptExpr,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(OptExpr, bool), String> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(OptExpr, bool), SqlCompileError> {
     let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx)?;
-    let (plan, child_changed) = rewrite_children(plan, rule, ctx)?;
+    let (plan, child_changed) = rewrite_children(plan, rule, ctx, work)?;
     Ok((plan, node_changed || child_changed))
 }
 
@@ -47,8 +68,9 @@ fn rewrite_bottom_up(
     plan: OptExpr,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(OptExpr, bool), String> {
-    let (plan, child_changed) = rewrite_children(plan, rule, ctx)?;
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(OptExpr, bool), SqlCompileError> {
+    let (plan, child_changed) = rewrite_children(plan, rule, ctx, work)?;
     let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx)?;
     Ok((plan, child_changed || node_changed))
 }
@@ -57,7 +79,7 @@ fn apply_rule_to_node(
     plan: OptExpr,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(OptExpr, bool), String> {
+) -> Result<(OptExpr, bool), SqlCompileError> {
     if super::tree_binder::bind_tree(&rule.pattern(), &plan).is_none() {
         return Ok((plan, false));
     }
@@ -72,7 +94,10 @@ fn apply_rule_to_node(
     ctx.trace_mut().rule_matched(phase, rule_name);
 
     let start = Instant::now();
-    match rule.apply(plan, ctx) {
+    let applied = rule.apply(plan, ctx);
+    // A request stop is never a rule diagnostic or a rejected candidate.
+    ctx.check_deadline(rule_name)?;
+    match applied {
         Ok(RewriteResult::Unchanged) => Ok((original, false)),
         Ok(RewriteResult::Changed(next)) => {
             ctx.trace_mut()
@@ -85,13 +110,13 @@ fn apply_rule_to_node(
                 .rule_rejected(phase, rule_name, message.clone());
             match ctx.policy().failure_policy {
                 RewriteFailurePolicy::CollectDiagnostics => Ok((original, false)),
-                RewriteFailurePolicy::FailFast => Err(message),
+                RewriteFailurePolicy::FailFast => Err(SqlCompileError::Compilation(message)),
             }
         }
         Err(message) => {
             ctx.trace_mut()
                 .rule_failed(phase, rule_name, message.clone());
-            Err(message)
+            Err(SqlCompileError::Compilation(message))
         }
     }
 }
@@ -100,8 +125,10 @@ fn rewrite_children(
     mut plan: OptExpr,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(OptExpr, bool), String> {
-    let (children, changed) = rewrite_plan_list(std::mem::take(&mut plan.children), rule, ctx)?;
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(OptExpr, bool), SqlCompileError> {
+    let (children, changed) =
+        rewrite_plan_list(std::mem::take(&mut plan.children), rule, ctx, work)?;
     plan.children = children;
     Ok((plan, changed))
 }
@@ -110,11 +137,12 @@ fn rewrite_plan_list(
     inputs: Vec<OptExpr>,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(Vec<OptExpr>, bool), String> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Vec<OptExpr>, bool), SqlCompileError> {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let (input, input_changed) = rewrite_with_rule(input, rule, ctx)?;
+        let (input, input_changed) = rewrite_with_rule_inner(input, rule, ctx, work)?;
         changed |= input_changed;
         rewritten.push(input);
     }
@@ -573,5 +601,145 @@ mod tests {
             panic!("expected scan on join right side (under project)");
         };
         assert_eq!(right_scan.table.name, "after");
+    }
+
+    #[derive(Clone, Copy)]
+    enum StopPoint {
+        Entry,
+        Batch,
+        Finish,
+    }
+    struct ObservedControl {
+        units: std::sync::Mutex<Vec<u32>>,
+        stop: Option<(StopPoint, novarocks_type_contract::CompileControlError)>,
+    }
+    impl novarocks_type_contract::PureCompileControl for ObservedControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            work_units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            self.units.lock().unwrap().push(work_units);
+            if let Some((point, error)) = self.stop {
+                let stop = match point {
+                    StopPoint::Entry => work_units == 0,
+                    StopPoint::Batch => work_units == 256,
+                    StopPoint::Finish => work_units > 0 && work_units < 256,
+                };
+                if stop {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+    }
+    struct NeverMatches {
+        visits: std::sync::atomic::AtomicUsize,
+    }
+    impl LogicalRewriteRule for NeverMatches {
+        fn name(&self) -> &'static str {
+            "NeverMatches"
+        }
+        fn phase(&self) -> RewritePhase {
+            RewritePhase::StructuralRewrite
+        }
+        fn matches(&self, _: &OptExpr, _: &RewriteContext) -> bool {
+            self.visits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+        fn apply(&self, _: OptExpr, _: &mut RewriteContext) -> Result<RewriteResult, String> {
+            panic!("structurally unmatched rule must never run")
+        }
+    }
+    fn wide_union() -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalUnion(crate::optimizer::operator::UnionOp {
+                all: true,
+                output_columns: vec![],
+                child_output_columns: vec![vec![]; 320],
+            }),
+            (0..320)
+                .map(|_| {
+                    OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                        rows: vec![vec![]],
+                        columns: vec![],
+                    }))
+                })
+                .collect(),
+        )
+    }
+    #[test]
+    fn rewrite_accounts_actual_wide_nodes_and_finishes_pending_work() {
+        let control = ObservedControl {
+            units: Default::default(),
+            stop: None,
+        };
+        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+        let rule = NeverMatches {
+            visits: Default::default(),
+        };
+        let (output, changed) = rewrite_with_rule(wide_union(), &rule, &mut ctx).unwrap();
+        assert!(!changed);
+        assert_eq!(output.children.len(), 320);
+        assert_eq!(rule.visits.load(std::sync::atomic::Ordering::SeqCst), 321);
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 256, 65]);
+    }
+    #[test]
+    fn rewrite_keeps_all_control_categories_at_entry_batch_and_finish() {
+        use novarocks_type_contract::CompileControlError as Error;
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::ResourceExhausted,
+        ] {
+            for point in [StopPoint::Entry, StopPoint::Batch, StopPoint::Finish] {
+                let control = ObservedControl {
+                    units: Default::default(),
+                    stop: Some((point, error)),
+                };
+                let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+                let rule = NeverMatches {
+                    visits: Default::default(),
+                };
+                let failure = rewrite_with_rule(wide_union(), &rule, &mut ctx).unwrap_err();
+                assert_eq!(failure, crate::compiler::SqlCompileError::from(error));
+                assert!(
+                    ctx.trace().events().is_empty(),
+                    "control must not become a rule diagnostic"
+                );
+                let units = control.units.lock().unwrap();
+                match point {
+                    StopPoint::Entry => {
+                        assert_eq!(*units, vec![0]);
+                        assert_eq!(rule.visits.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    }
+                    StopPoint::Batch => {
+                        assert_eq!(*units, vec![0, 256]);
+                        assert!(rule.visits.load(std::sync::atomic::Ordering::SeqCst) < 320);
+                    }
+                    StopPoint::Finish => assert_eq!(*units, vec![0, 256, 65]),
+                }
+            }
+        }
+    }
+    #[test]
+    fn successful_rewrite_output_does_not_retain_control() {
+        let owner = std::sync::Arc::new(ObservedControl {
+            units: Default::default(),
+            stop: None,
+        });
+        let weak = std::sync::Arc::downgrade(&owner);
+        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), owner.as_ref());
+        let cloned = ctx.clone();
+        let rule = NeverMatches {
+            visits: Default::default(),
+        };
+        let (output, _) = rewrite_with_rule(wide_union(), &rule, &mut ctx).unwrap();
+        drop(cloned);
+        drop(ctx);
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(output.children.len(), 320);
     }
 }

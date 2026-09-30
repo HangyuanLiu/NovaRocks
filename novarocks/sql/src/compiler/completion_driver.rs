@@ -767,6 +767,7 @@ fn optimize_to_physical(
         &settings,
         constant_evaluator,
         Arc::clone(&function_catalog),
+        control,
     );
     let optimized = match root_distribution {
         Some(distribution) => crate::optimizer::optimize_with_root_distribution(
@@ -785,8 +786,7 @@ fn optimize_to_physical(
             candidates,
             environment,
         ),
-    }
-    .map_err(SqlCompileError::Compilation)?;
+    }?;
     control.check()?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
         .map_err(SqlCompileError::Compilation)?;

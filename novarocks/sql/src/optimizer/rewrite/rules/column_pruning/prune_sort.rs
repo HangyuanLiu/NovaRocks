@@ -70,10 +70,11 @@ mod tests {
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }
 

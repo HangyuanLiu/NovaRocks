@@ -1567,6 +1567,63 @@ impl ConstantValue {
 // Convenience factories actively allocate, unlike try_new's already-owned
 // input. Check exact grammar, expanded child extents and payload before Arrow
 // allocation. These are finite opaque construction bounds, not MEM grants.
+/// Check one conventional scalar construction before allocating Arrow backing.
+/// Non-NULL construction is limited to inline or variable primitive carriers;
+/// nested and encoded values require their own expansion preflight. NULL
+/// construction uses the same recursive bounds as the owner NULL factory.
+/// This checks finite library work and bytes; it is not a host allocation grant.
+pub fn preflight_scalar_construction(
+    field: &Field,
+    ty: &FunctionValueType,
+    payload: u64,
+    null: bool,
+    policy: ConstantPolicy,
+    phase: CompilePhase,
+    control: &dyn PureCompileControl,
+) -> Result<(), ConstantError> {
+    control.checkpoint(phase, 0)?;
+    if !null
+        && !matches!(
+            ty.data_type,
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal32(_, _)
+                | DataType::Decimal64(_, _)
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::Duration(_)
+                | DataType::Interval(_)
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+        )
+    {
+        return Err(ConstantError::Invalid(
+            "non-NULL scalar construction requires a primitive carrier",
+        ));
+    }
+    factory_preflight(field, ty, payload, null, policy, phase, control)
+}
+
 fn factory_preflight(
     field: &Field,
     ty: &FunctionValueType,

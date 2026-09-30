@@ -406,10 +406,11 @@ mod tests {
     use crate::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::optimizer::scalar::{ScalarArena, SortKey};
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx

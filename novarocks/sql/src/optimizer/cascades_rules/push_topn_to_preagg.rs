@@ -904,7 +904,9 @@ mod tests {
             &fixture.memo,
             fixture.root_group,
             0,
-        );
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(bindings.len(), 1);
 
         let out = PushDownTopNToPreAgg.apply_bound(&bindings[0], &mut fixture.memo);

@@ -627,7 +627,7 @@ mod tests {
         )
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx

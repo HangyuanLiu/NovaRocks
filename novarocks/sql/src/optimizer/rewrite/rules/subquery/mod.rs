@@ -96,7 +96,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{PlanLimitNode, PlanValuesNode};
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(

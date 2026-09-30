@@ -71,10 +71,11 @@ mod tests {
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }
 

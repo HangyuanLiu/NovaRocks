@@ -442,10 +442,14 @@ mod tests {
             .rewrite(opt_in, &mut ctx)
             .expect_err("Validation must reject the wrapped-but-unconsumed plan");
         assert!(
-            err.starts_with("IVM rewrite failed to resolve incremental markers:"),
+            err.to_string()
+                .starts_with("IVM rewrite failed to resolve incremental markers:"),
             "unexpected error message: {err}"
         );
-        assert!(err.contains("\"ImvDelta\""), "kind list missing: {err}");
+        assert!(
+            err.to_string().contains("\"ImvDelta\""),
+            "kind list missing: {err}"
+        );
 
         // Trace must record the rejection under the rule's name.
         assert!(ctx.trace().events().iter().any(|e| matches!(

@@ -42,6 +42,7 @@ novarocks-functions.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-constant-contract.workspace = true
 novarocks-types.workspace = true
 novarocks-user-error.workspace = true
 md-5.workspace = true

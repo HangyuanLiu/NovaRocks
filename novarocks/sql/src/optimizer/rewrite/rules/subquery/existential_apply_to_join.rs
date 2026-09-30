@@ -155,7 +155,7 @@ mod tests {
     const EXISTS_OUT: ColumnId = ColumnId(3);
     const CONST_ONE: ColumnId = ColumnId(4);
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx

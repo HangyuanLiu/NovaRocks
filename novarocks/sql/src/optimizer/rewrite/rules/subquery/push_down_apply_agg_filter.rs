@@ -360,7 +360,7 @@ mod tests {
     const MAX_RESULT: ColumnId = ColumnId(10); // output_column_id for max(v2)
     const APPLY_OUT: ColumnId = ColumnId(20); // the Apply's output column
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx

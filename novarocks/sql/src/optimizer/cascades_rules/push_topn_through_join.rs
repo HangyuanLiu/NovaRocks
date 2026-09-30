@@ -639,7 +639,14 @@ mod tests {
             false,
             join,
         );
-        let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn_group, 0);
+        let bindings = bind(
+            &PushTopNThroughJoin.pattern(),
+            &memo,
+            topn_group,
+            0,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(bindings.len(), 2);
 
         let rewrites = bindings
@@ -844,7 +851,14 @@ mod tests {
             false,
             join,
         );
-        let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn_group, 0);
+        let bindings = bind(
+            &PushTopNThroughJoin.pattern(),
+            &memo,
+            topn_group,
+            0,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(bindings.len(), 1);
 
         let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);
@@ -876,7 +890,10 @@ mod tests {
             &mut memo,
             &crate::optimizer::cascades_rules::all_transformation_rules(),
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-            Instant::now() + Duration::from_secs(5),
+            &crate::optimizer::OptimizerControl {
+                request: crate::optimizer::test_optimizer_control(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
         )
         .expect("explore should finish");
 
@@ -934,14 +951,19 @@ mod tests {
             &mut memo,
             &crate::optimizer::cascades_rules::all_transformation_rules(),
             &options,
-            Instant::now() + Duration::from_secs(5),
+            &crate::optimizer::OptimizerControl {
+                request: crate::optimizer::test_optimizer_control(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
         )
         .expect("explore should finish");
         crate::optimizer::implement(
             &mut memo,
             &crate::optimizer::cascades_rules::all_implementation_rules(),
             &options,
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("implementation should finish");
         assert!(
             has_physical_hash_join_with_pushed_preserved_topn(&memo),
             "pushed join must stay hash-join implementable before post-explore stats derivation"
@@ -949,8 +971,10 @@ mod tests {
         crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
 
         let required = PhysicalPropertySet::gather();
-        let mut ctx =
-            crate::optimizer::search::SearchContext::new(stats_input, options.cost_options.clone());
+        let mut ctx = crate::optimizer::search::SearchContext::new_with_options_for_test(
+            stats_input,
+            options.cost_options.clone(),
+        );
         let total_cost = ctx
             .optimize_group(&memo, root, &required)
             .expect("search should finish");
@@ -1063,7 +1087,14 @@ mod tests {
                 false,
                 join,
             );
-            let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn, 0);
+            let bindings = bind(
+                &PushTopNThroughJoin.pattern(),
+                &memo,
+                topn,
+                0,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
             assert_eq!(bindings.len(), 1);
             let groups_before = memo.groups.len();
             let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);

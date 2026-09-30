@@ -33,7 +33,9 @@ use super::property::*;
 use super::statistics::CostEstimate;
 #[cfg(test)]
 use super::statistics::MAX_FINITE_COST;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::stats_input::OptimizerStatsInput;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 pub(crate) use super::derive::EnforcerKind;
 
@@ -175,7 +177,10 @@ pub(crate) struct EnforcerInfo {
 // ---------------------------------------------------------------------------
 
 /// Memoized search state for the top-down Cascades optimization.
-pub(crate) struct SearchContext {
+pub(crate) struct SearchContext<'a> {
+    // Borrow the admitted request only while search is running. Winners and
+    // memo facts retain no control, clock, cancellation or runtime authority.
+    control: &'a dyn PureCompileControl,
     /// (GroupId, PhysicalPropertySet) -> Winner
     pub(crate) winners: HashMap<(GroupId, PhysicalPropertySet), Winner>,
     pub(crate) stats_input: OptimizerStatsInput,
@@ -187,9 +192,14 @@ pub(crate) struct SearchContext {
     in_progress: HashSet<(GroupId, PhysicalPropertySet)>,
 }
 
-impl SearchContext {
-    pub(crate) fn new(stats_input: OptimizerStatsInput, cost_options: CostOptions) -> Self {
+impl<'a> SearchContext<'a> {
+    pub(crate) fn new(
+        stats_input: OptimizerStatsInput,
+        cost_options: CostOptions,
+        control: &'a dyn PureCompileControl,
+    ) -> Self {
         Self {
+            control,
             winners: HashMap::new(),
             stats_input,
             cost_options,
@@ -199,7 +209,21 @@ impl SearchContext {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(stats_input: OptimizerStatsInput) -> Self {
-        Self::new(stats_input, CostOptions::default())
+        Self::new_with_options_for_test(stats_input, CostOptions::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_options_for_test(
+        stats_input: OptimizerStatsInput,
+        cost_options: CostOptions,
+    ) -> Self {
+        static CONTROL: std::sync::OnceLock<crate::compiler::SqlCompileControl> =
+            std::sync::OnceLock::new();
+        Self::new(
+            stats_input,
+            cost_options,
+            CONTROL.get_or_init(crate::compiler::SqlCompileControl::unbounded),
+        )
     }
 
     /// Top-down cost-based search for the cheapest plan in `group_id` that
@@ -209,35 +233,56 @@ impl SearchContext {
     /// expression in the group can satisfy the requirement (even with
     /// enforcers).  This is not an error — some groups simply have no
     /// physical alternatives yet (e.g. unexpanded logical-only groups).
+    /// Control failures remain typed errors and never become an infeasible cost.
     pub(crate) fn optimize_group(
         &mut self,
         memo: &Memo,
         group_id: GroupId,
         required: &PhysicalPropertySet,
-    ) -> Result<TotalCost, String> {
+    ) -> Result<TotalCost, SqlCompileError> {
+        let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Validate)?;
         let cache_key = (group_id, required.clone());
 
         // 1. Check winner cache.
         if let Some(winner) = self.winners.get(&cache_key) {
-            return Ok(winner.total_cost);
+            let total_cost = winner.total_cost;
+            work.finish()?;
+            return Ok(total_cost);
         }
 
         // 2. Cycle guard: if this (group, props) is already being computed on
         //    the call stack, we have a mutual enforcer cycle.  Return INFINITY
         //    so the caller treats this path as infeasible and picks another.
         if self.in_progress.contains(&cache_key) {
+            work.finish()?;
             return Ok(f64::INFINITY);
         }
         self.in_progress.insert(cache_key.clone());
 
+        let result = self.optimize_group_uncached(memo, group_id, required, &mut work);
+        // An aborted search must not leave a fake enforcer cycle on retry.
+        // Previously completed child winners remain valid independent facts.
+        self.in_progress.remove(&cache_key);
+        let winner = result?;
+        work.finish()?;
+        let total_cost = winner.total_cost;
+        self.winners.insert(cache_key, winner);
+        Ok(total_cost)
+    }
+
+    fn optimize_group_uncached(
+        &mut self,
+        memo: &Memo,
+        group_id: GroupId,
+        required: &PhysicalPropertySet,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Winner, SqlCompileError> {
         let group = &memo.groups[group_id];
         let num_physical = group.physical_exprs.len();
 
         // Groups with no physical exprs: return infinity (not an error).
         if num_physical == 0 {
-            self.in_progress.remove(&cache_key);
-            self.winners.insert(cache_key, Winner::infeasible(group_id));
-            return Ok(f64::INFINITY);
+            return Ok(Winner::infeasible(group_id));
         }
 
         let mut best_cost = f64::INFINITY;
@@ -263,6 +308,7 @@ impl SearchContext {
         let own_stats = stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
 
         for expr_idx in 0..num_physical {
+            work.step()?;
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
 
             let alternatives = super::derive::derive_required_alternatives(
@@ -274,6 +320,7 @@ impl SearchContext {
             let feasibility_is_advisory =
                 super::cost::feasibility_is_advisory_only(&expr.op, &alternatives);
             for alt in alternatives {
+                work.step()?;
                 let child_reqs = alt.child_props.clone();
                 if child_reqs.len() != expr.children.len() {
                     continue;
@@ -297,18 +344,27 @@ impl SearchContext {
                     }
                 }
 
-                let child_stats_vec: Vec<_> = expr
-                    .children
-                    .iter()
-                    .map(|&cg| stats_for_group(&memo.groups[cg], memo, &self.stats_input))
-                    .collect();
-                let child_stats_refs: Vec<&_> = child_stats_vec.iter().collect();
+                let mut child_stats_vec = Vec::with_capacity(expr.children.len());
+                for &cg in &expr.children {
+                    work.step()?;
+                    child_stats_vec.push(stats_for_group(
+                        &memo.groups[cg],
+                        memo,
+                        &self.stats_input,
+                    ));
+                }
+                let mut child_stats_refs = Vec::with_capacity(child_stats_vec.len());
+                for stats in &child_stats_vec {
+                    work.step()?;
+                    child_stats_refs.push(stats);
+                }
 
                 let mut child_outputs: Vec<PhysicalPropertySet> =
                     Vec::with_capacity(expr.children.len());
                 let mut child_cost_estimate = CostEstimate::default();
                 let mut feasible = true;
                 for (i, &cg) in expr.children.iter().enumerate() {
+                    work.step()?;
                     let child_cost = self.optimize_group(memo, cg, &child_reqs[i])?;
                     if child_cost.is_infinite() {
                         feasible = false;
@@ -325,7 +381,11 @@ impl SearchContext {
                     continue;
                 }
 
-                let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
+                let mut child_output_refs = Vec::with_capacity(child_outputs.len());
+                for output in &child_outputs {
+                    work.step()?;
+                    child_output_refs.push(output);
+                }
                 let cost_input = CostInput {
                     op: &expr.op,
                     own_stats: &own_stats,
@@ -361,6 +421,7 @@ impl SearchContext {
                         let mut candidate_materialized_enforcer_estimate: Option<CostEstimate> =
                             None;
                         for enforcer in &enforcers {
+                            work.step()?;
                             let enforcer_estimate = super::derive::estimate_enforcer_cost_estimate(
                                 enforcer,
                                 &group_stats,
@@ -406,11 +467,8 @@ impl SearchContext {
             }
         }
 
-        // Remove from in-progress before caching, so re-entrant calls after
-        // this point (e.g. from a sibling in a parent loop) see the cache hit.
-        self.in_progress.remove(&cache_key);
-
-        // Cache the result even if best_cost is INFINITY (avoids recomputation).
+        // Build a candidate even if its cost is INFINITY. The caller observes
+        // final control before publishing either feasible or infeasible facts.
         let winner = if best_cost.is_infinite() {
             Winner::infeasible(group_id)
         } else {
@@ -429,9 +487,7 @@ impl SearchContext {
                 best_child_outputs,
             )
         };
-        let total_cost = winner.total_cost;
-        self.winners.insert(cache_key, winner);
-        Ok(total_cost)
+        Ok(winner)
     }
 }
 
@@ -1114,7 +1170,10 @@ mod tests {
             network_weight: 0.0,
             ..Default::default()
         };
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()), options.clone());
+        let mut ctx = SearchContext::new_with_options_for_test(
+            legacy_stats_input(make_table_stats()),
+            options.clone(),
+        );
         let required = PhysicalPropertySet::any();
 
         ctx.optimize_group(&memo, gid, &required).expect("search");
@@ -1506,7 +1565,8 @@ mod tests {
         low_budget_profile.per_node_build_memory_budget_bytes = 1.0 * 1024.0 * 1024.0;
         let mut low_budget_options = CostOptions::default();
         low_budget_options.apply_profile(low_budget_profile);
-        let mut low_budget_ctx = SearchContext::new(empty_stats_input(), low_budget_options);
+        let mut low_budget_ctx =
+            SearchContext::new_with_options_for_test(empty_stats_input(), low_budget_options);
         low_budget_ctx
             .optimize_group(&memo, root, &required)
             .expect("low-budget search");
@@ -1519,7 +1579,8 @@ mod tests {
         high_budget_profile.per_node_build_memory_budget_bytes = 8.0 * 1024.0 * 1024.0;
         let mut high_budget_options = CostOptions::default();
         high_budget_options.apply_profile(high_budget_profile);
-        let mut high_budget_ctx = SearchContext::new(empty_stats_input(), high_budget_options);
+        let mut high_budget_ctx =
+            SearchContext::new_with_options_for_test(empty_stats_input(), high_budget_options);
         high_budget_ctx
             .optimize_group(&memo, root, &required)
             .expect("high-budget search");
@@ -1566,7 +1627,7 @@ mod tests {
         profile.per_node_build_memory_budget_bytes = 1.0 * 1024.0 * 1024.0;
         let mut options = CostOptions::default();
         options.apply_profile(profile);
-        let mut ctx = SearchContext::new(empty_stats_input(), options);
+        let mut ctx = SearchContext::new_with_options_for_test(empty_stats_input(), options);
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -1995,6 +2056,252 @@ mod cascaded_derivation_tests {
                 Some(EnforcerKind::Distribution(_))
             ),
             "Broadcast Join should repartition above the join. winner = {bj_winner:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use novarocks_type_contract::{CompileControlError, MAX_UNOBSERVED_COMPILE_WORK};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    // Modes stop at actual search entry, a complete work quantum, the final
+    // partial quantum, or the empty-group finish respectively.
+    struct Control {
+        mode: AtomicU8,
+        error: CompileControlError,
+        observed: Mutex<Vec<(CompilePhase, u32)>>,
+    }
+
+    impl Control {
+        fn new(error: CompileControlError, mode: u8) -> Self {
+            Self {
+                mode: AtomicU8::new(mode),
+                error,
+                observed: Mutex::default(),
+            }
+        }
+    }
+
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut observed = self.observed.lock().expect("observations");
+            observed.push((phase, units));
+            assert!(units <= MAX_UNOBSERVED_COMPILE_WORK);
+            let stop = match self.mode.load(Ordering::SeqCst) {
+                0 => false,
+                1 => true,
+                2 => units == MAX_UNOBSERVED_COMPILE_WORK,
+                3 => units > 0 && units < MAX_UNOBSERVED_COMPILE_WORK,
+                4 => observed.len() == 2,
+                _ => unreachable!("fixture mode"),
+            };
+            if stop { Err(self.error) } else { Ok(()) }
+        }
+    }
+
+    fn errors() -> [CompileControlError; 3] {
+        [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ]
+    }
+
+    fn stats() -> OptimizerStatsInput {
+        super::tests::legacy_stats_input(super::tests::make_table_stats())
+    }
+
+    fn scan_alternatives(count: usize) -> (Memo, GroupId) {
+        assert!(count > 0);
+        let (mut memo, group) = super::tests::single_scan_memo();
+        let op = memo.groups[group].physical_exprs[0].op.clone();
+        for id in 1..count {
+            memo.add_expr_to_group(
+                group,
+                super::super::memo::MExpr {
+                    id,
+                    op: op.clone(),
+                    children: Vec::new(),
+                },
+            );
+        }
+        assert_eq!(memo.groups[group].physical_exprs.len(), count);
+        (memo, group)
+    }
+
+    fn logical_only_scan() -> (Memo, GroupId) {
+        let (mut memo, group) = super::tests::single_scan_memo();
+        let physical = memo.groups[group].physical_exprs.remove(0);
+        let Operator::PhysicalScan(scan) = physical.op else {
+            panic!("scan fixture")
+        };
+        memo.add_expr_to_group(
+            group,
+            super::super::memo::MExpr {
+                id: physical.id,
+                op: Operator::LogicalScan(scan),
+                children: Vec::new(),
+            },
+        );
+        assert!(memo.groups[group].physical_exprs.is_empty());
+        assert_eq!(memo.groups[group].logical_exprs.len(), 1);
+        (memo, group)
+    }
+
+    #[test]
+    fn search_entry_preserves_control_before_cache_cycle_or_infeasibility() {
+        let (memo, group) = super::tests::single_scan_memo();
+        let (logical, logical_group) = logical_only_scan();
+        let required = PhysicalPropertySet::any();
+        for error in errors() {
+            let control = Control::new(error, 1);
+            let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
+            assert_eq!(
+                search.optimize_group(&memo, group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert!(search.winners.is_empty());
+            assert!(search.in_progress.is_empty());
+            assert_eq!(
+                *control.observed.lock().unwrap(),
+                vec![(CompilePhase::Validate, 0)]
+            );
+
+            control.mode.store(0, Ordering::SeqCst);
+            let cost = search.optimize_group(&memo, group, &required).unwrap();
+            assert!(cost.is_finite());
+            let cached_index = search.winners[&(group, required.clone())].expr_index;
+            control.mode.store(1, Ordering::SeqCst);
+            assert_eq!(
+                search.optimize_group(&memo, group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert_eq!(search.winners.len(), 1);
+            assert_eq!(
+                search.winners[&(group, required.clone())].expr_index,
+                cached_index
+            );
+
+            let mut logical_search = SearchContext::new(stats(), CostOptions::default(), &control);
+            assert_eq!(
+                logical_search.optimize_group(&logical, logical_group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert!(logical_search.winners.is_empty());
+            assert!(logical_search.in_progress.is_empty());
+
+            // Exercise the actual cycle-guard fast path, with a key already
+            // owned by an outer search invocation, without changing the memo.
+            let mut cyclic = SearchContext::new(stats(), CostOptions::default(), &control);
+            cyclic.in_progress.insert((group, required.clone()));
+            assert_eq!(
+                cyclic.optimize_group(&memo, group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert!(cyclic.winners.is_empty());
+        }
+    }
+
+    #[test]
+    fn wide_real_search_stops_at_positive_quantum_without_publishing_a_winner() {
+        let (memo, group) = scan_alternatives(320);
+        let required = PhysicalPropertySet::any();
+        for error in errors() {
+            let control = Control::new(error, 2);
+            let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
+            assert_eq!(
+                search.optimize_group(&memo, group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert!(search.winners.is_empty());
+            assert!(search.in_progress.is_empty());
+            assert_eq!(
+                *control.observed.lock().unwrap(),
+                vec![
+                    (CompilePhase::Validate, 0),
+                    (CompilePhase::Validate, MAX_UNOBSERVED_COMPILE_WORK),
+                ]
+            );
+
+            // The interrupted invocation did not leave a cycle sentinel or a
+            // fake Infinity winner. A separately permitted search still picks
+            // the original first-inserted equal-cost physical alternative.
+            control.mode.store(0, Ordering::SeqCst);
+            let cost = search.optimize_group(&memo, group, &required).unwrap();
+            assert!(cost.is_finite());
+            assert_eq!(search.winners[&(group, required.clone())].expr_index, 0);
+            assert!(search.in_progress.is_empty());
+        }
+    }
+
+    #[test]
+    fn final_control_failure_does_not_publish_computed_or_infeasible_winners() {
+        let (memo, group) = super::tests::single_scan_memo();
+        let (logical, logical_group) = logical_only_scan();
+        let required = PhysicalPropertySet::any();
+        for error in errors() {
+            let control = Control::new(error, 3);
+            let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
+            assert_eq!(
+                search.optimize_group(&memo, group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert!(search.winners.is_empty());
+            assert!(search.in_progress.is_empty());
+            let observed = control.observed.lock().unwrap();
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0], (CompilePhase::Validate, 0));
+            assert!(observed[1].1 > 0 && observed[1].1 < MAX_UNOBSERVED_COMPILE_WORK);
+            drop(observed);
+
+            let empty_control = Control::new(error, 4);
+            let mut empty_search =
+                SearchContext::new(stats(), CostOptions::default(), &empty_control);
+            assert_eq!(
+                empty_search.optimize_group(&logical, logical_group, &required),
+                Err(SqlCompileError::from(error))
+            );
+            assert!(empty_search.winners.is_empty());
+            assert!(empty_search.in_progress.is_empty());
+            assert_eq!(
+                *empty_control.observed.lock().unwrap(),
+                vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 0)]
+            );
+        }
+    }
+
+    #[test]
+    fn successful_controlled_search_keeps_cost_ties_enforcers_and_infeasibility() {
+        let (memo, group) = scan_alternatives(320);
+        let (logical, logical_group) = logical_only_scan();
+        let control = Control::new(CompileControlError::Cancelled, 0);
+        let mut search = SearchContext::new(stats(), CostOptions::default(), &control);
+        let any = PhysicalPropertySet::any();
+        let cost = search.optimize_group(&memo, group, &any).unwrap();
+        let cached = search.optimize_group(&memo, group, &any).unwrap();
+        assert_eq!(cost, cached);
+        assert_eq!(search.winners[&(group, any)].expr_index, 0);
+        let gather = PhysicalPropertySet::gather();
+        let gathered = search.optimize_group(&memo, group, &gather).unwrap();
+        assert!(gathered.is_finite());
+        assert!(search.winners[&(group, gather)].enforcer.is_some());
+        let mut logical_search = SearchContext::new(stats(), CostOptions::default(), &control);
+        assert!(
+            logical_search
+                .optimize_group(&logical, logical_group, &PhysicalPropertySet::any())
+                .unwrap()
+                .is_infinite()
+        );
+        assert!(
+            control
+                .observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, units)| { *units == MAX_UNOBSERVED_COMPILE_WORK })
         );
     }
 }

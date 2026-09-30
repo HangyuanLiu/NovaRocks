@@ -597,7 +597,9 @@ pub fn analyze_join_incremental_refresh_change_stream(
         logical,
         logical_output.factory,
         context.functions,
-    )?;
+        &context.control,
+    )
+    .map_err(|error| error.to_string())?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
         factory,
@@ -1049,13 +1051,14 @@ fn build_join_incremental_refresh_logical_plan(
     plan: crate::planner::logical::LogicalPlanNode,
     factory: crate::column_id::ColumnRefFactory,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         crate::planner::logical::LogicalPlanNode,
         crate::column_id::ColumnRefFactory,
         Option<crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     let is_aggregate_refresh = snapshot.schema_contract.aggregate.is_some();
     let factory_cell = Rc::new(RefCell::new(factory));
@@ -1064,15 +1067,26 @@ fn build_join_incremental_refresh_logical_plan(
             plan,
             snapshot: Arc::clone(snapshot),
             disabled_rules: join_incremental_disabled_rules(is_aggregate_refresh),
-            deadline: None,
+            control,
             column_ref_factory: Rc::clone(&factory_cell),
             #[cfg(not(test))]
             function_catalog: functions.snapshot(),
         },
     )
-    .map_err(|error| format!("join refresh logical rewrite: {error}"))?;
+    .map_err(|error| match error {
+        crate::compiler::SqlCompileError::Compilation(message) => {
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "join refresh logical rewrite: {message}"
+            ))
+        }
+        control => control,
+    })?;
     let mut factory = Rc::try_unwrap(factory_cell)
-        .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
+        .map_err(|_| {
+            crate::compiler::SqlCompileError::Compilation(
+                "IMV rewrite leaked ColumnRefFactory references".to_string(),
+            )
+        })?
         .into_inner();
     let mut change_stream_override = None;
     let plan = match mode {
@@ -1085,16 +1099,16 @@ fn build_join_incremental_refresh_logical_plan(
                 .join_refresh
                 .clone()
                 .ok_or_else(|| {
-                    format!(
+                    crate::compiler::SqlCompileError::Compilation(format!(
                         "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
                         snapshot.target.fqn()
-                    )
+                    ))
                 })?;
             descriptor.validate().map_err(|error| {
-                format!(
+                crate::compiler::SqlCompileError::Compilation(format!(
                     "iceberg join MV {} incremental refresh descriptor is invalid: {error}",
                     snapshot.target.fqn()
-                )
+                ))
             })?;
             change_stream_override = Some(
                 crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
@@ -1103,7 +1117,8 @@ fn build_join_incremental_refresh_logical_plan(
                 },
             );
             let locator_columns =
-                allocate_join_incremental_locator_column_ids(&mut factory, &outcome.plan)?;
+                allocate_join_incremental_locator_column_ids(&mut factory, &outcome.plan)
+                    .map_err(crate::compiler::SqlCompileError::Compilation)?;
             crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 outcome.plan,
                 &descriptor,
@@ -1117,10 +1132,12 @@ fn build_join_incremental_refresh_logical_plan(
                 #[cfg(not(test))]
                 functions,
             )
-            .map_err(|error| format!("build join refresh coalesce logical plan: {error}"))?
+            .map_err(|error| crate::compiler::SqlCompileError::Compilation(
+                format!("build join refresh coalesce logical plan: {error}")))?
         }
     };
-    reserve_factory_for_plan(&mut factory, &plan)?;
+    reserve_factory_for_plan(&mut factory, &plan)
+        .map_err(crate::compiler::SqlCompileError::Compilation)?;
     Ok((plan, factory, change_stream_override))
 }
 

@@ -1427,7 +1427,9 @@ mod tests {
             &mut memo,
             &crate::optimizer::cascades_rules::all_implementation_rules(),
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("implementation should finish");
 
         assert!(
             memo.groups[pushed_group]

@@ -2430,7 +2430,7 @@ mod tests {
         }
     }
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         build_ctx_with_state_columns(vec![
             single_state_column("binary"),
             retraction_count_state_column(),
@@ -2439,14 +2439,14 @@ mod tests {
 
     fn build_ctx_with_state_columns(
         state_columns: Vec<SqlImvAggregateStateColumnContract>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         build_ctx_with_state_columns_and_target_partition(state_columns, None)
     }
 
     fn build_ctx_with_state_columns_and_target_partition(
         state_columns: Vec<SqlImvAggregateStateColumnContract>,
         target_partition: Option<SqlImvPartitionContract>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         build_ctx_with_state_columns_target_partition_and_branch(
             state_columns,
             target_partition,
@@ -2454,7 +2454,7 @@ mod tests {
         )
     }
 
-    fn build_branch_ctx() -> RewriteContext {
+    fn build_branch_ctx() -> RewriteContext<'static> {
         build_ctx_with_state_columns_target_partition_and_branch(
             vec![
                 single_state_column("binary"),
@@ -2472,7 +2472,7 @@ mod tests {
         state_columns: Vec<SqlImvAggregateStateColumnContract>,
         target_partition: Option<SqlImvPartitionContract>,
         branch_contract: Option<SqlImvBranchContract>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         let snapshot = crate::compiler::mv_rewrite::test_aggregate_snapshot(
             state_columns,
             target_partition,
@@ -2495,7 +2495,7 @@ mod tests {
     }
 
     fn aggregate_rewrite_test_context_with_factory() -> (
-        RewriteContext,
+        RewriteContext<'static>,
         ImvExtension,
         crate::compiler::mv_rewrite::SqlImvAggregateLayout,
     ) {

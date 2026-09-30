@@ -287,7 +287,7 @@ mod tests {
     use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         factory.borrow_mut().reserve_until(200);

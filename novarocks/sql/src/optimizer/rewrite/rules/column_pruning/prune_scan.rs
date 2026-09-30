@@ -337,10 +337,11 @@ mod tests {
         }
     }
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(arena);
@@ -437,6 +438,7 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         let result = rule.apply(expr, &mut ctx).unwrap();

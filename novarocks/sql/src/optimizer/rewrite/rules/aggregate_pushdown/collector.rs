@@ -381,7 +381,7 @@ mod tests {
         dead_code,
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx

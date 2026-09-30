@@ -187,7 +187,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
-    fn ctx_with_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
+    fn ctx_with_arena() -> (RewriteContext<'static>, Rc<RefCell<ScalarArena>>) {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(Rc::clone(&arena));

@@ -27,6 +27,7 @@ pub(crate) mod column_id;
 pub mod compiler;
 pub(crate) mod functions;
 pub mod literal;
+pub(crate) mod literal_constant;
 pub(crate) mod mv_refresh;
 pub(crate) mod parser;
 pub mod planning;
