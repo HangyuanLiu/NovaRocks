@@ -137,12 +137,6 @@ pub fn validate_plan_with_limits(
         plan.runtime_filters().len(),
         limits.plan_runtime_filters,
     );
-    bounded_count(
-        &mut errors,
-        "artifact_refs",
-        plan.artifact_refs().len(),
-        limits.plan_artifact_refs,
-    );
     if plan.fragments().is_empty() {
         errors.push(ValidationError::new("fragments", "plan has no fragments"));
     }
@@ -176,8 +170,6 @@ pub fn validate_plan_with_limits(
     run_validation_stage!(validate_writer_flows(plan, &mut errors));
     run_validation_stage!(validate_result(plan, &mut errors));
     run_validation_stage!(validate_runtime_filters(plan, &mut errors));
-    run_validation_stage!(validate_artifact_refs(plan, &mut errors));
-    run_validation_stage!(validate_artifact_inputs(plan, &mut errors));
     run_validation_stage!(validate_annotations(plan, &mut errors));
     run_validation_stage!(validate_cross_fragment_value_origins(plan, &mut errors));
     run_validation_stage!(validate_provider_read_occurrences(plan, &mut errors));

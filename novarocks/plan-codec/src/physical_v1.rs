@@ -934,9 +934,6 @@ impl std::error::Error for WireLayoutError {}
 /// This runs before a wire layout or protobuf tree is allocated. It never
 /// patches unsupported semantics into a nearby v1 shape.
 pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1PreflightError> {
-    if !plan.artifact_refs().is_empty() {
-        return Err(PhysicalV1PreflightError::ArtifactReferences);
-    }
     for fragment in plan.fragments().values() {
         validate_native_v1_tree_depth(fragment).map_err(|error| {
             PhysicalV1PreflightError::TreeDepth {
@@ -1037,11 +1034,6 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
             }
         }
         match fragment.sink() {
-            FragmentSink::SealedArtifact(_) => {
-                return Err(PhysicalV1PreflightError::SealedArtifactSink {
-                    fragment: fragment.id(),
-                });
-            }
             FragmentSink::Noop => {
                 return Err(PhysicalV1PreflightError::NoopSink {
                     fragment: fragment.id(),
@@ -1240,13 +1232,9 @@ fn validate_v1_function_identity(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PhysicalV1PreflightError {
-    ArtifactReferences,
     TreeDepth {
         fragment: FragmentId,
         reason: Box<str>,
-    },
-    SealedArtifactSink {
-        fragment: FragmentId,
     },
     NoopSink {
         fragment: FragmentId,
@@ -1279,16 +1267,9 @@ pub enum PhysicalV1PreflightError {
 impl fmt::Display for PhysicalV1PreflightError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ArtifactReferences => formatter
-                .write_str("native wire v1 cannot encode sealed artifact references losslessly"),
             Self::TreeDepth { fragment, reason } => write!(
                 formatter,
                 "native wire v1 cannot encode fragment {} safely: {reason}",
-                fragment.get()
-            ),
-            Self::SealedArtifactSink { fragment } => write!(
-                formatter,
-                "native wire v1 cannot encode sealed artifact sink in fragment {}",
                 fragment.get()
             ),
             Self::NoopSink { fragment } => write!(

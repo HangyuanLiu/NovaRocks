@@ -23,10 +23,9 @@ use novarocks_connector_contract::{
 };
 
 use crate::{
-    AggregateBinding, AggregateCallId, ArtifactRefId, EdgeId, ExprArena, ExprId, FragmentId,
-    NodeId, NullOrdering, PLAN_CONTRACT_REVISION, PlanVersionId, ProviderColumnReference, Relation,
-    RuntimeFilterId, SealedArtifactRef, SealedArtifactSinkSpec, SortDirection, SortExpr, ValueId,
-    ValueType,
+    AggregateBinding, AggregateCallId, EdgeId, ExprArena, ExprId, FragmentId, NodeId, NullOrdering,
+    PLAN_CONTRACT_REVISION, PlanVersionId, ProviderColumnReference, Relation, RuntimeFilterId,
+    SortDirection, SortExpr, ValueId, ValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +34,6 @@ pub enum WriterDerivedKind {
     AffectedRows,
     CommitFragment,
     ChangeEvent,
-    ArtifactReference,
     RelationAuxiliary,
     WriteTargetOrdinal,
     GroupingKey,
@@ -1002,7 +1000,6 @@ pub enum FragmentSink {
         effect: ValueId,
         routes: Box<[ChangeStreamRoute]>,
     },
-    SealedArtifact(Box<SealedArtifactSinkSpec>),
     Noop,
 }
 
@@ -1151,10 +1148,6 @@ pub struct InboundFragmentCut {
     pub destination_node: NodeId,
     pub imports: Box<[CutImport]>,
     pub partitioning: EdgePartitioning,
-    /// Exact provider inputs proven upstream of this edge.
-    pub source_bindings: Box<[crate::ArtifactSourceBinding]>,
-    /// Whether the upstream row set can contain rows with no provider source.
-    pub has_source_free_rows: bool,
     pub change_stream_writer: Option<ChangeStreamWriterCut>,
     pub writer_result: Option<WriterResultCut>,
 }
@@ -1169,10 +1162,6 @@ pub struct OutboundFragmentCut {
     /// Exact source-to-destination value mapping at the peer boundary.
     pub destination_imports: Box<[CutImport]>,
     pub partitioning: EdgePartitioning,
-    /// Exact provider inputs proven upstream of this edge.
-    pub source_bindings: Box<[crate::ArtifactSourceBinding]>,
-    /// Whether the upstream row set can contain rows with no provider source.
-    pub has_source_free_rows: bool,
     pub change_stream_writer: Option<ChangeStreamWriterCut>,
     pub writer_result: Option<WriterResultCut>,
 }
@@ -1181,8 +1170,6 @@ pub struct OutboundFragmentCut {
 pub struct FragmentCuts {
     pub inbound: Box<[InboundFragmentCut]>,
     pub outbound: Box<[OutboundFragmentCut]>,
-    /// Exact immutable artifacts consumed by this fragment.
-    pub artifact_refs: Box<[SealedArtifactRef]>,
     /// Complete static runtime-filter contracts with at least one local endpoint.
     pub runtime_filters: Box<[RuntimeFilter]>,
 }
@@ -1514,7 +1501,6 @@ pub struct PhysicalPlan {
     edges: BTreeMap<EdgeId, Edge>,
     runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     result_port: Option<ResultPort>,
-    artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     required: RequiredContracts,
     annotations: Box<[PlanAnnotation]>,
 }
@@ -1540,10 +1526,6 @@ impl PhysicalPlan {
         self.result_port.as_ref()
     }
 
-    pub fn artifact_refs(&self) -> &BTreeMap<ArtifactRefId, SealedArtifactRef> {
-        &self.artifact_refs
-    }
-
     pub const fn required(&self) -> RequiredContracts {
         self.required
     }
@@ -1559,7 +1541,6 @@ pub(crate) struct PhysicalPlanParts {
     pub edges: BTreeMap<EdgeId, Edge>,
     pub runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     pub result_port: Option<ResultPort>,
-    pub artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     pub required: RequiredContracts,
     pub annotations: Box<[PlanAnnotation]>,
 }
@@ -1572,7 +1553,6 @@ impl From<PhysicalPlanParts> for PhysicalPlan {
             edges: parts.edges,
             runtime_filters: parts.runtime_filters,
             result_port: parts.result_port,
-            artifact_refs: parts.artifact_refs,
             required: parts.required,
             annotations: parts.annotations,
         }

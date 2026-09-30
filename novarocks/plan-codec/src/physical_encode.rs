@@ -1502,8 +1502,8 @@ fn preflight_encoder(
             }
             FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
             }
-            FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {
-                unreachable!("shared preflight rejects these sinks")
+            FragmentSink::Noop => {
+                unreachable!("shared preflight rejects this sink")
             }
         }
     }
@@ -3740,8 +3740,8 @@ fn encode_sink(
                     .collect::<Result<Vec<_>, String>>()?,
             })
         }
-        FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {
-            unreachable!("shared preflight rejects these sinks")
+        FragmentSink::Noop => {
+            unreachable!("shared preflight rejects this sink")
         }
     };
     Ok(plan::DataSink { kind: Some(kind) })
@@ -4977,7 +4977,6 @@ mod tests {
             schema: Box::default(),
             predicate_guarantees: Box::default(),
             provided_properties: properties(),
-            artifact_inputs: Box::default(),
         });
         let mut source = wire::ConnectorTableScanSource {
             table: Some(wire::CatalogTableHandle {

@@ -2515,7 +2515,6 @@ impl ContractLoweringVisitor {
                     predicate_guarantees: guarantees.into_boxed_slice(),
                     provided_properties: properties.clone(),
                     coverage_evidence: contract.coverage_evidence,
-                    artifact_inputs: Box::default(),
                 })
             }
             _ => Relation::Data(DataRelation {
@@ -2525,7 +2524,6 @@ impl ContractLoweringVisitor {
                 schema: relation_schema.into_boxed_slice(),
                 predicate_guarantees: guarantees.into_boxed_slice(),
                 provided_properties: properties.clone(),
-                artifact_inputs: Box::default(),
             }),
         };
         self.fragment_mut().add_scan(

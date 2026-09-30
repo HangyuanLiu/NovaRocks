@@ -99,20 +99,6 @@ impl fmt::Display for OptionalQuoted<'_> {
     }
 }
 
-struct CoverageBound<'a> {
-    value: Option<&'a [u8]>,
-    infinity: &'static str,
-}
-
-impl fmt::Display for CoverageBound<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.value {
-            Some(value) => Hex(value).fmt(formatter),
-            None => formatter.write_str(self.infinity),
-        }
-    }
-}
-
 struct DigestBytes([u8; 32]);
 
 impl fmt::Display for DigestBytes {
@@ -607,7 +593,6 @@ pub fn render_completed_plan(
     render_display_annotations(display_annotations, &mut lines)?;
     if is_detailed(level) {
         render_annotations(&context, AnnotationSubject::Plan, "", &mut lines)?;
-        render_artifact_references(&context, &mut lines)?;
         render_edges(&context, &mut lines)?;
         render_runtime_filters(&context, &mut lines)?;
     }
@@ -891,36 +876,6 @@ fn render_result_schema(
     Ok(())
 }
 
-fn render_artifact_references(
-    context: &RenderContext<'_>,
-    lines: &mut ExplainRenderOutput,
-) -> Result<(), SqlCompileError> {
-    if context.plan.artifact_refs().is_empty() {
-        return Ok(());
-    }
-    lines.push(format_args!("SEALED ARTIFACT REFERENCES"))?;
-    for artifact in context.plan.artifact_refs().values() {
-        lines.push(format_args!(
-            "  artifact{} kind={} format={}@{} schema=[{}] source={} coverage={} location={} content-digest={} schema-digest={} objects={} rows={}",
-            artifact.id.get(),
-            artifact.kind.as_str(),
-            artifact.format.id.as_str(),
-            artifact.format.revision,
-            joined(&artifact.schema, ",", |ty: &novarocks_physical_plan::ValueType, output: &mut fmt::Formatter<'_>| {
-                format_value_type(ty).fmt(output)
-            }),
-            format_artifact_source(&artifact.source),
-            format_coverage_set(&artifact.coverage),
-            quote_text(&artifact.location),
-            format_hex(&artifact.content_digest),
-            format_hex(&artifact.schema_digest),
-            artifact.object_count,
-            artifact.row_count
-        ))?;
-    }
-    Ok(())
-}
-
 fn render_edges(
     context: &RenderContext<'_>,
     lines: &mut ExplainRenderOutput,
@@ -972,7 +927,7 @@ fn render_cut_attachments(
     })?;
     for cut in &cuts.inbound {
         lines.push(format_args!(
-            "    inbound edge{} kind={} source=f{} destination=n{} imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} source-bindings=[{}] source-free={} change-stream-writer={} writer-result={}",
+            "    inbound edge{} kind={} source=f{} destination=n{} imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} change-stream-writer={} writer-result={}",
             cut.edge.get(),
             edge_kind(cut.kind),
             cut.source_fragment.get(),
@@ -982,15 +937,13 @@ fn render_cut_attachments(
             row_multiplicity(cut.partitioning.source_multiplicity),
             format_distribution_complete(context, fragment_id, &cut.partitioning.destination),
             row_multiplicity(cut.partitioning.destination_multiplicity),
-            joined(&cut.source_bindings, ";", |binding: &novarocks_physical_plan::ArtifactSourceBinding, output: &mut fmt::Formatter<'_>| format_artifact_source(binding).fmt(output)),
-            cut.has_source_free_rows,
             ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
             WriterResultCutDisplay(cut.writer_result.as_ref())
         ))?;
     }
     for cut in &cuts.outbound {
         lines.push(format_args!(
-            "    outbound edge{} kind={} destination=f{} projection=[{}] destination-imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} source-bindings=[{}] source-free={} change-stream-writer={} writer-result={}",
+            "    outbound edge{} kind={} destination=f{} projection=[{}] destination-imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} change-stream-writer={} writer-result={}",
             cut.edge.get(),
             edge_kind(cut.kind),
             cut.destination_fragment.get(),
@@ -1000,8 +953,6 @@ fn render_cut_attachments(
             row_multiplicity(cut.partitioning.source_multiplicity),
             format_distribution_complete(context, cut.destination_fragment, &cut.partitioning.destination),
             row_multiplicity(cut.partitioning.destination_multiplicity),
-            joined(&cut.source_bindings, ";", |binding: &novarocks_physical_plan::ArtifactSourceBinding, output: &mut fmt::Formatter<'_>| format_artifact_source(binding).fmt(output)),
-            cut.has_source_free_rows,
             ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
             WriterResultCutDisplay(cut.writer_result.as_ref())
         ))?;
@@ -1100,19 +1051,6 @@ fn render_sink(
                 ))?;
             }
         }
-        FragmentSink::SealedArtifact(spec) => lines.push(format_args!(
-            "  SINK sealed-artifact kind={} format={}@{} input=[{}] partition-by=[{}] order-by=[{}] group-boundaries=[{}] source={} coverage={} max-reference-bytes={}",
-            spec.kind.as_str(),
-            spec.format.id.as_str(),
-            spec.format.revision,
-            joined(&spec.input, ",", |field: &novarocks_physical_plan::ArtifactInputField, output: &mut fmt::Formatter<'_>| write!(output, "{}:{}", context.value_name(fragment_id, field.value), format_value_type(&field.ty))),
-            joined(&spec.partition_by, ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
-            joined(&spec.order_by, ",", |key: &novarocks_physical_plan::ArtifactSortKey, output: &mut fmt::Formatter<'_>| write!(output, "{} {} NULLS {}", context.value_name(fragment_id, key.value), sort_direction(key.direction), null_ordering(key.null_ordering))),
-            joined(&spec.group_boundaries, ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
-            format_artifact_source(&spec.source),
-            format_coverage_set(&spec.required_coverage),
-            spec.max_reference_bytes
-        ))?,
         FragmentSink::Noop => lines.push(format_args!("  SINK noop"))?,
     }
     Ok(())
@@ -1247,7 +1185,6 @@ fn writer_derived_kind(kind: novarocks_physical_plan::WriterDerivedKind) -> &'st
         WriterDerivedKind::AffectedRows => "affected-rows",
         WriterDerivedKind::CommitFragment => "commit-fragment",
         WriterDerivedKind::ChangeEvent => "change-event",
-        WriterDerivedKind::ArtifactReference => "artifact-reference",
         WriterDerivedKind::RelationAuxiliary => "relation-auxiliary",
         WriterDerivedKind::WriteTargetOrdinal => "write-target-ordinal",
         WriterDerivedKind::GroupingKey => "grouping-key",
@@ -1372,56 +1309,6 @@ fn format_distribution_complete<'a>(
     }
 }
 
-struct ArtifactSourceDisplay<'a>(&'a novarocks_physical_plan::ArtifactSourceBinding);
-
-impl fmt::Display for ArtifactSourceDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{{read={}, selection-digest={}}}",
-            format_provider_read(&self.0.source),
-            format_hex(&self.0.selection_digest)
-        )
-    }
-}
-
-fn format_artifact_source(
-    source: &novarocks_physical_plan::ArtifactSourceBinding,
-) -> ArtifactSourceDisplay<'_> {
-    ArtifactSourceDisplay(source)
-}
-
-struct ArtifactRequirementDisplay<'a>(&'a novarocks_physical_plan::ArtifactInputRequirement);
-
-impl fmt::Display for ArtifactRequirementDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let requirement = self.0;
-        write!(
-            formatter,
-            "artifact{} kind={} format={}@{} schema=[{}] source={} coverage={}",
-            requirement.artifact.get(),
-            requirement.kind.as_str(),
-            requirement.format.id.as_str(),
-            requirement.format.revision,
-            joined(
-                &requirement.schema,
-                ",",
-                |ty: &novarocks_physical_plan::ValueType, output: &mut fmt::Formatter<'_>| {
-                    format_value_type(ty).fmt(output)
-                }
-            ),
-            format_artifact_source(&requirement.source),
-            format_coverage_set(&requirement.required_coverage)
-        )
-    }
-}
-
-fn format_artifact_requirement(
-    requirement: &novarocks_physical_plan::ArtifactInputRequirement,
-) -> ArtifactRequirementDisplay<'_> {
-    ArtifactRequirementDisplay(requirement)
-}
-
 macro_rules! format_connector_payload {
     ($payload:expr) => {{ ConnectorPayloadDisplay($payload) }};
 }
@@ -1472,42 +1359,6 @@ fn format_provider_read(
     read: &novarocks_physical_plan::ProviderReadReference,
 ) -> ProviderReadDisplay<'_> {
     ProviderReadDisplay(read)
-}
-
-struct CoverageDisplay<'a>(&'a novarocks_physical_plan::CoverageSet);
-
-impl fmt::Display for CoverageDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let coverage = self.0;
-        write!(
-            formatter,
-            "{{domain={}, selection-digest={}, complete={}, ranges=[{}]}}",
-            quote_text(&coverage.domain),
-            format_hex(&coverage.selection_digest),
-            coverage.complete_input,
-            joined(
-                &coverage.ranges,
-                ",",
-                |range: &novarocks_physical_plan::CoverageRange,
-                 output: &mut fmt::Formatter<'_>| write!(
-                    output,
-                    "{}..{}",
-                    CoverageBound {
-                        value: range.start.as_deref(),
-                        infinity: "-inf"
-                    },
-                    CoverageBound {
-                        value: range.end.as_deref(),
-                        infinity: "+inf"
-                    }
-                )
-            )
-        )
-    }
-}
-
-fn format_coverage_set(coverage: &novarocks_physical_plan::CoverageSet) -> CoverageDisplay<'_> {
-    CoverageDisplay(coverage)
 }
 
 fn connector_codec_category(
@@ -2794,16 +2645,14 @@ fn render_node_contract(
             ));
             match relation.as_ref() {
                 novarocks_physical_plan::Relation::Data(data) => lines.push(format_args!(
-                    "{pad}  selection-digest={}, artifact-inputs=[{}]",
-                    format_hex(&data.selection_digest),
-                    joined(&data.artifact_inputs, "; ", |requirement: &novarocks_physical_plan::ArtifactInputRequirement, output: &mut fmt::Formatter<'_>| format_artifact_requirement(requirement).fmt(output))
+                    "{pad}  selection-digest={}",
+                    format_hex(&data.selection_digest)
                 )),
                 novarocks_physical_plan::Relation::Metadata(metadata) => lines.push(format_args!(
-                    "{pad}  selection-digest={}, coverage-evidence={{bytes={}, digest={}}}, artifact-inputs=[{}]",
+                    "{pad}  selection-digest={}, coverage-evidence={{bytes={}, digest={}}}",
                     format_hex(&metadata.selection_digest),
                     metadata.coverage_evidence.len(),
-                    digest_bytes(&metadata.coverage_evidence),
-                    joined(&metadata.artifact_inputs, "; ", |requirement: &novarocks_physical_plan::ArtifactInputRequirement, output: &mut fmt::Formatter<'_>| format_artifact_requirement(requirement).fmt(output))
+                    digest_bytes(&metadata.coverage_evidence)
                 )),
             }
             for (ordinal, field) in relation.schema().iter().enumerate() {
@@ -4397,10 +4246,6 @@ mod tests {
         assert!(rendered.contains("source={fragment=f"), "{rendered}");
         assert!(rendered.contains("mapping=["), "{rendered}");
         assert!(rendered.contains("CUT ATTACHMENTS"), "{rendered}");
-        assert!(
-            rendered.contains("source-bindings=[] source-free=true"),
-            "{rendered}"
-        );
         assert!(rendered.contains("change-stream-writer=none"), "{rendered}");
         assert!(rendered.contains("writer-result=none"), "{rendered}");
         assert!(rendered.contains("SINK stream edge=edge"), "{rendered}");
@@ -4794,8 +4639,18 @@ mod tests {
         assert!(pruning.contains("residual expr=e"), "{pruning}");
         assert!(pruning.contains("relation-field[0] column="), "{pruning}");
         assert!(pruning.contains("provider-output[0] column="), "{pruning}");
-        assert!(pruning.contains("source-bindings=[{read="), "{pruning}");
-        assert!(pruning.contains("source-free=false"), "{pruning}");
+        assert!(
+            pruning.contains("provider-read={provider=iceberg"),
+            "{pruning}"
+        );
+        assert!(
+            pruning.contains("input-version={bytes=1, digest="),
+            "{pruning}"
+        );
+        assert!(
+            pruning.contains(&format!("selection-digest={}", "08".repeat(32))),
+            "{pruning}"
+        );
     }
 
     #[test]

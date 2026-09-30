@@ -20,9 +20,8 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ArtifactInputField, CoverageSet, Distribution, Edge, EdgeId, Fragment, FragmentId,
-    FragmentSink, NodeId, NodeKind, PhysicalPlan, RowMultiplicity, SealedArtifactRef,
-    SealedArtifactSinkSpec, ValueId, ValueOrigin,
+    Distribution, Edge, EdgeId, Fragment, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
+    RowMultiplicity, ValueId, ValueOrigin,
 };
 
 pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut ValidationContext) {
@@ -202,7 +201,6 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                 ));
             }
         }
-        FragmentSink::SealedArtifact(spec) => validate_artifact_sink(fragment, spec, errors),
         FragmentSink::Result => {
             if root_multiplicity != Some(RowMultiplicity::SingleCopy) {
                 errors.push(ValidationError::new(
@@ -588,7 +586,7 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
                 }
                 &[]
             }
-            FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => &[],
+            FragmentSink::Result | FragmentSink::Noop => &[],
         };
         for edge_id in edges {
             if !referenced.insert(*edge_id) {
@@ -705,7 +703,7 @@ pub(crate) fn edge_kind_matches_sink(sink: &FragmentSink, kind: crate::EdgeKind)
         FragmentSink::Stream { .. } => kind == crate::EdgeKind::Stream,
         FragmentSink::Multicast { .. } => kind == crate::EdgeKind::CteMulticast,
         FragmentSink::Router { .. } => kind == crate::EdgeKind::ChangeStreamRouter,
-        FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => false,
+        FragmentSink::Result | FragmentSink::Noop => false,
     }
 }
 
@@ -977,258 +975,6 @@ pub(crate) fn validate_result_port_fields(
                 "result_port.fields",
                 format!("result type differs at ordinal {ordinal}"),
             ));
-        }
-    }
-}
-
-pub(crate) fn validate_artifact_sink(
-    fragment: &Fragment,
-    spec: &SealedArtifactSinkSpec,
-    errors: &mut ValidationContext,
-) {
-    let path = format!("fragments[{}].sink.sealed_artifact", fragment.id().get());
-    if spec.format.revision == 0
-        || spec.input.is_empty()
-        || spec.max_reference_bytes == 0
-        || spec.max_reference_bytes > MAX_ARTIFACT_REFERENCE_BYTES
-        || spec.source.selection_digest == [0; 32]
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "sealed artifact sink requires a format revision, input and reference budget",
-        ));
-    }
-    validate_read_reference(&spec.source.source, &path, errors);
-    validate_coverage(&spec.required_coverage, &path, errors);
-    if spec.required_coverage.selection_digest != spec.source.selection_digest {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact coverage is not bound to the exact source selection",
-        ));
-    }
-    for ArtifactInputField { value, ty } in &spec.input {
-        match fragment.values().get(value) {
-            Some(definition) if definition.ty != *ty => errors.push(ValidationError::new(
-                &path,
-                "artifact input type differs from its value definition",
-            )),
-            Some(_) => {}
-            None => require_value(fragment, *value, &path, errors),
-        }
-    }
-    for value in &spec.partition_by {
-        require_value(fragment, *value, &path, errors);
-    }
-    for key in &spec.order_by {
-        require_value(fragment, key.value, &path, errors);
-    }
-    for value in &spec.group_boundaries {
-        require_value(fragment, *value, &path, errors);
-    }
-    let Some(root) = fragment.nodes().get(&fragment.root()) else {
-        return;
-    };
-    let input_values = spec
-        .input
-        .iter()
-        .map(|field| field.value)
-        .collect::<Vec<_>>();
-    let input_value_index = ValuePortIndex::new(&input_values);
-    if input_values.as_slice() != root.output.columns.as_ref() {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact input schema differs from the fragment root output",
-        ));
-    }
-    if !spec.partition_by.is_empty() {
-        match &root.output_properties.distribution {
-            Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. }
-                if keys.as_ref() == spec.partition_by.as_ref() => {}
-            _ => errors.push(ValidationError::new(
-                &path,
-                "artifact partition requirement is not guaranteed by the fragment output",
-            )),
-        }
-    } else if root.output_properties.distribution != Distribution::Singleton {
-        errors.push(ValidationError::new(
-            &path,
-            "unpartitioned sealed artifact requires singleton placement",
-        ));
-    }
-    if root.output_properties.row_multiplicity != RowMultiplicity::SingleCopy {
-        errors.push(ValidationError::new(
-            &path,
-            "sealed artifact requires single-copy row ownership",
-        ));
-    }
-    let required_order = spec
-        .order_by
-        .iter()
-        .map(|key| crate::OrderingKey {
-            value: key.value,
-            direction: key.direction,
-            null_ordering: key.null_ordering,
-        })
-        .collect::<Vec<_>>();
-    if root.output_properties.ordering.len() < required_order.len()
-        || root.output_properties.ordering[..required_order.len()] != required_order
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact ordering requirement is not guaranteed by the fragment root",
-        ));
-    }
-    if spec
-        .group_boundaries
-        .iter()
-        .any(|value| !input_value_index.contains(value))
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact group boundary is absent from the exact input schema",
-        ));
-    }
-}
-
-pub(crate) fn validate_artifact_refs(plan: &PhysicalPlan, errors: &mut ValidationContext) {
-    for artifact in plan.artifact_refs().values() {
-        validate_artifact_ref(artifact, errors);
-    }
-}
-
-pub(crate) fn validate_artifact_ref(artifact: &SealedArtifactRef, errors: &mut ValidationContext) {
-    let path = format!("artifact_refs[{}]", artifact.id.get());
-    if artifact.format.revision == 0 || artifact.schema.is_empty() {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact reference requires a format revision and schema",
-        ));
-    }
-    if artifact.location.is_empty() || artifact.location.len() > 4096 {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact location must be bounded and non-empty",
-        ));
-    }
-    if artifact.content_digest == [0; 32]
-        || artifact.schema_digest == [0; 32]
-        || artifact.source.selection_digest == [0; 32]
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact evidence digests must be non-zero",
-        ));
-    }
-    validate_read_reference(&artifact.source.source, &path, errors);
-    validate_coverage(&artifact.coverage, &path, errors);
-    if artifact.coverage.selection_digest != artifact.source.selection_digest {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact coverage is not bound to the exact source selection",
-        ));
-    }
-}
-
-pub(crate) fn validate_coverage(
-    coverage: &CoverageSet,
-    path: &str,
-    errors: &mut ValidationContext,
-) {
-    if coverage.domain.is_empty()
-        || coverage.domain.len() > 1024
-        || coverage.selection_digest == [0; 32]
-        || coverage.ranges.is_empty()
-    {
-        errors.push(ValidationError::new(
-            path,
-            "coverage requires a bounded domain and at least one range",
-        ));
-        return;
-    }
-    for (index, range) in coverage.ranges.iter().enumerate() {
-        if let (Some(start), Some(end)) = (&range.start, &range.end)
-            && start.as_ref() >= end.as_ref()
-        {
-            errors.push(ValidationError::new(
-                path,
-                format!("coverage range {index} is empty or reversed"),
-            ));
-        }
-        if index > 0 {
-            let previous = &coverage.ranges[index - 1];
-            let ordered = match (&previous.end, &range.start) {
-                (Some(previous_end), Some(current_start)) => {
-                    previous_end.as_ref() <= current_start.as_ref()
-                }
-                (Some(_), None) | (None, _) => false,
-            };
-            if !ordered {
-                errors.push(ValidationError::new(
-                    path,
-                    format!("coverage ranges overlap or are out of order at {index}"),
-                ));
-            }
-        }
-    }
-    if coverage.complete_input {
-        let spans_complete_domain = coverage
-            .ranges
-            .first()
-            .is_some_and(|range| range.start.is_none())
-            && coverage
-                .ranges
-                .last()
-                .is_some_and(|range| range.end.is_none())
-            && coverage.ranges.windows(2).all(|pair| {
-                matches!(
-                    (&pair[0].end, &pair[1].start),
-                    (Some(previous_end), Some(next_start))
-                        if previous_end.as_ref() == next_start.as_ref()
-                )
-            });
-        if !spans_complete_domain {
-            errors.push(ValidationError::new(
-                path,
-                "complete coverage must form one gap-free unbounded domain",
-            ));
-        }
-    }
-}
-
-pub(crate) fn validate_artifact_inputs(plan: &PhysicalPlan, errors: &mut ValidationContext) {
-    for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            if let NodeKind::Scan { relation, .. } = &node.kind {
-                let path = format!(
-                    "fragments[{}].nodes[{}].relation.artifact_inputs",
-                    fragment.id().get(),
-                    node.id.get()
-                );
-                for requirement in relation.artifact_inputs() {
-                    match plan.artifact_refs().get(&requirement.artifact) {
-                        Some(artifact)
-                            if artifact.kind == requirement.kind
-                                && artifact.format == requirement.format
-                                && artifact.schema == requirement.schema
-                                && artifact.source == requirement.source
-                                && artifact.coverage == requirement.required_coverage => {}
-                        Some(_) => errors.push(ValidationError::new(
-                            &path,
-                            format!(
-                                "artifact {} differs from the relation's exact input requirement",
-                                requirement.artifact.get()
-                            ),
-                        )),
-                        None => errors.push(ValidationError::new(
-                            &path,
-                            format!(
-                                "artifact reference {} is not defined",
-                                requirement.artifact.get()
-                            ),
-                        )),
-                    }
-                }
-            }
         }
     }
 }

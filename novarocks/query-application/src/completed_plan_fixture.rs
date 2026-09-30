@@ -166,7 +166,6 @@ pub(crate) fn completed_scan_candidate(version: [u8; 16]) -> CompletedPhysicalPl
         }]),
         predicate_guarantees: Box::default(),
         provided_properties: properties,
-        artifact_inputs: Box::default(),
         coverage_evidence: Box::from([4]),
     });
     let mut fragment = FragmentBuilder::new(FragmentId::new(1));

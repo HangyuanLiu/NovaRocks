@@ -167,7 +167,7 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
             }
         };
         if public.source().input_version() != &relation.read().input_version
-            || public.source().selection_digest() != relation.source_binding().selection_digest
+            || public.source().selection_digest() != relation.selection_digest()
             || !metadata_matches
             || public.schema().fields().len() != relation.schema().len()
             || !relation

@@ -26,7 +26,6 @@ use novarocks_connector_contract::{
 use super::*;
 
 mod aggregate_sequence_contract;
-mod artifact_provenance_contract;
 mod contract_regressions;
 mod definition_control_contract;
 mod exchange_occurrence_contract;
@@ -206,7 +205,6 @@ fn metadata_relation(binding: &ConnectorReadBinding, column: ProviderColumnRefer
         }]),
         predicate_guarantees: Box::default(),
         provided_properties: unconstrained(),
-        artifact_inputs: Box::default(),
         coverage_evidence: Box::from([4]),
     })
 }
@@ -879,7 +877,7 @@ fn non_empty_values_require_an_exact_singleton_or_replicated_broadcast_placement
 }
 
 #[test]
-fn metadata_relation_and_progressive_artifact_sink_are_closed_contracts() {
+fn metadata_relation_retains_its_closed_source_contract() {
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 2),
@@ -893,166 +891,98 @@ fn metadata_relation_and_progressive_artifact_sink_are_closed_contracts() {
         row_multiplicity: RowMultiplicity::SingleCopy,
         ordering: Box::default(),
     };
-    let mut builder = FragmentBuilder::new(FragmentId::new(9));
-    let node = builder.reserve_node_id().unwrap();
-    let value = builder
-        .add_value(
-            ty(DataType::Int64, false),
-            ValueOrigin::ProviderField {
-                scan_node: node,
-                field: column.clone(),
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            },
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::Scan {
-                occurrence: ProviderReadOccurrenceId::new(0),
-                relation: Box::new(relation),
-                read_budget: scan_budget(),
-                provider_outputs: Box::from([(column, value)]),
-                residuals: Box::default(),
-                derived_values: Box::default(),
-            },
-        })
-        .unwrap();
-    let source = ArtifactSourceBinding {
-        source: ProviderReadReference {
-            binding: binding.clone(),
-            input_version: ExactInputVersion::try_new(vec![9]).unwrap(),
-            relation: ConnectorReadRelationPayload::new(
-                ConnectorReadRelationKind::SystemTable,
-                encoded(&binding, ConnectorCodecCategory::ReadTable, 1),
-                encoded(&binding, ConnectorCodecCategory::ReadView, 2),
-            ),
-        },
-        selection_digest: [8; 32],
+    let build = |relation: Relation| {
+        let mut builder = FragmentBuilder::new(FragmentId::new(9));
+        let node = builder.reserve_node_id().unwrap();
+        let value = builder
+            .add_value(
+                ty(DataType::Int64, false),
+                ValueOrigin::ProviderField {
+                    scan_node: node,
+                    field: column.clone(),
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: PhysicalProperties {
+                    distribution: Distribution::Singleton,
+                    row_multiplicity: RowMultiplicity::SingleCopy,
+                    ordering: Box::default(),
+                },
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Scan {
+                    occurrence: ProviderReadOccurrenceId::new(0),
+                    relation: Box::new(relation),
+                    read_budget: scan_budget(),
+                    provider_outputs: Box::from([(column.clone(), value)]),
+                    residuals: Box::default(),
+                    derived_values: Box::default(),
+                },
+            })
+            .unwrap();
+        builder.finish_definition(node, FragmentSink::Noop, dop())
     };
-    let fragment = builder
-        .finish_definition(
-            node,
-            FragmentSink::SealedArtifact(Box::new(SealedArtifactSinkSpec {
-                kind: ArtifactKind::try_new("split-directory").unwrap(),
-                format: ArtifactFormat {
-                    id: ArtifactFormatId::try_new("uea4.discovery").unwrap(),
-                    revision: 1,
-                },
-                input: Box::from([ArtifactInputField {
-                    value,
-                    ty: ty(DataType::Int64, false),
-                }]),
-                partition_by: Box::default(),
-                order_by: Box::default(),
-                group_boundaries: Box::from([value]),
-                source,
-                required_coverage: CoverageSet {
-                    domain: "manifest-entry".into(),
-                    selection_digest: [8; 32],
-                    ranges: Box::from([
-                        CoverageRange {
-                            start: None,
-                            end: Some(Box::from([10])),
-                        },
-                        CoverageRange {
-                            start: Some(Box::from([10])),
-                            end: None,
-                        },
-                    ]),
-                    complete_input: true,
-                },
-                max_reference_bytes: 4096,
-            })),
-            dop(),
-        )
-        .unwrap();
+    let fragment = build(relation.clone()).unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     let plan = plan.finish().unwrap();
     assert!(matches!(
         plan.fragments().get(&FragmentId::new(9)).unwrap().sink(),
-        FragmentSink::SealedArtifact(_)
+        FragmentSink::Noop
     ));
-}
-
-#[test]
-fn artifact_coverage_rejects_overlapping_ranges() {
-    let coverage = CoverageSet {
-        domain: "groups".into(),
-        selection_digest: [1; 32],
-        ranges: Box::from([
-            CoverageRange {
-                start: Some(Box::from([1])),
-                end: Some(Box::from([5])),
-            },
-            CoverageRange {
-                start: Some(Box::from([4])),
-                end: Some(Box::from([7])),
-            },
-        ]),
-        complete_input: false,
+    let Relation::Metadata(metadata) = &relation else {
+        unreachable!()
     };
-    let mut errors = super::validation::ValidationContext::new();
-    super::validation::validate_coverage(&coverage, "coverage", &mut errors);
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].message().contains("overlap"));
-}
-
-#[test]
-fn complete_artifact_coverage_rejects_a_gap() {
-    let coverage = CoverageSet {
-        domain: "groups".into(),
-        selection_digest: [1; 32],
-        ranges: Box::from([
-            CoverageRange {
-                start: None,
-                end: Some(Box::from([10])),
-            },
-            CoverageRange {
-                start: Some(Box::from([20])),
-                end: None,
-            },
-        ]),
-        complete_input: true,
+    assert_eq!(metadata.selection_digest, [8; 32]);
+    assert_eq!(metadata.coverage_evidence.as_ref(), &[4]);
+    assert_eq!(
+        metadata.read.input_version,
+        ExactInputVersion::try_new(vec![9]).unwrap()
+    );
+    let mut zero_selection = relation.clone();
+    let Relation::Metadata(metadata) = &mut zero_selection else {
+        unreachable!()
     };
-    let mut errors = super::validation::ValidationContext::new();
-    super::validation::validate_coverage(&coverage, "coverage", &mut errors);
-    assert!(errors.iter().any(|error| {
-        error
-            .message()
-            .contains("complete coverage must form one gap-free unbounded domain")
-    }));
-}
-
-#[test]
-fn complete_artifact_coverage_rejects_bounded_ends() {
-    let coverage = CoverageSet {
-        domain: "groups".into(),
-        selection_digest: [1; 32],
-        ranges: Box::from([CoverageRange {
-            start: Some(Box::from([10])),
-            end: Some(Box::from([20])),
-        }]),
-        complete_input: true,
-    };
-    let mut errors = super::validation::ValidationContext::new();
-    super::validation::validate_coverage(&coverage, "coverage", &mut errors);
-    assert!(errors.iter().any(|error| {
-        error
-            .message()
-            .contains("complete coverage must form one gap-free unbounded domain")
-    }));
+    metadata.selection_digest = [0; 32];
+    assert!(
+        build(zero_selection)
+            .unwrap_err()
+            .errors()
+            .iter()
+            .any(|error| {
+                error
+                    .message()
+                    .contains("relation selection digest is zero")
+            })
+    );
+    for evidence in [
+        Box::<[u8]>::default(),
+        vec![4; MAX_METADATA_COVERAGE_EVIDENCE_BYTES + 1].into_boxed_slice(),
+    ] {
+        let mut invalid_coverage = relation.clone();
+        let Relation::Metadata(metadata) = &mut invalid_coverage else {
+            unreachable!()
+        };
+        metadata.coverage_evidence = evidence;
+        assert!(
+            build(invalid_coverage)
+                .unwrap_err()
+                .errors()
+                .iter()
+                .any(|error| {
+                    error.message().contains(
+                        "metadata relation coverage evidence must be bounded and non-empty",
+                    )
+                })
+        );
+    }
 }
 
 #[test]
@@ -1170,8 +1100,6 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            source_bindings: Box::default(),
-            has_source_free_rows: false,
             change_stream_writer: None,
             writer_result: None,
         }]),
@@ -1668,86 +1596,6 @@ fn literal_representation_must_match_its_declared_type() {
 }
 
 #[test]
-fn fragment_validation_requires_its_exact_artifact_cut() {
-    let binding = connector_binding();
-    let column = ProviderColumnReference {
-        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 4),
-    };
-    let mut relation = metadata_relation(&binding, column.clone());
-    if let Relation::Metadata(metadata) = &mut relation {
-        metadata.selection_digest = [6; 32];
-    }
-    let source = ArtifactSourceBinding {
-        source: relation.read().clone(),
-        selection_digest: [6; 32],
-    };
-    let requirement = ArtifactInputRequirement {
-        artifact: ArtifactRefId::new(1),
-        kind: ArtifactKind::try_new("split-directory").unwrap(),
-        format: ArtifactFormat {
-            id: ArtifactFormatId::try_new("uea4.discovery").unwrap(),
-            revision: 1,
-        },
-        schema: Box::from([ty(DataType::Int64, false)]),
-        source,
-        required_coverage: CoverageSet {
-            domain: "manifest-entry".into(),
-            selection_digest: [6; 32],
-            ranges: Box::from([CoverageRange {
-                start: None,
-                end: None,
-            }]),
-            complete_input: true,
-        },
-    };
-    match &mut relation {
-        Relation::Metadata(metadata) => {
-            metadata.artifact_inputs = Box::from([requirement]);
-        }
-        Relation::Data(_) => unreachable!(),
-    }
-    let mut builder = FragmentBuilder::new(FragmentId::new(13));
-    let node = builder.reserve_node_id().unwrap();
-    let value = builder
-        .add_value(
-            ty(DataType::Int64, false),
-            ValueOrigin::ProviderField {
-                scan_node: node,
-                field: column.clone(),
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: unconstrained(),
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::Scan {
-                occurrence: ProviderReadOccurrenceId::new(0),
-                relation: Box::new(relation),
-                read_budget: scan_budget(),
-                provider_outputs: Box::from([(column, value)]),
-                residuals: Box::default(),
-                derived_values: Box::default(),
-            },
-        })
-        .unwrap();
-    let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
-        .unwrap();
-
-    let error = validate_fragment(&fragment, &FragmentCuts::default())
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("artifact references in fragment cuts differ"));
-}
-
-#[test]
 fn exchange_partitioning_maps_source_and_destination_value_domains() {
     let edge = EdgeId::new(21);
     let (source, source_value) =
@@ -2067,167 +1915,6 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
 }
 
 #[test]
-fn sealed_artifact_accepts_exact_source_provenance_across_an_exchange() {
-    let binding = connector_binding();
-    let column = ProviderColumnReference {
-        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 7),
-    };
-    let mut relation = metadata_relation(&binding, column.clone());
-    let Relation::Metadata(metadata) = &mut relation else {
-        unreachable!();
-    };
-    metadata.provided_properties = PhysicalProperties {
-        distribution: Distribution::Singleton,
-        row_multiplicity: RowMultiplicity::SingleCopy,
-        ordering: Box::default(),
-    };
-    let source_binding = relation.source_binding();
-    let edge = EdgeId::new(26);
-    let source_id = FragmentId::new(26);
-    let mut source_builder = FragmentBuilder::new(source_id);
-    let scan = source_builder.reserve_node_id().unwrap();
-    let source_value = source_builder
-        .add_value(
-            ty(DataType::Int64, false),
-            ValueOrigin::ProviderField {
-                scan_node: scan,
-                field: column.clone(),
-            },
-        )
-        .unwrap();
-    source_builder
-        .insert_node_unchecked(PhysicalNode {
-            id: scan,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            },
-            output: OutputPort {
-                node: scan,
-                columns: Box::from([source_value]),
-            },
-            kind: NodeKind::Scan {
-                occurrence: ProviderReadOccurrenceId::new(0),
-                relation: Box::new(relation),
-                read_budget: scan_budget(),
-                provider_outputs: Box::from([(column, source_value)]),
-                residuals: Box::default(),
-                derived_values: Box::default(),
-            },
-        })
-        .unwrap();
-    let source = source_builder
-        .finish_definition(scan, FragmentSink::Stream { edge }, dop())
-        .unwrap();
-
-    let destination_id = FragmentId::new(27);
-    let mut destination_builder = FragmentBuilder::new(destination_id);
-    let receiver = destination_builder.reserve_node_id().unwrap();
-    let imported = destination_builder
-        .add_value(
-            ty(DataType::Int64, false),
-            ValueOrigin::ExchangeImport { edge, source_value },
-        )
-        .unwrap();
-    destination_builder
-        .insert_node_unchecked(PhysicalNode {
-            id: receiver,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            },
-            output: OutputPort {
-                node: receiver,
-                columns: Box::from([imported]),
-            },
-            kind: NodeKind::ExchangeSource {
-                edge,
-                imports: Box::from([(source_value, imported)]),
-            },
-        })
-        .unwrap();
-    let destination = destination_builder
-        .finish_definition(
-            receiver,
-            FragmentSink::SealedArtifact(Box::new(SealedArtifactSinkSpec {
-                kind: ArtifactKind::try_new("split-directory").unwrap(),
-                format: ArtifactFormat {
-                    id: ArtifactFormatId::try_new("uea4.discovery").unwrap(),
-                    revision: 1,
-                },
-                input: Box::from([ArtifactInputField {
-                    value: imported,
-                    ty: ty(DataType::Int64, false),
-                }]),
-                partition_by: Box::default(),
-                order_by: Box::default(),
-                group_boundaries: Box::from([imported]),
-                source: source_binding,
-                required_coverage: CoverageSet {
-                    domain: "manifest-entry".into(),
-                    selection_digest: [8; 32],
-                    ranges: Box::from([CoverageRange {
-                        start: None,
-                        end: None,
-                    }]),
-                    complete_input: true,
-                },
-                max_reference_bytes: 4096,
-            })),
-            dop(),
-        )
-        .unwrap();
-
-    let mut plan = PlanBuilder::new(version());
-    plan.add_fragment(source).unwrap();
-    plan.add_fragment(destination).unwrap();
-    plan.add_edge(Edge {
-        id: edge,
-        kind: EdgeKind::Stream,
-        source: EdgeSource {
-            fragment: source_id,
-            projection: Box::from([source_value]),
-        },
-        destination: EdgeDestination {
-            fragment: destination_id,
-            node: receiver,
-            receive_mapping: Box::from([(source_value, imported)]),
-        },
-        partitioning: EdgePartitioning {
-            source: Distribution::Singleton,
-            source_multiplicity: RowMultiplicity::SingleCopy,
-            destination: Distribution::Singleton,
-            destination_multiplicity: RowMultiplicity::SingleCopy,
-        },
-    })
-    .unwrap();
-    let plan = plan.finish().unwrap();
-    let cuts = fragment_cuts(&plan, destination_id).unwrap();
-    assert_eq!(cuts.inbound[0].source_bindings.len(), 1);
-
-    let source_fragment = plan.fragments().get(&source_id).unwrap();
-    let mut source_cuts = fragment_cuts(&plan, source_id).unwrap();
-    source_cuts.outbound[0].source_bindings[0].selection_digest = [99; 32];
-    let error = validate_fragment(source_fragment, &source_cuts)
-        .expect_err("the source fragment must recheck its outbound provenance")
-        .to_string();
-    assert!(error.contains("outbound source provenance differs"));
-
-    let mut source_cuts = fragment_cuts(&plan, source_id).unwrap();
-    source_cuts.outbound[0].has_source_free_rows = true;
-    let error = validate_fragment(source_fragment, &source_cuts)
-        .expect_err("the source fragment must recheck source-free row provenance")
-        .to_string();
-    assert!(error.contains("outbound source provenance differs"));
-}
-
-#[test]
 fn repeat_publishes_a_distinct_nullable_grouping_value() {
     let mut builder = FragmentBuilder::new(FragmentId::new(28));
     let source = builder.reserve_node_id().unwrap();
@@ -2513,10 +2200,7 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
             },
             change_stream_writer: None,
             writer_result: None,
-            source_bindings: Box::default(),
-            has_source_free_rows: false,
         }]),
-        artifact_refs: Box::default(),
         runtime_filters: Box::default(),
     };
     let error = validate_fragment(&fragment, &cuts).unwrap_err().to_string();

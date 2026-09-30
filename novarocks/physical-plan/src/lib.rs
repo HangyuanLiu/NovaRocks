@@ -21,7 +21,6 @@
 //! intentionally contains no SQL IR, generated wire DTO, application owner,
 //! provider implementation, runtime object, or I/O capability.
 
-mod artifact;
 mod builder;
 mod expression;
 mod expression_site;
@@ -35,7 +34,6 @@ mod relation;
 mod resource;
 mod validation;
 
-pub use artifact::*;
 pub use builder::*;
 pub use expression::*;
 pub use expression_site::*;
@@ -70,7 +68,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 9;
+pub const PLAN_CONTRACT_REVISION: u32 = 10;
 
 #[cfg(test)]
 mod tests;

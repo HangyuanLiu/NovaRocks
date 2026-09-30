@@ -133,7 +133,6 @@ fn append_scan(builder: &mut FragmentBuilder, residual: bool) -> (NodeId, ValueI
             })
             .collect(),
         provided_properties: properties(),
-        artifact_inputs: Box::default(),
     });
     builder
         .insert_node_unchecked(PhysicalNode {
@@ -316,7 +315,7 @@ fn public_read(
     };
     let facts = ConnectorReadStaticFacts::try_new(
         relation.read().input_version.clone(),
-        relation.source_binding().selection_digest,
+        relation.selection_digest(),
         ConnectorReadProperties::try_new(distribution, ordering)?,
         ConnectorReadArtifactCoverage::NoArtifactInputs,
         coverage,

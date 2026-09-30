@@ -24,12 +24,10 @@ use novarocks_connector_contract::ConnectorEncodedPayload;
 
 use crate::validation::ValidationContext;
 use crate::{
-    AggregateBinding, ArtifactInputRequirement, ArtifactSourceBinding, BoundFunction,
-    BoundTableFunction, CoverageSet, ExprKind, Fragment, FragmentCuts, FragmentSink,
-    FunctionArgumentType, NodeKind, PhysicalPlan, ProviderReadReference, Relation, RuntimeFilter,
-    RuntimeFilterCoverage, RuntimeFilterCoverageNode, RuntimeFilterDomain, SealedArtifactRef,
-    SealedArtifactSinkSpec, SortMode, UnpivotConstant, ValidationError, ValueType,
-    WriterFinishSpec, WriterRelationSchema,
+    AggregateBinding, BoundFunction, BoundTableFunction, ExprKind, Fragment, FragmentCuts,
+    FragmentSink, FunctionArgumentType, NodeKind, PhysicalPlan, ProviderReadReference, Relation,
+    RuntimeFilter, RuntimeFilterCoverage, RuntimeFilterCoverageNode, RuntimeFilterDomain, SortMode,
+    UnpivotConstant, ValidationError, ValueType, WriterFinishSpec, WriterRelationSchema,
 };
 
 pub const MAX_ANNOTATIONS: usize = 4_096;
@@ -106,19 +104,6 @@ impl CutResourcePreflight {
 
     pub(crate) fn add_distribution(&mut self, distribution: &crate::Distribution) {
         add_distribution_usage(distribution, &mut self.usage);
-    }
-
-    pub(crate) fn add_source(&mut self, source: &ArtifactSourceBinding, path: &str) {
-        add_artifact_source_usage(source, path, &mut self.usage);
-    }
-
-    pub(crate) fn add_artifact(
-        &mut self,
-        artifact: &SealedArtifactRef,
-        path: &str,
-        errors: &mut ValidationContext,
-    ) {
-        add_artifact_ref_usage(artifact, path, &mut self.usage, errors);
     }
 
     pub(crate) fn add_filter(
@@ -241,16 +226,12 @@ fn fragment_cut_usage(
 ) -> ResourceUsage {
     let prefix = format!("fragments[{}].cuts", fragment.id().get());
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
-    usage.add_item_counts([
-        cuts.inbound.len(),
-        cuts.outbound.len(),
-        cuts.artifact_refs.len(),
-    ]);
+    usage.add_item_counts([cuts.inbound.len(), cuts.outbound.len()]);
     for (index, cut) in cuts.inbound.iter().enumerate() {
         if usage.exhausted() {
             break;
         }
-        usage.add_item_counts([cut.imports.len(), cut.source_bindings.len()]);
+        usage.add_items(cut.imports.len());
         if let Some(writer) = &cut.change_stream_writer {
             usage.add_items(writer.fields.len());
         }
@@ -264,16 +245,6 @@ fn fragment_cut_usage(
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
-        for (binding, source) in cut.source_bindings.iter().enumerate() {
-            if usage.exhausted() {
-                break;
-            }
-            add_artifact_source_usage(
-                source,
-                &format!("{prefix}.inbound[{index}].source_bindings[{binding}]"),
-                &mut usage,
-            );
-        }
         for (ordinal, import) in cut.imports.iter().enumerate() {
             if usage.exhausted() {
                 break;
@@ -290,11 +261,7 @@ fn fragment_cut_usage(
         if usage.exhausted() {
             break;
         }
-        usage.add_item_counts([
-            cut.projection.len(),
-            cut.destination_imports.len(),
-            cut.source_bindings.len(),
-        ]);
+        usage.add_item_counts([cut.projection.len(), cut.destination_imports.len()]);
         if let Some(writer) = &cut.change_stream_writer {
             usage.add_items(writer.fields.len());
         }
@@ -308,16 +275,6 @@ fn fragment_cut_usage(
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
-        for (binding, source) in cut.source_bindings.iter().enumerate() {
-            if usage.exhausted() {
-                break;
-            }
-            add_artifact_source_usage(
-                source,
-                &format!("{prefix}.outbound[{index}].source_bindings[{binding}]"),
-                &mut usage,
-            );
-        }
         for (ordinal, value) in cut.projection.iter().enumerate() {
             if usage.exhausted() {
                 break;
@@ -340,17 +297,6 @@ fn fragment_cut_usage(
                 errors,
             );
         }
-    }
-    for (index, artifact) in cuts.artifact_refs.iter().enumerate() {
-        if usage.exhausted() {
-            break;
-        }
-        add_artifact_ref_usage(
-            artifact,
-            &format!("{prefix}.artifact_refs[{index}]"),
-            &mut usage,
-            errors,
-        );
     }
     usage.add_items(cuts.runtime_filters.len());
     for (index, filter) in cuts.runtime_filters.iter().enumerate() {
@@ -394,7 +340,6 @@ pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut Validati
         plan.fragments().len(),
         plan.edges().len(),
         plan.runtime_filters().len(),
-        plan.artifact_refs().len(),
         plan.annotations().len(),
     ]);
     for fragment in plan.fragments().values() {
@@ -428,17 +373,6 @@ pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut Validati
                 errors,
             );
         }
-    }
-    for (id, artifact) in plan.artifact_refs() {
-        if usage.exhausted() {
-            break;
-        }
-        add_artifact_ref_usage(
-            artifact,
-            &format!("artifact_refs[{}]", id.get()),
-            &mut usage,
-            errors,
-        );
     }
     for (id, filter) in plan.runtime_filters() {
         if usage.exhausted() {
@@ -556,12 +490,7 @@ fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> Resour
             errors,
         );
     }
-    add_sink_usage(
-        fragment.sink(),
-        &format!("{prefix}.sink"),
-        &mut usage,
-        errors,
-    );
+    add_sink_usage(fragment.sink(), &mut usage);
     usage
 }
 
@@ -1054,23 +983,21 @@ fn add_relation_usage(
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
 ) {
-    let (schema, guarantees, artifacts, evidence_bytes, metadata_kind_bytes) = match relation {
+    let (schema, guarantees, evidence_bytes, metadata_kind_bytes) = match relation {
         Relation::Data(relation) => (
             relation.schema.as_ref(),
             relation.predicate_guarantees.as_ref(),
-            relation.artifact_inputs.as_ref(),
             0,
             0,
         ),
         Relation::Metadata(relation) => (
             relation.schema.as_ref(),
             relation.predicate_guarantees.as_ref(),
-            relation.artifact_inputs.as_ref(),
             relation.coverage_evidence.len(),
             relation.kind.as_str().len(),
         ),
     };
-    usage.add_item_counts([schema.len(), guarantees.len(), artifacts.len()]);
+    usage.add_item_counts([schema.len(), guarantees.len()]);
     usage.add_byte_counts([evidence_bytes, metadata_kind_bytes]);
     add_properties_usage(relation.provided_properties(), usage);
     add_read_reference_usage(relation.read(), usage);
@@ -1082,17 +1009,6 @@ fn add_relation_usage(
         validate_value_type(
             &field.ty,
             &format!("{path}.schema[{index}].type"),
-            usage,
-            errors,
-        );
-    }
-    for (index, artifact) in artifacts.iter().enumerate() {
-        if usage.exhausted() {
-            return;
-        }
-        add_artifact_requirement_usage(
-            artifact,
-            &format!("{path}.artifact_inputs[{index}]"),
             usage,
             errors,
         );
@@ -1123,63 +1039,7 @@ fn add_read_reference_usage(source: &ProviderReadReference, usage: &mut Resource
     add_encoded_payload_usage(source.relation.view(), usage);
 }
 
-fn add_artifact_source_usage(
-    source: &ArtifactSourceBinding,
-    _path: &str,
-    usage: &mut ResourceUsage,
-) {
-    add_read_reference_usage(&source.source, usage);
-}
-
-fn add_artifact_requirement_usage(
-    artifact: &ArtifactInputRequirement,
-    path: &str,
-    usage: &mut ResourceUsage,
-    errors: &mut ValidationContext,
-) {
-    usage.add_items(artifact.schema.len());
-    usage.add_byte_counts([
-        artifact.kind.as_str().len(),
-        artifact.format.id.as_str().len(),
-    ]);
-    add_artifact_source_usage(&artifact.source, &format!("{path}.source"), usage);
-    add_coverage_usage(&artifact.required_coverage, usage);
-    for (ordinal, ty) in artifact.schema.iter().enumerate() {
-        if usage.exhausted() {
-            return;
-        }
-        validate_value_type(ty, &format!("{path}.schema[{ordinal}]"), usage, errors);
-    }
-}
-
-fn add_artifact_ref_usage(
-    artifact: &SealedArtifactRef,
-    path: &str,
-    usage: &mut ResourceUsage,
-    errors: &mut ValidationContext,
-) {
-    usage.add_items(artifact.schema.len());
-    usage.add_byte_counts([
-        artifact.kind.as_str().len(),
-        artifact.format.id.as_str().len(),
-        artifact.location.len(),
-    ]);
-    add_artifact_source_usage(&artifact.source, &format!("{path}.source"), usage);
-    add_coverage_usage(&artifact.coverage, usage);
-    for (ordinal, ty) in artifact.schema.iter().enumerate() {
-        if usage.exhausted() {
-            return;
-        }
-        validate_value_type(ty, &format!("{path}.schema[{ordinal}]"), usage, errors);
-    }
-}
-
-fn add_sink_usage(
-    sink: &FragmentSink,
-    path: &str,
-    usage: &mut ResourceUsage,
-    errors: &mut ValidationContext,
-) {
+fn add_sink_usage(sink: &FragmentSink, usage: &mut ResourceUsage) {
     match sink {
         FragmentSink::Multicast { edges } => usage.add_items(edges.len()),
         FragmentSink::Router { routes, .. } => {
@@ -1195,52 +1055,7 @@ fn add_sink_usage(
                 ]);
             }
         }
-        FragmentSink::SealedArtifact(spec) => {
-            add_artifact_sink_usage(spec, path, usage, errors);
-        }
         FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Noop => {}
-    }
-}
-
-fn add_artifact_sink_usage(
-    spec: &SealedArtifactSinkSpec,
-    path: &str,
-    usage: &mut ResourceUsage,
-    errors: &mut ValidationContext,
-) {
-    usage.add_item_counts([
-        spec.input.len(),
-        spec.partition_by.len(),
-        spec.order_by.len(),
-        spec.group_boundaries.len(),
-    ]);
-    usage.add_byte_counts([spec.kind.as_str().len(), spec.format.id.as_str().len()]);
-    add_artifact_source_usage(&spec.source, &format!("{path}.source"), usage);
-    add_coverage_usage(&spec.required_coverage, usage);
-    for (index, field) in spec.input.iter().enumerate() {
-        if usage.exhausted() {
-            return;
-        }
-        validate_value_type(
-            &field.ty,
-            &format!("{path}.input[{index}].type"),
-            usage,
-            errors,
-        );
-    }
-}
-
-fn add_coverage_usage(coverage: &CoverageSet, usage: &mut ResourceUsage) {
-    usage.add_items(coverage.ranges.len());
-    usage.add_bytes(coverage.domain.len());
-    for range in &coverage.ranges {
-        if usage.exhausted() {
-            return;
-        }
-        usage.add_byte_counts([
-            range.start.as_deref().map_or(0, <[u8]>::len),
-            range.end.as_deref().map_or(0, <[u8]>::len),
-        ]);
     }
 }
 

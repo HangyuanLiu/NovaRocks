@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 
-use crate::resource::MAX_PLAN_DERIVED_CUT_ITEMS;
 use crate::{
     AggregatePhase, Distribution, EdgeId, ExprId, ExprKind, FragmentCuts, FragmentId, FragmentSink,
     NodeId, NodeKind, PhysicalNode, RowMultiplicity, ValueId, ValueOrigin, ValueType,
@@ -247,25 +246,6 @@ mod validation_error_tests {
                 .is_some()
         );
         assert_eq!(after_first - budget.remaining, expected.len());
-    }
-
-    #[test]
-    fn source_provenance_fanout_shares_the_complete_binding_set() {
-        let source = CompactSourceBindingSet::from_ids(&(0..4096).collect::<Vec<_>>()).unwrap();
-        let empty = CompactSourceBindingSet::from_ids(&[]).unwrap();
-
-        let fanout = (0..1024)
-            .map(|_| CompactSourceBindingSet::union(&empty, [source.clone()]))
-            .collect::<Vec<_>>();
-
-        assert!(fanout.iter().all(|set| Arc::ptr_eq(&set.ids, &source.ids)));
-    }
-
-    #[test]
-    fn source_provenance_rejects_high_fanout_before_destination_materialization() {
-        let mut items = 0;
-        assert!(charge_provenance_cut_items(&mut items, 4096, 8193).is_none());
-        assert!(items > MAX_PLAN_DERIVED_CUT_ITEMS);
     }
 
     #[test]

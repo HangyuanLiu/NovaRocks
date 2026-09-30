@@ -20,10 +20,7 @@ use novarocks_connector_contract::{
     ConnectorReadWorkSource,
 };
 
-use crate::{
-    ArtifactInputRequirement, ArtifactSourceBinding, ExprId, IdentityError, PhysicalProperties,
-    ValueType, stable_identity,
-};
+use crate::{ExprId, IdentityError, PhysicalProperties, ValueType, stable_identity};
 
 pub use novarocks_connector_contract::ConnectorReadInputVersion as ExactInputVersion;
 
@@ -78,7 +75,6 @@ pub struct DataRelation {
     /// `PruningOnly` never transfers row-level evaluation responsibility.
     pub predicate_guarantees: Box<[PredicateGuarantee]>,
     pub provided_properties: PhysicalProperties,
-    pub artifact_inputs: Box<[ArtifactInputRequirement]>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -113,7 +109,6 @@ pub struct MetadataRelation {
     pub predicate_guarantees: Box<[PredicateGuarantee]>,
     pub provided_properties: PhysicalProperties,
     pub coverage_evidence: Box<[u8]>,
-    pub artifact_inputs: Box<[ArtifactInputRequirement]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,30 +150,18 @@ impl Relation {
         }
     }
 
+    /// Digest of the exact frozen selection represented by this scan.
+    pub const fn selection_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Data(relation) => relation.selection_digest,
+            Self::Metadata(relation) => relation.selection_digest,
+        }
+    }
+
     pub fn provided_properties(&self) -> &PhysicalProperties {
         match self {
             Self::Data(relation) => &relation.provided_properties,
             Self::Metadata(relation) => &relation.provided_properties,
-        }
-    }
-
-    pub fn artifact_inputs(&self) -> &[ArtifactInputRequirement] {
-        match self {
-            Self::Data(relation) => &relation.artifact_inputs,
-            Self::Metadata(relation) => &relation.artifact_inputs,
-        }
-    }
-
-    pub fn source_binding(&self) -> ArtifactSourceBinding {
-        match self {
-            Self::Data(relation) => ArtifactSourceBinding {
-                source: relation.read.clone(),
-                selection_digest: relation.selection_digest,
-            },
-            Self::Metadata(relation) => ArtifactSourceBinding {
-                source: relation.read.clone(),
-                selection_digest: relation.selection_digest,
-            },
         }
     }
 }

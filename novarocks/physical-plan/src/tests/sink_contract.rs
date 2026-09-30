@@ -1263,8 +1263,6 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
             },
             change_stream_writer: None,
             writer_result: None,
-            source_bindings: Box::default(),
-            has_source_free_rows: false,
         }]),
         ..FragmentCuts::default()
     };

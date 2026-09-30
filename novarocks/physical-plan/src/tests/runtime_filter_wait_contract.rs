@@ -724,7 +724,6 @@ fn replace_source_fragment(
         edges: plan.edges().clone(),
         runtime_filters: plan.runtime_filters().clone(),
         result_port: plan.result_port().cloned(),
-        artifact_refs: plan.artifact_refs().clone(),
         required: plan.required(),
         annotations: plan.annotations().to_vec().into_boxed_slice(),
     })

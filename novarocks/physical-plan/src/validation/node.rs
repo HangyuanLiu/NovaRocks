@@ -2912,8 +2912,7 @@ pub(crate) fn validate_relation(
             "whole-relation work requires singleton distribution and exactly one driver",
         ));
     }
-    let relation_source = relation.source_binding();
-    if relation_source.selection_digest == [0; 32] {
+    if relation.selection_digest() == [0; 32] {
         errors.push(ValidationError::new(
             path,
             "relation selection digest is zero",
@@ -2927,31 +2926,6 @@ pub(crate) fn validate_relation(
     }
     for guarantee in relation.predicate_guarantees() {
         require_boolean_expression(fragment, guarantee.predicate, path, errors);
-    }
-    let mut artifact_ids = BTreeSet::new();
-    for requirement in relation.artifact_inputs() {
-        if !artifact_ids.insert(requirement.artifact) {
-            errors.push(ValidationError::new(
-                path,
-                "relation has duplicate artifact input requirements",
-            ));
-        }
-        if requirement.format.revision == 0 || requirement.schema.is_empty() {
-            errors.push(ValidationError::new(
-                path,
-                "artifact input requirement has an invalid format or empty schema",
-            ));
-        }
-        validate_read_reference(&requirement.source.source, path, errors);
-        validate_coverage(&requirement.required_coverage, path, errors);
-        if requirement.source != relation_source
-            || requirement.required_coverage.selection_digest != requirement.source.selection_digest
-        {
-            errors.push(ValidationError::new(
-                path,
-                "artifact input requirement is not bound to the relation's exact source selection",
-            ));
-        }
     }
     validate_distribution(
         fragment,

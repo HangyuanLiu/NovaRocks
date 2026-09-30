@@ -789,7 +789,7 @@ fn public_read(
     };
     let facts = ConnectorReadStaticFacts::try_new(
         relation.read().input_version.clone(),
-        relation.source_binding().selection_digest,
+        relation.selection_digest(),
         ConnectorReadProperties::try_new(distribution, ordering)?,
         ConnectorReadArtifactCoverage::NoArtifactInputs,
         coverage,

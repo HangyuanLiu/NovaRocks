@@ -59,7 +59,6 @@ pub fn derive_fragment_cuts(plan: &PhysicalPlan) -> Option<BTreeMap<FragmentId, 
 }
 
 pub(crate) struct FragmentCutDerivation {
-    pub(crate) provenance: PlanSourceProvenance,
     pub(crate) inbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) outbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) change_stream_writers: BTreeMap<EdgeId, crate::ChangeStreamWriterCut>,
@@ -67,7 +66,6 @@ pub(crate) struct FragmentCutDerivation {
 
 impl FragmentCutDerivation {
     pub(crate) fn new(plan: &PhysicalPlan, _limits: &PlanLimits) -> Option<Self> {
-        let provenance = source_provenance_index(plan)?;
         let mut inbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
         let mut outbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
         for edge in plan.edges().values() {
@@ -100,7 +98,6 @@ impl FragmentCutDerivation {
             }
         }
         Some(Self {
-            provenance,
             inbound,
             outbound,
             change_stream_writers,
@@ -125,10 +122,9 @@ impl FragmentCutDerivation {
         plan: &PhysicalPlan,
         fragment_id: FragmentId,
     ) -> Option<FragmentCuts> {
-        fragment_cuts_with_provenance(
+        fragment_cuts_from_edges(
             plan,
             fragment_id,
-            &self.provenance,
             self.inbound
                 .get(&fragment_id)
                 .map(Vec::as_slice)
@@ -176,14 +172,9 @@ pub(crate) fn preflight_fragment_cut_resources(
     {
         let edge = plan.edges().get(edge_id)?;
         let source = plan.fragments().get(&edge.source.fragment)?;
-        let source_binding_count = derivation.provenance.binding_count(edge.source.fragment)?;
         usage.add_items(edge.destination.receive_mapping.len() * if is_outbound { 2 } else { 1 });
-        usage.add_items(source_binding_count);
         usage.add_distribution(&edge.partitioning.source);
         usage.add_distribution(&edge.partitioning.destination);
-        for binding in derivation.provenance.binding_refs(edge.source.fragment)? {
-            usage.add_source(binding, &path);
-        }
         for (source_value, _) in &edge.destination.receive_mapping {
             let ty = &source.values().get(source_value)?.ty;
             usage.add_value_type(ty, &path, errors);
@@ -202,20 +193,6 @@ pub(crate) fn preflight_fragment_cut_resources(
             }
         }
     }
-    let artifacts = fragment
-        .nodes()
-        .values()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Scan { relation, .. } => Some(relation.artifact_inputs()),
-            _ => None,
-        })
-        .flatten()
-        .map(|requirement| requirement.artifact)
-        .collect::<BTreeSet<_>>();
-    usage.add_items(artifacts.len());
-    for artifact in artifacts {
-        usage.add_artifact(plan.artifact_refs().get(&artifact)?, &path, errors);
-    }
     usage.add_items(fragment.runtime_filters().len());
     for filter in fragment.runtime_filters() {
         usage.add_filter(plan.runtime_filters().get(filter)?, &path, errors);
@@ -223,10 +200,9 @@ pub(crate) fn preflight_fragment_cut_resources(
     Some(usage.validate(&format!("{path}.resources"), errors))
 }
 
-pub(crate) fn fragment_cuts_with_provenance(
+pub(crate) fn fragment_cuts_from_edges(
     plan: &PhysicalPlan,
     fragment_id: FragmentId,
-    provenance: &PlanSourceProvenance,
     inbound_edges: &[EdgeId],
     outbound_edges: &[EdgeId],
     derivation: &FragmentCutDerivation,
@@ -239,8 +215,6 @@ pub(crate) fn fragment_cuts_with_provenance(
         .into_iter()
         .map(|edge| {
             let source = plan.fragments().get(&edge.source.fragment)?;
-            let source_bindings = provenance.bindings(edge.source.fragment)?;
-            let has_source_free_rows = provenance.has_source_free_rows(edge.source.fragment)?;
             let imports = edge
                 .destination
                 .receive_mapping
@@ -262,8 +236,6 @@ pub(crate) fn fragment_cuts_with_provenance(
                 destination_node: edge.destination.node,
                 imports: imports.into_boxed_slice(),
                 partitioning: edge.partitioning.clone(),
-                source_bindings: source_bindings.into_boxed_slice(),
-                has_source_free_rows,
                 change_stream_writer: derivation.change_stream_writer(edge.id),
                 writer_result: writer_result_cut(plan, edge),
             })
@@ -275,8 +247,6 @@ pub(crate) fn fragment_cuts_with_provenance(
         .collect::<Option<Vec<_>>>()?
         .into_iter()
         .map(|edge| {
-            let source_bindings = provenance.bindings(edge.source.fragment)?;
-            let has_source_free_rows = provenance.has_source_free_rows(edge.source.fragment)?;
             let projection = edge
                 .source
                 .projection
@@ -309,28 +279,11 @@ pub(crate) fn fragment_cuts_with_provenance(
                     .collect::<Option<Vec<_>>>()?
                     .into_boxed_slice(),
                 partitioning: edge.partitioning.clone(),
-                source_bindings: source_bindings.into_boxed_slice(),
-                has_source_free_rows,
                 change_stream_writer: derivation.change_stream_writer(edge.id),
                 writer_result: writer_result_cut(plan, edge),
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    let mut artifact_refs = BTreeMap::new();
-    for requirement in fragment
-        .nodes()
-        .values()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Scan { relation, .. } => Some(relation.artifact_inputs()),
-            _ => None,
-        })
-        .flatten()
-    {
-        artifact_refs.insert(
-            requirement.artifact,
-            plan.artifact_refs().get(&requirement.artifact)?.clone(),
-        );
-    }
     let runtime_filters = fragment
         .runtime_filters()
         .iter()
@@ -339,7 +292,6 @@ pub(crate) fn fragment_cuts_with_provenance(
     Some(FragmentCuts {
         inbound: inbound.into_boxed_slice(),
         outbound: outbound.into_boxed_slice(),
-        artifact_refs: artifact_refs.into_values().collect(),
         runtime_filters: runtime_filters.into_boxed_slice(),
     })
 }
@@ -416,7 +368,6 @@ pub(crate) fn validate_fragment_cuts_into(
     errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].cuts", fragment.id().get());
-    let local_provenance = fragment_source_provenance(fragment, cuts);
     bounded_count(
         errors,
         &format!("{path}.inbound"),
@@ -428,12 +379,6 @@ pub(crate) fn validate_fragment_cuts_into(
         &format!("{path}.outbound"),
         cuts.outbound.len(),
         errors.limits().plan_edges,
-    );
-    bounded_count(
-        errors,
-        &format!("{path}.artifact_refs"),
-        cuts.artifact_refs.len(),
-        errors.limits().plan_artifact_refs,
     );
     bounded_count(
         errors,
@@ -449,21 +394,6 @@ pub(crate) fn validate_fragment_cuts_into(
             cut.imports.len(),
             errors.limits().fragment_values,
         );
-        bounded_count(
-            errors,
-            &format!("{path}.inbound.source_bindings"),
-            cut.source_bindings.len(),
-            errors.limits().plan_artifact_refs,
-        );
-        for source in &cut.source_bindings {
-            validate_read_reference(&source.source, &path, errors);
-            if source.selection_digest == [0; 32] {
-                errors.push(ValidationError::new(
-                    &path,
-                    "upstream source binding has a zero selection digest",
-                ));
-            }
-        }
         if !inbound_ids.insert(cut.edge) {
             errors.push(ValidationError::new(&path, "duplicate inbound edge"));
         }
@@ -630,29 +560,6 @@ pub(crate) fn validate_fragment_cuts_into(
             cut.projection.len(),
             errors.limits().fragment_values,
         );
-        bounded_count(
-            errors,
-            &format!("{path}.outbound.source_bindings"),
-            cut.source_bindings.len(),
-            errors.limits().plan_artifact_refs,
-        );
-        for source in &cut.source_bindings {
-            validate_read_reference(&source.source, &path, errors);
-            if source.selection_digest == [0; 32] {
-                errors.push(ValidationError::new(
-                    &path,
-                    "outbound source binding has a zero selection digest",
-                ));
-            }
-        }
-        if cut.has_source_free_rows != local_provenance.has_source_free_rows
-            || !same_source_bindings(&cut.source_bindings, &local_provenance.bindings)
-        {
-            errors.push(ValidationError::new(
-                &path,
-                "outbound source provenance differs from the fragment's exact inputs",
-            ));
-        }
         if !outbound_ids.insert(cut.edge) {
             errors.push(ValidationError::new(&path, "duplicate outbound edge"));
         }
@@ -736,7 +643,7 @@ pub(crate) fn validate_fragment_cuts_into(
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
         FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
-        FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => Vec::new(),
+        FragmentSink::Result | FragmentSink::Noop => Vec::new(),
     };
     let sink_edge_ids = sink_edges.iter().copied().collect::<BTreeSet<_>>();
     if sink_edge_ids.len() != sink_edges.len() {
@@ -807,20 +714,6 @@ pub(crate) fn validate_fragment_cuts_into(
         }
     }
     validate_fragment_writer_results(fragment, cuts, &path, errors);
-    if let FragmentSink::SealedArtifact(spec) = fragment.sink()
-        && (local_provenance.has_source_free_rows
-            || local_provenance.bindings.len() != 1
-            || local_provenance
-                .bindings
-                .values()
-                .any(|source| source != &spec.source))
-    {
-        errors.push(ValidationError::new(
-            &path,
-            "artifact inputs are not derived exclusively from the exact source binding",
-        ));
-    }
-    validate_fragment_artifact_cuts(fragment, cuts, &path, errors);
     validate_fragment_runtime_filter_cuts(fragment, cuts, &path, errors);
 }
 
@@ -1136,62 +1029,6 @@ pub(crate) fn validate_fragment_writer_results(
             errors.push(ValidationError::new(
                 path,
                 "table writer must feed exactly one local finish or writer result stream",
-            ));
-        }
-    }
-}
-
-pub(crate) fn validate_fragment_artifact_cuts(
-    fragment: &Fragment,
-    cuts: &FragmentCuts,
-    path: &str,
-    errors: &mut ValidationContext,
-) {
-    let mut supplied = BTreeMap::new();
-    for artifact in &cuts.artifact_refs {
-        if supplied.insert(artifact.id, artifact).is_some() {
-            errors.push(ValidationError::new(
-                path,
-                "duplicate artifact reference in fragment cuts",
-            ));
-        }
-        validate_artifact_ref(artifact, errors);
-    }
-    let requirements = fragment
-        .nodes()
-        .values()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Scan { relation, .. } => Some(relation.artifact_inputs()),
-            _ => None,
-        })
-        .flatten()
-        .collect::<Vec<_>>();
-    let expected = requirements
-        .iter()
-        .map(|requirement| requirement.artifact)
-        .collect::<BTreeSet<_>>();
-    if supplied.keys().copied().collect::<BTreeSet<_>>() != expected {
-        errors.push(ValidationError::new(
-            path,
-            "artifact references in fragment cuts differ from relation requirements",
-        ));
-    }
-    for requirement in requirements {
-        let Some(artifact) = supplied.get(&requirement.artifact) else {
-            continue;
-        };
-        if artifact.kind != requirement.kind
-            || artifact.format != requirement.format
-            || artifact.schema != requirement.schema
-            || artifact.source != requirement.source
-            || artifact.coverage != requirement.required_coverage
-        {
-            errors.push(ValidationError::new(
-                path,
-                format!(
-                    "artifact {} differs from the relation's exact input requirement",
-                    requirement.artifact.get()
-                ),
             ));
         }
     }

@@ -22,11 +22,11 @@ use std::fmt;
 use arrow_schema::DataType;
 
 use crate::{
-    ArtifactRefId, Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId,
-    FragmentParts, FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan,
-    PhysicalPlanParts, PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts,
-    ResultPort, RuntimeFilter, RuntimeFilterId, SealedArtifactRef, ValidationErrors, ValueDef,
-    ValueId, ValueOrigin, ValueType, validate_fragment_definition, validate_plan,
+    Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId, FragmentParts,
+    FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan, PhysicalPlanParts,
+    PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts, ResultPort, RuntimeFilter,
+    RuntimeFilterId, ValidationErrors, ValueDef, ValueId, ValueOrigin, ValueType,
+    validate_fragment_definition, validate_plan,
 };
 
 /// Mutable construction state. It cannot be encoded, scheduled or viewed as a
@@ -1023,7 +1023,6 @@ pub struct PlanBuilder {
     edges: BTreeMap<EdgeId, Edge>,
     runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     result_port: Option<ResultPort>,
-    artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     required: RequiredContracts,
     annotations: Vec<PlanAnnotation>,
 }
@@ -1037,7 +1036,6 @@ impl PlanBuilder {
             edges: BTreeMap::new(),
             runtime_filters: BTreeMap::new(),
             result_port: None,
-            artifact_refs: BTreeMap::new(),
             required: RequiredContracts::default(),
             annotations: Vec::new(),
         }
@@ -1104,17 +1102,6 @@ impl PlanBuilder {
         Ok(())
     }
 
-    pub fn add_artifact_ref(&mut self, artifact: SealedArtifactRef) -> Result<(), BuildError> {
-        let id = artifact.id;
-        match self.artifact_refs.entry(id) {
-            Entry::Vacant(entry) => {
-                entry.insert(artifact);
-            }
-            Entry::Occupied(_) => return Err(BuildError::DuplicateArtifactRef(id)),
-        }
-        Ok(())
-    }
-
     pub fn add_annotation(&mut self, annotation: PlanAnnotation) {
         self.annotations.push(annotation);
     }
@@ -1127,7 +1114,6 @@ impl PlanBuilder {
             edges: self.edges,
             runtime_filters: self.runtime_filters,
             result_port: self.result_port,
-            artifact_refs: self.artifact_refs,
             required: self.required,
             annotations: self.annotations.into_boxed_slice(),
         });
@@ -1145,7 +1131,6 @@ pub enum BuildError {
     DuplicateExpression(ExprId),
     DuplicateEdge(EdgeId),
     DuplicateRuntimeFilter(RuntimeFilterId),
-    DuplicateArtifactRef(ArtifactRefId),
     DuplicateResultPort,
     /// A node names an input that has not been inserted yet. Fragments are
     /// built bottom up, so this is always an ordering mistake.
@@ -1324,9 +1309,6 @@ impl fmt::Display for BuildError {
                 "node {} has {inputs} inputs but {requirements} input requirements",
                 node.get()
             ),
-            Self::DuplicateArtifactRef(id) => {
-                write!(formatter, "duplicate artifact reference {}", id.get())
-            }
             Self::DuplicateResultPort => formatter.write_str("result port is already set"),
         }
     }

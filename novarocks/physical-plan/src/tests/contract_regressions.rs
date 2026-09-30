@@ -691,7 +691,6 @@ fn local_runtime_filter_cuts(_fragment: &Fragment, filter: &RuntimeFilter) -> Fr
     FragmentCuts {
         inbound: Box::default(),
         outbound: Box::default(),
-        artifact_refs: Box::default(),
         runtime_filters: Box::from([filter.clone()]),
     }
 }
@@ -2864,7 +2863,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
             ty(DataType::Binary, true),
             ValueOrigin::WriterDerived {
                 writer_node: finish,
-                kind: WriterDerivedKind::ArtifactReference,
+                kind: WriterDerivedKind::RelationAuxiliary,
             },
         )
         .unwrap();
@@ -2918,7 +2917,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
                 ty(DataType::Binary, true),
                 ValueOrigin::WriterDerived {
                     writer_node: finish,
-                    kind: WriterDerivedKind::ArtifactReference,
+                    kind: WriterDerivedKind::RelationAuxiliary,
                 },
             )
             .unwrap();
