@@ -713,6 +713,10 @@ pub struct SqlOptimizeRequest<'a> {
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
+    pub(crate) fn control(&self) -> &SqlCompileControl {
+        &self.control
+    }
+
     pub fn new(
         analyzed: SqlAnalyzedQuery,
         statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
@@ -964,6 +968,12 @@ pub enum SqlCompileError {
     InvalidRequest(String),
     Analyze(AnalyzeError),
     Compilation(String),
+}
+
+impl From<novarocks_type_contract::CompileControlError> for SqlCompileError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        SqlCompileControl::compile_error(error)
+    }
 }
 
 impl From<AnalyzeError> for SqlCompileError {
@@ -2206,6 +2216,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
             .finish()
@@ -2649,6 +2660,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
             .finish()

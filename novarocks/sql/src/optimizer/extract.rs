@@ -1377,6 +1377,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("lower final physical plan")
             .finish()

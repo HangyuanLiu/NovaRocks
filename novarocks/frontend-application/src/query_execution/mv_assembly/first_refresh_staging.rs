@@ -320,6 +320,7 @@ fn bind_first_refresh_write_dataflow(
                 Arc::clone(&bindings),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = begin_final_mv_first_refresh_connector_write_plan(
                 analyzed,
                 &statistics,
@@ -338,7 +339,9 @@ fn bind_first_refresh_write_dataflow(
                 sealed_write_targets,
                 needs,
                 field_names,
-                |version, dop, reads, targets| completion.finish(version, dop, reads, targets),
+                |version, dop, reads, targets| {
+                    completion.finish(version, dop, reads, targets, &finish_control)
+                },
             )
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
@@ -424,6 +427,7 @@ fn bind_first_refresh_write_dataflow(
                 materializer.query_table_bindings(),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = begin_final_join_first_refresh_connector_write_plan(
                 analyzed,
                 &statistics,
@@ -442,7 +446,9 @@ fn bind_first_refresh_write_dataflow(
                 sealed_write_targets,
                 needs,
                 field_names,
-                |version, dop, reads, targets| completion.finish(version, dop, reads, targets),
+                |version, dop, reads, targets| {
+                    completion.finish(version, dop, reads, targets, &finish_control)
+                },
             )
         }
     }

@@ -65,7 +65,8 @@ use novarocks_physical_plan::{
 use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
 use novarocks_spi::connector::write_stack::{RootWriteResultSchema, WriteTargetOrdinal};
 use novarocks_type_contract::{
-    OrderedComparisonAlgorithm, PartitionCountParameterId, PartitionSpaceId,
+    CompileCheckpoints, CompileControlError, CompilePhase, OrderedComparisonAlgorithm,
+    PartitionCountParameterId, PartitionSpaceId, PureCompileControl,
 };
 use sha2::{Digest, Sha256};
 
@@ -100,8 +101,9 @@ pub(crate) fn lower_final_physical_plan(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
+    control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    lower_final_physical_plan_inner(plan, version, dop_domain, None)
+    lower_final_physical_plan_inner(plan, version, dop_domain, None, control)
 }
 
 pub(crate) fn lower_final_physical_plan_with_provider_reads(
@@ -109,8 +111,9 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     reads: FinalizedProviderReadSet,
+    control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads))
+    lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads), control)
 }
 
 /// Lower one admitted SQL write directly into the final physical-plan
@@ -130,6 +133,7 @@ pub(crate) fn lower_final_physical_write_plan(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     input: FinalWriteLowering<'_>,
+    control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let FinalWriteLowering {
         reads,
@@ -138,11 +142,11 @@ pub(crate) fn lower_final_physical_write_plan(
         auxiliary,
         mut targets,
     } = input;
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, control)?;
     // A write states the runtime filters it can name, for the same reason a
     // read does: a filter whose probe is not one value of one type is a filter
     // the plan cannot say anything exact about.
-    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let source = visitor.lower_node(plan)?;
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
     let writer = visitor.lower_table_writer(
@@ -169,6 +173,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     input: FinalChangeStreamWriteLowering<'_>,
+    control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
         reads,
@@ -176,17 +181,17 @@ pub(crate) fn lower_final_change_stream_write_plan(
         auxiliary,
         mut targets,
     } = input;
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, control)?;
     dag.validate().map_err(invalid_write)?;
     if !matches!(plan.kind, PhysicalPlanKind::ChangeEventExpand(_)) {
         return Err(invalid_write(
             "change-stream router source is not ChangeEventExpand".into(),
         ));
     }
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
     // A write states the runtime filters it can name, for the same reason a
     // read does: a filter whose probe is not one value of one type is a filter
     // the plan cannot say anything exact about.
-    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let source = visitor.lower_node(plan)?;
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
     let (writers, ordinals) =
@@ -200,9 +205,10 @@ fn lower_final_physical_plan_inner(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
+    control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
-    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, control)?;
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let root = visitor.lower_node(plan)?;
 
     // What the statement delivers is the type each value actually carries,
@@ -227,7 +233,9 @@ fn lower_final_physical_plan_inner(
     visitor.finish_draft(result_port)
 }
 
-struct ContractLoweringVisitor {
+struct ContractLoweringVisitor<'a> {
+    control: &'a dyn PureCompileControl,
+    work: CompileCheckpoints<'a>,
     current_fragment: FragmentId,
     next_fragment: u32,
     /// The one hash partition space each destination fragment receives in.
@@ -1263,13 +1271,17 @@ fn resolve_runtime_filter_activations(
     }
 }
 
-impl ContractLoweringVisitor {
+impl<'a> ContractLoweringVisitor<'a> {
     fn new(
         version: PlanVersionId,
         dop_domain: PipelineDopDomain,
         provider_reads: Option<FinalizedProviderReadSet>,
-    ) -> Self {
-        Self {
+        control: &'a dyn PureCompileControl,
+    ) -> Result<Self, ContractLoweringError> {
+        let work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        Ok(Self {
+            control,
+            work,
             current_fragment: ROOT_FRAGMENT_ID,
             next_fragment: 1,
             exchange_hash_schemes: BTreeMap::new(),
@@ -1296,7 +1308,7 @@ impl ContractLoweringVisitor {
             runtime_filter_probes: BTreeMap::new(),
             runtime_filter_attachments: BTreeSet::new(),
             edges: BTreeMap::new(),
-        }
+        })
     }
 
     fn fragment_mut(&mut self) -> &mut FragmentBuilder {
@@ -1509,6 +1521,7 @@ impl ContractLoweringVisitor {
         self.plan_builder.set_result_port(result_port)?;
         let mut finished_fragments = BTreeMap::new();
         for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
+            self.work.step()?;
             let (root, sink) = self.completions.remove(&fragment_id).ok_or(
                 ContractLoweringError::IncompleteFragment {
                     fragment: fragment_id,
@@ -1536,8 +1549,10 @@ impl ContractLoweringVisitor {
             self.plan_builder.add_runtime_filter(filter)?;
         }
         for fragment in finished_fragments.into_values() {
+            self.work.step()?;
             self.plan_builder.add_fragment(fragment)?;
         }
+        self.work.finish()?;
         Ok(self.plan_builder)
     }
 
@@ -1574,6 +1589,7 @@ impl ContractLoweringVisitor {
         &mut self,
         plan: &PhysicalPlanNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
+        self.work.step()?;
         let lowered = match &plan.kind {
             PhysicalPlanKind::Scan(scan) => self.lower_scan(plan, scan),
             PhysicalPlanKind::Values(values) => self.lower_values(plan, values),
@@ -7303,6 +7319,7 @@ impl ContractLoweringVisitor {
         expression: &TypedExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
+        self.work.step()?;
         if let ExprKind::Literal(literal) = &expression.kind {
             return self.lower_literal_expression(owner, literal, expression);
         }
@@ -7808,6 +7825,7 @@ impl ContractLoweringVisitor {
         literal: &LiteralValue,
         expression: &TypedExpr,
     ) -> Result<ExprId, ContractLoweringError> {
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
         let target = expression_type(expression);
         let (literal, source) = lower_literal(literal, &target)?;
         // A literal is an exact value; the position it stands in states the
@@ -9250,13 +9268,18 @@ fn require_passthrough_shape(
 /// without it, which is the same answer read from more rows. The decision is
 /// made once, over the whole plan, because a filter's producer and its
 /// consumers are lowered apart and have to agree.
-fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
+fn unstatable_runtime_filters(
+    plan: &PhysicalPlanNode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BTreeSet<i32>, CompileControlError> {
     let mut unstatable = BTreeSet::new();
     let mut built_types = BTreeMap::new();
     let mut probes: Vec<(i32, DataType)> = Vec::new();
     let mut pending = vec![plan];
     while let Some(node) = pending.pop() {
+        work.step()?;
         for intent in &node.probe_runtime_filters {
+            work.step()?;
             match identity_column_ref(&intent.probe_expr) {
                 Some(_) => probes.push((
                     intent.filter_id,
@@ -9272,6 +9295,7 @@ fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
         // for the plan to name it.
         if let PhysicalPlanKind::HashJoin(join) = &node.kind {
             for intent in &join.build_runtime_filters {
+                work.step()?;
                 let stated = join
                     .eq_conditions
                     .get(intent.expr_order)
@@ -9298,15 +9322,20 @@ fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
         }
         if let PhysicalPlanKind::HashAggregate(aggregate) = &node.kind {
             for intent in &aggregate.topn_runtime_filter_builds {
+                work.step()?;
                 built_types.insert(
                     intent.filter_id,
                     novarocks_types::undecorated_nested_type(&intent.group_key_expr.data_type),
                 );
             }
         }
-        pending.extend(node.children.iter());
+        for child in &node.children {
+            work.step()?;
+            pending.push(child);
+        }
     }
     for (filter_id, probe_type) in probes {
+        work.step()?;
         if built_types
             .get(&filter_id)
             .is_some_and(|built| *built != probe_type)
@@ -9314,7 +9343,7 @@ fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
             unstatable.insert(filter_id);
         }
     }
-    unstatable
+    Ok(unstatable)
 }
 
 /// The type a value takes when it publishes an expression's answer.
@@ -9877,6 +9906,7 @@ fn metadata_relation_kind(
 
 #[derive(Debug)]
 pub(crate) enum ContractLoweringError {
+    Control(CompileControlError),
     IdentitySpaceExhausted(&'static str),
     InvalidPlanIdentity {
         detail: String,
@@ -10040,6 +10070,7 @@ pub(crate) enum ContractLoweringError {
 impl fmt::Display for ContractLoweringError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Control(error) => error.fmt(formatter),
             Self::IdentitySpaceExhausted(kind) => {
                 write!(formatter, "{kind} identity space exhausted")
             }
@@ -10215,6 +10246,21 @@ impl fmt::Display for ContractLoweringError {
 
 impl std::error::Error for ContractLoweringError {}
 
+impl From<CompileControlError> for ContractLoweringError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
+    fn from(error: ContractLoweringError) -> Self {
+        match error {
+            ContractLoweringError::Control(error) => Self::from(error),
+            error => Self::Compilation(error.to_string()),
+        }
+    }
+}
+
 impl From<BuildError> for ContractLoweringError {
     fn from(error: BuildError) -> Self {
         Self::Build(error)
@@ -10276,6 +10322,161 @@ mod tests {
             max: 8,
             requires_power_of_two: true,
         }
+    }
+
+    struct LoweringControl {
+        cause: CompileControlError,
+        fail_at_entry: bool,
+        observations: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+    }
+
+    impl PureCompileControl for LoweringControl {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            self.observations.lock().unwrap().push((phase, units));
+            if self.fail_at_entry || units > 0 {
+                Err(self.cause)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn lowering_control_error(
+        result: Result<PlanBuilder, ContractLoweringError>,
+    ) -> CompileControlError {
+        match result {
+            Err(ContractLoweringError::Control(error)) => error,
+            Err(error) => panic!("expected typed control, got {error:?}"),
+            Ok(_) => panic!("control failure must not publish a builder"),
+        }
+    }
+
+    #[test]
+    fn physical_lowering_refuses_control_before_work_and_preserves_outer_categories() {
+        let source = values(
+            vec![column(1, "k", DataType::Int64, false)],
+            vec![vec![literal_int(7)]],
+        );
+        for (cause, outer) in [
+            (
+                CompileControlError::Cancelled,
+                crate::compiler::SqlCompileError::Cancelled,
+            ),
+            (
+                CompileControlError::DeadlineExceeded,
+                crate::compiler::SqlCompileError::DeadlineExceeded,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                crate::compiler::SqlCompileError::ResourceExhausted,
+            ),
+        ] {
+            let control = LoweringControl {
+                cause,
+                fail_at_entry: true,
+                observations: Default::default(),
+            };
+            let error = lowering_control_error(lower_final_physical_plan(
+                &source,
+                version(),
+                dop(),
+                &control,
+            ));
+            assert_eq!(error, cause);
+            assert_eq!(
+                *control.observations.lock().unwrap(),
+                [(CompilePhase::Validate, 0)]
+            );
+            assert_eq!(
+                crate::compiler::SqlCompileError::from(ContractLoweringError::Control(error)),
+                outer
+            );
+        }
+    }
+
+    #[test]
+    fn physical_lowering_observes_actual_expression_work_at_256() {
+        let columns = (1..=320)
+            .map(|id| column(id, &format!("c{id}"), DataType::Int64, false))
+            .collect();
+        let source = values(columns, vec![(0..320).map(literal_int).collect()]);
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = LoweringControl {
+                cause,
+                fail_at_entry: false,
+                observations: Default::default(),
+            };
+            assert_eq!(
+                lowering_control_error(lower_final_physical_plan(
+                    &source,
+                    version(),
+                    dop(),
+                    &control
+                )),
+                cause
+            );
+            let observed = control.observations.lock().unwrap();
+            assert!(
+                observed
+                    .iter()
+                    .all(|(phase, _)| *phase == CompilePhase::Validate)
+            );
+            assert_eq!(observed.iter().map(|(_, units)| units).sum::<u32>(), 256);
+            assert_eq!(observed.last(), Some(&(CompilePhase::Validate, 256)));
+        }
+    }
+
+    #[test]
+    fn physical_lowering_observes_pending_work_before_publishing_a_small_builder() {
+        let source = values(
+            vec![column(1, "k", DataType::Int64, false)],
+            vec![vec![literal_int(7)]],
+        );
+        let control = LoweringControl {
+            cause: CompileControlError::Cancelled,
+            fail_at_entry: false,
+            observations: Default::default(),
+        };
+        assert_eq!(
+            lowering_control_error(lower_final_physical_plan(
+                &source,
+                version(),
+                dop(),
+                &control
+            )),
+            CompileControlError::Cancelled
+        );
+        let observed = control.observations.lock().unwrap();
+        assert!(matches!(
+            observed.last(),
+            Some((CompilePhase::Validate, 1..=255))
+        ));
+    }
+
+    #[test]
+    fn physical_lowering_products_do_not_retain_request_control() {
+        struct Active;
+        impl crate::compiler::SqlCancellationObservation for Active {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+        let observation = std::sync::Arc::new(Active);
+        let weak = std::sync::Arc::downgrade(&observation);
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        let source = values(
+            vec![column(1, "k", DataType::Int64, false)],
+            vec![vec![literal_int(7)]],
+        );
+        let builder = lower_final_physical_plan(&source, version(), dop(), &control).unwrap();
+        drop(control);
+        drop(observation);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(builder.finish().unwrap().fragments().len(), 1);
     }
 
     #[test]
@@ -10693,7 +10894,13 @@ mod tests {
     }
 
     fn finish_for_test(plan: &PhysicalPlanNode) -> Result<PhysicalPlan, ContractLoweringError> {
-        Ok(lower_final_physical_plan(plan, version(), dop())?.finish()?)
+        Ok(lower_final_physical_plan(
+            plan,
+            version(),
+            dop(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )?
+        .finish()?)
     }
 
     fn write_handle() -> ConnectorEncodedPayload {
@@ -10730,6 +10937,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets,
             },
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
         .finish()
@@ -10785,6 +10993,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
         .finish()
@@ -10861,6 +11070,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
         .finish()
@@ -10945,6 +11155,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets,
             },
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
         .finish()
@@ -11035,6 +11246,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
         .finish()
@@ -11437,11 +11649,16 @@ mod tests {
             },
         );
 
-        let final_plan =
-            lower_final_physical_plan_with_provider_reads(&plan, version(), dop(), reads)
-                .unwrap()
-                .finish()
-                .expect("interleaved scan output must finish validation");
+        let final_plan = lower_final_physical_plan_with_provider_reads(
+            &plan,
+            version(),
+            dop(),
+            reads,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .finish()
+        .expect("interleaved scan output must finish validation");
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let root = fragment.nodes().get(&fragment.root()).unwrap();
         assert_eq!(root.output.columns.len(), 3);
@@ -11491,11 +11708,16 @@ mod tests {
                 max_batch_bytes: 1 << 20,
             },
         );
-        let bucket_plan =
-            lower_final_physical_plan_with_provider_reads(&plan, version(), dop(), bucket_reads)
-                .unwrap()
-                .finish()
-                .expect("interleaved bucket scan output must finish validation");
+        let bucket_plan = lower_final_physical_plan_with_provider_reads(
+            &plan,
+            version(),
+            dop(),
+            bucket_reads,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .finish()
+        .expect("interleaved bucket scan output must finish validation");
         let bucket_fragment = bucket_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let bucket_root = bucket_fragment
             .nodes()
@@ -11553,7 +11775,9 @@ mod tests {
             algorithm: PartitionHashAlgorithm::NativeExchangeV1,
         };
 
-        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+
+        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
         let sql_exchange = visitor.allocate_hash_scheme().unwrap();
         let provider = visitor.lower_provider_hash_scheme(&read, &scheme).unwrap();
         assert_ne!(provider.space, sql_exchange.space);
@@ -12162,7 +12386,12 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         assert!(matches!(
-            lower_final_physical_plan(&unpivot, version(), dop()),
+            lower_final_physical_plan(
+                &unpivot,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            ),
             Err(ContractLoweringError::InvalidUnpivot { .. })
         ));
 
@@ -12185,7 +12414,12 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         assert!(matches!(
-            lower_final_physical_plan(&repeat, version(), dop()),
+            lower_final_physical_plan(
+                &repeat,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            ),
             Err(ContractLoweringError::InvalidRepeat { .. })
         ));
 
@@ -12212,7 +12446,12 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         assert!(matches!(
-            lower_final_physical_plan(&table_function, version(), dop()),
+            lower_final_physical_plan(
+                &table_function,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            ),
             Err(ContractLoweringError::InvalidTableFunction { .. })
         ));
 
@@ -12242,7 +12481,12 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         assert!(matches!(
-            lower_final_physical_plan(&window, version(), dop()),
+            lower_final_physical_plan(
+                &window,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            ),
             Err(ContractLoweringError::InvalidWindow { .. })
         ));
     }
@@ -12261,7 +12505,15 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
 
-        assert!(lower_final_physical_plan(&unsupported, version(), dop()).is_err());
+        assert!(
+            lower_final_physical_plan(
+                &unsupported,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -12278,9 +12530,14 @@ mod tests {
             vec![left, right],
         );
         assert!(matches!(
-            lower_final_physical_plan(&hash_join, version(), dop())
-                .err()
-                .expect("unknown distribution must fail"),
+            lower_final_physical_plan(
+                &hash_join,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .err()
+            .expect("unknown distribution must fail"),
             ContractLoweringError::MissingPlannerFact {
                 node: "HashJoin",
                 fact: "exact distribution mode",
@@ -12302,9 +12559,14 @@ mod tests {
             vec![left, right],
         );
         assert!(matches!(
-            lower_final_physical_plan(&hash_join, version(), dop())
-                .err()
-                .expect("colocate without bucket proof must fail"),
+            lower_final_physical_plan(
+                &hash_join,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .err()
+            .expect("colocate without bucket proof must fail"),
             ContractLoweringError::MissingPlannerFact {
                 node: "HashJoin",
                 fact: "matching key-aligned bucket partition schemes on both inputs",
@@ -12925,9 +13187,14 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         assert!(matches!(
-            lower_final_physical_plan(&partition_sort, version(), dop())
-                .err()
-                .expect("partition sort must fail"),
+            lower_final_physical_plan(
+                &partition_sort,
+                version(),
+                dop(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .err()
+            .expect("partition sort must fail"),
             ContractLoweringError::UnsupportedSortMode { .. }
         ));
     }
@@ -13063,7 +13330,9 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let root_distribution = |plan: PhysicalPlanNode| {
-            let mut visitor = ContractLoweringVisitor::new(version(), dop(), None);
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let mut visitor =
+                ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
             visitor
                 .lower_node(&plan)
                 .expect("tested operator must lower")
@@ -13117,7 +13386,8 @@ mod tests {
                 source: crate::planner::physical::HashSource::ShuffleJoin,
             },
         );
-        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
         let hash_project = visitor.lower_node(&project_first(hash_child)).unwrap();
         assert_eq!(
             hash_project.properties.distribution,
@@ -13144,7 +13414,8 @@ mod tests {
             stats: stats(),
             probe_runtime_filters: Vec::new(),
         };
-        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
         let ordered_project = visitor.lower_node(&project_first(sort)).unwrap();
         assert_eq!(ordered_project.properties.ordering.len(), 1);
         assert_eq!(

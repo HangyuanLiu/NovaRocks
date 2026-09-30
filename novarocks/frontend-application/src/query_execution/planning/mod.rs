@@ -51,6 +51,16 @@ pub fn sql_cancellation_observation(
     Arc::new(QueryCancellationObservation::new(view))
 }
 
+/// Borrow the existing admitted statement's control facts for a pure compile phase.
+pub(crate) fn sql_compile_control_from_execution(
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+) -> novarocks_sql::compiler::SqlCompileControl {
+    novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        sql_cancellation_observation(execution.cancellation().clone()),
+    )
+}
+
 struct ConnectorCancellationObservation {
     stop: novarocks_spi::connector::ConnectorStopView,
 }

@@ -367,6 +367,7 @@ pub fn prepare_completed_statistics_collection(
             ])
             .map_err(contract_violation)?,
         ),
+        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
     )
     .map_err(contract_violation)?;
     let version = plan.version();

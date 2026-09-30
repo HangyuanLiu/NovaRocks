@@ -1662,6 +1662,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 },
             ])?,
         ),
+        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
     )?;
     let version = plan.version();
     let candidate =

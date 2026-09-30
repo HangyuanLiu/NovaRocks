@@ -578,6 +578,10 @@ impl DmlWritePlanInput {
 /// plan addresses that scan by is the one occurrence the finalized read set
 /// accounts for. Taking it from anywhere else would let the plan name a read
 /// nothing was frozen for.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Frozen write facts and the request's read-only control remain separate inputs."
+)]
 pub fn build_final_frozen_connector_write_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
@@ -586,6 +590,7 @@ pub fn build_final_frozen_connector_write_plan(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
     let scan_occurrence = final_write
         .plan
@@ -616,6 +621,7 @@ pub fn build_final_frozen_connector_write_plan(
         &auxiliary,
         settings,
         final_write,
+        control,
     )
 }
 
@@ -692,6 +698,7 @@ impl DmlWriteCompletion {
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
         targets: DmlFinalizedWriteTargetSet,
+        control: &crate::compiler::SqlCompileControl,
     ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
         let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
             &self.physical,
@@ -704,6 +711,7 @@ impl DmlWriteCompletion {
                 auxiliary: &self.auxiliary,
                 targets: targets.0,
             },
+            control,
         )
         .map_err(|error| error.to_string())?;
         self.query_statistics.annotate_final_plan(&mut builder);
@@ -720,6 +728,7 @@ pub fn compile_final_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
@@ -745,6 +754,7 @@ pub fn compile_final_connector_write_plan(
         &auxiliary,
         settings,
         final_write,
+        &control,
     )
 }
 
@@ -757,6 +767,7 @@ fn complete_connector_write_plan(
     auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
@@ -775,6 +786,7 @@ fn complete_connector_write_plan(
             auxiliary,
             targets: finalized_targets.0,
         },
+        control,
     )
     .map_err(|error| error.to_string())?;
     query_statistics.annotate_final_plan(&mut builder);
@@ -822,6 +834,7 @@ impl DmlReadCompletion {
         version: novarocks_physical_plan::PlanVersionId,
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
+        control: &crate::compiler::SqlCompileControl,
     ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
         let mut builder = match reads.into_optional() {
             Some(reads) => {
@@ -830,12 +843,14 @@ impl DmlReadCompletion {
                     version,
                     dop_domain,
                     reads,
+                    control,
                 )
             }
             None => crate::planner::distributed::build::lower_final_physical_plan(
                 &self.physical,
                 version,
                 dop_domain,
+                control,
             ),
         }
         .map_err(|error| error.to_string())?;
@@ -1092,6 +1107,7 @@ impl DmlChangeStreamCompletion {
     pub fn finish(
         self,
         final_write: DmlFinalWritePlanContext,
+        control: &crate::compiler::SqlCompileControl,
     ) -> Result<DmlFinalChangeStreamPlan, String> {
         let (final_context, finalized_targets) = final_write.into_parts();
         let (version, dop_domain, reads) = final_context.into_parts();
@@ -1105,6 +1121,7 @@ impl DmlChangeStreamCompletion {
                 auxiliary: &self.auxiliary,
                 targets: finalized_targets.0,
             },
+            control,
         )
         .map_err(|error| error.to_string())?;
         self.query_statistics.annotate_final_plan(&mut builder);
@@ -1266,6 +1283,7 @@ pub fn begin_final_dml_change_stream(
 pub fn compile_final_dml_change_stream(
     request: DmlFinalChangeStreamCompileRequest<'_>,
 ) -> Result<DmlFinalChangeStreamPlan, String> {
+    let control = request.optimize_request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
@@ -1305,6 +1323,7 @@ pub fn compile_final_dml_change_stream(
             shape: request.shape,
             final_write: request.final_write,
         },
+        &control,
     )
 }
 
@@ -1315,6 +1334,7 @@ pub(crate) fn seal_final_change_stream_producer(
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     context: DmlFinalChangeStreamSealContext,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, String> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
     else {
@@ -1338,9 +1358,11 @@ pub(crate) fn seal_final_change_stream_producer(
         effect_output_ordinal,
         functions,
         context,
+        control,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1349,6 +1371,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     effect_output_ordinal: usize,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     context: DmlFinalChangeStreamSealContext,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, String> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
     else {
@@ -1397,6 +1420,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
             auxiliary: &auxiliary,
             targets: finalized_targets.0,
         },
+        control,
     )
     .map_err(|error| error.to_string())?;
     query_statistics.annotate_final_plan(&mut builder);
@@ -2086,6 +2110,7 @@ pub fn build_final_statistics_connector_plan(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_context: DmlFinalPlanContext,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
     if required.is_empty() {
         return Err(
@@ -2107,7 +2132,7 @@ pub fn build_final_statistics_connector_plan(
     );
     let builder =
         crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
-            &physical, version, dop_domain, reads,
+            &physical, version, dop_domain, reads, control,
         )
         .map_err(|error| error.to_string())?;
     builder.finish().map_err(|error| error.to_string())
@@ -2707,6 +2732,7 @@ mod tests {
             &functions,
             &SessionOptimizerSettings::default(),
             statistics_final_context(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("ANALYZE plan");
 

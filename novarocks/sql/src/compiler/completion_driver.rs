@@ -713,7 +713,7 @@ fn optimize_and_prepare_provider(
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     let optimized = optimize_to_physical(analyzed, &statistics_snapshot, control)?;
-    provider_or_ready_step(common, optimized, next_need_ordinal)
+    provider_or_ready_step(common, optimized, next_need_ordinal, control)
 }
 
 /// The optimizer result and the immutable base-table facts it consumed travel
@@ -800,6 +800,7 @@ fn provider_or_ready_step(
     common: FinalPlanCommon,
     optimized: OptimizedPhysicalPlan,
     next_need_ordinal: u32,
+    control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     let OptimizedPhysicalPlan {
         mut physical,
@@ -829,8 +830,9 @@ fn provider_or_ready_step(
         &physical,
         common.version,
         common.dop_domain,
+        control,
     )
-    .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+    .map_err(SqlCompileError::from)?;
     query_statistics.annotate_final_plan(&mut builder);
     Ok(CompilerStep::ready(
         common.version,
@@ -1107,8 +1109,9 @@ pub(super) fn resume_provider_read(
             state.common.version,
             state.common.dop_domain,
             reads,
+            control,
         )
-        .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+        .map_err(SqlCompileError::from)?;
     state.query_statistics.annotate_final_plan(&mut builder);
     Ok(CompilerStep::ready(
         state.common.version,
@@ -2380,6 +2383,7 @@ mod tests {
                     requires_power_of_two: true,
                 },
                 reads,
+                &SqlCompileControl::unbounded(),
             )
             .expect("DML final plan");
         let expected = "TABLE STATS ref=0 table=iceberg.db.orders rows=23 confidence=Exact source=IcebergManifest";

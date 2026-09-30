@@ -456,6 +456,7 @@ fn compile_dml_change_stream_write(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
+    let completion_control = compile_control.clone();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
         DmlChangeStreamCompileRequest {
             optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
@@ -517,11 +518,13 @@ fn compile_dml_change_stream_write(
         ))?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
     let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
-    let finalized =
-        completion.finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+    let finalized = completion.finish(
+        novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
             targets,
-        ))?;
+        ),
+        &completion_control,
+    )?;
     let (plan, writer_routes) = finalized.into_parts();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
@@ -3034,6 +3037,7 @@ fn execute_exact_cow_match_query(
             Arc::clone(&table_bindings),
             connector_context,
         )?;
+    let completion_control = compile_control.clone();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
         execution.optimizer_settings(),
@@ -3071,6 +3075,7 @@ fn execute_exact_cow_match_query(
         version,
         crate::query_execution::contract::completed_plan_dop_domain(None)?,
         reads,
+        &completion_control,
     )?;
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)

@@ -1421,6 +1421,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
+    let completion_control = compile_control.clone();
     let optimize_request =
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     // A write session both selects the dataflow shape and owns the recipes
@@ -1504,6 +1505,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
                 handle: write_handle,
             },
         ])?,
+        &completion_control,
     )?;
     let version = plan.version();
     let candidate =

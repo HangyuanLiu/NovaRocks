@@ -744,6 +744,7 @@ fn prepare_planned_ctas_connector_write(
         crate::query_execution::contract::completed_plan_dop_domain(query_options.as_ref())?,
         reads,
         targets,
+        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
     )?;
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)

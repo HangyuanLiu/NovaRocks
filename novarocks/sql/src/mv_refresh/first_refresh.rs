@@ -634,7 +634,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )
     .map_err(|error| error.to_string())?
     .into_optimized_output()
@@ -669,6 +669,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
             shape,
             final_write,
         },
+        &control,
     )
 }
 
@@ -796,7 +797,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )
     .map_err(|error| error.to_string())?
     .into_optimized_output()
@@ -826,6 +827,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
             shape,
             final_write,
         },
+        &control,
     )
 }
 

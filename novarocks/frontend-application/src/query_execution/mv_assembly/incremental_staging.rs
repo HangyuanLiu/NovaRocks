@@ -387,6 +387,7 @@ fn bind_incremental_write_dataflow(
                 analyzer_catalog.query_table_bindings(),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
@@ -408,12 +409,15 @@ fn bind_incremental_write_dataflow(
                 field_names,
                 |version, dop, reads, targets| {
                     completion
-                        .finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-                            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                version, dop, reads,
+                        .finish(
+                            novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+                                novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                                    version, dop, reads,
+                                ),
+                                targets,
                             ),
-                            targets,
-                        ))
+                            &finish_control,
+                        )
                         .map(|completed| completed.into_parts().0)
                 },
             )
@@ -483,6 +487,7 @@ fn bind_incremental_write_dataflow(
                 analyzer_catalog.query_table_bindings(),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
@@ -504,12 +509,15 @@ fn bind_incremental_write_dataflow(
                 field_names,
                 |version, dop, reads, targets| {
                     completion
-                        .finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-                            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                version, dop, reads,
+                        .finish(
+                            novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+                                novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                                    version, dop, reads,
+                                ),
+                                targets,
                             ),
-                            targets,
-                        ))
+                            &finish_control,
+                        )
                         .map(|completed| completed.into_parts().0)
                 },
             )
