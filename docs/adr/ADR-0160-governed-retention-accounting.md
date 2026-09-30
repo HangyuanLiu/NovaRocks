@@ -2,9 +2,9 @@
 id: ADR-0160
 title: "Governed Arrow retention follows explicit lineage and a committed leaf"
 domain: [memory-governance]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0166
 date: 2026-09-24
 provenance:
   - "discussion: 2026-09-14 to 2026-09-24 Arrow retained-capacity and leaf protocol review"
@@ -15,6 +15,8 @@ code-anchors:
   - "novarocks/memory-arrow/src/retained.rs (Retained, Entry, LineageSet)"
   - "novarocks/memory-arrow/src/shared.rs (SharedRetention)"
 ---
+
+> 本条为历史裁决。MEM-1 M02a 由 ADR-0166 整体替换 Reservation 与 Arrow 谱系实现；下列源码锚点仅描述历史版本。
 
 ## 问题
 

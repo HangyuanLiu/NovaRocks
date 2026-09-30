@@ -15,104 +15,67 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Observation values and the bounded event ring.
+//! Versioned accounting observations and separately qualified live samples.
 //!
-//! A snapshot separates the facts MEM-1 requires to stay separate: known live
-//! allocation `L`, unfulfilled grants `F`, the bounded third-party upper bound
-//! `O`, their sum `C`, the floor, the installed policy, the excess, and the
-//! peaks. It carries the versions it was read under so a consumer can tell a
-//! stale reading from a policy change.
-//!
-//! Two things a snapshot deliberately does not offer: a claim that several
-//! accounts were read at the same instant, and any way to add a child's peak
-//! into a parent's. Both are called out per field.
+//! Ledger commitment and responsibility classification use one root gate.
+//! Hooks remain local and may publish newer live facts during observation;
+//! those facts are reported as samples, never as settled capacity or teardown.
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::error::{ConstraintKind, MetadataRegistryLabel};
 use crate::ids::{AccountId, AccountKind, ConfigVersion, PolicyVersion};
+use crate::sync::{Arc, Ordering};
+use crate::{AccountHandle, account::Path, domain::Domain};
+use std::time::Instant;
 
-/// One account's separately expressed facts.
-///
-/// Every byte count is in the managed byte unit the adapters declare. Peaks
-/// belong to this account alone: `peak_committed_bytes` of a parent is not the
-/// sum of its children's, and summing children's peaks is never valid because
-/// they may have occurred at different times.
+/// One account's ledger facts and the quality of its live observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountSnapshot {
-    /// The account this snapshot describes.
     pub account: AccountId,
-    /// What the account stands for.
     pub kind: AccountKind,
-    /// Known live allocation `L`: backing proven by an owner and still alive.
+    /// Last incorporated payload L plus separately disclosed metadata.
+    /// This is not a simultaneous measurement of outstanding allocations.
     pub live_bytes: u64,
-    /// Unfulfilled grants `F`: issued rights that may still be fulfilled,
-    /// including sub-grants handed down and not yet returned.
     pub granted_bytes: u64,
-    /// Third-party remaining upper bound `O`: authorised coverage that cannot
-    /// yet be expressed as known `L`. This is not measured usage.
     pub bounded_bytes: u64,
-    /// Total commitment `C`, as the account itself maintains it.
-    ///
-    /// This is the authoritative number, and the one every bound is enforced
-    /// on: it changes only when capacity crosses the account's own boundary.
-    /// `L + F + O` above is a walk of the subtree taken without a global
-    /// lock, so the two agree at quiescent points and the decomposition can
-    /// transiently read higher while a top-up's optimistic claim is in
-    /// flight. A consumer judging a limit uses this field; a consumer
-    /// explaining where the bytes went uses the decomposition.
+    /// Authoritative ledger C, independent of live sampling quality.
     pub committed_bytes: u64,
-    /// Capacity this account keeps for a progressable unit, which ordinary
-    /// competition may not revoke. The floor is a lower bound on retention,
-    /// not a fourth quantity: the bytes it protects appear in `L`, `F` or `O`.
+    /// Protected part of existing C, never an additional charge.
     pub floor_bytes: u64,
-    /// Installed policy limit, when one is installed.
     pub policy_limit_bytes: Option<u64>,
-    /// Bytes held beyond the applicable bound: the account's own policy, or
-    /// the managed capacity at the root. A lowered policy does not erase
-    /// commitments, so this is reported honestly rather than clamped. It falls
-    /// back to zero on its own once the account is inside its bound again.
     pub excess_bytes: u64,
-    /// Bytes this account charged without a grant, cumulatively.
-    ///
-    /// This is a different fact from `excess_bytes` and must not be added to
-    /// it. An account can absorb unbudgeted allocation while staying well
-    /// inside every bound — the process simply had the capacity — and it can
-    /// exceed a bound without ever allocating unbudgeted. The first says a
-    /// caller's own sizing was wrong; the second says a limit is being
-    /// breached. This counter never decreases, because "this happened" does
-    /// not stop being true when the bytes are released.
-    pub unbudgeted_bytes: u64,
-    /// Whether the account is closed to further growth, for any reason.
+    /// Ordinary growth is closed by this account or an ancestor constraint.
     pub growth_frozen: bool,
-    /// Whether growth is closed specifically because unbudgeted allocation was
-    /// absorbed and no arbitrator has resolved it yet.
-    ///
-    /// Unlike an over-bound freeze, this one does not lift by itself:
-    /// releasing the bytes does not make the sizing that produced them
-    /// correct, so an arbitrator has to say the account may grow again.
-    pub frozen_by_unbudgeted: bool,
-    /// This account's own peak `C`.
+    /// The account's actual maintained C peak, not a sum of child peaks.
     pub peak_committed_bytes: u64,
-    /// This account's own peak `L`.
-    pub peak_live_bytes: u64,
-    /// Policy version the numbers were read under.
     pub policy_version: PolicyVersion,
+    pub ledger_revision: u64,
+    pub capacity_revision: u64,
+    pub capacity_target: u64,
+    /// Prepaid stable-record metadata and, at root, shared index backing.
+    pub metadata_bytes: u64,
+    pub storage_metadata_bytes: u64,
+    pub settled_payload_live_bytes: u64,
+    /// Outstanding payload observed during the sampling interval. Hooks can
+    /// change it independently of the gate protecting accounting membership.
+    pub sampled_payload_live_bytes: u64,
+    pub account_slack_bytes: u64,
+    pub subtree_slack_bytes: u64,
+    pub active_scopes: u64,
+    /// Samples whose current live value differs from incorporated L.
+    pub dirty_domains: u64,
+    /// Samples whose publication sequence changed across the live read.
+    pub changing_live_samples: u64,
+    /// Sum of each independent domain's incorporated E, without netting F.
+    pub settled_debt_bytes: u64,
+    pub sampled_debt_bytes: u64,
+    pub live_accounts: u32,
+    /// False when a final account Drop has not yet returned disappeared
+    /// membership's slack. The bounded observer never waits for quiescence.
+    pub classification_complete: bool,
+    pub sampling_span_ns: u64,
 }
 
 impl AccountSnapshot {
-    /// Reports whether the subtree decomposition `L + F + O` matches the
-    /// maintained `C`.
-    ///
-    /// Counters are read without a global lock, so this is transiently false
-    /// while another thread is mid-transition: an in-flight top-up has
-    /// already raised a child's commitment before the parent has handed the
-    /// capacity over, and a sponsor transfer deliberately leaves the common
-    /// ancestor inconsistent for its duration. Tests assert this at quiescent
-    /// points; production consumers treat a false result as "re-read", not as
-    /// a bug.
+    /// A decomposition check, not proof of snapshot/live or teardown quality.
     pub const fn is_internally_consistent(&self) -> bool {
         match self.live_bytes.checked_add(self.granted_bytes) {
             Some(partial) => match partial.checked_add(self.bounded_bytes) {
@@ -122,9 +85,6 @@ impl AccountSnapshot {
             None => false,
         }
     }
-
-    /// Returns the bytes still available under the installed policy, or `None`
-    /// when no policy is installed.
     pub const fn policy_remaining_bytes(&self) -> Option<u64> {
         match self.policy_limit_bytes {
             Some(limit) => Some(limit.saturating_sub(self.committed_bytes)),
@@ -133,49 +93,26 @@ impl AccountSnapshot {
     }
 }
 
-/// The process authority's own facts.
-///
-/// `capacity_bytes` and `headroom_budget_bytes` partition
-/// `process_bound_bytes`. The hard guarantee `C <= B` covers only the declared
-/// hard-governed set; the headroom budget covers what the observation tier
-/// measures instead. The two are overlapping views of one process and must
-/// never be added into a single total.
+/// Process responsibility and observation coverage are overlapping views.
+/// Allocation/RSS observations must never be added to ledger commitment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthoritySnapshot {
-    /// The root account of this process.
     pub root: AccountSnapshot,
-    /// Managed capacity `B`, the bound `C` is kept under.
     pub capacity_bytes: u64,
-    /// Headroom budget `H` for allocations outside hard governance.
     pub headroom_budget_bytes: u64,
-    /// Process bound `P` this authority was configured against.
     pub process_bound_bytes: u64,
-    /// Configuration version the numbers were read under.
     pub config_version: ConfigVersion,
-    /// Live accounts in the tree at the moment of the read.
     pub live_accounts: u32,
 }
-
 impl AuthoritySnapshot {
-    /// Returns the capacity still grantable under `B`.
     pub const fn capacity_remaining_bytes(&self) -> u64 {
         self.capacity_bytes
             .saturating_sub(self.root.committed_bytes)
     }
-
-    /// Reports whether the hard guarantee `C <= B` holds in this reading.
-    ///
-    /// This is judged on the root's maintained commitment, which is where the
-    /// bound is actually enforced, and not on the subtree decomposition. The
-    /// decomposition is a lock-free walk and can read higher than `B` while a
-    /// top-up's optimistic claim is in flight; treating that as a broken
-    /// bound would report a violation that never existed.
+    /// Capacity may legitimately be below existing C after shrink/debt.
     pub const fn honours_capacity_bound(&self) -> bool {
         self.root.committed_bytes <= self.capacity_bytes
     }
-
-    /// Returns the subtree decomposition's own total, for a consumer that
-    /// wants to compare it against the maintained commitment.
     pub const fn decomposed_committed_bytes(&self) -> u64 {
         self.root
             .live_bytes
@@ -184,406 +121,580 @@ impl AuthoritySnapshot {
     }
 }
 
-/// What happened, for a bounded observer.
-///
-/// Events exist so an arbitrator or an observability consumer can react
-/// without polling every account. They are droppable: losing an event never
-/// loses an authorisation result, and a consumer that sees a gap re-reads the
-/// snapshot instead.
+/// Disjoint classifications of one accounting version. Root C already
+/// includes residual; handoff alone is never reclaim benefit. Consumers must
+/// reject incomplete classification before using query pressure for policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryEventKind {
-    /// A request was refused by a constraint.
-    GrantDenied {
-        /// The account the request was made against.
-        scope: AccountId,
-        /// The constraint that refused.
-        constraint: ConstraintKind,
-        /// Bytes requested.
-        requested: u64,
-    },
-    /// A fulfilment established live allocation beyond its grant's remainder.
-    /// The memory exists, so it is charged; growth is frozen instead.
-    ExcessRecorded {
-        /// The account that recorded the excess.
-        scope: AccountId,
-        /// Bytes recorded beyond the grant remainder.
-        excess_bytes: u64,
-    },
-    /// An account was closed to further growth.
-    GrowthFrozen {
-        /// The affected account.
-        scope: AccountId,
-    },
-    /// An account was reopened to growth after its excess was resolved.
-    GrowthResumed {
-        /// The affected account.
-        scope: AccountId,
-    },
-    /// A policy limit was installed or changed.
-    PolicyInstalled {
-        /// The affected account.
-        scope: AccountId,
-        /// The new limit.
-        limit_bytes: u64,
-        /// The version the new limit carries.
-        version: PolicyVersion,
-    },
-    /// Idle account capacity was reclaimed by an arbitrator.
-    IdleCapacityReclaimed {
-        /// The affected account.
-        scope: AccountId,
-        /// Bytes actually reclaimed.
-        reclaimed_bytes: u64,
-    },
-    /// A bounded registry refused a new entry.
-    MetadataExhausted {
-        /// Which registry refused.
-        registry: MetadataRegistryLabel,
-    },
+pub struct PressureProjection {
+    pub root_committed: u64,
+    pub query_committed: u64,
+    pub residual_committed: u64,
+    pub residual_query_committed: u64,
+    pub residual_metadata: u64,
+    pub storage_metadata: u64,
+    pub active_metadata: u64,
+    pub account_slack: u64,
+    pub active_scopes: u64,
+    /// Inactive rights based on settled facts; active hook samples are separate.
+    pub settled_idle_authorization: u64,
+    pub pending_drain_domains: u64,
+    pub dirty_domains: u64,
+    pub sampled_payload_live: u64,
+    pub settled_payload_live: u64,
+    pub changing_live_samples: u64,
+    pub settled_debt: u64,
+    pub sampled_debt: u64,
+    pub classified_committed: u64,
+    pub unclassified_committed: u64,
+    pub classification_complete: bool,
+    pub root_revision: u64,
+    pub capacity_target: u64,
+    pub capacity_revision: u64,
+    pub control_floor: u64,
+    pub elastic_capacity: u64,
+    pub elastic_committed: u64,
+    pub elastic_excess: u64,
+    pub floor_target_gap: u64,
 }
-
-/// One buffered event with its sequence number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryEvent {
-    /// Monotonic sequence number within this ring.
-    pub sequence: u64,
-    /// What happened.
-    pub kind: MemoryEventKind,
-}
-
-/// Events read from the ring, plus whether anything was lost in the requested
-/// sequence range.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventBatch {
-    /// The events, in sequence order.
-    pub events: Vec<MemoryEvent>,
-    /// Missing events between the requested sequence and `next_sequence`.
-    /// A non-zero value means the reader must re-read the snapshot.
-    pub dropped_before: u64,
-    /// The sequence to request next.
-    pub next_sequence: u64,
-}
-
-impl EventBatch {
-    /// Reports whether the reader lost events and must re-read a snapshot.
-    pub const fn has_gap(&self) -> bool {
-        self.dropped_before > 0
+impl PressureProjection {
+    pub fn query_pressure(&self) -> u64 {
+        self.query_committed + self.residual_query_committed
+    }
+    pub fn non_evictable(&self, evictable_cache: u64) -> Option<u64> {
+        self.root_committed.checked_sub(evictable_cache)
+    }
+    /// Policy-facing pressure refuses an incomplete responsibility sample.
+    pub fn complete_query_pressure(&self) -> Option<u64> {
+        self.classification_complete.then(|| self.query_pressure())
     }
 }
 
-/// A bounded ring of observation events.
-///
-/// The ring never grows: when it is full the oldest event is dropped and a
-/// counter records the loss. Reservation cleanup uses a nonblocking record
-/// path, so a busy observer cannot delay cleanup or silently hide a change.
-/// Deferred reservation events may be published after a later state change;
-/// consumers use notifications to re-read the authoritative snapshot.
-#[derive(Debug)]
-pub struct EventRing {
-    capacity: usize,
-    next_sequence: AtomicU64,
-    dropped: AtomicU64,
-    buffered: Mutex<VecDeque<MemoryEvent>>,
+// Capacity is fixed at assembly. Reserve pin buffers before acquiring the
+// root gate; filling them under the gate cannot allocate. Pins are declared
+// outside the gate's scope, so a final account/domain drop always occurs after
+// gate release and cannot recursively acquire its own observation gate.
+struct ObservationMembers {
+    accounts: Vec<AccountHandle>,
+    domains: Vec<Arc<Domain>>,
 }
-
-impl EventRing {
-    /// Creates a ring holding at most `capacity` events. A zero capacity is
-    /// raised to one so a ring always reports the most recent change.
-    pub fn new(capacity: u32) -> Self {
-        let capacity = (capacity as usize).max(1);
+impl ObservationMembers {
+    fn reserve(account: &AccountHandle) -> Self {
+        let domain_capacity = account.0.shared.domains.lock().unwrap().records.len();
         Self {
-            capacity,
-            next_sequence: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            buffered: Mutex::new(VecDeque::with_capacity(capacity)),
+            accounts: Vec::with_capacity(account.0.shared.max_accounts as usize),
+            domains: Vec::with_capacity(domain_capacity),
         }
     }
-
-    /// Returns the configured capacity.
-    pub const fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Records an event, dropping the oldest if the ring is full.
-    ///
-    /// This is deliberately infallible: an event is a notification, and losing
-    /// one must never fail the capacity operation that produced it.
-    pub fn record(&self, kind: MemoryEventKind) {
-        let mut buffered = self
-            .buffered
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Assign the sequence under the buffer lock so readers cannot mistake
-        // an event waiting to be inserted for a dropped event.
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        if buffered.len() == self.capacity {
-            buffered.pop_front();
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+    fn capture(&mut self, account: &AccountHandle) {
+        let shared = &account.0.shared;
+        {
+            let registry = shared.accounts.lock().unwrap();
+            self.accounts.extend(
+                registry
+                    .records
+                    .iter()
+                    .take(registry.upper)
+                    .filter_map(|r| r.as_ref().and_then(|r| r.upgrade()).map(AccountHandle)),
+            );
         }
-        buffered.push_back(MemoryEvent { sequence, kind });
-    }
-
-    /// Records without waiting for an observer. A busy ring loses this
-    /// notification with a detectable sequence gap instead of delaying
-    /// reservation cleanup.
-    pub(crate) fn record_nonblocking(&self, kind: MemoryEventKind) {
-        let mut buffered = match self.buffered.try_lock() {
-            Ok(buffered) => buffered,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.skip_dropped(1);
-                return;
-            }
-        };
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        if buffered.len() == self.capacity {
-            buffered.pop_front();
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        buffered.push_back(MemoryEvent { sequence, kind });
-    }
-
-    /// Reserves sequence positions for events discarded before publication.
-    /// This path uses only atomics, so it can be called while a reservation's
-    /// slow lock is held and the observer will still detect the loss.
-    pub(crate) fn skip_dropped(&self, count: u64) {
-        if count > 0 {
-            self.next_sequence.fetch_add(count, Ordering::Relaxed);
-            self.dropped.fetch_add(count, Ordering::Relaxed);
+        {
+            let registry = shared.domains.lock().unwrap();
+            self.domains.extend(
+                registry
+                    .records
+                    .iter()
+                    .take(registry.upper)
+                    .filter_map(Clone::clone),
+            );
         }
     }
-
-    /// Returns buffered events with a sequence at or after `from_sequence`.
-    ///
-    /// The batch reports missing positions anywhere in the requested sequence
-    /// range, including positions skipped after the latest buffered event.
-    pub fn read_from(&self, from_sequence: u64) -> EventBatch {
-        let buffered = self
-            .buffered
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let next_sequence = self.next_sequence.load(Ordering::Relaxed);
-        let events: Vec<MemoryEvent> = buffered
-            .iter()
-            .copied()
-            .filter(|event| event.sequence >= from_sequence && event.sequence < next_sequence)
-            .collect();
-        let mut cursor = from_sequence.min(next_sequence);
-        let mut dropped_before = 0;
-        for event in &events {
-            dropped_before += event.sequence.saturating_sub(cursor);
-            cursor = event.sequence + 1;
-        }
-        dropped_before += next_sequence.saturating_sub(cursor);
-        EventBatch {
-            events,
-            dropped_before,
-            next_sequence,
-        }
-    }
-
-    /// Returns the total number of events dropped over the ring's lifetime.
-    pub fn dropped_total(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+    fn clear(&mut self) {
+        self.domains.clear();
+        self.accounts.clear();
     }
 }
 
-#[cfg(test)]
+pub(crate) fn account_snapshot(account: &AccountHandle) -> AccountSnapshot {
+    capture(account).0
+}
+
+fn capture(account: &AccountHandle) -> (AccountSnapshot, PressureProjection) {
+    let started = Instant::now();
+    let mut members = ObservationMembers::reserve(account);
+    let path = Path::new(account);
+    let root = path.node(path.len - 1);
+    // An account whose last Arc died can disappear from the weak registry
+    // before its Drop obtains the gate to return slack. Bounded retries release
+    // all gates and pins, allowing that drop to finish; sustained churn is
+    // reported as incomplete instead of hanging a management request.
+    for attempt in 0..3 {
+        members.clear();
+        let observation = {
+            let _gate = root.0.gate.write().unwrap();
+            members.capture(account);
+            capture_locked(account, root, &members, started)
+        };
+        if observation.1.classification_complete || attempt == 2 {
+            return observation;
+        }
+    }
+    unreachable!("bounded observation always returns its final sample")
+}
+
+fn capture_locked(
+    account: &AccountHandle,
+    root: &AccountHandle,
+    members: &ObservationMembers,
+    started: Instant,
+) -> (AccountSnapshot, PressureProjection) {
+    let shared = &account.0.shared;
+    let storage = shared.storage_bytes.load(Ordering::Acquire);
+    let mut pressure = PressureProjection {
+        root_committed: 0,
+        query_committed: 0,
+        residual_committed: 0,
+        residual_query_committed: 0,
+        residual_metadata: 0,
+        storage_metadata: storage,
+        active_metadata: 0,
+        account_slack: 0,
+        active_scopes: 0,
+        settled_idle_authorization: 0,
+        pending_drain_domains: 0,
+        dirty_domains: 0,
+        sampled_payload_live: 0,
+        settled_payload_live: 0,
+        changing_live_samples: 0,
+        settled_debt: 0,
+        sampled_debt: 0,
+        classified_committed: storage,
+        unclassified_committed: 0,
+        classification_complete: false,
+        root_revision: 0,
+        capacity_target: 0,
+        capacity_revision: 0,
+        control_floor: 0,
+        elastic_capacity: 0,
+        elastic_committed: 0,
+        elastic_excess: 0,
+        floor_target_gap: 0,
+    };
+    let scoped_storage = if account.id() == root.id() {
+        storage
+    } else {
+        0
+    };
+    let mut metadata = scoped_storage;
+    let mut settled_live = 0;
+    let mut sampled_live = 0;
+    let mut free = 0;
+    let mut external = 0;
+    let mut slack = 0;
+    let mut scopes = 0;
+    let mut dirty = 0;
+    let mut changing = 0;
+    let mut settled_debt = 0;
+    let mut sampled_debt = 0;
+    let mut live_accounts = 0;
+    for member in &members.accounts {
+        let state = member.0.ledger.lock().unwrap();
+        pressure.account_slack += state.slack;
+        pressure.classified_committed += state.slack;
+        if Path::new(member)
+            .nodes
+            .iter()
+            .flatten()
+            .any(|n| n.kind() == AccountKind::Work)
+        {
+            pressure.query_committed += state.slack;
+        }
+        if member.is_descendant_of(account) {
+            free += state.slack;
+            slack += state.slack;
+            if !state.retired {
+                live_accounts += 1;
+            }
+        }
+    }
+    for domain in &members.domains {
+        let state = domain.state.lock().unwrap();
+        let total = state.committed + domain.metadata;
+        pressure.classified_committed += total;
+        if state.residual {
+            pressure.residual_committed += total;
+            pressure.residual_metadata += domain.metadata;
+            if state.query_origin {
+                pressure.residual_query_committed += total;
+            }
+        } else {
+            pressure.active_metadata += domain.metadata;
+            if state.query_origin {
+                pressure.query_committed += total;
+            }
+        }
+        let before = domain.owner.sequence.load(Ordering::Acquire);
+        let live = domain.owner.live();
+        let after = domain.owner.sequence.load(Ordering::Acquire);
+        let current_obligation = live.saturating_add(state.external);
+        let domain_settled_debt = state.committed.saturating_sub(state.authorized);
+        let domain_sampled_debt = current_obligation.saturating_sub(state.authorized);
+        let is_dirty = u64::from(
+            live != state.settled_live
+                || state.authorized.max(current_obligation) != state.committed,
+        );
+        let is_changing = u64::from(before != after);
+        pressure.sampled_payload_live += live;
+        pressure.settled_payload_live += state.settled_live;
+        pressure.active_scopes += u64::from(state.active);
+        if !state.active {
+            pressure.settled_idle_authorization += state
+                .authorized
+                .saturating_sub(state.settled_live.saturating_add(state.external));
+        }
+        pressure.pending_drain_domains += u64::from(state.drain_requested);
+        pressure.dirty_domains += is_dirty;
+        pressure.changing_live_samples += is_changing;
+        pressure.settled_debt += domain_settled_debt;
+        pressure.sampled_debt += domain_sampled_debt;
+        if state.account.is_descendant_of(account) {
+            metadata += domain.metadata;
+            settled_live += state.settled_live;
+            sampled_live += live;
+            external += state.external;
+            free += state
+                .authorized
+                .saturating_sub(state.settled_live.saturating_add(state.external));
+            scopes += u64::from(state.active);
+            dirty += is_dirty;
+            changing += is_changing;
+            settled_debt += domain_settled_debt;
+            sampled_debt += domain_sampled_debt;
+        }
+    }
+    {
+        let state = root.0.ledger.lock().unwrap();
+        pressure.root_committed = state.committed;
+        pressure.root_revision = state.revision;
+        pressure.control_floor = state.floor;
+    }
+    pressure.capacity_target = shared.target.load(Ordering::Acquire);
+    pressure.capacity_revision = shared.capacity_revision.load(Ordering::Acquire);
+    pressure.elastic_capacity = pressure
+        .capacity_target
+        .saturating_sub(pressure.control_floor);
+    pressure.elastic_committed = pressure
+        .root_committed
+        .saturating_sub(pressure.control_floor);
+    pressure.elastic_excess = pressure
+        .elastic_committed
+        .saturating_sub(pressure.elastic_capacity);
+    pressure.floor_target_gap = pressure
+        .control_floor
+        .saturating_sub(pressure.capacity_target);
+    pressure.unclassified_committed = pressure
+        .root_committed
+        .saturating_sub(pressure.classified_committed);
+    pressure.classification_complete = pressure.root_committed == pressure.classified_committed;
+    let path = Path::new(account);
+    let growth_frozen = path.nodes.iter().flatten().any(|node| {
+        let state = node.0.ledger.lock().unwrap();
+        let limit = if node.id() == root.id() {
+            pressure.capacity_target
+        } else {
+            state.policy.map_or(u64::MAX, |p| p.limit_bytes())
+        };
+        state.closed || state.committed > limit
+    });
+    let state = account.0.ledger.lock().unwrap();
+    let limit = if account.id() == root.id() {
+        pressure.capacity_target
+    } else {
+        state.policy.map_or(u64::MAX, |p| p.limit_bytes())
+    };
+    let snapshot = AccountSnapshot {
+        account: account.id(),
+        kind: account.kind(),
+        live_bytes: settled_live + metadata,
+        granted_bytes: free,
+        bounded_bytes: external,
+        committed_bytes: state.committed,
+        floor_bytes: state.floor,
+        policy_limit_bytes: state.policy.map(|p| p.limit_bytes()),
+        excess_bytes: state.committed.saturating_sub(limit),
+        growth_frozen,
+        peak_committed_bytes: state.peak,
+        policy_version: state.version,
+        ledger_revision: state.revision,
+        capacity_revision: pressure.capacity_revision,
+        capacity_target: pressure.capacity_target,
+        metadata_bytes: metadata,
+        storage_metadata_bytes: scoped_storage,
+        settled_payload_live_bytes: settled_live,
+        sampled_payload_live_bytes: sampled_live,
+        account_slack_bytes: state.slack,
+        subtree_slack_bytes: slack,
+        active_scopes: scopes,
+        dirty_domains: dirty,
+        changing_live_samples: changing,
+        settled_debt_bytes: settled_debt,
+        sampled_debt_bytes: sampled_debt,
+        live_accounts,
+        classification_complete: pressure.classification_complete,
+        sampling_span_ns: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+    };
+    (snapshot, pressure)
+}
+
+impl crate::MemoryAuthority {
+    pub fn pressure_projection(&self) -> PressureProjection {
+        capture(self.root()).1
+    }
+
+    /// Root ledger and disjoint pressure classifications from one capture.
+    /// Member pins and all temporary allocations are released outside gates.
+    pub fn accounting_snapshot(&self) -> (AuthoritySnapshot, PressureProjection) {
+        let (root, pressure) = capture(self.root());
+        let config = self.config();
+        let authority = AuthoritySnapshot {
+            root,
+            capacity_bytes: root.capacity_target,
+            headroom_budget_bytes: config.headroom_budget_bytes,
+            process_bound_bytes: config.process_bound_bytes,
+            config_version: ConfigVersion::new(root.capacity_revision),
+            live_accounts: root.live_accounts,
+        };
+        (authority, pressure)
+    }
+}
+
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use crate::{
+        AuthorityConfig, ExternalRef, MemoryAuthority, OWNER_METADATA_BYTES, TeardownEvidence,
+        TopUpPolicy,
+    };
+    use std::sync::{Arc as StdArc, Barrier};
 
-    fn snapshot(live: u64, granted: u64, bounded: u64, committed: u64) -> AccountSnapshot {
-        AccountSnapshot {
-            account: AccountId::new(1),
-            kind: AccountKind::Work,
-            live_bytes: live,
-            granted_bytes: granted,
-            bounded_bytes: bounded,
-            committed_bytes: committed,
-            floor_bytes: 0,
-            policy_limit_bytes: None,
-            excess_bytes: 0,
-            unbudgeted_bytes: 0,
-            growth_frozen: false,
-            frozen_by_unbudgeted: false,
-            peak_committed_bytes: committed,
-            peak_live_bytes: live,
-            policy_version: PolicyVersion::INITIAL,
-        }
+    fn authority() -> MemoryAuthority {
+        let mut config = AuthorityConfig::new(131_072, 65_536, 65_536);
+        config.max_accounts = 16;
+        config.max_active_owners = 4;
+        config.metadata_budget_bytes = 8_192;
+        config.top_up = TopUpPolicy::uniform(1);
+        MemoryAuthority::new(config).unwrap()
     }
 
     #[test]
-    fn consistency_check_matches_the_l_f_o_decomposition() {
-        assert!(snapshot(60, 40, 0, 100).is_internally_consistent());
-        assert!(snapshot(0, 100, 0, 100).is_internally_consistent());
-        assert!(snapshot(10, 20, 30, 60).is_internally_consistent());
-        assert!(!snapshot(60, 40, 0, 90).is_internally_consistent());
-    }
-
-    #[test]
-    fn policy_remaining_is_absent_without_a_policy_and_saturates_over_it() {
-        assert_eq!(snapshot(0, 0, 0, 0).policy_remaining_bytes(), None);
-        let mut over = snapshot(120, 0, 0, 120);
-        over.policy_limit_bytes = Some(100);
-        assert_eq!(over.policy_remaining_bytes(), Some(0));
-    }
-
-    #[test]
-    fn authority_snapshot_reports_the_capacity_bound_and_remainder() {
-        let authority = AuthoritySnapshot {
-            root: snapshot(30, 20, 0, 50),
-            capacity_bytes: 100,
-            headroom_budget_bytes: 20,
-            process_bound_bytes: 128,
-            config_version: ConfigVersion::new(1),
-            live_accounts: 3,
-        };
-        assert!(authority.honours_capacity_bound());
-        assert_eq!(authority.capacity_remaining_bytes(), 50);
-
-        let over = AuthoritySnapshot {
-            root: snapshot(150, 0, 0, 150),
-            ..authority
-        };
-        assert!(!over.honours_capacity_bound());
-        assert_eq!(over.capacity_remaining_bytes(), 0);
-    }
-
-    #[test]
-    fn ring_returns_events_in_order_from_a_requested_sequence() {
-        let ring = EventRing::new(8);
-        for index in 0..4u64 {
-            ring.record(MemoryEventKind::GrowthFrozen {
-                scope: AccountId::new(index + 1),
-            });
-        }
-        let batch = ring.read_from(0);
-        assert_eq!(batch.events.len(), 4);
-        assert_eq!(batch.events[0].sequence, 0);
-        assert_eq!(batch.next_sequence, 4);
-        assert!(!batch.has_gap());
-
-        let tail = ring.read_from(2);
-        assert_eq!(tail.events.len(), 2);
-        assert_eq!(tail.events[0].sequence, 2);
-        assert!(!tail.has_gap());
-    }
-
-    #[test]
-    fn slow_reader_sees_a_detectable_gap_instead_of_silent_loss() {
-        let ring = EventRing::new(2);
-        for index in 0..5u64 {
-            ring.record(MemoryEventKind::GrowthFrozen {
-                scope: AccountId::new(index + 1),
-            });
-        }
-        assert_eq!(ring.dropped_total(), 3);
-        let batch = ring.read_from(0);
-        assert!(batch.has_gap(), "{batch:?}");
-        assert_eq!(batch.dropped_before, 3);
-        assert_eq!(batch.events.len(), 2);
-        assert_eq!(batch.events[0].sequence, 3);
-    }
-
-    #[test]
-    fn reading_past_the_end_reports_no_events_and_the_next_sequence() {
-        let ring = EventRing::new(4);
-        ring.record(MemoryEventKind::MetadataExhausted {
-            registry: MetadataRegistryLabel::Accounts,
-        });
-        let batch = ring.read_from(9);
-        assert!(batch.events.is_empty());
-        assert_eq!(batch.next_sequence, 1);
-        assert!(!batch.has_gap());
-    }
-
-    #[test]
-    fn zero_capacity_still_keeps_the_latest_event() {
-        let ring = EventRing::new(0);
-        assert_eq!(ring.capacity(), 1);
-        ring.record(MemoryEventKind::GrowthResumed {
-            scope: AccountId::new(1),
-        });
-        ring.record(MemoryEventKind::GrowthResumed {
-            scope: AccountId::new(2),
-        });
-        let batch = ring.read_from(0);
-        assert_eq!(batch.events.len(), 1);
-        assert_eq!(batch.events[0].sequence, 1);
-        assert!(batch.has_gap());
-    }
-
-    #[test]
-    fn skipped_events_leave_detectable_internal_and_trailing_gaps() {
-        let ring = EventRing::new(4);
-        ring.record(MemoryEventKind::GrowthFrozen {
-            scope: AccountId::new(1),
-        });
-        ring.skip_dropped(2);
-        ring.record(MemoryEventKind::GrowthResumed {
-            scope: AccountId::new(1),
-        });
-        ring.skip_dropped(1);
-
-        let batch = ring.read_from(0);
-        assert_eq!(
-            batch
-                .events
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            vec![0, 3]
-        );
-        assert_eq!(batch.next_sequence, 5);
-        assert_eq!(batch.dropped_before, 3);
-        assert!(batch.has_gap());
-        assert_eq!(ring.dropped_total(), 3);
-
-        let tail = ring.read_from(4);
-        assert!(tail.events.is_empty());
-        assert_eq!(tail.dropped_before, 1);
-        assert!(tail.has_gap());
-    }
-
-    #[cfg(not(loom))]
-    #[test]
-    fn reservation_cleanup_does_not_wait_for_a_busy_event_reader() {
-        use crate::Reservation;
-        use crate::account::TopUpPolicy;
-        use crate::authority::{AuthorityConfig, MemoryAuthority};
-        use crate::ids::{AccountKind, ExternalRef};
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let mut config = AuthorityConfig::new(8, 4, 4);
-        config.top_up = TopUpPolicy::uniform(2);
-        let authority = MemoryAuthority::new(config).unwrap();
-        let sponsor = authority
-            .create_account(AccountKind::Work, ExternalRef::from_u128(1))
+    fn members_created_after_buffer_reservation_are_in_the_committed_capture() {
+        let a = authority();
+        let mut members = ObservationMembers::reserve(a.root());
+        let query = a
+            .create_account(AccountKind::Work, ExternalRef::NONE)
             .unwrap();
-        let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
-        drop(leaf.try_grow(2).unwrap());
-        leaf.trim();
-        assert!(
-            authority.events().read_from(0).events.iter().any(|event| {
-                matches!(event.kind, MemoryEventKind::IdleCapacityReclaimed { .. })
-            })
+        let domain = query.create_domain(512).unwrap();
+        let (snapshot, pressure) = {
+            let _gate = a.root().0.gate.write().unwrap();
+            members.capture(a.root());
+            capture_locked(a.root(), a.root(), &members, Instant::now())
+        };
+        assert!(snapshot.classification_complete);
+        assert_eq!(
+            pressure.complete_query_pressure(),
+            Some(512 + OWNER_METADATA_BYTES)
         );
-        let lease = leaf.try_grow(2).unwrap();
-        let reader = authority.events().buffered.lock().unwrap();
+        assert_eq!(pressure.root_committed, pressure.classified_committed);
+        assert_eq!(
+            pressure.root_committed,
+            pressure.storage_metadata + pressure.query_committed
+        );
+        assert_eq!(snapshot.live_accounts, 2);
+        assert_eq!(
+            snapshot.metadata_bytes,
+            pressure.storage_metadata + OWNER_METADATA_BYTES
+        );
+        assert_eq!(domain.snapshot().authorized, 512);
+    }
 
-        let (done, finished) = mpsc::channel();
-        let cleanup = std::thread::spawn(move || {
-            assert!(leaf.try_grow(8).is_err());
-            leaf.close();
-            drop(lease);
-            done.send(()).unwrap();
+    #[test]
+    fn outstanding_hooks_are_samples_and_never_disguised_as_settled_live() {
+        let a = authority();
+        let query = a
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let domain = query.create_domain(512).unwrap();
+        let mut scope = domain.activate(512, 0).unwrap();
+        let origin = scope.record_allocation(256);
+        let (before, pressure) = a.accounting_snapshot();
+        assert_eq!(before.root.settled_payload_live_bytes, 0);
+        assert_eq!(before.root.sampled_payload_live_bytes, 256);
+        assert_eq!(before.root.active_scopes, 1);
+        assert_eq!(before.root.dirty_domains, 1);
+        assert_eq!(before.root.live_bytes, before.root.metadata_bytes);
+        assert_eq!(pressure.sampled_payload_live, 256);
+        assert_eq!(pressure.settled_payload_live, 0);
+        assert!(before.root.is_internally_consistent());
+        scope.finish();
+        let settled = query.snapshot();
+        assert_eq!(settled.settled_payload_live_bytes, 256);
+        assert_eq!(settled.sampled_payload_live_bytes, 256);
+        assert_eq!(settled.active_scopes, 0);
+        assert_eq!(settled.dirty_domains, 0);
+        // SAFETY: one matching release for the outstanding published allocation.
+        unsafe {
+            origin.record_deallocation(256);
+        }
+        let dirty = query.snapshot();
+        assert_eq!(dirty.settled_payload_live_bytes, 256);
+        assert_eq!(dirty.sampled_payload_live_bytes, 0);
+        assert_eq!(dirty.dirty_domains, 1);
+        assert_eq!(dirty.peak_committed_bytes, settled.peak_committed_bytes);
+        domain.settle();
+        let freed = query.snapshot();
+        assert_eq!(freed.settled_payload_live_bytes, 0);
+        assert_eq!(freed.dirty_domains, 0);
+        assert_eq!(freed.peak_committed_bytes, settled.peak_committed_bytes);
+    }
+
+    #[test]
+    fn debt_samples_and_settled_debt_preserve_each_domains_independent_rights() {
+        let a = authority();
+        let query = a
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let debtor = query.create_domain(512).unwrap();
+        let untouched = query.create_domain(512).unwrap();
+        let mut scope = debtor.activate(512, 0).unwrap();
+        let origin = scope.record_allocation(768);
+        let sampled = query.snapshot();
+        assert_eq!(sampled.sampled_debt_bytes, 256);
+        assert_eq!(sampled.settled_debt_bytes, 0);
+        assert_eq!(sampled.dirty_domains, 1);
+        scope.finish();
+        let (snapshot, pressure) = a.accounting_snapshot();
+        assert_eq!(snapshot.root.sampled_debt_bytes, 256);
+        assert_eq!(snapshot.root.settled_debt_bytes, 256);
+        assert_eq!(pressure.settled_debt, 256);
+        assert_eq!(pressure.sampled_debt, 256);
+        assert_eq!(untouched.snapshot().free, 512);
+        assert_eq!(
+            pressure.complete_query_pressure(),
+            Some(1_280 + 2 * OWNER_METADATA_BYTES)
+        );
+        // SAFETY: one exact release for the published successful allocation.
+        unsafe {
+            origin.record_deallocation(768);
+        }
+        let freed = query.snapshot();
+        assert_eq!(freed.settled_debt_bytes, 256);
+        assert_eq!(freed.sampled_debt_bytes, 0);
+        assert_eq!(freed.dirty_domains, 1);
+        debtor.settle();
+        let reconciled = query.snapshot();
+        assert_eq!(reconciled.settled_debt_bytes, 0);
+        assert_eq!(reconciled.dirty_domains, 0);
+    }
+
+    #[test]
+    fn target_revision_floor_and_elastic_pressure_come_from_the_same_capture() {
+        let a = authority();
+        a.install_control_branch(4_096).unwrap();
+        let query = a
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let _domain = query.create_domain(1_024).unwrap();
+        let mut writer = a.take_capacity_writer().unwrap();
+        let revision = writer.set_capacity(0).unwrap();
+        let (authority, pressure) = a.accounting_snapshot();
+        assert_eq!(authority.capacity_bytes, 0);
+        assert_eq!(authority.root.capacity_revision, revision);
+        assert_eq!(pressure.capacity_revision, revision);
+        assert_eq!(authority.root.ledger_revision, pressure.root_revision);
+        assert_eq!(pressure.control_floor, 4_096);
+        assert_eq!(pressure.floor_target_gap, 4_096);
+        assert_eq!(pressure.elastic_capacity, 0);
+        assert_eq!(pressure.elastic_committed, pressure.root_committed - 4_096);
+        assert_eq!(pressure.elastic_excess, pressure.elastic_committed);
+        assert_eq!(authority.root.excess_bytes, pressure.root_committed);
+        assert!(pressure.classification_complete);
+        assert!(
+            query.snapshot().growth_frozen,
+            "ancestor shrink closes ordinary growth"
+        );
+    }
+
+    #[test]
+    fn final_drop_waiting_on_an_ancestor_reports_incomplete_without_hanging_observer() {
+        let a = authority();
+        let group = a
+            .create_account(AccountKind::ResourceGroup, ExternalRef::NONE)
+            .unwrap();
+        // The still-live group retains its actual account allocation fee.
+        let baseline = a.root().committed_bytes();
+        let query = group
+            .create_child(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let with_query_metadata = a.root().committed_bytes();
+        assert!(with_query_metadata > baseline);
+        query.prefund(1_024).unwrap();
+        let slot = query.0.slot.load(Ordering::Acquire) as usize;
+        let group_gate = group.0.gate.write().unwrap();
+        let start = StdArc::new(Barrier::new(2));
+        let ready = start.clone();
+        let dropper = std::thread::spawn(move || {
+            ready.wait();
+            drop(query);
         });
-        let completed_while_reader_held = finished.recv_timeout(Duration::from_secs(5)).is_ok();
-        drop(reader);
-        cleanup.join().unwrap();
-        assert!(completed_while_reader_held);
-        assert!(authority.events().dropped_total() > 0);
-        assert!(authority.events().read_from(0).has_gap());
+        start.wait();
+        while a.shared.accounts.lock().unwrap().records[slot].is_some() {
+            std::thread::yield_now();
+        }
+        // Last Drop removed weak membership but cannot yet acquire group_gate
+        // to return the root's slack obligation. Three retries must return
+        // explicit incomplete quality, not wait for that writer indefinitely.
+        let (snapshot, pressure) = a.accounting_snapshot();
+        assert!(!snapshot.root.classification_complete);
+        assert!(!pressure.classification_complete);
+        assert_eq!(pressure.root_committed, with_query_metadata + 1_024);
+        assert_eq!(pressure.unclassified_committed, 1_024);
+        assert_eq!(pressure.complete_query_pressure(), None);
+        drop(group_gate);
+        dropper.join().unwrap();
+        let (_, pressure) = a.accounting_snapshot();
+        assert!(pressure.classification_complete);
+        assert_eq!(pressure.root_committed, baseline);
+        assert_eq!(pressure.complete_query_pressure(), Some(0));
+    }
+
+    #[test]
+    fn pinned_members_are_released_after_gate_so_observation_can_be_the_last_reference() {
+        let a = authority();
+        let baseline = a.root().committed_bytes();
+        let query = a
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        query.prefund(512).unwrap();
+        let mut members = ObservationMembers::reserve(a.root());
+        {
+            let _gate = a.root().0.gate.write().unwrap();
+            members.capture(a.root());
+            drop(query);
+            let (_, pressure) = capture_locked(a.root(), a.root(), &members, Instant::now());
+            assert_eq!(pressure.complete_query_pressure(), Some(512));
+        }
+        // The observer now owns the final strong account reference. Clearing
+        // pins outside the gate allows Account::drop to return slack normally.
+        members.clear();
+        assert_eq!(a.root().committed_bytes(), baseline);
+        let evidence = TeardownEvidence {
+            tasks_exited: true,
+            operators_destroyed: true,
+            io: &[],
+            now_ns: 1,
+        };
+        let replacement = a
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        replacement.retire(&evidence).unwrap();
     }
 }

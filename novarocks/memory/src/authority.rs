@@ -15,59 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The process capacity authority (MEM-1 wave-1 T02).
-//!
-//! One operating-system process installs exactly one authority. It validates
-//! that managed capacity `B` plus the headroom budget `H` fits inside the
-//! process bound `P`, owns the root account, and hands out account handles.
-//! Roles inside the same process consume the injected authority; they never
-//! create a second one over the same physical budget, and they never sample
-//! the same resident memory twice and add the results.
-//!
-//! # `B`, `H` and `P`
-//!
-//! `P` is what the process is allowed to use, resolved from the deployment's
-//! own memory configuration. `B` is the part of it this authority governs
-//! hard: every managed commitment is kept at or under `B`. `H` is the part
-//! reserved for everything the hard tier cannot cover — a third party's
-//! internals, a native library, allocator retention and fragmentation. They
-//! partition `P`, so `B + H <= P`, and a configuration that breaks that is
-//! rejected rather than quietly promising capacity the process does not have.
-//!
-//! `H` is a policy number, not a measurement and not a residual: it is what
-//! the deployment set aside, and the observation tier measures actual usage
-//! against it. The difference between the two is a diagnostic, never an
-//! attribution to a query.
+//! Process assembly and the unique, non-cloneable capacity writer.
+use crate::sync::{Arc, AtomicU64, Mutex, Ordering, Weak};
+use crate::{
+    account::{Account, AccountHandle, TopUpPolicy},
+    error::{CapacityError, ConfigError, MetadataRegistryLabel},
+    ids::{AccountKind, ConfigVersion, ExternalRef},
+    policy::LimitDimension,
+    snapshot::AuthoritySnapshot,
+};
+use std::sync::OnceLock;
 
-use std::sync::{Arc, OnceLock};
-
-use crate::account::{AccountHandle, AccountTreeShared, TopUpPolicy};
-use crate::error::{CapacityError, ConfigError, MetadataRegistryLabel};
-use crate::ids::{AccountKind, ConfigVersion, ExternalRef};
-use crate::policy::LimitDimension;
-use crate::snapshot::{AuthoritySnapshot, EventRing};
-
-/// How one process's memory authority is sized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorityConfig {
-    /// `P`: what the whole process may use.
     pub process_bound_bytes: u64,
-    /// `B`: the part this authority governs hard.
     pub capacity_bytes: u64,
-    /// `H`: the part set aside for allocations outside hard governance.
     pub headroom_budget_bytes: u64,
-    /// The account-tree limit. The core's own metadata is budgeted like any
-    /// other growing state.
     pub max_accounts: u32,
-    /// How many observation events are buffered before the oldest is dropped.
     pub event_capacity: u32,
-    /// How much capacity a top-up moves at once.
     pub top_up: TopUpPolicy,
+    pub max_active_owners: u32,
+    pub metadata_budget_bytes: u64,
 }
-
 impl AuthorityConfig {
-    /// Builds a configuration that splits `process_bound_bytes` into managed
-    /// capacity and headroom, with the default metadata limits.
     pub const fn new(
         process_bound_bytes: u64,
         capacity_bytes: u64,
@@ -79,15 +49,11 @@ impl AuthorityConfig {
             headroom_budget_bytes,
             max_accounts: 65_536,
             event_capacity: 65_536,
-            top_up: TopUpPolicy::DEFAULT,
+            top_up: TopUpPolicy::uniform(256 * 1024),
+            max_active_owners: 65_536,
+            metadata_budget_bytes: 64 * 1024 * 1024,
         }
     }
-
-    /// Checks that the configuration is internally possible.
-    ///
-    /// This is the one place the `B + H <= P` partition is enforced. It is a
-    /// configuration invariant rather than a runtime check because a process
-    /// that promised more than it has cannot discover that safely later.
     pub const fn validate(&self) -> Result<(), ConfigError> {
         if self.process_bound_bytes == 0 {
             return Err(ConfigError::ProcessBoundIsZero);
@@ -97,22 +63,15 @@ impl AuthorityConfig {
                 registry: MetadataRegistryLabel::Accounts,
             });
         }
-        if self.event_capacity == 0 {
+        if self.max_active_owners == 0 || self.metadata_budget_bytes == 0 {
             return Err(ConfigError::MetadataLimitIsZero {
-                registry: MetadataRegistryLabel::Events,
+                registry: MetadataRegistryLabel::Owners,
             });
         }
-        let declared = match self.capacity_bytes.checked_add(self.headroom_budget_bytes) {
-            Some(declared) => declared,
-            None => {
-                return Err(ConfigError::CapacityExceedsProcessBound {
-                    capacity_bytes: self.capacity_bytes,
-                    headroom_budget_bytes: self.headroom_budget_bytes,
-                    process_bound_bytes: self.process_bound_bytes,
-                });
-            }
-        };
-        if declared > self.process_bound_bytes {
+        if match self.capacity_bytes.checked_add(self.headroom_budget_bytes) {
+            Some(total) => total > self.process_bound_bytes,
+            None => true,
+        } {
             return Err(ConfigError::CapacityExceedsProcessBound {
                 capacity_bytes: self.capacity_bytes,
                 headroom_budget_bytes: self.headroom_budget_bytes,
@@ -122,164 +81,405 @@ impl AuthorityConfig {
         Ok(())
     }
 }
-
-/// One process's memory authority.
-///
-/// The authority is the trusted assembly point: whoever composes the process
-/// creates it once and injects account handles into the roles that need them.
-/// A handle grants the right to derive children and request capacity, and
-/// nothing more, so a consumer cannot mint a second authority over the same
-/// physical budget by constructing types it happens to be able to name.
 #[derive(Debug)]
+pub(crate) struct Shared {
+    pub ceiling: u64,
+    pub top_up: TopUpPolicy,
+    pub target: AtomicU64,
+    pub capacity_revision: AtomicU64,
+    pub next_id: AtomicU64,
+    pub membership_revision: AtomicU64,
+    pub max_accounts: u32,
+    pub accounts: Mutex<AccountRegistry>,
+    pub writer_taken: Mutex<bool>,
+    pub assembly: Mutex<()>,
+    pub domains: Mutex<crate::domain::DomainRegistry>,
+    pub max_active_owners: u32,
+    pub metadata_budget: u64,
+    pub storage_bytes: AtomicU64,
+    pub maintenance: Mutex<crate::maintenance::MaintenanceState>,
+}
+#[derive(Debug)]
+/// Process-local ownership of the allocation-origin registry.
+///
+/// This authority must outlive every active allocation scope, external bound
+/// and outstanding allocation origin issued by it. Shutdown closes admission and detaches
+/// empty records; it is not evidence of executor or I/O teardown. A record
+/// with publishing or allocation responsibility remains pinned rather than
+/// invalidating a raw origin if this lifetime contract is violated.
 pub struct MemoryAuthority {
     config: AuthorityConfig,
-    config_version: ConfigVersion,
+    pub(crate) shared: Arc<Shared>,
     root: AccountHandle,
-    shared: Arc<AccountTreeShared>,
     control: OnceLock<AccountHandle>,
 }
-
 impl MemoryAuthority {
-    /// Installs the authority for this process.
     pub fn new(config: AuthorityConfig) -> Result<Self, ConfigError> {
         config.validate()?;
-        let shared = Arc::new(AccountTreeShared::new(
-            config.capacity_bytes,
-            config.max_accounts,
-            config.top_up,
-            config.event_capacity,
-        ));
-        let root =
-            AccountHandle::new_root(ExternalRef::NONE, Arc::clone(&shared)).map_err(|_| {
-                // The only way the root can be refused is a zero account budget,
-                // which `validate` already rejected.
-                ConfigError::MetadataLimitIsZero {
-                    registry: MetadataRegistryLabel::Accounts,
+        let shared = Arc::new(Shared {
+            ceiling: config.capacity_bytes,
+            top_up: config.top_up,
+            target: AtomicU64::new(config.capacity_bytes),
+            capacity_revision: AtomicU64::new(1),
+            next_id: AtomicU64::new(2),
+            membership_revision: AtomicU64::new(1),
+            max_accounts: config.max_accounts,
+            accounts: Mutex::new(AccountRegistry {
+                records: (0..config.max_accounts).map(|_| None).collect(),
+                free_slots: (1..config.max_accounts as usize).rev().collect(),
+                upper: 1,
+            }),
+            writer_taken: Mutex::new(false),
+            assembly: Mutex::new(()),
+            domains: Mutex::new({
+                let slots = (config.metadata_budget_bytes
+                    / (crate::domain::OWNER_METADATA_BYTES
+                        + (2 * std::mem::size_of::<usize>()) as u64))
+                    as usize;
+                crate::domain::DomainRegistry {
+                    records: (0..slots).map(|_| None).collect(),
+                    free_slots: (0..slots).rev().collect(),
+                    active: 0,
+                    metadata: 0,
+                    upper: 0,
                 }
-            })?;
+            }),
+            max_active_owners: config.max_active_owners,
+            metadata_budget: config.metadata_budget_bytes,
+            storage_bytes: AtomicU64::new(0),
+            maintenance: Mutex::new(crate::maintenance::MaintenanceState::default()),
+        });
+        let root = AccountHandle::new_root(shared.clone());
+        shared.accounts.lock().unwrap().records[0] = Some(Arc::downgrade(&root.0));
+        root.0.slot.store(0, Ordering::Relaxed);
+        // Index backing is allocated once and belongs to storage, not to an
+        // individual execution account or to an uncounted residual count cap.
+        let storage = (std::mem::size_of::<Shared>() + 2 * std::mem::size_of::<usize>()) as u64
+            + crate::account::ACCOUNT_METADATA_BYTES
+            + {
+                let registry = shared.domains.lock().unwrap();
+                (registry.records.capacity()
+                    * std::mem::size_of::<Option<Arc<crate::domain::Domain>>>()
+                    + registry.free_slots.capacity() * std::mem::size_of::<usize>())
+                    as u64
+            }
+            + {
+                let registry = shared.accounts.lock().unwrap();
+                (registry.records.capacity() * std::mem::size_of::<Option<Weak<Account>>>()
+                    + registry.free_slots.capacity() * std::mem::size_of::<usize>())
+                    as u64
+            };
+        if storage > config.capacity_bytes {
+            return Err(ConfigError::CoreMetadataExceedsCapacity {
+                metadata_bytes: storage,
+                capacity_bytes: config.capacity_bytes,
+            });
+        }
+        shared.storage_bytes.store(storage, Ordering::Relaxed);
+        {
+            let mut s = root.0.ledger.lock().unwrap();
+            s.committed = storage;
+            s.peak = storage;
+            root.0.committed.store(storage, Ordering::Release);
+        }
         Ok(Self {
             config,
-            config_version: ConfigVersion::new(1),
-            root,
             shared,
+            root,
             control: OnceLock::new(),
         })
     }
-
-    /// Returns the configuration this authority was installed with.
     pub const fn config(&self) -> AuthorityConfig {
         self.config
     }
-
-    /// Returns the configuration version snapshots are stamped with.
-    pub const fn config_version(&self) -> ConfigVersion {
-        self.config_version
+    pub fn config_version(&self) -> ConfigVersion {
+        ConfigVersion::new(self.shared.capacity_revision.load(Ordering::Acquire))
     }
-
-    /// Returns the process root account.
     pub const fn root(&self) -> &AccountHandle {
         &self.root
     }
-
-    /// Returns managed capacity `B`.
-    pub const fn capacity_bytes(&self) -> u64 {
-        self.config.capacity_bytes
+    pub fn capacity_bytes(&self) -> u64 {
+        self.shared.target.load(Ordering::Acquire)
     }
-
-    /// Returns the headroom budget `H`.
-    ///
-    /// This is what the deployment set aside for allocations the hard tier
-    /// does not cover. It is not the measured size of those allocations, and
-    /// it is not `A_rust - B`.
     pub const fn headroom_budget_bytes(&self) -> u64 {
         self.config.headroom_budget_bytes
     }
-
-    /// Returns the process bound `P`.
     pub const fn process_bound_bytes(&self) -> u64 {
         self.config.process_bound_bytes
     }
-
-    /// Returns the observation event ring.
-    pub fn events(&self) -> &EventRing {
-        self.shared.events()
-    }
-
-    /// Returns the number of live accounts.
     pub fn live_accounts(&self) -> u32 {
-        self.shared.live_accounts()
+        self.shared
+            .account_list()
+            .iter()
+            .filter(|a| !a.is_retired())
+            .count() as u32
     }
-
-    /// Reads the authority's own facts.
-    ///
-    /// The root's `L`, `F` and `O` are summed over the tree at read time, so
-    /// this describes a short period rather than one instant. It is stamped
-    /// with the configuration version so a consumer can tell a stale reading
-    /// from a configuration change.
-    pub fn snapshot(&self) -> AuthoritySnapshot {
-        AuthoritySnapshot {
-            root: self.root.snapshot(),
-            capacity_bytes: self.config.capacity_bytes,
-            headroom_budget_bytes: self.config.headroom_budget_bytes,
-            process_bound_bytes: self.config.process_bound_bytes,
-            config_version: self.config_version,
-            live_accounts: self.shared.live_accounts(),
-        }
-    }
-
-    /// Derives an account directly under the process root.
     pub fn create_account(
         &self,
-        kind: crate::ids::AccountKind,
+        kind: AccountKind,
         external: ExternalRef,
     ) -> Result<AccountHandle, CapacityError> {
         self.root.create_child(kind, external)
     }
-
-    /// Installs this process's control branch.
-    ///
-    /// Control-plane work — the traffic that carries a cancellation, a status
-    /// or a result header — must not be refused because ordinary query work
-    /// filled the process. Giving it a *separate branch* rather than a
-    /// reservation inside the work branch is what makes that true: the two
-    /// branches share only the root, so a work-side limit cannot reach it and
-    /// exhausting work capacity leaves this branch untouched.
-    ///
-    /// Three further properties follow from the core as it already stands,
-    /// which is why control needs no partition concept of its own:
-    ///
-    /// * *Exempt from cancellation checks*: nothing calls `close_to_growth`
-    ///   on this account, and a refusal only ever consults the account's own
-    ///   closed flag.
-    /// * *Outside per-scope limits*: a per-scope policy is installed on the
-    ///   work branch, and a strict tree gives one account exactly one parent
-    ///   chain — this branch is not on it.
-    /// * *Its own wait timeout*: waiting belongs to the arbitrator, so a
-    ///   timeout is a policy it applies per branch, not a mechanism here.
-    ///
-    /// Installing it twice is refused rather than silently ignored: a second
-    /// call means two owners each believe they sized the control partition.
-    pub fn install_control_branch(
-        &self,
-        limit_bytes: u64,
-    ) -> Result<&AccountHandle, CapacityError> {
+    /// Precommit the floor before admitting work. Duplicate or late assembly
+    /// is an error; a policy number alone never backs control traffic.
+    pub fn install_control_branch(&self, bytes: u64) -> Result<&AccountHandle, CapacityError> {
+        let _assembly = self.shared.assembly.lock().unwrap();
+        if self.control.get().is_some() || self.live_accounts() != 1 {
+            return Err(CapacityError::Invalid {
+                detail: "control floor must be installed exactly once before work",
+            });
+        }
         let branch = self
             .root
-            .create_child(AccountKind::Service, ExternalRef::NONE)?;
-        branch.install_policy(limit_bytes, LimitDimension::Service);
+            .create_child_unlocked(AccountKind::Service, ExternalRef::NONE)?;
+        branch.prefund(bytes)?;
+        branch.install_policy(bytes, LimitDimension::Service);
+        {
+            let _gate = self.root.0.gate.write().unwrap();
+            branch.0.ledger.lock().unwrap().floor = bytes;
+            branch.0.control.store(1, Ordering::Release);
+            self.root.0.ledger.lock().unwrap().floor = bytes;
+        }
         self.control
             .set(branch)
-            .map_err(|_| CapacityError::Unsupported {
-                detail: "the process control branch is already installed",
+            .map_err(|_| CapacityError::Invalid {
+                detail: "control floor already installed",
             })?;
-        Ok(self
-            .control
-            .get()
-            .expect("the control branch was just installed"))
+        Ok(self.control.get().unwrap())
     }
-
-    /// Returns this process's control branch, if one was installed.
     pub fn control_branch(&self) -> Option<&AccountHandle> {
         self.control.get()
+    }
+    pub fn take_capacity_writer(&self) -> Result<CapacityWriter, CapacityError> {
+        let mut taken = self.shared.writer_taken.lock().unwrap();
+        if *taken {
+            return Err(CapacityError::Invalid {
+                detail: "capacity writer already issued",
+            });
+        }
+        *taken = true;
+        Ok(CapacityWriter {
+            root: self.root.clone(),
+        })
+    }
+    pub fn snapshot(&self) -> AuthoritySnapshot {
+        // The root gate pairs target/revision with the root commitment read.
+        let root = self.root.snapshot();
+        let live_accounts = root.live_accounts;
+        AuthoritySnapshot {
+            root,
+            capacity_bytes: root.capacity_target,
+            headroom_budget_bytes: self.config.headroom_budget_bytes,
+            process_bound_bytes: self.config.process_bound_bytes,
+            config_version: ConfigVersion::new(root.capacity_revision),
+            live_accounts,
+        }
+    }
+}
+#[derive(Debug)]
+pub struct CapacityWriter {
+    root: AccountHandle,
+}
+impl CapacityWriter {
+    pub fn set_capacity(&mut self, target: u64) -> Result<u64, CapacityError> {
+        let shared = &self.root.0.shared;
+        if target > shared.ceiling {
+            return Err(CapacityError::Invalid {
+                detail: "capacity target exceeds configured ceiling",
+            });
+        }
+        let _gate = self.root.0.gate.write().unwrap();
+        if shared.target.load(Ordering::Acquire) == target {
+            return Ok(shared.capacity_revision.load(Ordering::Acquire));
+        }
+        let previous = shared.target.load(Ordering::Acquire);
+        shared.target.store(target, Ordering::Release);
+        let revision = shared.capacity_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        drop(_gate);
+        if target < previous {
+            crate::maintenance::request(
+                &self.root.0.shared,
+                crate::maintenance::MaintenanceReason::CapacityReduced,
+            );
+        }
+        Ok(revision)
+    }
+}
+
+impl Shared {
+    pub(crate) fn next_identity(&self) -> Result<u64, CapacityError> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| CapacityError::Invalid {
+                detail: "memory identity space exhausted",
+            })
+    }
+    pub(crate) fn account_list(&self) -> Vec<AccountHandle> {
+        let mut list = Vec::with_capacity(self.max_accounts as usize);
+        let registry = self.accounts.lock().unwrap();
+        list.extend(
+            registry
+                .records
+                .iter()
+                .filter_map(|a| a.as_ref().and_then(|a| a.upgrade()).map(AccountHandle)),
+        );
+        list
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AccountRegistry {
+    pub records: Vec<Option<Weak<Account>>>,
+    pub free_slots: Vec<usize>,
+    pub upper: usize,
+}
+
+impl Drop for MemoryAuthority {
+    fn drop(&mut self) {
+        // Close first so external lane handles cannot activate or refill while
+        // their empty registry publication is detached. This produces no
+        // teardown receipt and does not revoke an active scope's real facts.
+        self.root.close_to_growth();
+        self.detach_empty_records();
+    }
+}
+impl MemoryAuthority {
+    fn detach_empty_records(&self) {
+        let upper = self.shared.domains.lock().unwrap().upper;
+        for index in 0..upper {
+            let record = self.shared.domains.lock().unwrap().records[index].clone();
+            let Some(record) = record else { continue };
+            let state = record.state.lock().unwrap();
+            if state.active || state.external_handles != 0 || !record.owner.reclaimable() {
+                continue;
+            }
+            let detached = {
+                let mut registry = self.shared.domains.lock().unwrap();
+                if !registry.records[index]
+                    .as_ref()
+                    .is_some_and(|published| Arc::ptr_eq(published, &record))
+                {
+                    continue;
+                }
+                let detached = registry.records[index].take();
+                registry.free_slots.push(index);
+                registry.metadata -= record.metadata;
+                if !state.residual {
+                    registry.active -= 1;
+                }
+                detached
+            };
+            // Destruction may release an affiliation and acquire ancestor
+            // gates. Drop outside both the lane and publication locks. An
+            // external lane handle still owns its sealed storage, if present.
+            drop(state);
+            drop(detached);
+            drop(record);
+        }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod lifetime_tests {
+    use super::*;
+
+    fn authority() -> MemoryAuthority {
+        let mut config = AuthorityConfig::new(16_384, 16_384, 0);
+        config.max_accounts = 3;
+        config.max_active_owners = 2;
+        config.metadata_budget_bytes =
+            2 * (crate::domain::OWNER_METADATA_BYTES + 2 * std::mem::size_of::<usize>() as u64);
+        MemoryAuthority::new(config).unwrap()
+    }
+
+    #[test]
+    fn shutdown_preserves_external_publication_rights_including_zero_bytes() {
+        for bytes in [0, 64] {
+            let authority = authority();
+            let domain = authority.root().create_domain(bytes).unwrap();
+            let mut bound = domain.external_bound(bytes).unwrap();
+            let record = Arc::downgrade(&domain.0);
+            drop(domain);
+            authority.root.close_to_growth();
+            authority.detach_empty_records();
+            let origin = bound.convert_to_live(bytes).unwrap();
+            drop(bound);
+            authority.detach_empty_records();
+            assert!(record.upgrade().is_some());
+            // SAFETY: this exact converted allocation is outstanding and its
+            // storage has been released; the authority remains alive.
+            unsafe { origin.record_deallocation(bytes) };
+            authority.detach_empty_records();
+            assert!(record.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn exhausted_identity_source_refuses_without_wrapping_or_charging_storage() {
+        let a = authority();
+        a.shared.next_id.store(u64::MAX, Ordering::Relaxed);
+        let before = a.root().committed_bytes();
+        assert!(matches!(
+            a.create_account(AccountKind::Work, ExternalRef::NONE),
+            Err(CapacityError::Invalid { .. })
+        ));
+        assert!(matches!(
+            a.root().create_domain(1),
+            Err(CapacityError::Invalid { .. })
+        ));
+        assert_eq!(a.shared.next_id.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(a.root().committed_bytes(), before);
+    }
+    #[test]
+    fn dropping_authority_detaches_unused_child_lane_cycles() {
+        let authority = authority();
+        let shared = Arc::downgrade(&authority.shared);
+        let root = Arc::downgrade(&authority.root.0);
+        let account = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let weak_account = Arc::downgrade(&account.0);
+        let domain = account.create_domain(1).unwrap();
+        drop(domain);
+        drop(account);
+        drop(authority);
+
+        assert!(weak_account.upgrade().is_none());
+        assert!(root.upgrade().is_none());
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_authority_detaches_unused_root_lane_cycles() {
+        let authority = authority();
+        let shared = Arc::downgrade(&authority.shared);
+        let root = Arc::downgrade(&authority.root.0);
+        let domain = authority.root().create_domain(1).unwrap();
+        drop(domain);
+        drop(authority);
+
+        assert!(root.upgrade().is_none());
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn externally_held_lane_is_sealed_and_releases_storage_after_shutdown() {
+        let authority = authority();
+        let shared = Arc::downgrade(&authority.shared);
+        let account = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let domain = account.create_domain(1).unwrap();
+        drop(authority);
+
+        assert!(domain.snapshot().sealed);
+        assert!(domain.activate(0, 0).is_err());
+        assert!(domain.refill(1).is_err());
+        assert!(account.prefund(1).is_err());
+        assert!(shared.upgrade().is_some());
+        drop(domain);
+        drop(account);
+        assert!(shared.upgrade().is_none());
     }
 }

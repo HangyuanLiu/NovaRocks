@@ -15,21 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exposure pins retain stable metadata; they never charge payload again.
-use crate::domain::FundingDomain;
-#[derive(Debug, Clone)]
-pub struct HolderPin {
-    domain: FundingDomain,
-}
-impl FundingDomain {
-    pub fn pin(&self) -> HolderPin {
-        HolderPin {
-            domain: self.clone(),
-        }
-    }
-}
-impl HolderPin {
-    pub fn sampled_live_bytes(&self) -> u64 {
-        self.domain.0.owner.live()
-    }
+mod common;
+use common::*;
+#[test]
+fn hierarchy_snapshot_decomposes_each_byte_once() {
+    let a = authority(32_768);
+    let q = work(&a);
+    q.prefund(8_192).unwrap();
+    let d = q.create_domain(2_048).unwrap();
+    let mut l = d.activate(2_048, 0).unwrap();
+    let p = l.record_allocation(1_024);
+    l.finish();
+    assert!(q.snapshot().is_internally_consistent());
+    assert!(a.snapshot().root.is_internally_consistent());
+    free(p, 1_024);
 }

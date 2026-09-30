@@ -334,8 +334,8 @@ fn compose_memory_authority(config: &NovaRocksConfig) -> anyhow::Result<Arc<Memo
     let authority = MemoryAuthority::new(authority_config)
         .map_err(|error| anyhow::anyhow!("compose process memory authority: {error}"))?;
     // Control-plane traffic gets its own branch off the root before any work
-    // account exists, so a process that later fills its work capacity still
-    // has somewhere to allocate a cancellation or a status.
+    // account exists. Installation precommits its protected floor, so ordinary
+    // work cannot consume cancellation/status backing, even after shrink.
     let control_bytes = config.runtime.frontend_workload.control_bytes;
     authority
         .install_control_branch(control_bytes)
@@ -461,10 +461,17 @@ mod tests {
             authority.control_branch().is_some(),
             "control must have its own partition before any work account exists"
         );
+        let (snapshot, pressure) = authority.accounting_snapshot();
+        let control = authority.control_branch().unwrap();
+        assert!(pressure.classification_complete);
+        assert!(pressure.storage_metadata > 0);
+        assert_eq!(snapshot.root.live_bytes, pressure.storage_metadata);
+        assert_eq!(snapshot.root.floor_bytes, control.committed_bytes());
+        assert_eq!(snapshot.root.granted_bytes, snapshot.root.floor_bytes);
         assert_eq!(
-            authority.snapshot().root.live_bytes,
-            0,
-            "a freshly composed authority has charged nothing"
+            snapshot.root.committed_bytes,
+            pressure.storage_metadata + snapshot.root.floor_bytes,
+            "assembly must charge real core storage and prepay the protected floor"
         );
     }
 

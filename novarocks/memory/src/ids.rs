@@ -24,32 +24,6 @@
 //! transport vocabulary.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Generates process-unique identity values for one authority.
-///
-/// Identities are unique within a process, monotonically increasing, and never
-/// reused. They are bookkeeping handles, not capabilities: holding an id grants
-/// nothing, which is why they can appear freely in snapshots and logs.
-#[derive(Debug, Default)]
-pub struct IdSource {
-    next: AtomicU64,
-}
-
-impl IdSource {
-    /// Creates a source whose first issued value is 1.
-    pub const fn new() -> Self {
-        Self {
-            next: AtomicU64::new(1),
-        }
-    }
-
-    /// Issues the next raw identity value.
-    pub fn next_raw(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed)
-    }
-}
-
 macro_rules! neutral_id {
     ($(#[$meta:meta])* $name:ident, $label:literal) => {
         $(#[$meta])*
@@ -57,7 +31,7 @@ macro_rules! neutral_id {
         pub struct $name(u64);
 
         impl $name {
-            /// Wraps a raw value, normally one issued by [`IdSource`].
+            /// Wraps a raw value, issued by its process authority.
             pub const fn new(raw: u64) -> Self {
                 Self(raw)
             }
@@ -81,37 +55,6 @@ neutral_id!(
     AccountId,
     "account"
 );
-neutral_id!(
-    /// Identifies one issued capacity grant.
-    GrantId,
-    "grant"
-);
-neutral_id!(
-    /// Identifies one retention lease held by a scope.
-    HolderId,
-    "holder"
-);
-neutral_id!(
-    /// Identifies one pin taken on a resident resource.
-    PinId,
-    "pin"
-);
-neutral_id!(
-    /// Identifies one registered reclaimer.
-    ReclaimerId,
-    "reclaimer"
-);
-neutral_id!(
-    /// Identifies one reclaim request.
-    ReclaimTicketId,
-    "reclaim-ticket"
-);
-neutral_id!(
-    /// Identifies one capacity wait ticket owned by an arbitrator.
-    WaitTicketId,
-    "wait-ticket"
-);
-
 /// Version of the policy constraints installed on an account.
 ///
 /// A snapshot reports the version its numbers were produced under, so a
@@ -285,20 +228,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id_source_issues_unique_increasing_values() {
-        let source = IdSource::new();
-        let first = source.next_raw();
-        let second = source.next_raw();
-        assert_eq!(first, 1);
-        assert_eq!(second, 2);
-        assert_ne!(AccountId::new(first), AccountId::new(second));
-    }
-
-    #[test]
     fn identities_display_with_their_own_label() {
         assert_eq!(AccountId::new(7).to_string(), "account#7");
-        assert_eq!(GrantId::new(7).to_string(), "grant#7");
-        assert_eq!(WaitTicketId::new(1).to_string(), "wait-ticket#1");
         assert_eq!(PolicyVersion::new(3).to_string(), "policy-v3");
         assert_eq!(ConfigVersion::new(3).to_string(), "config-v3");
     }

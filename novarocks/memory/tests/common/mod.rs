@@ -15,21 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exposure pins retain stable metadata; they never charge payload again.
-use crate::domain::FundingDomain;
-#[derive(Debug, Clone)]
-pub struct HolderPin {
-    domain: FundingDomain,
+#![allow(dead_code)]
+use novarocks_memory::*;
+pub fn authority(bytes: u64) -> MemoryAuthority {
+    let mut config = AuthorityConfig::new(bytes * 2, bytes, bytes);
+    config.max_accounts = 32;
+    config.metadata_budget_bytes = 16 * 1024;
+    config.max_active_owners = 4;
+    config.top_up = TopUpPolicy::uniform(1024);
+    MemoryAuthority::new(config).unwrap()
 }
-impl FundingDomain {
-    pub fn pin(&self) -> HolderPin {
-        HolderPin {
-            domain: self.clone(),
-        }
+pub fn work(a: &MemoryAuthority) -> AccountHandle {
+    a.create_account(AccountKind::Work, ExternalRef::NONE)
+        .unwrap()
+}
+pub fn exited() -> TeardownEvidence<'static> {
+    TeardownEvidence {
+        tasks_exited: true,
+        operators_destroyed: true,
+        io: &[],
+        now_ns: 1,
     }
 }
-impl HolderPin {
-    pub fn sampled_live_bytes(&self) -> u64 {
-        self.domain.0.owner.live()
-    }
+pub fn free(origin: AllocationOrigin, bytes: u64) {
+    unsafe { origin.record_deallocation(bytes) }
 }

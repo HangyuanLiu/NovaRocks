@@ -15,21 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exposure pins retain stable metadata; they never charge payload again.
-use crate::domain::FundingDomain;
-#[derive(Debug, Clone)]
-pub struct HolderPin {
-    domain: FundingDomain,
-}
-impl FundingDomain {
-    pub fn pin(&self) -> HolderPin {
-        HolderPin {
-            domain: self.clone(),
-        }
-    }
-}
-impl HolderPin {
-    pub fn sampled_live_bytes(&self) -> u64 {
-        self.domain.0.owner.live()
-    }
+mod common;
+use common::*;
+#[test]
+fn stock_miss_is_covered_by_the_same_workset_and_signal_stays_sticky() {
+    let a = authority(32_768);
+    let q = work(&a);
+    let d = q.create_domain(4_096).unwrap();
+    let before = a.root().interactions();
+    let mut l = d.activate(1_024, 100).unwrap();
+    let o = l.record_allocation(1_536);
+    assert!(l.threshold_triggered());
+    free(o, 1_536);
+    assert!(l.threshold_triggered());
+    let r = l.finish();
+    assert_eq!(r.debt, 0);
+    assert!(r.next_step.is_ok());
+    assert_eq!(a.root().interactions(), before);
 }
