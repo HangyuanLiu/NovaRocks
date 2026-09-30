@@ -44,6 +44,7 @@ mod scalar_kernel;
 mod specialization;
 mod table_call;
 mod window_call;
+mod window_kernel;
 
 pub use aggregate_call::*;
 pub use aggregate_erasure::*;
@@ -63,6 +64,7 @@ pub use scalar_kernel::*;
 pub use specialization::FunctionSpecializationFailure;
 pub use table_call::*;
 pub use window_call::*;
+pub use window_kernel::*;
 
 const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v5\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
