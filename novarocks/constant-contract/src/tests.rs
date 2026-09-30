@@ -715,3 +715,337 @@ fn union_tag_lookup_observes_each_candidate_across_repeated_reads() {
     ));
     assert_eq!(*control.units.lock().unwrap(), vec![0, 256]);
 }
+
+fn payload(value: &ConstantValue) -> u64 {
+    value
+        .selected_payload_bytes_observed(CompilePhase::Validate, &Control::good())
+        .unwrap()
+}
+
+#[test]
+fn unsigned_accessors_preserve_exact_carriers_and_real_null() {
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(arrow_array::UInt8Array::from(vec![Some(u8::MAX), None])),
+        Arc::new(arrow_array::UInt16Array::from(vec![Some(u16::MAX), None])),
+        Arc::new(arrow_array::UInt32Array::from(vec![Some(u32::MAX), None])),
+        Arc::new(arrow_array::UInt64Array::from(vec![Some(u64::MAX), None])),
+    ];
+    for (array, maximum) in
+        arrays
+            .into_iter()
+            .zip([u8::MAX as u64, u16::MAX as u64, u32::MAX as u64, u64::MAX])
+    {
+        let p = pool(array, true);
+        assert_eq!(p.value(0).unwrap().try_u64().unwrap(), Some(maximum));
+        assert_eq!(p.value(1).unwrap().try_u64().unwrap(), None);
+        assert!(p.value(0).unwrap().try_i64().is_err());
+    }
+    for array in [
+        Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        Arc::new(arrow_array::TimestampNanosecondArray::from(vec![1])) as ArrayRef,
+        Arc::new(arrow_array::NullArray::new(1)) as ArrayRef,
+    ] {
+        assert!(pool(array, true).value(0).unwrap().try_u64().is_err());
+    }
+}
+
+#[test]
+fn selected_payload_excludes_pool_rows_padding_and_headers() {
+    let huge = "x".repeat(100_000);
+    let p = pool(
+        Arc::new(StringArray::from(vec![
+            Some("é"),
+            Some(huge.as_str()),
+            None,
+        ])),
+        true,
+    );
+    assert_eq!(payload(&p.value(0).unwrap()), 2);
+    assert_eq!(payload(&p.value(1).unwrap()), 100_000);
+    assert_eq!(payload(&p.value(2).unwrap()), 0);
+    assert!(p.resource_facts().retained_buffer_capacity_bytes > 100_002);
+    assert!(Arc::ptr_eq(
+        &p.value(0).unwrap().pool.0,
+        &p.value(1).unwrap().pool.0
+    ));
+    let boolean = pool(
+        Arc::new(arrow_array::BooleanArray::from(vec![Some(true), None])),
+        true,
+    );
+    assert_eq!(payload(&boolean.value(0).unwrap()), 1);
+    assert_eq!(payload(&boolean.value(1).unwrap()), 0);
+    assert_eq!(
+        payload(
+            &pool(
+                Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])),
+                false
+            )
+            .value(0)
+            .unwrap()
+        ),
+        8
+    );
+    let decimal = pool(
+        Arc::new(
+            arrow_array::Decimal256Array::from(vec![arrow_buffer::i256::from_i128(1)])
+                .with_precision_and_scale(60, 0)
+                .unwrap(),
+        ),
+        false,
+    );
+    assert_eq!(payload(&decimal.value(0).unwrap()), 32);
+}
+
+#[test]
+fn selected_payload_decodes_dictionary_and_run_end_values() {
+    let huge = "z".repeat(50_000);
+    let values = Arc::new(StringArray::from(vec![
+        Some("q"),
+        Some(huge.as_str()),
+        None,
+    ])) as ArrayRef;
+    let dictionary = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(0), Some(1), Some(2), None]),
+        values.clone(),
+    )
+    .unwrap();
+    let p = pool(Arc::new(dictionary), true);
+    assert_eq!(payload(&p.value(0).unwrap()), 1);
+    assert_eq!(payload(&p.value(1).unwrap()), 50_000);
+    assert_eq!(payload(&p.value(2).unwrap()), 0);
+    assert_eq!(payload(&p.value(3).unwrap()), 0);
+    assert!(p.value(0).unwrap().try_u64().is_err());
+
+    let dtype = DataType::RunEndEncoded(
+        Arc::new(Field::new("ends", DataType::Int16, false)),
+        Arc::new(Field::new("values", DataType::Utf8, true)),
+    );
+    let data = ArrayData::builder(dtype.clone())
+        .len(10_000)
+        .child_data(vec![
+            arrow_array::Int16Array::from(vec![1, 2, 10_000]).to_data(),
+            values.to_data(),
+        ])
+        .build()
+        .unwrap();
+    let p = ConstantPool::try_new(
+        Arc::new(Field::new("literal", dtype.clone(), true)),
+        FunctionValueType::new(dtype, true),
+        data,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    assert_eq!(payload(&p.value(0).unwrap()), 1);
+    assert_eq!(payload(&p.value(1).unwrap()), 50_000);
+    assert_eq!(payload(&p.value(2).unwrap()), 0);
+    assert_eq!(payload(&p.value(9_999).unwrap()), 0);
+}
+
+#[test]
+fn selected_payload_counts_nested_selected_children_and_parent_null_masks() {
+    let list =
+        arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Int64Type, _, _>(vec![
+            Some(vec![Some(1), None, Some(3)]),
+        ]);
+    let columns: Vec<(Arc<Field>, ArrayRef)> = vec![
+        (
+            Arc::new(Field::new("flag", DataType::Boolean, false)),
+            Arc::new(arrow_array::BooleanArray::from(vec![true])),
+        ),
+        (
+            Arc::new(Field::new("text", DataType::Utf8, false)),
+            Arc::new(StringArray::from(vec!["é"])),
+        ),
+        (
+            Arc::new(Field::new("items", list.data_type().clone(), false)),
+            Arc::new(list),
+        ),
+    ];
+    let p = pool(Arc::new(arrow_array::StructArray::from(columns)), false);
+    assert_eq!(payload(&p.value(0).unwrap()), 19);
+    let data = p
+        .array()
+        .to_data()
+        .into_builder()
+        .nulls(Some(arrow_buffer::NullBuffer::new_null(1)))
+        .build()
+        .unwrap();
+    let nullable = ConstantPool::try_new(
+        Arc::new(Field::new("literal", data.data_type().clone(), true)),
+        FunctionValueType::new(data.data_type().clone(), true),
+        data,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    assert_eq!(payload(&nullable.value(0).unwrap()), 0);
+
+    let fields: arrow_schema::UnionFields = vec![
+        (0, Arc::new(Field::new("selected", DataType::Utf8, true))),
+        (1, Arc::new(Field::new("unused", DataType::Utf8, true))),
+    ]
+    .into_iter()
+    .collect();
+    let dtype = DataType::Union(fields, UnionMode::Dense);
+    let data = ArrayData::builder(dtype.clone())
+        .len(2)
+        .buffers(vec![
+            arrow_buffer::Buffer::from_slice_ref([0i8, 0]),
+            arrow_buffer::Buffer::from_slice_ref([0i32, 1]),
+        ])
+        .child_data(vec![
+            StringArray::from(vec![Some("one"), None]).to_data(),
+            StringArray::from(vec!["x".repeat(50_000)]).to_data(),
+        ])
+        .build()
+        .unwrap();
+    let p = ConstantPool::try_new(
+        Arc::new(Field::new("literal", dtype.clone(), true)),
+        FunctionValueType::new(dtype, true),
+        data,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    assert_eq!(payload(&p.value(0).unwrap()), 3);
+    assert_eq!(payload(&p.value(1).unwrap()), 0);
+}
+
+#[test]
+fn selected_map_payload_counts_entry_values_without_offset_storage() {
+    let fields: arrow_schema::Fields = vec![
+        Arc::new(Field::new("key", DataType::Utf8, false)),
+        Arc::new(Field::new("value", DataType::Utf8, true)),
+    ]
+    .into();
+    let entries_type = DataType::Struct(fields);
+    let entries = ArrayData::builder(entries_type.clone())
+        .len(2)
+        .child_data(vec![
+            StringArray::from(vec!["a", "bb"]).to_data(),
+            StringArray::from(vec![Some("é"), None]).to_data(),
+        ])
+        .build()
+        .unwrap();
+    let dtype = DataType::Map(Arc::new(Field::new("entries", entries_type, false)), false);
+    let data = ArrayData::builder(dtype.clone())
+        .len(1)
+        .buffers(vec![arrow_buffer::Buffer::from_slice_ref([0i32, 2])])
+        .child_data(vec![entries])
+        .build()
+        .unwrap();
+    let p = ConstantPool::try_new(
+        Arc::new(Field::new("literal", dtype.clone(), false)),
+        FunctionValueType::new(dtype, false),
+        data,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    assert_eq!(payload(&p.value(0).unwrap()), 5);
+}
+
+#[test]
+fn selected_payload_controls_are_typed_at_entry_and_actual_256_work() {
+    let list =
+        arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Int64Type, _, _>(vec![
+            Some(vec![Some(1); 512]),
+        ]);
+    let p = pool(Arc::new(list), false);
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at_positive in [false, true] {
+            let control = Control {
+                failure: Some(error),
+                at_positive,
+                units: Mutex::new(vec![]),
+            };
+            assert_eq!(
+                p.value(0)
+                    .unwrap()
+                    .selected_payload_bytes_observed(CompilePhase::Validate, &control),
+                Err(ConstantError::Control(error))
+            );
+            assert_eq!(
+                *control.units.lock().unwrap(),
+                if at_positive { vec![0, 256] } else { vec![0] }
+            );
+        }
+    }
+    let dtype = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
+    let data = ArrayData::builder(dtype.clone())
+        .len(1)
+        .buffers(vec![arrow_buffer::Buffer::from_slice_ref([0i32, 500_000])])
+        .child_data(vec![arrow_array::NullArray::new(500_000).to_data()])
+        .build()
+        .unwrap();
+    let p = ConstantPool::try_new(
+        Arc::new(Field::new("literal", dtype.clone(), false)),
+        FunctionValueType::new(dtype, false),
+        data,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    let control = Control::good();
+    assert_eq!(
+        p.value(0)
+            .unwrap()
+            .selected_payload_bytes_observed(CompilePhase::Validate, &control)
+            .unwrap(),
+        0
+    );
+    assert!(control.units.lock().unwrap().len() < 10);
+}
+
+#[test]
+fn raw_decimal_values_exceeding_exact_precision_are_rejected() {
+    let values = vec![
+        (
+            DataType::Decimal32(2, 0),
+            arrow_buffer::Buffer::from_slice_ref([123i32]),
+        ),
+        (
+            DataType::Decimal64(2, 0),
+            arrow_buffer::Buffer::from_slice_ref([123i64]),
+        ),
+        (
+            DataType::Decimal128(2, 0),
+            arrow_buffer::Buffer::from_slice_ref([123i128]),
+        ),
+        (
+            DataType::Decimal256(2, 0),
+            arrow_buffer::Buffer::from_slice_ref([arrow_buffer::i256::from_i128(123)]),
+        ),
+    ];
+    for (dtype, buffer) in values {
+        // Arrow structural validation permits the raw fixed-width carrier;
+        // the constant owner additionally enforces declared decimal precision.
+        let data = ArrayData::builder(dtype.clone())
+            .len(1)
+            .buffers(vec![buffer])
+            .build()
+            .unwrap();
+        data.validate_full().unwrap();
+        assert!(matches!(
+            ConstantPool::try_new(
+                Arc::new(Field::new("literal", dtype.clone(), false)),
+                FunctionValueType::new(dtype, false),
+                data,
+                policy(),
+                CompilePhase::Validate,
+                &Control::good()
+            ),
+            Err(ConstantError::Arrow(_))
+        ));
+    }
+}

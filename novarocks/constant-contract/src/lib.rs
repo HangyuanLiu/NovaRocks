@@ -247,6 +247,26 @@ impl ConstantValue {
         work.finish()?;
         Ok(null)
     }
+    /// Exact payload bytes of this selected SQL value. NULL contributes zero;
+    /// nested values count only their selected child payloads. Pool padding,
+    /// offsets, headers, dictionary codes and unselected rows are excluded.
+    /// This is a semantic size, distinct from retained backing/resource facts.
+    pub fn selected_payload_bytes_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<u64, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let bytes = selected_payload_bytes(
+            Row {
+                data: &self.pool.0.data,
+                index: self.ordinal as usize,
+            },
+            &mut work,
+        )?;
+        work.finish()?;
+        Ok(bytes)
+    }
     /// Factories use the same checked owner. The caller supplies all type/field
     /// facts and policy; no logical label, field name or environment is guessed.
     pub fn from_scalar_array(
@@ -927,6 +947,87 @@ fn validate_values(
     Ok(())
 }
 
+enum PayloadFrame<'a> {
+    Row(Row<'a>),
+    Range(&'a ArrayData, usize, usize),
+    Fields(&'a ArrayData, usize, usize),
+}
+fn selected_payload_bytes(
+    row: Row<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<u64, ConstantError> {
+    let mut total = 0;
+    let mut pending = vec![PayloadFrame::Row(row)];
+    while let Some(frame) = pending.pop() {
+        work.step()?;
+        let row = match frame {
+            PayloadFrame::Row(row) => row,
+            PayloadFrame::Range(data, start, end) => {
+                if start == end || matches!(data.data_type(), DataType::Null) {
+                    continue;
+                }
+                pending.push(PayloadFrame::Range(data, start + 1, end));
+                Row { data, index: start }
+            }
+            PayloadFrame::Fields(data, row, field) => {
+                if field == data.child_data().len() {
+                    continue;
+                }
+                pending.push(PayloadFrame::Fields(data, row, field + 1));
+                Row {
+                    data: &data.child_data()[field],
+                    index: row,
+                }
+            }
+        };
+        let Some(row) = resolve_row(row, work)? else {
+            continue;
+        };
+        if let Some(width) = row.data.data_type().primitive_width() {
+            total = checked_add(total, width as u64)?;
+            continue;
+        }
+        match row.data.data_type() {
+            DataType::Boolean => total = checked_add(total, 1)?,
+            DataType::FixedSizeBinary(width) => {
+                total = checked_add(
+                    total,
+                    u64::try_from(*width)
+                        .map_err(|_| ConstantError::Invalid("negative binary width"))?,
+                )?;
+            }
+            DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Utf8View
+            | DataType::BinaryView => {
+                total = checked_add(total, variable_bytes(row)?.len() as u64)?
+            }
+            DataType::Struct(_) => pending.push(PayloadFrame::Fields(row.data, row.index, 0)),
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _) => {
+                let (start, end) = list_range(row)?;
+                pending.push(PayloadFrame::Range(&row.data.child_data()[0], start, end));
+            }
+            DataType::Union(_, _) => {
+                let (_, child, _) = union_row(row.data, row.index, work)?;
+                pending.push(PayloadFrame::Row(child));
+            }
+            _ => {
+                return Err(ConstantError::Invalid(
+                    "unsupported selected constant payload carrier",
+                ));
+            }
+        }
+    }
+    Ok(total)
+}
+
 enum EqualFrame<'a> {
     Row(Row<'a>, Row<'a>),
     Range(&'a ArrayData, usize, &'a ArrayData, usize, usize),
@@ -1176,6 +1277,33 @@ impl ConstantValue {
             DataType::Int64 => signed!(arrow_array::Int64Array),
             _ => Err(ConstantError::Invalid(
                 "constant is not a signed integer carrier",
+            )),
+        }
+    }
+    /// Lossless borrowed extraction from unsigned integer carriers only.
+    /// None means an actual SQL NULL; signed/temporal/encoded carriers are
+    /// explicit type errors, never implicit conversions or nonconstants.
+    pub fn try_u64(&self) -> Result<Option<u64>, ConstantError> {
+        let array = self.pool.array();
+        let row = self.ordinal as usize;
+        macro_rules! unsigned {
+            ($t:ty) => {{
+                let array = array
+                    .as_any()
+                    .downcast_ref::<$t>()
+                    .ok_or(ConstantError::Invalid(
+                        "unsigned integer array differs from carrier",
+                    ))?;
+                Ok(array.is_valid(row).then(|| array.value(row) as u64))
+            }};
+        }
+        match array.data_type() {
+            DataType::UInt8 => unsigned!(arrow_array::UInt8Array),
+            DataType::UInt16 => unsigned!(arrow_array::UInt16Array),
+            DataType::UInt32 => unsigned!(arrow_array::UInt32Array),
+            DataType::UInt64 => unsigned!(arrow_array::UInt64Array),
+            _ => Err(ConstantError::Invalid(
+                "constant is not an unsigned integer carrier",
             )),
         }
     }
