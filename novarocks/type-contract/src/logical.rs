@@ -123,17 +123,36 @@ pub fn validate_nested_logical_types(root: &DataType) -> Result<(), ValueTypeErr
 /// Same bounded structural validation with a caller-owned work/control
 /// observer. Every type node and child edge is observed without a shadow
 /// validator or recursive type copy.
-pub fn validate_nested_logical_types_observed<'a, E>(
-    root: &'a DataType,
+pub fn validate_nested_logical_types_observed<E>(
+    root: &DataType,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E>
 where
     E: From<ValueTypeError>,
 {
+    validate_value_type_structure_observed(root, |visit| match visit {
+        ValueTypeVisit::Field(_) => Ok(()),
+        _ => observe(),
+    })
+}
+
+/// One walk exposes exact borrowed attributes to the caller's carrier-resource
+/// checks; logical validation and node/depth bounds remain defined here.
+#[derive(Clone, Copy, Debug)]
+pub enum ValueTypeVisit<'a> {
+    TypeNode(&'a DataType),
+    ChildEdge(&'a DataType),
+    Field(&'a Field),
+}
+
+pub fn validate_value_type_structure_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    mut observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
     let mut pending = vec![(root, 1usize)];
     let mut visited = 0usize;
     while let Some((ty, depth)) = pending.pop() {
-        observe()?;
+        observe(ValueTypeVisit::TypeNode(ty))?;
         visited += 1;
         if depth > MAX_VALUE_TYPE_DEPTH {
             return Err(ValueTypeError::TooDeep.into());
@@ -141,8 +160,12 @@ where
         if visited > MAX_VALUE_TYPE_NODES {
             return Err(ValueTypeError::TooManyNodes.into());
         }
-        let mut push = |child: &'a DataType| -> Result<(), E> {
-            observe()?;
+        let mut push = |child: &'a DataType, field: Option<&'a Field>| -> Result<(), E> {
+            if let Some(field) = field {
+                observe(ValueTypeVisit::Field(field))?;
+                field_logical_type(field)?;
+            }
+            observe(ValueTypeVisit::ChildEdge(child))?;
             if visited + pending.len() >= MAX_VALUE_TYPE_NODES {
                 return Err(ValueTypeError::TooManyNodes.into());
             }
@@ -156,30 +179,25 @@ where
             | DataType::LargeListView(field)
             | DataType::FixedSizeList(field, _)
             | DataType::Map(field, _) => {
-                field_logical_type(field)?;
-                push(field.data_type())?;
+                push(field.data_type(), Some(field))?;
             }
             DataType::Struct(fields) => {
                 for field in fields {
-                    field_logical_type(field)?;
-                    push(field.data_type())?;
+                    push(field.data_type(), Some(field))?;
                 }
             }
             DataType::Union(fields, _) => {
                 for (_, field) in fields.iter() {
-                    field_logical_type(field)?;
-                    push(field.data_type())?;
+                    push(field.data_type(), Some(field))?;
                 }
             }
             DataType::Dictionary(key, value) => {
-                push(key)?;
-                push(value)?;
+                push(key, None)?;
+                push(value, None)?;
             }
             DataType::RunEndEncoded(ends, values) => {
-                field_logical_type(ends)?;
-                field_logical_type(values)?;
-                push(ends.data_type())?;
-                push(values.data_type())?;
+                push(ends.data_type(), Some(ends))?;
+                push(values.data_type(), Some(values))?;
             }
             _ => {}
         }

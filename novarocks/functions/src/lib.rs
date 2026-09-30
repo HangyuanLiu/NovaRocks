@@ -29,15 +29,22 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
+mod aggregate_call;
 mod binding;
+mod call_contract;
 mod effect_refinement;
 mod evaluation;
+mod kernel_control;
+mod kernel_input;
 mod lambda_rows;
 mod scalar_kernel;
 
+pub use aggregate_call::*;
 pub use binding::*;
+pub use call_contract::*;
 pub use effect_refinement::*;
 pub use evaluation::*;
+pub use kernel_control::*;
 pub use lambda_rows::*;
 pub use novarocks_type_contract::{
     AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,

@@ -85,6 +85,30 @@ impl<'a> Selection<'a> {
     pub fn iter(self) -> impl ExactSizeIterator<Item = usize> + 'a {
         (0..self.len()).map(move |ordinal| self.row(ordinal).expect("ordinal is in selection"))
     }
+    /// Shared backing compares in O(1); distinct sparse backing observes each row.
+    pub fn same_rows_observed<E>(
+        self,
+        other: Selection<'_>,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if self.batch_rows != other.batch_rows || self.len() != other.len() {
+            return Ok(false);
+        }
+        match (self.rows, other.rows) {
+            (None, None) => Ok(true),
+            (Some(left), Some(right)) if std::ptr::eq(left, right) => Ok(true),
+            (Some(left), Some(right)) => {
+                for (left, right) in left.iter().zip(right) {
+                    observe()?;
+                    if left != right {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 /// Broadcasting is explicit. A one-row column is not silently converted to
@@ -119,24 +143,39 @@ impl<'a> EvaluatedArgument<'a> {
         selection: Selection<'_>,
         exact_type: &DataType,
     ) -> Result<(), EvaluationContractError> {
+        self.validate_shape(selection)?;
+        if !novarocks_type_contract::arrow_data_types_exact(self.array().data_type(), exact_type) {
+            return Err(EvaluationContractError::ArgumentType);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_shape(
+        self,
+        selection: Selection<'_>,
+    ) -> Result<(), EvaluationContractError> {
+        self.validate_shape_observed(selection, || Ok(()))
+    }
+    pub(crate) fn validate_shape_observed<E: From<EvaluationContractError>>(
+        self,
+        selection: Selection<'_>,
+        observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
         let expected_rows = match self {
             Self::Scalar(_) => 1,
             Self::Column(_) => selection.batch_rows(),
             Self::SelectedColumn(output) => {
-                if output.selection != selection {
-                    return Err(EvaluationContractError::ArgumentSelection);
+                if !output.selection.same_rows_observed(selection, observe)? {
+                    return Err(EvaluationContractError::ArgumentSelection.into());
                 }
                 if !output.errors.is_empty() {
-                    return Err(EvaluationContractError::ArgumentRowErrors);
+                    return Err(EvaluationContractError::ArgumentRowErrors.into());
                 }
                 selection.len()
             }
         };
         if self.array().len() != expected_rows {
-            return Err(EvaluationContractError::ArgumentLength);
-        }
-        if !novarocks_type_contract::arrow_data_types_exact(self.array().data_type(), exact_type) {
-            return Err(EvaluationContractError::ArgumentType);
+            return Err(EvaluationContractError::ArgumentLength.into());
         }
         Ok(())
     }

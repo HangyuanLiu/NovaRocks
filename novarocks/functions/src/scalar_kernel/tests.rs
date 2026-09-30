@@ -16,10 +16,13 @@
 // under the License.
 
 use super::*;
-use crate::{FunctionOverloadId, RowDataError};
+use crate::{FunctionOverloadId, KernelDiagnostic, RowDataError};
+use arrow_array::types::{Int8Type, Int16Type};
+use arrow_array::{Array, DictionaryArray, RunArray};
 use arrow_array::{
     ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, NullArray, StringArray,
 };
+use arrow_schema::DataType;
 use novarocks_type_contract::{
     CallProofScope, EvaluationDemand, EvaluationDomainId, ExpressionUseId, FunctionFailureBehavior,
     FunctionInstanceState, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
@@ -28,34 +31,76 @@ use std::sync::{
     Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 fn contract(
     control: ArgumentControl,
     row_error: FunctionIntrinsicRowError,
     nullable: bool,
 ) -> Arc<ScalarCallContract> {
-    Arc::new(ScalarCallContract {
-        function_id: FunctionId::try_new("fixture/selected-state").unwrap(),
-        context: ExpressionEffectContext {
-            use_id: ExpressionUseId::new(7),
-            domain: EvaluationDomainId::new(9),
-            demand: EvaluationDemand::Value,
-        },
-        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        selected: Arc::new(FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new("fixture/i64").unwrap(),
-            argument_types: vec![FunctionArgumentType::Value(FunctionValueType::new(
-                DataType::Int64,
-                true,
-            ))]
-            .into_boxed_slice(),
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                DataType::Int64,
-                nullable,
-            )),
-            aggregate: None,
-        }),
-        effects: CallEffects {
+    contract_with_argument_nullability(control, row_error, nullable, true)
+}
+fn contract_with_argument_nullability(
+    control: ArgumentControl,
+    row_error: FunctionIntrinsicRowError,
+    nullable: bool,
+    argument_nullable: bool,
+) -> Arc<ScalarCallContract> {
+    use crate::{FunctionArgument, FunctionBindingRequest, FunctionEffectOwnerError};
+    use novarocks_type_contract::FunctionEffectDeclaration;
+    struct FixtureOwner {
+        selected: Arc<FunctionBindingSelection>,
+        base: FunctionEffectDeclaration,
+    }
+    impl FunctionEffectOwner for FixtureOwner {
+        type Error = FunctionBindingError;
+        fn declaration(
+            &self,
+            _: &FunctionId,
+            _: &FunctionBindingSelection,
+        ) -> Result<&FunctionEffectDeclaration, Self::Error> {
+            Ok(&self.base)
+        }
+        fn validate_and_refine(
+            &self,
+            input: CallEffectInput<'_>,
+            _: &dyn PureCompileControl,
+        ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+            assert!(std::ptr::eq(input.selected, self.selected.as_ref()));
+            assert_eq!(
+                input.request.arguments[0].argument_type(),
+                self.selected.argument_types[0]
+            );
+            Ok(CallEffects {
+                value_stability: self.base.value_stability,
+                own_row_error: self.base.own_row_error,
+                failure_behavior: self.base.failure_behavior,
+                null_behavior: self.base.null_behavior,
+                argument_control: self.base.argument_control,
+                instance_state: self.base.instance_state,
+                observable_effects: self.base.observable_effects,
+                environment: Box::default(),
+                proof_scope: input.proof_scope,
+            })
+        }
+    }
+    struct CompileControl;
+    impl PureCompileControl for CompileControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let function_id = FunctionId::try_new("fixture/selected-state").unwrap();
+    let argument_type = FunctionValueType::new(DataType::Int64, argument_nullable);
+    let selected = Arc::new(FunctionBindingSelection {
+        overload: FunctionOverloadId::try_new("fixture/i64").unwrap(),
+        argument_types: vec![FunctionArgumentType::Value(argument_type.clone())].into_boxed_slice(),
+        result_type: FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, nullable)),
+        aggregate: None,
+    });
+    let owner = FixtureOwner {
+        selected: selected.clone(),
+        base: FunctionEffectDeclaration {
             value_stability: if control == ArgumentControl::TypeOnly {
                 FunctionVolatility::Immutable
             } else {
@@ -75,11 +120,43 @@ fn contract(
                 warnings: false,
                 controlled_wait: false,
             },
-            environment: Box::default(),
-            proof_scope: CallProofScope::Unconditional,
+            environment_dependencies: Box::default(),
         },
-        parameters: SemanticParameters::try_new([]).unwrap(),
-    })
+    };
+    let args = [FunctionArgument::Value {
+        value_type: argument_type,
+        constant: None,
+    }];
+    let uses = [if control == ArgumentControl::TypeOnly {
+        None
+    } else {
+        Some(ExpressionUseId::new(10))
+    }];
+    let parameters = SemanticParameters::default();
+    let input = CallEffectInput {
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(7),
+            domain: EvaluationDomainId::new(9),
+            demand: EvaluationDemand::Value,
+        },
+        argument_uses: &uses,
+        function_id: &function_id,
+        kind: FunctionKind::Scalar,
+        selected: selected.as_ref(),
+        request: FunctionBindingRequest {
+            arguments: &args,
+            logical_argument_count: 1,
+        },
+        environment: &[],
+        parameters: &parameters,
+        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        proof_scope: CallProofScope::Unconditional,
+    };
+    let receipt = crate::refine_call_effects(&owner, input, &CompileControl).unwrap();
+    Arc::new(
+        ScalarCallContract::from_refined(input, &receipt, selected.clone(), &CompileControl)
+            .unwrap(),
+    )
 }
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -111,7 +188,7 @@ impl PreparedScalarKernel for Prepared {
     fn instance_retained_upper_bound(&self) -> usize {
         std::mem::size_of::<Instance>()
     }
-    fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, ScalarKernelFailure> {
+    fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
         Ok(Box::new(Instance {
             calls: self.calls.clone(),
             next: 0,
@@ -124,8 +201,8 @@ impl ScalarKernelInstance for Instance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
-        _: &dyn ScalarEvaluationControl,
-    ) -> Result<SelectedValues<'a>, ScalarKernelFailure> {
+        _: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if input.contract().effects().argument_control != ArgumentControl::TypeOnly {
             self.next += 1;
@@ -134,7 +211,7 @@ impl ScalarKernelInstance for Instance {
             self.extra_bytes = 1;
         }
         if matches!(self.mode, Mode::OuterFailure | Mode::GrowAndFail) {
-            return Err(ScalarKernelFailure::Operational(KernelDiagnostic::new(
+            return Err(KernelFailure::Operational(KernelDiagnostic::new(
                 "fixture exit",
             )));
         }
@@ -169,16 +246,16 @@ struct Control {
     work: Mutex<Vec<u32>>,
     fail_positive: bool,
 }
-impl ScalarEvaluationControl for Control {
-    fn checkpoint(&self, units: u32) -> Result<(), ScalarKernelFailure> {
+impl KernelEvaluationControl for Control {
+    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
         self.work.lock().unwrap().push(units);
         if self.fail_positive && units > 0 {
-            Err(ScalarKernelFailure::Cancelled)
+            Err(KernelFailure::Cancelled)
         } else {
             Ok(())
         }
     }
-    fn wait(&self, _: Duration) -> Result<(), ScalarKernelFailure> {
+    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
         Err(internal("fixture must never wait"))
     }
 }
@@ -296,7 +373,7 @@ fn outer_failures_and_owner_contract_violations_latch_without_replaying_effects(
             instance
                 .evaluate(selected, &arguments, &Control::default())
                 .unwrap_err(),
-            ScalarKernelFailure::InstanceFailed
+            KernelFailure::InstanceFailed
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
@@ -342,7 +419,7 @@ fn invalid_child_errors_and_interruption_never_reach_the_instance() {
     let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
     assert!(matches!(
         instance.evaluate(selection, &arguments, &Control::default()),
-        Err(ScalarKernelFailure::InvalidProgram(_))
+        Err(KernelFailure::InvalidProgram(_))
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     let (prepared, calls) = preparation(
@@ -363,12 +440,12 @@ fn invalid_child_errors_and_interruption_never_reach_the_instance() {
                 fail_positive: true
             }
         ),
-        Err(ScalarKernelFailure::Cancelled)
+        Err(KernelFailure::Cancelled)
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     assert!(matches!(
         instance.evaluate(selection, &arguments, &Control::default()),
-        Err(ScalarKernelFailure::InstanceFailed)
+        Err(KernelFailure::InstanceFailed)
     ));
 }
 
@@ -418,16 +495,12 @@ fn kernel_diagnostics_are_bounded_and_work_observation_is_not_zero_only() {
 
 #[test]
 fn nonnullable_arguments_check_only_selected_logical_values() {
-    let mut frozen = contract(
+    let frozen = contract_with_argument_nullability(
         ArgumentControl::Eager,
         FunctionIntrinsicRowError::NoRowError,
         false,
+        false,
     );
-    let signature = Arc::make_mut(&mut Arc::make_mut(&mut frozen).selected);
-    let FunctionArgumentType::Value(argument) = &mut signature.argument_types[0] else {
-        unreachable!()
-    };
-    argument.nullable = false;
     let calls = Arc::new(AtomicUsize::new(0));
     let prepared: Arc<dyn PreparedScalarKernel> = Arc::new(Prepared {
         contract: frozen,
@@ -454,7 +527,7 @@ fn nonnullable_arguments_check_only_selected_logical_values() {
             &arguments,
             &Control::default()
         ),
-        Err(ScalarKernelFailure::InvalidProgram(_))
+        Err(KernelFailure::InvalidProgram(_))
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(
@@ -531,7 +604,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             _: CallEffectInput<'_>,
             contract: Arc<ScalarCallContract>,
             _: &dyn PureCompileControl,
-        ) -> Result<Arc<dyn PreparedScalarKernel>, ScalarKernelFailure> {
+        ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
             let contract = if self.wrong_contract {
                 Arc::new((*contract).clone())
             } else {
@@ -590,18 +663,26 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             wrong_contract,
             validations: AtomicUsize::new(0),
         };
-        let prepared = specialize_scalar(&owner, input, frozen.selected.clone(), &CompileControl);
+        let prepared = specialize_scalar(
+            &owner,
+            input,
+            frozen.call().selected_owner().clone(),
+            &CompileControl,
+        );
         assert_eq!(owner.validations.load(Ordering::Relaxed), 1);
         if wrong_contract {
             assert!(matches!(
                 prepared,
                 Err(ScalarSpecializationFailure::Kernel(
-                    ScalarKernelFailure::Internal(_)
+                    KernelFailure::Internal(_)
                 ))
             ));
         } else {
             let prepared = prepared.unwrap();
-            assert!(Arc::ptr_eq(&prepared.contract().selected, &frozen.selected));
+            assert!(Arc::ptr_eq(
+                prepared.contract().call().selected_owner(),
+                frozen.call().selected_owner()
+            ));
             assert_eq!(prepared.contract().context(), frozen.context());
             assert_eq!(
                 prepared.contract().decimal_overflow_policy(),
@@ -625,9 +706,9 @@ fn unrepresentable_lifetime_bound_fails_before_state_creation() {
         fn instance_retained_upper_bound(&self) -> usize {
             usize::MAX
         }
-        fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, ScalarKernelFailure> {
+        fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
             self.creations.fetch_add(1, Ordering::Relaxed);
-            Err(ScalarKernelFailure::Cancelled)
+            Err(KernelFailure::Cancelled)
         }
     }
     let creations = Arc::new(AtomicUsize::new(0));
@@ -641,7 +722,7 @@ fn unrepresentable_lifetime_bound_fails_before_state_creation() {
     });
     assert!(matches!(
         ScalarEvaluationInstance::instantiate(prepared),
-        Err(ScalarKernelFailure::ResourceExhausted)
+        Err(KernelFailure::ResourceExhausted)
     ));
     assert_eq!(creations.load(Ordering::Relaxed), 0);
 }

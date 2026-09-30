@@ -56,8 +56,9 @@ pub use function::{
 pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use logical::{
     MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
-    ValueTypeError, field_logical_type, preserves_nested_logical_identity,
+    ValueTypeError, ValueTypeVisit, field_logical_type, preserves_nested_logical_identity,
     validate_nested_logical_types, validate_nested_logical_types_observed,
+    validate_value_type_structure_observed,
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
@@ -67,7 +68,7 @@ pub use schema::{
     MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
     MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
     MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, arrow_data_types_exact,
-    arrow_fields_exact, arrow_schemas_exact,
+    arrow_data_types_exact_observed, arrow_fields_exact, arrow_schemas_exact,
 };
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,

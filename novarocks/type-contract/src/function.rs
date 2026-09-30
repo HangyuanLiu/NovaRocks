@@ -127,6 +127,27 @@ impl FunctionValueType {
             && expected.validate().is_ok()
     }
 
+    pub fn same_value_domain_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        self.logical_type.validate_carrier(&self.data_type)?;
+        other.logical_type.validate_carrier(&other.data_type)?;
+        if self.logical_type != other.logical_type {
+            return Ok(false);
+        }
+        Ok(
+            fits_nested_nullability_observed(&self.data_type, &other.data_type, &mut observe)?
+                && fits_nested_nullability_observed(
+                    &other.data_type,
+                    &self.data_type,
+                    &mut observe,
+                )?,
+        )
+    }
+
     pub fn same_value_domain(&self, other: &Self) -> bool {
         self.logical_type == other.logical_type
             && fits_nested_nullability(&self.data_type, &other.data_type)
@@ -262,60 +283,96 @@ fn validate_identity(kind: &'static str, value: &str) -> Result<(), FunctionIden
 /// same direction nullability travels everywhere else. A field that may be
 /// null standing where a non-null one is asked for is the mismatch.
 pub fn fits_nested_nullability(actual: &DataType, expected: &DataType) -> bool {
-    if crate::validate_nested_logical_types(actual).is_err()
-        || crate::validate_nested_logical_types(expected).is_err()
-    {
-        return false;
+    fits_nested_nullability_observed::<crate::ValueTypeError>(actual, expected, || Ok(()))
+        .unwrap_or(false)
+}
+
+/// Preserve the same value-domain/nullability rule while observing recursive
+/// schemas and pair comparisons. Nonlogical field annotations do not change
+/// this semantic domain; exact physical-carrier comparison remains separate.
+pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
+    actual: &DataType,
+    expected: &DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    crate::validate_nested_logical_types_observed(actual, &mut observe)?;
+    crate::validate_nested_logical_types_observed(expected, &mut observe)?;
+    #[allow(deprecated)]
+    fn field_fits<E>(
+        actual: &Field,
+        expected: &Field,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        if actual.name() != expected.name()
+            || (!expected.is_nullable() && actual.is_nullable())
+            || actual.dict_id() != expected.dict_id()
+            || actual.dict_is_ordered() != expected.dict_is_ordered()
+            || crate::field_logical_type(actual) != crate::field_logical_type(expected)
+        {
+            return Ok(false);
+        }
+        fits(actual.data_type(), expected.data_type(), observe)
     }
-    #[allow(deprecated)] // Dictionary identity remains part of this frozen Arrow contract.
-    fn field_fits(actual: &Field, expected: &Field) -> bool {
-        actual.name() == expected.name()
-            && (expected.is_nullable() || !actual.is_nullable())
-            && actual.dict_id() == expected.dict_id()
-            && actual.dict_is_ordered() == expected.dict_is_ordered()
-            && crate::field_logical_type(actual) == crate::field_logical_type(expected)
-            && fits(actual.data_type(), expected.data_type())
-    }
-    fn fits(actual: &DataType, expected: &DataType) -> bool {
+    fn fits<E>(
+        actual: &DataType,
+        expected: &DataType,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
         match (actual, expected) {
             (DataType::List(actual), DataType::List(expected))
             | (DataType::LargeList(actual), DataType::LargeList(expected))
             | (DataType::ListView(actual), DataType::ListView(expected))
             | (DataType::LargeListView(actual), DataType::LargeListView(expected)) => {
-                field_fits(actual, expected)
+                field_fits(actual, expected, observe)
             }
-            (
-                DataType::FixedSizeList(actual, actual_len),
-                DataType::FixedSizeList(expected, expected_len),
-            ) => actual_len == expected_len && field_fits(actual, expected),
+            (DataType::FixedSizeList(actual, al), DataType::FixedSizeList(expected, el)) => {
+                if al != el {
+                    Ok(false)
+                } else {
+                    field_fits(actual, expected, observe)
+                }
+            }
             (DataType::Struct(actual), DataType::Struct(expected)) => {
-                actual.len() == expected.len()
-                    && actual
-                        .iter()
-                        .zip(expected.iter())
-                        .all(|(a, e)| field_fits(a, e))
+                if actual.len() != expected.len() {
+                    return Ok(false);
+                }
+                for (actual, expected) in actual.iter().zip(expected) {
+                    if !field_fits(actual, expected, observe)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
-            (DataType::Map(actual, actual_sorted), DataType::Map(expected, expected_sorted)) => {
-                actual_sorted == expected_sorted && field_fits(actual, expected)
+            (DataType::Map(actual, asorted), DataType::Map(expected, esorted)) => {
+                if asorted != esorted {
+                    Ok(false)
+                } else {
+                    field_fits(actual, expected, observe)
+                }
             }
-            (DataType::Union(actual, actual_mode), DataType::Union(expected, expected_mode)) => {
-                actual_mode == expected_mode
-                    && actual.len() == expected.len()
-                    && actual
-                        .iter()
-                        .zip(expected.iter())
-                        .all(|((ai, af), (ei, ef))| ai == ei && field_fits(af, ef))
+            (DataType::Union(actual, amode), DataType::Union(expected, emode)) => {
+                if amode != emode || actual.len() != expected.len() {
+                    return Ok(false);
+                }
+                for ((ai, actual), (ei, expected)) in actual.iter().zip(expected.iter()) {
+                    if ai != ei || !field_fits(actual, expected, observe)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             (DataType::Dictionary(ak, av), DataType::Dictionary(ek, ev)) => {
-                fits(ak, ek) && fits(av, ev)
+                Ok(fits(ak, ek, observe)? && fits(av, ev, observe)?)
             }
             (DataType::RunEndEncoded(ar, av), DataType::RunEndEncoded(er, ev)) => {
-                field_fits(ar, er) && field_fits(av, ev)
+                Ok(field_fits(ar, er, observe)? && field_fits(av, ev, observe)?)
             }
-            (actual, expected) => actual == expected,
+            (actual, expected) => Ok(actual == expected),
         }
     }
-    fits(actual, expected)
+    fits(actual, expected, &mut observe)
 }
 
 #[cfg(test)]

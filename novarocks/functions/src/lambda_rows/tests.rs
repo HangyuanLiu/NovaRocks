@@ -20,12 +20,12 @@ use std::{sync::Mutex, time::Duration};
 
 #[derive(Default)]
 struct Control {
-    fail: Option<ScalarKernelFailure>,
+    fail: Option<KernelFailure>,
     positive_only: bool,
     work: Mutex<Vec<u32>>,
 }
-impl ScalarEvaluationControl for Control {
-    fn checkpoint(&self, work: u32) -> Result<(), ScalarKernelFailure> {
+impl KernelEvaluationControl for Control {
+    fn checkpoint(&self, work: u32) -> Result<(), KernelFailure> {
         self.work.lock().unwrap().push(work);
         if (!self.positive_only || work != 0)
             && let Some(failure) = &self.fail
@@ -34,7 +34,7 @@ impl ScalarEvaluationControl for Control {
         }
         Ok(())
     }
-    fn wait(&self, _: Duration) -> Result<(), ScalarKernelFailure> {
+    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
         panic!("row metadata must not wait or invoke a body");
     }
 }
@@ -65,7 +65,7 @@ fn sparse_outer_rows_and_narrowed_elements_keep_original_parent_identity() {
     assert_eq!(map.selected_parent_row(selected, 2).unwrap(), None);
     assert!(matches!(
         map.validate_selection(Selection::all(21)),
-        Err(ScalarKernelFailure::InvalidProgram(_))
+        Err(KernelFailure::InvalidProgram(_))
     ));
 }
 
@@ -82,7 +82,7 @@ fn parent_metadata_is_selection_relative_and_never_repaired_or_reordered() {
     ] {
         assert!(matches!(
             LambdaElementRowMap::try_new(outer, parents, &Control::default()),
-            Err(ScalarKernelFailure::InvalidProgram(_))
+            Err(KernelFailure::InvalidProgram(_))
         ));
     }
     // Original batch row 2 is selected, but the metadata takes ordinal 0.
@@ -106,23 +106,23 @@ fn empty_collections_and_empty_outer_selection_have_no_element_invocations() {
     }
     assert!(matches!(
         LambdaElementRowMap::try_new(Selection::all(0), &[0], &Control::default()),
-        Err(ScalarKernelFailure::InvalidProgram(_))
+        Err(KernelFailure::InvalidProgram(_))
     ));
 }
 
 #[test]
 fn mapping_work_and_outer_failures_are_observed_without_a_row_error_channel() {
-    let parents = vec![0; MAX_UNOBSERVED_SCALAR_WORK as usize * 2 + 1];
+    let parents = vec![0; MAX_UNOBSERVED_KERNEL_WORK as usize * 2 + 1];
     let control = Control::default();
     LambdaElementRowMap::try_new(Selection::all(1), &parents, &control).unwrap();
     assert_eq!(
         *control.work.lock().unwrap(),
-        [0, MAX_UNOBSERVED_SCALAR_WORK, MAX_UNOBSERVED_SCALAR_WORK, 1]
+        [0, MAX_UNOBSERVED_KERNEL_WORK, MAX_UNOBSERVED_KERNEL_WORK, 1]
     );
     for failure in [
-        ScalarKernelFailure::Cancelled,
-        ScalarKernelFailure::DeadlineExceeded,
-        ScalarKernelFailure::ResourceExhausted,
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
     ] {
         for positive_only in [false, true] {
             let control = Control {
@@ -137,7 +137,7 @@ fn mapping_work_and_outer_failures_are_observed_without_a_row_error_channel() {
             assert_eq!(
                 *control.work.lock().unwrap(),
                 if positive_only {
-                    vec![0, MAX_UNOBSERVED_SCALAR_WORK]
+                    vec![0, MAX_UNOBSERVED_KERNEL_WORK]
                 } else {
                     vec![0]
                 }

@@ -106,11 +106,11 @@ fn type_only_preparation_rejects_malformed_or_unbounded_lambda_metadata() {
         let result =
             crate::ScalarCallContract::from_refined(input, &receipt, selected.clone(), &control);
         if resource_failure {
-            assert_eq!(result, Err(crate::ScalarKernelFailure::ResourceExhausted));
+            assert_eq!(result, Err(crate::KernelFailure::ResourceExhausted));
         } else {
             assert!(matches!(
                 result,
-                Err(crate::ScalarKernelFailure::InvalidProgram(_))
+                Err(crate::KernelFailure::InvalidProgram(_))
             ));
         }
     }

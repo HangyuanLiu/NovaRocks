@@ -20,8 +20,7 @@
 //! formal memory scopes. No expression is evaluated while constructing a map.
 
 use crate::{
-    KernelDiagnostic, MAX_UNOBSERVED_SCALAR_WORK, ScalarEvaluationControl, ScalarKernelFailure,
-    Selection,
+    KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK, Selection,
 };
 
 /// Each logical element has one parent ordinal in the outer Selection.
@@ -46,8 +45,8 @@ impl<'a> LambdaElementRowMap<'a> {
     pub fn try_new(
         outer: Selection<'a>,
         parents: &'a [usize],
-        control: &dyn ScalarEvaluationControl,
-    ) -> Result<Self, ScalarKernelFailure> {
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
         control.checkpoint(0)?;
         let mut previous = None;
         let mut work = 0;
@@ -59,7 +58,7 @@ impl<'a> LambdaElementRowMap<'a> {
             }
             previous = Some(parent);
             work += 1;
-            if work == MAX_UNOBSERVED_SCALAR_WORK {
+            if work == MAX_UNOBSERVED_KERNEL_WORK {
                 control.checkpoint(work)?;
                 work = 0;
             }
@@ -94,7 +93,7 @@ impl<'a> LambdaElementRowMap<'a> {
     /// Validate a body's narrowed Selection in the same logical element frame.
     /// A same-sized frame still requires the host's exact invocation ownership;
     /// row counts are not a frame identity or a cache/reuse proof.
-    pub fn validate_selection(self, elements: Selection<'_>) -> Result<(), ScalarKernelFailure> {
+    pub fn validate_selection(self, elements: Selection<'_>) -> Result<(), KernelFailure> {
         if elements.batch_rows() != self.element_rows() {
             return Err(invalid(
                 "lambda body selection uses a different element row domain",
@@ -111,7 +110,7 @@ impl<'a> LambdaElementRowMap<'a> {
         self,
         elements: Selection<'_>,
         selected_ordinal: usize,
-    ) -> Result<Option<usize>, ScalarKernelFailure> {
+    ) -> Result<Option<usize>, KernelFailure> {
         self.validate_selection(elements)?;
         Ok(elements
             .row(selected_ordinal)
@@ -119,8 +118,8 @@ impl<'a> LambdaElementRowMap<'a> {
     }
 }
 
-fn invalid(message: &str) -> ScalarKernelFailure {
-    ScalarKernelFailure::InvalidProgram(KernelDiagnostic::new(message))
+fn invalid(message: &str) -> KernelFailure {
+    KernelFailure::InvalidProgram(KernelDiagnostic::new(message))
 }
 
 #[cfg(test)]

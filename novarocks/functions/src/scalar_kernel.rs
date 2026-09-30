@@ -18,110 +18,35 @@
 //! Pure immutable scalar preparation and instance-owned batch invocation.
 //! An ordinary kernel receives evaluated values, never an expression arena.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc};
 
-use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-};
-use arrow_array::{Array, DictionaryArray, RunArray, UnionArray, new_empty_array};
-use arrow_schema::DataType;
+use arrow_array::new_empty_array;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CompileCheckpoints, CompileControlError, CompilePhase,
-    DecimalOverflowPolicy, ExpressionEffectContext, FunctionIntrinsicRowError, FunctionKind,
-    FunctionValueType, PureCompileControl, SemanticParameters,
+    ArgumentControl, CallEffects, CompileControlError, CompilePhase, DecimalOverflowPolicy,
+    ExpressionEffectContext, FunctionIntrinsicRowError, FunctionKind, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 
 use crate::{
     CallEffectInput, CallEffectRefinementError, EvaluatedArgument, FunctionArgumentType,
     FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionEffectOwner,
-    FunctionId, FunctionResultType, RefinedCallEffects, SelectedValues, Selection,
+    FunctionId, FunctionResultType, KernelEvaluationControl, KernelFailure, RefinedCallEffects,
+    SelectedValues, Selection,
 };
 
-/// Bounded diagnostics on outer failures. Only RowDataError enters the
-/// maskable row channel; this carrier cannot be converted to it implicitly.
+use crate::kernel_control::{internal, invalid};
+use crate::kernel_input::{EvaluationCheckpoints, logical_is_null, validate_argument_observed};
+
+/// Ordinary scalar preparation retains the same checked call authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelDiagnostic(Box<str>);
-impl KernelDiagnostic {
-    pub fn new(message: &str) -> Self {
-        let mut end = message.len().min(crate::MAX_ROW_ERROR_MESSAGE_BYTES);
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        Self(message[..end].into())
-    }
-    pub fn message(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ScalarKernelFailure {
-    Cancelled,
-    DeadlineExceeded,
-    ResourceExhausted,
-    InvalidProgram(KernelDiagnostic),
-    Internal(KernelDiagnostic),
-    Operational(KernelDiagnostic),
-    InstanceFailed,
-}
-impl fmt::Display for ScalarKernelFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InstanceFailed => f.write_str("scalar instance has already failed"),
-            Self::Cancelled => f.write_str("scalar evaluation was cancelled"),
-            Self::DeadlineExceeded => f.write_str("scalar evaluation deadline was exceeded"),
-            Self::ResourceExhausted => f.write_str("scalar evaluation resources were exhausted"),
-            Self::InvalidProgram(message) => {
-                write!(f, "invalid scalar program: {}", message.message())
-            }
-            Self::Internal(message) => write!(f, "scalar internal failure: {}", message.message()),
-            Self::Operational(message) => {
-                write!(f, "scalar operational failure: {}", message.message())
-            }
-        }
-    }
-}
-impl std::error::Error for ScalarKernelFailure {}
-
-pub const MAX_UNOBSERVED_SCALAR_WORK: u32 = 256;
-
-/// Runtime-owned interruption/work control, independent of statement semantic
-/// time. Waiting is the exact sleep implementation's observable operation.
-/// The host installs its formal memory scopes and authorizes known allocation
-/// steps before invocation; this interface does not mint a second budget.
-pub trait ScalarEvaluationControl: Send + Sync {
-    fn checkpoint(&self, work_units: u32) -> Result<(), ScalarKernelFailure>;
-    fn wait(&self, duration: Duration) -> Result<(), ScalarKernelFailure>;
-}
-
-/// One locally verified call's immutable public facts. Constants needed by a
-/// specialization live in its prepared implementation, not in a live service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScalarCallContract {
-    function_id: FunctionId,
-    context: ExpressionEffectContext,
-    decimal_overflow_policy: DecimalOverflowPolicy,
-    selected: Arc<FunctionBindingSelection>,
-    effects: CallEffects,
-    parameters: SemanticParameters,
-}
+pub struct ScalarCallContract(crate::FunctionCallContract);
 impl ScalarCallContract {
     pub fn from_refined(
         input: CallEffectInput<'_>,
         receipt: &RefinedCallEffects<'_>,
         selected: Arc<FunctionBindingSelection>,
         control: &dyn PureCompileControl,
-    ) -> Result<Self, ScalarKernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        receipt
-            .validate_input(input)
-            .map_err(|_| invalid("call refinement receipt differs from exact input"))?;
-        if !std::ptr::eq(input.selected, selected.as_ref()) {
-            return Err(invalid(
-                "scalar signature owner differs from the exact input borrow",
-            ));
-        }
+    ) -> Result<Self, KernelFailure> {
         if input.kind != FunctionKind::Scalar || input.selected.aggregate.is_some() {
             return Err(invalid(
                 "ordinary scalar preparation requires a scalar binding",
@@ -135,68 +60,31 @@ impl ScalarCallContract {
                 "guarded, higher-order and relational calls require their own control ABI",
             ));
         }
-        let FunctionResultType::Scalar(result) = &input.selected.result_type else {
-            return Err(invalid("ordinary scalar binding cannot produce a relation"));
-        };
-        validate_type_observed(result, &mut work)?;
-        for argument in &input.selected.argument_types {
-            match argument {
-                FunctionArgumentType::Value(value) => validate_type_observed(value, &mut work)?,
-                FunctionArgumentType::Lambda {
-                    parameter_types,
-                    result_type,
-                } if receipt.facts().argument_control == ArgumentControl::TypeOnly => {
-                    if parameter_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
-                        return Err(ScalarKernelFailure::ResourceExhausted);
-                    }
-                    validate_type_observed(result_type, &mut work)?;
-                    for parameter in parameter_types {
-                        validate_type_observed(parameter, &mut work)?;
-                        work.step().map_err(compile_failure)?;
-                    }
-                }
-                FunctionArgumentType::Lambda { .. } => {
-                    return Err(invalid(
-                        "ordinary scalar binding cannot consume lambda values",
-                    ));
-                }
-            }
-            work.step().map_err(compile_failure)?;
-        }
-        let parameters = input
-            .parameters
-            .project(receipt.facts().environment.iter().copied())
-            .map_err(|_| invalid("scalar environment is not frozen"))?;
-        work.finish().map_err(compile_failure)?;
-        Ok(Self {
-            function_id: input.function_id.clone(),
-            context: input.context,
-            decimal_overflow_policy: input.decimal_overflow_policy,
-            selected,
-            effects: receipt.facts().clone(),
-            parameters,
-        })
+        crate::FunctionCallContract::from_refined(input, receipt, selected, control).map(Self)
+    }
+    pub const fn call(&self) -> &crate::FunctionCallContract {
+        &self.0
     }
     pub const fn function_id(&self) -> &FunctionId {
-        &self.function_id
+        self.0.function_id()
     }
     pub const fn context(&self) -> ExpressionEffectContext {
-        self.context
+        self.0.context()
     }
     pub const fn decimal_overflow_policy(&self) -> DecimalOverflowPolicy {
-        self.decimal_overflow_policy
+        self.0.decimal_overflow_policy()
     }
     pub fn selected(&self) -> &FunctionBindingSelection {
-        &self.selected
+        self.0.selected()
     }
     pub const fn effects(&self) -> &CallEffects {
-        &self.effects
+        self.0.effects()
     }
     pub const fn parameters(&self) -> &SemanticParameters {
-        &self.parameters
+        self.0.parameters()
     }
     pub fn result_type(&self) -> &FunctionValueType {
-        match &self.selected.result_type {
+        match &self.selected().result_type {
             FunctionResultType::Scalar(result) => result,
             FunctionResultType::Relation(_) => {
                 unreachable!("constructor accepts scalar results only")
@@ -204,10 +92,10 @@ impl ScalarCallContract {
         }
     }
     pub fn value_argument_types(&self) -> impl ExactSizeIterator<Item = &FunctionValueType> {
-        let arguments = if self.effects.argument_control == ArgumentControl::TypeOnly {
+        let arguments = if self.effects().argument_control == ArgumentControl::TypeOnly {
             &[][..]
         } else {
-            self.selected.argument_types.as_ref()
+            self.selected().argument_types.as_ref()
         };
         arguments.iter().map(|argument| match argument {
             FunctionArgumentType::Value(value) => value,
@@ -249,7 +137,7 @@ pub trait PreparedScalarKernel: Send + Sync + fmt::Debug {
     /// authorizes construction and remaining mutation headroom before any
     /// allocation; post-call checking cannot recover an exceeded hard limit.
     fn instance_retained_upper_bound(&self) -> usize;
-    fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, ScalarKernelFailure>;
+    fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure>;
 }
 
 /// One exact immutable owner supplies binding validation, effect refinement
@@ -263,7 +151,7 @@ pub trait PureScalarImplementation:
         input: CallEffectInput<'_>,
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, ScalarKernelFailure>;
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure>;
 }
 
 #[derive(Debug)]
@@ -271,7 +159,7 @@ pub enum ScalarSpecializationFailure {
     Binding(FunctionBindingError),
     Effects(novarocks_type_contract::EffectContractError),
     Control(CompileControlError),
-    Kernel(ScalarKernelFailure),
+    Kernel(KernelFailure),
     InvalidInput(&'static str),
 }
 impl fmt::Display for ScalarSpecializationFailure {
@@ -336,8 +224,8 @@ pub trait ScalarKernelInstance: Send {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
-        control: &dyn ScalarEvaluationControl,
-    ) -> Result<SelectedValues<'a>, ScalarKernelFailure>;
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, KernelFailure>;
     /// O(1), exact known retained bytes for host reconciliation. The host
     /// supplies headroom for a bounded mutation before calling evaluate.
     fn retained_bytes(&self) -> usize;
@@ -355,15 +243,13 @@ pub struct ScalarEvaluationInstance {
     failed: bool,
 }
 impl ScalarEvaluationInstance {
-    pub fn instantiate(
-        prepared: Arc<dyn PreparedScalarKernel>,
-    ) -> Result<Self, ScalarKernelFailure> {
+    pub fn instantiate(prepared: Arc<dyn PreparedScalarKernel>) -> Result<Self, KernelFailure> {
         let contract = Arc::clone(prepared.contract());
         let retained_upper_bound = prepared.instance_retained_upper_bound();
         // Reject an unrepresentable lifetime charge before creating state.
         std::mem::size_of::<Self>()
             .checked_add(retained_upper_bound)
-            .ok_or(ScalarKernelFailure::ResourceExhausted)?;
+            .ok_or(KernelFailure::ResourceExhausted)?;
         let instance = prepared.create_instance()?;
         if instance.retained_bytes() > retained_upper_bound {
             return Err(internal(
@@ -381,7 +267,7 @@ impl ScalarEvaluationInstance {
     pub fn contract(&self) -> &ScalarCallContract {
         &self.contract
     }
-    pub fn retained_bytes(&self) -> Result<usize, ScalarKernelFailure> {
+    pub fn retained_bytes(&self) -> Result<usize, KernelFailure> {
         let bytes = self.instance.retained_bytes();
         if bytes > self.retained_upper_bound {
             return Err(internal(
@@ -400,10 +286,10 @@ impl ScalarEvaluationInstance {
         &mut self,
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
-        control: &dyn ScalarEvaluationControl,
-    ) -> Result<SelectedValues<'a>, ScalarKernelFailure> {
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
         if self.failed {
-            return Err(ScalarKernelFailure::InstanceFailed);
+            return Err(KernelFailure::InstanceFailed);
         }
         let result = self.evaluate_once(selection, arguments, control);
         if result.is_err() {
@@ -415,8 +301,8 @@ impl ScalarEvaluationInstance {
         &mut self,
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
-        control: &dyn ScalarEvaluationControl,
-    ) -> Result<SelectedValues<'a>, ScalarKernelFailure> {
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
         control.checkpoint(0)?;
         let contract = &self.contract;
         let expected = contract.value_argument_types();
@@ -425,28 +311,9 @@ impl ScalarEvaluationInstance {
                 "evaluated scalar arguments differ from the exact call shape",
             ));
         }
-        let mut work = EvaluationCheckpoints::new(control);
         for (argument, ty) in arguments.iter().zip(expected) {
-            argument.validate(selection, &ty.data_type).map_err(|_| {
-                invalid("evaluated scalar argument violates its exact selected carrier")
-            })?;
-            work.step()?;
-            if !ty.nullable {
-                for (ordinal, row) in selection.iter().enumerate() {
-                    if logical_is_null(
-                        argument.array().as_ref(),
-                        argument.value_row(ordinal, row),
-                        1,
-                        &mut work,
-                    )? {
-                        return Err(invalid(
-                            "non-null scalar argument contains a selected SQL NULL",
-                        ));
-                    }
-                }
-            }
+            validate_argument_observed(*argument, selection, ty, control)?;
         }
-        work.finish()?;
         if selection.is_empty() {
             return SelectedValues::try_new(
                 selection,
@@ -477,16 +344,21 @@ impl ScalarEvaluationInstance {
                 "never-failing scalar implementation returned a row data error",
             ));
         }
-        if output.selection() != selection
-            || !novarocks_type_contract::arrow_data_types_exact(
+        let mut work = EvaluationCheckpoints::new(control);
+        if !output
+            .selection()
+            .same_rows_observed(selection, || work.step())?
+            || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
                 output.values().data_type(),
                 &contract.result_type().data_type,
-            )
+                || work.step(),
+            )?
         {
             return Err(internal(
                 "scalar implementation returned an unrelated selection or type",
             ));
         }
+        work.finish()?;
         if !contract.result_type().nullable {
             let mut work = EvaluationCheckpoints::new(control);
             let mut errors = output.errors().iter().peekable();
@@ -508,156 +380,6 @@ impl ScalarEvaluationInstance {
         control.checkpoint(0)?;
         Ok(output)
     }
-}
-fn invalid(message: &str) -> ScalarKernelFailure {
-    ScalarKernelFailure::InvalidProgram(KernelDiagnostic::new(message))
-}
-fn internal(message: &str) -> ScalarKernelFailure {
-    ScalarKernelFailure::Internal(KernelDiagnostic::new(message))
-}
-
-fn compile_failure(error: CompileControlError) -> ScalarKernelFailure {
-    match error {
-        CompileControlError::Cancelled => ScalarKernelFailure::Cancelled,
-        CompileControlError::DeadlineExceeded => ScalarKernelFailure::DeadlineExceeded,
-        CompileControlError::ResourceExhausted => ScalarKernelFailure::ResourceExhausted,
-    }
-}
-fn type_failure(error: novarocks_type_contract::ValueTypeError) -> ScalarKernelFailure {
-    match error {
-        novarocks_type_contract::ValueTypeError::TooDeep
-        | novarocks_type_contract::ValueTypeError::TooManyNodes => {
-            ScalarKernelFailure::ResourceExhausted
-        }
-        _ => invalid("scalar binding has invalid exact logical type"),
-    }
-}
-struct EvaluationCheckpoints<'a> {
-    control: &'a dyn ScalarEvaluationControl,
-    pending: u32,
-}
-impl<'a> EvaluationCheckpoints<'a> {
-    fn new(control: &'a dyn ScalarEvaluationControl) -> Self {
-        Self {
-            control,
-            pending: 0,
-        }
-    }
-    fn step(&mut self) -> Result<(), ScalarKernelFailure> {
-        self.pending += 1;
-        if self.pending == MAX_UNOBSERVED_SCALAR_WORK {
-            self.control.checkpoint(self.pending)?;
-            self.pending = 0;
-        }
-        Ok(())
-    }
-    fn finish(self) -> Result<(), ScalarKernelFailure> {
-        self.control.checkpoint(self.pending)
-    }
-}
-
-/// Logical NULL checks never materialize Arrow's dictionary/union/run-end
-/// logical-null bitmap. Every visited row/type node has bounded work control.
-fn logical_is_null(
-    array: &dyn Array,
-    row: usize,
-    depth: usize,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<bool, ScalarKernelFailure> {
-    work.step()?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH || row >= array.len() {
-        return Err(internal("scalar result has invalid nested row addressing"));
-    }
-    if array.is_null(row) {
-        return Ok(true);
-    }
-    match array.data_type() {
-        DataType::Null => Ok(true),
-        DataType::Dictionary(key, _) => {
-            macro_rules! dictionary {
-                ($key:ty) => {{
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<DictionaryArray<$key>>()
-                        .ok_or_else(|| {
-                            internal("scalar dictionary carrier differs from its type")
-                        })?;
-                    match array.key(row) {
-                        Some(key) => logical_is_null(array.values().as_ref(), key, depth + 1, work),
-                        None => Ok(true),
-                    }
-                }};
-            }
-            match key.as_ref() {
-                DataType::Int8 => dictionary!(Int8Type),
-                DataType::Int16 => dictionary!(Int16Type),
-                DataType::Int32 => dictionary!(Int32Type),
-                DataType::Int64 => dictionary!(Int64Type),
-                DataType::UInt8 => dictionary!(UInt8Type),
-                DataType::UInt16 => dictionary!(UInt16Type),
-                DataType::UInt32 => dictionary!(UInt32Type),
-                DataType::UInt64 => dictionary!(UInt64Type),
-                _ => Err(internal("scalar dictionary key type is invalid")),
-            }
-        }
-        DataType::RunEndEncoded(run_ends, _) => {
-            macro_rules! run {
-                ($key:ty) => {{
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<RunArray<$key>>()
-                        .ok_or_else(|| internal("scalar run-end carrier differs from its type"))?;
-                    logical_is_null(
-                        array.values().as_ref(),
-                        array.get_physical_index(row),
-                        depth + 1,
-                        work,
-                    )
-                }};
-            }
-            match run_ends.data_type() {
-                DataType::Int16 => run!(Int16Type),
-                DataType::Int32 => run!(Int32Type),
-                DataType::Int64 => run!(Int64Type),
-                _ => Err(internal("scalar run-end index type is invalid")),
-            }
-        }
-        DataType::Union(fields, _) => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UnionArray>()
-                .ok_or_else(|| internal("scalar union carrier differs from its type"))?;
-            let type_id = array.type_id(row);
-            if !fields.iter().any(|(id, _)| id == type_id) {
-                return Err(internal("scalar union type id is invalid"));
-            }
-            logical_is_null(
-                array.child(type_id).as_ref(),
-                array.value_offset(row),
-                depth + 1,
-                work,
-            )
-        }
-        _ => Ok(false),
-    }
-}
-
-impl From<novarocks_type_contract::ValueTypeError> for ScalarKernelFailure {
-    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
-        type_failure(error)
-    }
-}
-fn validate_type_observed(
-    value: &FunctionValueType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ScalarKernelFailure> {
-    value
-        .logical_type
-        .validate_carrier(&value.data_type)
-        .map_err(type_failure)?;
-    novarocks_type_contract::validate_nested_logical_types_observed(&value.data_type, || {
-        work.step().map_err(compile_failure)
-    })
 }
 
 #[cfg(test)]
