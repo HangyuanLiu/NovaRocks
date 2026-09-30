@@ -538,8 +538,7 @@ impl ProgramNodeKind {
             | Self::UnionAll { .. }
             | Self::Limit { .. }
             | Self::TableFunction { .. }
-            | Self::SetOp { .. }
-            | Self::TableFinish { .. } => Vec::new(),
+            | Self::SetOp { .. } => Vec::new(),
             Self::Project { exprs, .. } => exprs.clone(),
             Self::Unpivot { value_mappings, .. } => value_mappings
                 .iter()
@@ -616,6 +615,18 @@ impl ProgramNodeKind {
                 bindings.iter().map(|binding| binding.expr_id).collect()
             }
             Self::TableWriter { .. } => Vec::new(),
+            Self::TableFinish {
+                final_aggregates, ..
+            } => final_aggregates
+                .unpivot
+                .iter()
+                .flat_map(|unpivot| &unpivot.mappings)
+                .flat_map(|mapping| &mapping.constants)
+                .filter_map(|value| match value {
+                    UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
+                    _ => None,
+                })
+                .collect(),
             Self::ChangeEventExpand { events, .. } => events
                 .iter()
                 .flat_map(|event| {
@@ -1284,6 +1295,99 @@ mod tests {
             layout.identity().unwrap(),
             KernelAbiVersion::CURRENT,
         )
+    }
+
+    #[test]
+    fn table_finish_checks_scalar_constants_in_every_grouped_unpivot_mapping() {
+        let make_program = |last_constant: UnpivotConstant| {
+            let (values, layout) = values();
+            let expressions = Arc::new(
+                ImmutableExpressions::try_new(
+                    vec![StaticExprNode::new(
+                        StaticExprKind::Literal(crate::StaticLiteral::Int64(7)),
+                        DataType::Int64,
+                        None,
+                    )],
+                    false,
+                    HashMap::new(),
+                    None,
+                )
+                .unwrap(),
+            );
+            let unpivot = WriterGroupedUnpivotPlan {
+                grouping_input_slot_id: SlotId::new(1),
+                grouping_output_slot_id: SlotId::new(2),
+                passthrough_output_slot_id: SlotId::new(3),
+                value_output_slot_id: SlotId::new(4),
+                literal_output_slot_ids: vec![SlotId::new(5)],
+                mappings: vec![
+                    WriterGroupedUnpivotMapping {
+                        grouping_key: 0,
+                        input_value_slot_id: SlotId::new(1),
+                        constants: vec![UnpivotConstant::Int32List(vec![2])],
+                    },
+                    WriterGroupedUnpivotMapping {
+                        grouping_key: 1,
+                        input_value_slot_id: SlotId::new(1),
+                        constants: vec![UnpivotConstant::Scalar {
+                            expr_id: ProgramExprId::new(0),
+                            nullable: false,
+                        }],
+                    },
+                    WriterGroupedUnpivotMapping {
+                        grouping_key: 2,
+                        input_value_slot_id: SlotId::new(1),
+                        constants: vec![last_constant],
+                    },
+                ],
+                max_output_rows: 16,
+                max_output_bytes: 1024,
+            };
+            LocalProgram::try_new(
+                vec![
+                    ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
+                    ProgramNode::new(
+                        2,
+                        ProgramNodeKind::TableFinish {
+                            inputs: vec![ProgramNodeId::new(0)],
+                            expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
+                            writer_multiplex_layout: layout.clone(),
+                            root_result_layout: layout.clone(),
+                            final_aggregates: WriterFinalAggregatePlan {
+                                calls: vec![],
+                                unpivot: Some(unpivot),
+                            },
+                        },
+                        layout.clone(),
+                    ),
+                ],
+                ProgramNodeId::new(1),
+                expressions,
+                profile(&layout),
+                BindingRequirements::try_new(vec![BindingRequirement::TableFinish {
+                    node: ProgramNodeId::new(1),
+                    layout,
+                }])
+                .unwrap(),
+            )
+        };
+        assert!(
+            make_program(UnpivotConstant::Scalar {
+                expr_id: ProgramExprId::new(0),
+                nullable: false,
+            })
+            .is_ok()
+        );
+        assert!(make_program(UnpivotConstant::Utf8Map(vec![])).is_ok());
+        for index in [1, usize::MAX] {
+            assert!(matches!(
+                make_program(UnpivotConstant::Scalar {
+                    expr_id: ProgramExprId::new(index),
+                    nullable: false,
+                }),
+                Err(LocalProgramError::InvalidExpression)
+            ));
+        }
     }
 
     #[test]
