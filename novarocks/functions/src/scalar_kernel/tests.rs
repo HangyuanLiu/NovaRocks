@@ -435,7 +435,10 @@ fn nonnullable_arguments_check_only_selected_logical_values() {
         mode: Mode::Good,
     });
     let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-    assert_eq!(instance.retained_bytes(), instance.retained_upper_bound());
+    assert_eq!(
+        instance.retained_bytes().unwrap(),
+        instance.retained_upper_bound()
+    );
     let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
     let arguments = [EvaluatedArgument::Column(&input)];
     instance
@@ -454,7 +457,10 @@ fn nonnullable_arguments_check_only_selected_logical_values() {
         Err(ScalarKernelFailure::InvalidProgram(_))
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 1);
-    assert_eq!(instance.retained_bytes(), instance.retained_upper_bound());
+    assert_eq!(
+        instance.retained_bytes().unwrap(),
+        instance.retained_upper_bound()
+    );
 }
 
 #[test]
@@ -603,4 +609,39 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             );
         }
     }
+}
+
+#[test]
+fn unrepresentable_lifetime_bound_fails_before_state_creation() {
+    #[derive(Debug)]
+    struct Unrepresentable {
+        contract: Arc<ScalarCallContract>,
+        creations: Arc<AtomicUsize>,
+    }
+    impl PreparedScalarKernel for Unrepresentable {
+        fn contract(&self) -> &Arc<ScalarCallContract> {
+            &self.contract
+        }
+        fn instance_retained_upper_bound(&self) -> usize {
+            usize::MAX
+        }
+        fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, ScalarKernelFailure> {
+            self.creations.fetch_add(1, Ordering::Relaxed);
+            Err(ScalarKernelFailure::Cancelled)
+        }
+    }
+    let creations = Arc::new(AtomicUsize::new(0));
+    let prepared = Arc::new(Unrepresentable {
+        contract: contract(
+            ArgumentControl::Eager,
+            FunctionIntrinsicRowError::NoRowError,
+            true,
+        ),
+        creations: creations.clone(),
+    });
+    assert!(matches!(
+        ScalarEvaluationInstance::instantiate(prepared),
+        Err(ScalarKernelFailure::ResourceExhausted)
+    ));
+    assert_eq!(creations.load(Ordering::Relaxed), 0);
 }

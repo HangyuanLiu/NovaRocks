@@ -345,6 +345,10 @@ impl ScalarEvaluationInstance {
     ) -> Result<Self, ScalarKernelFailure> {
         let contract = Arc::clone(prepared.contract());
         let retained_upper_bound = prepared.instance_retained_upper_bound();
+        // Reject an unrepresentable lifetime charge before creating state.
+        std::mem::size_of::<Self>()
+            .checked_add(retained_upper_bound)
+            .ok_or(ScalarKernelFailure::ResourceExhausted)?;
         let instance = prepared.create_instance()?;
         if instance.retained_bytes() > retained_upper_bound {
             return Err(internal(
@@ -362,8 +366,15 @@ impl ScalarEvaluationInstance {
     pub fn contract(&self) -> &ScalarCallContract {
         &self.contract
     }
-    pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.instance.retained_bytes()
+    pub fn retained_bytes(&self) -> Result<usize, ScalarKernelFailure> {
+        let bytes = self.instance.retained_bytes();
+        if bytes > self.retained_upper_bound {
+            return Err(internal(
+                "scalar instance exceeded its lifetime retained bound",
+            ));
+        }
+        // The immutable upper bound was checked before instance creation.
+        Ok(std::mem::size_of::<Self>() + bytes)
     }
     /// Shared preparation backing is accounted by its immutable owner. This
     /// bound covers this wrapper's inline body plus its one owned boxed state.
