@@ -29,6 +29,7 @@ mod aggregate_sequence_contract;
 mod artifact_provenance_contract;
 mod contract_regressions;
 mod exchange_occurrence_contract;
+mod expression_site_contract;
 mod ordering_window_assertion_contract;
 mod package_contract;
 mod partition_scan_contract;

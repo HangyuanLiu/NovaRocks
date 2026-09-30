@@ -400,6 +400,15 @@ impl ExprArena {
     }
 }
 
+impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for ExprArena {
+    fn definition_count(&self) -> usize {
+        self.len()
+    }
+    fn contains_definition(&self, id: ExprId) -> bool {
+        self.get(id).is_some()
+    }
+}
+
 /// Return whether every expression has replica-deterministic semantics.
 ///
 /// Missing expression definitions fail closed. `allow_values` is explicit
