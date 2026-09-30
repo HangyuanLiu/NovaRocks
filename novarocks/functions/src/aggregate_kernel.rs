@@ -217,7 +217,9 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
     Ok(AggregateSpecialization { prepared, effects })
 }
 
-fn state_retained_bound<K: PreparedAggregateKernel>(kernel: &K) -> Result<usize, KernelFailure> {
+pub(crate) fn state_retained_bound<K: PreparedAggregateKernel>(
+    kernel: &K,
+) -> Result<usize, KernelFailure> {
     let heap = match kernel.memory_policy() {
         AggregateStateMemoryPolicy::FixedZero => 0,
         AggregateStateMemoryPolicy::BoundedRetained {
@@ -416,7 +418,7 @@ impl<'batch, K: PreparedAggregateKernel> AggregateMergeInvocation<'batch, K> {
     }
 }
 
-fn finish_lifecycle<T>(
+pub(crate) fn finish_lifecycle<T>(
     result: Result<T, KernelFailure>,
     post: Result<(), KernelFailure>,
 ) -> Result<T, KernelFailure> {

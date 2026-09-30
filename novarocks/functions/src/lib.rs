@@ -19,7 +19,8 @@
 //!
 //! The catalog owns function identity, visibility and signature resolution.
 //! Scalar preparation and selected-batch invocation use neutral contracts.
-//! Aggregate arena placement and state erasure remain Execution-owned.
+//! Framework-owned typed erasure resolves immutable aggregate CPU handles;
+//! Execution owns state storage, group mapping, memory scopes and teardown.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,6 +31,7 @@ use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
 mod aggregate_call;
+mod aggregate_erasure;
 mod aggregate_kernel;
 mod binding;
 mod call_contract;
@@ -44,6 +46,7 @@ mod table_call;
 mod window_call;
 
 pub use aggregate_call::*;
+pub use aggregate_erasure::*;
 pub use aggregate_kernel::*;
 pub use binding::*;
 pub use call_contract::*;
