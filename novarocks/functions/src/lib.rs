@@ -43,6 +43,7 @@ mod higher_order_kernel;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
+mod pure_catalogue;
 mod scalar_kernel;
 mod specialization;
 mod table_call;
@@ -66,6 +67,7 @@ pub use novarocks_type_contract::{
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
     FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
 };
+pub use pure_catalogue::*;
 pub use scalar_kernel::*;
 pub use specialization::FunctionSpecializationFailure;
 pub use table_call::*;
@@ -73,7 +75,7 @@ pub use table_kernel::*;
 pub use window_call::*;
 pub use window_kernel::*;
 
-const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v6\0";
+const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v7\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
 
 const fn function_kind_tag(kind: FunctionKind) -> u8 {

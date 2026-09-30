@@ -374,18 +374,20 @@ pub struct ResolvedFunctionBinding {
 
 #[derive(Clone)]
 pub(crate) struct FunctionBindingDefinition {
-    pub(crate) declaration: FunctionBindingDeclaration,
+    pub(crate) declaration: Arc<FunctionBindingDeclaration>,
     resolver: Arc<dyn FunctionBindingResolver>,
+    pub(crate) pure: Option<crate::pure_catalogue::PureFunctionAttachment>,
 }
 
 impl FunctionBindingDefinition {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         declaration: FunctionBindingDeclaration,
         resolver: Arc<dyn FunctionBindingResolver>,
     ) -> Self {
         Self {
-            declaration,
+            declaration: Arc::new(declaration),
             resolver,
+            pure: None,
         }
     }
 }
@@ -597,7 +599,7 @@ impl FunctionDefinition {
         )
     }
 
-    fn bound(
+    pub(crate) fn bound(
         canonical_name: impl AsRef<str>,
         visibility: FunctionVisibility,
         declaration: FunctionBindingDeclaration,
@@ -637,14 +639,17 @@ impl FunctionDefinition {
             aggregate_resolver,
             resolver: None,
             binding: Some(FunctionBindingDefinition {
-                declaration,
+                declaration: Arc::new(declaration),
                 resolver,
+                pure: None,
             }),
         })
     }
 
     pub fn binding_declaration(&self) -> Option<&FunctionBindingDeclaration> {
-        self.binding.as_ref().map(|binding| &binding.declaration)
+        self.binding
+            .as_ref()
+            .map(|binding| binding.declaration.as_ref())
     }
 }
 
@@ -941,6 +946,7 @@ pub(crate) fn digest_binding_definition(
             hasher.update([0]);
         }
     }
+    crate::pure_catalogue::digest_pure_attachment(hasher, binding.pure.as_ref());
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
