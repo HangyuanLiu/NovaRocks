@@ -23,14 +23,109 @@ use novarocks_connector_contract::{
     ConnectorReadRelationRecipeDraft, ConnectorValueType, FrozenConnectorRead, FrozenConnectorScan,
     StaticScanAssignment, TupleDomain,
 };
-use novarocks_type_contract::{SemanticParameterId, SemanticParameterValue, SemanticParameters};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationDomainId,
+    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+    ExpressionInvocation, ExpressionUseId, PureCompileControl, SemanticParameterId,
+    SemanticParameterValue, SemanticParameters,
+};
 
 use super::*;
 
+struct Control;
+impl PureCompileControl for Control {
+    fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+        Ok(())
+    }
+}
+
+fn fixture_expression_uses(fragment: &Fragment) -> PhysicalRootUses {
+    let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let mut uses = Vec::new();
+    let mut bindings = Vec::new();
+    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
+        let definition = fragment.expressions().get(root.expr).unwrap();
+        match &definition.kind {
+            ExprKind::Literal(_) | ExprKind::Value(_) => {}
+            ExprKind::FunctionCall { function, args } => {
+                // This fixture declares only the exact zero-argument Eager
+                // call below; legacy bits are never a general control fallback.
+                assert_eq!(function.function_id.as_str(), "test.parameter");
+                assert_eq!(function.overload.as_str(), "test.parameter.zero");
+                assert_eq!(
+                    function.argument_evaluation,
+                    FunctionArgumentEvaluation::Eager
+                );
+                assert!(function.argument_types.is_empty());
+                assert!(args.is_empty());
+            }
+            other => panic!("fixture requires explicit control for {other:?}"),
+        }
+        let id = ExpressionUseId::new(ordinal as u32);
+        uses.push(ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: id,
+                domain,
+                demand: root.demand,
+            },
+            definition: root.expr,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        });
+        bindings.push((*site, id));
+    }
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        uses,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    PhysicalRootUses::try_new(fragment, flow, bindings, &Control).unwrap()
+}
+
+fn fixture_controls(plan: &PhysicalPlan) -> BTreeMap<FragmentId, PhysicalRootUses> {
+    plan.fragments()
+        .iter()
+        .map(|(id, fragment)| (*id, fixture_expression_uses(fragment)))
+        .collect()
+}
+
+fn extract(
+    plan: &PhysicalPlan,
+    scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
+    parameters: &SemanticParameters,
+    writes: &BTreeMap<WriteTargetOrdinal, novarocks_connector_contract::ConnectorWriteRecipeDraft>,
+) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
+    extract_fragment_packages(
+        plan,
+        scans,
+        parameters,
+        writes,
+        &fixture_controls(plan),
+        &Control,
+    )
+}
+
 fn package_input(fragment: Fragment) -> FragmentPackageInput {
+    let expression_uses = fixture_expression_uses(&fragment);
+    package_input_with_controls(fragment, expression_uses)
+}
+
+fn package_input_with_controls(
+    fragment: Fragment,
+    expression_uses: PhysicalRootUses,
+) -> FragmentPackageInput {
     FragmentPackageInput {
         version: version(),
         required: RequiredContracts::default(),
+        expression_uses,
         fragment,
         cuts: FragmentCuts::default(),
         result: None,
@@ -39,6 +134,503 @@ fn package_input(fragment: Fragment) -> FragmentPackageInput {
         writes: BTreeMap::new(),
         annotations: Box::default(),
     }
+}
+
+#[test]
+fn extraction_requires_exact_expression_control_fragment_coverage() {
+    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    let plan = builder.finish().unwrap();
+    let controls = fixture_controls(&plan);
+    let parameters = SemanticParameters::default();
+    let extract_with = |controls: &BTreeMap<FragmentId, PhysicalRootUses>| {
+        extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &parameters,
+            &BTreeMap::new(),
+            controls,
+            &Control,
+        )
+    };
+    let packages = extract_with(&controls).unwrap();
+    assert_eq!(
+        packages[&fragment.id()].expression_uses(),
+        &controls[&fragment.id()]
+    );
+    assert_eq!(
+        extract_with(&BTreeMap::new()).unwrap_err(),
+        FragmentPackageExtractionError::MissingExpressionUses(fragment.id())
+    );
+    let (extra_fragment, _) = literal_fragment(FragmentId::new(82), FragmentSink::Noop, false);
+    let mut extra = controls;
+    extra.insert(
+        extra_fragment.id(),
+        fixture_expression_uses(&extra_fragment),
+    );
+    assert_eq!(
+        extract_with(&extra).unwrap_err(),
+        FragmentPackageExtractionError::UnusedExpressionUses
+    );
+}
+
+fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, ExprId) {
+    let mut builder = FragmentBuilder::new(FragmentId::new(83));
+    let node = builder.reserve_node_id().unwrap();
+    let left = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Literal(LiteralValue::Int64(11)),
+        )
+        .unwrap();
+    let right = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Literal(LiteralValue::Int64(22)),
+        )
+        .unwrap();
+    let root = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Binary {
+                left,
+                op: BinaryOperator::Subtract,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+        )
+        .unwrap();
+    let outputs = (0..2)
+        .map(|ordinal| {
+            builder
+                .add_value(
+                    ty(DataType::Int64, false),
+                    ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: ordinal,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton(),
+            output: OutputPort {
+                node,
+                columns: outputs.into_boxed_slice(),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([root, left])]),
+            },
+        })
+        .unwrap();
+    let fragment = builder
+        .finish_definition(node, FragmentSink::Noop, dop())
+        .unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let invocation = |id, definition, arguments| ExpressionInvocation {
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(id),
+            domain,
+            demand: EvaluationDemand::Value,
+        },
+        definition,
+        control: ControlShape::Eager,
+        arguments,
+    };
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        vec![
+            invocation(
+                0,
+                root,
+                Box::from([ExpressionUseId::new(1), ExpressionUseId::new(2)]),
+            ),
+            invocation(1, left, Box::default()),
+            invocation(2, right, Box::default()),
+            invocation(3, left, Box::default()),
+        ],
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let uses = PhysicalRootUses::try_new(
+        &fragment,
+        flow,
+        vec![
+            (
+                ExpressionRootSite {
+                    node,
+                    role: ExpressionRootRole::ValuesCell { row: 0, column: 0 },
+                },
+                ExpressionUseId::new(0),
+            ),
+            (
+                ExpressionRootSite {
+                    node,
+                    role: ExpressionRootRole::ValuesCell { row: 0, column: 1 },
+                },
+                ExpressionUseId::new(3),
+            ),
+        ],
+        &Control,
+    )
+    .unwrap();
+    (fragment, uses, root, left, right)
+}
+
+#[test]
+fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids() {
+    let (original, uses, root, left, right) = binary_control_fixture();
+    FragmentPackage::try_new(
+        package_input_with_controls(original.clone(), uses.clone()),
+        &Control,
+    )
+    .unwrap();
+    for mutation in 0..3 {
+        let mut expressions = original.expressions().clone();
+        let mut nodes = original.nodes().clone();
+        let mut values = original.values().clone();
+        let expected = match mutation {
+            0 => {
+                let mut root_definition = expressions.get(root).unwrap().clone();
+                root_definition.kind = ExprKind::Binary {
+                    left: right,
+                    op: BinaryOperator::Subtract,
+                    right: left,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                };
+                expressions.insert(root_definition);
+                RootUseBindingError::WrongArguments
+            }
+            1 => {
+                let mut condition = expressions.get(left).unwrap().clone();
+                condition.ty = ty(DataType::Boolean, false);
+                condition.kind = ExprKind::Literal(LiteralValue::Boolean(true));
+                expressions.insert(condition);
+                let mut root_definition = expressions.get(root).unwrap().clone();
+                root_definition.ty = ty(DataType::Int64, true);
+                root_definition.kind = ExprKind::Case {
+                    operand: None,
+                    when_then: Box::from([(left, right)]),
+                    else_expr: None,
+                };
+                expressions.insert(root_definition);
+                let outputs = &nodes[&original.root()].output.columns;
+                values.get_mut(&outputs[0]).unwrap().ty = ty(DataType::Int64, true);
+                values.get_mut(&outputs[1]).unwrap().ty = ty(DataType::Boolean, false);
+                RootUseBindingError::WrongControl
+            }
+            _ => {
+                let NodeKind::Values { rows } = &mut nodes.get_mut(&original.root()).unwrap().kind
+                else {
+                    unreachable!();
+                };
+                rows[0].swap(0, 1);
+                RootUseBindingError::ChangedRoots
+            }
+        };
+        let changed = Fragment::from(FragmentParts {
+            id: original.id(),
+            root: original.root(),
+            values,
+            expressions,
+            nodes,
+            sink: original.sink().clone(),
+            dop_domain: original.dop_domain(),
+            runtime_filters: original.runtime_filters().into(),
+        });
+        validate_fragment_definition(&changed).unwrap();
+        assert_eq!(changed.id(), original.id());
+        assert_eq!(changed.expressions().len(), original.expressions().len());
+        assert_eq!(
+            FragmentPackage::try_new(package_input_with_controls(changed, uses.clone()), &Control)
+                .unwrap_err(),
+            FragmentPackageError::ExpressionUses(expected)
+        );
+    }
+}
+
+struct FailureControl {
+    failure: CompileControlError,
+    positive_only: bool,
+    work: std::sync::Mutex<Vec<u32>>,
+}
+impl PureCompileControl for FailureControl {
+    fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
+        self.work.lock().unwrap().push(units);
+        if !self.positive_only || units > 0 {
+            Err(self.failure)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn package_and_extraction_keep_typed_control_failures_before_and_during_validation() {
+    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let input = package_input(fragment.clone());
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment).unwrap();
+    let plan = builder.finish().unwrap();
+    let controls = fixture_controls(&plan);
+    for failure in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for positive_only in [false, true] {
+            let control = FailureControl {
+                failure,
+                positive_only,
+                work: std::sync::Mutex::default(),
+            };
+            assert_eq!(
+                FragmentPackage::try_new(input.clone(), &control).unwrap_err(),
+                FragmentPackageError::Control(failure)
+            );
+            if positive_only {
+                assert!(control.work.lock().unwrap().iter().any(|units| *units > 0));
+            }
+            let control = FailureControl {
+                failure,
+                positive_only,
+                work: std::sync::Mutex::default(),
+            };
+            let expected = FragmentPackageExtractionError::Control(failure);
+            assert_eq!(
+                extract_fragment_packages(
+                    &plan,
+                    &BTreeMap::new(),
+                    &SemanticParameters::default(),
+                    &BTreeMap::new(),
+                    &controls,
+                    &control
+                )
+                .unwrap_err(),
+                expected
+            );
+            if positive_only {
+                assert!(control.work.lock().unwrap().iter().any(|units| *units > 0));
+            }
+        }
+    }
+}
+
+#[test]
+fn package_control_checks_correspondence_without_claiming_literal_content_identity() {
+    let (original, _) = literal_fragment(FragmentId::new(84), FragmentSink::Noop, false);
+    let checked = fixture_expression_uses(&original);
+    let mut expressions = original.expressions().clone();
+    let NodeKind::Values { rows } = &original.nodes()[&original.root()].kind else {
+        unreachable!();
+    };
+    let mut literal = expressions.get(rows[0][0]).unwrap().clone();
+    assert!(matches!(
+        literal.kind,
+        ExprKind::Literal(LiteralValue::Int64(11))
+    ));
+    literal.kind = ExprKind::Literal(LiteralValue::Int64(22));
+    expressions.insert(literal);
+    let changed = Fragment::from(FragmentParts {
+        id: original.id(),
+        root: original.root(),
+        values: original.values().clone(),
+        expressions,
+        nodes: original.nodes().clone(),
+        sink: original.sink().clone(),
+        dop_domain: original.dop_domain(),
+        runtime_filters: original.runtime_filters().into(),
+    });
+    validate_fragment_definition(&changed).unwrap();
+    let package = FragmentPackage::try_new(
+        package_input_with_controls(changed.clone(), checked.clone()),
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(package.fragment(), &changed);
+    assert_eq!(package.expression_uses(), &checked);
+
+    let (other, _) = literal_fragment(FragmentId::new(85), FragmentSink::Noop, false);
+    assert_eq!(
+        FragmentPackage::try_new(package_input_with_controls(other, checked), &Control)
+            .unwrap_err(),
+        FragmentPackageError::ExpressionUses(RootUseBindingError::WrongFragment)
+    );
+}
+
+#[test]
+fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
+    use novarocks_type_contract::{DomainGuard, GuardKind};
+    let (original, _, root, left, right) = binary_control_fixture();
+    let mut expressions = original.expressions().clone();
+    let mut condition = expressions.get(left).unwrap().clone();
+    condition.ty = ty(DataType::Boolean, false);
+    condition.kind = ExprKind::Literal(LiteralValue::Boolean(true));
+    expressions.insert(condition);
+    let mut result = expressions.get(root).unwrap().clone();
+    result.ty = ty(DataType::Int64, true);
+    result.kind = ExprKind::Case {
+        operand: None,
+        when_then: Box::from([(left, right)]),
+        else_expr: None,
+    };
+    expressions.insert(result);
+    let mut values = original.values().clone();
+    let node = original.root();
+    let outputs = &original.nodes()[&node].output.columns;
+    values.get_mut(&outputs[0]).unwrap().ty = ty(DataType::Int64, true);
+    values.get_mut(&outputs[1]).unwrap().ty = ty(DataType::Boolean, false);
+    let fragment = Fragment::from(FragmentParts {
+        id: original.id(),
+        root: node,
+        values,
+        expressions,
+        nodes: original.nodes().clone(),
+        sink: original.sink().clone(),
+        dop_domain: original.dop_domain(),
+        runtime_filters: original.runtime_filters().into(),
+    });
+    validate_fragment_definition(&fragment).unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let when = EvaluationDomainId::new(1);
+    let then = EvaluationDomainId::new(2);
+    let invocation = |id, definition, domain, demand, control, arguments| ExpressionInvocation {
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(id),
+            domain,
+            demand,
+        },
+        definition,
+        control,
+        arguments,
+    };
+    let flow = ExpressionControlFlow::try_new(
+        vec![
+            ExpressionEvaluationDomain {
+                id: domain,
+                parent: None,
+                guard: None,
+            },
+            ExpressionEvaluationDomain {
+                id: when,
+                parent: Some(domain),
+                guard: Some(DomainGuard {
+                    owner: ExpressionUseId::new(0),
+                    kind: GuardKind::CaseWhen { arm: 0 },
+                }),
+            },
+            ExpressionEvaluationDomain {
+                id: then,
+                parent: Some(domain),
+                guard: Some(DomainGuard {
+                    owner: ExpressionUseId::new(0),
+                    kind: GuardKind::CaseThen { arm: 0 },
+                }),
+            },
+        ],
+        vec![
+            invocation(
+                0,
+                root,
+                domain,
+                EvaluationDemand::Value,
+                ControlShape::Case {
+                    simple: false,
+                    arms: 1,
+                    has_else: false,
+                },
+                Box::from([ExpressionUseId::new(1), ExpressionUseId::new(2)]),
+            ),
+            invocation(
+                1,
+                left,
+                when,
+                EvaluationDemand::TruthOnly,
+                ControlShape::Eager,
+                Box::default(),
+            ),
+            invocation(
+                2,
+                right,
+                then,
+                EvaluationDemand::Value,
+                ControlShape::Eager,
+                Box::default(),
+            ),
+            invocation(
+                3,
+                left,
+                domain,
+                EvaluationDemand::Value,
+                ControlShape::Eager,
+                Box::default(),
+            ),
+        ],
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let uses = PhysicalRootUses::try_new(
+        &fragment,
+        flow.clone(),
+        vec![
+            (
+                ExpressionRootSite {
+                    node,
+                    role: ExpressionRootRole::ValuesCell { row: 0, column: 0 },
+                },
+                ExpressionUseId::new(0),
+            ),
+            (
+                ExpressionRootSite {
+                    node,
+                    role: ExpressionRootRole::ValuesCell { row: 0, column: 1 },
+                },
+                ExpressionUseId::new(3),
+            ),
+        ],
+        &Control,
+    )
+    .unwrap();
+    let package = FragmentPackage::try_new(
+        package_input_with_controls(fragment, uses.clone()),
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(package.expression_uses(), &uses);
+    assert_eq!(package.expression_uses().flow(), &flow);
+    assert_eq!(
+        package.expression_uses().flow().domains()[&when]
+            .guard
+            .unwrap()
+            .kind,
+        GuardKind::CaseWhen { arm: 0 }
+    );
+    assert_eq!(
+        package.expression_uses().flow().domains()[&then]
+            .guard
+            .unwrap()
+            .kind,
+        GuardKind::CaseThen { arm: 0 }
+    );
 }
 
 fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
@@ -187,7 +779,7 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
     )])
     .unwrap();
     let scans = BTreeMap::from([(ProviderReadOccurrenceId::new(0), scan.clone())]);
-    let packages = extract_fragment_packages(&plan, &scans, &parameters, &BTreeMap::new()).unwrap();
+    let packages = extract(&plan, &scans, &parameters, &BTreeMap::new()).unwrap();
     let package = &packages[&fragment_id];
     assert_eq!(package.fragment(), &fragment);
     assert!(package.parameters().entries().is_empty());
@@ -197,13 +789,13 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
         matches!(&package.fragment().nodes()[&node_id].kind, NodeKind::Scan { relation, .. } if matches!(relation.as_ref(), Relation::Metadata(_)))
     );
     assert!(matches!(
-        extract_fragment_packages(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()),
+        extract(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()),
         Err(FragmentPackageExtractionError::MissingScan(_))
     ));
     let mut extra = scans;
     extra.insert(ProviderReadOccurrenceId::new(1), scan);
     assert!(matches!(
-        extract_fragment_packages(&plan, &extra, &parameters, &BTreeMap::new()),
+        extract(&plan, &extra, &parameters, &BTreeMap::new()),
         Err(FragmentPackageExtractionError::UnusedScan)
     ));
 }
@@ -217,18 +809,18 @@ fn package_refuses_missing_or_wrong_scan_node_facts() {
     let fragment = finish_scan_relation(metadata_relation(&binding, column)).unwrap();
     let mut input = package_input(fragment.clone());
     assert!(
-        FragmentPackage::try_new(input.clone())
+        FragmentPackage::try_new(input.clone(), &Control)
             .unwrap_err()
             .to_string()
             .contains("no complete frozen public facts")
     );
     input.scans.insert(fragment.root(), frozen_scan(&fragment));
-    FragmentPackage::try_new(input.clone()).unwrap();
+    FragmentPackage::try_new(input.clone(), &Control).unwrap();
     input
         .scans
         .insert(NodeId::new(u32::MAX), frozen_scan(&fragment));
     assert!(
-        FragmentPackage::try_new(input)
+        FragmentPackage::try_new(input, &Control)
             .unwrap_err()
             .to_string()
             .contains("missing or non-scan node")
@@ -314,7 +906,7 @@ fn package_refuses_complete_public_source_drift() {
         let mut input = package_input(fragment.clone());
         input.scans.insert(fragment.root(), scan);
         assert!(
-            FragmentPackage::try_new(input).is_err(),
+            FragmentPackage::try_new(input, &Control).is_err(),
             "accepted public source drift {mutation}"
         );
     }
@@ -376,7 +968,7 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
         let mut input = package_input(fragment.clone());
         input.scans.insert(fragment.root(), malformed.unwrap());
         assert!(
-            FragmentPackage::try_new(input).is_err(),
+            FragmentPackage::try_new(input, &Control).is_err(),
             "mutation {mutation}"
         );
     }
@@ -393,17 +985,17 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
         ty: fragment.values()[&value].ty.clone(),
     };
     let mut input = package_input(fragment.clone());
-    assert!(FragmentPackage::try_new(input.clone()).is_err());
+    assert!(FragmentPackage::try_new(input.clone(), &Control).is_err());
     input.result = Some(ResultPort {
         fragment: id,
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: Box::from([field]),
     });
-    FragmentPackage::try_new(input.clone()).unwrap();
+    FragmentPackage::try_new(input.clone(), &Control).unwrap();
     let mut wrong_result = input.clone();
     wrong_result.result.as_mut().unwrap().fields[0].ty.nullable = true;
     assert!(
-        FragmentPackage::try_new(wrong_result)
+        FragmentPackage::try_new(wrong_result, &Control)
             .unwrap_err()
             .to_string()
             .contains("result type differs")
@@ -414,7 +1006,7 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
         value: "17".into(),
     }]);
     assert!(
-        FragmentPackage::try_new(input)
+        FragmentPackage::try_new(input, &Control)
             .unwrap_err()
             .to_string()
             .contains("subject this plan does not have")
@@ -437,9 +1029,8 @@ fn remote_plan_statistics_do_not_grow_a_fragment_package() {
     let after = builder.finish().unwrap();
     let parameters = SemanticParameters::default();
     assert_eq!(
-        extract_fragment_packages(&before, &BTreeMap::new(), &parameters, &BTreeMap::new())
-            .unwrap(),
-        extract_fragment_packages(&after, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap()
+        extract(&before, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap(),
+        extract(&after, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap()
     );
     assert_eq!(after.annotations().len(), 1);
 }
@@ -529,7 +1120,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         input
             .scans
             .insert(scan_id, public_read(&fragment, scan_id, scan).unwrap());
-        let result = FragmentPackage::try_new(input.clone());
+        let result = FragmentPackage::try_new(input.clone(), &Control);
         assert_eq!(result.is_ok(), accepted, "{variable}: {result:?}");
     }
 }
@@ -610,8 +1201,7 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
         ),
     ])
     .unwrap();
-    let packages =
-        extract_fragment_packages(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
+    let packages = extract(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
     let mut input = packages[&FragmentId::new(81)].clone().into_input();
     assert_eq!(input.parameters.entries().len(), 1);
     assert_eq!(
@@ -620,14 +1210,14 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     );
     input.parameters = parameters;
     assert!(
-        FragmentPackage::try_new(input.clone())
+        FragmentPackage::try_new(input.clone(), &Control)
             .unwrap_err()
             .to_string()
             .contains("unused definitions")
     );
     input.parameters = SemanticParameters::default();
     assert!(
-        FragmentPackage::try_new(input.clone())
+        FragmentPackage::try_new(input.clone(), &Control)
             .unwrap_err()
             .to_string()
             .contains("missing semantic parameter ID")
@@ -638,7 +1228,7 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     )])
     .unwrap();
     assert!(
-        FragmentPackage::try_new(input)
+        FragmentPackage::try_new(input, &Control)
             .unwrap_err()
             .to_string()
             .contains("expected key")
@@ -654,7 +1244,7 @@ fn package_cannot_carry_whole_plan_display_annotations() {
         key: "optimizer.table_statistics".into(),
         value: "peer facts".into(),
     }]);
-    assert!(FragmentPackage::try_new(input).is_err());
+    assert!(FragmentPackage::try_new(input, &Control).is_err());
 }
 
 #[test]
@@ -702,17 +1292,17 @@ fn writer_package_requires_the_exact_public_input_recipe() {
     let mut input = package_input(fragment.clone());
     input.cuts = fragment_cuts(&plan, fragment.id()).unwrap();
     assert!(
-        FragmentPackage::try_new(input.clone())
+        FragmentPackage::try_new(input.clone(), &Control)
             .unwrap_err()
             .to_string()
             .contains("no complete frozen public facts")
     );
     input.writes.insert(writer_id, write.clone());
-    FragmentPackage::try_new(input.clone()).unwrap();
+    FragmentPackage::try_new(input.clone(), &Control).unwrap();
     let mut wrong_node = input.clone();
     wrong_node.writes.insert(NodeId::new(u32::MAX), write);
     assert!(
-        FragmentPackage::try_new(wrong_node)
+        FragmentPackage::try_new(wrong_node, &Control)
             .unwrap_err()
             .to_string()
             .contains("missing or non-writer node")
@@ -743,7 +1333,7 @@ fn writer_package_requires_the_exact_public_input_recipe() {
         .unwrap();
         input.writes.insert(writer_id, write);
         assert!(
-            FragmentPackage::try_new(input.clone())
+            FragmentPackage::try_new(input.clone(), &Control)
                 .unwrap_err()
                 .to_string()
                 .contains("input field occurrence")
@@ -831,7 +1421,7 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
         )
         .unwrap();
         input.writes.insert(original.root(), recipe);
-        let result = FragmentPackage::try_new(input.clone());
+        let result = FragmentPackage::try_new(input.clone(), &Control);
         if id == 1 {
             result.unwrap();
         } else {

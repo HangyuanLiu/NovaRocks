@@ -94,6 +94,7 @@ pub struct ExpressionControlFlow<D> {
     domains: Arc<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>,
     uses: Arc<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>,
     roots: Arc<[ExpressionUseId]>,
+    use_references: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExpressionControlFlowError {
@@ -295,6 +296,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
             domains: Arc::new(domain_index),
             uses: Arc::new(use_index),
             roots: roots.into(),
+            use_references: references,
         })
     }
     /// Every invocation with no parent argument edge, in stable ID order.
@@ -307,6 +309,11 @@ impl<D: Copy> ExpressionControlFlow<D> {
     }
     pub fn uses(&self) -> &BTreeMap<ExpressionUseId, ExpressionInvocation<D>> {
         &self.uses
+    }
+    /// Invocation entries plus their ordered argument references, counted by
+    /// the same bounded constructor. No unobserved edge scan is needed later.
+    pub const fn use_reference_count(&self) -> usize {
+        self.use_references
     }
 }
 fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionControlFlowError> {
@@ -544,6 +551,7 @@ mod tests {
             &[ExpressionUseId::new(50), ExpressionUseId::new(u32::MAX)]
         );
         assert_eq!(graph.uses().len(), 3);
+        assert_eq!(graph.use_reference_count(), 4);
         assert_eq!(
             ExpressionControlFlow::try_new(
                 vec![root()],

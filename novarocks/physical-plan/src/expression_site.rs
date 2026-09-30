@@ -579,6 +579,8 @@ pub enum RootUseBindingError {
     Roots(ExpressionRootError),
     WrongControl,
     WrongArguments,
+    WrongFragment,
+    ChangedRoots,
 }
 impl fmt::Display for RootUseBindingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -592,6 +594,40 @@ impl From<CompileControlError> for RootUseBindingError {
     }
 }
 impl PhysicalRootUses {
+    /// Recheck control correspondence against the current package fragment.
+    /// Numeric IDs do not prove correspondence after a rewrite. The immutable
+    /// graph's own guards and edges were checked by its constructor; roots,
+    /// demand and ordered definitions are checked again here. This is not a
+    /// content identity or effect proof: changing a literal's value or an eager
+    /// operator while retaining these facts can remain valid. Accurate owner
+    /// capabilities and effects must be checked for the current definitions.
+    pub fn validate_fragment(
+        &self,
+        fragment: &Fragment,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), RootUseBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        if self.roots.fragment != fragment.id() {
+            return Err(RootUseBindingError::WrongFragment);
+        }
+        let roots =
+            PhysicalExpressionRoots::try_new(fragment, control).map_err(|error| match error {
+                ExpressionRootError::Control(error) => RootUseBindingError::Control(error),
+                error => RootUseBindingError::Roots(error),
+            })?;
+        if roots.sites.len() != self.roots.sites.len() {
+            return Err(RootUseBindingError::ChangedRoots);
+        }
+        for (actual, checked) in roots.sites.iter().zip(self.roots.sites.iter()) {
+            if actual != checked {
+                return Err(RootUseBindingError::ChangedRoots);
+            }
+            work.step()?;
+        }
+        validate_definition_correspondence(fragment, &self.flow, &mut work)?;
+        work.finish()?;
+        Ok(())
+    }
     pub fn try_new(
         fragment: &Fragment,
         flow: novarocks_type_contract::ExpressionControlFlow<crate::ExprId>,

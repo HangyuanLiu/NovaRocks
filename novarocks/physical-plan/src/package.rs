@@ -24,12 +24,15 @@ use std::fmt;
 use novarocks_connector_contract::{
     ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal,
 };
-use novarocks_type_contract::{SemanticParameterError, SemanticParameterRef, SemanticParameters};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, SemanticParameterError,
+    SemanticParameterRef, SemanticParameters,
+};
 
 use crate::{
-    AnnotationSubject, Fragment, FragmentCuts, FragmentId, NodeId, PhysicalPlan, PlanAnnotation,
-    PlanVersionId, ProviderReadOccurrenceId, RequiredContracts, ResultPort, ValidationErrors,
-    derive_fragment_cuts,
+    AnnotationSubject, Fragment, FragmentCuts, FragmentId, NodeId, PhysicalPlan, PhysicalRootUses,
+    PlanAnnotation, PlanVersionId, ProviderReadOccurrenceId, RequiredContracts, ResultPort,
+    RootUseBindingError, ValidationErrors, derive_fragment_cuts,
 };
 
 /// An owned input for the same checked constructor on FE and BE. It contains
@@ -39,6 +42,9 @@ pub struct FragmentPackageInput {
     pub version: PlanVersionId,
     pub required: RequiredContracts,
     pub fragment: Fragment,
+    /// Complete invocation control and exact field bindings. Required even
+    /// for a fragment with no expression roots; no eager fallback is inferred.
+    pub expression_uses: PhysicalRootUses,
     pub cuts: FragmentCuts,
     pub result: Option<ResultPort>,
     pub parameters: SemanticParameters,
@@ -53,8 +59,21 @@ pub struct FragmentPackageInput {
 pub struct FragmentPackage(FragmentPackageInput);
 
 impl FragmentPackage {
-    pub fn try_new(input: FragmentPackageInput) -> Result<Self, ValidationErrors> {
-        crate::validation::validate_package(&input)?;
+    pub fn try_new(
+        input: FragmentPackageInput,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FragmentPackageError> {
+        control
+            .checkpoint(CompilePhase::Validate, 0)
+            .map_err(FragmentPackageError::Control)?;
+        crate::validation::validate_package(&input).map_err(FragmentPackageError::Structure)?;
+        input
+            .expression_uses
+            .validate_fragment(&input.fragment, control)
+            .map_err(|error| match error {
+                RootUseBindingError::Control(error) => FragmentPackageError::Control(error),
+                error => FragmentPackageError::ExpressionUses(error),
+            })?;
         Ok(Self(input))
     }
 
@@ -68,6 +87,10 @@ impl FragmentPackage {
 
     pub const fn fragment(&self) -> &Fragment {
         &self.0.fragment
+    }
+
+    pub const fn expression_uses(&self) -> &PhysicalRootUses {
+        &self.0.expression_uses
     }
 
     pub const fn cuts(&self) -> &FragmentCuts {
@@ -99,6 +122,23 @@ impl FragmentPackage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FragmentPackageError {
+    Control(CompileControlError),
+    Structure(ValidationErrors),
+    ExpressionUses(RootUseBindingError),
+}
+impl fmt::Display for FragmentPackageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Control(error) => error.fmt(f),
+            Self::Structure(error) => error.fmt(f),
+            Self::ExpressionUses(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for FragmentPackageError {}
+
 /// Extract from the immutable complete-plan authority. No second global plan
 /// validation or executable peer graph is performed here. Boundary derivation
 /// is indexed once for all fragments; each output uses the BE constructor.
@@ -107,7 +147,12 @@ pub fn extract_fragment_packages(
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
     parameters: &SemanticParameters,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
+    expression_uses: &BTreeMap<FragmentId, PhysicalRootUses>,
+    control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
+    control
+        .checkpoint(CompilePhase::Validate, 0)
+        .map_err(FragmentPackageExtractionError::Control)?;
     let mut cuts =
         derive_fragment_cuts(plan).ok_or(FragmentPackageExtractionError::BoundaryDerivation)?;
     // Display/statistics annotations for the whole plan remain FE-owned. Index
@@ -153,25 +198,37 @@ pub fn extract_fragment_packages(
             .remove(&fragment.id())
             .unwrap_or_default()
             .into_boxed_slice();
-        let package = FragmentPackage::try_new(FragmentPackageInput {
-            version: plan.version(),
-            required: plan.required(),
-            fragment: fragment.clone(),
-            cuts: cuts
-                .remove(&fragment.id())
-                .ok_or(FragmentPackageExtractionError::BoundaryDerivation)?,
-            result: plan
-                .result_port()
-                .filter(|result| result.fragment == fragment.id())
-                .cloned(),
-            parameters: parameters
-                .project(fragment_parameter_references(fragment))
-                .map_err(FragmentPackageExtractionError::Parameter)?,
-            scans: local_scans,
-            writes: local_writes,
-            annotations,
-        })
-        .map_err(FragmentPackageExtractionError::Local)?;
+        let package = FragmentPackage::try_new(
+            FragmentPackageInput {
+                version: plan.version(),
+                required: plan.required(),
+                fragment: fragment.clone(),
+                expression_uses: expression_uses
+                    .get(&fragment.id())
+                    .ok_or(FragmentPackageExtractionError::MissingExpressionUses(
+                        fragment.id(),
+                    ))?
+                    .clone(),
+                cuts: cuts
+                    .remove(&fragment.id())
+                    .ok_or(FragmentPackageExtractionError::BoundaryDerivation)?,
+                result: plan
+                    .result_port()
+                    .filter(|result| result.fragment == fragment.id())
+                    .cloned(),
+                parameters: parameters
+                    .project(fragment_parameter_references(fragment))
+                    .map_err(FragmentPackageExtractionError::Parameter)?,
+                scans: local_scans,
+                writes: local_writes,
+                annotations,
+            },
+            control,
+        )
+        .map_err(|error| match error {
+            FragmentPackageError::Control(error) => FragmentPackageExtractionError::Control(error),
+            error => FragmentPackageExtractionError::Local(error),
+        })?;
         outputs.insert(fragment.id(), package);
     }
     if consumed.len() != scans.len() {
@@ -179,6 +236,11 @@ pub fn extract_fragment_packages(
     }
     if consumed_writes.len() != writes.len() {
         return Err(FragmentPackageExtractionError::UnusedWrite);
+    }
+    if expression_uses.len() != outputs.len()
+        || expression_uses.keys().any(|id| !outputs.contains_key(id))
+    {
+        return Err(FragmentPackageExtractionError::UnusedExpressionUses);
     }
     Ok(outputs)
 }
@@ -190,8 +252,11 @@ pub enum FragmentPackageExtractionError {
     UnusedScan,
     MissingWrite(WriteTargetOrdinal),
     UnusedWrite,
-    Local(ValidationErrors),
+    Local(FragmentPackageError),
     Parameter(SemanticParameterError),
+    Control(CompileControlError),
+    MissingExpressionUses(FragmentId),
+    UnusedExpressionUses,
 }
 
 impl fmt::Display for FragmentPackageExtractionError {
@@ -210,6 +275,13 @@ impl fmt::Display for FragmentPackageExtractionError {
             Self::UnusedWrite => f.write_str("frozen write facts contain an unused target"),
             Self::Local(errors) => errors.fmt(f),
             Self::Parameter(error) => error.fmt(f),
+            Self::Control(error) => error.fmt(f),
+            Self::MissingExpressionUses(id) => {
+                write!(f, "expression control is missing for fragment {}", id.get())
+            }
+            Self::UnusedExpressionUses => {
+                f.write_str("expression control names an unused fragment")
+            }
         }
     }
 }
