@@ -21,6 +21,7 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CompilePhase {
     CarrierPreflight,
+    Encode,
     Decode,
     Validate,
     ProviderValidation,

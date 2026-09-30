@@ -49,6 +49,14 @@ pub mod physical_type_v2 {
     include!(concat!(env!("OUT_DIR"), "/novarocks.physical_type_v2.rs"));
 }
 
+/// Flat invocation/control component of the v2 physical package vocabulary.
+pub mod physical_control_v2 {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/novarocks.physical_control_v2.rs"
+    ));
+}
+
 #[allow(clippy::large_enum_variant)]
 pub mod plan {
     include!(concat!(env!("OUT_DIR"), "/novarocks.plan.rs"));

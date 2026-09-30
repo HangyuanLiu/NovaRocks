@@ -1,0 +1,141 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.physical_control_v2;
+
+// The flat invocation/control component of a v2 fragment package. Definitions
+// live in the fragment expression table. IDs are sparse, zero is valid, and
+// singular reference presence is required by the typed decoder.
+message ExpressionControl {
+  repeated EvaluationDomain domains = 1;
+  repeated ExpressionUse uses = 2;
+  repeated RootBinding roots = 3;
+}
+message EvaluationDomain {
+  uint32 id = 1;
+  optional uint32 parent_domain_id = 2;
+  DomainGuard guard = 3;
+}
+message DomainGuard {
+  optional uint32 owner_use_id = 1;
+  oneof kind {
+    SimpleGuard simple = 2;
+    uint32 coalesce_after_null_ordinal = 3;
+    uint32 case_when_arm = 4;
+    uint32 case_then_arm = 5;
+  }
+}
+enum SimpleGuard {
+  SIMPLE_GUARD_UNSPECIFIED = 0;
+  SIMPLE_GUARD_IF_THEN = 1;
+  SIMPLE_GUARD_IF_ELSE = 2;
+  SIMPLE_GUARD_CASE_ELSE = 3;
+  SIMPLE_GUARD_LAMBDA_INVOCATION = 4;
+}
+enum EvaluationDemand {
+  EVALUATION_DEMAND_UNSPECIFIED = 0;
+  EVALUATION_DEMAND_VALUE = 1;
+  EVALUATION_DEMAND_TRUTH_ONLY = 2;
+}
+message ExpressionUse {
+  uint32 id = 1;
+  optional uint32 definition_id = 2;
+  optional uint32 domain_id = 3;
+  EvaluationDemand demand = 4;
+  ControlShape control = 5;
+  // Each edge names a separate invocation, even when its definition is shared.
+  repeated uint32 argument_use_ids = 6;
+}
+message ControlShape {
+  oneof kind {
+    SimpleControl simple = 1;
+    CaseControl case_control = 2;
+    HigherOrderControl higher_order = 3;
+  }
+}
+enum SimpleControl {
+  SIMPLE_CONTROL_UNSPECIFIED = 0;
+  SIMPLE_CONTROL_EAGER = 1;
+  SIMPLE_CONTROL_TYPE_ONLY = 2;
+  SIMPLE_CONTROL_LAMBDA_BODY = 3;
+  SIMPLE_CONTROL_CONJUNCTION = 4;
+  SIMPLE_CONTROL_DISJUNCTION = 5;
+  SIMPLE_CONTROL_IF = 6;
+  SIMPLE_CONTROL_COALESCE = 7;
+}
+message CaseControl {
+  bool simple = 1;
+  uint32 arms = 2;
+  bool has_else = 3;
+}
+message HigherOrderControl {
+  uint32 body_ordinal = 1;
+  EvaluationDemand body_demand = 2;
+}
+message RootBinding {
+  optional uint32 use_id = 1;
+  RootSite site = 2;
+}
+message Empty {}
+message CallArgumentRoot { uint32 call = 1; uint32 argument = 2; }
+message CallOrderRoot { uint32 call = 1; uint32 key = 2; }
+message ValuesRoot { uint32 row = 1; uint32 column = 2; }
+message MappingConstantRoot { uint32 mapping = 1; uint32 constant = 2; }
+message ChangeAssignmentRoot { uint32 event = 1; uint32 assignment = 2; }
+message JoinKeyRoot { uint32 key = 1; JoinSide side = 2; }
+enum JoinSide {
+  JOIN_SIDE_UNSPECIFIED = 0;
+  JOIN_SIDE_LEFT = 1;
+  JOIN_SIDE_RIGHT = 2;
+}
+// These are real node field positions, not indices in a flattened expression
+// list. Optional fields and non-scalar constants do not compact ordinals.
+message RootSite {
+  optional uint32 node_id = 1;
+  oneof role {
+    uint32 scan_residual = 2;
+    uint32 scan_derived = 3;
+    uint32 filter_predicate = 4;
+    uint32 project_output = 5;
+    uint32 aggregate_group = 6;
+    CallArgumentRoot aggregate_argument = 7;
+    CallOrderRoot aggregate_order = 8;
+    JoinKeyRoot join_key = 9;
+    Empty hash_join_residual = 10;
+    Empty nest_loop_predicate = 11;
+    uint32 sort_order = 12;
+    uint32 sort_partition = 13;
+    uint32 top_n_order = 14;
+    uint32 top_n_group = 15;
+    CallArgumentRoot top_n_state_argument = 16;
+    CallOrderRoot top_n_state_order = 17;
+    uint32 window_partition = 18;
+    uint32 window_order = 19;
+    uint32 window_call = 20;
+    ValuesRoot values_cell = 21;
+    Empty series_start = 22;
+    Empty series_stop = 23;
+    Empty series_step = 24;
+    uint32 table_function_argument = 25;
+    MappingConstantRoot unpivot_constant = 26;
+    uint32 change_predicate = 27;
+    ChangeAssignmentRoot change_assignment = 28;
+    MappingConstantRoot finish_unpivot_constant = 29;
+  }
+}

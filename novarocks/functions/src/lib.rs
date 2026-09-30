@@ -38,6 +38,7 @@ mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
 mod scalar_kernel;
+mod table_call;
 
 pub use aggregate_call::*;
 pub use binding::*;
@@ -52,6 +53,7 @@ pub use novarocks_type_contract::{
     FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
 };
 pub use scalar_kernel::*;
+pub use table_call::*;
 
 const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v5\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
