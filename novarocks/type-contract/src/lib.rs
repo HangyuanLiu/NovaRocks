@@ -69,7 +69,8 @@ pub use schema::{
     MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
     MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
     MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, arrow_data_types_exact,
-    arrow_data_types_exact_observed, arrow_fields_exact, arrow_schemas_exact,
+    arrow_data_types_exact_observed, arrow_fields_exact, arrow_fields_exact_observed,
+    arrow_schemas_exact,
 };
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,

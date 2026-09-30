@@ -49,7 +49,8 @@ pub fn arrow_fields_exact(left: &Field, right: &Field) -> bool {
 }
 
 pub fn arrow_data_types_exact(left: &DataType, right: &DataType) -> bool {
-    compare_types::<crate::ValueTypeError>(left, right, || Ok(()), false).unwrap_or(false)
+    compare_types::<std::convert::Infallible>(left, right, || Ok(()), |_, _| Ok(()))
+        .unwrap_or(false)
 }
 
 /// The same exact comparison with bounded depth/node traversal and an observer
@@ -60,103 +61,161 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
     right: &DataType,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types(left, right, observe, true)
+    compare_types(left, right, observe, |depth, nodes| {
+        if depth > crate::MAX_VALUE_TYPE_DEPTH {
+            Err(crate::ValueTypeError::TooDeep.into())
+        } else if nodes > crate::MAX_VALUE_TYPE_NODES {
+            Err(crate::ValueTypeError::TooManyNodes.into())
+        } else {
+            Ok(())
+        }
+    })
 }
 
-fn compare_types<E: From<crate::ValueTypeError>>(
+/// Observe exact field comparison within the caller's already validated schema
+/// domain. This adds no type-node admission bound: owners such as writer
+/// relations have their own depth and aggregate schema-byte limits.
+/// Callers must validate those limits before entering this borrowed traversal.
+pub fn arrow_fields_exact_observed<E>(
+    left: &Field,
+    right: &Field,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    Walk {
+        observe: &mut observe,
+        validate: &mut |_, _| Ok(()),
+        nodes: 0,
+    }
+    .field(left, right, 1)
+}
+
+fn compare_types<E>(
     left: &DataType,
     right: &DataType,
     mut observe: impl FnMut() -> Result<(), E>,
-    bounded: bool,
+    mut validate: impl FnMut(usize, usize) -> Result<(), E>,
 ) -> Result<bool, E> {
-    struct Walk<'a, F> {
-        observe: &'a mut F,
-        nodes: usize,
-        bounded: bool,
-    }
-    impl<E: From<crate::ValueTypeError>, F: FnMut() -> Result<(), E>> Walk<'_, F> {
-        fn field(&mut self, left: &Field, right: &Field, depth: usize) -> Result<bool, E> {
-            (self.observe)()?;
-            #[allow(deprecated)]
-            let ids_equal = left.dict_id() == right.dict_id();
-            if left.name() != right.name()
-                || left.is_nullable() != right.is_nullable()
-                || left.metadata() != right.metadata()
-                || !ids_equal
-                || left.dict_is_ordered() != right.dict_is_ordered()
-            {
-                return Ok(false);
-            }
-            self.ty(left.data_type(), right.data_type(), depth)
-        }
-        fn ty(&mut self, left: &DataType, right: &DataType, depth: usize) -> Result<bool, E> {
-            (self.observe)()?;
-            if self.bounded && depth > crate::MAX_VALUE_TYPE_DEPTH {
-                return Err(crate::ValueTypeError::TooDeep.into());
-            }
-            self.nodes += 1;
-            if self.bounded && self.nodes > crate::MAX_VALUE_TYPE_NODES {
-                return Err(crate::ValueTypeError::TooManyNodes.into());
-            }
-            match (left, right) {
-                (DataType::List(left), DataType::List(right))
-                | (DataType::ListView(left), DataType::ListView(right))
-                | (DataType::LargeList(left), DataType::LargeList(right))
-                | (DataType::LargeListView(left), DataType::LargeListView(right)) => {
-                    self.field(left, right, depth + 1)
-                }
-                (DataType::FixedSizeList(left, ls), DataType::FixedSizeList(right, rs)) => {
-                    if ls != rs {
-                        Ok(false)
-                    } else {
-                        self.field(left, right, depth + 1)
-                    }
-                }
-                (DataType::Struct(left), DataType::Struct(right)) => {
-                    if left.len() != right.len() {
-                        return Ok(false);
-                    }
-                    for (left, right) in left.iter().zip(right) {
-                        if !self.field(left, right, depth + 1)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                }
-                (DataType::Union(left, lm), DataType::Union(right, rm)) => {
-                    if lm != rm || left.len() != right.len() {
-                        return Ok(false);
-                    }
-                    for ((li, left), (ri, right)) in left.iter().zip(right.iter()) {
-                        if li != ri || !self.field(left, right, depth + 1)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                }
-                (DataType::Dictionary(lk, lv), DataType::Dictionary(rk, rv)) => {
-                    Ok(self.ty(lk, rk, depth + 1)? && self.ty(lv, rv, depth + 1)?)
-                }
-                (DataType::Map(left, ls), DataType::Map(right, rs)) => {
-                    if ls != rs {
-                        Ok(false)
-                    } else {
-                        self.field(left, right, depth + 1)
-                    }
-                }
-                (DataType::RunEndEncoded(lr, lv), DataType::RunEndEncoded(rr, rv)) => {
-                    Ok(self.field(lr, rr, depth + 1)? && self.field(lv, rv, depth + 1)?)
-                }
-                _ => Ok(left == right),
-            }
-        }
-    }
     Walk {
         observe: &mut observe,
+        validate: &mut validate,
         nodes: 0,
-        bounded,
     }
     .ty(left, right, 1)
+}
+
+struct Walk<'a, F, B> {
+    observe: &'a mut F,
+    validate: &'a mut B,
+    nodes: usize,
+}
+impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Walk<'_, F, B> {
+    fn bytes(&mut self, left: &[u8], right: &[u8]) -> Result<bool, E> {
+        if left.len() != right.len() {
+            return Ok(false);
+        }
+        for (left, right) in left.chunks(1024).zip(right.chunks(1024)) {
+            (self.observe)()?;
+            if left != right {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn metadata(&mut self, left: &Field, right: &Field) -> Result<bool, E> {
+        if left.metadata().len() != right.metadata().len() {
+            return Ok(false);
+        }
+        for (key, value) in left.metadata() {
+            (self.observe)()?;
+            let Some(other) = right.metadata().get(key) else {
+                return Ok(false);
+            };
+            if !self.bytes(value.as_bytes(), other.as_bytes())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn field(&mut self, left: &Field, right: &Field, depth: usize) -> Result<bool, E> {
+        (self.observe)()?;
+        #[allow(deprecated)]
+        let ids_equal = left.dict_id() == right.dict_id();
+        if !self.bytes(left.name().as_bytes(), right.name().as_bytes())?
+            || left.is_nullable() != right.is_nullable()
+            || !self.metadata(left, right)?
+            || !ids_equal
+            || left.dict_is_ordered() != right.dict_is_ordered()
+        {
+            return Ok(false);
+        }
+        self.ty(left.data_type(), right.data_type(), depth)
+    }
+    fn ty(&mut self, left: &DataType, right: &DataType, depth: usize) -> Result<bool, E> {
+        (self.observe)()?;
+        self.nodes += 1;
+        (self.validate)(depth, self.nodes)?;
+        match (left, right) {
+            (DataType::List(left), DataType::List(right))
+            | (DataType::ListView(left), DataType::ListView(right))
+            | (DataType::LargeList(left), DataType::LargeList(right))
+            | (DataType::LargeListView(left), DataType::LargeListView(right)) => {
+                self.field(left, right, depth + 1)
+            }
+            (DataType::FixedSizeList(left, ls), DataType::FixedSizeList(right, rs)) => {
+                if ls != rs {
+                    Ok(false)
+                } else {
+                    self.field(left, right, depth + 1)
+                }
+            }
+            (DataType::Struct(left), DataType::Struct(right)) => {
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for (left, right) in left.iter().zip(right) {
+                    if !self.field(left, right, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (DataType::Union(left, lm), DataType::Union(right, rm)) => {
+                if lm != rm || left.len() != right.len() {
+                    return Ok(false);
+                }
+                for ((li, left), (ri, right)) in left.iter().zip(right.iter()) {
+                    if li != ri || !self.field(left, right, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (DataType::Dictionary(lk, lv), DataType::Dictionary(rk, rv)) => {
+                Ok(self.ty(lk, rk, depth + 1)? && self.ty(lv, rv, depth + 1)?)
+            }
+            (DataType::Map(left, ls), DataType::Map(right, rs)) => {
+                if ls != rs {
+                    Ok(false)
+                } else {
+                    self.field(left, right, depth + 1)
+                }
+            }
+            (DataType::RunEndEncoded(lr, lv), DataType::RunEndEncoded(rr, rv)) => {
+                Ok(self.field(lr, rr, depth + 1)? && self.field(lv, rv, depth + 1)?)
+            }
+            (DataType::Timestamp(lu, lt), DataType::Timestamp(ru, rt)) => {
+                if lu != ru {
+                    return Ok(false);
+                }
+                match (lt, rt) {
+                    (Some(left), Some(right)) => self.bytes(left.as_bytes(), right.as_bytes()),
+                    (None, None) => Ok(true),
+                    _ => Ok(false),
+                }
+            }
+            _ => Ok(left == right),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,7 +281,7 @@ mod tests {
             } else {
                 assert_eq!(result, Ok(true));
                 work.finish().unwrap();
-                assert_eq!(*control.work.lock().unwrap(), [0, 256, 256, 89]);
+                assert_eq!(*control.work.lock().unwrap(), [0, 256, 256, 256, 133]);
             }
         }
     }
@@ -277,6 +336,66 @@ mod tests {
                 Ok(false)
             );
             assert!(!arrow_data_types_exact(&first, &second));
+        }
+    }
+    #[test]
+    fn owner_validated_field_comparison_does_not_add_default_type_admission_bounds() {
+        let field = Field::new(
+            "writer",
+            DataType::Struct(
+                (0..5000)
+                    .map(|i| Field::new(i.to_string(), DataType::Int32, false))
+                    .collect(),
+            ),
+            false,
+        );
+        let mut visits = 0;
+        assert_eq!(
+            arrow_fields_exact_observed::<ValueTypeError>(&field, &field, || {
+                visits += 1;
+                Ok(())
+            }),
+            Ok(true)
+        );
+        assert!(visits > 15000);
+        assert_eq!(
+            arrow_data_types_exact_observed::<ValueTypeError>(
+                field.data_type(),
+                field.data_type(),
+                || Ok(())
+            ),
+            Err(ValueTypeError::TooManyNodes)
+        );
+    }
+
+    #[test]
+    fn owner_bounded_long_timezone_comparison_observes_bytes_before_completion() {
+        let field = Field::new(
+            "writer_time",
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some("x".repeat(300 * 1024).into()),
+            ),
+            true,
+        );
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                failure: Some(failure),
+                work: Mutex::default(),
+            };
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation).unwrap();
+            assert_eq!(
+                arrow_fields_exact_observed::<Failure>(&field, &field, || work
+                    .step()
+                    .map_err(Failure::Control)),
+                Err(Failure::Control(failure))
+            );
+            assert_eq!(*control.work.lock().unwrap(), [0, 256]);
         }
     }
 }

@@ -27,6 +27,7 @@ mod error;
 mod identity;
 mod mutation;
 mod predicate;
+mod pure_compile;
 mod read;
 mod read_facts;
 mod read_program;
@@ -96,3 +97,5 @@ pub use scan::{
     ConnectorScan, FrozenConnectorScan, MAX_STATIC_SCAN_RETAINED_BYTES, ScanColumnId,
     StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment, StaticScanDynamicFilter,
 };
+
+pub use pure_compile::PureProviderCompileError;

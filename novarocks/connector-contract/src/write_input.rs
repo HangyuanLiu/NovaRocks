@@ -101,6 +101,78 @@ pub enum ConnectorWriteInputShape {
 }
 
 impl ConnectorWriteInputShape {
+    /// Exact roles, order, field tokens and complete Arrow fields, with observed
+    /// nested schema/metadata work and no field copying or packed-role guess.
+    /// Both shapes come from validated writer drafts, preserving the writer
+    /// owner's depth/aggregate-byte domain rather than a new type-node gate.
+    pub(crate) fn same_layout_observed<E>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        let same_roles = match (self, other) {
+            (Self::Data { fields: left }, Self::Data { fields: right }) => {
+                left.len() == right.len()
+            }
+            (
+                Self::EqualityDelete {
+                    equality_fields: left,
+                },
+                Self::EqualityDelete {
+                    equality_fields: right,
+                },
+            ) => left.len() == right.len(),
+            (
+                Self::RowLineage {
+                    data_fields: left,
+                    row_identity_fields: left_identity,
+                },
+                Self::RowLineage {
+                    data_fields: right,
+                    row_identity_fields: right_identity,
+                },
+            ) => left.len() == right.len() && left_identity.len() == right_identity.len(),
+            (
+                Self::PositionDelete {
+                    identity_fields: left,
+                    partition_source_fields: left_partition,
+                },
+                Self::PositionDelete {
+                    identity_fields: right,
+                    partition_source_fields: right_partition,
+                },
+            )
+            | (
+                Self::DeletionVector {
+                    identity_fields: left,
+                    partition_source_fields: left_partition,
+                },
+                Self::DeletionVector {
+                    identity_fields: right,
+                    partition_source_fields: right_partition,
+                },
+            ) => left.len() == right.len() && left_partition.len() == right_partition.len(),
+            _ => false,
+        };
+        if !same_roles {
+            return Ok(false);
+        }
+        for (left, right) in self.fields_iter().zip(other.fields_iter()) {
+            observe()?;
+            if left.token() != right.token()
+                || !novarocks_type_contract::arrow_fields_exact_observed::<E>(
+                    left.field(),
+                    right.field(),
+                    &mut observe,
+                )?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn owned_bounded(&self) -> Result<Self, ConnectorError> {
         let copy = |fields: &[ConnectorWriteFieldBinding]| {
             fields

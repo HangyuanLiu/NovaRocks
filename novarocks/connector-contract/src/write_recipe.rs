@@ -21,8 +21,11 @@
 use crate::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorEncodedPayload, ConnectorError,
     ConnectorErrorKind, ConnectorWriteBinding, ConnectorWriteInputShape,
-    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, WRITE_FIELD_ALLOCATION_CHARGE,
-    validate_write_field_schema,
+    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, PureProviderCompileError,
+    WRITE_FIELD_ALLOCATION_CHARGE, validate_write_field_schema,
+};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
 use std::{error::Error, fmt};
 
@@ -116,18 +119,22 @@ impl ConnectorWriteRecipeDraft {
 
 /// The caller selects the exact installed pure definition. This interface
 /// cannot recover or return an execution handle or acquire I/O capabilities.
+/// Private decode, canonicalization and copying must observe bounded work;
+/// interruption returns Control unchanged, never a Provider diagnostic.
 pub trait ConnectorWriteRecipeCompiler: Send + Sync {
     type Error: Error;
     fn compile_private(
         &self,
         draft: &ConnectorWriteRecipeDraft,
-    ) -> Result<ConnectorWriteRecipeDraft, Self::Error>;
+        control: &dyn PureCompileControl,
+    ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>>;
 }
 
 #[derive(Debug)]
 pub enum ConnectorWriteRecipeCompileError<E: Error> {
     Contract(ConnectorError),
     Provider(E),
+    Control(CompileControlError),
 }
 
 impl<E: Error> fmt::Display for ConnectorWriteRecipeCompileError<E> {
@@ -135,6 +142,7 @@ impl<E: Error> fmt::Display for ConnectorWriteRecipeCompileError<E> {
         match self {
             Self::Contract(error) => fmt::Display::fmt(error, f),
             Self::Provider(error) => fmt::Display::fmt(error, f),
+            Self::Control(error) => fmt::Display::fmt(error, f),
         }
     }
 }
@@ -147,18 +155,34 @@ impl ConnectorWriteRecipe {
     pub fn try_compile_with_provider<C: ConnectorWriteRecipeCompiler + ?Sized>(
         draft: &ConnectorWriteRecipeDraft,
         compiler: &C,
+        control: &dyn PureCompileControl,
     ) -> Result<Self, ConnectorWriteRecipeCompileError<C::Error>> {
-        let canonical = compiler
-            .compile_private(draft)
-            .map_err(ConnectorWriteRecipeCompileError::Provider)?;
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)
+            .map_err(ConnectorWriteRecipeCompileError::Control)?;
+        let canonical =
+            compiler
+                .compile_private(draft, control)
+                .map_err(|failure| match failure {
+                    PureProviderCompileError::Provider(error) => {
+                        ConnectorWriteRecipeCompileError::Provider(error)
+                    }
+                    PureProviderCompileError::Control(error) => {
+                        ConnectorWriteRecipeCompileError::Control(error)
+                    }
+                })?;
         if canonical.binding != draft.binding
             || canonical.payload.header() != draft.payload.header()
-            || canonical.input != draft.input
+            || !canonical
+                .input
+                .same_layout_observed::<CompileControlError>(&draft.input, || work.step())
+                .map_err(ConnectorWriteRecipeCompileError::Control)?
         {
             return Err(ConnectorWriteRecipeCompileError::Contract(invalid(
                 "writer recipe public facts changed during provider canonicalization",
             )));
         }
+        work.finish()
+            .map_err(ConnectorWriteRecipeCompileError::Control)?;
         Ok(Self(canonical))
     }
     pub const fn draft(&self) -> &ConnectorWriteRecipeDraft {
@@ -211,13 +235,20 @@ mod tests {
             Field::new(format!("v{index}"), DataType::Int64, false),
         )
     }
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
     struct Compiler(u8);
     impl ConnectorWriteRecipeCompiler for Compiler {
         type Error = ConnectorError;
         fn compile_private(
             &self,
             draft: &ConnectorWriteRecipeDraft,
-        ) -> Result<ConnectorWriteRecipeDraft, Self::Error> {
+            _: &dyn PureCompileControl,
+        ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>> {
             let mut input = draft.input.clone();
             let mut binding = draft.binding.clone();
             let mut payload = draft.payload.clone();
@@ -268,6 +299,7 @@ mod tests {
                 );
             }
             ConnectorWriteRecipeDraft::try_new(binding, payload, input)
+                .map_err(PureProviderCompileError::Provider)
         }
     }
     #[test]
@@ -275,7 +307,9 @@ mod tests {
         let draft = draft(ConnectorWriteInputShape::Data {
             fields: vec![field(1), field(2)],
         });
-        let recipe = ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(0)).unwrap();
+        let recipe =
+            ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(0), &Control)
+                .unwrap();
         assert_eq!(recipe.draft().input(), draft.input());
         assert_eq!(
             recipe.draft().payload().payload().as_ref(),
@@ -284,7 +318,11 @@ mod tests {
         for mutation in 1..=5 {
             assert!(
                 matches!(
-                    ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(mutation)),
+                    ConnectorWriteRecipe::try_compile_with_provider(
+                        &draft,
+                        &Compiler(mutation),
+                        &Control
+                    ),
                     Err(ConnectorWriteRecipeCompileError::Contract(_))
                 ),
                 "mutation {mutation}"
@@ -315,7 +353,7 @@ mod tests {
         ] {
             let draft = draft(input.clone());
             assert_eq!(
-                ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(0))
+                ConnectorWriteRecipe::try_compile_with_provider(&draft, &Compiler(0), &Control)
                     .unwrap()
                     .draft()
                     .input(),

@@ -19,7 +19,7 @@
 use crate::{
     ConnectorError, ConnectorErrorKind, ConnectorReadPublicFacts, ConnectorReadRelationKind,
     ConnectorReadRelationRecipe, ConnectorReadRelationRecipeDraft, FrozenConnectorScan,
-    MAX_STATIC_SCAN_RETAINED_BYTES, StaticConnectorScanError,
+    MAX_STATIC_SCAN_RETAINED_BYTES, PureProviderCompileError, StaticConnectorScanError,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
@@ -89,13 +89,15 @@ impl FrozenConnectorRead {
 /// The exact installed pure provider definition validates private facts against
 /// the entire frozen input. It may canonicalize private bytes only; the public
 /// source and scan facts are borrowed and cannot be replaced by this result.
+/// Decode, canonicalization and copying loops must observe bounded work through
+/// control; interruption returns Control unchanged, never a Provider diagnostic.
 pub trait ConnectorReadProgramCompiler: Send + Sync {
     type Error: Error;
     fn compile_private(
         &self,
         frozen: &FrozenConnectorRead,
         control: &dyn PureCompileControl,
-    ) -> Result<ConnectorReadRelationRecipeDraft, Self::Error>;
+    ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<Self::Error>>;
 }
 
 #[derive(Debug)]
@@ -128,9 +130,17 @@ impl ConnectorReadProgramRecipe {
         control
             .checkpoint(CompilePhase::ProviderValidation, 0)
             .map_err(ConnectorReadProgramCompileError::Control)?;
-        let canonical = compiler
-            .compile_private(frozen, control)
-            .map_err(ConnectorReadProgramCompileError::Provider)?;
+        let canonical =
+            compiler
+                .compile_private(frozen, control)
+                .map_err(|failure| match failure {
+                    PureProviderCompileError::Provider(error) => {
+                        ConnectorReadProgramCompileError::Provider(error)
+                    }
+                    PureProviderCompileError::Control(error) => {
+                        ConnectorReadProgramCompileError::Control(error)
+                    }
+                })?;
         let mut checkpoints =
             CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)
                 .map_err(ConnectorReadProgramCompileError::Control)?;
@@ -275,13 +285,14 @@ mod tests {
             &self,
             frozen: &FrozenConnectorRead,
             _: &dyn PureCompileControl,
-        ) -> Result<ConnectorReadRelationRecipeDraft, ConnectorError> {
+        ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<ConnectorError>>
+        {
             if frozen.public_facts().source().input_version().as_bytes() != [9]
                 || frozen.public_facts().source().selection_digest() != [7; 32]
             {
-                return Err(invalid(
+                return Err(PureProviderCompileError::Provider(invalid(
                     "fixture private source identity differs from public facts",
-                ));
+                )));
             }
             let draft = frozen.scan().recipe();
             let revision = if self.0 { 2 } else { 1 };
@@ -305,7 +316,7 @@ mod tests {
                 ),
                 draft.columns().iter().map(canonical).collect(),
             )
-            .map_err(|error| invalid(error.to_string()))
+            .map_err(|error| PureProviderCompileError::Provider(invalid(error.to_string())))
         }
     }
     fn frozen_with_columns(
@@ -393,7 +404,8 @@ mod tests {
                 &self,
                 frozen: &FrozenConnectorRead,
                 _: &dyn PureCompileControl,
-            ) -> Result<ConnectorReadRelationRecipeDraft, Self::Error> {
+            ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<Self::Error>>
+            {
                 let original = frozen.scan().recipe();
                 ConnectorReadRelationRecipeDraft::try_new(
                     original.binding().clone(),
@@ -403,7 +415,7 @@ mod tests {
                         Bytes::from(vec![0; MAX_STATIC_SCAN_RETAINED_BYTES]),
                     )],
                 )
-                .map_err(|e| invalid(e.to_string()))
+                .map_err(|e| PureProviderCompileError::Provider(invalid(e.to_string())))
             }
         }
         let frozen =
