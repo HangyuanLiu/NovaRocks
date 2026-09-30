@@ -30,6 +30,7 @@ mod artifact_provenance_contract;
 mod contract_regressions;
 mod exchange_occurrence_contract;
 mod ordering_window_assertion_contract;
+mod package_contract;
 mod partition_scan_contract;
 mod runtime_filter_wait_contract;
 mod set_operation_contract;

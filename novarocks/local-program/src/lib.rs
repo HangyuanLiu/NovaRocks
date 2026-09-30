@@ -21,7 +21,6 @@
 //! or async runtime dependency. A program's static representation moves here
 //! as its node and expression types are separated from task-owned bindings.
 
-mod connector_scan;
 mod contract;
 mod expressions;
 mod layout;
@@ -31,10 +30,6 @@ mod runtime_filter;
 mod sink;
 mod values;
 
-pub use connector_scan::{
-    ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
-    StaticScanDynamicFilter,
-};
 pub use contract::{
     CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,
     FragmentSinkAssignmentRequirement, KernelAbiVersion, LayoutIdentity, RuntimeFilterContract,
@@ -46,6 +41,10 @@ pub use expressions::{
     StaticFieldSchema, StaticFunctionKind, StaticLiteral,
 };
 pub use layout::{LayoutError, StaticLayout};
+pub use novarocks_connector_contract::{
+    ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
+    StaticScanDynamicFilter,
+};
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,

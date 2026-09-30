@@ -29,8 +29,13 @@ mod mutation;
 mod predicate;
 mod read;
 mod recipe;
+mod scan;
+mod type_projection;
 mod value;
 mod write;
+mod write_input;
+mod write_recipe;
+mod write_schema;
 
 pub use catalog::{CATALOG_VERSION_BYTES, CatalogHandle, CatalogVersion};
 pub use codec::{
@@ -58,5 +63,19 @@ pub use recipe::{
     MAX_CONNECTOR_RECIPE_BYTES, MAX_CONNECTOR_RECIPE_COLUMNS, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
     MAX_CONNECTOR_RECIPE_SPLIT_WEIGHT,
 };
+pub use type_projection::{connector_type_accepts_arrow, connector_type_for_arrow};
 pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECISION};
 pub use write::{ConnectorWriteFieldToken, MAX_CONNECTOR_WRITE_TARGETS, WriteTargetOrdinal};
+pub use write_input::{
+    ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteInputShape,
+};
+pub use write_recipe::{
+    ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,
+    ConnectorWriteRecipeDraft, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+};
+pub use write_schema::*;
+
+pub use scan::{
+    ConnectorScan, FrozenConnectorScan, MAX_STATIC_SCAN_RETAINED_BYTES, ScanColumnId,
+    StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment, StaticScanDynamicFilter,
+};

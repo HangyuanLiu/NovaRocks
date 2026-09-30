@@ -1,0 +1,310 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::resource::CutResourcePreflight;
+use crate::{FragmentPackageInput, FragmentSink, RuntimeFilterApplyPoint};
+
+pub(crate) fn validate_package(input: &FragmentPackageInput) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationContext::new();
+    let fragment = &input.fragment;
+    let mut usage = CutResourcePreflight::new();
+    usage.add_fragment(fragment, &mut errors);
+    usage.add_cuts(fragment, &input.cuts, &mut errors);
+    usage.add_items(input.scans.len());
+    for scan in input.scans.values() {
+        usage.add_bytes(scan.retained_bytes());
+        usage.add_items(scan.assignments().len());
+    }
+    usage.add_items(input.writes.len());
+    for write in input.writes.values() {
+        usage.add_bytes(write.charged_bytes());
+        usage.add_items(write.input().field_count());
+    }
+    if let Some(result) = &input.result {
+        usage.add_items(result.fields.len());
+        for field in &result.fields {
+            usage.add_bytes(field.name.len());
+            usage.add_bytes(field.alias.as_ref().map_or(0, |alias| alias.len()));
+            usage.add_value_type(&field.ty, "package.result.type", &mut errors);
+        }
+    }
+    usage.add_items(input.parameters.entries().len());
+    for value in input.parameters.entries().values() {
+        if let novarocks_type_contract::SemanticParameterValue::TimeZone(zone) = value {
+            usage.add_bytes(zone.len());
+        }
+    }
+    usage.add_items(input.annotations.len());
+    for annotation in &input.annotations {
+        usage.add_bytes(annotation.key.len());
+        usage.add_bytes(annotation.value.len());
+    }
+    usage.validate("package.resources", &mut errors);
+    if !errors.is_empty() {
+        return Err(ValidationErrors::from_collector(errors));
+    }
+    if input.required.plan_contract_revision != PLAN_CONTRACT_REVISION {
+        errors.push(ValidationError::new(
+            "package.required",
+            "fragment package plan contract revision differs",
+        ));
+    }
+    validate_fragment_structure_into(fragment, &mut errors);
+    if !errors.is_empty() {
+        return Err(ValidationErrors::from_collector(errors));
+    }
+    validate_fragment_cuts_into(fragment, &input.cuts, &mut errors);
+    validate_fragment_partition_identities(fragment, &input.cuts, &mut errors);
+    match (fragment.sink(), &input.result) {
+        (FragmentSink::Result, Some(result)) => {
+            validate_result_port_fields(fragment, result, &mut errors)
+        }
+        (FragmentSink::Result, None) => errors.push(ValidationError::new(
+            "package.result",
+            "result sink has no result port",
+        )),
+        (_, Some(_)) => errors.push(ValidationError::new(
+            "package.result",
+            "result port has no result sink",
+        )),
+        (_, None) => {}
+    }
+    validate_annotation_table(
+        &input.annotations,
+        |subject| match subject {
+            AnnotationSubject::Plan => false,
+            AnnotationSubject::Fragment(id) => id == fragment.id(),
+            AnnotationSubject::Node(id, node) => {
+                id == fragment.id() && fragment.nodes().contains_key(&node)
+            }
+            AnnotationSubject::Value(id, value) => {
+                id == fragment.id() && fragment.values().contains_key(&value)
+            }
+        },
+        &mut errors,
+    );
+    match input
+        .parameters
+        .project(crate::package::fragment_parameter_references(fragment))
+    {
+        Ok(closure) if closure == input.parameters => {}
+        Ok(_) => errors.push(ValidationError::new(
+            "package.parameters",
+            "semantic parameter table contains unused definitions",
+        )),
+        Err(error) => errors.push(ValidationError::new(
+            "package.parameters",
+            error.to_string(),
+        )),
+    }
+    validate_package_scans(input, &mut errors);
+    validate_package_writes(input, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors::from_collector(errors))
+    }
+}
+
+fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationContext) {
+    let fragment = &input.fragment;
+    let mut consumers_by_scan: BTreeMap<NodeId, BTreeMap<crate::RuntimeFilterId, Vec<_>>> =
+        BTreeMap::new();
+    for filter in &input.cuts.runtime_filters {
+        for consumer in &filter.consumers {
+            if consumer.endpoint.fragment == fragment.id()
+                && consumer.apply_point == RuntimeFilterApplyPoint::ScanSource
+            {
+                consumers_by_scan
+                    .entry(consumer.endpoint.node)
+                    .or_default()
+                    .entry(filter.id)
+                    .or_default()
+                    .push(consumer);
+            }
+        }
+    }
+    for node in fragment.nodes().values() {
+        let NodeKind::Scan {
+            relation,
+            read_budget,
+            provider_outputs,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        let path = format!("package.scans[{}]", node.id.get());
+        let Some(scan) = input.scans.get(&node.id) else {
+            errors.push(ValidationError::new(
+                &path,
+                "physical scan has no complete frozen public facts",
+            ));
+            continue;
+        };
+        let recipe = scan.recipe();
+        if recipe.binding() != &relation.read().binding
+            || recipe.relation() != &relation.read().relation
+            || recipe.columns().len() != relation.schema().len()
+            || !recipe
+                .columns()
+                .iter()
+                .zip(relation.schema())
+                .all(|(column, field)| column == &field.column.column_payload)
+        {
+            errors.push(ValidationError::new(
+                &path,
+                "frozen scan recipe differs from its exact physical relation or column occurrence",
+            ));
+        }
+        if scan.assignments().len() != relation.schema().len()
+            || !scan
+                .assignments()
+                .iter()
+                .zip(relation.schema())
+                .all(|(assignment, field)| {
+                    novarocks_connector_contract::connector_type_accepts_arrow(
+                        assignment.value_type(),
+                        &field.ty.data_type,
+                    )
+                })
+        {
+            errors.push(ValidationError::new(
+                &path,
+                "frozen scan assignment type differs from its exact physical schema ordinal",
+            ));
+        }
+        if scan.max_batch_rows().get() != read_budget.max_batch_rows
+            || scan.max_batch_bytes().get() != read_budget.max_batch_bytes
+            || scan.work_source() != relation.work_source()
+        {
+            errors.push(ValidationError::new(
+                &path,
+                "frozen scan execution bounds or work source differ from the physical scan",
+            ));
+        }
+        let assignment_columns = scan
+            .assignments()
+            .iter()
+            .enumerate()
+            .map(|(index, assignment)| (assignment.variable(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut actual_filters = BTreeSet::new();
+        for dynamic in scan.dynamic_filters() {
+            let filter_id = crate::RuntimeFilterId::new(dynamic.filter_id());
+            let value = assignment_columns
+                .get(dynamic.variable())
+                .and_then(|ordinal| provider_outputs.get(*ordinal))
+                .map(|(_, value)| value);
+            let valid = consumers_by_scan
+                .get(&node.id)
+                .and_then(|filters| filters.get(&filter_id))
+                .is_some_and(|consumers| {
+                    !consumers.is_empty()
+                        && consumers.iter().all(|consumer| {
+                            consumer.endpoint.values.len() == 1
+                                && consumer.endpoint.values.first() == value
+                        })
+                });
+            if !valid {
+                errors.push(ValidationError::new(
+                    &path,
+                    "dynamic filter does not bind the exact local scan consumer column",
+                ));
+            }
+            actual_filters.insert(filter_id);
+        }
+        let expected_filters = consumers_by_scan
+            .get(&node.id)
+            .map(|filters| filters.keys().copied().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        if actual_filters != expected_filters {
+            errors.push(ValidationError::new(
+                &path,
+                "frozen scan dynamic filters do not cover its exact local consumers",
+            ));
+        }
+        if errors.is_saturated() {
+            errors.mark_truncated();
+            return;
+        }
+    }
+    for id in input.scans.keys() {
+        if !fragment
+            .nodes()
+            .get(id)
+            .is_some_and(|node| matches!(node.kind, NodeKind::Scan { .. }))
+        {
+            errors.push(ValidationError::new(
+                "package.scans",
+                "frozen scan facts name a missing or non-scan node",
+            ));
+        }
+    }
+}
+
+fn validate_package_writes(input: &FragmentPackageInput, errors: &mut ValidationContext) {
+    for node in input.fragment.nodes().values() {
+        let NodeKind::TableWriter { target } = &node.kind else {
+            continue;
+        };
+        let path = format!("package.writes[{}]", node.id.get());
+        let Some(write) = input.writes.get(&node.id) else {
+            errors.push(ValidationError::new(
+                &path,
+                "physical writer has no complete frozen public facts",
+            ));
+            continue;
+        };
+        if write.payload() != &target.handle
+            || write.input().field_count() != target.target_fields.len()
+            || !write
+                .input()
+                .fields_iter()
+                .zip(&target.target_fields)
+                .all(|(field, target)| {
+                    field.token() == target.token
+                        && field.field().name() == target.provider_name.as_ref()
+                        && novarocks_connector_contract::arrow_data_types_exact(
+                            field.field().data_type(),
+                            &target.ty.data_type,
+                        )
+                        && field.field().is_nullable() == target.ty.nullable
+                })
+        {
+            errors.push(ValidationError::new(&path, "frozen writer recipe differs from its exact physical handle or input field occurrence"));
+        }
+        if errors.is_saturated() {
+            errors.mark_truncated();
+            return;
+        }
+    }
+    for id in input.writes.keys() {
+        if !input
+            .fragment
+            .nodes()
+            .get(id)
+            .is_some_and(|node| matches!(node.kind, NodeKind::TableWriter { .. }))
+        {
+            errors.push(ValidationError::new(
+                "package.writes",
+                "frozen write facts name a missing or non-writer node",
+            ));
+        }
+    }
+}

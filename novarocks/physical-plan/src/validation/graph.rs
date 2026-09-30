@@ -919,60 +919,64 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
             "result_port",
             "plan has more than one result sink",
         )),
-        (Some(result), [fragment]) => {
-            if result.fragment != fragment.id() {
-                errors.push(ValidationError::new(
-                    "result_port.fragment",
-                    "result port belongs to another fragment",
-                ));
-            }
-            if result.output.node != fragment.root() {
-                errors.push(ValidationError::new(
-                    "result_port.output",
-                    "result output is not the result fragment root",
-                ));
-            }
-            match fragment.nodes().get(&result.output.node) {
-                Some(node) if node.output == result.output => {}
-                Some(_) => errors.push(ValidationError::new(
-                    "result_port.output",
-                    "result output differs from the node output port",
-                )),
-                None => errors.push(ValidationError::new(
-                    "result_port.output",
-                    "result node is not defined",
-                )),
-            }
-            if result.fields.len() != result.output.columns.len() {
-                errors.push(ValidationError::new(
-                    "result_port.fields",
-                    "result schema width differs from output width",
-                ));
-            }
-            for (ordinal, (field, value)) in
-                result.fields.iter().zip(&result.output.columns).enumerate()
-            {
-                if field.value != *value {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result value differs at ordinal {ordinal}"),
-                    ));
-                }
-                if field.name.is_empty() {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result name is empty at ordinal {ordinal}"),
-                    ));
-                }
-                if let Some(definition) = fragment.values().get(value)
-                    && definition.ty != field.ty
-                {
-                    errors.push(ValidationError::new(
-                        "result_port.fields",
-                        format!("result type differs at ordinal {ordinal}"),
-                    ));
-                }
-            }
+        (Some(result), [fragment]) => validate_result_port_fields(fragment, result, errors),
+    }
+}
+
+pub(crate) fn validate_result_port_fields(
+    fragment: &Fragment,
+    result: &crate::ResultPort,
+    errors: &mut ValidationContext,
+) {
+    if result.fragment != fragment.id() {
+        errors.push(ValidationError::new(
+            "result_port.fragment",
+            "result port belongs to another fragment",
+        ));
+    }
+    if result.output.node != fragment.root() {
+        errors.push(ValidationError::new(
+            "result_port.output",
+            "result output is not the result fragment root",
+        ));
+    }
+    match fragment.nodes().get(&result.output.node) {
+        Some(node) if node.output == result.output => {}
+        Some(_) => errors.push(ValidationError::new(
+            "result_port.output",
+            "result output differs from the node output port",
+        )),
+        None => errors.push(ValidationError::new(
+            "result_port.output",
+            "result node is not defined",
+        )),
+    }
+    if result.fields.len() != result.output.columns.len() {
+        errors.push(ValidationError::new(
+            "result_port.fields",
+            "result schema width differs from output width",
+        ));
+    }
+    for (ordinal, (field, value)) in result.fields.iter().zip(&result.output.columns).enumerate() {
+        if field.value != *value {
+            errors.push(ValidationError::new(
+                "result_port.fields",
+                format!("result value differs at ordinal {ordinal}"),
+            ));
+        }
+        if field.name.is_empty() {
+            errors.push(ValidationError::new(
+                "result_port.fields",
+                format!("result name is empty at ordinal {ordinal}"),
+            ));
+        }
+        if let Some(definition) = fragment.values().get(value)
+            && definition.ty != field.ty
+        {
+            errors.push(ValidationError::new(
+                "result_port.fields",
+                format!("result type differs at ordinal {ordinal}"),
+            ));
         }
     }
 }

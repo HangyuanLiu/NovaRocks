@@ -1631,6 +1631,9 @@ fn validate_table_binding(
     function: &novarocks_physical_plan::BoundTableFunction,
     arguments: &[ExprId],
 ) -> Result<(), String> {
+    if !function.semantic_parameters.is_empty() {
+        return Err("native wire v1 cannot carry frozen semantic parameter references".into());
+    }
     for argument in &function.argument_types {
         validate_function_argument_type(argument)?;
     }
@@ -1740,6 +1743,9 @@ fn validate_bound_function(
     result_type: FunctionResultType,
     aggregate: Option<AggregateBindingSelection>,
 ) -> Result<(), String> {
+    if !function.semantic_parameters.is_empty() {
+        return Err("native wire v1 cannot carry frozen semantic parameter references".into());
+    }
     for argument in &function.argument_types {
         validate_function_argument_type(argument)?;
     }
@@ -2173,72 +2179,7 @@ fn physical_type_accepts_connector_type(
     data_type: &arrow::datatypes::DataType,
     connector_type: ConnectorValueType,
 ) -> bool {
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    matches!(
-        (data_type, connector_type),
-        (DataType::Boolean, ConnectorValueType::Boolean)
-            | (DataType::Int8, ConnectorValueType::TinyInt)
-            | (DataType::Int16, ConnectorValueType::SmallInt)
-            | (DataType::Int32, ConnectorValueType::Integer)
-            | (DataType::Int64, ConnectorValueType::BigInt)
-            | (DataType::Float32, ConnectorValueType::Real)
-            | (DataType::Float64, ConnectorValueType::Double)
-            | (DataType::Date32, ConnectorValueType::Date)
-            | (
-                DataType::Time64(TimeUnit::Microsecond),
-                ConnectorValueType::TimeMicros
-            )
-            | (
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                ConnectorValueType::TimestampMillis
-            )
-            | (
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                ConnectorValueType::TimestampMicros
-            )
-            | (
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                ConnectorValueType::TimestampNanos
-            )
-            | (
-                DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
-                ConnectorValueType::TimestampTzMicros
-            )
-            | (
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(_)),
-                ConnectorValueType::TimestampTzNanos
-            )
-            | (DataType::Utf8, ConnectorValueType::Varchar)
-            | (DataType::Binary, ConnectorValueType::Varbinary)
-            | (DataType::FixedSizeBinary(16), ConnectorValueType::Uuid)
-            | (
-                DataType::FixedSizeBinary(16),
-                ConnectorValueType::Fixed { length: 16 }
-            )
-            // `NonComparable` is the connector's own name for a column whose
-            // engine type has no comparable counterpart -- ROW, ARRAY, MAP,
-            // and the variant a large binary carries -- so those engine types
-            // are exactly what it types.
-            | (
-                DataType::List(_)
-                    | DataType::LargeList(_)
-                    | DataType::FixedSizeList(_, _)
-                    | DataType::Map(_, _)
-                    | DataType::Struct(_)
-                    | DataType::LargeBinary,
-                ConnectorValueType::NonComparable
-            )
-    ) || matches!(
-        (data_type, connector_type),
-        (
-            DataType::Decimal128(precision, scale),
-            ConnectorValueType::Decimal {
-                precision: connector_precision,
-                scale: connector_scale,
-            }
-        ) if *precision == connector_precision && *scale == connector_scale
-    )
+    novarocks_connector_contract::connector_type_accepts_arrow(connector_type, data_type)
 }
 
 fn preflight_scan_dynamic_filters(
@@ -2916,7 +2857,7 @@ fn encode_node_payload(
                             function_order_by,
                         )?,
                         aggregate_binding: aggregate_binding
-                            .as_ref()
+                            .as_deref()
                             .map(encode_aggregate_signature)
                             .transpose()?,
                     })
@@ -3293,7 +3234,15 @@ fn encode_table_writer(
                 column_id: ordinal_u32(ordinal)?
                     .checked_add(1)
                     .ok_or_else(|| "writer target schema slot overflowed".to_string())?,
-                name: field_token_name(fact, field.token)?,
+                name: {
+                    if field_token_name(fact, field.token)?.as_str() != field.provider_name.as_ref()
+                    {
+                        return Err(
+                            "writer provider name differs from its frozen target field".into()
+                        );
+                    }
+                    field.provider_name.to_string()
+                },
                 r#type: Some(encode_physical_type(&field.ty.data_type)?),
                 nullable: field.ty.nullable,
                 is_internal: field.hidden,
@@ -4855,6 +4804,7 @@ mod tests {
         builder.register(definition).unwrap();
         let catalog = builder.seal_bound().unwrap();
         let function = novarocks_physical_plan::BoundFunction {
+            semantic_parameters: Box::default(),
             function_id,
             overload,
             kind: FunctionKind::Scalar,

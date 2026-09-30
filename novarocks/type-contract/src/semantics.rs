@@ -45,6 +45,16 @@ impl SemanticParameterId {
     }
 }
 
+/// An exact dependency on one frozen value in its lexical setting scope.
+/// Different scopes may bind the same stable key to different sparse IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SemanticParameterRef {
+    pub id: SemanticParameterId,
+    pub expected_key: SemanticParameterKey,
+}
+
+pub const MAX_SEMANTIC_PARAMETERS: usize = 4096;
+
 /// The value variant fixes its semantic key and logical type. A codec must
 /// reject a different key/type instead of coercing or supplying a default.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,7 +66,8 @@ pub enum SemanticParameterValue {
     AllowThrowException(bool),
     DecimalOverflowToDouble(bool),
     GroupConcatLegacy(bool),
-    GroupConcatMaxLen(u64),
+    /// Raw admitted setting; specialization applies the existing minimum clamp.
+    GroupConcatMaxLen(i64),
 }
 
 impl SemanticParameterValue {
@@ -77,7 +88,6 @@ impl SemanticParameterValue {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SemanticParameters {
     entries: BTreeMap<SemanticParameterId, SemanticParameterValue>,
-    keys: BTreeMap<SemanticParameterKey, SemanticParameterId>,
 }
 
 impl SemanticParameters {
@@ -85,13 +95,20 @@ impl SemanticParameters {
         entries: impl IntoIterator<Item = (SemanticParameterId, SemanticParameterValue)>,
     ) -> Result<Self, SemanticParameterError> {
         let mut table = Self::default();
+        let mut has_statement_start = false;
         for (id, value) in entries {
             let key = value.key();
             if table.entries.contains_key(&id) {
                 return Err(SemanticParameterError::DuplicateId(id));
             }
-            if table.keys.contains_key(&key) {
-                return Err(SemanticParameterError::DuplicateKey(key));
+            if table.entries.len() >= MAX_SEMANTIC_PARAMETERS {
+                return Err(SemanticParameterError::TooManyParameters);
+            }
+            if key == SemanticParameterKey::StatementStartUtc {
+                if has_statement_start {
+                    return Err(SemanticParameterError::DuplicateStatementStart);
+                }
+                has_statement_start = true;
             }
             if let SemanticParameterValue::TimeZone(zone) = &value
                 && (zone.is_empty() || zone.len() > 255 || zone.chars().any(char::is_control))
@@ -99,7 +116,6 @@ impl SemanticParameters {
                 return Err(SemanticParameterError::InvalidTimeZone);
             }
             table.entries.insert(id, value);
-            table.keys.insert(key, id);
         }
         Ok(table)
     }
@@ -114,28 +130,30 @@ impl SemanticParameters {
 
     pub fn require(
         &self,
-        key: SemanticParameterKey,
-    ) -> Result<(SemanticParameterId, &SemanticParameterValue), SemanticParameterError> {
-        let id = self
-            .keys
-            .get(&key)
-            .copied()
-            .ok_or(SemanticParameterError::MissingKey(key))?;
-        Ok((id, &self.entries[&id]))
+        reference: SemanticParameterRef,
+    ) -> Result<&SemanticParameterValue, SemanticParameterError> {
+        let value = self
+            .entries
+            .get(&reference.id)
+            .ok_or(SemanticParameterError::MissingId(reference.id))?;
+        if value.key() != reference.expected_key {
+            return Err(SemanticParameterError::KeyMismatch(reference));
+        }
+        Ok(value)
     }
 
-    /// Extract the exact parameter closure of a fragment. Repeated references
-    /// share one definition; absent parameters cannot acquire process defaults.
+    /// Extract exact dependencies, preserving scoped values and sparse IDs.
+    /// A shared definition is cloned once; every reference's key is checked.
     pub fn project(
         &self,
-        required: impl IntoIterator<Item = SemanticParameterKey>,
+        required: impl IntoIterator<Item = SemanticParameterRef>,
     ) -> Result<Self, SemanticParameterError> {
         let mut selected = BTreeSet::new();
         let mut entries = Vec::new();
-        for key in required {
-            if selected.insert(key) {
-                let (id, value) = self.require(key)?;
-                entries.push((id, value.clone()));
+        for reference in required {
+            let value = self.require(reference)?;
+            if selected.insert(reference.id) {
+                entries.push((reference.id, value.clone()));
             }
         }
         Self::try_new(entries)
@@ -145,8 +163,10 @@ impl SemanticParameters {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticParameterError {
     DuplicateId(SemanticParameterId),
-    DuplicateKey(SemanticParameterKey),
-    MissingKey(SemanticParameterKey),
+    DuplicateStatementStart,
+    MissingId(SemanticParameterId),
+    KeyMismatch(SemanticParameterRef),
+    TooManyParameters,
     InvalidTimeZone,
 }
 
@@ -154,8 +174,19 @@ impl fmt::Display for SemanticParameterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateId(id) => write!(f, "duplicate semantic parameter ID {}", id.get()),
-            Self::DuplicateKey(key) => write!(f, "duplicate semantic parameter key {key:?}"),
-            Self::MissingKey(key) => write!(f, "missing required semantic parameter {key:?}"),
+            Self::DuplicateStatementStart => {
+                f.write_str("statement start has multiple authorities")
+            }
+            Self::MissingId(id) => write!(f, "missing semantic parameter ID {}", id.get()),
+            Self::KeyMismatch(reference) => write!(
+                f,
+                "semantic parameter ID {} does not have expected key {:?}",
+                reference.id.get(),
+                reference.expected_key
+            ),
+            Self::TooManyParameters => {
+                f.write_str("semantic parameter table exceeds its definition bound")
+            }
             Self::InvalidTimeZone => f.write_str(
                 "semantic time zone must contain 1..255 bytes and no control characters",
             ),
@@ -212,8 +243,14 @@ mod tests {
         .unwrap();
         let projected = table
             .project([
-                SemanticParameterKey::StatementStartUtc,
-                SemanticParameterKey::StatementStartUtc,
+                SemanticParameterRef {
+                    id: clock,
+                    expected_key: SemanticParameterKey::StatementStartUtc,
+                },
+                SemanticParameterRef {
+                    id: clock,
+                    expected_key: SemanticParameterKey::StatementStartUtc,
+                },
             ])
             .unwrap();
         assert_eq!(projected.entries().len(), 1);
@@ -223,8 +260,11 @@ mod tests {
         );
         assert_eq!(projected.clone(), projected);
         assert!(matches!(
-            projected.require(SemanticParameterKey::TimeZone),
-            Err(SemanticParameterError::MissingKey(_))
+            projected.require(SemanticParameterRef {
+                id: SemanticParameterId::new(2),
+                expected_key: SemanticParameterKey::TimeZone
+            }),
+            Err(SemanticParameterError::MissingId(_))
         ));
     }
 
@@ -244,16 +284,64 @@ mod tests {
             [
                 (
                     SemanticParameterId::new(1),
-                    SemanticParameterValue::AllowThrowException(true),
+                    SemanticParameterValue::StatementStartUtc(1),
                 ),
                 (
                     SemanticParameterId::new(2),
-                    SemanticParameterValue::AllowThrowException(false),
+                    SemanticParameterValue::StatementStartUtc(2),
                 ),
             ],
         ] {
             assert!(SemanticParameters::try_new(entries).is_err());
         }
+    }
+
+    #[test]
+    fn lexical_scopes_keep_distinct_values_for_the_same_key() {
+        let first = SemanticParameterRef {
+            id: SemanticParameterId::new(7),
+            expected_key: SemanticParameterKey::AllowThrowException,
+        };
+        let second = SemanticParameterRef {
+            id: SemanticParameterId::new(u32::MAX),
+            expected_key: SemanticParameterKey::AllowThrowException,
+        };
+        let table = SemanticParameters::try_new([
+            (first.id, SemanticParameterValue::AllowThrowException(true)),
+            (
+                second.id,
+                SemanticParameterValue::AllowThrowException(false),
+            ),
+            (
+                SemanticParameterId::new(2),
+                SemanticParameterValue::GroupConcatMaxLen(-121),
+            ),
+        ])
+        .unwrap();
+        let projected = table.project([first, second, first]).unwrap();
+        assert_eq!(projected.entries().len(), 2);
+        assert_eq!(
+            projected.require(first).unwrap(),
+            &SemanticParameterValue::AllowThrowException(true)
+        );
+        assert_eq!(
+            projected.require(second).unwrap(),
+            &SemanticParameterValue::AllowThrowException(false)
+        );
+        assert_eq!(
+            table.get(SemanticParameterId::new(2)),
+            Some(&SemanticParameterValue::GroupConcatMaxLen(-121))
+        );
+        assert!(matches!(
+            table.project([
+                first,
+                SemanticParameterRef {
+                    id: first.id,
+                    expected_key: SemanticParameterKey::TimeZone
+                }
+            ]),
+            Err(SemanticParameterError::KeyMismatch(_))
+        ));
     }
 
     #[test]
@@ -273,6 +361,34 @@ mod tests {
                 SemanticParameterValue::TimeZone("x".repeat(255).into())
             )])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn definition_bound_is_independent_of_sparse_ids() {
+        let entries = (0..MAX_SEMANTIC_PARAMETERS)
+            .map(|index| {
+                (
+                    SemanticParameterId::new(u32::MAX - index as u32),
+                    SemanticParameterValue::AllowThrowException(index % 2 == 0),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            SemanticParameters::try_new(entries.clone())
+                .unwrap()
+                .entries()
+                .len(),
+            MAX_SEMANTIC_PARAMETERS
+        );
+        let mut over = entries;
+        over.push((
+            SemanticParameterId::new(0),
+            SemanticParameterValue::GroupConcatMaxLen(-1),
+        ));
+        assert_eq!(
+            SemanticParameters::try_new(over),
+            Err(SemanticParameterError::TooManyParameters)
         );
     }
 

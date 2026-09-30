@@ -798,12 +798,14 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
                     required_distribution: Distribution::Singleton,
                     target_fields: Box::from([
                         WriterTargetField {
+                            provider_name: "a".into(),
                             token: token_a,
                             input: imported_a,
                             ty: input_ty.clone(),
                             hidden: false,
                         },
                         WriterTargetField {
+                            provider_name: "b".into(),
                             token: token_b,
                             input: imported_b,
                             ty: input_ty,

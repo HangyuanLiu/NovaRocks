@@ -26,6 +26,14 @@ use novarocks_type_contract::{
 
 use crate::{ExprId, FunctionArgumentType, ValueId, ValueType};
 
+/// One expression use occurrence. Shared ExprIds retain independent demand;
+/// this value does not authorize caching across uses or control domains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExprUse {
+    pub expr: ExprId,
+    pub demand: novarocks_type_contract::EvaluationDemand,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundFunction {
     pub function_id: FunctionId,
@@ -37,6 +45,8 @@ pub struct BoundFunction {
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
     pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
+    /// Exact frozen environment dependencies of this bound call occurrence.
+    pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
 }
 
 /// Exact binding for a function whose result is a relation rather than a
@@ -52,6 +62,8 @@ pub struct BoundTableFunction {
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
     pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
+    /// Exact frozen environment dependencies of this bound call occurrence.
+    pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,11 +236,11 @@ pub enum ExprKind {
     /// and the depth bound exists to stop pathological nesting rather than to
     /// cap how many conditions a user may write.
     ///
-    /// `args` is evaluation order. Three-valued `AND` is associative and
-    /// commutative, but its arguments are not: they may fail or be volatile,
-    /// so a consumer must evaluate left to right and stop at the first `false`.
-    /// Any parenthesisation that preserves this order is observably equal,
-    /// which is what lets a codec shape the list into a balanced tree.
+    /// The list preserves source occurrences. A pure Boolean region may be
+    /// scheduled using exact effect facts and buffer row data errors. Value
+    /// demand is decided by FALSE; TruthOnly demand is decided by FALSE or
+    /// NULL. Observable state/effects and strong conditional domains constrain
+    /// movement independently of Boolean associativity.
     Conjunction {
         args: Box<[ExprId]>,
     },
@@ -287,7 +299,7 @@ pub enum ExprKind {
         function_order_by: Box<[SortExpr]>,
         frame: Option<WindowFrame>,
         ignore_nulls: bool,
-        aggregate_binding: Option<AggregateBinding>,
+        aggregate_binding: Option<Box<AggregateBinding>>,
     },
 }
 

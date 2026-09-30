@@ -77,6 +77,19 @@ impl CutResourcePreflight {
         }
     }
 
+    pub(crate) fn add_fragment(&mut self, fragment: &Fragment, errors: &mut ValidationContext) {
+        self.usage.merge(fragment_usage(fragment, errors));
+    }
+
+    pub(crate) fn add_cuts(
+        &mut self,
+        fragment: &Fragment,
+        cuts: &FragmentCuts,
+        errors: &mut ValidationContext,
+    ) {
+        self.usage.merge(fragment_cut_usage(fragment, cuts, errors));
+    }
+
     pub(crate) fn add_items(&mut self, count: usize) {
         self.usage.add_items(count);
     }
@@ -205,6 +218,21 @@ pub(crate) fn validate_fragment_cut_resources(
     cuts: &FragmentCuts,
     errors: &mut ValidationContext,
 ) {
+    let usage = fragment_cut_usage(fragment, cuts, errors);
+    validate_usage(
+        "fragment.cuts.resources",
+        usage,
+        MAX_FRAGMENT_DYNAMIC_ITEMS,
+        MAX_FRAGMENT_DYNAMIC_BYTES,
+        errors,
+    );
+}
+
+fn fragment_cut_usage(
+    fragment: &Fragment,
+    cuts: &FragmentCuts,
+    errors: &mut ValidationContext,
+) -> ResourceUsage {
     let prefix = format!("fragments[{}].cuts", fragment.id().get());
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
     usage.add_item_counts([
@@ -330,13 +358,7 @@ pub(crate) fn validate_fragment_cut_resources(
             errors,
         );
     }
-    validate_usage(
-        &format!("{prefix}.resources"),
-        usage,
-        MAX_FRAGMENT_DYNAMIC_ITEMS,
-        MAX_FRAGMENT_DYNAMIC_BYTES,
-        errors,
-    );
+    usage
 }
 
 fn add_writer_result_cut_usage(
@@ -605,7 +627,10 @@ fn add_function_usage(
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
 ) {
-    usage.add_items(function.argument_types.len());
+    usage.add_item_counts([
+        function.argument_types.len(),
+        function.semantic_parameters.len(),
+    ]);
     usage.add_byte_counts([
         function.function_id.as_str().len(),
         function.overload.as_str().len(),
@@ -625,7 +650,11 @@ fn add_table_function_usage(
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
 ) {
-    usage.add_item_counts([function.argument_types.len(), function.result_types.len()]);
+    usage.add_item_counts([
+        function.argument_types.len(),
+        function.result_types.len(),
+        function.semantic_parameters.len(),
+    ]);
     usage.add_byte_counts([
         function.function_id.as_str().len(),
         function.overload.as_str().len(),
@@ -885,6 +914,13 @@ fn add_node_usage(
             for (index, field) in target.target_fields.iter().enumerate() {
                 if usage.exhausted() {
                     return;
+                }
+                usage.add_bytes(field.provider_name.len());
+                if field.provider_name.len() > MAX_DATA_TYPE_FIELD_NAME_BYTES {
+                    errors.push(ValidationError::resource_limit(
+                        format!("{path}.target_fields[{index}].provider_name"),
+                        "writer provider field name exceeds the field-name byte limit",
+                    ));
                 }
                 validate_value_type(
                     &field.ty,
@@ -1624,6 +1660,7 @@ mod tests {
     #[test]
     fn function_and_aggregate_identity_bytes_are_accounted() {
         let function = BoundFunction {
+            semantic_parameters: Box::default(),
             function_id: novarocks_type_contract::FunctionId::try_new("f".repeat(1024)).unwrap(),
             overload: novarocks_type_contract::FunctionOverloadId::try_new("o".repeat(1024))
                 .unwrap(),

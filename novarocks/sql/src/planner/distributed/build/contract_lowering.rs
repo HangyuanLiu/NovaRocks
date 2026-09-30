@@ -2692,6 +2692,7 @@ impl ContractLoweringVisitor {
                 }
                 Ok(WriterTargetField {
                     token: target.token,
+                    provider_name: target.column.name.clone().into(),
                     input: *value,
                     // Stated in the plan's own vocabulary, like every other
                     // type it carries: the provider's decoration belongs to
@@ -6657,6 +6658,7 @@ impl ContractLoweringVisitor {
             output.clone().into_boxed_slice(),
             NodeKind::TableFunction {
                 function: BoundTableFunction {
+                    semantic_parameters: Box::default(),
                     function_id: binding.function_id.clone(),
                     overload: binding.selected.overload.clone(),
                     argument_types: binding
@@ -7014,7 +7016,7 @@ impl ContractLoweringVisitor {
                 function_order_by,
                 frame,
                 ignore_nulls: window.ignore_nulls,
-                aggregate_binding,
+                aggregate_binding: aggregate_binding.map(Box::new),
             },
         )?)
     }
@@ -7601,6 +7603,7 @@ impl ContractLoweringVisitor {
                     .collect::<Result<Vec<_>, _>>()?;
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
+                        semantic_parameters: Box::default(),
                         function_id: binding.function_id.clone(),
                         overload: binding.selected.overload.clone(),
                         kind: binding.kind,
@@ -8810,6 +8813,7 @@ fn bound_function_from_resolved(
     result_type: &ValueType,
 ) -> BoundFunction {
     BoundFunction {
+        semantic_parameters: Box::default(),
         function_id: binding.function_id.clone(),
         overload: binding.selected.overload.clone(),
         kind: binding.kind,
@@ -8953,6 +8957,7 @@ fn lower_aggregate_binding(
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
         function: BoundFunction {
+            semantic_parameters: Box::default(),
             function_id: resolved.function_id.clone(),
             overload: resolved.selected.overload.clone(),
             kind: resolved.kind,

@@ -462,6 +462,18 @@ impl ConnectorReadRelationRecipe {
     }
 }
 
+impl AsRef<ConnectorReadRelationRecipeDraft> for ConnectorReadRelationRecipeDraft {
+    fn as_ref(&self) -> &ConnectorReadRelationRecipeDraft {
+        self
+    }
+}
+
+impl AsRef<ConnectorReadRelationRecipeDraft> for ConnectorReadRelationRecipe {
+    fn as_ref(&self) -> &ConnectorReadRelationRecipeDraft {
+        self.draft()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;

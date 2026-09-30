@@ -29,8 +29,10 @@ use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
 mod binding;
+mod evaluation;
 
 pub use binding::*;
+pub use evaluation::*;
 pub use novarocks_type_contract::{
     AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,

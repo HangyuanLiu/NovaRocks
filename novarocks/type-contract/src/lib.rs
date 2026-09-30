@@ -48,6 +48,7 @@ pub use partition::{
     PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
 };
 pub use semantics::{
-    BooleanValue, EvaluationDemand, SemanticParameterError, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterValue, SemanticParameters,
+    BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    SemanticParameters,
 };

@@ -11,4 +11,5 @@ workspace = true
 doctest = false
 
 [dependencies]
+arrow-schema.workspace = true
 bytes.workspace = true

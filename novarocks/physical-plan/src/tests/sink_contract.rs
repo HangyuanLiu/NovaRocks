@@ -207,7 +207,7 @@ fn route(
 }
 
 #[derive(Clone, Copy)]
-enum RouterWriterShape {
+pub(super) enum RouterWriterShape {
     Valid,
     OrdinalDrift,
     TokenDrift,
@@ -216,7 +216,9 @@ enum RouterWriterShape {
     UnionAuxiliarySwap,
 }
 
-fn finish_router_writer_plan(shape: RouterWriterShape) -> Result<PhysicalPlan, ValidationErrors> {
+pub(super) fn finish_router_writer_plan(
+    shape: RouterWriterShape,
+) -> Result<PhysicalPlan, ValidationErrors> {
     finish_router_writer_fixture(shape).1
 }
 
@@ -383,6 +385,7 @@ fn finish_router_writer_fixture(
                     input: Box::from([imported]),
                     required_distribution: edge_distribution.clone(),
                     target_fields: Box::from([WriterTargetField {
+                        provider_name: "v".into(),
                         token: writer_token,
                         input: imported,
                         ty: ty(DataType::Int64, false),
@@ -544,6 +547,7 @@ fn finish_router_writer_fixture(
                         input: Box::from([local_input_value]),
                         required_distribution: Distribution::Singleton,
                         target_fields: Box::from([WriterTargetField {
+                            provider_name: "v".into(),
                             token: ConnectorWriteFieldToken::from_bytes([8; 32]),
                             input: local_input_value,
                             ty: ty(DataType::Int64, false),

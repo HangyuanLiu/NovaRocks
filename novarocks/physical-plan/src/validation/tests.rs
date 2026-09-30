@@ -442,6 +442,7 @@ mod validation_error_tests {
     fn aggregate_sequence_index_builds_once_for_many_distinct_lookups_and_ambiguity() {
         let binding = |sequence| crate::AggregateBinding {
             function: crate::BoundFunction {
+                semantic_parameters: Box::default(),
                 function_id: crate::FunctionId::try_new("builtin/test_sum/v1").unwrap(),
                 overload: crate::FunctionOverloadId::try_new("i64").unwrap(),
                 kind: crate::FunctionKind::Aggregate,

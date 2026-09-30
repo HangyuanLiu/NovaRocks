@@ -435,6 +435,7 @@ fn finish_topn_reduction(
 
 fn window_function() -> BoundFunction {
     BoundFunction {
+        semantic_parameters: Box::default(),
         function_id: FunctionId::try_new("builtin/row_number/v1").unwrap(),
         overload: FunctionOverloadId::try_new("row-number-empty").unwrap(),
         kind: FunctionKind::Window,
@@ -992,6 +993,7 @@ fn finish_table_function_with_sink(
             },
             kind: NodeKind::TableFunction {
                 function: BoundTableFunction {
+                    semantic_parameters: Box::default(),
                     function_id: FunctionId::try_new("builtin/generate_one/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("empty-to-i64").unwrap(),
                     argument_types: Box::default(),

@@ -25,6 +25,7 @@ mod artifact;
 mod builder;
 mod expression;
 mod identity;
+mod package;
 mod plan;
 mod relation;
 mod resource;
@@ -44,6 +45,7 @@ pub use novarocks_type_contract::{
     PartitionCountParameterIdentityError, PartitionHashAlgorithm, PartitionSpaceId,
     PartitionSpaceIdentityError,
 };
+pub use package::*;
 pub use plan::*;
 pub use relation::*;
 pub use resource::{
@@ -60,7 +62,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 5;
+pub const PLAN_CONTRACT_REVISION: u32 = 6;
 
 #[cfg(test)]
 mod tests;

@@ -317,7 +317,7 @@ fn null_safe_join_filter(
     (fragment, filter, other_left_value)
 }
 
-fn scan_lineage_filter(
+pub(super) fn scan_lineage_filter(
     through_filter: bool,
     through_project: bool,
     through_inner_join: bool,
@@ -2190,6 +2190,7 @@ fn table_function_fragment(
             },
             kind: NodeKind::TableFunction {
                 function: BoundTableFunction {
+                    semantic_parameters: Box::default(),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("i64-to-i64-utf8").unwrap(),
                     argument_types: Box::from([FunctionArgumentType::Value(ty(
@@ -2282,6 +2283,7 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
             value_type.clone(),
             ExprKind::FunctionCall {
                 function: BoundFunction {
+                    semantic_parameters: Box::default(),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("disguised-scalar").unwrap(),
                     kind: FunctionKind::Table,
@@ -2402,6 +2404,7 @@ fn higher_order_function_fragment(
             parameter_type.clone(),
             ExprKind::FunctionCall {
                 function: BoundFunction {
+                    semantic_parameters: Box::default(),
                     function_id: FunctionId::try_new("builtin/test_higher_order/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("lambda-i64-to-i64").unwrap(),
                     kind: FunctionKind::Scalar,
@@ -2502,15 +2505,16 @@ fn lambda_cannot_be_reused_outside_its_exact_bound_argument_positions() {
 }
 
 #[derive(Clone, Copy)]
-enum TableWriterFixture {
+pub(super) enum TableWriterFixture {
     InputPort,
     TargetField,
     Distribution,
     SchemaRevision,
     SchemaRole,
+    ProviderName(usize),
 }
 
-fn invalid_table_writer_fragment(
+pub(super) fn invalid_table_writer_fragment(
     fixture: TableWriterFixture,
 ) -> Result<Fragment, ValidationErrors> {
     use novarocks_connector_contract::{ConnectorCodecCategory, ConnectorWriteFieldToken};
@@ -2600,6 +2604,10 @@ fn invalid_table_writer_fragment(
                     }]),
                     required_distribution: writer_distribution,
                     target_fields: Box::from([WriterTargetField {
+                        provider_name: match fixture {
+                            TableWriterFixture::ProviderName(bytes) => "v".repeat(bytes).into(),
+                            _ => "v".into(),
+                        },
                         token: ConnectorWriteFieldToken::from_bytes([7; 32]),
                         input: if matches!(fixture, TableWriterFixture::TargetField) {
                             output_value
@@ -2663,6 +2671,22 @@ fn table_writer_rejects_a_relabelled_fixed_relation_field() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("writer relation field differs from its closed role contract"));
+}
+
+#[test]
+fn table_writer_provider_name_is_complete_and_bounded() {
+    invalid_table_writer_fragment(TableWriterFixture::ProviderName(1)).unwrap();
+    invalid_table_writer_fragment(TableWriterFixture::ProviderName(
+        MAX_DATA_TYPE_FIELD_NAME_BYTES,
+    ))
+    .unwrap();
+    let empty = invalid_table_writer_fragment(TableWriterFixture::ProviderName(0)).unwrap_err();
+    assert!(empty.to_string().contains("empty provider name"));
+    let oversized = invalid_table_writer_fragment(TableWriterFixture::ProviderName(
+        MAX_DATA_TYPE_FIELD_NAME_BYTES + 1,
+    ))
+    .unwrap_err();
+    assert!(oversized.to_string().contains("field-name byte limit"));
 }
 
 #[derive(Clone, Copy)]
@@ -2852,6 +2876,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
         },
         binding: AggregateBinding {
             function: BoundFunction {
+                semantic_parameters: Box::default(),
                 function_id: FunctionId::try_new("builtin/test_statistics/v1").unwrap(),
                 overload: FunctionOverloadId::try_new("i64-to-binary").unwrap(),
                 kind: FunctionKind::Aggregate,

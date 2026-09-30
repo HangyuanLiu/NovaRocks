@@ -1423,6 +1423,12 @@ pub(crate) fn validate_node_semantics(
             );
             let mut target_tokens = BTreeSet::new();
             for field in &target.target_fields {
+                if field.provider_name.is_empty() {
+                    errors.push(ValidationError::new(
+                        path,
+                        "table writer target field has an empty provider name",
+                    ));
+                }
                 if !target_tokens.insert(&field.token) {
                     errors.push(ValidationError::new(
                         path,

@@ -500,6 +500,9 @@ pub struct WriterTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriterTargetField {
     pub token: ConnectorWriteFieldToken,
+    /// Exact provider name frozen alongside this token. It is validated
+    /// against the same private target before a runtime writer is created.
+    pub provider_name: Box<str>,
     pub input: ValueId,
     pub ty: ValueType,
     pub hidden: bool,
@@ -710,8 +713,9 @@ pub enum NodeKind {
     /// that predicate count never becomes expression depth, and so that
     /// consumers that reason per conjunct - pushdown, residual responsibility,
     /// runtime-filter placement - read the conjuncts directly instead of
-    /// re-splitting a tree. Order is evaluation order and short-circuits at the
-    /// first `false`, exactly as [`crate::ExprKind::Conjunction`] does.
+    /// re-splitting a tree. Each predicate is a TruthOnly use; FALSE or NULL
+    /// decides rejection. Scheduling must preserve the exact effect and
+    /// conditional-domain responsibilities of each occurrence.
     Filter {
         predicates: Box<[ExprId]>,
     },
@@ -821,6 +825,97 @@ pub struct ScanReadBudget {
 }
 
 impl NodeKind {
+    /// Runtime expression roots, in occurrence order. Proof-only provider
+    /// guarantee references are excluded. Join keys retain Value demand; a
+    /// NULL-aware anti join also needs its predicate's three-valued result.
+    pub fn evaluation_roots(&self) -> Vec<crate::ExprUse> {
+        use novarocks_type_contract::EvaluationDemand::{TruthOnly, Value};
+        let mut roots = Vec::new();
+        let mut append = |expr, demand| roots.push(crate::ExprUse { expr, demand });
+        match self {
+            Self::Scan { residuals, .. } => {
+                for expr in residuals {
+                    append(*expr, TruthOnly);
+                }
+            }
+            Self::Filter { predicates } => {
+                for expr in predicates {
+                    append(*expr, TruthOnly);
+                }
+            }
+            Self::HashJoin {
+                kind,
+                keys,
+                residual,
+                ..
+            } => {
+                for key in keys {
+                    append(key.left, Value);
+                    append(key.right, Value);
+                }
+                if let Some(expr) = residual {
+                    append(
+                        *expr,
+                        if *kind == JoinKind::NullAwareLeftAnti {
+                            Value
+                        } else {
+                            TruthOnly
+                        },
+                    );
+                }
+            }
+            Self::NestLoopJoin {
+                kind, predicate, ..
+            } => {
+                if let Some(expr) = predicate {
+                    append(
+                        *expr,
+                        if *kind == JoinKind::NullAwareLeftAnti {
+                            Value
+                        } else {
+                            TruthOnly
+                        },
+                    );
+                }
+            }
+            Self::ChangeEventExpand { events, .. } => {
+                for event in events {
+                    if let Some(expr) = event.predicate {
+                        append(expr, TruthOnly);
+                    }
+                    for (_, expr) in &event.assignments {
+                        if let Some(expr) = expr {
+                            append(*expr, Value);
+                        }
+                    }
+                }
+            }
+            Self::Project { .. }
+            | Self::Aggregate { .. }
+            | Self::Sort { .. }
+            | Self::TopN { .. }
+            | Self::Window(_)
+            | Self::Values { .. }
+            | Self::GenerateSeries { .. }
+            | Self::TableFunction { .. }
+            | Self::Unpivot { .. }
+            | Self::TableFinish(_) => {
+                let mut references = Vec::new();
+                self.expression_references(&mut references);
+                for expr in references {
+                    append(expr, Value);
+                }
+            }
+            Self::Limit { .. }
+            | Self::SetOp { .. }
+            | Self::Repeat { .. }
+            | Self::AssertOneRow(_)
+            | Self::ExchangeSource { .. }
+            | Self::TableWriter { .. } => {}
+        }
+        roots
+    }
+
     pub(crate) fn expression_references(&self, output: &mut Vec<ExprId>) {
         match self {
             Self::Scan {

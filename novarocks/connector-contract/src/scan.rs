@@ -23,9 +23,10 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use novarocks_connector_contract::{
+use crate::{
     ConnectorExpression, ConnectorReadRelationKind, ConnectorReadRelationRecipe,
-    ConnectorReadWorkSource, ConnectorValueType, MAX_CONNECTOR_RECIPE_COLUMNS, TupleDomain,
+    ConnectorReadRelationRecipeDraft, ConnectorReadWorkSource, ConnectorValueType,
+    MAX_CONNECTOR_RECIPE_COLUMNS, TupleDomain,
 };
 
 const MAX_SCAN_NAME_BYTES: usize = 256;
@@ -48,7 +49,7 @@ impl ScanColumnId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticScanAssignment {
     variable: Arc<str>,
     value_type: ConnectorValueType,
@@ -71,7 +72,7 @@ impl StaticScanAssignment {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticScanDynamicFilter {
     filter_id: u32,
     variable: Arc<str>,
@@ -94,9 +95,11 @@ impl StaticScanDynamicFilter {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct StaticConnectorScan {
-    recipe: ConnectorReadRelationRecipe,
+/// Shared public scan facts. The recipe type states whether private provider
+/// validation has run; neither form owns a reader or other live capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorScan<R> {
+    recipe: R,
     assignments: Arc<[StaticScanAssignment]>,
     enforced_predicate: TupleDomain<ScanColumnId>,
     unenforced_predicate: TupleDomain<ScanColumnId>,
@@ -105,6 +108,7 @@ pub struct StaticConnectorScan {
     max_batch_rows: NonZeroU64,
     max_batch_bytes: NonZeroU64,
     work_source: ConnectorReadWorkSource,
+    retained_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,13 +137,18 @@ impl fmt::Display for StaticConnectorScanError {
 
 impl std::error::Error for StaticConnectorScanError {}
 
-impl StaticConnectorScan {
+/// Structurally checked frozen input carried by a physical FragmentPackage.
+pub type FrozenConnectorScan = ConnectorScan<ConnectorReadRelationRecipeDraft>;
+/// Provider-validated input consumed by a local program.
+pub type StaticConnectorScan = ConnectorScan<ConnectorReadRelationRecipe>;
+
+impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
     #[expect(
         clippy::too_many_arguments,
         reason = "The frozen scan has independent public semantics and one provider recipe."
     )]
     pub fn try_new(
-        recipe: ConnectorReadRelationRecipe,
+        recipe: R,
         assignments: Vec<StaticScanAssignment>,
         enforced_predicate: TupleDomain<ScanColumnId>,
         unenforced_predicate: TupleDomain<ScanColumnId>,
@@ -155,7 +164,7 @@ impl StaticConnectorScan {
         if assignments.len() > MAX_CONNECTOR_RECIPE_COLUMNS {
             return Err(StaticConnectorScanError::TooManyAssignments);
         }
-        if assignments.len() != recipe.draft().columns().len() {
+        if assignments.len() != recipe.as_ref().columns().len() {
             return Err(StaticConnectorScanError::RecipeColumnMismatch);
         }
         let mut variables = BTreeMap::new();
@@ -221,11 +230,11 @@ impl StaticConnectorScan {
             }
         }
         if work_source == ConnectorReadWorkSource::WholeRelation
-            && recipe.draft().relation().kind() != ConnectorReadRelationKind::SystemTable
+            && recipe.as_ref().relation().kind() != ConnectorReadRelationKind::SystemTable
         {
             return Err(StaticConnectorScanError::WholeRelationRequiresSystemTable);
         }
-        let mut retained = recipe.draft().charged_bytes();
+        let mut retained = recipe.as_ref().charged_bytes();
         let assignment_bytes = assignments
             .iter()
             .try_fold(0usize, |total, assignment| {
@@ -248,7 +257,11 @@ impl StaticConnectorScan {
             .and_then(|value| value.checked_add(tuple_domain_bytes(&enforced_predicate)?))
             .and_then(|value| value.checked_add(tuple_domain_bytes(&unenforced_predicate)?))
             .and_then(|value| {
-                value.checked_add(remaining_expression.as_ref().map_or(0, expression_bytes))
+                value.checked_add(
+                    remaining_expression
+                        .as_ref()
+                        .map_or(Some(0), expression_bytes)?,
+                )
             })
             .ok_or(StaticConnectorScanError::TooManyRetainedBytes)?;
         if retained > MAX_STATIC_SCAN_RETAINED_BYTES {
@@ -264,10 +277,11 @@ impl StaticConnectorScan {
             max_batch_rows,
             max_batch_bytes,
             work_source,
+            retained_bytes: retained,
         })
     }
 
-    pub const fn recipe(&self) -> &ConnectorReadRelationRecipe {
+    pub const fn recipe(&self) -> &R {
         &self.recipe
     }
 
@@ -302,6 +316,12 @@ impl StaticConnectorScan {
     pub const fn work_source(&self) -> ConnectorReadWorkSource {
         self.work_source
     }
+
+    /// The checked conservative charge computed from these frozen facts.
+    /// A containing package must still enforce its cumulative budget.
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
 }
 
 fn tuple_domain_bytes(domain: &TupleDomain<ScanColumnId>) -> Option<usize> {
@@ -323,36 +343,36 @@ fn tuple_domain_bytes(domain: &TupleDomain<ScanColumnId>) -> Option<usize> {
     Some(total)
 }
 
-fn expression_bytes(expression: &ConnectorExpression) -> usize {
-    let mut total = 0;
+fn expression_bytes(expression: &ConnectorExpression) -> Option<usize> {
+    let mut total = 0usize;
     let mut pending = vec![expression];
     while let Some(node) = pending.pop() {
-        total += std::mem::size_of::<ConnectorExpression>();
+        total = total.checked_add(std::mem::size_of::<ConnectorExpression>())?;
         match node {
             ConnectorExpression::Constant { value, .. } => {
-                total += value.as_ref().map_or(0, |value| value.payload_bytes())
+                total =
+                    total.checked_add(value.as_ref().map_or(0, |value| value.payload_bytes()))?
             }
-            ConnectorExpression::Variable { name, .. } => total += name.len(),
+            ConnectorExpression::Variable { name, .. } => total = total.checked_add(name.len())?,
             ConnectorExpression::FieldDereference { target, .. } => pending.push(target),
             ConnectorExpression::Call {
                 function,
                 arguments,
                 ..
             } => {
-                total += function.as_str().len();
+                total = total.checked_add(function.as_str().len())?;
                 pending.extend(arguments);
             }
         }
     }
-    total
+    Some(total)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use bytes::Bytes;
-    use novarocks_connector_contract::{
+    use crate::{
         CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
         ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding,
@@ -360,6 +380,7 @@ mod tests {
         ConnectorReadRelationRecipeCompiler, ConnectorReadRelationRecipeDraft,
         ConnectorReadRelationRecipeError, ConnectorValue, Domain, ValueSet,
     };
+    use bytes::Bytes;
 
     use super::*;
 
@@ -475,6 +496,58 @@ mod tests {
                 ConnectorReadWorkSource::RuntimeSplits,
             ),
             Err(StaticConnectorScanError::PredicateTypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn frozen_and_compiled_scans_share_one_public_contract() {
+        let compiled_recipe = recipe();
+        let assignment = vec![StaticScanAssignment::new(
+            Arc::from("v"),
+            ConnectorValueType::BigInt,
+        )];
+        let frozen = FrozenConnectorScan::try_new(
+            compiled_recipe.draft().clone(),
+            assignment.clone(),
+            TupleDomain::all(),
+            TupleDomain::all(),
+            None,
+            vec![StaticScanDynamicFilter::new(7, Arc::from("v"))],
+            NonZeroU64::new(17).unwrap(),
+            NonZeroU64::new(8192).unwrap(),
+            ConnectorReadWorkSource::RuntimeSplits,
+        )
+        .unwrap();
+        let compiled = StaticConnectorScan::try_new(
+            compiled_recipe,
+            assignment,
+            frozen.enforced_predicate().clone(),
+            frozen.unenforced_predicate().clone(),
+            frozen.remaining_expression().cloned(),
+            frozen.dynamic_filters().to_vec(),
+            frozen.max_batch_rows(),
+            frozen.max_batch_bytes(),
+            frozen.work_source(),
+        )
+        .unwrap();
+        assert_eq!(frozen.recipe(), compiled.recipe().draft());
+        assert_eq!(frozen.assignments(), compiled.assignments());
+        assert_eq!(frozen.dynamic_filters(), compiled.dynamic_filters());
+        assert_eq!(frozen.max_batch_rows().get(), 17);
+        assert_eq!(frozen.max_batch_bytes().get(), 8192);
+        assert!(matches!(
+            FrozenConnectorScan::try_new(
+                frozen.recipe().clone(),
+                frozen.assignments().to_vec(),
+                TupleDomain::all(),
+                TupleDomain::all(),
+                None,
+                vec![StaticScanDynamicFilter::new(7, Arc::from("unknown"))],
+                frozen.max_batch_rows(),
+                frozen.max_batch_bytes(),
+                frozen.work_source(),
+            ),
+            Err(StaticConnectorScanError::UnknownDynamicFilterVariable)
         ));
     }
 }

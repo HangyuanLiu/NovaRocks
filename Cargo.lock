@@ -3673,6 +3673,7 @@ dependencies = [
 name = "novarocks-connector-contract"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "bytes",
 ]
 
@@ -4288,6 +4289,7 @@ dependencies = [
  "chrono",
  "hex",
  "md-5 0.10.6",
+ "novarocks-connector-contract",
  "novarocks-functions",
  "novarocks-parser",
  "novarocks-physical-plan",

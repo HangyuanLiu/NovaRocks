@@ -278,7 +278,10 @@ impl ProviderReadColumnNeed {
         if name.trim().is_empty() {
             return Err(CompletionProtocolError::InvalidProviderReadColumn { ordinal });
         }
-        if provider_connector_type_for_engine(&engine_type.data_type) != Some(connector_type) {
+        if !novarocks_connector_contract::connector_type_accepts_arrow(
+            connector_type,
+            &engine_type.data_type,
+        ) {
             return Err(CompletionProtocolError::ProviderReadColumnTypeMismatch { ordinal });
         }
         Ok(Self {
@@ -317,61 +320,7 @@ impl ProviderReadColumnNeed {
     }
 }
 
-pub(super) fn provider_connector_type_for_engine(
-    data_type: &arrow::datatypes::DataType,
-) -> Option<ConnectorValueType> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    match data_type {
-        DataType::Boolean => Some(ConnectorValueType::Boolean),
-        DataType::Int8 => Some(ConnectorValueType::TinyInt),
-        DataType::Int16 => Some(ConnectorValueType::SmallInt),
-        DataType::Int32 => Some(ConnectorValueType::Integer),
-        DataType::Int64 => Some(ConnectorValueType::BigInt),
-        DataType::Float32 => Some(ConnectorValueType::Real),
-        DataType::Float64 => Some(ConnectorValueType::Double),
-        DataType::Decimal128(precision, scale) if *precision <= 38 => {
-            Some(ConnectorValueType::Decimal {
-                precision: *precision,
-                scale: *scale,
-            })
-        }
-        DataType::Date32 => Some(ConnectorValueType::Date),
-        DataType::Time64(TimeUnit::Microsecond) => Some(ConnectorValueType::TimeMicros),
-        DataType::Timestamp(TimeUnit::Millisecond, None) => {
-            Some(ConnectorValueType::TimestampMillis)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Some(ConnectorValueType::TimestampMicros)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => Some(ConnectorValueType::TimestampNanos),
-        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
-            Some(ConnectorValueType::TimestampTzMicros)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
-            Some(ConnectorValueType::TimestampTzNanos)
-        }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            Some(ConnectorValueType::Varchar)
-        }
-        DataType::Binary | DataType::BinaryView => Some(ConnectorValueType::Varbinary),
-        // A variant's encoded value is the one thing carried in a large
-        // binary, and the connector's own vocabulary already puts it beside
-        // ROW/ARRAY/MAP: it is not a binary anyone compares, and a predicate
-        // over it is not a predicate over bytes.
-        DataType::LargeBinary => Some(ConnectorValueType::NonComparable),
-        DataType::FixedSizeBinary(length) if *length >= 0 => Some(ConnectorValueType::Fixed {
-            length: *length as u32,
-        }),
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::ListView(_)
-        | DataType::LargeListView(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::Struct(_)
-        | DataType::Map(_, _) => Some(ConnectorValueType::NonComparable),
-        _ => None,
-    }
-}
+pub(super) use novarocks_connector_contract::connector_type_for_arrow as provider_connector_type_for_engine;
 
 impl fmt::Debug for ProviderReadColumnNeed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

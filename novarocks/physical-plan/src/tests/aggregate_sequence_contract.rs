@@ -54,6 +54,7 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
     };
     AggregateBinding {
         function: BoundFunction {
+            semantic_parameters: Box::default(),
             function_id: FunctionId::try_new(function_id).unwrap(),
             overload: FunctionOverloadId::try_new(overload).unwrap(),
             kind: FunctionKind::Aggregate,

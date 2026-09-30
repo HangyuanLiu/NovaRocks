@@ -28,7 +28,7 @@
 /// into additional physical writer placements does not charge again.
 ///
 /// [`ConnectorWriterHandle`]: super::ConnectorWriterHandle
-pub const MAX_CONNECTOR_WRITER_HANDLE_BYTES: usize = 16 * 1024 * 1024;
+pub use novarocks_connector_contract::MAX_CONNECTOR_WRITER_HANDLE_BYTES;
 
 /// The largest total canonical encoding of all unique logical writer handles in
 /// one sealed query plan. The frontend is the only owner of this budget: a

@@ -23,6 +23,7 @@ mod graph;
 mod index;
 mod limits;
 mod node;
+mod package;
 mod properties;
 mod runtime_filter;
 
@@ -37,6 +38,7 @@ pub(crate) use graph::*;
 pub(crate) use index::*;
 pub use limits::*;
 pub(crate) use node::*;
+pub(crate) use package::*;
 pub(crate) use properties::*;
 pub(crate) use runtime_filter::*;
 
@@ -270,12 +272,19 @@ pub(crate) fn validate_provider_read_occurrences(
 }
 
 pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut ValidationContext) {
-    let prefix = format!("fragments[{}]", fragment.id().get());
     let previous_errors = errors.len();
     validate_fragment_resources(fragment, errors);
     if errors.len() != previous_errors {
         return;
     }
+    validate_fragment_structure_into(fragment, errors);
+}
+
+pub(crate) fn validate_fragment_structure_into(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+) {
+    let prefix = format!("fragments[{}]", fragment.id().get());
     bounded_count(
         errors,
         &format!("{prefix}.nodes"),
@@ -412,28 +421,9 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
 }
 
 pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationContext) {
-    bounded_count(
-        errors,
-        "annotations",
-        plan.annotations().len(),
-        MAX_ANNOTATIONS,
-    );
-    let total_bytes = plan
-        .annotations()
-        .iter()
-        .fold(0_usize, |total, annotation| {
-            total
-                .saturating_add(annotation.key.len())
-                .saturating_add(annotation.value.len())
-        });
-    if total_bytes > MAX_ANNOTATION_BYTES {
-        errors.push(ValidationError::resource_limit(
-            "annotations",
-            format!("contains {total_bytes} bytes, exceeding {MAX_ANNOTATION_BYTES}"),
-        ));
-    }
-    for (index, annotation) in plan.annotations().iter().enumerate() {
-        let valid = match annotation.subject {
+    validate_annotation_table(
+        plan.annotations(),
+        |subject| match subject {
             AnnotationSubject::Plan => true,
             AnnotationSubject::Fragment(fragment) => plan.fragments().contains_key(&fragment),
             AnnotationSubject::Node(fragment, node) => plan
@@ -444,7 +434,30 @@ pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationC
                 .fragments()
                 .get(&fragment)
                 .is_some_and(|fragment| fragment.values().contains_key(&value)),
-        };
+        },
+        errors,
+    );
+}
+
+pub(crate) fn validate_annotation_table(
+    annotations: &[crate::PlanAnnotation],
+    valid_subject: impl Fn(AnnotationSubject) -> bool,
+    errors: &mut ValidationContext,
+) {
+    bounded_count(errors, "annotations", annotations.len(), MAX_ANNOTATIONS);
+    let total_bytes = annotations.iter().fold(0_usize, |total, annotation| {
+        total
+            .saturating_add(annotation.key.len())
+            .saturating_add(annotation.value.len())
+    });
+    if total_bytes > MAX_ANNOTATION_BYTES {
+        errors.push(ValidationError::resource_limit(
+            "annotations",
+            format!("contains {total_bytes} bytes, exceeding {MAX_ANNOTATION_BYTES}"),
+        ));
+    }
+    for (index, annotation) in annotations.iter().enumerate() {
+        let valid = valid_subject(annotation.subject);
         // Four different faults read alike once they are one message, and an
         // annotation names a subject the reader has to go and find.
         let fault = if !valid {
