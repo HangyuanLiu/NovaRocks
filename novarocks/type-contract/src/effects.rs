@@ -55,10 +55,58 @@ pub enum ArgumentControl {
     Coalesce,
     SimpleCase,
     SearchedCase,
-    HigherOrder,
+    /// The exact overload owner declares the lambda argument and the body's
+    /// consumption context. Boolean-returning bodies are not automatically
+    /// TruthOnly: map/materialization and truth filtering have different uses.
+    HigherOrder {
+        body_ordinal: u32,
+        body_demand: crate::EvaluationDemand,
+    },
     Aggregate,
     Window,
     Table,
+}
+
+impl ArgumentControl {
+    /// Match the invocation protocol to already verified exact owner facts.
+    /// Arity, ordered child definitions, guards and types remain separate
+    /// obligations. This comparison does not authenticate an owner declaration
+    /// or authorize effect movement. Relational lifecycle protocols deliberately
+    /// do not become scalar Eager invocations.
+    pub const fn matches_scalar_shape(self, shape: crate::ControlShape) -> bool {
+        use crate::ControlShape;
+        match (self, shape) {
+            (Self::Eager, ControlShape::Eager)
+            | (Self::TypeOnly, ControlShape::TypeOnly)
+            | (Self::If, ControlShape::If)
+            | (Self::Coalesce, ControlShape::Coalesce)
+            | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
+            | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
+            (
+                Self::HigherOrder {
+                    body_ordinal,
+                    body_demand,
+                },
+                ControlShape::HigherOrder {
+                    body_ordinal: actual_ordinal,
+                    body_demand: actual_demand,
+                },
+            ) => {
+                body_ordinal == actual_ordinal
+                    && matches!(
+                        (body_demand, actual_demand),
+                        (
+                            crate::EvaluationDemand::Value,
+                            crate::EvaluationDemand::Value
+                        ) | (
+                            crate::EvaluationDemand::TruthOnly,
+                            crate::EvaluationDemand::TruthOnly
+                        )
+                    )
+            }
+            _ => false,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FunctionNullBehavior {
@@ -136,7 +184,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::Coalesce
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
-                        | ArgumentControl::HigherOrder
+                        | ArgumentControl::HigherOrder { .. }
                 ) && matches!(
                     self.instance_state,
                     FunctionInstanceState::None | FunctionInstanceState::ScalarInstance
@@ -458,5 +506,95 @@ mod tests {
             call.validate_refinement(&base, scope),
             Err(EffectContractError::ControlMismatch)
         );
+    }
+
+    #[test]
+    fn exact_control_matches_shape_without_inventing_a_scalar_lifecycle() {
+        use crate::{ControlShape, EvaluationDemand};
+        let controls = [
+            ArgumentControl::Eager,
+            ArgumentControl::TypeOnly,
+            ArgumentControl::If,
+            ArgumentControl::Coalesce,
+            ArgumentControl::SimpleCase,
+            ArgumentControl::SearchedCase,
+            ArgumentControl::HigherOrder {
+                body_ordinal: 2,
+                body_demand: EvaluationDemand::Value,
+            },
+            ArgumentControl::HigherOrder {
+                body_ordinal: 2,
+                body_demand: EvaluationDemand::TruthOnly,
+            },
+            ArgumentControl::Aggregate,
+            ArgumentControl::Window,
+            ArgumentControl::Table,
+        ];
+        let shapes = [
+            ControlShape::Eager,
+            ControlShape::TypeOnly,
+            ControlShape::If,
+            ControlShape::Coalesce,
+            ControlShape::Case {
+                simple: true,
+                arms: 1,
+                has_else: true,
+            },
+            ControlShape::Case {
+                simple: false,
+                arms: 1,
+                has_else: true,
+            },
+            ControlShape::HigherOrder {
+                body_ordinal: 2,
+                body_demand: EvaluationDemand::Value,
+            },
+            ControlShape::HigherOrder {
+                body_ordinal: 2,
+                body_demand: EvaluationDemand::TruthOnly,
+            },
+        ];
+        for (index, control) in controls.into_iter().enumerate() {
+            for (shape_index, shape) in shapes.into_iter().enumerate() {
+                assert_eq!(control.matches_scalar_shape(shape), index == shape_index);
+            }
+            assert!(!control.matches_scalar_shape(ControlShape::Conjunction));
+            assert!(!control.matches_scalar_shape(ControlShape::Disjunction));
+            assert!(!control.matches_scalar_shape(ControlShape::HigherOrder {
+                body_ordinal: 1,
+                body_demand: EvaluationDemand::Value
+            }));
+        }
+    }
+
+    #[test]
+    fn higher_order_refinement_cannot_change_body_position_or_demand() {
+        use crate::EvaluationDemand;
+        let mut base = base();
+        base.argument_control = ArgumentControl::HigherOrder {
+            body_ordinal: 1,
+            body_demand: EvaluationDemand::Value,
+        };
+        let mut refined = call();
+        refined.argument_control = base.argument_control;
+        refined
+            .validate_refinement(&base, CallProofScope::Unconditional)
+            .unwrap();
+        for control in [
+            ArgumentControl::HigherOrder {
+                body_ordinal: 0,
+                body_demand: EvaluationDemand::Value,
+            },
+            ArgumentControl::HigherOrder {
+                body_ordinal: 1,
+                body_demand: EvaluationDemand::TruthOnly,
+            },
+        ] {
+            refined.argument_control = control;
+            assert_eq!(
+                refined.validate_refinement(&base, CallProofScope::Unconditional),
+                Err(EffectContractError::ControlMismatch)
+            );
+        }
     }
 }

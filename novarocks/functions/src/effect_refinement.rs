@@ -51,6 +51,9 @@ pub struct CallEffectInput<'a> {
 /// specialization may retain a delayed row-error recipe.
 pub trait FunctionEffectOwner: Send + Sync {
     type Error: Error;
+    /// Lookup the already-selected overload's base declaration using a bounded
+    /// index. Recursive signature/constant validation belongs in the observed
+    /// validate_and_refine operation, not in this lookup without control.
     fn declaration(
         &self,
         function: &FunctionId,
@@ -138,6 +141,51 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
     declaration
         .validate(input.kind)
         .map_err(CallEffectRefinementError::Contract)?;
+    // Body demand is an exact owner fact, never inferred from a name or the
+    // function result type. This ABI has one lambda body argument; another
+    // lambda-bearing protocol must add its own closed declaration.
+    if let novarocks_type_contract::ArgumentControl::HigherOrder {
+        body_ordinal,
+        body_demand,
+    } = declaration.argument_control
+    {
+        let Some(crate::FunctionArgumentType::Lambda { result_type, .. }) =
+            input.selected.argument_types.get(body_ordinal as usize)
+        else {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "higher-order body ordinal does not identify the selected lambda argument",
+            ));
+        };
+        if body_demand == novarocks_type_contract::EvaluationDemand::TruthOnly
+            && (result_type.data_type != arrow_schema::DataType::Boolean
+                || result_type.logical_type != novarocks_type_contract::ValueLogicalType::Physical)
+        {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "higher-order TruthOnly body requires an exact Boolean result type",
+            ));
+        }
+        for (ordinal, argument) in input.selected.argument_types.iter().enumerate() {
+            if matches!(argument, crate::FunctionArgumentType::Lambda { .. })
+                != (ordinal == body_ordinal as usize)
+            {
+                return Err(CallEffectRefinementError::InvalidInput(
+                    "higher-order body declaration differs from selected lambda channels",
+                ));
+            }
+            work.step().map_err(CallEffectRefinementError::Control)?;
+        }
+    } else {
+        for argument in &input.selected.argument_types {
+            if declaration.argument_control != novarocks_type_contract::ArgumentControl::TypeOnly
+                && matches!(argument, crate::FunctionArgumentType::Lambda { .. })
+            {
+                return Err(CallEffectRefinementError::InvalidInput(
+                    "lambda value arguments require an exact higher-order control declaration",
+                ));
+            }
+            work.step().map_err(CallEffectRefinementError::Control)?;
+        }
+    }
     for use_id in input.argument_uses {
         if use_id.is_none()
             != (declaration.argument_control == novarocks_type_contract::ArgumentControl::TypeOnly)
@@ -191,6 +239,10 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
     work.finish().map_err(CallEffectRefinementError::Control)?;
     Ok(RefinedCallEffects { input, effects })
 }
+
+#[cfg(test)]
+#[path = "effect_refinement/higher_order_tests.rs"]
+mod higher_order_tests;
 
 /// Only exact-owner recomputation constructs this token. In particular, Stable
 /// eligibility requires the owner to prove a complete frozen environment; the
