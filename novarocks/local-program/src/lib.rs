@@ -29,8 +29,10 @@ mod layout;
 mod program;
 mod provenance;
 mod requirements;
+mod resolved_calls;
 mod runtime_filter;
 mod sink;
+mod typed_expressions;
 mod values;
 
 pub use contract::{
@@ -67,6 +69,7 @@ pub use requirements::{
     BindingRequirement, BindingRequirements, BindingRequirementsError, ProgramNodeId,
     ScanSourceKind,
 };
+pub use resolved_calls::*;
 pub use runtime_filter::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,
     FilterOrderKey, FilterProducerKind, FilterReduction, FilterSortDirection, StaticFilterConsumer,
@@ -76,4 +79,5 @@ pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
     StaticSinkError, StaticSinkProgram, StaticStreamBranch,
 };
+pub use typed_expressions::*;
 pub use values::{MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesError};

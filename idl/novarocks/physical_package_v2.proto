@@ -1,0 +1,1433 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.physical_package_v2;
+
+import "catalog.proto";
+import "connector_common.proto";
+import "connector_read.proto";
+import "physical_type_v2.proto";
+import "physical_control_v2.proto";
+import "physical_semantics_v2.proto";
+import "plan.proto";
+
+// One immutable, task-independent local package. This does not carry remote
+// execution graphs, prepared handles, live providers, placement or capabilities.
+// Tables are sparse definition namespaces: zero/MAX IDs are valid; entry count,
+// not maximum ID, bounds storage. Singular references require presence and all
+// ordered occurrences/repeated references survive. Duplicate definitions fail.
+// The typed decoder must check all required components, closed variants and exact
+// field correspondences before the existing checked public constructors run.
+message FragmentPackage {
+  bytes plan_version = 1; // Exactly 16 bytes; the all-zero value is invalid.
+  RequiredContracts required = 2;
+  Fragment fragment = 3;
+  novarocks.physical_type_v2.TypeTable types = 4;
+  repeated SchemaDefinition schemas = 5;
+  repeated IpcConstantPool constants = 6;
+  repeated FunctionBindingDefinition function_bindings = 7;
+  repeated AggregateBindingDefinition aggregate_bindings = 8;
+  repeated ProviderBindingDefinition provider_bindings = 9;
+  repeated ConnectorPayloadDefinition provider_payloads = 10;
+  repeated ProviderReadReferenceDefinition read_references = 11;
+  repeated RelationDefinition relations = 12;
+  novarocks.physical_control_v2.ExpressionControl expression_control = 13;
+  novarocks.physical_semantics_v2.FrozenCalls calls = 14;
+  novarocks.physical_semantics_v2.FrozenPruning pruning = 15;
+  novarocks.physical_semantics_v2.SemanticParameters parameters = 16;
+  FragmentCuts cuts = 17;
+  ResultPort result = 18;
+  repeated FrozenReadScan scans = 19;
+  repeated FrozenWriterRecipe writes = 20;
+  repeated PlanAnnotation annotations = 21;
+  // Provider public residual expressions use this separate real vocabulary;
+  // these IDs do not name engine expressions or engine function overloads.
+  repeated ConnectorExpressionDefinition connector_expressions = 22;
+}
+message RequiredContracts { uint32 plan_contract_revision = 1; }
+message Fragment {
+  uint32 id = 1;
+  optional uint32 root_node_id = 2;
+  repeated ValueDefinition values = 3;
+  repeated ExpressionDefinition expressions = 4;
+  repeated PhysicalNode nodes = 5;
+  FragmentSink sink = 6;
+  PipelineDopDomain dop_domain = 7;
+  repeated uint32 runtime_filter_ids = 8;
+}
+message PipelineDopDomain {
+  uint32 min = 1;
+  uint32 max = 2;
+  bool requires_power_of_two = 3;
+}
+message SchemaDefinition {
+  uint32 id = 1;
+  repeated uint32 field_ids = 2;
+  repeated novarocks.plan.ArrowFieldMetadataEntry metadata = 3;
+}
+// Constants of one exact value type share one pool. Each pool is a standard
+// Arrow IPC stream with exactly one column and one RecordBatch, including EOS.
+// The referenced complete field fixes root schema attributes; value_type_id
+// independently fixes SQL logical identity/nullability. They must agree with
+// the actual IPC schema. No stream is created per small scalar literal.
+// Decode uses Arrow validation and separately bounds message/field/dictionary/
+// metadata/depth, row count, logical elements, expanded bytes and total work.
+// Encoded length or a sender's declaration cannot substitute for those bounds.
+message IpcConstantPool {
+  uint32 id = 1;
+  optional uint32 value_type_id = 2;
+  optional uint32 field_id = 3;
+  IpcCompression compression = 4;
+  bytes arrow_ipc = 5;
+}
+enum IpcCompression {
+  IPC_COMPRESSION_UNSPECIFIED = 0;
+  IPC_COMPRESSION_UNCOMPRESSED = 1;
+}
+message ConstantReference {
+  optional uint32 pool_id = 1;
+  uint32 row_ordinal = 2;
+}
+// Exact definitions only. Old binding volatility/evaluation/error bits and
+// semantic_parameters are migration projections, not another wire authority.
+// Full effects and frozen environments belong to actual occurrence entries.
+message FunctionBindingDefinition {
+  uint32 id = 1;
+  string function_id = 2;
+  string overload_id = 3;
+  FunctionKind kind = 4;
+  repeated FunctionArgumentType arguments = 5;
+  oneof result {
+    uint32 scalar_value_type_id = 6;
+    RelationResultTypes relation = 7;
+  }
+}
+enum FunctionKind {
+  FUNCTION_KIND_UNSPECIFIED = 0;
+  FUNCTION_KIND_SCALAR = 1;
+  FUNCTION_KIND_AGGREGATE = 2;
+  FUNCTION_KIND_WINDOW = 3;
+  FUNCTION_KIND_TABLE = 4;
+}
+message FunctionArgumentType {
+  oneof kind {
+    uint32 value_type_id = 1;
+    LambdaArgumentType lambda = 2;
+  }
+}
+message LambdaArgumentType {
+  repeated uint32 parameter_value_type_ids = 1;
+  optional uint32 result_value_type_id = 2;
+}
+message RelationResultTypes { repeated uint32 value_type_ids = 1; }
+message AggregateBindingDefinition {
+  uint32 id = 1;
+  optional uint32 function_binding_id = 2;
+  AggregatePhase phase = 3;
+  uint32 logical_argument_count = 4;
+  optional uint32 intermediate_value_type_id = 5;
+  string state_format = 6;
+}
+message AggregatePhase {
+  oneof kind {
+    novarocks.physical_control_v2.Empty single = 1;
+    uint32 partial_sequence_id = 2;
+    uint32 intermediate_sequence_id = 3;
+    uint32 final_sequence_id = 4;
+  }
+}
+message TopNPhase {
+  oneof kind {
+    novarocks.physical_control_v2.Empty single = 1;
+    uint32 partial_sequence_id = 2;
+    uint32 final_sequence_id = 3;
+  }
+}
+message ProviderBindingDefinition {
+  uint32 id = 1;
+  string provider_id = 2;
+  string instance_id = 3;
+  novarocks.catalog.CatalogHandle catalog = 4;
+}
+message ConnectorPayloadDefinition {
+  uint32 id = 1;
+  novarocks.connector_common.ConnectorEncodedPayload payload = 2;
+}
+message ProviderReadReferenceDefinition {
+  uint32 id = 1;
+  optional uint32 provider_binding_id = 2;
+  bytes input_version = 3;
+  ConnectorRelationKind kind = 4;
+  optional uint32 table_payload_id = 5;
+  optional uint32 view_payload_id = 6;
+}
+enum ConnectorRelationKind {
+  CONNECTOR_RELATION_KIND_UNSPECIFIED = 0;
+  CONNECTOR_RELATION_KIND_TABLE = 1;
+  CONNECTOR_RELATION_KIND_TABLE_FUNCTION = 2;
+  CONNECTOR_RELATION_KIND_CHANGE_WINDOW = 3;
+  CONNECTOR_RELATION_KIND_SYSTEM_TABLE = 4;
+  CONNECTOR_RELATION_KIND_TABLE_EXECUTE = 5;
+  CONNECTOR_RELATION_KIND_MERGE_TABLE = 6;
+}
+message RelationDefinition {
+  uint32 id = 1;
+  oneof kind {
+    DataRelation data = 2;
+    MetadataRelation metadata = 3;
+  }
+}
+message DataRelation {
+  optional uint32 read_reference_id = 1;
+  novarocks.connector_read.ScanWorkSource work_source = 2;
+  bytes selection_digest = 3; // Exactly 32 bytes.
+  repeated RelationField schema = 4;
+  repeated PredicateGuarantee predicate_guarantees = 5;
+  PhysicalProperties provided_properties = 6;
+}
+message MetadataRelation {
+  string kind = 1;
+  optional uint32 read_reference_id = 2;
+  novarocks.connector_read.ScanWorkSource work_source = 3;
+  bytes selection_digest = 4;
+  repeated RelationField schema = 5;
+  repeated PredicateGuarantee predicate_guarantees = 6;
+  PhysicalProperties provided_properties = 7;
+  bytes coverage_evidence = 8;
+}
+message RelationField {
+  optional uint32 column_payload_id = 1;
+  optional uint32 value_type_id = 2;
+}
+message PredicateGuarantee {
+  optional uint32 predicate_expr_id = 1;
+  PredicateGuaranteeKind kind = 2;
+}
+enum PredicateGuaranteeKind {
+  PREDICATE_GUARANTEE_KIND_UNSPECIFIED = 0;
+  PREDICATE_GUARANTEE_KIND_EXACT = 1;
+  PREDICATE_GUARANTEE_KIND_PRUNING_ONLY = 2;
+}
+message ValueDefinition {
+  uint32 id = 1;
+  optional uint32 value_type_id = 2;
+  ValueOrigin origin = 3;
+}
+message ValueOrigin {
+  oneof kind {
+    ProviderFieldOrigin provider_field = 1;
+    ExpressionOrigin expression = 2;
+    NullExtendedOrigin null_extended = 3;
+    AggregateStateOrigin aggregate_state = 4;
+    uint32 aggregate_result_call_id = 5;
+    NodeOutputOrigin node_output = 6;
+    ExchangeImportOrigin exchange_import = 7;
+    CteImportOrigin cte_import = 8;
+    WriterDerivedOrigin writer_derived = 9;
+  }
+}
+message ProviderFieldOrigin {
+  optional uint32 scan_node_id = 1;
+  optional uint32 column_payload_id = 2;
+}
+message ExpressionOrigin {
+  optional uint32 node_id = 1;
+  optional uint32 expr_id = 2;
+}
+message NullExtendedOrigin {
+  optional uint32 node_id = 1;
+  optional uint32 original_value_id = 2;
+}
+message AggregateStateOrigin {
+  optional uint32 call_id = 1;
+  AggregatePhase phase = 2;
+}
+message NodeOutputOrigin {
+  optional uint32 node_id = 1;
+  uint32 output_ordinal = 2;
+}
+message ExchangeImportOrigin {
+  optional uint32 edge_id = 1;
+  optional uint32 source_value_id = 2;
+}
+message CteImportOrigin {
+  optional uint32 edge_id = 1;
+  optional uint32 producer_fragment_id = 2;
+  optional uint32 producer_value_id = 3;
+}
+message WriterDerivedOrigin {
+  optional uint32 writer_node_id = 1;
+  WriterDerivedKind kind = 2;
+}
+enum WriterDerivedKind {
+  WRITER_DERIVED_KIND_UNSPECIFIED = 0;
+  WRITER_DERIVED_KIND_RELATION_KIND = 1;
+  WRITER_DERIVED_KIND_AFFECTED_ROWS = 2;
+  WRITER_DERIVED_KIND_COMMIT_FRAGMENT = 3;
+  WRITER_DERIVED_KIND_CHANGE_EVENT = 4;
+  WRITER_DERIVED_KIND_RELATION_AUXILIARY = 5;
+  WRITER_DERIVED_KIND_WRITE_TARGET_ORDINAL = 6;
+  WRITER_DERIVED_KIND_GROUPING_KEY = 7;
+}
+message ExpressionDefinition {
+  uint32 id = 1;
+  optional uint32 owner_node_id = 2;
+  optional uint32 lambda_scope_expr_id = 3;
+  optional uint32 value_type_id = 4;
+  oneof kind {
+    uint32 value_id = 5;
+    LambdaParameter lambda_parameter = 6;
+    ConstantReference literal = 7;
+    UnaryExpression unary = 8;
+    BinaryExpression binary = 9;
+    ExpressionIds conjunction = 10;
+    ExpressionIds disjunction = 11;
+    FunctionCall function_call = 12;
+    LambdaExpression lambda = 13;
+    CastExpression cast = 14;
+    IsNullExpression is_null = 15;
+    InListExpression in_list = 16;
+    BetweenExpression between = 17;
+    LikeExpression like = 18;
+    CaseExpression case_expression = 19;
+    TruthValueExpression is_truth_value = 20;
+    WindowCall window_call = 21;
+  }
+}
+message ExpressionIds { repeated uint32 expr_ids = 1; }
+message ValueIds { repeated uint32 value_ids = 1; }
+message LambdaParameter {
+  optional uint32 lambda_expr_id = 1;
+  uint32 ordinal = 2;
+}
+message UnaryExpression {
+  UnaryOperator op = 1;
+  optional uint32 expr_id = 2;
+}
+enum UnaryOperator {
+  UNARY_OPERATOR_UNSPECIFIED = 0;
+  UNARY_OPERATOR_PLUS = 1;
+  UNARY_OPERATOR_MINUS = 2;
+  UNARY_OPERATOR_NOT = 3;
+  UNARY_OPERATOR_BITWISE_NOT = 4;
+}
+message BinaryExpression {
+  optional uint32 left_expr_id = 1;
+  BinaryOperator op = 2;
+  optional uint32 right_expr_id = 3;
+  DecimalOverflowPolicy decimal_overflow_policy = 4;
+}
+enum BinaryOperator {
+  BINARY_OPERATOR_UNSPECIFIED = 0;
+  BINARY_OPERATOR_ADD = 1;
+  BINARY_OPERATOR_SUBTRACT = 2;
+  BINARY_OPERATOR_MULTIPLY = 3;
+  BINARY_OPERATOR_DIVIDE = 4;
+  BINARY_OPERATOR_MODULO = 5;
+  BINARY_OPERATOR_EQ = 6;
+  BINARY_OPERATOR_EQ_FOR_NULL = 7;
+  BINARY_OPERATOR_NOT_EQ = 8;
+  BINARY_OPERATOR_LT = 9;
+  BINARY_OPERATOR_LT_EQ = 10;
+  BINARY_OPERATOR_GT = 11;
+  BINARY_OPERATOR_GT_EQ = 12;
+  BINARY_OPERATOR_BIT_AND = 13;
+  BINARY_OPERATOR_BIT_OR = 14;
+  BINARY_OPERATOR_BIT_XOR = 15;
+}
+enum DecimalOverflowPolicy {
+  DECIMAL_OVERFLOW_POLICY_UNSPECIFIED = 0;
+  DECIMAL_OVERFLOW_POLICY_OUTPUT_NULL = 1;
+  DECIMAL_OVERFLOW_POLICY_REPORT_ERROR = 2;
+}
+message FunctionCall {
+  optional uint32 function_binding_id = 1;
+  repeated uint32 argument_expr_ids = 2;
+}
+message LambdaExpression {
+  repeated uint32 parameter_value_type_ids = 1;
+  optional uint32 body_expr_id = 2;
+}
+message CastExpression {
+  optional uint32 expr_id = 1;
+  optional uint32 target_carrier_type_id = 2;
+  DecimalOverflowPolicy decimal_overflow_policy = 3;
+}
+message IsNullExpression {
+  optional uint32 expr_id = 1;
+  bool negated = 2;
+}
+message InListExpression {
+  optional uint32 expr_id = 1;
+  repeated uint32 list_expr_ids = 2;
+  bool negated = 3;
+}
+message BetweenExpression {
+  optional uint32 expr_id = 1;
+  optional uint32 low_expr_id = 2;
+  optional uint32 high_expr_id = 3;
+  bool negated = 4;
+}
+message LikeExpression {
+  optional uint32 expr_id = 1;
+  optional uint32 pattern_expr_id = 2;
+  bool negated = 3;
+}
+message CaseExpression {
+  optional uint32 operand_expr_id = 1;
+  repeated WhenThen arms = 2;
+  optional uint32 else_expr_id = 3;
+}
+message WhenThen {
+  optional uint32 when_expr_id = 1;
+  optional uint32 then_expr_id = 2;
+}
+message TruthValueExpression {
+  optional uint32 expr_id = 1;
+  bool value = 2;
+  bool negated = 3;
+}
+message WindowCall {
+  optional uint32 function_binding_id = 1;
+  bool distinct = 2;
+  repeated uint32 argument_expr_ids = 3;
+  repeated SortExpression function_order_by = 4;
+  WindowFrame frame = 5;
+  bool ignore_nulls = 6;
+  optional uint32 aggregate_binding_id = 7;
+}
+message SortExpression {
+  optional uint32 expr_id = 1;
+  SortDirection direction = 2;
+  NullOrdering null_ordering = 3;
+}
+enum SortDirection {
+  SORT_DIRECTION_UNSPECIFIED = 0;
+  SORT_DIRECTION_ASCENDING = 1;
+  SORT_DIRECTION_DESCENDING = 2;
+}
+enum NullOrdering {
+  NULL_ORDERING_UNSPECIFIED = 0;
+  NULL_ORDERING_FIRST = 1;
+  NULL_ORDERING_LAST = 2;
+}
+message WindowFrame {
+  WindowFrameUnits units = 1;
+  WindowBound start = 2;
+  WindowBound end = 3;
+  WindowFrameExclusion exclusion = 4;
+}
+message WindowBound {
+  oneof kind {
+    novarocks.physical_control_v2.Empty unbounded_preceding = 1;
+    uint32 preceding_expr_id = 2;
+    novarocks.physical_control_v2.Empty current_row = 3;
+    uint32 following_expr_id = 4;
+    novarocks.physical_control_v2.Empty unbounded_following = 5;
+  }
+}
+enum WindowFrameUnits {
+  WINDOW_FRAME_UNITS_UNSPECIFIED = 0;
+  WINDOW_FRAME_UNITS_ROWS = 1;
+  WINDOW_FRAME_UNITS_RANGE = 2;
+  WINDOW_FRAME_UNITS_GROUPS = 3;
+}
+enum WindowFrameExclusion {
+  WINDOW_FRAME_EXCLUSION_UNSPECIFIED = 0;
+  WINDOW_FRAME_EXCLUSION_NO_OTHERS = 1;
+  WINDOW_FRAME_EXCLUSION_CURRENT_ROW = 2;
+  WINDOW_FRAME_EXCLUSION_GROUP = 3;
+  WINDOW_FRAME_EXCLUSION_TIES = 4;
+}
+message PhysicalProperties {
+  Distribution distribution = 1;
+  RowMultiplicity row_multiplicity = 2;
+  repeated OrderingKey ordering = 3;
+}
+enum RowMultiplicity {
+  ROW_MULTIPLICITY_UNSPECIFIED = 0;
+  ROW_MULTIPLICITY_SINGLE_COPY = 1;
+  ROW_MULTIPLICITY_REPLICATED = 2;
+}
+message OrderingKey {
+  optional uint32 value_id = 1;
+  SortDirection direction = 2;
+  NullOrdering null_ordering = 3;
+}
+message Distribution {
+  oneof kind {
+    novarocks.physical_control_v2.Empty unconstrained = 1;
+    novarocks.physical_control_v2.Empty singleton = 2;
+    novarocks.physical_control_v2.Empty round_robin = 3;
+    novarocks.physical_control_v2.Empty broadcast = 4;
+    HashDistribution hash = 5;
+    BucketDistribution bucket_shuffle = 6;
+  }
+}
+message HashDistribution {
+  repeated uint32 key_value_ids = 1;
+  HashPartitionScheme scheme = 2;
+}
+message HashPartitionScheme {
+  bytes partition_space = 1; // Exact32bytes identity, not a node ID.
+  PartitionCountParameter count = 2;
+  PartitionHashAlgorithm algorithm = 3;
+}
+message PartitionCountParameter {
+  bytes id = 1; // Exact32bytes identity.
+  PartitionCountDomain admissible = 2;
+}
+message PartitionCountDomain {
+  uint32 min = 1;
+  uint32 max = 2;
+  bool requires_power_of_two = 3;
+}
+message BucketDistribution {
+  repeated uint32 key_value_ids = 1;
+  BucketPartitionScheme scheme = 2;
+}
+message BucketPartitionScheme {
+  bytes partition_space = 1;
+  uint32 bucket_count = 2;
+  PartitionHashAlgorithm hash = 3;
+  BucketLayoutAlgorithm layout = 4;
+  BucketOrdinalDomainProof ordinal_domain = 5;
+}
+message BucketOrdinalDomainProof {
+  uint32 first_ordinal = 1;
+  uint32 ordinal_count = 2;
+  bytes evidence_digest = 3;
+}
+enum PartitionHashAlgorithm {
+  PARTITION_HASH_ALGORITHM_UNSPECIFIED = 0;
+  PARTITION_HASH_ALGORITHM_NATIVE_EXCHANGE_V1 = 1;
+  PARTITION_HASH_ALGORITHM_NATIVE_BUCKET_CRC32_V1 = 2;
+}
+enum BucketLayoutAlgorithm {
+  BUCKET_LAYOUT_ALGORITHM_UNSPECIFIED = 0;
+  BUCKET_LAYOUT_ALGORITHM_DENSE_ZERO_BASED_V1 = 1;
+}
+enum OrderedComparisonAlgorithm {
+  ORDERED_COMPARISON_ALGORITHM_UNSPECIFIED = 0;
+  ORDERED_COMPARISON_ALGORITHM_NATIVE_SCALAR_ORDER_V1 = 1;
+}
+
+message PhysicalNode {
+  uint32 id = 1;
+  repeated uint32 input_node_ids = 2;
+  repeated PhysicalProperties required_inputs = 3;
+  PhysicalProperties output_properties = 4;
+  OutputPort output = 5;
+  oneof kind {
+    ScanNode scan = 6;
+    FilterNode filter = 7;
+    ProjectNode project = 8;
+    AggregateNode aggregate = 9;
+    HashJoinNode hash_join = 10;
+    NestLoopJoinNode nest_loop_join = 11;
+    SortNode sort = 12;
+    TopNNode top_n = 13;
+    LimitNode limit = 14;
+    WindowNode window = 15;
+    SetOperationNode set_operation = 16;
+    ValuesNode values = 17;
+    RepeatNode repeat = 18;
+    UnpivotNode unpivot = 19;
+    GenerateSeriesNode generate_series = 20;
+    TableFunctionNode table_function = 21;
+    RowCountAssertionNode assert_one_row = 22;
+    ChangeEventExpandNode change_event_expand = 23;
+    ExchangeSourceNode exchange_source = 24;
+    WriterTarget table_writer = 25;
+    WriterFinish table_finish = 26;
+  }
+}
+message OutputPort {
+  optional uint32 node_id = 1;
+  // Duplicate values are distinct ordered output occurrences.
+  repeated uint32 value_ids = 2;
+}
+message ScanNode {
+  optional uint32 occurrence_id = 1;
+  optional uint32 relation_id = 2;
+  ScanReadBudget read_budget = 3;
+  repeated ProviderOutput provider_outputs = 4;
+  repeated uint32 residual_expr_ids = 5;
+  repeated uint32 derived_value_ids = 6;
+}
+message ScanReadBudget {
+  uint64 max_batch_rows = 1;
+  uint64 max_batch_bytes = 2;
+}
+message ProviderOutput {
+  optional uint32 column_payload_id = 1;
+  optional uint32 value_id = 2;
+}
+message FilterNode { repeated uint32 predicate_expr_ids = 1; }
+message ExpressionOutput {
+  optional uint32 expr_id = 1;
+  optional uint32 value_id = 2;
+}
+message ProjectNode { repeated ExpressionOutput expressions = 1; }
+message AggregateNode {
+  repeated ExpressionOutput group_by = 1;
+  repeated AggregateCall calls = 2;
+  AggregateGrouping grouping = 3;
+}
+enum AggregateGrouping {
+  AGGREGATE_GROUPING_UNSPECIFIED = 0;
+  AGGREGATE_GROUPING_PARTIAL = 1;
+  // Actual task/profile-wide unique full-key output, independently of finalize.
+  AGGREGATE_GROUPING_COMPLETE = 2;
+}
+message AggregateCall {
+  uint32 id = 1;
+  optional uint32 aggregate_binding_id = 2;
+  repeated uint32 argument_expr_ids = 3;
+  bool distinct = 4;
+  repeated SortExpression order_by = 5;
+  optional uint32 output_value_id = 6;
+}
+message JoinKey {
+  optional uint32 left_expr_id = 1;
+  optional uint32 right_expr_id = 2;
+  bool null_safe = 3;
+}
+message HashJoinNode {
+  JoinKind kind = 1;
+  repeated JoinKey keys = 2;
+  JoinSide build_side = 3;
+  JoinDistribution distribution = 4;
+  optional uint32 residual_expr_id = 5;
+  repeated uint32 null_extended_value_ids = 6;
+}
+message NestLoopJoinNode {
+  JoinKind kind = 1;
+  NestLoopJoinDistribution distribution = 2;
+  optional uint32 predicate_expr_id = 3;
+  repeated uint32 null_extended_value_ids = 4;
+}
+enum JoinKind {
+  JOIN_KIND_UNSPECIFIED = 0;
+  JOIN_KIND_CROSS = 1;
+  JOIN_KIND_INNER = 2;
+  JOIN_KIND_LEFT_OUTER = 3;
+  JOIN_KIND_RIGHT_OUTER = 4;
+  JOIN_KIND_FULL_OUTER = 5;
+  JOIN_KIND_LEFT_SEMI = 6;
+  JOIN_KIND_RIGHT_SEMI = 7;
+  JOIN_KIND_LEFT_ANTI = 8;
+  JOIN_KIND_RIGHT_ANTI = 9;
+  JOIN_KIND_NULL_AWARE_LEFT_ANTI = 10;
+}
+enum JoinSide {
+  JOIN_SIDE_UNSPECIFIED = 0;
+  JOIN_SIDE_LEFT = 1;
+  JOIN_SIDE_RIGHT = 2;
+}
+enum JoinDistribution {
+  JOIN_DISTRIBUTION_UNSPECIFIED = 0;
+  JOIN_DISTRIBUTION_COLOCATED = 1;
+  JOIN_DISTRIBUTION_PARTITIONED = 2;
+  JOIN_DISTRIBUTION_BROADCAST_BUILD = 3;
+  JOIN_DISTRIBUTION_SINGLETON = 4;
+}
+enum NestLoopJoinDistribution {
+  NEST_LOOP_JOIN_DISTRIBUTION_UNSPECIFIED = 0;
+  NEST_LOOP_JOIN_DISTRIBUTION_SINGLETON = 1;
+  NEST_LOOP_JOIN_DISTRIBUTION_BROADCAST_RIGHT = 2;
+}
+message SortNode {
+  repeated SortExpression order_by = 1;
+  SortMode mode = 2;
+}
+message SortMode {
+  oneof kind {
+    novarocks.physical_control_v2.Empty global = 1;
+    AnalyticSort analytic = 2;
+    PartitionTopN partition_top_n = 3;
+  }
+}
+message AnalyticSort { repeated SortExpression partition_by = 1; }
+message PartitionTopN {
+  repeated SortExpression partition_by = 1;
+  uint64 limit = 2;
+  PartitionTopNType kind = 3;
+}
+enum PartitionTopNType {
+  PARTITION_TOP_N_TYPE_UNSPECIFIED = 0;
+  PARTITION_TOP_N_TYPE_ROW_NUMBER = 1;
+  PARTITION_TOP_N_TYPE_RANK = 2;
+  PARTITION_TOP_N_TYPE_DENSE_RANK = 3;
+}
+message TopNNode {
+  repeated SortExpression order_by = 1;
+  uint64 limit = 2;
+  uint64 offset = 3;
+  TopNPhase phase = 4;
+  TopNReduction reduction = 5;
+}
+message TopNReduction {
+  oneof kind {
+    novarocks.physical_control_v2.Empty rows = 1;
+    GroupedStates grouped_states = 2;
+  }
+}
+message GroupedStates {
+  repeated ExpressionOutput group_by = 1;
+  repeated AggregateCall calls = 2;
+  OrderedComparisonAlgorithm comparator = 3;
+}
+message LimitNode {
+  optional uint64 limit = 1;
+  uint64 offset = 2;
+}
+message WindowNode {
+  repeated SortExpression partition_by = 1;
+  repeated SortExpression order_by = 2;
+  repeated ExpressionOutput expressions = 3;
+}
+message SetOperationNode {
+  SetOperationKind kind = 1;
+  repeated ValueIds input_mappings = 2;
+}
+enum SetOperationKind {
+  SET_OPERATION_KIND_UNSPECIFIED = 0;
+  SET_OPERATION_KIND_UNION_ALL = 1;
+  SET_OPERATION_KIND_INTERSECT = 2;
+  SET_OPERATION_KIND_EXCEPT = 3;
+}
+message ValuesNode { repeated ExpressionIds rows = 1; }
+message RepeatNode {
+  repeated uint32 rollup_key_value_ids = 1;
+  repeated ValueIds grouping_sets = 2;
+  repeated ValueMapping grouping_values = 3;
+  repeated GroupingOutput grouping_outputs = 4;
+}
+message ValueMapping {
+  optional uint32 source_value_id = 1;
+  optional uint32 destination_value_id = 2;
+}
+message GroupingOutput {
+  optional uint32 output_value_id = 1;
+  repeated uint32 argument_value_ids = 2;
+}
+// Real existing constant variants. Special list/map constants use the same
+// typed IPC pool without inventing a scalar ExprId or losing their exact kind.
+message UnpivotConstant {
+  oneof kind {
+    uint32 scalar_expr_id = 1;
+    ConstantReference int32_list = 2;
+    ConstantReference utf8_map = 3;
+  }
+}
+message UnpivotMapping {
+  optional uint32 input_value_id = 1;
+  repeated UnpivotConstant constants = 2;
+}
+message UnpivotNode {
+  repeated ValueMapping passthrough = 1;
+  optional uint32 value_output_id = 2;
+  repeated uint32 literal_output_ids = 3;
+  repeated UnpivotMapping mappings = 4;
+  uint64 max_output_rows = 5;
+  uint64 max_output_bytes = 6;
+}
+message GenerateSeriesNode {
+  optional uint32 start_expr_id = 1;
+  optional uint32 stop_expr_id = 2;
+  optional uint32 step_expr_id = 3;
+}
+message TableFunctionNode {
+  optional uint32 function_binding_id = 1;
+  repeated uint32 argument_expr_ids = 2;
+  repeated TableFunctionOutput outputs = 3;
+  bool left_outer = 4;
+}
+message TableFunctionOutput {
+  oneof kind {
+    uint32 passthrough_value_id = 1;
+    TableFunctionResult function_result = 2;
+  }
+}
+message TableFunctionResult {
+  uint32 result_ordinal = 1;
+  optional uint32 value_id = 2;
+}
+message RowCountAssertionNode {
+  oneof kind {
+    GlobalRowCountAssertion global = 1;
+    PerKeyRowCountAssertion per_key_at_most_one = 2;
+  }
+}
+message GlobalRowCountAssertion {
+  string subject = 1;
+  uint64 desired_rows = 2;
+  RowCountComparison comparison = 3;
+}
+enum RowCountComparison {
+  ROW_COUNT_COMPARISON_UNSPECIFIED = 0;
+  ROW_COUNT_COMPARISON_EQ = 1;
+  ROW_COUNT_COMPARISON_NE = 2;
+  ROW_COUNT_COMPARISON_LT = 3;
+  ROW_COUNT_COMPARISON_LE = 4;
+  ROW_COUNT_COMPARISON_GT = 5;
+  ROW_COUNT_COMPARISON_GE = 6;
+}
+message PerKeyRowCountAssertion {
+  repeated uint32 key_value_ids = 1;
+  repeated string labels = 2;
+  string message = 3;
+}
+message ChangeEventExpandNode {
+  repeated ChangeEvent events = 1;
+  optional uint32 effect_output_value_id = 2;
+}
+message ChangeEvent {
+  optional uint32 predicate_expr_id = 1;
+  RowMutationEffect effect = 2;
+  repeated ChangeAssignment assignments = 3;
+}
+message ChangeAssignment {
+  optional uint32 value_id = 1;
+  optional uint32 expr_id = 2;
+}
+enum RowMutationEffect {
+  ROW_MUTATION_EFFECT_UNSPECIFIED = 0;
+  ROW_MUTATION_EFFECT_DELETE = 1;
+  ROW_MUTATION_EFFECT_REPLACE = 2;
+  ROW_MUTATION_EFFECT_INSERT = 3;
+}
+message ExchangeSourceNode {
+  optional uint32 edge_id = 1;
+  repeated ValueMapping imports = 2;
+}
+message WriterTarget {
+  optional uint32 handle_payload_id = 1;
+  uint32 write_target_ordinal = 2;
+  repeated uint32 input_value_ids = 3;
+  Distribution required_distribution = 4;
+  repeated WriterTargetField target_fields = 5;
+  WriterRelationSchema output_schema = 6;
+  repeated WriterAggregateCall partial_aggregates = 7;
+}
+message WriterTargetField {
+  bytes token = 1; // Exact32bytes provider field identity.
+  string provider_name = 2;
+  optional uint32 input_value_id = 3;
+  optional uint32 value_type_id = 4;
+  bool hidden = 5;
+}
+message WriterRelationSchema {
+  uint32 revision = 1;
+  repeated WriterRelationField fields = 2;
+}
+message WriterRelationField {
+  optional uint32 value_id = 1;
+  string name = 2;
+  optional uint32 value_type_id = 3;
+  WriterRelationFieldRole role = 4;
+}
+enum WriterRelationFieldRole {
+  WRITER_RELATION_FIELD_ROLE_UNSPECIFIED = 0;
+  WRITER_RELATION_FIELD_ROLE_KIND = 1;
+  WRITER_RELATION_FIELD_ROLE_TARGET_ORDINAL = 2;
+  WRITER_RELATION_FIELD_ROLE_ROW_COUNT = 3;
+  WRITER_RELATION_FIELD_ROLE_COMMIT_FRAGMENT = 4;
+  WRITER_RELATION_FIELD_ROLE_AUXILIARY = 5;
+}
+message WriterAggregateCall {
+  optional uint32 input_value_id = 1;
+  optional uint32 aggregate_binding_id = 2;
+  optional uint32 output_value_id = 3;
+}
+message WriterFinish {
+  repeated uint32 expected_target_ordinals = 1;
+  WriterRelationSchema input_schema = 2;
+  WriterRelationSchema output_schema = 3;
+  repeated WriterAggregateCall final_aggregates = 4;
+  WriterGroupedUnpivot grouped_unpivot = 5;
+}
+message WriterGroupedUnpivot {
+  repeated uint32 statistics_target_ordinals = 1;
+  optional uint32 grouping_input_value_id = 2;
+  optional uint32 grouping_output_value_id = 3;
+  optional uint32 passthrough_output_value_id = 4;
+  optional uint32 value_output_id = 5;
+  repeated uint32 literal_output_ids = 6;
+  repeated WriterGroupedUnpivotMapping mappings = 7;
+  uint64 max_output_rows = 8;
+  uint64 max_output_bytes = 9;
+}
+message WriterGroupedUnpivotMapping {
+  uint32 write_target_ordinal = 1;
+  optional uint32 input_value_id = 2;
+  repeated UnpivotConstant constants = 3;
+}
+message FragmentSink {
+  oneof kind {
+    novarocks.physical_control_v2.Empty result = 1;
+    uint32 stream_edge_id = 2;
+    MulticastSink multicast = 3;
+    RouterSink router = 4;
+    novarocks.physical_control_v2.Empty noop = 5;
+  }
+}
+message MulticastSink { repeated uint32 edge_ids = 1; }
+message RouterSink {
+  optional uint32 effect_value_id = 1;
+  repeated ChangeStreamRoute routes = 2;
+}
+message ChangeStreamRoute {
+  bytes route_id = 1;
+  uint32 write_target_ordinal = 2;
+  repeated RowMutationEffect accepted_effects = 3;
+  repeated WriteInputMapping input_mapping = 4;
+  repeated uint32 partition_value_ids = 5;
+  optional uint32 edge_id = 6;
+}
+message WriteInputMapping {
+  bytes field_token = 1;
+  optional uint32 value_id = 2;
+}
+message ResultPort {
+  optional uint32 fragment_id = 1;
+  OutputPort output = 2;
+  repeated ResultField fields = 3;
+}
+message ResultField {
+  string name = 1;
+  optional string alias = 2;
+  optional uint32 value_id = 3;
+  optional uint32 value_type_id = 4;
+}
+message PlanAnnotation {
+  AnnotationSubject subject = 1;
+  string key = 2;
+  string value = 3;
+}
+// A global Plan subject is invalid in this local package and has no branch.
+message AnnotationSubject {
+  oneof kind {
+    uint32 fragment_id = 1;
+    FragmentNodeSubject node = 2;
+    FragmentValueSubject value = 3;
+  }
+}
+message FragmentNodeSubject {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+}
+message FragmentValueSubject {
+  optional uint32 fragment_id = 1;
+  optional uint32 value_id = 2;
+}
+
+message FragmentCuts {
+  repeated InboundFragmentCut inbound = 1;
+  repeated OutboundFragmentCut outbound = 2;
+  repeated RuntimeFilter runtime_filters = 3;
+}
+enum EdgeKind {
+  EDGE_KIND_UNSPECIFIED = 0;
+  EDGE_KIND_STREAM = 1;
+  EDGE_KIND_CTE_MULTICAST = 2;
+  EDGE_KIND_CHANGE_STREAM_ROUTER = 3;
+}
+message EdgePartitioning {
+  Distribution source = 1;
+  RowMultiplicity source_multiplicity = 2;
+  Distribution destination = 3;
+  RowMultiplicity destination_multiplicity = 4;
+}
+message CutValue {
+  optional uint32 value_id = 1;
+  optional uint32 value_type_id = 2;
+}
+message CutImport {
+  CutValue source = 1;
+  optional uint32 destination_value_id = 2;
+}
+message ChangeStreamWriterCutField {
+  bytes field_token = 1;
+  optional uint32 source_value_id = 2;
+  optional uint32 destination_value_id = 3;
+}
+message ChangeStreamWriterCut {
+  bytes route_id = 1;
+  uint32 write_target_ordinal = 2;
+  repeated ChangeStreamWriterCutField fields = 3;
+}
+message WriterResultCutField {
+  optional uint32 source_value_id = 1;
+  optional uint32 destination_value_id = 2;
+  string name = 3;
+  optional uint32 value_type_id = 4;
+  WriterRelationFieldRole role = 5;
+}
+message WriterResultCut {
+  uint32 write_target_ordinal = 1;
+  uint32 schema_revision = 2;
+  repeated WriterResultCutField fields = 3;
+}
+message InboundFragmentCut {
+  optional uint32 edge_id = 1;
+  EdgeKind kind = 2;
+  optional uint32 source_fragment_id = 3;
+  optional uint32 destination_node_id = 4;
+  repeated CutImport imports = 5;
+  EdgePartitioning partitioning = 6;
+  ChangeStreamWriterCut change_stream_writer = 7;
+  WriterResultCut writer_result = 8;
+}
+message OutboundFragmentCut {
+  optional uint32 edge_id = 1;
+  EdgeKind kind = 2;
+  optional uint32 destination_fragment_id = 3;
+  repeated CutValue projection = 4;
+  repeated CutImport destination_imports = 5;
+  EdgePartitioning partitioning = 6;
+  ChangeStreamWriterCut change_stream_writer = 7;
+  WriterResultCut writer_result = 8;
+}
+
+// Runtime-filter remote endpoints are immutable contract facts, not remote
+// execution graphs. The local decoder validates local obligations and cuts.
+message RuntimeFilter {
+  optional uint32 id = 1;
+  RuntimeFilterKind kind = 2;
+  RuntimeFilterDomain domain = 3;
+  RuntimeFilterLifecycle lifecycle = 4;
+  RuntimeFilterReduction reduction = 5;
+  RuntimeFilterCoverage availability_coverage = 6;
+  RuntimeFilterCoverage terminal_coverage = 7;
+  repeated RuntimeFilterEqualityWitness equality_witnesses = 8;
+  repeated RuntimeFilterProducer producers = 9;
+  repeated RuntimeFilterConsumer consumers = 10;
+  RuntimeFilterPolicy policy = 11;
+}
+enum RuntimeFilterKind {
+  RUNTIME_FILTER_KIND_UNSPECIFIED = 0;
+  RUNTIME_FILTER_KIND_BLOOM = 1;
+  RUNTIME_FILTER_KIND_MIN_MAX = 2;
+  RUNTIME_FILTER_KIND_IN_LIST = 3;
+}
+enum RuntimeFilterNullSemantics {
+  RUNTIME_FILTER_NULL_SEMANTICS_UNSPECIFIED = 0;
+  RUNTIME_FILTER_NULL_SEMANTICS_NEVER_MATCHES = 1;
+  RUNTIME_FILTER_NULL_SEMANTICS_NULL_SAFE_EQUAL = 2;
+}
+message RuntimeFilterDomain {
+  oneof kind {
+    RuntimeFilterMembershipDomain membership = 1;
+    RuntimeFilterOrderedDomain ordered = 2;
+  }
+}
+message RuntimeFilterMembershipDomain {
+  optional uint32 value_type_id = 1;
+  RuntimeFilterNullSemantics null_semantics = 2;
+}
+message RuntimeFilterOrderedDomain {
+  RuntimeFilterOrderKey key = 1;
+  bool inclusive = 2;
+  OrderedComparisonAlgorithm comparator = 3;
+}
+message RuntimeFilterOrderKey {
+  optional uint32 value_type_id = 1;
+  SortDirection direction = 2;
+  NullOrdering null_ordering = 3;
+}
+enum RuntimeFilterContributionKind {
+  RUNTIME_FILTER_CONTRIBUTION_KIND_UNSPECIFIED = 0;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_VALUE_DOMAIN_DELTA = 1;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_FINAL_DOMAIN_SHARD = 2;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_ORDERED_BOUND_UPDATE = 3;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_FINAL_ORDERED_HULL_SHARD = 4;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_PRODUCER_CLOSED = 5;
+}
+enum RuntimeFilterLifecycle {
+  RUNTIME_FILTER_LIFECYCLE_UNSPECIFIED = 0;
+  RUNTIME_FILTER_LIFECYCLE_COMPLETE_ONCE = 1;
+  RUNTIME_FILTER_LIFECYCLE_MONOTONIC_UPDATES = 2;
+}
+enum RuntimeFilterReduction {
+  RUNTIME_FILTER_REDUCTION_UNSPECIFIED = 0;
+  RUNTIME_FILTER_REDUCTION_SET_UNION = 1;
+  RUNTIME_FILTER_REDUCTION_TIGHTEN_ORDERED_BOUND = 2;
+  RUNTIME_FILTER_REDUCTION_UNION_ORDERED_HULL = 3;
+}
+enum RuntimeFilterCompletion {
+  RUNTIME_FILTER_COMPLETION_UNSPECIFIED = 0;
+  RUNTIME_FILTER_COMPLETION_PRODUCER_CLOSED = 1;
+  RUNTIME_FILTER_COMPLETION_FENCED_COMMITTED_DOMAIN = 2;
+}
+message RuntimeFilterCoverage {
+  repeated RuntimeFilterCoverageNode nodes = 1;
+  optional uint32 root_index = 2;
+}
+message RuntimeFilterCoverageNode {
+  oneof kind {
+    uint32 witness_id = 1;
+    CoverageChildren all_of = 2;
+    CoverageChildren any_of = 3;
+  }
+}
+// Indices are strictly increasing and precede the containing parent node.
+message CoverageChildren { repeated uint32 node_indices = 1; }
+message RuntimeFilterProducerProgress {
+  repeated uint32 build_edge_ids = 1;
+  repeated uint32 non_build_edge_ids = 2;
+}
+message RuntimeFilterApplyPoint {
+  oneof kind {
+    uint32 node_input_ordinal = 1;
+    novarocks.physical_control_v2.Empty node_output = 2;
+    novarocks.physical_control_v2.Empty scan_source = 3;
+  }
+}
+message RuntimeFilterProducerTarget {
+  oneof kind {
+    uint32 join_build_equality_id = 1;
+    RuntimeFilterAggregateTopNKey aggregate_topn_key = 2;
+  }
+}
+message RuntimeFilterAggregateTopNKey {
+  uint32 group_key_ordinal = 1;
+  optional uint32 topn_node_id = 2;
+  TopNPhase phase = 3;
+  uint32 order_key_ordinal = 4;
+  uint64 limit = 5;
+  uint64 offset = 6;
+  SortDirection direction = 7;
+  NullOrdering null_ordering = 8;
+}
+enum RuntimeFilterArtifactCapability {
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_UNSPECIFIED = 0;
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_MEMBERSHIP = 1;
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_ORDERED_RANGE = 2;
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_EMPTY_DOMAIN = 3;
+}
+enum LateApplyGranularity {
+  LATE_APPLY_GRANULARITY_UNSPECIFIED = 0;
+  LATE_APPLY_GRANULARITY_ROW = 1;
+  LATE_APPLY_GRANULARITY_BATCH = 2;
+  LATE_APPLY_GRANULARITY_ROW_GROUP = 3;
+  LATE_APPLY_GRANULARITY_SPLIT = 4;
+  LATE_APPLY_GRANULARITY_FILE = 5;
+}
+message RuntimeFilterConsumerActivation {
+  oneof kind {
+    novarocks.physical_control_v2.Empty blocking_snapshot = 1;
+    LateApplyGranularity start_unfiltered_then_apply_complete = 2;
+    LateApplyGranularity non_blocking_live = 3;
+  }
+}
+message RuntimeFilterConsumerTarget {
+  oneof kind {
+    uint32 join_probe_equality_id = 1;
+    RuntimeFilterScanField scan_field = 2;
+    RuntimeFilterAggregateTopNScanField aggregate_topn_scan_field = 3;
+  }
+}
+message RuntimeFilterScanField {
+  optional uint32 equality_id = 1;
+  repeated RuntimeFilterLineageStep lineage = 2;
+}
+message RuntimeFilterAggregateTopNScanField {
+  optional uint32 producer_witness_id = 1;
+  repeated RuntimeFilterLineageStep lineage = 2;
+}
+message RuntimeFilterLineageStep {
+  oneof kind {
+    FragmentInputLineage filter_pass_through = 1;
+    FragmentInputLineage sort_pass_through = 2;
+    ProjectIdentityLineage project_identity = 3;
+    JoinEqualityLineage join_equality = 4;
+    FragmentInputLineage join_output_pass_through = 5;
+    AggregateGroupKeyLineage aggregate_group_key = 6;
+    UnionAllBranchLineage union_all_branch = 7;
+    ExchangeMappingLineage exchange_mapping = 8;
+  }
+}
+message FragmentInputLineage {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+  uint32 input_ordinal = 3;
+}
+message ProjectIdentityLineage {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+  uint32 output_ordinal = 3;
+}
+message JoinEqualityLineage {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+  uint32 key_ordinal = 3;
+  JoinSide source_side = 4;
+  JoinSide target_side = 5;
+}
+message AggregateGroupKeyLineage {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+  uint32 group_key_ordinal = 3;
+}
+message UnionAllBranchLineage {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+  uint32 input_ordinal = 3;
+  uint32 output_ordinal = 4;
+}
+message ExchangeMappingLineage {
+  optional uint32 edge_id = 1;
+  uint32 mapping_ordinal = 2;
+}
+message RuntimeFilterEqualityWitness {
+  optional uint32 id = 1;
+  optional uint32 fragment_id = 2;
+  optional uint32 join_node_id = 3;
+  uint32 key_ordinal = 4;
+  JoinSide domain_side = 5;
+}
+message RuntimeFilterProducer {
+  optional uint32 witness_id = 1;
+  RuntimeFilterEndpoint endpoint = 2;
+  RuntimeFilterApplyPoint apply_point = 3;
+  repeated RuntimeFilterContributionKind contribution_kinds = 4;
+  RuntimeFilterCompletion completion = 5;
+  RuntimeFilterProducerProgress progress = 6;
+  RuntimeFilterProducerTarget target = 7;
+}
+message RuntimeFilterEndpoint {
+  optional uint32 fragment_id = 1;
+  optional uint32 node_id = 2;
+  repeated uint32 value_ids = 3;
+}
+message RuntimeFilterConsumer {
+  RuntimeFilterEndpoint endpoint = 1;
+  RuntimeFilterApplyPoint apply_point = 2;
+  repeated RuntimeFilterArtifactCapability capabilities = 3;
+  RuntimeFilterConsumerActivation activation = 4;
+  RuntimeFilterConsumerTarget target = 5;
+}
+message RuntimeFilterPolicy {
+  uint64 max_contribution_bytes = 1;
+  uint64 max_artifact_bytes = 2;
+  uint64 deadline_ms = 3;
+  uint32 max_retries = 4;
+}
+
+// Complete public provider input paired with one actual physical scan node.
+// Provider-private canonicalization authenticates this whole input separately;
+// opaque payload bytes never stand in for these public facts.
+message FrozenReadScan {
+  optional uint32 node_id = 1;
+  ConnectorReadRecipe recipe = 2;
+  ConnectorScanFacts facts = 3;
+  ConnectorReadPublicFacts public_facts = 4;
+}
+message ConnectorReadRecipe {
+  optional uint32 provider_binding_id = 1;
+  ConnectorRelationKind kind = 2;
+  optional uint32 table_payload_id = 3;
+  optional uint32 view_payload_id = 4;
+  // Positional counterpart of assignments and the public schema fields.
+  repeated uint32 column_payload_ids = 5;
+}
+message ConnectorScanFacts {
+  repeated StaticScanAssignment assignments = 1;
+  ScanTupleDomain enforced_predicate = 2;
+  ScanTupleDomain unenforced_predicate = 3;
+  optional uint32 remaining_connector_expression_id = 4;
+  repeated StaticScanDynamicFilter dynamic_filters = 5;
+  uint64 max_batch_rows = 6;
+  uint64 max_batch_bytes = 7;
+  novarocks.connector_read.ScanWorkSource work_source = 8;
+}
+message StaticScanAssignment {
+  string variable = 1;
+  novarocks.connector_read.ValueType value_type = 2;
+}
+message StaticScanDynamicFilter {
+  optional uint32 filter_id = 1;
+  string variable = 2;
+}
+// Column identity here is an assignment/schema ordinal, not a payload or
+// fragment-local ValueId. Ordinal zero is valid; unique entries are canonical.
+message ScanTupleDomain {
+  oneof kind {
+    novarocks.physical_control_v2.Empty all = 1;
+    novarocks.physical_control_v2.Empty none = 2;
+    ScanColumnDomains columns = 3;
+  }
+}
+message ScanColumnDomains { repeated ScanColumnDomain entries = 1; }
+message ScanColumnDomain {
+  uint32 column_ordinal = 1;
+  novarocks.connector_read.Domain domain = 2;
+}
+message ConnectorReadPublicFacts {
+  ConnectorReadStaticFacts source = 1;
+  optional string metadata_kind = 2;
+  optional uint32 schema_id = 3;
+  // Root logical identity is independent of Arrow field metadata. Order is
+  // exactly the public schema/recipe/assignment order, including duplicates.
+  repeated novarocks.physical_type_v2.LogicalType logical_types = 4;
+}
+message ConnectorReadStaticFacts {
+  bytes input_version = 1;
+  bytes selection_digest = 2;
+  ConnectorReadProperties properties = 3;
+  ConnectorReadArtifactCoverage artifact_coverage = 4;
+  bytes coverage_evidence = 5;
+}
+// This existing provider public evidence remains distinct from the retired
+// physical-plan sealed artifact placeholder graph.
+message ConnectorReadArtifactCoverage {
+  oneof kind {
+    novarocks.physical_control_v2.Empty no_artifact_inputs = 1;
+    ConnectorReadExactArtifactCoverage exact = 2;
+  }
+}
+message ConnectorReadExactArtifactCoverage {
+  bytes source_selection_digest = 1;
+  bytes content_digest = 2;
+  bytes evidence = 3;
+}
+message ConnectorReadProperties {
+  ConnectorReadDistribution distribution = 1;
+  repeated ConnectorReadOrderingKey ordering = 2;
+}
+// The provider's existing distribution vocabulary has its own algorithms and
+// bucket proof domain. It is not an engine exchange Distribution.
+message ConnectorReadDistribution {
+  oneof kind {
+    novarocks.physical_control_v2.Empty unconstrained = 1;
+    novarocks.physical_control_v2.Empty singleton = 2;
+    novarocks.physical_control_v2.Empty round_robin = 3;
+    ConnectorReadHashDistribution hash = 4;
+    ConnectorReadBucketDistribution bucket_shuffle = 5;
+  }
+}
+message ConnectorReadHashDistribution {
+  repeated uint32 key_column_ordinals = 1;
+  bytes partition_space = 2;
+  ConnectorReadPartitionCountDomain admissible = 3;
+  ConnectorReadPartitionHash algorithm = 4;
+}
+message ConnectorReadPartitionCountDomain {
+  uint32 min = 1;
+  uint32 max = 2;
+  bool requires_power_of_two = 3;
+}
+message ConnectorReadBucketDistribution {
+  repeated uint32 key_column_ordinals = 1;
+  bytes partition_space = 2;
+  uint32 bucket_count = 3;
+  ConnectorReadPartitionHash hash = 4;
+  ConnectorReadBucketLayout layout = 5;
+  bytes ordinal_domain_evidence = 6;
+}
+enum ConnectorReadPartitionHash {
+  CONNECTOR_READ_PARTITION_HASH_UNSPECIFIED = 0;
+  CONNECTOR_READ_PARTITION_HASH_XX_HASH_64 = 1;
+  CONNECTOR_READ_PARTITION_HASH_MURMUR_3_X64_128 = 2;
+}
+enum ConnectorReadBucketLayout {
+  CONNECTOR_READ_BUCKET_LAYOUT_UNSPECIFIED = 0;
+  CONNECTOR_READ_BUCKET_LAYOUT_DIRECT_MODULO = 1;
+  CONNECTOR_READ_BUCKET_LAYOUT_JUMP_CONSISTENT = 2;
+}
+message ConnectorReadOrderingKey {
+  uint32 column_ordinal = 1;
+  SortDirection direction = 2;
+  NullOrdering null_ordering = 3;
+}
+
+// Flat form of the existing provider residual-expression algebra. Names here
+// are provider public ConnectorFunctionName, never engine function resolution.
+// IDs are a package-wide namespace separate from engine ExpressionDefinition.
+message ConnectorExpressionDefinition {
+  uint32 id = 1;
+  oneof kind {
+    ConnectorConstantExpression constant = 2;
+    ConnectorVariableExpression variable = 3;
+    ConnectorFieldDereferenceExpression field_dereference = 4;
+    ConnectorCallExpression call = 5;
+  }
+}
+message ConnectorConstantExpression {
+  novarocks.connector_read.ValueType value_type = 1;
+  novarocks.connector_read.Value value = 2; // Absent is typed NULL.
+}
+message ConnectorVariableExpression {
+  string name = 1;
+  novarocks.connector_read.ValueType value_type = 2;
+}
+message ConnectorFieldDereferenceExpression {
+  optional uint32 target_connector_expression_id = 1;
+  uint32 field_index = 2;
+  novarocks.connector_read.ValueType value_type = 3;
+}
+message ConnectorCallExpression {
+  string function_name = 1;
+  novarocks.connector_read.ValueType value_type = 2;
+  repeated uint32 argument_connector_expression_ids = 3;
+}
+
+message FrozenWriterRecipe {
+  optional uint32 node_id = 1;
+  optional uint32 provider_binding_id = 2;
+  optional uint32 handle_payload_id = 3;
+  ConnectorWriteInputShape input = 4;
+}
+// All five existing provider roles retain ordered, exact Arrow Field references.
+// No coarse comparable type, packed role guess or runtime writer is encoded.
+// Writer schema depth/aggregate-byte bounds belong to its existing owner; the
+// decoder must not apply the read owner's unrelated per-type node-count gate.
+message ConnectorWriteInputShape {
+  oneof kind {
+    ConnectorWriteDataInput data = 1;
+    ConnectorWriteRowLineageInput row_lineage = 2;
+    ConnectorWritePositionDeleteInput position_delete = 3;
+    ConnectorWriteDeletionVectorInput deletion_vector = 4;
+    ConnectorWriteEqualityDeleteInput equality_delete = 5;
+  }
+}
+message ConnectorWriteFieldBinding {
+  bytes field_token = 1;
+  optional uint32 field_id = 2;
+}
+message ConnectorWriteDataInput {
+  repeated ConnectorWriteFieldBinding fields = 1;
+}
+message ConnectorWriteRowLineageInput {
+  repeated ConnectorWriteFieldBinding data_fields = 1;
+  repeated ConnectorWriteFieldBinding row_identity_fields = 2;
+}
+message ConnectorWritePositionDeleteInput {
+  repeated ConnectorWriteFieldBinding identity_fields = 1;
+  repeated ConnectorWriteFieldBinding partition_source_fields = 2;
+}
+message ConnectorWriteDeletionVectorInput {
+  repeated ConnectorWriteFieldBinding identity_fields = 1;
+  repeated ConnectorWriteFieldBinding partition_source_fields = 2;
+}
+message ConnectorWriteEqualityDeleteInput {
+  repeated ConnectorWriteFieldBinding equality_fields = 1;
+}

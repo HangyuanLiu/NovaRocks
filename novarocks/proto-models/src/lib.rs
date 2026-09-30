@@ -65,6 +65,15 @@ pub mod physical_semantics_v2 {
     ));
 }
 
+/// Complete flat fragment carrier. Generated DTOs remain codec-owned;
+/// structural and installed-capability validation precede local compilation.
+pub mod physical_package_v2 {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/novarocks.physical_package_v2.rs"
+    ));
+}
+
 #[allow(clippy::large_enum_variant)]
 pub mod plan {
     include!(concat!(env!("OUT_DIR"), "/novarocks.plan.rs"));

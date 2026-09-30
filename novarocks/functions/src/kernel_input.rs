@@ -174,7 +174,10 @@ pub(crate) fn logical_is_null(
     }
 }
 
-pub(crate) fn validate_type_observed(
+/// Validate a complete pure function value type in the caller's existing work
+/// scope. Local compilation uses the same signature/logical/metadata limits as
+/// kernel preparation, without reconstructing a second type resource policy.
+pub fn validate_type_observed(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {

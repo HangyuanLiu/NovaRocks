@@ -1,0 +1,373 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::{
+    BindingRequirement, BindingRequirements, CompileProfile, ImmutableExpressions,
+    KernelAbiVersion, LocalProgram, ProgramControlFlow, ProgramEvaluationDomain, ProgramNode,
+    ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, StaticExprNode, StaticLayout,
+    StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues,
+};
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use novarocks_execution_contract::DataStreamPartitionType;
+use novarocks_type_contract::{EvaluationDomainId, ValueLogicalType};
+use novarocks_types::SlotId;
+use std::{collections::HashMap, num::NonZeroUsize};
+
+#[derive(Default)]
+struct Control {
+    at: Option<u32>,
+    failure: Option<CompileControlError>,
+}
+impl PureCompileControl for Control {
+    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert_eq!(phase, CompilePhase::LowerProgram);
+        assert!(units <= 256);
+        if self.at == Some(units) {
+            Err(self.failure.unwrap())
+        } else {
+            Ok(())
+        }
+    }
+}
+fn arena(nodes: Vec<StaticExprNode>) -> Arc<ImmutableExpressions> {
+    Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap())
+}
+fn bool_node() -> StaticExprNode {
+    StaticExprNode::new(
+        StaticExprKind::Literal(StaticLiteral::Bool(true)),
+        DataType::Boolean,
+        None,
+    )
+}
+fn value(ty: DataType, nullable: bool) -> FunctionArgumentType {
+    FunctionArgumentType::Value(FunctionValueType::new(ty, nullable))
+}
+fn empty_flow(count: usize) -> ProgramControlFlow {
+    ProgramControlFlow::try_new(
+        vec![ProgramEvaluationDomain {
+            id: EvaluationDomainId::new(u32::MAX),
+            parent: None,
+            guard: None,
+        }],
+        vec![],
+        count,
+        &Control::default(),
+    )
+    .unwrap()
+}
+fn resolved(
+    nodes: Vec<StaticExprNode>,
+    sink_nodes: Option<Vec<StaticExprNode>>,
+) -> ProgramResolvedCalls {
+    let main = arena(nodes);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "source",
+        DataType::Boolean,
+        false,
+    )]));
+    let layout = StaticLayout::try_new(schema.clone(), Arc::from([SlotId::new(1)])).unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(vec![true]))]).unwrap();
+    let values = StaticValues::try_new(batch, layout.clone()).unwrap();
+    let profile = CompileProfile::new(
+        NonZeroUsize::new(1).unwrap(),
+        None,
+        layout.identity().unwrap(),
+        KernelAbiVersion::CURRENT,
+    );
+    let mut flows =
+        BTreeMap::from([(ProgramExpressionArena::Main, empty_flow(main.nodes().len()))]);
+    let (requirements, sink) = match sink_nodes {
+        Some(nodes) => {
+            let sink_arena = arena(nodes);
+            flows.insert(
+                ProgramExpressionArena::Sink,
+                empty_flow(sink_arena.nodes().len()),
+            );
+            let branch = StaticStreamBranch::try_new(
+                10,
+                DataStreamPartitionType::Unpartitioned,
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
+            (
+                vec![BindingRequirement::ExchangeOutput {
+                    branch: 0,
+                    layout: layout.clone(),
+                }],
+                Some(StaticSinkProgram::try_data_stream(branch, sink_arena).unwrap()),
+            )
+        }
+        None => (vec![], None),
+    };
+    let program = LocalProgram::try_new_with_sink(
+        vec![ProgramNode::new(
+            0,
+            ProgramNodeKind::Values { values },
+            layout,
+        )],
+        ProgramNodeId::new(0),
+        main,
+        profile,
+        BindingRequirements::try_new(requirements).unwrap(),
+        sink,
+    )
+    .unwrap();
+    let snapshot =
+        ProgramRootControlBindings::try_new(program, flows, vec![], &Control::default()).unwrap();
+    ProgramResolvedCalls::try_new(snapshot, vec![], &Control::default()).unwrap()
+}
+fn main_types(
+    types: Vec<FunctionArgumentType>,
+) -> BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>> {
+    BTreeMap::from([(ProgramExpressionArena::Main, types)])
+}
+
+#[test]
+fn unused_definitions_still_have_explicit_full_logical_and_nullable_types() {
+    let source = resolved(
+        vec![StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Utf8("null".into())),
+            DataType::Utf8,
+            None,
+        )],
+        None,
+    );
+    let json = FunctionArgumentType::Value(
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap(),
+    );
+    let typed = ProgramTypedExpressions::try_new(
+        source,
+        main_types(vec![json.clone()]),
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        typed.definition_type(ProgramExpressionArena::Main, ProgramExprId::new(0)),
+        Some(&json)
+    );
+    assert!(
+        typed
+            .definition_type(ProgramExpressionArena::Sink, ProgramExprId::new(0))
+            .is_none()
+    );
+    assert!(
+        typed
+            .definition_type(ProgramExpressionArena::Main, ProgramExprId::new(1))
+            .is_none()
+    );
+    assert!(typed.resolved_calls().calls().is_empty());
+}
+
+#[test]
+fn missing_extra_arena_and_definition_positions_are_not_optional() {
+    let source = resolved(vec![bool_node()], None);
+    for entries in [
+        BTreeMap::new(),
+        main_types(vec![]),
+        main_types(vec![value(DataType::Boolean, true); 2]),
+        BTreeMap::from([(
+            ProgramExpressionArena::Sink,
+            vec![value(DataType::Boolean, true)],
+        )]),
+    ] {
+        assert_eq!(
+            ProgramTypedExpressions::try_new(source.clone(), entries, &Control::default())
+                .unwrap_err(),
+            ProgramExpressionTypeError::IncompleteCoverage
+        );
+    }
+}
+
+#[test]
+fn lambda_parameter_shape_and_body_type_remain_explicit() {
+    let source = resolved(
+        vec![
+            bool_node(),
+            StaticExprNode::new(
+                StaticExprKind::LambdaFunction {
+                    body: ProgramExprId::new(0),
+                    arg_slots: vec![SlotId::new(7)],
+                    common_sub_exprs: vec![],
+                    is_nondeterministic: false,
+                },
+                DataType::Boolean,
+                None,
+            ),
+        ],
+        None,
+    );
+    let lambda = FunctionArgumentType::Lambda {
+        parameter_types: vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+        result_type: FunctionValueType::new(DataType::Boolean, true),
+    };
+    ProgramTypedExpressions::try_new(
+        source.clone(),
+        main_types(vec![value(DataType::Boolean, true), lambda.clone()]),
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ProgramTypedExpressions::try_new(
+            source.clone(),
+            main_types(vec![value(DataType::Boolean, true); 2]),
+            &Control::default()
+        )
+        .unwrap_err(),
+        ProgramExpressionTypeError::WrongKind
+    );
+    let FunctionArgumentType::Lambda { result_type, .. } = lambda.clone() else {
+        unreachable!()
+    };
+    let wrong = FunctionArgumentType::Lambda {
+        parameter_types: Box::default(),
+        result_type,
+    };
+    assert_eq!(
+        ProgramTypedExpressions::try_new(
+            source.clone(),
+            main_types(vec![value(DataType::Boolean, true), wrong]),
+            &Control::default()
+        )
+        .unwrap_err(),
+        ProgramExpressionTypeError::WrongLambda
+    );
+    assert_eq!(
+        ProgramTypedExpressions::try_new(
+            source,
+            main_types(vec![value(DataType::Boolean, false), lambda]),
+            &Control::default()
+        )
+        .unwrap_err(),
+        ProgramExpressionTypeError::TypeMismatch
+    );
+}
+
+#[test]
+fn exact_dictionary_field_identity_and_root_logical_validation_are_observed() {
+    #[allow(deprecated)]
+    let field = |id| {
+        Arc::new(Field::new_dict(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+            id,
+            true,
+        ))
+    };
+    let left = DataType::Struct(vec![field(1)].into());
+    let right = DataType::Struct(vec![field(2)].into());
+    assert_eq!(left, right); // Arrow logical equality is deliberately coarser.
+    let source = resolved(
+        vec![StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Null),
+            left.clone(),
+            None,
+        )],
+        None,
+    );
+    ProgramTypedExpressions::try_new(
+        source.clone(),
+        main_types(vec![value(left, true)]),
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ProgramTypedExpressions::try_new(
+            source,
+            main_types(vec![value(right, true)]),
+            &Control::default()
+        )
+        .unwrap_err(),
+        ProgramExpressionTypeError::TypeMismatch
+    );
+    let wrong = FunctionArgumentType::Value(FunctionValueType {
+        data_type: DataType::Boolean,
+        nullable: true,
+        logical_type: ValueLogicalType::Json,
+    });
+    assert!(matches!(
+        ProgramTypedExpressions::try_new(
+            resolved(vec![bool_node()], None),
+            main_types(vec![wrong]),
+            &Control::default()
+        ),
+        Err(ProgramExpressionTypeError::Kernel(
+            KernelFailure::InvalidProgram(_)
+        ))
+    ));
+}
+
+#[test]
+fn combined_definition_budget_counts_distinct_arenas_even_for_unused_constants() {
+    for main_count in [
+        MAX_STATIC_EXPRESSIONS - 2,
+        MAX_STATIC_EXPRESSIONS - 1,
+        MAX_STATIC_EXPRESSIONS,
+    ] {
+        let source = resolved(vec![bool_node(); main_count], Some(vec![bool_node()]));
+        let types = BTreeMap::from([
+            (
+                ProgramExpressionArena::Main,
+                vec![value(DataType::Boolean, false); main_count],
+            ),
+            (
+                ProgramExpressionArena::Sink,
+                vec![value(DataType::Boolean, false)],
+            ),
+        ]);
+        let result = ProgramTypedExpressions::try_new(source, types, &Control::default());
+        if main_count == MAX_STATIC_EXPRESSIONS {
+            assert_eq!(
+                result.unwrap_err(),
+                ProgramExpressionTypeError::TooManyDefinitions
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+#[test]
+fn signature_type_work_uses_one_scope_and_preserves_all_three_control_failures() {
+    let source = resolved(vec![bool_node(); 300], None);
+    for failure in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in [0, 256] {
+            assert_eq!(
+                ProgramTypedExpressions::try_new(
+                    source.clone(),
+                    main_types(vec![value(DataType::Boolean, false); 300]),
+                    &Control {
+                        at: Some(at),
+                        failure: Some(failure)
+                    }
+                )
+                .unwrap_err(),
+                ProgramExpressionTypeError::Control(failure)
+            );
+        }
+    }
+}
