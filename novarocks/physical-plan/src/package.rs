@@ -239,12 +239,12 @@ pub(crate) fn fragment_parameter_references(fragment: &Fragment) -> Vec<Semantic
         }
     }
     for node in fragment.nodes().values() {
-        match &node.kind {
-            crate::NodeKind::Aggregate { calls, .. } => {
-                for call in calls {
-                    references.extend_from_slice(&call.binding.function.semantic_parameters);
-                }
+        if let Some((_, calls)) = node.kind.aggregate_contract() {
+            for call in calls {
+                references.extend_from_slice(&call.binding.function.semantic_parameters);
             }
+        }
+        match &node.kind {
             crate::NodeKind::TableFunction { function, .. } => {
                 references.extend_from_slice(&function.semantic_parameters)
             }

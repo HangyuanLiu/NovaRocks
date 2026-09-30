@@ -927,6 +927,7 @@ fn materialize_runtime_filter(
                         limit: frozen_limit,
                         offset,
                         phase,
+                        reduction: novarocks_physical_plan::TopNReduction::Rows,
                     } = &candidate.kind
                     else {
                         return None;

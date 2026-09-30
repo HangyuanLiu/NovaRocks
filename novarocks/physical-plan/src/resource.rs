@@ -748,6 +748,21 @@ fn add_node_usage(
     if usage.exhausted() {
         return;
     }
+    if let Some((group_by, calls)) = kind.aggregate_contract() {
+        usage.add_item_counts([group_by.len(), calls.len()]);
+        for (index, call) in calls.iter().enumerate() {
+            if usage.exhausted() {
+                return;
+            }
+            usage.add_item_counts([call.arguments.len(), call.order_by.len()]);
+            add_aggregate_binding_usage(
+                &call.binding,
+                &format!("{path}.calls[{index}].binding"),
+                usage,
+                errors,
+            );
+        }
+    }
     match kind {
         NodeKind::Scan {
             relation,
@@ -770,23 +785,7 @@ fn add_node_usage(
             add_relation_usage(relation, &format!("{path}.relation"), usage, errors);
         }
         NodeKind::Project { expressions } => usage.add_items(expressions.len()),
-        NodeKind::Aggregate {
-            group_by, calls, ..
-        } => {
-            usage.add_item_counts([group_by.len(), calls.len()]);
-            for (index, call) in calls.iter().enumerate() {
-                if usage.exhausted() {
-                    return;
-                }
-                usage.add_item_counts([call.arguments.len(), call.order_by.len()]);
-                add_aggregate_binding_usage(
-                    &call.binding,
-                    &format!("{path}.calls[{index}].binding"),
-                    usage,
-                    errors,
-                );
-            }
-        }
+        NodeKind::Aggregate { .. } => {}
         NodeKind::HashJoin {
             keys,
             null_extended,

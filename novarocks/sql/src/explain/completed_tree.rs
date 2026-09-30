@@ -1032,6 +1032,7 @@ impl TreeContext<'_> {
                 limit,
                 offset,
                 phase,
+                reduction,
             } => {
                 let label = match phase {
                     novarocks_physical_plan::TopNPhase::Partial { .. } => "LOCAL TOP-N",
@@ -1039,7 +1040,20 @@ impl TreeContext<'_> {
                 };
                 // Both bounds, always: a top-N that skips nothing says so
                 // rather than leaving a reader to infer it.
-                let parts = [format!("limit={limit}"), format!("offset={offset}")];
+                let mut parts = vec![format!("limit={limit}"), format!("offset={offset}")];
+                if let novarocks_physical_plan::TopNReduction::GroupedStates {
+                    group_by,
+                    calls,
+                    comparator,
+                } = reduction
+                {
+                    parts.push(format!(
+                        "unit=group-key, keys={}, merged-states={}, comparator={}",
+                        group_by.len(),
+                        calls.len(),
+                        comparator.stable_name()
+                    ));
+                }
                 out.push(format!(
                     "{prefix}{label} ({}) [{}]{stats}",
                     parts.join(", "),

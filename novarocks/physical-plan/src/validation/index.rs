@@ -486,24 +486,6 @@ impl SemanticTraceIndexes {
             })
             .collect()
     }
-
-    pub(crate) fn port_contains_all(
-        &mut self,
-        fragment: FragmentId,
-        node: &PhysicalNode,
-        values: impl IntoIterator<Item = ValueId>,
-        value_count: usize,
-        budget: &mut SemanticTraceWorkBudget,
-    ) -> bool {
-        let key = (fragment, node.id);
-        if !self.ensure_port(key, &node.output.columns, budget) || !budget.charge(value_count) {
-            return false;
-        }
-        let Some(port) = self.ports.get(&key) else {
-            return false;
-        };
-        values.into_iter().all(|value| port.contains(&value))
-    }
 }
 
 #[derive(Clone, Default, PartialEq)]

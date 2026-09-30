@@ -628,9 +628,12 @@ pub enum SortMode {
 /// Whether an aggregate's groups are complete when it emits them.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateGrouping {
-    /// Some later pass still combines these groups.
+    /// Later exact state consumers combine these groups. One key may be
+    /// emitted repeatedly within a lane, across drivers or across batches.
     Partial,
-    /// Each group is emitted once, finished.
+    /// The required grouping domain is complete and each full key is emitted
+    /// at most once by the entire task under its actual CompileProfile.
+    /// This covers every driver and does not imply SQL-value finalization.
     Complete,
 }
 
@@ -639,6 +642,21 @@ pub enum TopNPhase {
     Single,
     Partial { sequence: crate::TopNSequenceId },
     Final { sequence: crate::TopNSequenceId },
+}
+
+/// Exact unit counted and state responsibility of a TopN reduction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TopNReduction {
+    Rows,
+    /// Limit counts distinct complete grouping keys. Every contribution for
+    /// each retained key is merged through these exact Intermediate calls.
+    /// Output states have new identities; no contribution is a passthrough.
+    /// This guarantees task-local uniqueness, not global group completion.
+    GroupedStates {
+        group_by: Box<[(ExprId, ValueId)]>,
+        calls: Box<[AggregateCall]>,
+        comparator: novarocks_type_contract::OrderedComparisonAlgorithm,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -725,15 +743,10 @@ pub enum NodeKind {
     Aggregate {
         group_by: Box<[(ExprId, ValueId)]>,
         calls: Box<[AggregateCall]>,
-        /// Whether the groups this node emits are finished with.
-        ///
-        /// Every call already states its own phase and they agree, so this
-        /// repeats what they say -- except for an aggregate that has no call
-        /// at all. A `DISTINCT` is exactly that, and a local pass that only
-        /// drops duplicates ahead of a shuffle is as legitimate as the pass
-        /// that finishes the groups; without this the two are
-        /// indistinguishable and the local pass is asked to prove a
-        /// co-location it does not need.
+        /// Required grouping completion and task-wide output uniqueness.
+        /// Call finalization is independent: Complete may emit intermediate
+        /// states, while a finalizing call requires Complete. The compiler
+        /// must meet this requirement across the selected local DOP.
         grouping: AggregateGrouping,
     },
     HashJoin {
@@ -759,6 +772,7 @@ pub enum NodeKind {
         limit: u64,
         offset: u64,
         phase: TopNPhase,
+        reduction: TopNReduction,
     },
     Limit {
         limit: Option<u64>,
@@ -824,7 +838,27 @@ pub struct ScanReadBudget {
     pub max_batch_bytes: u64,
 }
 
+/// Borrow of the common grouping and exact aggregate-call contract.
+pub type AggregateContractRef<'a> = (&'a [(ExprId, ValueId)], &'a [AggregateCall]);
+
 impl NodeKind {
+    /// The one aggregate state contract, shared by ordinary aggregation and
+    /// key-budgeted reduction. No separate grouped-TopN binding vocabulary.
+    pub fn aggregate_contract(&self) -> Option<AggregateContractRef<'_>> {
+        match self {
+            Self::Aggregate {
+                group_by, calls, ..
+            }
+            | Self::TopN {
+                reduction:
+                    TopNReduction::GroupedStates {
+                        group_by, calls, ..
+                    },
+                ..
+            } => Some((group_by, calls)),
+            _ => None,
+        }
+    }
     /// Runtime expression roots, in occurrence order. Proof-only provider
     /// guarantee references are excluded. Join keys retain Value demand; a
     /// NULL-aware anti join also needs its predicate's three-valued result.
@@ -961,7 +995,23 @@ impl NodeKind {
                     }
                 }
             }
-            Self::TopN { order_by, .. } => output.extend(order_by.iter().map(|item| item.expr)),
+            Self::TopN {
+                order_by,
+                reduction,
+                ..
+            } => {
+                output.extend(order_by.iter().map(|item| item.expr));
+                if let TopNReduction::GroupedStates {
+                    group_by, calls, ..
+                } = reduction
+                {
+                    output.extend(group_by.iter().map(|(expr, _)| *expr));
+                    for call in calls {
+                        output.extend(call.arguments.iter().copied());
+                        output.extend(call.order_by.iter().map(|item| item.expr));
+                    }
+                }
+            }
             Self::Window(spec) => {
                 output.extend(spec.partition_by.iter().map(|item| item.expr));
                 output.extend(spec.order_by.iter().map(|item| item.expr));

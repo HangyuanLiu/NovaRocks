@@ -131,7 +131,7 @@ fn add_provider_scan(
                 columns: values.clone().into_boxed_slice(),
             },
             kind: NodeKind::Scan {
-                occurrence: ProviderReadOccurrenceId::new(0),
+                occurrence: ProviderReadOccurrenceId::new(scan.get()),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: columns
@@ -206,12 +206,47 @@ fn add_aggregate(
     call_id: AggregateCallId,
     input_properties: PhysicalProperties,
 ) -> (NodeId, Vec<ValueId>) {
+    add_aggregate_with_grouping(
+        builder,
+        input,
+        group_inputs,
+        argument,
+        phase,
+        drift,
+        distinct,
+        call_id,
+        input_properties,
+        if phase.produces_final_result() {
+            AggregateGrouping::Complete
+        } else {
+            AggregateGrouping::Partial
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_aggregate_with_grouping(
+    builder: &mut FragmentBuilder,
+    input: NodeId,
+    group_inputs: &[ValueId],
+    argument: ValueId,
+    phase: AggregatePhase,
+    drift: BindingDrift,
+    distinct: bool,
+    call_id: AggregateCallId,
+    input_properties: PhysicalProperties,
+    grouping: AggregateGrouping,
+) -> (NodeId, Vec<ValueId>) {
     let node = builder.reserve_node_id().unwrap();
     let group_by = group_inputs
         .iter()
         .map(|value| {
             let expression = builder
-                .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(*value))
+                .add_expression(
+                    node,
+                    builder.value(*value).unwrap().ty.clone(),
+                    ExprKind::Value(*value),
+                )
                 .unwrap();
             (expression, *value)
         })
@@ -269,14 +304,7 @@ fn add_aggregate(
                     order_by: Box::default(),
                     output,
                 }]),
-                grouping: match phase {
-                    AggregatePhase::Single | AggregatePhase::Final { .. } => {
-                        AggregateGrouping::Complete
-                    }
-                    AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                        AggregateGrouping::Partial
-                    }
-                },
+                grouping,
             },
         })
         .unwrap();
@@ -829,4 +857,436 @@ fn aggregate_call_identity_is_unique_across_a_fragment() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("aggregate call identity must be unique within its fragment"));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GroupedReductionFixture {
+    Valid,
+    MissingState,
+    WrongSequence,
+    ReusedState,
+    StateRanking,
+    Offset,
+    RowBudget,
+    DuplicateState,
+    FloatKey,
+    BinaryCarrier,
+    LargeIntKey,
+    RepeatedPort,
+    DroppedGroupingKey,
+    RenamedDroppedGroupingKey,
+    RenamedRowBudget,
+    StagedRowBudget,
+    UnionCompleteRowBudget,
+    UnionGroupedStates,
+    CompleteRowBudget,
+    DistinctState,
+}
+fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPlan, String> {
+    let row_budget = matches!(
+        fixture,
+        GroupedReductionFixture::RowBudget
+            | GroupedReductionFixture::RenamedRowBudget
+            | GroupedReductionFixture::UnionCompleteRowBudget
+            | GroupedReductionFixture::CompleteRowBudget
+    );
+    let mut b = FragmentBuilder::new(FragmentId::new(811));
+    let singleton = properties(Distribution::Singleton);
+    let key_type = match fixture {
+        GroupedReductionFixture::FloatKey => ty(DataType::Float64, false),
+        GroupedReductionFixture::BinaryCarrier => ty(DataType::FixedSizeBinary(16), false),
+        GroupedReductionFixture::LargeIntKey => ValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap(),
+        _ => ty(DataType::Int64, false),
+    };
+    let field_types = if matches!(
+        fixture,
+        GroupedReductionFixture::DroppedGroupingKey
+            | GroupedReductionFixture::RenamedDroppedGroupingKey
+    ) {
+        vec![
+            key_type.clone(),
+            ty(DataType::Int64, false),
+            ty(DataType::Int64, false),
+        ]
+    } else {
+        vec![key_type.clone(), ty(DataType::Int64, false)]
+    };
+    let (scan, values) = add_provider_scan(&mut b, &field_types, singleton.clone());
+    let grouping_inputs = if matches!(
+        fixture,
+        GroupedReductionFixture::DroppedGroupingKey
+            | GroupedReductionFixture::RenamedDroppedGroupingKey
+    ) {
+        vec![values[0], values[1]]
+    } else {
+        vec![values[0]]
+    };
+    let (partial, values) = add_aggregate_with_grouping(
+        &mut b,
+        scan,
+        &grouping_inputs,
+        *values.last().unwrap(),
+        AggregatePhase::Partial { sequence: SEQUENCE },
+        BindingDrift::None,
+        matches!(fixture, GroupedReductionFixture::DistinctState),
+        AggregateCallId::new(811),
+        singleton.clone(),
+        if matches!(
+            fixture,
+            GroupedReductionFixture::UnionCompleteRowBudget
+                | GroupedReductionFixture::CompleteRowBudget
+        ) {
+            AggregateGrouping::Complete
+        } else {
+            AggregateGrouping::Partial
+        },
+    );
+    let (partial, values) = if matches!(
+        fixture,
+        GroupedReductionFixture::UnionCompleteRowBudget
+            | GroupedReductionFixture::UnionGroupedStates
+    ) {
+        let (left, left_values) = (partial, values);
+        let (right_scan, right_input) = add_provider_scan(
+            &mut b,
+            &[key_type.clone(), ty(DataType::Int64, false)],
+            singleton.clone(),
+        );
+        let (right, right_values) = add_aggregate_with_grouping(
+            &mut b,
+            right_scan,
+            &[right_input[0]],
+            right_input[1],
+            AggregatePhase::Partial { sequence: SEQUENCE },
+            BindingDrift::None,
+            false,
+            AggregateCallId::new(815),
+            singleton.clone(),
+            AggregateGrouping::Complete,
+        );
+        let union = b.reserve_node_id().unwrap();
+        let key = b
+            .add_value(
+                key_type.clone(),
+                ValueOrigin::NodeOutput {
+                    node: union,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        let state = b
+            .add_value(
+                ty(DataType::Binary, false),
+                ValueOrigin::NodeOutput {
+                    node: union,
+                    output_ordinal: 1,
+                },
+            )
+            .unwrap();
+        b.insert_node_unchecked(PhysicalNode {
+            id: union,
+            inputs: Box::from([left, right]),
+            required_inputs: Box::from([singleton.clone(), singleton.clone()]),
+            output_properties: singleton.clone(),
+            output: OutputPort {
+                node: union,
+                columns: Box::from([key, state]),
+            },
+            kind: NodeKind::SetOp {
+                kind: SetOperationKind::UnionAll,
+                input_mappings: Box::from([
+                    left_values.into_boxed_slice(),
+                    right_values.into_boxed_slice(),
+                ]),
+            },
+        })
+        .unwrap();
+        (union, vec![key, state])
+    } else {
+        (partial, values)
+    };
+    let mut values = values;
+    let partial = if matches!(
+        fixture,
+        GroupedReductionFixture::RepeatedPort
+            | GroupedReductionFixture::DroppedGroupingKey
+            | GroupedReductionFixture::RenamedDroppedGroupingKey
+            | GroupedReductionFixture::RenamedRowBudget
+    ) {
+        values = vec![values[0], *values.last().unwrap()];
+        let projection = b.reserve_node_id().unwrap();
+        let key = b
+            .add_expression(projection, key_type.clone(), ExprKind::Value(values[0]))
+            .unwrap();
+        let state = b
+            .add_expression(
+                projection,
+                ty(DataType::Binary, false),
+                ExprKind::Value(values[1]),
+            )
+            .unwrap();
+        let output_key = if matches!(
+            fixture,
+            GroupedReductionFixture::RenamedDroppedGroupingKey
+                | GroupedReductionFixture::RenamedRowBudget
+        ) {
+            b.add_value(
+                key_type.clone(),
+                ValueOrigin::Expr {
+                    node: projection,
+                    expr: key,
+                },
+            )
+            .unwrap()
+        } else {
+            values[0]
+        };
+        b.add_project(
+            projection,
+            partial,
+            Box::from([(key, output_key), (state, values[1])]),
+            if matches!(fixture, GroupedReductionFixture::RepeatedPort) {
+                Box::from([output_key, values[1], values[1]])
+            } else {
+                Box::from([output_key, values[1]])
+            },
+        )
+        .unwrap();
+        values[0] = output_key;
+        projection
+    } else {
+        partial
+    };
+    let topn = b.reserve_node_id().unwrap();
+    let key_expr = b
+        .add_expression(topn, key_type.clone(), ExprKind::Value(values[0]))
+        .unwrap();
+    let state_expr = if row_budget {
+        key_expr
+    } else {
+        b.add_expression(
+            topn,
+            ty(DataType::Binary, false),
+            ExprKind::Value(values[1]),
+        )
+        .unwrap()
+    };
+    let call_id = AggregateCallId::new(812);
+    let phase = AggregatePhase::Intermediate {
+        sequence: if matches!(fixture, GroupedReductionFixture::WrongSequence) {
+            AggregateSequenceId::new(999)
+        } else {
+            SEQUENCE
+        },
+    };
+    let state = if row_budget || matches!(fixture, GroupedReductionFixture::ReusedState) {
+        values[1]
+    } else {
+        b.add_value(
+            ty(DataType::Binary, false),
+            ValueOrigin::AggregateState {
+                call: call_id,
+                phase,
+            },
+        )
+        .unwrap()
+    };
+    let call = AggregateCall {
+        id: call_id,
+        binding: aggregate_binding(phase, BindingDrift::None),
+        arguments: Box::from([state_expr]),
+        distinct: false,
+        order_by: Box::default(),
+        output: state,
+    };
+    let calls = if matches!(fixture, GroupedReductionFixture::MissingState) {
+        Box::default()
+    } else if matches!(fixture, GroupedReductionFixture::DuplicateState) {
+        Box::from([call.clone(), call])
+    } else {
+        Box::from([call])
+    };
+    let reduction = if row_budget {
+        TopNReduction::Rows
+    } else {
+        TopNReduction::GroupedStates {
+            group_by: Box::from([(key_expr, values[0])]),
+            calls,
+            comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
+        }
+    };
+    let order = if matches!(fixture, GroupedReductionFixture::StateRanking) {
+        state_expr
+    } else {
+        key_expr
+    };
+    let output_state = if row_budget { values[1] } else { state };
+    let ordered_value = if matches!(fixture, GroupedReductionFixture::StateRanking) {
+        values[1]
+    } else {
+        values[0]
+    };
+    b.insert_node_unchecked(PhysicalNode {
+        id: topn,
+        inputs: Box::from([partial]),
+        required_inputs: Box::from([singleton.clone()]),
+        output_properties: PhysicalProperties {
+            ordering: Box::from([OrderingKey {
+                value: ordered_value,
+                direction: SortDirection::Ascending,
+                null_ordering: NullOrdering::Last,
+            }]),
+            ..singleton.clone()
+        },
+        output: OutputPort {
+            node: topn,
+            columns: Box::from([values[0], output_state]),
+        },
+        kind: NodeKind::TopN {
+            order_by: Box::from([SortExpr {
+                expr: order,
+                direction: SortDirection::Ascending,
+                null_ordering: NullOrdering::Last,
+            }]),
+            limit: 1,
+            offset: u64::from(matches!(fixture, GroupedReductionFixture::Offset)),
+            phase: TopNPhase::Partial {
+                sequence: TopNSequenceId::new(811),
+            },
+            reduction,
+        },
+    })
+    .unwrap();
+    let mut topn_input = singleton.clone();
+    topn_input.ordering = Box::from([OrderingKey {
+        value: ordered_value,
+        direction: SortDirection::Ascending,
+        null_ordering: NullOrdering::Last,
+    }]);
+    let topn = if matches!(fixture, GroupedReductionFixture::StagedRowBudget) {
+        let rows = b.reserve_node_id().unwrap();
+        let order = b
+            .add_expression(rows, key_type.clone(), ExprKind::Value(values[0]))
+            .unwrap();
+        b.add_top_n(
+            rows,
+            topn,
+            Box::from([SortExpr {
+                expr: order,
+                direction: SortDirection::Ascending,
+                null_ordering: NullOrdering::Last,
+            }]),
+            1,
+            0,
+            TopNPhase::Partial {
+                sequence: TopNSequenceId::new(811),
+            },
+        )
+        .unwrap();
+        rows
+    } else {
+        topn
+    };
+    let (final_agg, outputs) = add_aggregate(
+        &mut b,
+        topn,
+        &[values[0]],
+        output_state,
+        AggregatePhase::Final { sequence: SEQUENCE },
+        BindingDrift::None,
+        false,
+        AggregateCallId::new(813),
+        topn_input,
+    );
+    let final_topn = b.reserve_node_id().unwrap();
+    let order = b
+        .add_expression(final_topn, key_type.clone(), ExprKind::Value(outputs[0]))
+        .unwrap();
+    b.add_top_n(
+        final_topn,
+        final_agg,
+        Box::from([SortExpr {
+            expr: order,
+            direction: SortDirection::Ascending,
+            null_ordering: NullOrdering::Last,
+        }]),
+        1,
+        0,
+        TopNPhase::Final {
+            sequence: TopNSequenceId::new(811),
+        },
+    )
+    .unwrap();
+    let fragment = b
+        .finish_definition(final_topn, FragmentSink::Noop, dop())
+        .map_err(|e| e.to_string())?;
+    let mut plan = PlanBuilder::new(version());
+    plan.add_fragment(fragment).unwrap();
+    plan.finish().map_err(|e| e.to_string())
+}
+#[test]
+fn grouped_topn_merges_new_exact_intermediate_states_in_both_sequences() {
+    grouped_reduction_plan(GroupedReductionFixture::LargeIntKey).unwrap();
+    grouped_reduction_plan(GroupedReductionFixture::CompleteRowBudget).unwrap();
+    grouped_reduction_plan(GroupedReductionFixture::UnionGroupedStates).unwrap();
+    let plan = grouped_reduction_plan(GroupedReductionFixture::Valid).unwrap();
+    let fragment = plan.fragments().values().next().unwrap();
+    let grouped = fragment
+        .nodes()
+        .values()
+        .find(|n| {
+            matches!(
+                n.kind,
+                NodeKind::TopN {
+                    reduction: TopNReduction::GroupedStates { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let (_, calls) = grouped.kind.aggregate_contract().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_ne!(
+        calls[0].output,
+        crate::expression_value(fragment.expressions(), calls[0].arguments[0]).unwrap()
+    );
+}
+#[test]
+fn grouped_topn_rejects_missing_contributions_row_budgets_and_binding_drift() {
+    for fixture in [
+        GroupedReductionFixture::MissingState,
+        GroupedReductionFixture::WrongSequence,
+        GroupedReductionFixture::ReusedState,
+        GroupedReductionFixture::StateRanking,
+        GroupedReductionFixture::Offset,
+        GroupedReductionFixture::RowBudget,
+        GroupedReductionFixture::DuplicateState,
+        GroupedReductionFixture::FloatKey,
+        GroupedReductionFixture::BinaryCarrier,
+        GroupedReductionFixture::RepeatedPort,
+        GroupedReductionFixture::DroppedGroupingKey,
+        GroupedReductionFixture::RenamedDroppedGroupingKey,
+        GroupedReductionFixture::RenamedRowBudget,
+        GroupedReductionFixture::StagedRowBudget,
+        GroupedReductionFixture::UnionCompleteRowBudget,
+        GroupedReductionFixture::DistinctState,
+    ] {
+        let error = grouped_reduction_plan(fixture).unwrap_err();
+        if matches!(
+            fixture,
+            GroupedReductionFixture::DroppedGroupingKey
+                | GroupedReductionFixture::RenamedDroppedGroupingKey
+                | GroupedReductionFixture::RowBudget
+                | GroupedReductionFixture::RenamedRowBudget
+                | GroupedReductionFixture::StagedRowBudget
+                | GroupedReductionFixture::UnionCompleteRowBudget
+        ) {
+            assert!(error.contains("TopN partial paths"), "{fixture:?}: {error}");
+        }
+    }
 }

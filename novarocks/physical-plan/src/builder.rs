@@ -367,6 +367,7 @@ impl FragmentBuilder {
             output_properties,
             output: OutputPort { node, columns },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by,
                 limit,
                 offset,

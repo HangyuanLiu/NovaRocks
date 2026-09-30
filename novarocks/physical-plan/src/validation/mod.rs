@@ -329,7 +329,7 @@ pub(crate) fn validate_fragment_structure_into(
     }
     let mut aggregate_calls = BTreeMap::new();
     for node in fragment.nodes().values() {
-        let NodeKind::Aggregate { calls, .. } = &node.kind else {
+        let Some((_, calls)) = node.kind.aggregate_contract() else {
             continue;
         };
         for call in calls {

@@ -1341,6 +1341,7 @@ pub(crate) fn validate_runtime_filter_producer_target(
                 limit: actual_limit,
                 offset: actual_offset,
                 phase: actual_phase,
+                reduction: crate::TopNReduction::Rows,
             } = &topn_node.kind
             else {
                 return errors.push(ValidationError::new(

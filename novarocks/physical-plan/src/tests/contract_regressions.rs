@@ -790,6 +790,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
                 columns: Box::from([scan_value]),
             },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by: Box::from([SortExpr {
                     expr: order_key,
                     direction: SortDirection::Ascending,

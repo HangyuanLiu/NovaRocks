@@ -1420,8 +1420,16 @@ fn preflight_encoder(
                     limit,
                     offset,
                     phase,
+                    reduction,
                     ..
                 } => {
+                    if !matches!(reduction, novarocks_physical_plan::TopNReduction::Rows) {
+                        return unsupported(
+                            fragment,
+                            node,
+                            "key-budgeted TopN state merging requires wire v2",
+                        );
+                    }
                     if !v1_topn_phase_is_lossless(*phase) {
                         return unsupported(
                             fragment,
@@ -2585,6 +2593,7 @@ fn encode_node_payload(
             limit,
             offset,
             phase,
+            ..
         } => Kind::Topn(plan::TopNNode {
             items: encode_sort_items(fragment, layout, node.id, order_by)?,
             limit: Some(i64_from_u64(*limit)?),
@@ -5156,7 +5165,7 @@ mod tests {
         assert!(v1_topn_phase_is_lossless(TopNPhase::Partial { sequence }));
         assert!(v1_topn_phase_is_lossless(TopNPhase::Final { sequence }));
 
-        let physical = finish_split_topn_plan();
+        let physical = finish_split_topn_plan(false);
         let (catalog, _) = exact_scalar_catalog();
         let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
             .expect("a split TopN states both halves as nodes of its own");
@@ -6057,7 +6066,19 @@ mod tests {
         }
     }
 
-    fn finish_split_topn_plan() -> PhysicalPlan {
+    #[test]
+    fn wire_v1_refuses_group_key_budgets_instead_of_encoding_row_topn() {
+        let physical = finish_split_topn_plan(true);
+        let (catalog, _) = exact_scalar_catalog();
+        let error =
+            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap_err();
+        assert!(
+            error.contains("key-budgeted TopN state merging requires wire v2"),
+            "{error}"
+        );
+    }
+
+    fn finish_split_topn_plan(grouped: bool) -> PhysicalPlan {
         use novarocks_physical_plan::{
             EdgeDestination, EdgePartitioning, EdgeSource, NullOrdering, OrderingKey,
             SortDirection, SortExpr, TopNSequenceId,
@@ -6120,6 +6141,32 @@ mod tests {
                 },
             })
             .unwrap();
+        let partial_input = if grouped {
+            let aggregate = partial_builder.reserve_node_id().unwrap();
+            let key = partial_builder
+                .add_expression(aggregate, ty.clone(), ExprKind::Value(partial_value))
+                .unwrap();
+            partial_builder
+                .insert_node_unchecked(PhysicalNode {
+                    id: aggregate,
+                    inputs: Box::from([partial_source]),
+                    required_inputs: Box::from([partial_input_properties.clone()]),
+                    output_properties: partial_input_properties.clone(),
+                    output: OutputPort {
+                        node: aggregate,
+                        columns: Box::from([partial_value]),
+                    },
+                    kind: NodeKind::Aggregate {
+                        group_by: Box::from([(key, partial_value)]),
+                        calls: Box::default(),
+                        grouping: novarocks_physical_plan::AggregateGrouping::Partial,
+                    },
+                })
+                .unwrap();
+            aggregate
+        } else {
+            partial_source
+        };
         let partial_topn = partial_builder.reserve_node_id().unwrap();
         let partial_order = partial_builder
             .add_expression(partial_topn, ty.clone(), ExprKind::Value(partial_value))
@@ -6128,7 +6175,7 @@ mod tests {
         partial_builder
             .insert_node_unchecked(PhysicalNode {
                 id: partial_topn,
-                inputs: Box::from([partial_source]),
+                inputs: Box::from([partial_input]),
                 required_inputs: Box::from([partial_input_properties]),
                 output_properties: PhysicalProperties {
                     distribution: partial_distribution.clone(),
@@ -6144,6 +6191,13 @@ mod tests {
                     columns: Box::from([partial_value]),
                 },
                 kind: NodeKind::TopN {
+                    reduction: if grouped {
+                        novarocks_physical_plan::TopNReduction::GroupedStates {
+                            group_by: Box::from([(partial_order, partial_value)]),
+                            calls: Box::default(),
+                            comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
+                        }
+                    } else { novarocks_physical_plan::TopNReduction::Rows },
                     order_by: Box::from([SortExpr {
                         expr: partial_order,
                         direction: SortDirection::Ascending,
@@ -6217,6 +6271,7 @@ mod tests {
                     columns: Box::from([final_value]),
                 },
                 kind: NodeKind::TopN {
+                    reduction: novarocks_physical_plan::TopNReduction::Rows,
                     order_by: Box::from([SortExpr {
                         expr: final_order,
                         direction: SortDirection::Ascending,

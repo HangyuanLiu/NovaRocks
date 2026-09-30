@@ -2979,11 +2979,17 @@ fn render_node_contract(
             limit,
             offset,
             phase,
-        } => lines.push(format_args!(
-            "{pad}  phase={}, limit={limit}, offset={offset}, order-by=[{}]",
-            topn_phase(*phase),
-            format_sort_exprs(plan, fragment_id, fragment, order_by)
-        )),
+            reduction,
+        } => {
+            lines.push(format_args!(
+                "{pad}  phase={}, limit={limit}, offset={offset}, order-by=[{}]",
+                topn_phase(*phase),
+                format_sort_exprs(plan, fragment_id, fragment, order_by)
+            ));
+            if let novarocks_physical_plan::TopNReduction::GroupedStates { group_by, calls, comparator } = reduction {
+                lines.push(format_args!("{pad}  unit=group-key, keys={}, merged-states={}, comparator={}", group_by.len(), calls.len(), comparator.stable_name()));
+            }
+        },
         NodeKind::Limit { limit, offset } => match limit {
             Some(limit) => lines.push(format_args!("{pad}  limit={limit}, offset={offset}")),
             None => lines.push(format_args!("{pad}  limit=none, offset={offset}")),
