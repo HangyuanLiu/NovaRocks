@@ -2042,6 +2042,7 @@ pub fn contribute_builtin_functions(
             function_id,
             FunctionKind::Scalar,
             [FunctionOverloadDeclaration {
+                effects: None,
                 semantics: builtin_scalar_semantics(name),
                 identity: overload.clone(),
                 argument_pattern: "owner-derived".into(),
@@ -2094,6 +2095,7 @@ pub fn contribute_builtin_functions(
                 .into_iter()
                 .zip(&signatures)
                 .map(|(identity, signature)| FunctionOverloadDeclaration {
+                    effects: None,
                     semantics: builtin_scalar_semantics(&name),
                     identity,
                     argument_pattern: signature.clone().into_boxed_str(),
@@ -2135,6 +2137,7 @@ pub fn contribute_builtin_functions(
             function_id,
             FunctionKind::Aggregate,
             [FunctionOverloadDeclaration {
+                effects: None,
                 semantics: FunctionSemantics {
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -2175,6 +2178,7 @@ pub fn contribute_builtin_functions(
         })?,
         FunctionKind::Table,
         [FunctionOverloadDeclaration {
+            effects: None,
             semantics: FunctionSemantics {
                 volatility: FunctionVolatility::Immutable,
                 argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -2344,6 +2348,7 @@ pub(crate) fn test_exact_aggregate_catalog(
         overloads
             .iter()
             .map(|overload| FunctionOverloadDeclaration {
+                effects: None,
                 semantics: FunctionSemantics {
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -2481,6 +2486,7 @@ mod tests {
                 .cloned()
                 .zip(&signatures)
                 .map(|(identity, signature)| FunctionOverloadDeclaration {
+                    effects: None,
                     semantics: builtin_scalar_semantics("json_object"),
                     identity,
                     argument_pattern: signature.clone().into_boxed_str(),

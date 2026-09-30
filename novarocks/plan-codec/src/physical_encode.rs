@@ -4808,6 +4808,7 @@ mod tests {
             function_id.clone(),
             FunctionKind::Scalar,
             [FunctionOverloadDeclaration {
+                effects: None,
                 semantics,
                 identity: overload.clone(),
                 argument_pattern: "(Int64)".into(),

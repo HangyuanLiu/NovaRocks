@@ -61,6 +61,7 @@ fn semantics() -> FunctionSemantics {
 
 fn overload(id: &str, pattern: &str) -> FunctionOverloadDeclaration {
     FunctionOverloadDeclaration {
+        effects: None,
         semantics: semantics(),
         identity: identity(id),
         argument_pattern: pattern.into(),

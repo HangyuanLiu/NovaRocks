@@ -38,6 +38,31 @@ pub struct FunctionSemantics {
     pub failure_behavior: FunctionFailureBehavior,
     pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
 }
+impl FunctionSemantics {
+    /// Lossy discovery projection only. Exact controls, NULL, state,
+    /// observables and environment facts remain in the full declaration.
+    pub fn from_effects(effects: &novarocks_type_contract::FunctionEffectDeclaration) -> Self {
+        use novarocks_type_contract::ArgumentControl;
+        let argument_evaluation = match effects.argument_control {
+            ArgumentControl::If
+            | ArgumentControl::Coalesce
+            | ArgumentControl::SimpleCase
+            | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
+            ArgumentControl::Eager
+            | ArgumentControl::TypeOnly
+            | ArgumentControl::HigherOrder { .. }
+            | ArgumentControl::Aggregate
+            | ArgumentControl::Window
+            | ArgumentControl::Table => FunctionArgumentEvaluation::Eager,
+        };
+        Self {
+            volatility: effects.value_stability,
+            argument_evaluation,
+            failure_behavior: effects.failure_behavior,
+            intrinsic_row_error: effects.own_row_error,
+        }
+    }
+}
 
 /// The aggregate state contract remains separate from its Arrow carrier.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,9 +77,30 @@ pub struct AggregateBindingDeclaration {
 pub struct FunctionOverloadDeclaration {
     pub identity: FunctionOverloadId,
     pub semantics: FunctionSemantics,
+    /// None is an explicit legacy-only declaration, never authority to infer
+    /// missing base facts. Pure installation requires every overload's Some.
+    pub effects: Option<novarocks_type_contract::FunctionEffectDeclaration>,
     pub argument_pattern: Box<str>,
     pub result_pattern: Box<str>,
     pub aggregate: Option<AggregateBindingDeclaration>,
+}
+impl FunctionOverloadDeclaration {
+    pub fn from_effects(
+        identity: FunctionOverloadId,
+        argument_pattern: impl Into<Box<str>>,
+        result_pattern: impl Into<Box<str>>,
+        aggregate: Option<AggregateBindingDeclaration>,
+        effects: novarocks_type_contract::FunctionEffectDeclaration,
+    ) -> Self {
+        Self {
+            identity,
+            semantics: FunctionSemantics::from_effects(&effects),
+            effects: Some(effects),
+            argument_pattern: argument_pattern.into(),
+            result_pattern: result_pattern.into(),
+            aggregate,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +111,39 @@ pub struct FunctionBindingDeclaration {
 }
 
 impl FunctionBindingDeclaration {
+    /// A complete metadata declaration, not proof of installed CPU coverage.
+    /// Legacy facts are never expanded into guessed NULL/state/control facts.
+    pub fn try_new_complete(
+        function_id: FunctionId,
+        kind: FunctionKind,
+        overloads: impl IntoIterator<Item = FunctionOverloadDeclaration>,
+    ) -> Result<Self, FunctionBindingError> {
+        let declaration = Self::try_new(function_id, kind, overloads)?;
+        declaration.validate_complete_effects()?;
+        Ok(declaration)
+    }
+
+    pub fn validate_complete_effects(&self) -> Result<(), FunctionBindingError> {
+        for overload in &self.overloads {
+            if overload.effects.is_none() {
+                return Err(FunctionBindingError::MissingEffectDeclaration(
+                    overload.identity.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn effect_declaration(
+        &self,
+        identity: &FunctionOverloadId,
+    ) -> Result<&novarocks_type_contract::FunctionEffectDeclaration, FunctionBindingError> {
+        self.overload(identity)?
+            .effects
+            .as_ref()
+            .ok_or_else(|| FunctionBindingError::MissingEffectDeclaration(identity.clone()))
+    }
+
     pub fn try_new(
         function_id: FunctionId,
         kind: FunctionKind,
@@ -75,6 +154,21 @@ impl FunctionBindingDeclaration {
             return Err(invalid("function has no declared overloads"));
         }
         overloads.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        for overload in &mut overloads {
+            if let Some(effects) = &mut overload.effects {
+                effects
+                    .validate(kind)
+                    .map_err(|_| invalid("invalid complete function effect declaration"))?;
+                if overload.semantics != FunctionSemantics::from_effects(effects) {
+                    return Err(invalid(
+                        "legacy semantics differ from full declaration projection",
+                    ));
+                }
+                // Environment dependencies are a set. Keep one canonical
+                // stored source for exact-owner lookup and digest material.
+                effects.environment_dependencies.sort_unstable();
+            }
+        }
         let mut patterns = BTreeSet::new();
         for (index, overload) in overloads.iter().enumerate() {
             if !overload
@@ -320,6 +414,7 @@ pub(crate) fn parametric_aggregate_binding(
         .iter()
         .map(|overload| {
             Ok(FunctionOverloadDeclaration {
+                effects: None,
                 semantics: FunctionSemantics {
                     volatility,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -832,6 +927,12 @@ pub(crate) fn digest_binding_definition(
         }]);
         digest_text(hasher, &overload.argument_pattern);
         digest_text(hasher, &overload.result_pattern);
+        if let Some(effects) = &overload.effects {
+            hasher.update([1]);
+            crate::effect_metadata::digest_effect_declaration(hasher, effects);
+        } else {
+            hasher.update([0]);
+        }
         if let Some(aggregate) = &overload.aggregate {
             hasher.update([1]);
             digest_text(hasher, &aggregate.intermediate_pattern);
@@ -844,6 +945,7 @@ pub(crate) fn digest_binding_definition(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionBindingError {
+    MissingEffectDeclaration(FunctionOverloadId),
     UnknownFunction,
     HiddenFunction,
     MissingBindingDeclaration,
@@ -861,6 +963,11 @@ fn invalid(message: &str) -> FunctionBindingError {
 impl fmt::Display for FunctionBindingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingEffectDeclaration(identity) => write!(
+                formatter,
+                "selected overload `{}` has no complete effect declaration",
+                identity.as_str()
+            ),
             Self::UnknownFunction => formatter.write_str("function is not registered"),
             Self::HiddenFunction => formatter.write_str("function is hidden from user SQL"),
             Self::MissingBindingDeclaration => {
@@ -891,3 +998,6 @@ impl std::error::Error for FunctionBindingError {}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod effect_metadata_tests;

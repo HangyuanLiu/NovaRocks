@@ -35,6 +35,7 @@ mod aggregate_erasure;
 mod aggregate_kernel;
 mod binding;
 mod call_contract;
+mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
 mod kernel_control;
@@ -68,7 +69,7 @@ pub use table_kernel::*;
 pub use window_call::*;
 pub use window_kernel::*;
 
-const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v5\0";
+const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v6\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
 
 const fn function_kind_tag(kind: FunctionKind) -> u8 {
