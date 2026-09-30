@@ -66,9 +66,6 @@ pub enum ProgramNodeExpressionRole {
         call: u32,
         argument: u32,
     },
-    AggregateTopNGroup {
-        filter: u32,
-    },
     JoinProbeKey {
         key: u32,
     },
@@ -376,7 +373,6 @@ impl RootCollector<'_> {
             ProgramNodeKind::Aggregate {
                 group_by,
                 functions,
-                topn_filters,
                 ..
             } => {
                 for (group, definition) in group_by.iter().enumerate() {
@@ -403,22 +399,13 @@ impl RootCollector<'_> {
                         )?;
                     }
                 }
-                for (filter, value) in topn_filters.iter().enumerate() {
-                    self.node_root(
-                        node,
-                        Role::AggregateTopNGroup {
-                            filter: ordinal(filter)?,
-                        },
-                        value.group_key_expr,
-                        Value,
-                    )?;
-                }
+                // TopN producers observe the already evaluated group array.
+                // Their source expression is lineage, not another invocation.
             }
             ProgramNodeKind::Join {
                 probe_keys,
                 build_keys,
                 residual_predicate,
-                runtime_filters,
                 join_type,
                 ..
             } => {
@@ -450,16 +437,7 @@ impl RootCollector<'_> {
                         },
                     )?;
                 }
-                for (binding, value) in runtime_filters.iter().enumerate() {
-                    self.node_root(
-                        node,
-                        Role::RuntimeFilter {
-                            binding: ordinal(binding)?,
-                        },
-                        value.expr_id,
-                        Value,
-                    )?;
-                }
+                // Build-side RF producers observe the evaluated key arrays.
             }
             ProgramNodeKind::NestedLoopJoin {
                 join_conjunct,

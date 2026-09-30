@@ -1185,7 +1185,9 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             if functions.iter().any(|function| {
                 function.name.is_empty()
                     || function.order.is_asc_order.len() != function.order.nulls_first.len()
-            }) || topn_filters.iter().any(|filter| filter.group_key_ordinal >= group_by.len())
+            }) || topn_filters.iter().any(|filter| {
+                group_by.get(filter.group_key_ordinal) != Some(&filter.group_key_expr)
+            })
             {
                 return Err(LocalProgramError::InvalidNodeShape);
             }
@@ -1201,7 +1203,7 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
                 || probe_keys.len() != eq_null_safe.len()
                 || runtime_filters
                     .iter()
-                    .any(|filter| filter.key_ordinal >= build_keys.len())
+                    .any(|filter| build_keys.get(filter.key_ordinal) != Some(&filter.expr_id))
             {
                 return Err(LocalProgramError::InvalidNodeShape);
             }

@@ -17,17 +17,23 @@
 
 use super::*;
 use crate::{
-    BindingRequirement, BindingRequirements, CompileProfile, KernelAbiVersion, ProgramNode,
-    StaticExprKind, StaticExprNode, StaticLayout, StaticLiteral, StaticSinkProgram,
-    StaticStreamBranch, StaticValues, StaticWriterProjection, WriterFinalAggregatePlan,
-    WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
+    AggregateTopNFilter, BindingRequirement, BindingRequirements, CompileProfile, FilterNullOrder,
+    FilterNullSemantics, FilterOrderKey, FilterProducerAtExpr, FilterProducerKind, FilterReduction,
+    FilterSortDirection, JoinDistributionMode, KernelAbiVersion, LocalProgramError, ProgramNode,
+    StaticExprKind, StaticExprNode, StaticFilterContract, StaticFilterProducer, StaticLayout,
+    StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues, StaticWriterProjection,
+    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
 };
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_execution_contract::DataStreamPartitionType;
 use novarocks_types::SlotId;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Mutex};
+use std::{
+    collections::HashMap,
+    num::{NonZeroU32, NonZeroUsize},
+    sync::Mutex,
+};
 
 #[derive(Default)]
 struct Control {
@@ -90,6 +96,140 @@ fn profile(layout: &StaticLayout) -> CompileProfile {
         layout.identity().unwrap(),
         KernelAbiVersion::CURRENT,
     )
+}
+fn metadata_source_program(
+    join: bool,
+    wrong_definition: bool,
+) -> Result<LocalProgram, LocalProgramError> {
+    let (source, layout) = values(1);
+    let definitions = arena(vec![
+        StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Int64(7)),
+            DataType::Int64,
+            None,
+        ),
+        StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Int64(9)),
+            DataType::Int64,
+            None,
+        ),
+    ]);
+    let mut nodes = vec![ProgramNode::new(
+        10,
+        ProgramNodeKind::Values {
+            values: source.clone(),
+        },
+        layout.clone(),
+    )];
+    let source_definition = ProgramExprId::new(usize::from(wrong_definition));
+    let root = if join {
+        let producer = StaticFilterProducer::try_new(
+            7,
+            8,
+            FilterProducerKind::Membership,
+            StaticFilterContract::Membership {
+                data_type: DataType::Int64,
+                null_semantics: FilterNullSemantics::NeverMatches,
+                digest: [1; 32],
+            },
+            FilterReduction::SetUnion,
+        )
+        .unwrap();
+        nodes.push(ProgramNode::new(
+            11,
+            ProgramNodeKind::Values { values: source },
+            layout.clone(),
+        ));
+        nodes.push(ProgramNode::new(
+            20,
+            ProgramNodeKind::Join {
+                left: ProgramNodeId::new(0),
+                right: ProgramNodeId::new(1),
+                join_type: JoinType::Inner,
+                distribution_mode: JoinDistributionMode::Broadcast,
+                left_layout: layout.clone(),
+                right_layout: layout.clone(),
+                join_scope_layout: layout.clone(),
+                probe_keys: vec![ProgramExprId::new(0)],
+                build_keys: vec![ProgramExprId::new(0)],
+                eq_null_safe: vec![false],
+                residual_predicate: None,
+                runtime_filters: vec![FilterProducerAtExpr {
+                    expr_id: source_definition,
+                    key_ordinal: 0,
+                    producer,
+                }],
+            },
+            layout.clone(),
+        ));
+        ProgramNodeId::new(2)
+    } else {
+        let producer = StaticFilterProducer::try_new(
+            7,
+            8,
+            FilterProducerKind::OrderedBound,
+            StaticFilterContract::Ordered {
+                keys: Arc::from([FilterOrderKey {
+                    data_type: DataType::Int64,
+                    direction: FilterSortDirection::Ascending,
+                    null_order: FilterNullOrder::Last,
+                }]),
+                comparator_digest: [1; 32],
+                contract_digest: [2; 32],
+            },
+            FilterReduction::TightenOrderedBound,
+        )
+        .unwrap();
+        nodes.push(ProgramNode::new(
+            20,
+            ProgramNodeKind::Aggregate {
+                input: ProgramNodeId::new(0),
+                group_by: vec![ProgramExprId::new(0)],
+                functions: vec![],
+                need_finalize: true,
+                input_is_intermediate: false,
+                topn_filters: vec![AggregateTopNFilter {
+                    group_key_expr: source_definition,
+                    group_key_ordinal: 0,
+                    limit: NonZeroU32::new(3).unwrap(),
+                    producer,
+                }],
+                streaming_preaggregation_mode: None,
+            },
+            layout.clone(),
+        ));
+        ProgramNodeId::new(1)
+    };
+    LocalProgram::try_new(
+        nodes,
+        root,
+        definitions,
+        profile(&layout),
+        BindingRequirements::try_new(vec![BindingRequirement::RuntimeFilter { binding_id: 7 }])
+            .unwrap(),
+    )
+}
+
+#[test]
+fn group_and_build_filter_producers_reference_evaluated_arrays_without_extra_calls() {
+    for (join, expected) in [(false, 1), (true, 2)] {
+        let program = metadata_source_program(join, false).unwrap();
+        let roots = ProgramExpressionRoots::collect(&program, &Control::default()).unwrap();
+        assert_eq!(roots.sites().len(), expected);
+        assert!(roots.sites().keys().all(|site| matches!(
+            site,
+            ProgramExpressionRootSite::Node {
+                role: ProgramNodeExpressionRole::AggregateGroup { .. }
+                    | ProgramNodeExpressionRole::JoinProbeKey { .. }
+                    | ProgramNodeExpressionRole::JoinBuildKey { .. },
+                ..
+            }
+        )));
+        assert_eq!(
+            metadata_source_program(join, true).unwrap_err(),
+            LocalProgramError::InvalidNodeShape
+        );
+    }
 }
 fn branch(index: usize, keys: usize, columns: usize) -> StaticStreamBranch {
     StaticStreamBranch::try_new(
