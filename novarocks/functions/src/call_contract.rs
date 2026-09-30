@@ -25,7 +25,7 @@ use crate::{
 };
 use novarocks_type_contract::{
     CallEffects, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, ExpressionEffectContext,
-    FunctionKind, PureCompileControl, SemanticParameters,
+    FunctionKind, PureCompileControl, SemanticParameterProjectionError, SemanticParameters,
 };
 use std::sync::Arc;
 
@@ -103,8 +103,17 @@ impl FunctionCallContract {
         }
         let parameters = input
             .parameters
-            .project(receipt.facts().environment.iter().copied())
-            .map_err(|_| invalid("call environment is not frozen"))?;
+            .project_observed(
+                receipt.facts().environment.iter().copied(),
+                CompilePhase::FunctionSpecialization,
+                control,
+            )
+            .map_err(|error| match error {
+                SemanticParameterProjectionError::Control(error) => compile_failure(error),
+                SemanticParameterProjectionError::Parameter(_) => {
+                    invalid("call environment is not frozen")
+                }
+            })?;
         work.finish().map_err(compile_failure)?;
         Ok(Self {
             function_id: input.function_id.clone(),
@@ -145,3 +154,6 @@ impl FunctionCallContract {
         self.logical_argument_count
     }
 }
+
+#[cfg(test)]
+mod tests;
