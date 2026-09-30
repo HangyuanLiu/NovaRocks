@@ -25,29 +25,7 @@ use crate::{
     ValueType, stable_identity,
 };
 
-/// Exact, provider-owned identity of the frozen input version.
-///
-/// This is deliberately separate from request forms such as `Current` or a
-/// mutable reference name. The bytes are provider-defined, immutable and
-/// validated by the provider codec before execution resources are created.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExactInputVersion(Box<[u8]>);
-
-impl ExactInputVersion {
-    pub fn try_new(bytes: impl Into<Box<[u8]>>) -> Result<Self, RelationValueError> {
-        let bytes = bytes.into();
-        if bytes.is_empty() || bytes.len() > 4096 {
-            return Err(RelationValueError::InvalidInputVersionLength {
-                actual: bytes.len(),
-            });
-        }
-        Ok(Self(bytes))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
+pub use novarocks_connector_contract::ConnectorReadInputVersion as ExactInputVersion;
 
 /// Frozen, no-I/O provider relation reference.
 ///
@@ -204,21 +182,3 @@ impl Relation {
         }
     }
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RelationValueError {
-    InvalidInputVersionLength { actual: usize },
-}
-
-impl std::fmt::Display for RelationValueError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidInputVersionLength { actual } => write!(
-                formatter,
-                "exact input version is {actual} bytes; expected 1..=4096"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RelationValueError {}

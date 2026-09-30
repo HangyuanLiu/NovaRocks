@@ -1031,5 +1031,9 @@ fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
         nullable: false,
         logical_type: ValueLogicalType::Variant,
     });
-    assert!(catalog.validate_bound(&invalid, request(&arguments)).is_err());
+    assert!(
+        catalog
+            .validate_bound(&invalid, request(&arguments))
+            .is_err()
+    );
 }

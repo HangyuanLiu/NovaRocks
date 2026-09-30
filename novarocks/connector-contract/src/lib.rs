@@ -28,6 +28,7 @@ mod identity;
 mod mutation;
 mod predicate;
 mod read;
+mod read_facts;
 mod recipe;
 mod scan;
 mod type_projection;
@@ -54,6 +55,14 @@ pub use predicate::{
     TupleDomain, ValueSet,
 };
 pub use read::{ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource};
+pub use read_facts::{
+    ConnectorReadArtifactCoverage, ConnectorReadBucketLayout, ConnectorReadDistribution,
+    ConnectorReadInputVersion, ConnectorReadMetadataKind, ConnectorReadMetadataRequest,
+    ConnectorReadMetadataVersion, ConnectorReadNullOrdering, ConnectorReadOrderingKey,
+    ConnectorReadPartitionCountDomain, ConnectorReadPartitionHash, ConnectorReadProperties,
+    ConnectorReadSortDirection, ConnectorReadStaticFacts, MAX_READ_COVERAGE_EVIDENCE_BYTES,
+    MAX_READ_INPUT_VERSION_BYTES, MAX_READ_PROPERTY_KEYS,
+};
 pub use recipe::{
     ConnectorReadRecipeSplit, ConnectorReadRecipeSplitDraft, ConnectorReadRecipeSplitFacts,
     ConnectorReadRecipeSplitKind, ConnectorReadRelationRecipe,
