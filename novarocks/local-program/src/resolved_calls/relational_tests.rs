@@ -62,7 +62,7 @@ impl KernelEvaluationControl for Runtime {
 const RUNTIME: Runtime = Runtime;
 
 #[derive(Debug, Default)]
-struct Counts {
+pub(crate) struct Counts {
     resolve: AtomicUsize,
     legacy: AtomicUsize,
     refine: AtomicUsize,
@@ -120,14 +120,14 @@ fn base(kind: FunctionKind) -> FunctionEffectDeclaration {
     }
 }
 
-struct Owner {
-    declaration: FunctionBindingDeclaration,
-    implementations: Vec<PureImplementationDeclaration>,
-    selections: Vec<Arc<FunctionBindingSelection>>,
-    counts: Arc<Counts>,
+pub(crate) struct Owner {
+    pub(crate) declaration: FunctionBindingDeclaration,
+    pub(crate) implementations: Vec<PureImplementationDeclaration>,
+    pub(crate) selections: Vec<Arc<FunctionBindingSelection>>,
+    pub(crate) counts: Arc<Counts>,
 }
 impl Owner {
-    fn new(kind: FunctionKind, abis: &[PureKernelAbi]) -> Self {
+    pub(crate) fn new(kind: FunctionKind, abis: &[PureKernelAbi]) -> Self {
         let id = FunctionId::try_new(format!("fixture/catalogue/{kind:?}-v1")).unwrap();
         let mut overloads = Vec::new();
         let mut implementations = Vec::new();
@@ -175,7 +175,7 @@ impl Owner {
             counts: Arc::default(),
         }
     }
-    fn frozen(&self, selected: &FunctionBindingSelection) -> CallEffects {
+    pub(crate) fn frozen(&self, selected: &FunctionBindingSelection) -> CallEffects {
         let declaration = self
             .declaration
             .effect_declaration(&selected.overload)
@@ -192,7 +192,7 @@ impl Owner {
             proof_scope: CallProofScope::Unconditional,
         }
     }
-    fn manifest(&self) -> Vec<InstalledPureKernel> {
+    pub(crate) fn manifest(&self) -> Vec<InstalledPureKernel> {
         // Fixture installation inventory, independent of the sealed catalogue.
         self.implementations
             .iter()
@@ -306,16 +306,16 @@ impl AggregateSignatureResolver for Owner {
     }
 }
 
-struct Call<'owner> {
+pub(crate) struct Call<'owner> {
     owner: &'owner Owner,
-    selected: Arc<FunctionBindingSelection>,
+    pub(crate) selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     uses: [Option<ExpressionUseId>; 1],
     parameters: SemanticParameters,
-    context_id: u32,
+    pub(crate) context_id: u32,
 }
 impl<'owner> Call<'owner> {
-    fn new(owner: &'owner Owner, ordinal: usize) -> Self {
+    pub(crate) fn new(owner: &'owner Owner, ordinal: usize) -> Self {
         let selected = owner.selections[ordinal].clone();
         let arguments = selected
             .argument_types
@@ -337,7 +337,7 @@ impl<'owner> Call<'owner> {
             context_id: u32::MAX,
         }
     }
-    fn input(&self) -> CallEffectInput<'_> {
+    pub(crate) fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(self.context_id),
@@ -358,7 +358,7 @@ impl<'owner> Call<'owner> {
             proof_scope: CallProofScope::Unconditional,
         }
     }
-    fn children(&self) -> ScopedExpressionEffects {
+    pub(crate) fn children(&self) -> ScopedExpressionEffects {
         ScopedExpressionEffects::pure_value(self.input().context)
     }
 }
@@ -370,7 +370,7 @@ fn aggregate_options(phase: AggregateKernelPhase) -> AggregatePreparationOptions
         state_input_type: None,
     }
 }
-fn window_options() -> WindowCallOptions {
+pub(crate) fn window_options() -> WindowCallOptions {
     WindowCallOptions::try_new(
         Some(CommonWindowFrame {
             units: WindowFrameUnits::Rows,
@@ -383,7 +383,7 @@ fn window_options() -> WindowCallOptions {
     )
     .unwrap()
 }
-fn over_prepare(call: &Call<'_>) -> PureCallPreparation {
+pub(crate) fn over_prepare(call: &Call<'_>) -> PureCallPreparation {
     PureCallPreparation::AggregateWindow {
         arguments: call.children(),
         options: AggregateWindowPreparationOptions {
@@ -411,13 +411,13 @@ impl PureAggregateImplementation for Owner {
     }
 }
 #[derive(Debug)]
-struct Sum {
+pub(crate) struct Sum {
     contract: Arc<AggregateCallContract>,
-    counts: Arc<Counts>,
+    pub(crate) counts: Arc<Counts>,
 }
-struct SumState {
+pub(crate) struct SumState {
     value: i64,
-    counts: Arc<Counts>,
+    pub(crate) counts: Arc<Counts>,
 }
 impl Drop for SumState {
     fn drop(&mut self) {
@@ -581,11 +581,11 @@ impl PureWindowImplementation for Owner {
 struct Window {
     contract: Arc<WindowCallContract>,
     aggregate: Option<Arc<Sum>>,
-    counts: Arc<Counts>,
+    pub(crate) counts: Arc<Counts>,
 }
 struct Partition {
     results: Vec<i64>,
-    counts: Arc<Counts>,
+    pub(crate) counts: Arc<Counts>,
 }
 impl Drop for Partition {
     fn drop(&mut self) {
@@ -693,11 +693,11 @@ impl PureTableImplementation for Owner {
 #[derive(Debug)]
 struct Table {
     contract: Arc<TableCallContract>,
-    counts: Arc<Counts>,
+    pub(crate) counts: Arc<Counts>,
 }
 struct Cursor<'a> {
     input: SelectedTableInput<'a, 'a>,
-    counts: Arc<Counts>,
+    pub(crate) counts: Arc<Counts>,
     position: usize,
 }
 impl Drop for Cursor<'_> {
@@ -785,7 +785,7 @@ fn seal(
     builder.register(definition).unwrap();
     builder.seal_pure(manifest)
 }
-fn aggregate_catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
+pub(crate) fn aggregate_catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
     seal(
         FunctionDefinition::try_new_pure_aggregate_window(
             "typed_sum",
@@ -857,7 +857,7 @@ fn program(
     )
     .unwrap()
 }
-fn snapshot(program: LocalProgram) -> ProgramRootControlBindings {
+pub(crate) fn snapshot(program: LocalProgram) -> ProgramRootControlBindings {
     let roots = ProgramExpressionRoots::collect(&program, &COMPILE).unwrap();
     let mut flows = BTreeMap::new();
     let mut bindings = Vec::new();
@@ -918,7 +918,7 @@ fn resolved_signature(owner: &Owner) -> ResolvedAggregateSignature {
         state_format: state_format(),
     }
 }
-fn aggregate_node(
+pub(crate) fn aggregate_node(
     owner: &Owner,
     intermediate: bool,
     finalize: bool,
@@ -955,7 +955,7 @@ fn aggregate_node(
         vec![],
     )
 }
-fn prepare_aggregate_token(
+pub(crate) fn prepare_aggregate_token(
     catalog: &PureEngineFunctionCatalog,
     call: &Call<'_>,
     phase: AggregateKernelPhase,
@@ -977,7 +977,7 @@ fn prepare_aggregate_token(
         )
         .unwrap()
 }
-fn aggregate_site() -> ProgramCallSite {
+pub(crate) fn aggregate_site() -> ProgramCallSite {
     ProgramCallSite::Aggregate {
         node: ProgramNodeId::new(1),
         call: 0,
@@ -994,7 +994,7 @@ fn integers(array: &ArrayRef) -> Vec<i64> {
 #[repr(C, align(64))]
 struct Storage([MaybeUninit<u8>; 128]);
 
-fn run_aggregate(handle: &PreparedAggregateHandle, phase: AggregateKernelPhase) {
+pub(crate) fn run_aggregate(handle: &PreparedAggregateHandle, phase: AggregateKernelPhase) {
     let mut storage = Storage([MaybeUninit::uninit(); 128]);
     let mut states = [handle.initialize_in(&mut storage.0, &RUNTIME).unwrap()];
     let array: ArrayRef = Arc::new(Int64Array::from(vec![3, 999, 5]));
@@ -1091,7 +1091,7 @@ fn four_aggregate_phases_borrow_the_actual_frozen_handle_and_run_its_state() {
     assert_eq!(owner.counts.resolve.load(Ordering::Relaxed), 0);
 }
 
-fn window_program(
+pub(crate) fn window_program(
     owner: &Owner,
     aggregate: bool,
     frame: Option<WindowFrame>,
@@ -1128,20 +1128,20 @@ fn window_program(
         vec![],
     )
 }
-fn local_frame() -> WindowFrame {
+pub(crate) fn local_frame() -> WindowFrame {
     WindowFrame {
         start: None,
         end: Some(WindowBoundary::CurrentRow),
         window_type: WindowType::Rows,
     }
 }
-fn window_site() -> ProgramCallSite {
+pub(crate) fn window_site() -> ProgramCallSite {
     ProgramCallSite::Window {
         node: ProgramNodeId::new(1),
         call: 0,
     }
 }
-fn run_window(kernel: Arc<dyn PreparedWindowKernel>, expected: &[i64]) {
+pub(crate) fn run_window(kernel: Arc<dyn PreparedWindowKernel>, expected: &[i64]) {
     let array: ArrayRef = Arc::new(Int64Array::from(vec![3, 4, 5]));
     let args = [EvaluatedArgument::Column(&array)];
     let contract = kernel.contract().clone();
@@ -1244,7 +1244,11 @@ fn window_and_aggregate_over_keep_different_identity_with_the_same_partition_lif
     }
 }
 
-fn table_program(param_type: DataType, result_type: DataType, param_slot: u32) -> LocalProgram {
+pub(crate) fn table_program(
+    param_type: DataType,
+    result_type: DataType,
+    param_slot: u32,
+) -> LocalProgram {
     let input = layout(1, DataType::Int64);
     let output = layout(2, result_type.clone());
     program(
@@ -1271,7 +1275,7 @@ fn table_program(param_type: DataType, result_type: DataType, param_slot: u32) -
         vec![],
     )
 }
-fn table_fixture() -> (Arc<Owner>, PureEngineFunctionCatalog) {
+pub(crate) fn table_fixture() -> (Arc<Owner>, PureEngineFunctionCatalog) {
     let owner = Arc::new(Owner::new(FunctionKind::Table, &[PureKernelAbi::TableV1]));
     let catalog = seal(
         FunctionDefinition::try_new_pure_table(
@@ -1285,7 +1289,7 @@ fn table_fixture() -> (Arc<Owner>, PureEngineFunctionCatalog) {
     .unwrap();
     (owner, catalog)
 }
-fn prepare_table_token(
+pub(crate) fn prepare_table_token(
     catalog: &PureEngineFunctionCatalog,
     call: &Call<'_>,
 ) -> PureCallSpecialization {
@@ -1301,7 +1305,7 @@ fn prepare_table_token(
         )
         .unwrap()
 }
-fn table_site() -> ProgramCallSite {
+pub(crate) fn table_site() -> ProgramCallSite {
     ProgramCallSite::Table {
         node: ProgramNodeId::new(1),
     }
@@ -1367,7 +1371,11 @@ fn table_scope_borrows_the_exact_frozen_cursor_and_samples_only_selected_parent_
     assert_eq!(owner.counts.instance_drop.load(Ordering::Relaxed), 1);
 }
 
-fn writer_program(owner: &Owner, partial_input_slot: u32, final_input_slot: u32) -> LocalProgram {
+pub(crate) fn writer_program(
+    owner: &Owner,
+    partial_input_slot: u32,
+    final_input_slot: u32,
+) -> LocalProgram {
     let data = layout(1, DataType::Int64);
     let intermediate = layout(2, DataType::Int64);
     let final_layout = layout(999, DataType::Int64);
@@ -1431,19 +1439,19 @@ fn writer_program(owner: &Owner, partial_input_slot: u32, final_input_slot: u32)
         ],
     )
 }
-fn partial_site() -> ProgramCallSite {
+pub(crate) fn partial_site() -> ProgramCallSite {
     ProgramCallSite::WriterPartial {
         node: ProgramNodeId::new(1),
         call: 0,
     }
 }
-fn final_site() -> ProgramCallSite {
+pub(crate) fn final_site() -> ProgramCallSite {
     ProgramCallSite::WriterFinal {
         node: ProgramNodeId::new(2),
         call: 0,
     }
 }
-fn writer_tokens(
+pub(crate) fn writer_tokens(
     catalog: &PureEngineFunctionCatalog,
     owner: &Owner,
 ) -> Vec<(ProgramCallSite, PureCallSpecialization)> {

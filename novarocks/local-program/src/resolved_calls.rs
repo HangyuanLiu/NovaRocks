@@ -1088,4 +1088,4 @@ fn check_arrow(
 pub(crate) mod tests;
 
 #[cfg(test)]
-mod relational_tests;
+pub(crate) mod relational_tests;
