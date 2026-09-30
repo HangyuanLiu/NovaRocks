@@ -98,22 +98,22 @@ impl FrontendManagementSnapshot {
 /// `Serialize`; this projection is where its numbers meet a wire format, and
 /// keeping it here is what lets the core stay neutral.
 ///
-/// The two tiers are reported side by side and **must not be added together**:
-/// `capacity_bytes` is what this authority governs hard, `headroom_budget_bytes`
-/// is what the deployment set aside for allocations it does not cover. A gap
-/// between the two and the process bound is a coverage fact, not a leak.
+/// Managed responsibility and observation coverage are reported separately.
+/// `capacity_bytes` is the current managed target; headroom covers declared
+/// blind spots. Neither is measured RSS. Shrink preserves existing commitment
+/// and the control floor, so excess is pressure rather than erased liability.
 #[derive(serde::Serialize)]
 struct MemoryAuthorityManagementSnapshot {
     schema_version: u8,
     /// `P`: what the whole process may use.
     process_bound_bytes: u64,
-    /// `B`: the part governed hard.
+    /// Current managed target B, which can fall below existing commitment.
     capacity_bytes: u64,
     /// `H`: the part set aside for declared blind spots.
     headroom_budget_bytes: u64,
     /// `C` at the root, as the root itself maintains it.
     committed_bytes: u64,
-    /// `L`: allocation an owner proved and that is still alive.
+    /// Last incorporated payload L plus prepaid metadata, not current RSS.
     live_bytes: u64,
     /// `F`: issued rights not yet fulfilled.
     granted_bytes: u64,
@@ -123,6 +123,37 @@ struct MemoryAuthorityManagementSnapshot {
     capacity_remaining_bytes: u64,
     /// Whether `C <= B` held in this reading.
     honours_capacity_bound: bool,
+    ledger_revision: u64,
+    capacity_revision: u64,
+    control_floor_bytes: u64,
+    elastic_capacity_bytes: u64,
+    elastic_committed_bytes: u64,
+    root_excess_bytes: u64,
+    elastic_excess_bytes: u64,
+    floor_target_gap_bytes: u64,
+    settled_payload_live_bytes: u64,
+    sampled_payload_live_bytes: u64,
+    sampling_span_ns: u64,
+    active_scopes: u64,
+    settled_idle_authorization_bytes: u64,
+    pending_drain_domains: u64,
+    dirty_domains: u64,
+    changing_live_samples: u64,
+    settled_debt_bytes: u64,
+    sampled_debt_bytes: u64,
+    /// Complete classification shares the root ledger/capacity versions.
+    classification_complete: bool,
+    classified_committed_bytes: u64,
+    unclassified_committed_bytes: u64,
+    query_committed_bytes: u64,
+    residual_committed_bytes: u64,
+    residual_query_committed_bytes: u64,
+    residual_metadata_bytes: u64,
+    active_metadata_bytes: u64,
+    storage_metadata_bytes: u64,
+    account_slack_bytes: u64,
+    /// Null when a bounded observation cannot classify all commitment.
+    query_pressure_bytes: Option<u64>,
     live_accounts: u32,
     /// Whether a separate control partition is installed in this process.
     control_branch_installed: bool,
@@ -130,9 +161,9 @@ struct MemoryAuthorityManagementSnapshot {
 
 impl MemoryAuthorityManagementSnapshot {
     fn of(authority: &MemoryAuthority) -> Self {
-        let snapshot = authority.snapshot();
+        let (snapshot, pressure) = authority.accounting_snapshot();
         Self {
-            schema_version: 1,
+            schema_version: 2,
             process_bound_bytes: snapshot.process_bound_bytes,
             capacity_bytes: snapshot.capacity_bytes,
             headroom_budget_bytes: snapshot.headroom_budget_bytes,
@@ -142,6 +173,35 @@ impl MemoryAuthorityManagementSnapshot {
             bounded_bytes: snapshot.root.bounded_bytes,
             capacity_remaining_bytes: snapshot.capacity_remaining_bytes(),
             honours_capacity_bound: snapshot.honours_capacity_bound(),
+            ledger_revision: pressure.root_revision,
+            capacity_revision: pressure.capacity_revision,
+            control_floor_bytes: pressure.control_floor,
+            elastic_capacity_bytes: pressure.elastic_capacity,
+            elastic_committed_bytes: pressure.elastic_committed,
+            root_excess_bytes: snapshot.root.excess_bytes,
+            elastic_excess_bytes: pressure.elastic_excess,
+            floor_target_gap_bytes: pressure.floor_target_gap,
+            settled_payload_live_bytes: pressure.settled_payload_live,
+            sampled_payload_live_bytes: pressure.sampled_payload_live,
+            sampling_span_ns: snapshot.root.sampling_span_ns,
+            active_scopes: pressure.active_scopes,
+            settled_idle_authorization_bytes: pressure.settled_idle_authorization,
+            pending_drain_domains: pressure.pending_drain_domains,
+            dirty_domains: pressure.dirty_domains,
+            changing_live_samples: pressure.changing_live_samples,
+            settled_debt_bytes: pressure.settled_debt,
+            sampled_debt_bytes: pressure.sampled_debt,
+            classification_complete: pressure.classification_complete,
+            classified_committed_bytes: pressure.classified_committed,
+            unclassified_committed_bytes: pressure.unclassified_committed,
+            query_committed_bytes: pressure.query_committed,
+            residual_committed_bytes: pressure.residual_committed,
+            residual_query_committed_bytes: pressure.residual_query_committed,
+            residual_metadata_bytes: pressure.residual_metadata,
+            active_metadata_bytes: pressure.active_metadata,
+            storage_metadata_bytes: pressure.storage_metadata,
+            account_slack_bytes: pressure.account_slack,
+            query_pressure_bytes: pressure.complete_query_pressure(),
             live_accounts: snapshot.live_accounts,
             control_branch_installed: authority.control_branch().is_some(),
         }
@@ -509,6 +569,87 @@ mod tests {
                 "the snapshot must report {decomposed} so L/F/O can be read apart"
             );
         }
+    }
+
+    #[test]
+    fn management_separates_dirty_samples_and_preserves_residual_pressure_after_handoff() {
+        use novarocks_memory::{AccountKind, ExternalRef, OWNER_METADATA_BYTES, TeardownEvidence};
+        let authority = test_memory_authority();
+        let query = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let domain = query.create_domain(1_024).unwrap();
+        let mut scope = domain.activate(1_024, 0).unwrap();
+        let origin = scope.record_allocation(1_024);
+        let sample =
+            serde_json::to_value(super::MemoryAuthorityManagementSnapshot::of(&authority)).unwrap();
+        assert_eq!(sample["schema_version"], 2);
+        assert_eq!(sample["settled_payload_live_bytes"], 0);
+        assert_eq!(sample["sampled_payload_live_bytes"], 1_024);
+        assert_eq!(sample["active_scopes"], 1);
+        assert_eq!(sample["dirty_domains"], 1);
+        assert_eq!(sample["classification_complete"], true);
+        assert_eq!(sample["query_pressure_bytes"], 1_024 + OWNER_METADATA_BYTES);
+        scope.finish();
+        let before = super::MemoryAuthorityManagementSnapshot::of(&authority);
+        let evidence = TeardownEvidence {
+            tasks_exited: true,
+            operators_destroyed: true,
+            io: &[],
+            now_ns: 1,
+        };
+        query.retire(&evidence).unwrap();
+        let after =
+            serde_json::to_value(super::MemoryAuthorityManagementSnapshot::of(&authority)).unwrap();
+        assert_eq!(after["committed_bytes"], before.committed_bytes);
+        assert_eq!(
+            after["query_pressure_bytes"],
+            before.query_pressure_bytes.unwrap()
+        );
+        assert_eq!(after["query_committed_bytes"], 0);
+        assert_eq!(
+            after["residual_query_committed_bytes"],
+            1_024 + OWNER_METADATA_BYTES
+        );
+        assert_eq!(
+            after["residual_committed_bytes"],
+            1_024 + OWNER_METADATA_BYTES
+        );
+        assert_eq!(after["residual_metadata_bytes"], OWNER_METADATA_BYTES);
+        assert_eq!(after["dirty_domains"], 0);
+        assert_eq!(after["active_scopes"], 0);
+        assert_eq!(after["classification_complete"], true);
+        // SAFETY: this is the one release paired with the outstanding origin.
+        unsafe {
+            origin.record_deallocation(1_024);
+        }
+    }
+
+    #[test]
+    fn management_reports_floor_gap_and_elastic_excess_after_target_shrink() {
+        let authority = test_memory_authority();
+        let mut writer = authority.take_capacity_writer().unwrap();
+        let revision = writer.set_capacity(0).unwrap();
+        let sample =
+            serde_json::to_value(super::MemoryAuthorityManagementSnapshot::of(&authority)).unwrap();
+        assert_eq!(sample["capacity_bytes"], 0);
+        assert_eq!(sample["capacity_revision"], revision);
+        assert_eq!(sample["control_floor_bytes"], 1_024 * 1_024);
+        assert_eq!(sample["floor_target_gap_bytes"], 1_024 * 1_024);
+        assert_eq!(sample["elastic_capacity_bytes"], 0);
+        assert_eq!(
+            sample["elastic_excess_bytes"],
+            sample["elastic_committed_bytes"]
+        );
+        assert_eq!(sample["root_excess_bytes"], sample["committed_bytes"]);
+        assert_eq!(sample["classification_complete"], true);
+        assert_eq!(sample["honours_capacity_bound"], false);
+        assert_eq!(
+            sample["classified_committed_bytes"],
+            sample["committed_bytes"]
+        );
+        assert_eq!(sample["unclassified_committed_bytes"], 0);
+        assert!(sample["storage_metadata_bytes"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

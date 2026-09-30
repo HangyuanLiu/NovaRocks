@@ -30,12 +30,15 @@ doctest = false
 # The neutral memory core carries no dependencies at all: no Arrow, no SQL, no
 # query context, no scheduler, no async runtime. The memory boundary guard
 # enforces this, and MEM-1 treats it as a design contract rather than a
-# convention. Arrow lives behind `novarocks-memory-arrow`.
+# convention. Allocation provenance is carrier-neutral.
 [dependencies]
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7.2"
 
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
 [[bench]]
-name = "reservation_cost"
+name = "stock_cost"
 harness = false
