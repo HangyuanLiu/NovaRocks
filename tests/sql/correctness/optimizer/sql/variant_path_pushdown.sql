@@ -19,6 +19,24 @@
 -- Test Objective:
 -- Verify VariantPathPushdown exposes scan-level variant path materialization in
 -- EXPLAIN VERBOSE, and that disabling the rule removes the scan hint.
+-- Golden derivation: intrinsic::variant_get is MayRaise, so
+-- PushDownPredicateScan leaves its predicate on a FILTER above the scan.
+-- registry::query_rewrite_pipeline runs VariantPathPushdown after the final
+-- predicate pass: it materializes __nr_var_v_0 and rewrites that FILTER but
+-- does not rerun predicate pushdown. Disabling the rule retains the original
+-- variant_get FILTER. Keep the existing 25000 estimate above the filter;
+-- the unfiltered scan uses the 100000 missing-statistics fallback, not zero.
+-- Add FILTER plus its predicate line and remove the old scan predicate line
+-- (net +1 row per plan); scan materialization/min-max capability stay intact.
+-- This is a predicate-placement change, not a display-only correction.
+-- completion_predicate::lower_column explicitly rejects synthetic variant
+-- slots as provider predicate columns; completion_driver::provider_columns
+-- also excludes them from provider assignments. This refusal is at provider
+-- lowering, not a synthetic-slot guard in PushDownPredicateScan itself.
+-- contract_lowering::lower_scan retains the exact scalar binding and path
+-- in derived_values; Worker ConnectorVariantPathTransform materializes the
+-- input page before the downstream FILTER. This query has no other predicate
+-- that could suppress the strict extraction's original row-error domain.
 DROP TABLE IF EXISTS ${case_db}.t_variant_path_pushdown FORCE;
 CREATE TABLE ${case_db}.t_variant_path_pushdown (
   id INT,
@@ -30,6 +48,12 @@ TBLPROPERTIES (
 
 -- @explain_contains=variant columns:
 -- @explain_contains=variant_get(v, '$.a', 'bigint')
+-- @explain_contains=variant columns: __nr_var_v_0 := variant_get(v, '$.a', 'bigint')
+-- @explain_contains=columns: id, v, __nr_var_v_0
+-- @explain_contains=2:FILTER stats={rows=25000}
+-- @explain_contains=predicate: 1 = __nr_var_v_0
+-- @explain_contains=stats={rows=100000}
+-- @explain_not_contains=predicates:
 EXPLAIN VERBOSE SELECT id
 FROM ${case_db}.t_variant_path_pushdown
 WHERE variant_get(v, '$.a', 'bigint') = 1;
@@ -37,6 +61,12 @@ WHERE variant_get(v, '$.a', 'bigint') = 1;
 SET disable_optimizer_rules = 'VariantPathPushdown';
 
 -- @explain_not_contains=variant columns:
+-- @explain_not_contains=__nr_var_v_0
+-- @explain_contains=2:FILTER stats={rows=25000}
+-- @explain_contains=predicate: variant_get(v, '$.a', 'bigint') = 1
+-- @explain_contains=columns: id, v
+-- @explain_contains=stats={rows=100000}
+-- @explain_not_contains=predicates:
 EXPLAIN VERBOSE SELECT id
 FROM ${case_db}.t_variant_path_pushdown
 WHERE variant_get(v, '$.a', 'bigint') = 1;

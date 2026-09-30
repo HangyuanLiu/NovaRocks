@@ -206,12 +206,7 @@ ORDER BY t.pk;
 -- ========== EXISTS / NOT EXISTS ==========
 
 -- query 27
--- Correlated EXISTS with same-type STRUCT NULL-safe equal (<=>).
--- StarRocks FE rejects this as "Not support exists correlation subquery
--- with Non-EQ predicate"; NovaRocks lowers the <=> correlation into a
--- proper join condition. Result depends on seed data; just assert
--- the query succeeds.
--- @skip_result_check=true
+-- Every seeded row matches itself under NULL-safe equality, including outer NULL.
 SELECT s2 FROM ${case_db}.struct_test t
 WHERE EXISTS (SELECT 1 FROM ${case_db}.struct_test s WHERE t.s2 <=> s.s2)
 ORDER BY t.pk;
@@ -223,9 +218,7 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.struct_test s WHERE t.s2 = s.s5)
 ORDER BY t.pk;
 
 -- query 29
--- Correlated NOT EXISTS with same-type STRUCT NULL-safe equal (mirrors
--- the EXISTS case above) — StarRocks rejects, NovaRocks lowers correctly.
--- @skip_result_check=true
+-- Every seeded row has a NULL-safe match, so NOT EXISTS retains none.
 SELECT s5 FROM ${case_db}.struct_test t
 WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.struct_test s WHERE t.s5 <=> s.s5)
 ORDER BY t.pk;
@@ -269,14 +262,14 @@ ORDER BY t.pk;
 -- @order_sensitive=true
 SELECT t.s0, s.s0
 FROM ${case_db}.struct_test t RIGHT JOIN ${case_db}.struct_test s ON s.s0 = t.s0
-ORDER BY t.pk;
+ORDER BY t.pk, s.pk;
 
 -- query 35
 -- @order_sensitive=true
 -- duplicate to verify right join stability
 SELECT t.s0, s.s0
 FROM ${case_db}.struct_test t RIGHT JOIN ${case_db}.struct_test s ON s.s0 = t.s0
-ORDER BY t.pk;
+ORDER BY t.pk, s.pk;
 
 -- ========== FULL OUTER JOIN ==========
 
@@ -284,7 +277,7 @@ ORDER BY t.pk;
 -- @order_sensitive=true
 SELECT t.s0, s.s0
 FROM ${case_db}.struct_test t FULL JOIN ${case_db}.struct_test s ON s.s0 = t.s0
-ORDER BY t.pk;
+ORDER BY t.pk, s.pk;
 
 -- ========== FE error: LEFT JOIN cross-type ==========
 
@@ -293,3 +286,9 @@ ORDER BY t.pk;
 SELECT t.s1, s.s2
 FROM ${case_db}.struct_test t LEFT JOIN ${case_db}.struct_test s ON s.s1 = t.s2
 ORDER BY t.pk;
+
+-- query 38
+-- Outer NULL, NULL fields and NULL fields inside nested structs are distinct inputs.
+SELECT pk, s0 = s0 AS eq, s0 != s0 AS ne, s0 <=> s0 AS safe,
+       s5 = s5 AS nested_eq, s5 <=> s5 AS nested_safe
+FROM ${case_db}.struct_test ORDER BY pk;

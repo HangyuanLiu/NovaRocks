@@ -1,0 +1,599 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! External-only historical benchmark adapter. Never compiled in the candidate workspace.
+#![recursion_limit = "256"]
+use novarocks_memory::account::TopUpPolicy;
+use novarocks_memory::authority::{AuthorityConfig, MemoryAuthority};
+use novarocks_memory::ids::{AccountKind, ExternalRef};
+use novarocks_memory::{Reservation, ReservationLease};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    hint::black_box,
+    path::PathBuf,
+    sync::{Arc, Barrier, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
+const BASELINE_CHECKOUT: &str = @BASELINE_CHECKOUT@;
+const ADAPTER_HASH: &str = @ADAPTER_HASH@;
+const FROZEN_HASH: &str = "cd3f06768bd6b757860b8c17c724a31469eb880ab2674cd608d7b13693a0d676";
+const HISTORICAL_SHA: &str = "af9d0591676c75ede5fb53c2d64949e2d80667c5";
+type BenchResult<T> = Result<T, String>;
+
+#[derive(Clone, Debug)]
+struct Options {
+    manifest: PathBuf,
+    threads: usize,
+    pairs: usize,
+    rounds: usize,
+    bytes: u64,
+    work_us: u64,
+    work_iterations: Option<u64>,
+    calibrate: bool,
+    interval: usize,
+    mode: String,
+    variant: String,
+    quantum: u64,
+    accounts: usize,
+    depth: usize,
+    domains_per_thread: usize,
+    case: String,
+    service: bool,
+    dynamic: bool,
+    duration_ms: u64,
+    residual_count: usize,
+    late_phase: String,
+}
+impl Options {
+    fn parse() -> BenchResult<Self> {
+        let mut o = Self {
+            manifest: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("benches/stock_cost_manifest.json"),
+            threads: 1,
+            pairs: 10000,
+            rounds: 1,
+            bytes: 4096,
+            work_us: 0,
+            work_iterations: None,
+            calibrate: false,
+            interval: 16,
+            mode: "same-thread".into(),
+            variant: "historical".into(),
+            quantum: 262144,
+            accounts: 1,
+            depth: 2,
+            domains_per_thread: 1,
+            case: "funded".into(),
+            service: false,
+            dynamic: false,
+            duration_ms: 30000,
+            residual_count: 0,
+            late_phase: "before".into(),
+        };
+        let mut args = std::env::args().skip(1);
+        while let Some(flag) = args.next() {
+            if flag == "--calibrate-supply" {
+                o.calibrate = true;
+                continue;
+            }
+            if flag == "--bench" {
+                continue;
+            }
+            if flag == "--help" || flag == "-h" {
+                println!(
+                    "historical comparator --manifest PATH --threads T --pairs N --rounds N --bytes B --work-us U [--work-iterations N] --scope-interval N --mode same-thread|round-robin|fan-in --variant baseline|historical --quantum B --accounts N --depth N --domains-per-thread N --case funded|refill|alternating-sponsor"
+                );
+                std::process::exit(0);
+            }
+            let value = args
+                .next()
+                .ok_or_else(|| format!("missing value after {flag}"))?;
+            let number = || {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid number for {flag}: {value}"))
+            };
+            match flag.as_str() {
+                "--manifest" => o.manifest = value.into(),
+                "--threads" => o.threads = usize::try_from(number()?).map_err(|e| e.to_string())?,
+                "--pairs" => o.pairs = usize::try_from(number()?).map_err(|e| e.to_string())?,
+                "--rounds" => o.rounds = usize::try_from(number()?).map_err(|e| e.to_string())?,
+                "--bytes" => o.bytes = number()?,
+                "--work-us" => o.work_us = number()?,
+                "--work-iterations" => o.work_iterations = Some(number()?),
+                "--scope-interval" => {
+                    o.interval = usize::try_from(number()?).map_err(|e| e.to_string())?
+                }
+                "--mode" => o.mode = value,
+                "--variant" => o.variant = value,
+                "--quantum" => o.quantum = number()?,
+                "--case" => o.case = value,
+                "--accounts" => {
+                    o.accounts = usize::try_from(number()?).map_err(|e| e.to_string())?
+                }
+                "--depth" => o.depth = usize::try_from(number()?).map_err(|e| e.to_string())?,
+                "--domains-per-thread" => {
+                    o.domains_per_thread = usize::try_from(number()?).map_err(|e| e.to_string())?
+                }
+                "--service" if value == "dynamic-drain-residual" => o.service = true,
+                "--service" if value == "dynamic" => o.dynamic = true,
+                "--duration-ms" => o.duration_ms = number()?,
+                "--historical-residuals" => {
+                    o.residual_count = usize::try_from(number()?).map_err(|e| e.to_string())?
+                }
+                "--late-free-phase" => o.late_phase = value,
+                _ => return Err(format!("unsupported argument {flag} {value}")),
+            }
+        }
+        if [
+            o.threads,
+            o.pairs,
+            o.rounds,
+            o.interval,
+            o.accounts,
+            o.depth,
+            o.domains_per_thread,
+        ]
+        .contains(&0)
+            || o.bytes == 0
+            || o.quantum == 0
+        {
+            return Err("counts, bytes and quantum must be nonzero".into());
+        }
+        if !["same-thread", "round-robin", "fan-in"].contains(&o.mode.as_str())
+            || !["baseline", "historical"].contains(&o.variant.as_str())
+        {
+            return Err(
+                "unsupported mode or variant; historical Reservation runs externally".into(),
+            );
+        }
+        if o.depth >= 16 {
+            return Err("depth including the root must fit maximum tree depth 16".into());
+        }
+        if ![
+            "funded",
+            "refill",
+            "debt",
+            "refusal",
+            "oscillation",
+            "alternating-sponsor",
+        ]
+        .contains(&o.case.as_str())
+        {
+            return Err("unsupported authorization case".into());
+        }
+        if o.case == "alternating-sponsor" && (o.accounts < 2 || o.domains_per_thread < 2) {
+            return Err(
+                "alternating-sponsor needs at least two accounts and domains per thread".into(),
+            );
+        }
+        if !["before", "during", "after"].contains(&o.late_phase.as_str())
+            || (o.dynamic && o.duration_ms < 20)
+        {
+            return Err(
+                "late phase must be before/during/after; dynamic duration must be at least 20ms"
+                    .into(),
+            );
+        }
+        if !["funded", "refill", "alternating-sponsor"].contains(&o.case.as_str())
+            || o.service
+            || o.dynamic
+            || o.calibrate
+            || o.residual_count != 0
+        {
+            return Err(
+                "historical comparator supports funded/refill/alternating-sponsor static protocols only"
+                    .into(),
+            );
+        }
+        Ok(o)
+    }
+}
+fn validate_manifest(o: &Options) -> BenchResult<Value> {
+    let bytes = std::fs::read(&o.manifest).map_err(|e| e.to_string())?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != FROZEN_HASH {
+        return Err(format!(
+            "frozen manifest SHA256 mismatch: expected {FROZEN_HASH}, found {actual}; review inputs before measurement"
+        ));
+    }
+    let m: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if m["historical_reservation_baseline_sha"] != HISTORICAL_SHA
+        || m["protocol"]["max_tree_depth"] != 16
+    {
+        return Err("manifest contract differs from the reviewed runner".into());
+    }
+    if !m["protocol"]["quantum_sensitivity_bytes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(o.quantum))
+    {
+        return Err("quantum is outside the frozen sensitivity matrix".into());
+    }
+    Ok(m)
+}
+fn mul(a: u64, b: u64) -> BenchResult<u64> {
+    a.checked_mul(b)
+        .ok_or_else(|| "benchmark input overflow".into())
+}
+fn add(a: u64, b: u64) -> BenchResult<u64> {
+    a.checked_add(b)
+        .ok_or_else(|| "benchmark input overflow".into())
+}
+struct Assembly {
+    authority: MemoryAuthority,
+    domains: Vec<Vec<Reservation>>,
+    workset: u64,
+    target: u64,
+}
+fn assemble(o: &Options) -> BenchResult<Assembly> {
+    let workset = mul(o.bytes, 4)?.max(mul(o.quantum, 3)?);
+    let count = o
+        .threads
+        .checked_mul(o.domains_per_thread)
+        .ok_or("domain count overflow")?;
+    if count > 65536 {
+        return Err("cell exceeds frozen active-owner bound".into());
+    }
+    let target = mul(mul(count as u64, workset)?, 4)?;
+    let mut config = AuthorityConfig::new(target, target, 0);
+    config.max_accounts = u32::try_from(
+        o.accounts
+            .checked_mul(o.depth)
+            .and_then(|n| n.checked_add(count))
+            .and_then(|n| n.checked_add(1))
+            .ok_or("account count overflow")?,
+    )
+    .map_err(|e| e.to_string())?;
+    config.top_up = TopUpPolicy::uniform(o.quantum);
+    let authority = MemoryAuthority::new(config).map_err(|e| e.to_string())?;
+    let mut leaves = Vec::new();
+    for index in 0..o.accounts {
+        let mut leaf = authority
+            .create_account(AccountKind::Work, ExternalRef::from_u128(index as u128 + 1))
+            .map_err(|e| e.to_string())?;
+        for level in 1..o.depth {
+            leaf = leaf
+                .create_child(
+                    AccountKind::Service,
+                    ExternalRef::from_u128((index * o.depth + level + 1) as u128),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        leaves.push(leaf);
+    }
+    let mut domains = Vec::new();
+    for index in 0..o.threads {
+        let mut local = Vec::new();
+        for lane in 0..o.domains_per_thread {
+            let sponsor = if o.case == "alternating-sponsor" {
+                (index + lane) % leaves.len()
+            } else {
+                index % leaves.len()
+            };
+            let reservation = Reservation::new(
+                &leaves[sponsor],
+                ExternalRef::from_u128((1000000 + index * o.domains_per_thread + lane) as u128),
+            )
+            .map_err(|e| e.to_string())?;
+            // Match the candidate's retained private workset before timing.
+            drop(reservation.try_grow(workset).map_err(|e| e.to_string())?);
+            local.push(reservation);
+        }
+        domains.push(local);
+    }
+    Ok(Assembly {
+        authority,
+        domains,
+        workset,
+        target,
+    })
+}
+fn supply_work(us: u64, tag: u64, iterations: Option<u64>) -> u64 {
+    if let Some(iterations) = iterations {
+        let mut value = tag.wrapping_mul(0x9e3779b97f4a7c15);
+        for _ in 0..iterations {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            black_box(value);
+        }
+        black_box(value);
+        return tag.wrapping_mul(0xd6e8feb86659fd93);
+    }
+    let start = Instant::now();
+    let duration = Duration::from_micros(us);
+    let mut value = tag.wrapping_mul(0x9e3779b97f4a7c15);
+    loop {
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        black_box(value);
+        if us == 0 || start.elapsed() >= duration {
+            break;
+        }
+    }
+    // Scheduling-dependent burn iteration counts must not change the checksum.
+    black_box(value);
+    tag.wrapping_mul(0xd6e8feb86659fd93)
+}
+struct Packet {
+    lease: Option<ReservationLease>,
+    bytes: u64,
+    checksum: u64,
+    ack: mpsc::Sender<(u64, u64)>,
+}
+fn release(packet: Packet) -> BenchResult<()> {
+    if let Some(lease) = packet.lease {
+        if lease.bytes() != packet.bytes {
+            return Err("historical lease/free mismatch".into());
+        }
+        drop(lease);
+    }
+    packet
+        .ack
+        .send((packet.bytes, packet.checksum))
+        .map_err(|e| e.to_string())
+}
+struct WorkerResult {
+    samples: Vec<u64>,
+    checksum: u64,
+    freed: u64,
+    scope_count: u64,
+}
+fn worker(
+    o: &Options,
+    index: usize,
+    domains: &[Reservation],
+    barrier: &Barrier,
+    outbound: Option<mpsc::Sender<Packet>>,
+    inbound: Option<mpsc::Receiver<Packet>>,
+) -> BenchResult<WorkerResult> {
+    let (ack, acknowledgements) = mpsc::channel();
+    let mut result = WorkerResult {
+        samples: Vec::with_capacity(o.pairs),
+        checksum: 0,
+        freed: 0,
+        scope_count: 0,
+    };
+    barrier.wait();
+    for pair in 0..o.pairs {
+        // Work, retention, scope-boundary lane selection, true free and the
+        // exact acknowledgement all remain inside this complete timer.
+        let began = Instant::now();
+        let tag = (index as u64)
+            .wrapping_mul(o.pairs as u64)
+            .wrapping_add(pair as u64)
+            .wrapping_add(1);
+        let checksum = supply_work(o.work_us, tag, o.work_iterations);
+        let domain = &domains[(pair / o.interval) % domains.len()];
+        if pair.is_multiple_of(o.interval) {
+            result.scope_count += 1;
+            if o.case == "refill" && o.variant == "historical" {
+                let required = mul(o.bytes,4)?.max(mul(o.quantum,3)?);
+                // The old public API installs a required idle workset through
+                // native retention followed by its actual release. It has no
+                // partial retained-free trim target; record this difference.
+                drop(domain.try_grow(required).map_err(|e|e.to_string())?);
+            }
+        }
+        let lease = if o.variant == "historical" {
+            Some(domain.try_grow(o.bytes).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let packet = Packet {
+            lease,
+            bytes: o.bytes,
+            checksum,
+            ack: ack.clone(),
+        };
+        match o.mode.as_str() {
+            "same-thread" => release(packet)?,
+            "round-robin" => {
+                outbound
+                    .as_ref()
+                    .unwrap()
+                    .send(packet)
+                    .map_err(|e| e.to_string())?;
+                release(
+                    inbound
+                        .as_ref()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30))
+                        .map_err(|e| e.to_string())?,
+                )?;
+            }
+            "fan-in" => outbound
+                .as_ref()
+                .unwrap()
+                .send(packet)
+                .map_err(|e| e.to_string())?,
+            _ => unreachable!(),
+        }
+        let (freed, received_checksum) = acknowledgements
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|e| e.to_string())?;
+        if freed != o.bytes || received_checksum != checksum {
+            return Err("free acknowledgement does not match exact allocation".into());
+        }
+        result.freed = add(result.freed, freed)?;
+        result.checksum = result.checksum.wrapping_add(received_checksum);
+        result
+            .samples
+            .push(u64::try_from(began.elapsed().as_nanos()).map_err(|e| e.to_string())?);
+    }
+    Ok(result)
+}
+fn quantile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
+    let rank = sorted
+        .len()
+        .saturating_mul(numerator)
+        .div_ceil(denominator)
+        .max(1);
+    sorted[rank.min(sorted.len()) - 1]
+}
+fn metrics(a: &Assembly) -> (u64, u64, u64) {
+    a.domains
+        .iter()
+        .flatten()
+        .fold((0, 0, 0), |(top, ret, retry), d| {
+            let m = d.metrics();
+            (
+                top + m.parent_top_up_calls,
+                ret + m.parent_return_calls,
+                retry + m.free_cas_retries,
+            )
+        })
+}
+fn run_round(o: &Options, round: usize) -> BenchResult<Value> {
+    let a = assemble(o)?;
+    let before = metrics(&a);
+    let (samples, elapsed, checksum, freed, scopes) = thread::scope(|s| -> BenchResult<_> {
+        let consumer_count = usize::from(o.mode == "fan-in");
+        let barrier = Arc::new(Barrier::new(o.threads + consumer_count + 1));
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        let queues = if o.mode == "round-robin" {
+            o.threads
+        } else {
+            consumer_count
+        };
+        for _ in 0..queues {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            receivers.push(Some(rx));
+        }
+        let consumer = if consumer_count == 1 {
+            let inbound = receivers[0].take().unwrap();
+            let ready = barrier.clone();
+            Some(s.spawn(move || -> BenchResult<()> {
+                ready.wait();
+                for _ in 0..o
+                    .threads
+                    .checked_mul(o.pairs)
+                    .ok_or("pair count overflow")?
+                {
+                    release(
+                        inbound
+                            .recv_timeout(Duration::from_secs(30))
+                            .map_err(|e| e.to_string())?,
+                    )?;
+                }
+                Ok(())
+            }))
+        } else {
+            None
+        };
+        let mut handles = Vec::new();
+        for index in 0..o.threads {
+            let tx = match o.mode.as_str() {
+                "round-robin" => Some(senders[(index + 1) % o.threads].clone()),
+                "fan-in" => Some(senders[0].clone()),
+                _ => None,
+            };
+            let rx = if o.mode == "round-robin" {
+                receivers[index].take()
+            } else {
+                None
+            };
+            let ready = barrier.clone();
+            let domains = &a.domains[index];
+            handles.push(s.spawn(move || worker(o, index, domains, &ready, tx, rx)));
+        }
+        drop(senders);
+        let started = Instant::now();
+        barrier.wait();
+        let mut samples = Vec::new();
+        let mut checksum = 0u64;
+        let mut freed = 0;
+        let mut scopes = 0;
+        for handle in handles {
+            let r = handle.join().map_err(|_| "worker panicked")??;
+            samples.extend(r.samples);
+            checksum = checksum.wrapping_add(r.checksum);
+            freed = add(freed, r.freed)?;
+            scopes += r.scope_count;
+        }
+        if let Some(handle) = consumer {
+            handle.join().map_err(|_| "free consumer panicked")??;
+        }
+        Ok((samples, started.elapsed(), checksum, freed, scopes))
+    })?;
+
+    let expected = o.threads.checked_mul(o.pairs).ok_or("pair overflow")?;
+    if samples.len() != expected || freed != mul(expected as u64, o.bytes)? {
+        return Err("pair or actual-free byte mismatch".into());
+    }
+    let after = metrics(&a);
+    let mut sorted = samples;
+    sorted.sort_unstable();
+    let raw = std::env::var_os("STOCK_COST_SAVE_SAMPLES")
+        .map(|dir| -> BenchResult<String> {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = dir.join(format!("historical-{}-{}-r{}.json", o.case, o.mode, round));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&sorted).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(path.display().to_string())
+        })
+        .transpose()?;
+    let live: u64 = a
+        .domains
+        .iter()
+        .flatten()
+        .map(|d| d.snapshot().live_bytes)
+        .sum();
+    if live != 0 {
+        return Err("historical outstanding live bytes after free acknowledgements".into());
+    }
+    let record = json!({"kind":if o.case=="refill" {"historical_native_policy_diagnostic_round"}else{"historical_reservation_equal_work_round"},"semantic_equivalence":o.case!="refill","relative_cost_gate_applicable":o.case!="refill","equivalence_limit":if o.case=="refill" {json!("old native trim returns all idle workset; candidate returns quantum retaining W-q; compare absolute service/progress only")}else{Value::Null},"source_sha":HISTORICAL_SHA,"adapter_source_sha256":ADAPTER_HASH,"manifest_sha256":FROZEN_HASH,"protocol_only":true,"round":round,"case":o.case,"variant":o.variant,"mode":o.mode,"threads":o.threads,"pairs_per_thread":o.pairs,"successful_pairs":expected,"operation_bytes":o.bytes,"work_us":o.work_us,"supply_work_iterations":o.work_iterations,"supply_kind":if o.work_iterations.is_some(){"fixed_calibrated_iterations"}else{"wall_clock_smoke_probe"},"scope_interval":o.interval,"quantum_bytes":o.quantum,"accounts":o.accounts,"tree_depth":o.depth,"domains_per_thread":o.domains_per_thread,"workset_per_domain_bytes":a.workset,"high_total_target_bytes":a.target,"elapsed_ns":elapsed.as_nanos(),"pairs_per_second":expected as f64/elapsed.as_secs_f64(),"iteration_p99_ns":quantile(&sorted,99,100),"iteration_p999_ns":quantile(&sorted,999,1000),"iteration_max_ns":sorted.last(),"checksum":checksum,"free_acknowledged_bytes":freed,"actual_protocol_released_bytes":if o.variant=="historical"{freed}else{0},"scope_count":scopes,"parent_top_up_calls":after.0-before.0,"parent_return_calls":after.1-before.1,"free_cas_retries":after.2-before.2,"historical_refill_recipe":if o.case=="refill" {json!("native try_grow(W)+drop at scope entry; native trim all idle after exact payload free ack")}else{Value::Null},"authorization_priming_lease_release_bytes":if o.case=="refill" {scopes*a.workset}else{0},"final_live_bytes":live,"raw_sorted_samples":raw,"matrix_complete":false,"formal_acceptance":false,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"baseline_checkout":BASELINE_CHECKOUT});
+    for d in a.domains.iter().flatten() {
+        d.close();
+    }
+    black_box(a.authority.root().committed_bytes());
+    Ok(record)
+}
+fn main() {
+    let result = (|| -> BenchResult<()> {
+        let actual = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(BASELINE_CHECKOUT)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !actual.status.success()
+            || String::from_utf8_lossy(&actual.stdout).trim() != HISTORICAL_SHA
+        {
+            return Err("external checkout is not the exact historical baseline".into());
+        }
+        let o = Options::parse()?;
+        validate_manifest(&o)?;
+        for round in 0..o.rounds {
+            println!("{}", run_round(&o, round)?);
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("historical comparator failed: {e}");
+        std::process::exit(1);
+    }
+}

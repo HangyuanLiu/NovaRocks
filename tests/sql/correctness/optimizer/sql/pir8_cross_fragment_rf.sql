@@ -19,6 +19,10 @@
 -- PIR-8 M3 guard: a partitioned hash join must keep the runtime-filter probe
 -- target visible across the shuffle exchange after planner/codegen layering
 -- guards are tightened.
+-- Golden derivation: append_exchange retains the probe p.k and build b.k
+-- names. Assert both hash sinks instead of the old ambiguous k substring.
+-- Keep producer fragment 1/node 4 and consumer fragment 2/node 7, including
+-- BlockingSnapshot, the two hash exchanges, and the four-row result.
 
 CREATE TABLE ${case_db}.pir8_rf_probe (k INT, v INT);
 CREATE TABLE ${case_db}.pir8_rf_build (k INT, v INT);
@@ -42,7 +46,8 @@ SET global_runtime_filter_probe_min_selectivity = 0.0;
 SET cbo_broadcast_node_mem_budget_bytes = 0;
 
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
--- @explain_contains=PARTITION: HASH_PARTITIONED (k)
+-- @explain_contains=PARTITION: HASH_PARTITIONED (p.k)
+-- @explain_contains=PARTITION: HASH_PARTITIONED (b.k)
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
 -- @explain_contains=expr = (p.k)

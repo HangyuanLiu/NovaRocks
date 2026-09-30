@@ -963,10 +963,13 @@ fn assert_partitioned_runtime_filter_plan(
         explain.contains("HASH JOIN (PARTITIONED"),
         "Runtime Filter candidate did not select a partitioned hash join: {explain}"
     );
-    ensure!(
-        explain.contains("HASH_PARTITIONED (k)"),
-        "Runtime Filter candidate did not expose a key-aligned hash partition: {explain}"
-    );
+    for key in ["p.k", "b.k"] {
+        let partition = format!("PARTITION: HASH_PARTITIONED ({key})");
+        ensure!(
+            explain.lines().any(|line| line.trim() == partition),
+            "Runtime Filter candidate did not expose a hash partition on {key}: {explain}"
+        );
+    }
     ensure!(
         explain.contains("producer binding") && explain.contains("consumer binding"),
         "Runtime Filter candidate did not expose producer and consumer bindings: {explain}"

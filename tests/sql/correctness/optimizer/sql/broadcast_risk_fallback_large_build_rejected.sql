@@ -16,6 +16,10 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution
+-- Golden derivation: identity projections reuse each GENERATE_SERIES ValueId.
+-- Its first frozen name is generate_series; append_exchange preserves it,
+-- replacing old k imports on both sides without changing the partitioned
+-- join, source/project nodes, 1M/100M inputs, or 1M join estimate.
 CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
 SET cbo_broadcast_backend_count = 3;

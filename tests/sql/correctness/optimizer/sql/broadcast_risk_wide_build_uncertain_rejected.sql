@@ -16,6 +16,10 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution
+-- Golden derivation: the two shuffle imports retain p.k and b.k rather than k.
+-- Keep the RF producer on b, consumer on p, partitioned join, both exchanges,
+-- the 40500000000 estimate, and the 200000 result; unknown build statistics
+-- must not become permission to broadcast.
 CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_1m_exact (k INT);

@@ -18,6 +18,10 @@
 -- @tags=optimizer,stats,oq12
 -- Test Objective:
 -- Capture set-operation row-count estimates for all/distinct/intersect/except.
+-- Golden derivation: each branch projects its own k and shuffle imports keep
+-- that name, replacing v0/v1 in INTERSECT and EXCEPT sinks. The two branch
+-- identities remain distinct even though their display names match.
+-- Preserve set operators/exchanges and estimates 1600/160/300/500.
 DROP TABLE IF EXISTS ${case_db}.oq12_stats_set_l;
 DROP TABLE IF EXISTS ${case_db}.oq12_stats_set_r;
 CREATE TABLE ${case_db}.oq12_stats_set_l (k INT);

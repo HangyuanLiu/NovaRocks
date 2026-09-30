@@ -1,0 +1,69 @@
+-- query 1
+unknown_pair	definite_mismatch
+NULL	0
+
+-- query 2
+match_wins	not_match_wins
+1	0
+
+-- query 3
+outer_null
+NULL
+
+-- query 4
+empty_in	empty_not_in
+0	1
+
+-- query 5
+pk	member	nonmember
+1	NULL	NULL
+1	NULL	NULL
+2	0	1
+3	1	0
+4	NULL	NULL
+
+-- query 6
+unknown_pair	definite_mismatch
+NULL	0
+
+-- query 7
+unknown_pair	definite_mismatch
+NULL	0
+
+-- query 8
+unknown_pair	match
+NULL	1
+
+-- query 9
+text_differs
+0
+
+-- query 10
+pk
+2
+3
+
+-- query 11
+unknown_pair	definite_mismatch
+NULL	0
+
+-- query 12
+x	n
+1	2
+
+-- query 13
+x	membership
+1	1
+2	0
+
+-- query 14
+x	n
+1	2
+
+-- query 15
+membership
+1
+
+-- query 16
+n
+2

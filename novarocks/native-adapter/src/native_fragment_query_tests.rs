@@ -393,7 +393,7 @@ mod tests {
             "no charge has moved onto the account in this slice"
         );
         account
-            .request_grant(4096)
+            .prefund(4096)
             .expect("the account policy must still have its whole limit available");
         admitted.query_mem_tracker().release(8192);
     }

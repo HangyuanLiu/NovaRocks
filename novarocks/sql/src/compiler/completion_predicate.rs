@@ -145,7 +145,14 @@ fn lower_column(
     if output.data_type != expression.data_type || output.nullable != expression.nullable {
         return None;
     }
-    columns.get(column_id).copied()
+    // Composite assignments can name a scan column, but the provider domain
+    // vocabulary cannot represent even an IS NULL domain over that type.
+    // Keep the exact SQL predicate as an engine residual instead of emitting
+    // a constraint that the native decoder must reject.
+    columns
+        .get(column_id)
+        .copied()
+        .filter(|column| column.value_type.is_comparable())
 }
 
 fn comparison_domain(
@@ -434,6 +441,57 @@ mod tests {
         let scan = scan(vec![comparison(BinOp::Eq, expression, integer(1))]);
 
         assert!(lower_provider_predicates(&scan, &columns()).is_empty());
+    }
+
+    #[test]
+    fn composite_null_checks_remain_engine_residuals() {
+        use arrow::datatypes::Field;
+
+        let composite_types = [
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            DataType::Struct(vec![Field::new("k", DataType::Int32, true)].into()),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int32, false),
+                            Field::new("value", DataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+        ];
+        for data_type in composite_types {
+            for negated in [false, true] {
+                let mut expression = column_ref();
+                expression.data_type = data_type.clone();
+                expression.nullable = true;
+                let predicate = TypedExpr {
+                    kind: ExprKind::IsNull {
+                        expr: Box::new(expression),
+                        negated,
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                };
+                let mut scan = scan(vec![predicate]);
+                scan.columns[0].data_type = data_type.clone();
+                scan.columns[0].nullable = true;
+                let columns = BTreeMap::from([(
+                    ColumnId(1),
+                    ProviderPredicateColumn {
+                        ordinal: 0,
+                        value_type: ConnectorValueType::NonComparable,
+                    },
+                )]);
+                assert!(lower_provider_predicates(&scan, &columns).is_empty());
+                assert_eq!(scan.predicates.len(), 1, "SQL residual is retained");
+            }
+        }
     }
 
     #[test]

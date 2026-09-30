@@ -37,7 +37,8 @@ ALTER TABLE p SET TBLPROPERTIES ('identifier-field-ids' = '[1]');
 ALTER TABLE p SET TBLPROPERTIES ('current-schema-id' = '5');
 
 -- query 5
--- @expect_error=novarocks.* namespace is reserved
+-- Integer declarations are schema-owned, including the retired property form.
+-- @expect_error=Iceberg scalar integer declarations are owned by schema mutations
 ALTER TABLE p SET TBLPROPERTIES ('novarocks.logical_type.foo' = 'TINYINT');
 
 -- query 6
