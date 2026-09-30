@@ -215,6 +215,13 @@ append_dependency "$connector_to_type_root" connector-contract \
   'novarocks-type-contract = { path = "../type-contract" }'
 assert_accepted "$connector_to_type_root"
 
+# Public read/write recipes may freeze exact Arrow schemas. Arrays and all
+# executable capabilities remain excluded by the resolved closure guard.
+connector_schema_root="$(new_mutation connector-public-schema)"
+append_dependency "$connector_schema_root" connector-contract \
+  'arrow-schema = "=58.2.0"'
+assert_accepted "$connector_schema_root"
+
 # A forbidden application owner declared directly must be rejected.
 direct_root="$(new_mutation direct-application)"
 append_dependency "$direct_root" physical-plan \

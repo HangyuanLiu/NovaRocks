@@ -66,7 +66,9 @@ DIRECT_PACKAGE_ALLOW_LIST = frozenset(
 # contract may acquire physical-plan or application authority.
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
     TYPE_CONTRACT: frozenset({"arrow-schema"}),
-    CONNECTOR_CONTRACT: frozenset({"bytes", TYPE_CONTRACT}),
+    # Complete public read/write recipes freeze exact Arrow schemas, while
+    # arrays, decoding, storage and executable capabilities stay outside.
+    CONNECTOR_CONTRACT: frozenset({"arrow-schema", "bytes", TYPE_CONTRACT}),
 }
 
 # This vocabulary is used only for declared-edge diagnostics. Resolved closure
