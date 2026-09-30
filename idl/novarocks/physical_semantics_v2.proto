@@ -1,0 +1,159 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.physical_semantics_v2;
+
+import "physical_control_v2.proto";
+
+// Complete frozen semantic component, not a fragment envelope or an owner
+// capability proof. IDs are sparse; zero/MAX are valid. Required references
+// have presence. Typed decode rejects missing/unknown variants and duplicates.
+message SemanticParameters {
+  repeated SemanticParameter entries = 1;
+}
+message SemanticParameter {
+  uint32 id = 1;
+  // The value variant determines the one stable key. No separate key or type
+  // may override it; runtime settings and process defaults do not fill gaps.
+  oneof value {
+    sint64 statement_start_utc_micros = 2;
+    string time_zone = 3;
+    bool allow_throw_exception = 4;
+    bool decimal_overflow_to_double = 5;
+    bool group_concat_legacy = 6;
+    sint64 group_concat_max_len = 7;
+  }
+}
+enum SemanticParameterKey {
+  SEMANTIC_PARAMETER_KEY_UNSPECIFIED = 0;
+  SEMANTIC_PARAMETER_KEY_STATEMENT_START_UTC = 1;
+  SEMANTIC_PARAMETER_KEY_TIME_ZONE = 2;
+  SEMANTIC_PARAMETER_KEY_ALLOW_THROW_EXCEPTION = 3;
+  SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE = 4;
+  SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_LEGACY = 5;
+  SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_MAX_LEN = 6;
+}
+message SemanticParameterRef {
+  optional uint32 id = 1;
+  SemanticParameterKey expected_key = 2;
+}
+
+message FrozenCalls {
+  repeated FrozenCall entries = 1;
+}
+message FrozenCall {
+  CallSite site = 1;
+  EffectContext context = 2;
+  CallEffects effects = 3;
+}
+message NodeCallSite {
+  optional uint32 node_id = 1;
+  // This is an actual field ordinal, not an AggregateCallId or a signature ID.
+  uint32 call = 2;
+}
+message CallSite {
+  oneof kind {
+    uint32 expression_use_id = 1;
+    NodeCallSite aggregate = 2;
+    NodeCallSite top_n_state = 3;
+    NodeCallSite writer_partial = 4;
+    NodeCallSite writer_final = 5;
+    uint32 table_node_id = 6;
+  }
+}
+message EffectContext {
+  optional uint32 use_id = 1;
+  optional uint32 domain_id = 2;
+  novarocks.physical_control_v2.EvaluationDemand demand = 3;
+}
+
+// Claims belong to each real call occurrence. Exact signature/identity remain
+// in the referenced physical definition. Admission recomputes all nine fields
+// with the installed exact overload; there is no old-four-field fallback.
+message CallEffects {
+  ValueStability value_stability = 1;
+  OwnRowError own_row_error = 2;
+  FailureBehavior failure_behavior = 3;
+  NullBehavior null_behavior = 4;
+  ArgumentControl argument_control = 5;
+  InstanceState instance_state = 6;
+  ObservableEffects observable_effects = 7;
+  repeated SemanticParameterRef environment = 8;
+  ProofScope proof_scope = 9;
+}
+enum ValueStability {
+  VALUE_STABILITY_UNSPECIFIED = 0;
+  VALUE_STABILITY_IMMUTABLE = 1;
+  VALUE_STABILITY_STABLE = 2;
+  VALUE_STABILITY_VOLATILE = 3;
+}
+enum OwnRowError {
+  OWN_ROW_ERROR_UNSPECIFIED = 0;
+  OWN_ROW_ERROR_NO_ROW_ERROR = 1;
+  OWN_ROW_ERROR_MAY_RAISE = 2;
+  OWN_ROW_ERROR_NOT_ROW_EVALUATED = 3;
+}
+enum FailureBehavior {
+  FAILURE_BEHAVIOR_UNSPECIFIED = 0;
+  FAILURE_BEHAVIOR_PROPAGATE = 1;
+  FAILURE_BEHAVIOR_RETURNS_NULL = 2;
+}
+enum NullBehavior {
+  NULL_BEHAVIOR_UNSPECIFIED = 0;
+  NULL_BEHAVIOR_STRICT = 1;
+  NULL_BEHAVIOR_CALLED_ON_NULL = 2;
+  NULL_BEHAVIOR_CONTROL_DEFINED = 3;
+}
+message ArgumentControl {
+  oneof kind {
+    SimpleArgumentControl simple = 1;
+    novarocks.physical_control_v2.HigherOrderControl higher_order = 2;
+  }
+}
+enum SimpleArgumentControl {
+  SIMPLE_ARGUMENT_CONTROL_UNSPECIFIED = 0;
+  SIMPLE_ARGUMENT_CONTROL_EAGER = 1;
+  SIMPLE_ARGUMENT_CONTROL_TYPE_ONLY = 2;
+  SIMPLE_ARGUMENT_CONTROL_IF = 3;
+  SIMPLE_ARGUMENT_CONTROL_COALESCE = 4;
+  SIMPLE_ARGUMENT_CONTROL_SIMPLE_CASE = 5;
+  SIMPLE_ARGUMENT_CONTROL_SEARCHED_CASE = 6;
+  SIMPLE_ARGUMENT_CONTROL_AGGREGATE = 7;
+  SIMPLE_ARGUMENT_CONTROL_WINDOW = 8;
+  SIMPLE_ARGUMENT_CONTROL_TABLE = 9;
+}
+enum InstanceState {
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_NONE = 1;
+  INSTANCE_STATE_SCALAR_INSTANCE = 2;
+  INSTANCE_STATE_AGGREGATE_INSTANCE = 3;
+  INSTANCE_STATE_WINDOW_PARTITION = 4;
+  INSTANCE_STATE_TABLE_INSTANCE = 5;
+}
+message ObservableEffects {
+  bool rng_sampling = 1;
+  bool warnings = 2;
+  bool controlled_wait = 3;
+}
+message ProofScope {
+  oneof kind {
+    novarocks.physical_control_v2.Empty unconditional = 1;
+    uint32 domain_id = 2;
+  }
+}

@@ -25,6 +25,7 @@ mod artifact;
 mod builder;
 mod expression;
 mod expression_site;
+mod frozen_calls;
 mod identity;
 mod package;
 mod plan;
@@ -38,6 +39,7 @@ pub use artifact::*;
 pub use builder::*;
 pub use expression::*;
 pub use expression_site::*;
+pub use frozen_calls::*;
 pub use identity::*;
 pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal};
 pub use novarocks_type_contract::FunctionValueType as ValueType;
@@ -68,7 +70,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 8;
+pub const PLAN_CONTRACT_REVISION: u32 = 9;
 
 #[cfg(test)]
 mod tests;

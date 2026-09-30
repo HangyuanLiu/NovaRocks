@@ -19,7 +19,10 @@ use super::*;
 use crate::resource::CutResourcePreflight;
 use crate::{FragmentPackageInput, FragmentSink, RuntimeFilterApplyPoint};
 
-pub(crate) fn validate_package(input: &FragmentPackageInput) -> Result<(), ValidationErrors> {
+pub(crate) fn validate_package(
+    input: &FragmentPackageInput,
+    call_items: usize,
+) -> Result<(), ValidationErrors> {
     let mut errors = ValidationContext::new();
     let fragment = &input.fragment;
     let mut usage = CutResourcePreflight::new();
@@ -32,6 +35,7 @@ pub(crate) fn validate_package(input: &FragmentPackageInput) -> Result<(), Valid
     usage.add_items(control.flow().use_reference_count());
     usage.add_items(control.bindings().len());
     usage.add_items(control.roots().sites().len());
+    usage.add_items(call_items);
     usage.add_items(input.scans.len());
     for scan in input.scans.values() {
         usage.add_bytes(scan.retained_bytes());
@@ -105,20 +109,6 @@ pub(crate) fn validate_package(input: &FragmentPackageInput) -> Result<(), Valid
         },
         &mut errors,
     );
-    match input
-        .parameters
-        .project(crate::package::fragment_parameter_references(fragment))
-    {
-        Ok(closure) if closure == input.parameters => {}
-        Ok(_) => errors.push(ValidationError::new(
-            "package.parameters",
-            "semantic parameter table contains unused definitions",
-        )),
-        Err(error) => errors.push(ValidationError::new(
-            "package.parameters",
-            error.to_string(),
-        )),
-    }
     validate_package_scans(input, &mut errors);
     validate_package_writes(input, &mut errors);
     if errors.is_empty() {

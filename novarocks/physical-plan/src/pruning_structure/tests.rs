@@ -401,6 +401,9 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
     plan.add_fragment(fragment.clone()).unwrap();
     let plan = plan.finish().unwrap();
     let mut cuts = derive_fragment_cuts(&plan).unwrap();
+    let calls =
+        FrozenFragmentCalls::try_new(&fragment, &expression_uses, Vec::new(), &Control::default())
+            .unwrap();
     FragmentPackage::try_new(
         FragmentPackageInput {
             version,
@@ -408,6 +411,7 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
             cuts: cuts.remove(&fragment.id()).unwrap(),
             fragment,
             expression_uses,
+            calls,
             result: None,
             parameters: SemanticParameters::default(),
             scans: BTreeMap::from([(scan, read)]),

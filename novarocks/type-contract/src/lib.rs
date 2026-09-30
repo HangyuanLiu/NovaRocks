@@ -74,8 +74,8 @@ pub use schema::{
 };
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
+    SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
 
 pub use window::{WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits};

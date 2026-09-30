@@ -3326,41 +3326,109 @@ fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() 
 #[test]
 fn package_parameter_closure_includes_writer_final_state_calls() {
     use novarocks_type_contract::{
-        SemanticParameterError, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-        SemanticParameterValue, SemanticParameters,
+        ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
+        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
+        FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameterError,
+        SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
+        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
     };
-
-    let source = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let fragment = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
     let reference = SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
     };
-    let mut nodes = source.nodes().clone();
-    let NodeKind::TableFinish(finish) = &mut nodes.get_mut(&source.root()).unwrap().kind else {
-        panic!("expected table finish");
+    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let mut invocations = Vec::new();
+    let mut bindings = Vec::new();
+    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
+        assert!(matches!(
+            fragment.expressions().get(root.expr).unwrap().kind,
+            ExprKind::Literal(_)
+        ));
+        let id = ExpressionUseId::new(ordinal as u32);
+        invocations.push(ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: id,
+                domain,
+                demand: root.demand,
+            },
+            definition: root.expr,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        });
+        bindings.push((*site, id));
+    }
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
+    // This is a real checked writer definition. Complete occurrence claims
+    // remain independent of its legacy binding metadata and are not an owner
+    // authentication receipt or a fabricated writer-cut package.
+    let site = PhysicalCallSite::WriterFinal {
+        node: fragment.root(),
+        call: 0,
     };
-    finish.final_aggregates[0]
-        .binding
-        .function
-        .semantic_parameters = Box::from([reference]);
-    finish.final_aggregates[0].binding.function.volatility = FunctionVolatility::Stable;
-    let fragment = Fragment::from(FragmentParts {
-        id: source.id(),
-        root: source.root(),
-        values: source.values().clone(),
-        expressions: source.expressions().clone(),
-        nodes,
-        sink: source.sink().clone(),
-        dop_domain: source.dop_domain(),
-        runtime_filters: source.runtime_filters().into(),
-    });
-    validate_fragment_definition(&fragment).unwrap();
-
-    // This fixture validates the fragment definition, not a complete writer
-    // package. Exercise the exact dependency collection and projection used
-    // by package extraction without fabricating its writer cut contracts.
-    let references = crate::package::fragment_parameter_references(&fragment);
-    assert_eq!(references, vec![reference]);
+    let call = FrozenPhysicalCall {
+        site,
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(u32::MAX),
+            domain,
+            demand: novarocks_type_contract::EvaluationDemand::Value,
+        },
+        effects: CallEffects {
+            value_stability: FunctionVolatility::Stable,
+            own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            null_behavior: FunctionNullBehavior::CalledOnNull,
+            argument_control: ArgumentControl::Aggregate,
+            instance_state: FunctionInstanceState::AggregateInstance,
+            observable_effects: ObservableEffects::NONE,
+            environment: Box::from([reference]),
+            proof_scope: CallProofScope::Unconditional,
+        },
+    };
+    let calls =
+        FrozenFragmentCalls::try_new(&fragment, &uses, vec![call.clone()], &Control).unwrap();
+    let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
+        unreachable!()
+    };
+    let Some(PhysicalCallBinding::Aggregate(binding)) = calls.binding(&fragment, &uses, site)
+    else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(binding, &finish.final_aggregates[0].binding));
+    assert!(binding.function.semantic_parameters.is_empty());
+    assert_eq!(
+        calls.parameter_references().collect::<Vec<_>>(),
+        vec![reference]
+    );
+    let mut wrong_site = call;
+    wrong_site.site = PhysicalCallSite::WriterPartial {
+        node: fragment.root(),
+        call: 0,
+    };
+    assert_eq!(
+        FrozenFragmentCalls::try_new(&fragment, &uses, vec![wrong_site], &Control),
+        Err(FrozenCallError::MissingSite(site))
+    );
     let required = SemanticParameters::try_new([(
         reference.id,
         SemanticParameterValue::TimeZone("UTC".into()),
@@ -3375,12 +3443,24 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     ])
     .unwrap();
     assert_eq!(
-        parameters.project(references.iter().copied()).unwrap(),
+        parameters
+            .project_observed(
+                calls.parameter_references(),
+                CompilePhase::Validate,
+                &Control
+            )
+            .unwrap(),
         required
     );
     assert_eq!(
-        SemanticParameters::default().project(references.iter().copied()),
-        Err(SemanticParameterError::MissingId(reference.id))
+        SemanticParameters::default().project_observed(
+            calls.parameter_references(),
+            CompilePhase::Validate,
+            &Control
+        ),
+        Err(SemanticParameterProjectionError::Parameter(
+            SemanticParameterError::MissingId(reference.id)
+        ))
     );
     let wrong_key = SemanticParameters::try_new([(
         reference.id,
@@ -3388,7 +3468,13 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     )])
     .unwrap();
     assert_eq!(
-        wrong_key.project(references),
-        Err(SemanticParameterError::KeyMismatch(reference))
+        wrong_key.project_observed(
+            calls.parameter_references(),
+            CompilePhase::Validate,
+            &Control
+        ),
+        Err(SemanticParameterProjectionError::Parameter(
+            SemanticParameterError::KeyMismatch(reference)
+        ))
     );
 }

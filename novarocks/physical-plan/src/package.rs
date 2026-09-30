@@ -26,13 +26,14 @@ use novarocks_connector_contract::{
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, SemanticParameterError,
-    SemanticParameterRef, SemanticParameters,
+    SemanticParameterProjectionError, SemanticParameters,
 };
 
 use crate::{
-    AnnotationSubject, Fragment, FragmentCuts, FragmentId, NodeId, PhysicalPlan, PhysicalRootUses,
-    PlanAnnotation, PlanVersionId, ProviderReadOccurrenceId, RequiredContracts, ResultPort,
-    RootUseBindingError, ValidationErrors, derive_fragment_cuts,
+    AnnotationSubject, Fragment, FragmentCuts, FragmentId, FrozenCallError, FrozenFragmentCalls,
+    NodeId, PhysicalPlan, PhysicalRootUses, PlanAnnotation, PlanVersionId,
+    ProviderReadOccurrenceId, RequiredContracts, ResultPort, RootUseBindingError, ValidationErrors,
+    derive_fragment_cuts,
 };
 
 /// An owned input for the same checked constructor on FE and BE. It contains
@@ -45,6 +46,9 @@ pub struct FragmentPackageInput {
     /// Complete invocation control and exact field bindings. Required even
     /// for a fragment with no expression roots; no eager fallback is inferred.
     pub expression_uses: PhysicalRootUses,
+    /// Mandatory complete per-occurrence claims. Structural validity does not
+    /// authenticate these facts; the installed exact owner rechecks them.
+    pub calls: FrozenFragmentCalls,
     pub cuts: FragmentCuts,
     pub result: Option<ResultPort>,
     pub parameters: SemanticParameters,
@@ -66,14 +70,45 @@ impl FragmentPackage {
         control
             .checkpoint(CompilePhase::Validate, 0)
             .map_err(FragmentPackageError::Control)?;
-        crate::validation::validate_package(&input).map_err(FragmentPackageError::Structure)?;
+        let call_items =
+            input
+                .calls
+                .dynamic_items_observed(control)
+                .map_err(|error| match error {
+                    FrozenCallError::Control(error) => FragmentPackageError::Control(error),
+                    error => FragmentPackageError::Calls(error),
+                })?;
+        crate::validation::validate_package(&input, call_items)
+            .map_err(FragmentPackageError::Structure)?;
         input
-            .expression_uses
-            .validate_fragment(&input.fragment, control)
+            .calls
+            .validate_fragment(&input.fragment, &input.expression_uses, control)
             .map_err(|error| match error {
-                RootUseBindingError::Control(error) => FragmentPackageError::Control(error),
-                error => FragmentPackageError::ExpressionUses(error),
+                FrozenCallError::Control(error) => FragmentPackageError::Control(error),
+                FrozenCallError::Roots(error) => FragmentPackageError::ExpressionUses(error),
+                error => FragmentPackageError::Calls(error),
             })?;
+        let closure = input
+            .parameters
+            .project_observed(
+                input.calls.parameter_references(),
+                CompilePhase::Validate,
+                control,
+            )
+            .map_err(|error| match error {
+                SemanticParameterProjectionError::Control(error) => {
+                    FragmentPackageError::Control(error)
+                }
+                SemanticParameterProjectionError::Parameter(error) => {
+                    FragmentPackageError::Parameter(error)
+                }
+            })?;
+        // Projection resolves and copies this exact immutable table. Its keys
+        // are a subset, so equal counts prove closure without an unobserved
+        // second traversal/comparison of all frozen values.
+        if closure.entries().len() != input.parameters.entries().len() {
+            return Err(FragmentPackageError::UnusedParameters);
+        }
         Ok(Self(input))
     }
 
@@ -91,6 +126,10 @@ impl FragmentPackage {
 
     pub const fn expression_uses(&self) -> &PhysicalRootUses {
         &self.0.expression_uses
+    }
+
+    pub const fn calls(&self) -> &FrozenFragmentCalls {
+        &self.0.calls
     }
 
     pub const fn cuts(&self) -> &FragmentCuts {
@@ -127,6 +166,9 @@ pub enum FragmentPackageError {
     Control(CompileControlError),
     Structure(ValidationErrors),
     ExpressionUses(RootUseBindingError),
+    Calls(FrozenCallError),
+    Parameter(SemanticParameterError),
+    UnusedParameters,
 }
 impl fmt::Display for FragmentPackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,6 +176,11 @@ impl fmt::Display for FragmentPackageError {
             Self::Control(error) => error.fmt(f),
             Self::Structure(error) => error.fmt(f),
             Self::ExpressionUses(error) => error.fmt(f),
+            Self::Calls(error) => error.fmt(f),
+            Self::Parameter(error) => error.fmt(f),
+            Self::UnusedParameters => {
+                f.write_str("semantic parameter table contains unused definitions")
+            }
         }
     }
 }
@@ -148,6 +195,7 @@ pub fn extract_fragment_packages(
     parameters: &SemanticParameters,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
     expression_uses: &BTreeMap<FragmentId, PhysicalRootUses>,
+    calls: &BTreeMap<FragmentId, FrozenFragmentCalls>,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
     control
@@ -209,6 +257,10 @@ pub fn extract_fragment_packages(
                         fragment.id(),
                     ))?
                     .clone(),
+                calls: calls
+                    .get(&fragment.id())
+                    .ok_or(FragmentPackageExtractionError::MissingCalls(fragment.id()))?
+                    .clone(),
                 cuts: cuts
                     .remove(&fragment.id())
                     .ok_or(FragmentPackageExtractionError::BoundaryDerivation)?,
@@ -217,8 +269,19 @@ pub fn extract_fragment_packages(
                     .filter(|result| result.fragment == fragment.id())
                     .cloned(),
                 parameters: parameters
-                    .project(fragment_parameter_references(fragment))
-                    .map_err(FragmentPackageExtractionError::Parameter)?,
+                    .project_observed(
+                        calls[&fragment.id()].parameter_references(),
+                        CompilePhase::Validate,
+                        control,
+                    )
+                    .map_err(|error| match error {
+                        SemanticParameterProjectionError::Control(error) => {
+                            FragmentPackageExtractionError::Control(error)
+                        }
+                        SemanticParameterProjectionError::Parameter(error) => {
+                            FragmentPackageExtractionError::Parameter(error)
+                        }
+                    })?,
                 scans: local_scans,
                 writes: local_writes,
                 annotations,
@@ -242,6 +305,9 @@ pub fn extract_fragment_packages(
     {
         return Err(FragmentPackageExtractionError::UnusedExpressionUses);
     }
+    if calls.len() != outputs.len() || calls.keys().any(|id| !outputs.contains_key(id)) {
+        return Err(FragmentPackageExtractionError::UnusedCalls);
+    }
     Ok(outputs)
 }
 
@@ -257,6 +323,8 @@ pub enum FragmentPackageExtractionError {
     Control(CompileControlError),
     MissingExpressionUses(FragmentId),
     UnusedExpressionUses,
+    MissingCalls(FragmentId),
+    UnusedCalls,
 }
 
 impl fmt::Display for FragmentPackageExtractionError {
@@ -282,56 +350,12 @@ impl fmt::Display for FragmentPackageExtractionError {
             Self::UnusedExpressionUses => {
                 f.write_str("expression control names an unused fragment")
             }
+            Self::MissingCalls(id) => {
+                write!(f, "frozen calls are missing for fragment {}", id.get())
+            }
+            Self::UnusedCalls => f.write_str("frozen calls name an unused fragment"),
         }
     }
 }
 
 impl std::error::Error for FragmentPackageExtractionError {}
-
-/// Dependencies belong to exact call definitions, never to a function name or
-/// a process setting. Projection visits each definition once and preserves IDs.
-pub(crate) fn fragment_parameter_references(fragment: &Fragment) -> Vec<SemanticParameterRef> {
-    let mut references = Vec::new();
-    for (_, expression) in fragment.expressions().iter() {
-        match &expression.kind {
-            crate::ExprKind::FunctionCall { function, .. } => {
-                references.extend_from_slice(&function.semantic_parameters)
-            }
-            crate::ExprKind::WindowCall {
-                function,
-                aggregate_binding,
-                ..
-            } => {
-                references.extend_from_slice(&function.semantic_parameters);
-                if let Some(binding) = aggregate_binding {
-                    references.extend_from_slice(&binding.function.semantic_parameters);
-                }
-            }
-            _ => {}
-        }
-    }
-    for node in fragment.nodes().values() {
-        if let Some((_, calls)) = node.kind.aggregate_contract() {
-            for call in calls {
-                references.extend_from_slice(&call.binding.function.semantic_parameters);
-            }
-        }
-        match &node.kind {
-            crate::NodeKind::TableFunction { function, .. } => {
-                references.extend_from_slice(&function.semantic_parameters)
-            }
-            crate::NodeKind::TableWriter { target } => {
-                for call in &target.partial_aggregates {
-                    references.extend_from_slice(&call.binding.function.semantic_parameters);
-                }
-            }
-            crate::NodeKind::TableFinish(finish) => {
-                for call in &finish.final_aggregates {
-                    references.extend_from_slice(&call.binding.function.semantic_parameters);
-                }
-            }
-            _ => {}
-        }
-    }
-    references
-}

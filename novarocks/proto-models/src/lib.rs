@@ -57,6 +57,14 @@ pub mod physical_control_v2 {
     ));
 }
 
+/// Complete frozen call-effects and parameter component of the v2 vocabulary.
+pub mod physical_semantics_v2 {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/novarocks.physical_semantics_v2.rs"
+    ));
+}
+
 #[allow(clippy::large_enum_variant)]
 pub mod plan {
     include!(concat!(env!("OUT_DIR"), "/novarocks.plan.rs"));

@@ -24,10 +24,11 @@ use novarocks_connector_contract::{
     StaticScanAssignment, TupleDomain,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, PureCompileControl, SemanticParameterId,
-    SemanticParameterValue, SemanticParameters,
+    ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase, ControlShape,
+    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
+    FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
 
 use super::*;
@@ -97,35 +98,90 @@ fn fixture_controls(plan: &PhysicalPlan) -> BTreeMap<FragmentId, PhysicalRootUse
         .collect()
 }
 
+// The selected test.parameter.zero fixture reads its exact frozen timezone
+// reference and returns its bounded byte length as a non-NULL Int64. These
+// are explicit fixture-owner
+// facts, not effects inferred from a general function's legacy four fields.
+fn parameter_fixture_effects(reference: SemanticParameterRef) -> CallEffects {
+    assert_eq!(reference.expected_key, SemanticParameterKey::TimeZone);
+    CallEffects {
+        value_stability: FunctionVolatility::Stable,
+        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        failure_behavior: FunctionFailureBehavior::Propagate,
+        null_behavior: FunctionNullBehavior::CalledOnNull,
+        argument_control: ArgumentControl::Eager,
+        instance_state: FunctionInstanceState::None,
+        observable_effects: ObservableEffects::NONE,
+        environment: Box::from([reference]),
+        proof_scope: CallProofScope::Unconditional,
+    }
+}
+
+fn fixture_calls(fragment: &Fragment, uses: &PhysicalRootUses) -> FrozenFragmentCalls {
+    let mut calls = Vec::new();
+    for (id, invocation) in uses.flow().uses() {
+        if let ExprKind::FunctionCall { function, args } = &fragment
+            .expressions()
+            .get(invocation.definition)
+            .unwrap()
+            .kind
+        {
+            assert_eq!(function.function_id.as_str(), "test.parameter");
+            assert_eq!(function.overload.as_str(), "test.parameter.zero");
+            assert_eq!(function.kind, FunctionKind::Scalar);
+            assert_eq!(function.result_type, ty(DataType::Int64, false));
+            assert!(args.is_empty());
+            assert!(function.argument_types.is_empty());
+            let [reference] = function.semantic_parameters.as_ref() else {
+                panic!("the parameter fixture requires its selected timezone reference");
+            };
+            calls.push(FrozenPhysicalCall {
+                site: PhysicalCallSite::Expression(*id),
+                context: invocation.context,
+                effects: parameter_fixture_effects(*reference),
+            });
+        }
+    }
+    FrozenFragmentCalls::try_new(fragment, uses, calls, &Control).unwrap()
+}
+
+fn fixture_call_tables(
+    plan: &PhysicalPlan,
+    controls: &BTreeMap<FragmentId, PhysicalRootUses>,
+) -> BTreeMap<FragmentId, FrozenFragmentCalls> {
+    plan.fragments()
+        .iter()
+        .map(|(id, fragment)| (*id, fixture_calls(fragment, &controls[id])))
+        .collect()
+}
+
 fn extract(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
     parameters: &SemanticParameters,
     writes: &BTreeMap<WriteTargetOrdinal, novarocks_connector_contract::ConnectorWriteRecipeDraft>,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
-    extract_fragment_packages(
-        plan,
-        scans,
-        parameters,
-        writes,
-        &fixture_controls(plan),
-        &Control,
-    )
+    let controls = fixture_controls(plan);
+    let calls = fixture_call_tables(plan, &controls);
+    extract_fragment_packages(plan, scans, parameters, writes, &controls, &calls, &Control)
 }
 
 fn package_input(fragment: Fragment) -> FragmentPackageInput {
     let expression_uses = fixture_expression_uses(&fragment);
-    package_input_with_controls(fragment, expression_uses)
+    let calls = fixture_calls(&fragment, &expression_uses);
+    package_input_with_controls(fragment, expression_uses, calls)
 }
 
 fn package_input_with_controls(
     fragment: Fragment,
     expression_uses: PhysicalRootUses,
+    calls: FrozenFragmentCalls,
 ) -> FragmentPackageInput {
     FragmentPackageInput {
         version: version(),
         required: RequiredContracts::default(),
         expression_uses,
+        calls,
         fragment,
         cuts: FragmentCuts::default(),
         result: None,
@@ -143,6 +199,7 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = builder.finish().unwrap();
     let controls = fixture_controls(&plan);
+    let calls = fixture_call_tables(&plan, &controls);
     let parameters = SemanticParameters::default();
     let extract_with = |controls: &BTreeMap<FragmentId, PhysicalRootUses>| {
         extract_fragment_packages(
@@ -151,6 +208,7 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
             &parameters,
             &BTreeMap::new(),
             controls,
+            &calls,
             &Control,
         )
     };
@@ -295,8 +353,9 @@ fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, Expr
 #[test]
 fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids() {
     let (original, uses, root, left, right) = binary_control_fixture();
+    let calls = fixture_calls(&original, &uses);
     FragmentPackage::try_new(
-        package_input_with_controls(original.clone(), uses.clone()),
+        package_input_with_controls(original.clone(), uses.clone(), calls.clone()),
         &Control,
     )
     .unwrap();
@@ -358,8 +417,11 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
         assert_eq!(changed.id(), original.id());
         assert_eq!(changed.expressions().len(), original.expressions().len());
         assert_eq!(
-            FragmentPackage::try_new(package_input_with_controls(changed, uses.clone()), &Control)
-                .unwrap_err(),
+            FragmentPackage::try_new(
+                package_input_with_controls(changed, uses.clone(), calls.clone()),
+                &Control,
+            )
+            .unwrap_err(),
             FragmentPackageError::ExpressionUses(expected)
         );
     }
@@ -390,6 +452,7 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish().unwrap();
     let controls = fixture_controls(&plan);
+    let calls = fixture_call_tables(&plan, &controls);
     for failure in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
@@ -421,6 +484,7 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
                     &SemanticParameters::default(),
                     &BTreeMap::new(),
                     &controls,
+                    &calls,
                     &control
                 )
                 .unwrap_err(),
@@ -437,6 +501,7 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
 fn package_control_checks_correspondence_without_claiming_literal_content_identity() {
     let (original, _) = literal_fragment(FragmentId::new(84), FragmentSink::Noop, false);
     let checked = fixture_expression_uses(&original);
+    let calls = fixture_calls(&original, &checked);
     let mut expressions = original.expressions().clone();
     let NodeKind::Values { rows } = &original.nodes()[&original.root()].kind else {
         unreachable!();
@@ -460,7 +525,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
     });
     validate_fragment_definition(&changed).unwrap();
     let package = FragmentPackage::try_new(
-        package_input_with_controls(changed.clone(), checked.clone()),
+        package_input_with_controls(changed.clone(), checked.clone(), calls.clone()),
         &Control,
     )
     .unwrap();
@@ -469,7 +534,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
 
     let (other, _) = literal_fragment(FragmentId::new(85), FragmentSink::Noop, false);
     assert_eq!(
-        FragmentPackage::try_new(package_input_with_controls(other, checked), &Control)
+        FragmentPackage::try_new(package_input_with_controls(other, checked, calls), &Control)
             .unwrap_err(),
         FragmentPackageError::ExpressionUses(RootUseBindingError::WrongFragment)
     );
@@ -610,8 +675,9 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
         &Control,
     )
     .unwrap();
+    let calls = fixture_calls(&fragment, &uses);
     let package = FragmentPackage::try_new(
-        package_input_with_controls(fragment, uses.clone()),
+        package_input_with_controls(fragment, uses.clone(), calls),
         &Control,
     )
     .unwrap();
@@ -1126,6 +1192,11 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
 }
 
 fn parameter_fragment(reference: novarocks_type_contract::SemanticParameterRef) -> Fragment {
+    parameter_occurrences_fragment(reference, 1)
+}
+
+fn parameter_occurrences_fragment(reference: SemanticParameterRef, occurrences: u32) -> Fragment {
+    assert!(occurrences > 0);
     let mut builder = FragmentBuilder::new(FragmentId::new(81));
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
@@ -1150,15 +1221,19 @@ fn parameter_fragment(reference: novarocks_type_contract::SemanticParameterRef) 
             },
         )
         .unwrap();
-    let value = builder
-        .add_value(
-            value_type,
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
+    let values = (0..occurrences)
+        .map(|output_ordinal| {
+            builder
+                .add_value(
+                    value_type.clone(),
+                    ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     builder
         .insert_node_unchecked(PhysicalNode {
             id: node,
@@ -1167,16 +1242,307 @@ fn parameter_fragment(reference: novarocks_type_contract::SemanticParameterRef) 
             output_properties: singleton(),
             output: OutputPort {
                 node,
-                columns: Box::from([value]),
+                columns: values.into_boxed_slice(),
             },
             kind: NodeKind::Values {
-                rows: Box::from([Box::from([expr])]),
+                rows: Box::from([vec![expr; occurrences as usize].into_boxed_slice()]),
             },
         })
         .unwrap();
     builder
         .finish_definition(node, FragmentSink::Noop, dop())
         .unwrap()
+}
+
+#[test]
+fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls() {
+    let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    let plan = builder.finish().unwrap();
+    let controls = fixture_controls(&plan);
+    let calls = fixture_call_tables(&plan, &controls);
+    let parameters = SemanticParameters::default();
+    let extract_with = |calls: &BTreeMap<FragmentId, FrozenFragmentCalls>| {
+        extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &parameters,
+            &BTreeMap::new(),
+            &controls,
+            calls,
+            &Control,
+        )
+    };
+    let packages = extract_with(&calls).unwrap();
+    assert!(packages[&fragment.id()].calls().entries().is_empty());
+    assert_eq!(packages[&fragment.id()].calls(), &calls[&fragment.id()]);
+    assert_eq!(
+        extract_with(&BTreeMap::new()).unwrap_err(),
+        FragmentPackageExtractionError::MissingCalls(fragment.id())
+    );
+    let (extra_fragment, _) = literal_fragment(FragmentId::new(82), FragmentSink::Noop, false);
+    let extra_uses = fixture_expression_uses(&extra_fragment);
+    let mut extra = calls;
+    extra.insert(
+        extra_fragment.id(),
+        fixture_calls(&extra_fragment, &extra_uses),
+    );
+    assert_eq!(
+        extract_with(&extra).unwrap_err(),
+        FragmentPackageExtractionError::UnusedCalls
+    );
+}
+
+#[test]
+fn package_empty_noncall_table_cannot_substitute_for_an_actual_call_occurrence() {
+    let reference = SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let fragment = parameter_fragment(reference);
+    let uses = fixture_expression_uses(&fragment);
+    let (literal, _) = literal_fragment(fragment.id(), FragmentSink::Noop, false);
+    let literal_uses = fixture_expression_uses(&literal);
+    let empty_calls = fixture_calls(&literal, &literal_uses);
+    let empty = FragmentPackage::try_new(
+        package_input_with_controls(literal, literal_uses, empty_calls.clone()),
+        &Control,
+    )
+    .unwrap();
+    assert!(empty.calls().entries().is_empty());
+    assert_eq!(
+        FragmentPackage::try_new(
+            package_input_with_controls(fragment, uses, empty_calls),
+            &Control
+        )
+        .unwrap_err(),
+        FragmentPackageError::Calls(FrozenCallError::MissingSite(PhysicalCallSite::Expression(
+            ExpressionUseId::new(0)
+        )))
+    );
+}
+
+fn parameter_calls_with_references(
+    fragment: &Fragment,
+    uses: &PhysicalRootUses,
+    references: &[SemanticParameterRef],
+) -> FrozenFragmentCalls {
+    assert_eq!(uses.flow().uses().len(), references.len());
+    let calls = uses
+        .flow()
+        .uses()
+        .iter()
+        .zip(references)
+        .map(|((id, invocation), reference)| {
+            let ExprKind::FunctionCall { function, args } = &fragment
+                .expressions()
+                .get(invocation.definition)
+                .unwrap()
+                .kind
+            else {
+                panic!("explicit parameter-call fixture requires its actual function definition");
+            };
+            assert_eq!(function.function_id.as_str(), "test.parameter");
+            assert_eq!(function.overload.as_str(), "test.parameter.zero");
+            assert_eq!(function.kind, FunctionKind::Scalar);
+            assert_eq!(function.result_type, ty(DataType::Int64, false));
+            assert!(function.argument_types.is_empty());
+            assert!(args.is_empty());
+            FrozenPhysicalCall {
+                site: PhysicalCallSite::Expression(*id),
+                context: invocation.context,
+                effects: parameter_fixture_effects(*reference),
+            }
+        })
+        .collect();
+    FrozenFragmentCalls::try_new(fragment, uses, calls, &Control).unwrap()
+}
+
+#[test]
+fn package_preserves_same_key_different_lexical_references_for_shared_definition_uses() {
+    let first = SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let second = SemanticParameterRef {
+        id: SemanticParameterId::new(u32::MAX),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let fragment = parameter_occurrences_fragment(first, 2);
+    let uses = fixture_expression_uses(&fragment);
+    let contexts = uses.flow().uses().values().collect::<Vec<_>>();
+    assert_eq!(contexts[0].definition, contexts[1].definition);
+    assert_ne!(contexts[0].context.use_id, contexts[1].context.use_id);
+    let calls = parameter_calls_with_references(&fragment, &uses, &[first, second]);
+    let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
+    input.parameters = SemanticParameters::try_new([
+        (first.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            second.id,
+            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        ),
+    ])
+    .unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    assert_eq!(checked.parameters().entries().len(), 2);
+    for (id, reference) in [first, second].into_iter().enumerate() {
+        assert_eq!(
+            checked.calls().entries()
+                [&PhysicalCallSite::Expression(ExpressionUseId::new(id as u32))]
+                .effects
+                .environment
+                .as_ref(),
+            &[reference]
+        );
+    }
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment).unwrap();
+    let plan = builder.finish().unwrap();
+    let packages = extract_fragment_packages(
+        &plan,
+        &BTreeMap::new(),
+        &input.parameters,
+        &BTreeMap::new(),
+        &BTreeMap::from([(FragmentId::new(81), uses)]),
+        &BTreeMap::from([(FragmentId::new(81), calls)]),
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(
+        packages[&FragmentId::new(81)].parameters(),
+        checked.parameters()
+    );
+
+    let mut missing = input.clone();
+    missing.parameters =
+        SemanticParameters::try_new([(first.id, SemanticParameterValue::TimeZone("UTC".into()))])
+            .unwrap();
+    assert!(
+        FragmentPackage::try_new(missing, &Control)
+            .unwrap_err()
+            .to_string()
+            .contains("missing semantic parameter ID")
+    );
+    let mut wrong_key = input.clone();
+    wrong_key.parameters = SemanticParameters::try_new([
+        (first.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (second.id, SemanticParameterValue::AllowThrowException(true)),
+    ])
+    .unwrap();
+    assert!(
+        FragmentPackage::try_new(wrong_key, &Control)
+            .unwrap_err()
+            .to_string()
+            .contains("expected key")
+    );
+    input.parameters = SemanticParameters::try_new([
+        (first.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            second.id,
+            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        ),
+        (
+            SemanticParameterId::new(8),
+            SemanticParameterValue::TimeZone("Europe/London".into()),
+        ),
+    ])
+    .unwrap();
+    assert!(
+        FragmentPackage::try_new(input, &Control)
+            .unwrap_err()
+            .to_string()
+            .contains("unused definitions")
+    );
+}
+
+#[test]
+fn frozen_call_environment_is_the_only_package_dependency_authority() {
+    let legacy = SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let active = SemanticParameterRef {
+        id: SemanticParameterId::new(u32::MAX),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let fragment = parameter_fragment(legacy);
+    let uses = fixture_expression_uses(&fragment);
+    let calls = parameter_calls_with_references(&fragment, &uses, &[active]);
+    let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
+    input.parameters = SemanticParameters::try_new([(
+        active.id,
+        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+    )])
+    .unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    assert!(checked.parameters().entries().get(&legacy.id).is_none());
+    let definition = &checked
+        .fragment()
+        .expressions()
+        .get(checked.expression_uses().flow().uses()[&ExpressionUseId::new(0)].definition)
+        .unwrap()
+        .kind;
+    let ExprKind::FunctionCall { function, .. } = definition else {
+        unreachable!();
+    };
+    assert_eq!(function.semantic_parameters.as_ref(), &[legacy]);
+    assert_eq!(
+        checked.calls().entries()[&PhysicalCallSite::Expression(ExpressionUseId::new(0))]
+            .effects
+            .environment
+            .as_ref(),
+        &[active]
+    );
+
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment).unwrap();
+    let plan = builder.finish().unwrap();
+    let snapshot = SemanticParameters::try_new([
+        (legacy.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            active.id,
+            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        ),
+    ])
+    .unwrap();
+    let controls = BTreeMap::from([(FragmentId::new(81), uses)]);
+    let tables = BTreeMap::from([(FragmentId::new(81), calls)]);
+    let packages = extract_fragment_packages(
+        &plan,
+        &BTreeMap::new(),
+        &snapshot,
+        &BTreeMap::new(),
+        &controls,
+        &tables,
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(
+        packages[&FragmentId::new(81)].parameters(),
+        checked.parameters()
+    );
+    input.parameters =
+        SemanticParameters::try_new([(legacy.id, SemanticParameterValue::TimeZone("UTC".into()))])
+            .unwrap();
+    assert!(
+        FragmentPackage::try_new(input.clone(), &Control)
+            .unwrap_err()
+            .to_string()
+            .contains("missing semantic parameter ID")
+    );
+    assert!(matches!(
+        extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &input.parameters,
+            &BTreeMap::new(),
+            &controls,
+            &tables,
+            &Control
+        ),
+        Err(FragmentPackageExtractionError::Parameter(_))
+    ));
 }
 
 #[test]

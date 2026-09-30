@@ -41,11 +41,15 @@ pub struct BoundFunction {
     pub kind: FunctionKind,
     pub argument_types: Box<[FunctionArgumentType]>,
     pub result_type: ValueType,
+    /// Legacy binding metadata retained for producer migration. The new pure
+    /// path uses complete occurrence facts and recomputes the exact owner base;
+    /// it never refines, prepares or builds a parameter closure from these bits.
     pub volatility: FunctionVolatility,
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
     pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
-    /// Exact frozen environment dependencies of this bound call occurrence.
+    /// Legacy producer/v1 projection, not the new occurrence's environment.
+    /// FragmentPackage's mandatory call table is the only new-path authority.
     pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
 }
 
@@ -58,11 +62,13 @@ pub struct BoundTableFunction {
     pub overload: FunctionOverloadId,
     pub argument_types: Box<[FunctionArgumentType]>,
     pub result_types: Box<[ValueType]>,
+    /// Legacy producer metadata, not complete occurrence effect claims.
     pub volatility: FunctionVolatility,
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
     pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
-    /// Exact frozen environment dependencies of this bound call occurrence.
+    /// Legacy producer/v1 projection; the new pure path uses only the mandatory
+    /// call table's complete environment and frozen SemanticParameters values.
     pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
 }
 

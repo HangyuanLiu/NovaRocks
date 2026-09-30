@@ -18,6 +18,7 @@
 //! Immutable result-affecting parameters. Runtime deadlines, topology, batch
 //! sizing and resource policies are deliberately outside this vocabulary.
 
+use crate::{CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -158,7 +159,51 @@ impl SemanticParameters {
         }
         Self::try_new(entries)
     }
+
+    /// Observe every reference lookup and bounded value clone. Definitions
+    /// come exclusively from this already validated immutable table; a subset
+    /// needs no unobserved second validation or temporary entries vector.
+    pub fn project_observed(
+        &self,
+        required: impl IntoIterator<Item = SemanticParameterRef>,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, SemanticParameterProjectionError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)
+            .map_err(SemanticParameterProjectionError::Control)?;
+        let mut entries = BTreeMap::new();
+        for reference in required {
+            let value = self
+                .require(reference)
+                .map_err(SemanticParameterProjectionError::Parameter)?;
+            entries.entry(reference.id).or_insert_with(|| value.clone());
+            work.step()
+                .map_err(SemanticParameterProjectionError::Control)?;
+        }
+        work.finish()
+            .map_err(SemanticParameterProjectionError::Control)?;
+        Ok(Self { entries })
+    }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SemanticParameterProjectionError {
+    Parameter(SemanticParameterError),
+    Control(CompileControlError),
+}
+impl fmt::Display for SemanticParameterProjectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parameter(error) => error.fmt(f),
+            Self::Control(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SemanticParameterProjectionError {}
+
+#[cfg(test)]
+#[path = "semantics/projection_tests.rs"]
+mod projection_tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticParameterError {
