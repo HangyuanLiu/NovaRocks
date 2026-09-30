@@ -256,6 +256,45 @@ impl RefinedCallEffects<'_> {
     pub const fn facts(&self) -> &CallEffects {
         &self.effects
     }
+    /// Compare the FE's frozen declaration against this exact local receipt.
+    /// Environment references are observed individually; no opaque whole-tree
+    /// equality or second owner refinement is needed to hand off this receipt.
+    pub fn validate_frozen(
+        &self,
+        input: CallEffectInput<'_>,
+        frozen: &CallEffects,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), CallEffectRefinementError<std::convert::Infallible>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(CallEffectRefinementError::Control)?;
+        self.validate_input(input)
+            .map_err(CallEffectRefinementError::Contract)?;
+        let actual = self.facts();
+        let mismatch = || {
+            CallEffectRefinementError::InvalidInput(
+                "frozen call effects differ from exact local refinement",
+            )
+        };
+        if actual.value_stability != frozen.value_stability
+            || actual.own_row_error != frozen.own_row_error
+            || actual.failure_behavior != frozen.failure_behavior
+            || actual.null_behavior != frozen.null_behavior
+            || actual.argument_control != frozen.argument_control
+            || actual.instance_state != frozen.instance_state
+            || actual.observable_effects != frozen.observable_effects
+            || actual.proof_scope != frozen.proof_scope
+            || actual.environment.len() != frozen.environment.len()
+        {
+            return Err(mismatch());
+        }
+        for (actual, frozen) in actual.environment.iter().zip(&frozen.environment) {
+            work.step().map_err(CallEffectRefinementError::Control)?;
+            if actual != frozen {
+                return Err(mismatch());
+            }
+        }
+        work.finish().map_err(CallEffectRefinementError::Control)
+    }
     pub fn compose_for_use(
         &self,
         input: CallEffectInput<'_>,
@@ -357,18 +396,29 @@ impl ScopedExpressionEffects {
     }
 }
 
-pub fn validate_frozen_call_effects<O: FunctionEffectOwner + ?Sized>(
+/// Refine once, check the frozen facts, and preserve the borrowed receipt for
+/// child-effect composition and exact contract construction. It is not stored
+/// in LocalProgram or retained by a prepared implementation.
+pub fn validate_frozen_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
     owner: &O,
-    input: CallEffectInput<'_>,
+    input: CallEffectInput<'a>,
     frozen: &CallEffects,
     control: &dyn PureCompileControl,
-) -> Result<(), CallEffectRefinementError<O::Error>> {
-    if refine_call_effects(owner, input, control)?.facts() != frozen {
-        return Err(CallEffectRefinementError::InvalidInput(
-            "frozen call effects differ from exact local refinement",
-        ));
-    }
-    Ok(())
+) -> Result<RefinedCallEffects<'a>, CallEffectRefinementError<O::Error>> {
+    let receipt = refine_call_effects(owner, input, control)?;
+    receipt
+        .validate_frozen(input, frozen, control)
+        .map_err(|error| match error {
+            CallEffectRefinementError::Owner(never) => match never {},
+            CallEffectRefinementError::Contract(error) => {
+                CallEffectRefinementError::Contract(error)
+            }
+            CallEffectRefinementError::Control(error) => CallEffectRefinementError::Control(error),
+            CallEffectRefinementError::InvalidInput(error) => {
+                CallEffectRefinementError::InvalidInput(error)
+            }
+        })?;
+    Ok(receipt)
 }
 
 #[cfg(test)]

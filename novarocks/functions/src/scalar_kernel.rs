@@ -31,7 +31,7 @@ use crate::{
     CallEffectInput, CallEffectRefinementError, EvaluatedArgument, FunctionArgumentType,
     FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionEffectOwner,
     FunctionId, FunctionResultType, KernelEvaluationControl, KernelFailure, RefinedCallEffects,
-    SelectedValues, Selection,
+    ScopedExpressionEffects, SelectedValues, Selection,
 };
 
 use crate::kernel_control::{internal, invalid};
@@ -175,30 +175,78 @@ impl fmt::Display for ScalarSpecializationFailure {
 }
 impl std::error::Error for ScalarSpecializationFailure {}
 
-/// The compiler's narrow exact-owner entry: no name resolution or runtime
-/// capability acquisition. One owner validates, refines and specializes.
+/// One exact-owner preparation and complete use effects. The temporary
+/// refinement receipt and compile control are never retained in this result.
+#[derive(Debug)]
+pub struct ScalarSpecialization {
+    prepared: Arc<dyn PreparedScalarKernel>,
+    effects: ScopedExpressionEffects,
+}
+impl ScalarSpecialization {
+    pub fn prepared(&self) -> &Arc<dyn PreparedScalarKernel> {
+        &self.prepared
+    }
+    pub const fn effects(&self) -> ScopedExpressionEffects {
+        self.effects
+    }
+    pub fn into_prepared(self) -> Arc<dyn PreparedScalarKernel> {
+        self.prepared
+    }
+}
+
+/// FE's fresh exact-owner entry. Supplied child effects must already include
+/// every required child/domain; a function's own no-error fact cannot erase
+/// an argument's failure, state or observable effect.
 pub fn specialize_scalar<O: PureScalarImplementation + ?Sized>(
     owner: &O,
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
+    arguments: ScopedExpressionEffects,
     control: &dyn PureCompileControl,
-) -> Result<Arc<dyn PreparedScalarKernel>, ScalarSpecializationFailure> {
+) -> Result<ScalarSpecialization, ScalarSpecializationFailure> {
+    specialize_scalar_once(owner, input, selected, None, arguments, control)
+}
+
+/// BE's frozen exact-owner entry. Refine once, compare every frozen fact,
+/// compose children in this use's scope, and prepare through that same owner.
+/// Inaccurate facts or scopes fail before invoking the implementation prepare.
+pub fn specialize_frozen_scalar<O: PureScalarImplementation + ?Sized>(
+    owner: &O,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: &CallEffects,
+    arguments: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+) -> Result<ScalarSpecialization, ScalarSpecializationFailure> {
+    specialize_scalar_once(owner, input, selected, Some(frozen), arguments, control)
+}
+
+fn specialize_scalar_once<O: PureScalarImplementation + ?Sized>(
+    owner: &O,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+) -> Result<ScalarSpecialization, ScalarSpecializationFailure> {
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
         .map_err(ScalarSpecializationFailure::Control)?;
-    let receipt =
-        crate::refine_call_effects(owner, input, control).map_err(|error| match error {
-            CallEffectRefinementError::Owner(error) => ScalarSpecializationFailure::Binding(error),
-            CallEffectRefinementError::Control(error) => {
-                ScalarSpecializationFailure::Control(error)
-            }
-            CallEffectRefinementError::Contract(error) => {
-                ScalarSpecializationFailure::Effects(error)
-            }
-            CallEffectRefinementError::InvalidInput(error) => {
-                ScalarSpecializationFailure::InvalidInput(error)
-            }
-        })?;
+    let receipt = match frozen {
+        Some(frozen) => crate::validate_frozen_call_effects(owner, input, frozen, control),
+        None => crate::refine_call_effects(owner, input, control),
+    }
+    .map_err(|error| match error {
+        CallEffectRefinementError::Owner(error) => ScalarSpecializationFailure::Binding(error),
+        CallEffectRefinementError::Control(error) => ScalarSpecializationFailure::Control(error),
+        CallEffectRefinementError::Contract(error) => ScalarSpecializationFailure::Effects(error),
+        CallEffectRefinementError::InvalidInput(error) => {
+            ScalarSpecializationFailure::InvalidInput(error)
+        }
+    })?;
+    let effects = receipt
+        .compose_for_use(input, arguments)
+        .map_err(ScalarSpecializationFailure::Effects)?;
     let contract = Arc::new(
         ScalarCallContract::from_refined(input, &receipt, selected, control)
             .map_err(ScalarSpecializationFailure::Kernel)?,
@@ -214,7 +262,7 @@ pub fn specialize_scalar<O: PureScalarImplementation + ?Sized>(
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
         .map_err(ScalarSpecializationFailure::Control)?;
-    Ok(prepared)
+    Ok(ScalarSpecialization { prepared, effects })
 }
 
 /// Mutable state belongs to one expression use in one evaluation instance.
@@ -384,3 +432,7 @@ impl ScalarEvaluationInstance {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "scalar_kernel/specialization_tests.rs"]
+mod specialization_tests;

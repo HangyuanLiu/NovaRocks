@@ -667,6 +667,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             &owner,
             input,
             frozen.call().selected_owner().clone(),
+            ScopedExpressionEffects::pure_value(input.context),
             &CompileControl,
         );
         assert_eq!(owner.validations.load(Ordering::Relaxed), 1);
@@ -678,7 +679,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
                 ))
             ));
         } else {
-            let prepared = prepared.unwrap();
+            let prepared = prepared.unwrap().into_prepared();
             assert!(Arc::ptr_eq(
                 prepared.contract().call().selected_owner(),
                 frozen.call().selected_owner()
