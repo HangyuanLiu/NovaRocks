@@ -43,6 +43,7 @@ mod lambda_rows;
 mod scalar_kernel;
 mod specialization;
 mod table_call;
+mod table_kernel;
 mod window_call;
 mod window_kernel;
 
@@ -63,6 +64,7 @@ pub use novarocks_type_contract::{
 pub use scalar_kernel::*;
 pub use specialization::FunctionSpecializationFailure;
 pub use table_call::*;
+pub use table_kernel::*;
 pub use window_call::*;
 pub use window_kernel::*;
 
