@@ -240,17 +240,61 @@ pub enum PreparedPureKernel {
     /// this variant never pretends to be an ordinary evaluated-argument CPU.
     ControlIntrinsic(Arc<FunctionCallContract>),
 }
-#[derive(Debug)]
+impl PreparedPureKernel {
+    /// Borrow the exact call owned by this resolved lifecycle implementation.
+    /// Local compilation inspects one contract rather than reconstructing a
+    /// second signature/effect model or dispatching by a SQL function name.
+    pub fn call_contract(&self) -> &FunctionCallContract {
+        match self {
+            Self::Scalar(kernel) => kernel.contract().call(),
+            Self::HigherOrder(kernel) => kernel.contract().call(),
+            Self::Aggregate(kernel) => kernel.contract().call(),
+            Self::Window(kernel) => kernel.contract().call(),
+            Self::Table(kernel) => kernel.contract().call(),
+            Self::ControlIntrinsic(call) => call,
+        }
+    }
+}
+
+/// The catalogue records the actual validation route; a prepared variant or
+/// function kind cannot substitute for this provenance on the frozen BE path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PurePreparationSource {
+    Fresh,
+    Frozen,
+}
+
+#[derive(Clone, Debug)]
 pub struct PureCallSpecialization {
     prepared: PreparedPureKernel,
     effects: ScopedExpressionEffects,
+    implementations: Arc<[PureImplementationDeclaration]>,
+    implementation_index: usize,
+    source: PurePreparationSource,
 }
 impl PureCallSpecialization {
+    /// Borrow the exact record frozen at atomic owner registration. Seven ABIs
+    /// map to six prepared variants, so this is never inferred from a variant.
+    pub fn implementation(&self) -> &PureImplementationDeclaration {
+        &self.implementations[self.implementation_index]
+    }
+    pub const fn source(&self) -> PurePreparationSource {
+        self.source
+    }
     pub const fn prepared(&self) -> &PreparedPureKernel {
         &self.prepared
     }
     pub const fn effects(&self) -> ScopedExpressionEffects {
         self.effects
+    }
+    pub fn call_contract(&self) -> &FunctionCallContract {
+        self.prepared.call_contract()
+    }
+    /// Keep both the resolved implementation and its composed, scoped effects
+    /// when producing a local instruction. Consuming preparation does not
+    /// instantiate mutable state or allocate runtime capabilities.
+    pub fn into_parts(self) -> (PreparedPureKernel, ScopedExpressionEffects) {
+        (self.prepared, self.effects)
     }
     pub fn into_prepared(self) -> PreparedPureKernel {
         self.prepared
@@ -259,6 +303,12 @@ impl PureCallSpecialization {
 
 /// Private framework erasure operates once per preparation/batch. There is no
 /// public Any/downcast/raw-op port and no runtime name resolver in a handle.
+#[derive(Debug)]
+struct PreparedPureCallDraft {
+    prepared: PreparedPureKernel,
+    effects: ScopedExpressionEffects,
+}
+
 trait InstalledPureOwner: Send + Sync {
     fn prepare(
         &self,
@@ -267,7 +317,7 @@ trait InstalledPureOwner: Send + Sync {
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure>;
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure>;
 }
 
 #[derive(Clone)]
@@ -435,7 +485,7 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation> InstalledPureOwner
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         let PureCallPreparation::Scalar { arguments } = options else {
             return Err(wrong_options());
         };
@@ -450,7 +500,7 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation> InstalledPureOwner
             ),
             None => specialize_scalar(self.0.as_ref(), input, selected, arguments, control),
         }?;
-        Ok(PureCallSpecialization {
+        Ok(PreparedPureCallDraft {
             effects: value.effects(),
             prepared: PreparedPureKernel::Scalar(value.into_prepared()),
         })
@@ -466,7 +516,7 @@ impl<O: PureFunctionMetadataOwner + PureHigherOrderImplementation> InstalledPure
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         let PureCallPreparation::HigherOrder(options) = options else {
             return Err(wrong_options());
         };
@@ -481,7 +531,7 @@ impl<O: PureFunctionMetadataOwner + PureHigherOrderImplementation> InstalledPure
             ),
             None => specialize_higher_order(self.0.as_ref(), input, selected, options, control),
         }?;
-        Ok(PureCallSpecialization {
+        Ok(PreparedPureCallDraft {
             effects: value.effects(),
             prepared: PreparedPureKernel::HigherOrder(value.into_prepared()),
         })
@@ -497,7 +547,7 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation + PureHigherOrderIm
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         match options {
             options @ PureCallPreparation::Scalar { .. } => {
                 ScalarOwner(self.0.clone()).prepare(input, selected, frozen, options, control)
@@ -519,7 +569,7 @@ impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> InstalledPureOw
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         let PureCallPreparation::Aggregate { arguments, options } = options else {
             return Err(wrong_options());
         };
@@ -542,7 +592,7 @@ fn prepare_aggregate_handle<O: PureAggregateImplementation>(
     arguments: ScopedExpressionEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
-) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
     let value = match frozen {
         Some(frozen) => {
             specialize_frozen_aggregate(owner, input, selected, frozen, arguments, options, control)
@@ -552,7 +602,7 @@ fn prepare_aggregate_handle<O: PureAggregateImplementation>(
     let effects = value.effects();
     let handle = PreparedAggregateHandle::from_typed(value.into_prepared(), control)
         .map_err(FunctionSpecializationFailure::Kernel)?;
-    Ok(PureCallSpecialization {
+    Ok(PreparedPureCallDraft {
         effects,
         prepared: PreparedPureKernel::Aggregate(handle),
     })
@@ -567,7 +617,7 @@ impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation> Installed
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         match options {
             PureCallPreparation::Aggregate { arguments, options } => prepare_aggregate_handle(
                 self.0.as_ref(),
@@ -598,7 +648,7 @@ impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation> Installed
                         control,
                     ),
                 }?;
-                Ok(PureCallSpecialization {
+                Ok(PreparedPureCallDraft {
                     effects: value.effects(),
                     prepared: PreparedPureKernel::Window(value.into_prepared()),
                 })
@@ -617,7 +667,7 @@ impl<O: PureFunctionMetadataOwner + PureWindowImplementation> InstalledPureOwner
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         let PureCallPreparation::Window { arguments, options } = options else {
             return Err(wrong_options());
         };
@@ -640,7 +690,7 @@ impl<O: PureFunctionMetadataOwner + PureWindowImplementation> InstalledPureOwner
                 control,
             ),
         }?;
-        Ok(PureCallSpecialization {
+        Ok(PreparedPureCallDraft {
             effects: value.effects(),
             prepared: PreparedPureKernel::Window(value.into_prepared()),
         })
@@ -654,7 +704,7 @@ impl<O: PureFunctionMetadataOwner + PureTableImplementation> InstalledPureOwner 
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         let PureCallPreparation::Table { arguments } = options else {
             return Err(wrong_options());
         };
@@ -669,7 +719,7 @@ impl<O: PureFunctionMetadataOwner + PureTableImplementation> InstalledPureOwner 
             ),
             None => specialize_table(self.0.as_ref(), input, selected, arguments, control),
         }?;
-        Ok(PureCallSpecialization {
+        Ok(PreparedPureCallDraft {
             effects: value.effects(),
             prepared: PreparedPureKernel::Table(value.into_prepared()),
         })
@@ -683,7 +733,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         frozen: Option<&CallEffects>,
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
-    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
         let PureCallPreparation::ControlIntrinsic { arguments } = options else {
             return Err(wrong_options());
         };
@@ -701,7 +751,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(FunctionSpecializationFailure::Control)?;
-        Ok(PureCallSpecialization {
+        Ok(PreparedPureCallDraft {
             effects,
             prepared: PreparedPureKernel::ControlIntrinsic(call),
         })
@@ -1067,12 +1117,20 @@ impl PureEngineFunctionCatalog {
         {
             return Err(wrong_options());
         }
-        binding
-            .pure
-            .as_ref()
-            .expect("pure seal checked every installed owner")
+        let draft = attachment
             .owner
-            .prepare(input, selected, frozen, options, control)
+            .prepare(input, selected, frozen, options, control)?;
+        Ok(PureCallSpecialization {
+            prepared: draft.prepared,
+            effects: draft.effects,
+            implementations: attachment.implementations.clone(),
+            implementation_index: index,
+            source: if frozen.is_some() {
+                PurePreparationSource::Frozen
+            } else {
+                PurePreparationSource::Fresh
+            },
+        })
     }
 }
 

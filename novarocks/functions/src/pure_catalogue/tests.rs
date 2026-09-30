@@ -496,6 +496,115 @@ impl PureCompileControl for CompileControl {
     }
 }
 
+pub(super) fn assert_borrowed_call(
+    specialization: &PureCallSpecialization,
+    input: CallEffectInput<'_>,
+    expected: &CallEffects,
+) {
+    let direct: &FunctionCallContract = match specialization.prepared() {
+        PreparedPureKernel::Scalar(kernel) => kernel.contract().call(),
+        PreparedPureKernel::HigherOrder(kernel) => kernel.contract().call(),
+        PreparedPureKernel::Aggregate(kernel) => kernel.contract().call(),
+        PreparedPureKernel::Window(kernel) => kernel.contract().call(),
+        PreparedPureKernel::Table(kernel) => kernel.contract().call(),
+        PreparedPureKernel::ControlIntrinsic(call) => call.as_ref(),
+    };
+    let borrowed = specialization.call_contract();
+    assert!(std::ptr::eq(borrowed, direct));
+    assert!(std::ptr::eq(
+        specialization.prepared().call_contract(),
+        direct
+    ));
+    assert!(std::ptr::eq(borrowed.function_id(), direct.function_id()));
+    assert!(std::ptr::eq(
+        borrowed.selected_owner(),
+        direct.selected_owner()
+    ));
+    assert!(std::ptr::eq(borrowed.effects(), direct.effects()));
+    assert!(std::ptr::eq(borrowed.parameters(), direct.parameters()));
+    assert!(std::ptr::eq(borrowed.selected(), input.selected));
+    assert_eq!(borrowed.function_id(), input.function_id);
+    assert_eq!(borrowed.kind(), input.kind);
+    assert_eq!(borrowed.context(), input.context);
+    assert_eq!(
+        borrowed.decimal_overflow_policy(),
+        input.decimal_overflow_policy
+    );
+    assert_eq!(
+        borrowed.logical_argument_count(),
+        input.request.logical_argument_count
+    );
+    assert_eq!(borrowed.effects(), expected);
+    assert_eq!(
+        borrowed.parameters(),
+        &input
+            .parameters
+            .project(expected.environment.iter().copied())
+            .unwrap()
+    );
+}
+
+pub(super) fn assert_preparation_provenance(
+    specialization: &PureCallSpecialization,
+    expected: &PureImplementationDeclaration,
+    source: PurePreparationSource,
+) {
+    assert_eq!(specialization.implementation(), expected);
+    assert_eq!(specialization.source(), source);
+    assert_eq!(
+        specialization.implementation().overload,
+        specialization.call_contract().selected().overload
+    );
+    let cloned = specialization.clone();
+    assert!(std::ptr::eq(
+        specialization.implementation(),
+        cloned.implementation()
+    ));
+    assert!(std::ptr::eq(
+        specialization.call_contract(),
+        cloned.call_contract()
+    ));
+    assert_eq!(cloned.source(), source);
+    assert_eq!(cloned.effects(), specialization.effects());
+}
+
+pub(super) fn checked_into_parts(
+    specialization: PureCallSpecialization,
+    input: CallEffectInput<'_>,
+    expected: &CallEffects,
+) -> PreparedPureKernel {
+    assert_borrowed_call(&specialization, input, expected);
+    let original = specialization.prepared().clone();
+    let effects = specialization.effects();
+    let (prepared, retained_effects) = specialization.into_parts();
+    assert_eq!(retained_effects, effects);
+    assert!(std::ptr::eq(
+        prepared.call_contract(),
+        original.call_contract()
+    ));
+    match (&original, &prepared) {
+        (PreparedPureKernel::Scalar(a), PreparedPureKernel::Scalar(b)) => {
+            assert!(Arc::ptr_eq(a, b))
+        }
+        (PreparedPureKernel::HigherOrder(a), PreparedPureKernel::HigherOrder(b)) => {
+            assert!(Arc::ptr_eq(a, b))
+        }
+        (PreparedPureKernel::Aggregate(a), PreparedPureKernel::Aggregate(b)) => {
+            assert!(Arc::ptr_eq(a.contract(), b.contract()));
+            assert_eq!(a.state_layout(), b.state_layout());
+        }
+        (PreparedPureKernel::Window(a), PreparedPureKernel::Window(b)) => {
+            assert!(Arc::ptr_eq(a, b))
+        }
+        (PreparedPureKernel::Table(a), PreparedPureKernel::Table(b)) => assert!(Arc::ptr_eq(a, b)),
+        (PreparedPureKernel::ControlIntrinsic(a), PreparedPureKernel::ControlIntrinsic(b)) => {
+            assert!(Arc::ptr_eq(a, b))
+        }
+        _ => panic!("consuming specialization changed the resolved lifecycle"),
+    }
+    prepared
+}
+
 #[test]
 fn metadata_without_actual_owner_and_legacy_effects_cannot_be_pure_sealed() {
     let owner = Arc::new(Owner::new(false));
@@ -697,7 +806,18 @@ fn same_actual_owner_resolves_refines_and_prepares_fresh_and_frozen_and_scalar_c
             .iter()
             .all(|address| *address == Arc::as_ptr(&owner) as usize)
     );
-    let PreparedPureKernel::Scalar(prepared) = checked.into_prepared() else {
+    assert_preparation_provenance(
+        &fresh,
+        &owner.implementations[0],
+        PurePreparationSource::Fresh,
+    );
+    assert_preparation_provenance(
+        &checked,
+        &owner.implementations[0],
+        PurePreparationSource::Frozen,
+    );
+    checked_into_parts(fresh, input, &frozen);
+    let PreparedPureKernel::Scalar(prepared) = checked_into_parts(checked, input, &frozen) else {
         panic!("wrong installed lifecycle")
     };
     assert!(Arc::ptr_eq(
@@ -790,6 +910,18 @@ fn mixed_scalar_higher_order_owner_chooses_exact_overload_abi_without_cross_life
         )
         .unwrap();
     assert_eq!(fresh.effects(), checked.effects());
+    assert_preparation_provenance(
+        &fresh,
+        &owner.implementations[1],
+        PurePreparationSource::Fresh,
+    );
+    assert_preparation_provenance(
+        &checked,
+        &owner.implementations[1],
+        PurePreparationSource::Frozen,
+    );
+    checked_into_parts(fresh, input, &frozen);
+    checked_into_parts(checked, input, &frozen);
     assert_eq!(owner.counts.resolve.load(Ordering::Relaxed), 1);
     assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 2);
     assert_eq!(owner.counts.prepare.load(Ordering::Relaxed), 2);
@@ -1101,7 +1233,12 @@ fn exact_control_intrinsic_coalesce_fresh_frozen_keeps_descriptor_and_skips_ordi
         )
         .unwrap();
     assert_eq!(fresh.effects(), frozen.effects());
-    for specialization in [&fresh, &frozen] {
+    for (specialization, source) in [
+        (&fresh, PurePreparationSource::Fresh),
+        (&frozen, PurePreparationSource::Frozen),
+    ] {
+        assert_preparation_provenance(specialization, &owner.implementations[0], source);
+        assert_borrowed_call(specialization, input, &frozen_facts);
         let PreparedPureKernel::ControlIntrinsic(contract) = specialization.prepared() else {
             panic!("control ABI must return its exact intrinsic descriptor")
         };
@@ -1139,6 +1276,8 @@ fn exact_control_intrinsic_coalesce_fresh_frozen_keeps_descriptor_and_skips_ordi
             .iter()
             .all(|address| *address == Arc::as_ptr(&owner) as usize)
     );
+    checked_into_parts(fresh, input, &frozen_facts);
+    checked_into_parts(frozen, input, &frozen_facts);
     // An ordinary scalar option cannot route a control descriptor to its CPU.
     assert!(matches!(
         catalog.prepare_fresh(

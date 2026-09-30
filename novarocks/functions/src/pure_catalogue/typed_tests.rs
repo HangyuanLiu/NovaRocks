@@ -18,6 +18,7 @@
 //! Real CPU fixtures for atomic catalogue ownership. These do not install
 //! production kernels, authorize MEM allocations or prove native acceptance.
 
+use super::tests::{assert_preparation_provenance, checked_into_parts};
 use super::*;
 use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
@@ -836,13 +837,27 @@ fn registered_typed_aggregate_erases_real_cpu_and_drops_real_state() {
             &COMPILE,
         )
         .unwrap();
-    let PreparedPureKernel::Aggregate(handle) = prepared.into_prepared() else {
+    assert_preparation_provenance(
+        &prepared,
+        &owner.implementations[0],
+        PurePreparationSource::Frozen,
+    );
+    // A state initialized through the pre-consumption clone must remain usable
+    // by the moved handle; equal call contracts alone do not prove ownership.
+    let PreparedPureKernel::Aggregate(original_handle) = prepared.prepared().clone() else {
+        panic!("aggregate handle expected");
+    };
+    let PreparedPureKernel::Aggregate(handle) =
+        checked_into_parts(prepared, call.input(), &owner.frozen(&call.selected))
+    else {
         panic!("aggregate handle expected");
     };
     assert_eq!(handle.contract().phase(), AggregateKernelPhase::Partial);
     assert_eq!(handle.state_layout(), std::alloc::Layout::new::<SumState>());
     let mut storage = Storage([MaybeUninit::uninit(); 128]);
-    let mut states = [handle.initialize_in(&mut storage.0, &RUNTIME).unwrap()];
+    let mut states = [original_handle
+        .initialize_in(&mut storage.0, &RUNTIME)
+        .unwrap()];
     let input: ArrayRef = Arc::new(Int32Array::from(vec![3, 900, 5]));
     let arguments = [EvaluatedArgument::Column(&input)];
     let rows = [0, 2];
@@ -952,7 +967,64 @@ fn mixed_aggregate_capabilities_gate_over_before_private_prepare() {
             )
         }
         .unwrap();
-        let PreparedPureKernel::Window(handle) = specialization.into_prepared() else {
+        let source = if frozen {
+            PurePreparationSource::Frozen
+        } else {
+            PurePreparationSource::Fresh
+        };
+        assert_preparation_provenance(&specialization, &owner.implementations[1], source);
+        let ordinary = if frozen {
+            catalog.prepare_frozen(
+                window.input(),
+                window.selected.clone(),
+                &owner.frozen(&window.selected),
+                aggregate_prepare(&window, AggregateKernelPhase::Single),
+                &COMPILE,
+            )
+        } else {
+            catalog.prepare_fresh(
+                window.input(),
+                window.selected.clone(),
+                aggregate_prepare(&window, AggregateKernelPhase::Single),
+                &COMPILE,
+            )
+        }
+        .unwrap();
+        assert_preparation_provenance(&ordinary, &owner.implementations[1], source);
+        assert_eq!(
+            ordinary.implementation().abi,
+            PureKernelAbi::AggregateWindowV1
+        );
+        assert_eq!(
+            specialization.implementation().abi,
+            PureKernelAbi::AggregateWindowV1
+        );
+        assert!(std::ptr::eq(
+            ordinary.implementation(),
+            specialization.implementation()
+        ));
+        assert!(matches!(
+            ordinary.prepared(),
+            PreparedPureKernel::Aggregate(_)
+        ));
+        assert!(matches!(
+            specialization.prepared(),
+            PreparedPureKernel::Window(_)
+        ));
+        let PreparedPureKernel::Aggregate(ordinary_handle) =
+            checked_into_parts(ordinary, window.input(), &owner.frozen(&window.selected))
+        else {
+            panic!("ordinary aggregate handle expected");
+        };
+        assert_eq!(
+            ordinary_handle.contract().phase(),
+            AggregateKernelPhase::Single
+        );
+        let PreparedPureKernel::Window(handle) = checked_into_parts(
+            specialization,
+            window.input(),
+            &owner.frozen(&window.selected),
+        ) else {
             panic!("window handle expected");
         };
         assert_eq!(handle.contract().call().kind(), FunctionKind::Aggregate);
@@ -962,8 +1034,8 @@ fn mixed_aggregate_capabilities_gate_over_before_private_prepare() {
         );
         run_window(handle, &[2, 7, 4], &[2, 13]);
     }
-    assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 2);
-    assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), 2);
+    assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 4);
+    assert_eq!(owner.counts.aggregate.load(Ordering::Relaxed), 4);
     assert_eq!(owner.counts.adapter.load(Ordering::Relaxed), 2);
     assert_eq!(owner.counts.window.load(Ordering::Relaxed), 0);
     assert_eq!(owner.counts.state_create.load(Ordering::Relaxed), 6);
@@ -1003,7 +1075,15 @@ fn pure_window_fresh_and_frozen_prepare_real_partition() {
             catalog.prepare_fresh(call.input(), call.selected.clone(), options, &COMPILE)
         }
         .unwrap();
-        let PreparedPureKernel::Window(handle) = specialization.into_prepared() else {
+        let source = if frozen {
+            PurePreparationSource::Frozen
+        } else {
+            PurePreparationSource::Fresh
+        };
+        assert_preparation_provenance(&specialization, &owner.implementations[0], source);
+        let PreparedPureKernel::Window(handle) =
+            checked_into_parts(specialization, call.input(), &owner.frozen(&call.selected))
+        else {
             panic!("window handle expected");
         };
         assert!(std::ptr::eq(
@@ -1049,7 +1129,15 @@ fn pure_table_fresh_and_frozen_prepare_selected_cursor() {
             catalog.prepare_fresh(call.input(), call.selected.clone(), options, &COMPILE)
         }
         .unwrap();
-        let PreparedPureKernel::Table(handle) = specialization.into_prepared() else {
+        let source = if frozen {
+            PurePreparationSource::Frozen
+        } else {
+            PurePreparationSource::Fresh
+        };
+        assert_preparation_provenance(&specialization, &owner.implementations[0], source);
+        let PreparedPureKernel::Table(handle) =
+            checked_into_parts(specialization, call.input(), &owner.frozen(&call.selected))
+        else {
             panic!("table handle expected");
         };
         assert!(std::ptr::eq(
