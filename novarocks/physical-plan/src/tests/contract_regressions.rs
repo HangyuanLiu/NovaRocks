@@ -3322,3 +3322,73 @@ fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() 
         .to_string();
     assert!(error.contains("unpivot literal collections exceed the contract budget"));
 }
+
+#[test]
+fn package_parameter_closure_includes_writer_final_state_calls() {
+    use novarocks_type_contract::{
+        SemanticParameterError, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+        SemanticParameterValue, SemanticParameters,
+    };
+
+    let source = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
+    let reference = SemanticParameterRef {
+        id: SemanticParameterId::new(u32::MAX),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let mut nodes = source.nodes().clone();
+    let NodeKind::TableFinish(finish) = &mut nodes.get_mut(&source.root()).unwrap().kind else {
+        panic!("expected table finish");
+    };
+    finish.final_aggregates[0]
+        .binding
+        .function
+        .semantic_parameters = Box::from([reference]);
+    finish.final_aggregates[0].binding.function.volatility = FunctionVolatility::Stable;
+    let fragment = Fragment::from(FragmentParts {
+        id: source.id(),
+        root: source.root(),
+        values: source.values().clone(),
+        expressions: source.expressions().clone(),
+        nodes,
+        sink: source.sink().clone(),
+        dop_domain: source.dop_domain(),
+        runtime_filters: source.runtime_filters().into(),
+    });
+    validate_fragment_definition(&fragment).unwrap();
+
+    // This fixture validates the fragment definition, not a complete writer
+    // package. Exercise the exact dependency collection and projection used
+    // by package extraction without fabricating its writer cut contracts.
+    let references = crate::package::fragment_parameter_references(&fragment);
+    assert_eq!(references, vec![reference]);
+    let required = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::TimeZone("UTC".into()),
+    )])
+    .unwrap();
+    let parameters = SemanticParameters::try_new([
+        (reference.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            SemanticParameterId::new(0),
+            SemanticParameterValue::AllowThrowException(true),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(
+        parameters.project(references.iter().copied()).unwrap(),
+        required
+    );
+    assert_eq!(
+        SemanticParameters::default().project(references.iter().copied()),
+        Err(SemanticParameterError::MissingId(reference.id))
+    );
+    let wrong_key = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::AllowThrowException(true),
+    )])
+    .unwrap();
+    assert_eq!(
+        wrong_key.project(references),
+        Err(SemanticParameterError::KeyMismatch(reference))
+    );
+}

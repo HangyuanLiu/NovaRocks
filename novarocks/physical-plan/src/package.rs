@@ -253,6 +253,11 @@ pub(crate) fn fragment_parameter_references(fragment: &Fragment) -> Vec<Semantic
                     references.extend_from_slice(&call.binding.function.semantic_parameters);
                 }
             }
+            crate::NodeKind::TableFinish(finish) => {
+                for call in &finish.final_aggregates {
+                    references.extend_from_slice(&call.binding.function.semantic_parameters);
+                }
+            }
             _ => {}
         }
     }
