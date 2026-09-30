@@ -280,6 +280,8 @@ fn validate_package_writes(input: &FragmentPackageInput, errors: &mut Validation
                 .all(|(field, target)| {
                     field.token() == target.token
                         && field.field().name() == target.provider_name.as_ref()
+                        && novarocks_type_contract::field_logical_type(field.field())
+                            == Ok(target.ty.logical_type)
                         && novarocks_connector_contract::arrow_data_types_exact(
                             field.field().data_type(),
                             &target.ty.data_type,

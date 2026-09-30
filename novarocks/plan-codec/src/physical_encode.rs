@@ -1129,7 +1129,7 @@ fn preflight_encoder(
             .get(&field.value)
             .is_some_and(|value| matches!(value.origin, ValueOrigin::WriterDerived { .. }));
         if !writer_derived {
-            validate_physical_type(&field.ty.data_type)
+            validate_v1_value_type(&field.ty)
                 .map_err(|reason| format!("result field `{}`: {reason}", field.name))?;
         }
     }
@@ -1148,7 +1148,7 @@ fn preflight_encoder(
         }
         for value in fragment.values().values() {
             if !matches!(value.origin, ValueOrigin::WriterDerived { .. }) {
-                validate_physical_type(&value.ty.data_type).map_err(|reason| {
+                validate_v1_value_type(&value.ty).map_err(|reason| {
                     format!(
                         "fragment {} value {}: {reason}",
                         fragment.id().get(),
@@ -1165,7 +1165,7 @@ fn preflight_encoder(
                     id.get()
                 )
             };
-            validate_physical_type(&expression.ty.data_type).map_err(subject)?;
+            validate_v1_value_type(&expression.ty).map_err(subject)?;
             match &expression.kind {
                 ExprKind::Cast { target, .. } => {
                     validate_physical_type(target).map_err(|reason| {
@@ -1339,7 +1339,7 @@ fn preflight_encoder(
                         ));
                     }
                     for field in &target.target_fields {
-                        validate_physical_type(&field.ty.data_type)?;
+                        validate_v1_value_type(&field.ty)?;
                     }
                     validate_writer_schema(&target.output_schema)?;
                     for call in &target.partial_aggregates {
@@ -1510,14 +1510,14 @@ fn preflight_runtime_filters(physical: &PhysicalPlan) -> Result<ScanRuntimeFilte
     for filter in physical.runtime_filters().values() {
         match &filter.domain {
             RuntimeFilterDomain::Membership { ty, .. } => {
-                validate_physical_type(&ty.data_type)?;
+                validate_v1_value_type(ty)?;
             }
             RuntimeFilterDomain::Ordered {
                 key,
                 inclusive,
                 comparator,
             } => {
-                validate_physical_type(&key.ty.data_type)?;
+                validate_v1_value_type(&key.ty)?;
                 if !inclusive {
                     return Err(format!(
                         "native wire v1 cannot encode exclusive runtime-filter {} bounds",
@@ -1638,7 +1638,7 @@ fn validate_table_binding(
         validate_function_argument_type(argument)?;
     }
     for result in &function.result_types {
-        validate_physical_type(&result.data_type)
+        validate_v1_value_type(result)
             .map_err(|reason| format!("table function result: {reason}"))?;
     }
     let request_arguments = arguments
@@ -1749,10 +1749,10 @@ fn validate_bound_function(
     for argument in &function.argument_types {
         validate_function_argument_type(argument)?;
     }
-    validate_physical_type(&function.result_type.data_type)
+    validate_v1_value_type(&function.result_type)
         .map_err(|reason| format!("bound function result: {reason}"))?;
     if let Some(aggregate) = &aggregate {
-        validate_physical_type(&aggregate.intermediate_type.data_type)
+        validate_v1_value_type(&aggregate.intermediate_type)
             .map_err(|reason| format!("aggregate intermediate: {reason}"))?;
     }
     let bound = ResolvedFunctionBinding {
@@ -1788,17 +1788,32 @@ fn validate_bound_function(
         })
 }
 
+fn validate_v1_value_type(ty: &novarocks_type_contract::FunctionValueType) -> Result<(), String> {
+    reject_v1_logical_identity(ty)?;
+    validate_physical_type(&ty.data_type)
+}
+
+fn reject_v1_logical_identity(
+    ty: &novarocks_type_contract::FunctionValueType,
+) -> Result<(), String> {
+    if ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+        return Err("native wire v1 cannot carry explicit root logical identities".into());
+    }
+    ty.validate().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn validate_function_argument_type(argument: &FunctionArgumentType) -> Result<(), String> {
     match argument {
-        FunctionArgumentType::Value(value_type) => validate_physical_type(&value_type.data_type),
+        FunctionArgumentType::Value(value_type) => validate_v1_value_type(value_type),
         FunctionArgumentType::Lambda {
             parameter_types,
             result_type,
         } => {
             for parameter in parameter_types {
-                validate_physical_type(&parameter.data_type)?;
+                validate_v1_value_type(parameter)?;
             }
-            validate_physical_type(&result_type.data_type)
+            validate_v1_value_type(result_type)
         }
     }
 }
@@ -2017,7 +2032,7 @@ fn preflight_scan_columns<'a>(
         }
     }
     for field in relation_fields {
-        validate_physical_type(&field.ty.data_type)?;
+        validate_v1_value_type(&field.ty)?;
         let Some((_, column)) = index.fact_column(&field.column) else {
             return Err(format!(
                 "native wire v1 scan fact omits provider column at fragment {} node {}",
@@ -2237,6 +2252,7 @@ fn validate_writer_schema(
     schema: &novarocks_physical_plan::WriterRelationSchema,
 ) -> Result<(), String> {
     for field in &schema.fields {
+        reject_v1_logical_identity(&field.ty)?;
         validate_arrow_authoritative_compatibility_type(&field.ty.data_type)?;
     }
     Ok(())
@@ -4783,7 +4799,7 @@ mod tests {
             function_id.clone(),
             FunctionKind::Scalar,
             [FunctionOverloadDeclaration {
-                semantics: semantics,
+                semantics,
                 identity: overload.clone(),
                 argument_pattern: "(Int64)".into(),
                 result_pattern: "Int64".into(),

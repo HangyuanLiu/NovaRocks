@@ -126,7 +126,7 @@ pub(crate) fn validate_value(
                 // The value names what the expression produces, and may admit
                 // null where the expression does not: an exact value standing
                 // where null is admitted is sound. The reverse is not.
-                if expression.ty.data_type != value.ty.data_type
+                if !expression.ty.same_value_domain(&value.ty)
                     || (expression.ty.nullable && !value.ty.nullable)
                 {
                     errors.push(ValidationError::new(
@@ -157,7 +157,7 @@ pub(crate) fn validate_value(
                 None => require_node(fragment, *node, &path, errors),
             }
             if let Some(source) = fragment.values().get(of) {
-                if source.ty.data_type != value.ty.data_type || !value.ty.nullable {
+                if !source.ty.same_value_domain(&value.ty) || !value.ty.nullable {
                     errors.push(ValidationError::new(
                         &path,
                         "null-extended value must preserve the data type and be nullable",
@@ -981,7 +981,7 @@ pub(crate) fn validate_node_semantics(
                 if let (Some(left), Some(right)) = (
                     fragment.expressions().get(key.left),
                     fragment.expressions().get(key.right),
-                ) && left.ty.data_type != right.ty.data_type
+                ) && !left.ty.same_value_domain(&right.ty)
                 {
                     errors.push(ValidationError::new(
                         path,
@@ -1275,7 +1275,7 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && (input_value.ty.data_type != output_value.ty.data_type
+                        && (!input_value.ty.same_value_domain(&output_value.ty)
                             || (input_value.ty.nullable && !output_value.ty.nullable))
                     {
                         // A set operation's column admits null when any branch
@@ -1440,7 +1440,7 @@ pub(crate) fn validate_node_semantics(
                     // value it reads must have that data type. Either side
                     // may admit more nulls; whether this row can be written
                     // is the target's answer when the row reaches it.
-                    Some(value) if value.ty.data_type != field.ty.data_type => {
+                    Some(value) if !value.ty.same_value_domain(&field.ty) => {
                         errors.push(ValidationError::new(
                             path,
                             format!(
@@ -1973,7 +1973,7 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(output),
                             fragment.expressions().get(*expression),
                         )
-                        && (output.ty.data_type != expression.ty.data_type
+                        && (!output.ty.same_value_domain(&expression.ty)
                             || (expression.ty.nullable && !output.ty.nullable))
                     {
                         errors.push(ValidationError::new(
@@ -2305,7 +2305,7 @@ pub(crate) fn validate_writer_aggregates(
         // nothing in it. What the aggregate is, is its type; whether a given
         // row may be written is the target's own answer.
         if let (Some(expected), Some(actual)) = (expected_input, fragment.values().get(&call.input))
-            && expected.data_type != actual.ty.data_type
+            && !expected.same_value_domain(&actual.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2330,7 +2330,7 @@ pub(crate) fn validate_writer_aggregates(
         // non-null while the phase can produce a null would be read as a value
         // that was never written.
         if let Some(actual) = fragment.values().get(&call.output)
-            && (actual.ty.data_type != expected_output.data_type
+            && (!actual.ty.same_value_domain(expected_output)
                 || (expected_output.nullable && !actual.ty.nullable))
         {
             errors.push(ValidationError::new(
@@ -2472,7 +2472,7 @@ pub(crate) fn validate_unpivot(
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
         ) {
-            if input.ty.data_type != output.ty.data_type {
+            if !input.ty.same_value_domain(&output.ty) {
                 errors.push(ValidationError::new(
                     path,
                     "unpivot mapping input type differs from its value output",
@@ -2744,7 +2744,7 @@ pub(crate) fn validate_writer_grouped_unpivot(
         if let (Some(input), Some(output)) = (
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
-        ) && input.ty.data_type != output.ty.data_type
+        ) && !input.ty.same_value_domain(&output.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2897,7 +2897,7 @@ pub(crate) fn validate_unpivot_constant(
         {
             Some(expression) => (
                 matches!(expression.kind, ExprKind::Literal(_))
-                    && expression.ty.data_type == output_type.data_type,
+                    && expression.ty.same_value_domain(output_type),
                 expression.ty.nullable,
             ),
             None => {

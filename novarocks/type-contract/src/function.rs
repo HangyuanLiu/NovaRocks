@@ -66,10 +66,29 @@ impl AggregateStateFormatId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FunctionValueType {
     pub data_type: DataType,
     pub nullable: bool,
+    pub logical_type: crate::ValueLogicalType,
+}
+
+impl PartialEq for FunctionValueType {
+    fn eq(&self, other: &Self) -> bool {
+        self.nullable == other.nullable
+            && self.logical_type == other.logical_type
+            && crate::arrow_data_types_exact(&self.data_type, &other.data_type)
+    }
+}
+impl Eq for FunctionValueType {}
+impl std::hash::Hash for FunctionValueType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Arrow's coarser dictionary equality/hash may collide for different
+        // frozen dictionary identities; exact equality still distinguishes them.
+        std::hash::Hash::hash(&self.data_type, state);
+        std::hash::Hash::hash(&self.nullable, state);
+        std::hash::Hash::hash(&self.logical_type, state);
+    }
 }
 
 impl FunctionValueType {
@@ -77,7 +96,43 @@ impl FunctionValueType {
         Self {
             data_type,
             nullable,
+            logical_type: crate::ValueLogicalType::Physical,
         }
+    }
+
+    pub fn try_with_logical_type(
+        data_type: DataType,
+        nullable: bool,
+        logical_type: crate::ValueLogicalType,
+    ) -> Result<Self, crate::ValueTypeError> {
+        let value = Self {
+            data_type,
+            nullable,
+            logical_type,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), crate::ValueTypeError> {
+        self.logical_type.validate_carrier(&self.data_type)?;
+        crate::validate_nested_logical_types(&self.data_type)
+    }
+
+    pub fn fits_value_type(&self, expected: &Self) -> bool {
+        self.logical_type == expected.logical_type
+            && (expected.nullable || !self.nullable)
+            && fits_nested_nullability(&self.data_type, &expected.data_type)
+            && self.validate().is_ok()
+            && expected.validate().is_ok()
+    }
+
+    pub fn same_value_domain(&self, other: &Self) -> bool {
+        self.logical_type == other.logical_type
+            && fits_nested_nullability(&self.data_type, &other.data_type)
+            && fits_nested_nullability(&other.data_type, &self.data_type)
+            && self.validate().is_ok()
+            && other.validate().is_ok()
     }
 }
 
@@ -207,32 +262,60 @@ fn validate_identity(kind: &'static str, value: &str) -> Result<(), FunctionIden
 /// same direction nullability travels everywhere else. A field that may be
 /// null standing where a non-null one is asked for is the mismatch.
 pub fn fits_nested_nullability(actual: &DataType, expected: &DataType) -> bool {
+    if crate::validate_nested_logical_types(actual).is_err()
+        || crate::validate_nested_logical_types(expected).is_err()
+    {
+        return false;
+    }
+    #[allow(deprecated)] // Dictionary identity remains part of this frozen Arrow contract.
     fn field_fits(actual: &Field, expected: &Field) -> bool {
         actual.name() == expected.name()
             && (expected.is_nullable() || !actual.is_nullable())
-            && fits_nested_nullability(actual.data_type(), expected.data_type())
+            && actual.dict_id() == expected.dict_id()
+            && actual.dict_is_ordered() == expected.dict_is_ordered()
+            && crate::field_logical_type(actual) == crate::field_logical_type(expected)
+            && fits(actual.data_type(), expected.data_type())
     }
-    match (actual, expected) {
-        (DataType::List(actual), DataType::List(expected))
-        | (DataType::LargeList(actual), DataType::LargeList(expected)) => {
-            field_fits(actual, expected)
+    fn fits(actual: &DataType, expected: &DataType) -> bool {
+        match (actual, expected) {
+            (DataType::List(actual), DataType::List(expected))
+            | (DataType::LargeList(actual), DataType::LargeList(expected))
+            | (DataType::ListView(actual), DataType::ListView(expected))
+            | (DataType::LargeListView(actual), DataType::LargeListView(expected)) => {
+                field_fits(actual, expected)
+            }
+            (
+                DataType::FixedSizeList(actual, actual_len),
+                DataType::FixedSizeList(expected, expected_len),
+            ) => actual_len == expected_len && field_fits(actual, expected),
+            (DataType::Struct(actual), DataType::Struct(expected)) => {
+                actual.len() == expected.len()
+                    && actual
+                        .iter()
+                        .zip(expected.iter())
+                        .all(|(a, e)| field_fits(a, e))
+            }
+            (DataType::Map(actual, actual_sorted), DataType::Map(expected, expected_sorted)) => {
+                actual_sorted == expected_sorted && field_fits(actual, expected)
+            }
+            (DataType::Union(actual, actual_mode), DataType::Union(expected, expected_mode)) => {
+                actual_mode == expected_mode
+                    && actual.len() == expected.len()
+                    && actual
+                        .iter()
+                        .zip(expected.iter())
+                        .all(|((ai, af), (ei, ef))| ai == ei && field_fits(af, ef))
+            }
+            (DataType::Dictionary(ak, av), DataType::Dictionary(ek, ev)) => {
+                fits(ak, ek) && fits(av, ev)
+            }
+            (DataType::RunEndEncoded(ar, av), DataType::RunEndEncoded(er, ev)) => {
+                field_fits(ar, er) && field_fits(av, ev)
+            }
+            (actual, expected) => actual == expected,
         }
-        (
-            DataType::FixedSizeList(actual, actual_len),
-            DataType::FixedSizeList(expected, expected_len),
-        ) => actual_len == expected_len && field_fits(actual, expected),
-        (DataType::Struct(actual), DataType::Struct(expected)) => {
-            actual.len() == expected.len()
-                && actual
-                    .iter()
-                    .zip(expected.iter())
-                    .all(|(actual, expected)| field_fits(actual, expected))
-        }
-        (DataType::Map(actual, actual_sorted), DataType::Map(expected, expected_sorted)) => {
-            actual_sorted == expected_sorted && field_fits(actual, expected)
-        }
-        (actual, expected) => actual == expected,
     }
+    fits(actual, expected)
 }
 
 #[cfg(test)]

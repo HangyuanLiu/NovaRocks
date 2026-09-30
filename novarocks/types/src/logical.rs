@@ -20,7 +20,7 @@ use arrow_schema::Field;
 /// The one metadata key that says what a field *is* rather than where it came
 /// from: every other entry an Arrow field may carry is a provider's own
 /// bookkeeping.
-pub const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+pub use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LogicalType {
@@ -32,24 +32,33 @@ pub enum LogicalType {
 }
 
 impl LogicalType {
-    pub(crate) fn metadata_value(self) -> &'static str {
+    pub const fn semantic_identity(self) -> novarocks_type_contract::ValueLogicalType {
+        use novarocks_type_contract::ValueLogicalType;
         match self {
-            Self::Json => "json",
-            Self::Hll => "hll",
-            Self::Bitmap => "bitmap",
-            Self::Object => "object",
-            Self::Percentile => "percentile",
+            Self::Json => ValueLogicalType::Json,
+            Self::Hll => ValueLogicalType::Hll,
+            Self::Bitmap => ValueLogicalType::Bitmap,
+            Self::Object => ValueLogicalType::Object,
+            Self::Percentile => ValueLogicalType::Percentile,
         }
     }
 
+    pub(crate) fn metadata_value(self) -> &'static str {
+        self.semantic_identity()
+            .metadata_value()
+            .expect("legacy logical types are explicit")
+    }
+
     pub(crate) fn from_metadata_value(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "json" => Some(Self::Json),
-            "hll" => Some(Self::Hll),
-            "bitmap" => Some(Self::Bitmap),
-            "object" => Some(Self::Object),
-            "percentile" => Some(Self::Percentile),
+        use novarocks_type_contract::ValueLogicalType;
+        // Preserve this legacy runtime adapter's admitted spellings. New
+        // frozen contracts use the canonical pure parser directly.
+        match ValueLogicalType::from_metadata_value(&value.trim().to_ascii_lowercase()).ok()? {
+            ValueLogicalType::Json => Some(Self::Json),
+            ValueLogicalType::Hll => Some(Self::Hll),
+            ValueLogicalType::Bitmap => Some(Self::Bitmap),
+            ValueLogicalType::Object => Some(Self::Object),
+            ValueLogicalType::Percentile => Some(Self::Percentile),
             _ => None,
         }
     }

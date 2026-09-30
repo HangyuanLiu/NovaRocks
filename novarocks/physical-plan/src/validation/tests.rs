@@ -33,6 +33,96 @@ mod validation_error_tests {
     use super::*;
 
     #[test]
+    fn uuid_is_not_a_numeric_largeint_domain() {
+        use novarocks_type_contract::ValueLogicalType;
+        let expression = |id, logical_type| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                logical_type,
+            )
+            .unwrap(),
+            kind: ExprKind::Literal(crate::LiteralValue::LargeInt(1)),
+        };
+        let uuid = expression(1, ValueLogicalType::Uuid);
+        for op in [crate::BinaryOperator::Add, crate::BinaryOperator::BitAnd] {
+            let mut errors = ValidationContext::new();
+            validate_binary_types(&uuid, op, &uuid, &uuid, "uuid", &mut errors);
+            assert!(!errors.is_empty());
+        }
+        let mut errors = ValidationContext::new();
+        validate_literal_type(
+            &crate::LiteralValue::LargeInt(1),
+            &uuid.ty,
+            "uuid",
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+        let integer = expression(2, ValueLogicalType::LargeInt);
+        let plain = expression(3, ValueLogicalType::Physical);
+        for (input, output, valid) in [
+            (&integer, &integer, true),
+            (&integer, &plain, false),
+            (&plain, &integer, false),
+        ] {
+            let mut errors = ValidationContext::new();
+            validate_binary_types(
+                input,
+                crate::BinaryOperator::Add,
+                input,
+                output,
+                "largeint",
+                &mut errors,
+            );
+            assert_eq!(errors.is_empty(), valid);
+        }
+    }
+
+    #[test]
+    fn comparison_refuses_equal_carriers_with_different_root_domains() {
+        use novarocks_type_contract::ValueLogicalType;
+        let expression = |id, logical_type| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: ValueType::try_with_logical_type(DataType::Utf8, true, logical_type).unwrap(),
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let json = expression(1, ValueLogicalType::Json);
+        let plain = expression(2, ValueLogicalType::Physical);
+        let output = crate::ExprNode {
+            id: ExprId::new(3),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: ValueType::new(DataType::Boolean, true),
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let mut errors = ValidationContext::new();
+        validate_binary_types(
+            &json,
+            crate::BinaryOperator::Eq,
+            &plain,
+            &output,
+            "comparison",
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+        let mut errors = ValidationContext::new();
+        validate_binary_types(
+            &json,
+            crate::BinaryOperator::Eq,
+            &json,
+            &output,
+            "comparison",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
         let expression = |id, data_type| crate::ExprNode {
             id: ExprId::new(id),

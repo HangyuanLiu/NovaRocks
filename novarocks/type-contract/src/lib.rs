@@ -25,7 +25,9 @@ mod array_generate;
 mod comparison;
 mod function;
 mod largeint;
+mod logical;
 mod partition;
+mod schema;
 mod semantics;
 
 pub use arithmetic::{
@@ -43,10 +45,16 @@ pub use function::{
     fits_nested_nullability,
 };
 pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
+pub use logical::{
+    MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
+    ValueTypeError, field_logical_type, preserves_nested_logical_identity,
+    validate_nested_logical_types,
+};
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
     PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
 };
+pub use schema::{arrow_data_types_exact, arrow_fields_exact, arrow_schemas_exact};
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,

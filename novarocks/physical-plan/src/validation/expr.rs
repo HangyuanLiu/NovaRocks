@@ -259,8 +259,8 @@ pub(crate) fn validate_expression(
                 let widens = expression.ty.nullable || !input.ty.nullable;
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
-                        is_numeric(&input.ty.data_type)
-                            && input.ty.data_type == expression.ty.data_type
+                        is_numeric_value(&input.ty)
+                            && input.ty.same_value_domain(&expression.ty)
                             && widens
                     }
                     crate::UnaryOperator::Not => {
@@ -269,8 +269,8 @@ pub(crate) fn validate_expression(
                             && widens
                     }
                     crate::UnaryOperator::BitwiseNot => {
-                        is_integer(&input.ty.data_type)
-                            && input.ty.data_type == expression.ty.data_type
+                        is_integer_value(&input.ty)
+                            && input.ty.same_value_domain(&expression.ty)
                             && widens
                     }
                 };
@@ -395,6 +395,18 @@ pub(crate) fn validate_expression(
             decimal_overflow_policy,
         } => {
             if let Some(input) = fragment.expressions().get(*expr)
+                && (input.ty.logical_type != expression.ty.logical_type
+                    || !novarocks_type_contract::preserves_nested_logical_identity(
+                        &input.ty.data_type,
+                        target,
+                    ))
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "carrier CAST cannot establish or erase a logical identity",
+                ));
+            }
+            if let Some(input) = fragment.expressions().get(*expr)
                 && !novarocks_type_contract::decimal_error_policy_cast_supported(
                     &input.ty.data_type,
                     target,
@@ -411,7 +423,7 @@ pub(crate) fn validate_expression(
             // statement may stand this value where null is admitted. It may
             // not claim the reverse: a null-admitting input does not stop
             // admitting null by being converted.
-            if &expression.ty.data_type != target {
+            if !novarocks_type_contract::arrow_data_types_exact(&expression.ty.data_type, target) {
                 // Both types, because which half drifted is the diagnosis.
                 errors.push(ValidationError::new(
                     &path,
@@ -454,7 +466,7 @@ pub(crate) fn validate_expression(
                     if fragment
                         .expressions()
                         .get(*candidate)
-                        .is_some_and(|candidate| candidate.ty.data_type != input.ty.data_type)
+                        .is_some_and(|candidate| !candidate.ty.same_value_domain(&input.ty))
                     {
                         errors.push(ValidationError::new(
                             &path,
@@ -485,7 +497,7 @@ pub(crate) fn validate_expression(
                     if fragment
                         .expressions()
                         .get(bound)
-                        .is_some_and(|bound| bound.ty.data_type != input.ty.data_type)
+                        .is_some_and(|bound| !bound.ty.same_value_domain(&input.ty))
                     {
                         errors.push(ValidationError::new(
                             &path,
@@ -551,7 +563,7 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64,
         crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(&ty.data_type)
+            novarocks_type_contract::is_largeint_data_type(&ty.data_type) && is_numeric_value(ty)
         }
         crate::LiteralValue::Decimal128(_) => {
             matches!(ty.data_type, DataType::Decimal128(_, _))
@@ -701,7 +713,7 @@ pub(crate) fn validate_binary_types(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    let same_inputs = left.ty.data_type == right.ty.data_type;
+    let same_inputs = left.ty.same_value_domain(&right.ty);
     // An operator may admit null neither operand does -- arithmetic answers
     // with null where it cannot answer with a number, and a plan's nullability
     // widens on the way out. It may not admit less than its operands do.
@@ -713,6 +725,15 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::Multiply
         | crate::BinaryOperator::Divide
         | crate::BinaryOperator::Modulo => {
+            let expected_root =
+                if novarocks_type_contract::is_largeint_data_type(&output.ty.data_type)
+                    && [left.ty.logical_type, right.ty.logical_type]
+                        .contains(&novarocks_type_contract::ValueLogicalType::LargeInt)
+                {
+                    novarocks_type_contract::ValueLogicalType::LargeInt
+                } else {
+                    novarocks_type_contract::ValueLogicalType::Physical
+                };
             let operation = match op {
                 crate::BinaryOperator::Add => novarocks_type_contract::ArithmeticOperator::Add,
                 crate::BinaryOperator::Subtract => {
@@ -729,13 +750,17 @@ pub(crate) fn validate_binary_types(
                 }
                 _ => unreachable!(),
             };
-            novarocks_type_contract::arithmetic_result_type_with_op(
-                &left.ty.data_type,
-                &right.ty.data_type,
-                operation,
-            )
-            .as_ref()
-            .is_some_and(|expected| expected == &output.ty.data_type)
+            output.ty.logical_type == expected_root
+                && is_numeric_value(&left.ty)
+                && is_numeric_value(&right.ty)
+                && is_numeric_value(&output.ty)
+                && novarocks_type_contract::arithmetic_result_type_with_op(
+                    &left.ty.data_type,
+                    &right.ty.data_type,
+                    operation,
+                )
+                .as_ref()
+                .is_some_and(|expected| expected == &output.ty.data_type)
                 && nullability_widens(output.ty.nullable)
         }
         crate::BinaryOperator::Eq
@@ -755,8 +780,8 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::BitOr
         | crate::BinaryOperator::BitXor => {
             same_inputs
-                && is_integer(&left.ty.data_type)
-                && output.ty.data_type == left.ty.data_type
+                && is_integer_value(&left.ty)
+                && output.ty.same_value_domain(&left.ty)
                 && nullability_widens(output.ty.nullable)
         }
     };
@@ -787,7 +812,7 @@ pub(crate) fn validate_case_types(
     for (when, then) in when_then {
         if let Some(when) = fragment.expressions().get(*when) {
             let valid = operand_type
-                .map(|operand| operand.data_type == when.ty.data_type)
+                .map(|operand| operand.same_value_domain(&when.ty))
                 .unwrap_or(when.ty.data_type == DataType::Boolean);
             if !valid {
                 errors.push(ValidationError::new(
@@ -805,7 +830,7 @@ pub(crate) fn validate_case_types(
         if fragment
             .expressions()
             .get(*then)
-            .is_some_and(|then| then.ty.data_type != expression.ty.data_type)
+            .is_some_and(|then| !then.ty.same_value_domain(&expression.ty))
         {
             errors.push(ValidationError::new(
                 path,
@@ -817,7 +842,7 @@ pub(crate) fn validate_case_types(
         && fragment
             .expressions()
             .get(else_expr)
-            .is_some_and(|otherwise| otherwise.ty.data_type != expression.ty.data_type)
+            .is_some_and(|otherwise| !otherwise.ty.same_value_domain(&expression.ty))
     {
         errors.push(ValidationError::new(
             path,
@@ -1035,6 +1060,22 @@ pub(crate) fn is_numeric(ty: &DataType) -> bool {
         )
 }
 
+fn is_integer_value(ty: &ValueType) -> bool {
+    matches!(
+        ty.logical_type,
+        novarocks_type_contract::ValueLogicalType::Physical
+            | novarocks_type_contract::ValueLogicalType::LargeInt
+    ) && is_integer(&ty.data_type)
+}
+
+fn is_numeric_value(ty: &ValueType) -> bool {
+    matches!(
+        ty.logical_type,
+        novarocks_type_contract::ValueLogicalType::Physical
+            | novarocks_type_contract::ValueLogicalType::LargeInt
+    ) && is_numeric(&ty.data_type)
+}
+
 pub(crate) fn validate_function_call(
     fragment: &Fragment,
     expression: &crate::ExprNode,
@@ -1094,10 +1135,7 @@ pub(crate) fn validate_function_arguments(
                 // A parameter that accepts null accepts a value that never
                 // writes one; the mismatch is the other way round.
                 (crate::FunctionArgumentType::Value(expected), _) => {
-                    novarocks_type_contract::fits_nested_nullability(
-                        &actual.ty.data_type,
-                        &expected.data_type,
-                    ) && (expected.nullable || !actual.ty.nullable)
+                    actual.ty.fits_value_type(expected)
                 }
                 (
                     crate::FunctionArgumentType::Lambda {
@@ -1316,7 +1354,7 @@ pub(crate) fn validate_aggregate_arguments(
                     "state-consuming aggregate phase requires exactly one state input",
                 ));
             } else if let Some(argument) = fragment.expressions().get(args[0])
-                && (argument.ty.data_type != binding.intermediate_type.data_type
+                && (!argument.ty.same_value_domain(&binding.intermediate_type)
                     || (binding.intermediate_type.nullable && !argument.ty.nullable))
             {
                 // The carrier the state travelled in may admit null the

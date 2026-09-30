@@ -391,7 +391,7 @@ pub(crate) fn validate_edge(
                 // the sender never writes -- it is declared by the statement's
                 // column layout, not by the value that happens to fill it. It
                 // may not declare the reverse.
-                if source_value.ty.data_type != destination_value.ty.data_type
+                if !source_value.ty.same_value_domain(&destination_value.ty)
                     || (source_value.ty.nullable && !destination_value.ty.nullable)
                 {
                     errors.push(ValidationError::new(

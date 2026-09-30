@@ -42,8 +42,8 @@ pub const MAX_PLAN_DYNAMIC_ITEMS: usize = 16 * 1024 * 1024;
 pub const MAX_PLAN_DYNAMIC_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_ITEMS: usize = 32 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_BYTES: usize = 512 * 1024 * 1024;
-pub const MAX_DATA_TYPE_DEPTH: usize = 64;
-pub const MAX_DATA_TYPE_NODES: usize = 4_096;
+pub const MAX_DATA_TYPE_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+pub const MAX_DATA_TYPE_NODES: usize = novarocks_type_contract::MAX_VALUE_TYPE_NODES;
 pub const MAX_DATA_TYPE_FIELD_NAME_BYTES: usize = 1_024;
 pub const MAX_DATA_TYPE_FIELD_METADATA_ENTRIES: usize = 256;
 pub const MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES: usize = 1_024;
@@ -1376,6 +1376,11 @@ fn validate_value_type(
     errors: &mut ValidationContext,
 ) {
     validate_data_type(&ty.data_type, path, usage, errors);
+    if !usage.exhausted()
+        && let Err(error) = ty.validate()
+    {
+        errors.push(ValidationError::new(path, error.to_string()));
+    }
 }
 
 fn validate_data_type(
@@ -1667,6 +1672,7 @@ mod tests {
             kind: crate::FunctionKind::Aggregate,
             argument_types: Box::default(),
             result_type: ValueType {
+                logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                 data_type: DataType::Int64,
                 nullable: false,
             },
@@ -1681,6 +1687,7 @@ mod tests {
             phase: crate::AggregatePhase::Single,
             logical_argument_count: 0,
             intermediate_type: ValueType {
+                logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                 data_type: DataType::Int64,
                 nullable: false,
             },

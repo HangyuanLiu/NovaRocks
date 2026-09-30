@@ -26,10 +26,7 @@ fn identity(value: &str) -> FunctionOverloadId {
 }
 
 fn value_type(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType {
-        data_type,
-        nullable,
-    }
+    FunctionValueType::new(data_type, nullable)
 }
 
 fn argument(data_type: DataType, nullable: bool) -> FunctionArgument {
@@ -974,4 +971,65 @@ fn intrinsic_row_error_is_independent_of_catching_and_closed_by_function_kind() 
             .validate_bound(&forged, request(&arguments))
             .is_err()
     );
+}
+
+#[test]
+fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+    let declaration = declaration(
+        FunctionKind::Scalar,
+        vec![overload("test/echo/T/v1", "(T)")],
+    );
+    let catalog = catalog(Arc::new(EchoResolver::default()), declaration);
+    let typed =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap();
+    let arguments = [FunctionArgument::Value {
+        value_type: typed,
+        constant: None,
+    }];
+    let bound = catalog
+        .resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments))
+        .unwrap();
+    let mut forged = bound.clone();
+    forged.selected.argument_types = Box::from([FunctionArgumentType::Value(
+        FunctionValueType::new(DataType::Utf8, false),
+    )]);
+    assert!(
+        catalog
+            .validate_bound(&forged, request(&arguments))
+            .is_err()
+    );
+    let malformed = [FunctionArgument::Value {
+        value_type: FunctionValueType {
+            data_type: DataType::Int64,
+            nullable: false,
+            logical_type: ValueLogicalType::Json,
+        },
+        constant: None,
+    }];
+    assert!(
+        catalog
+            .resolve_bound_user("echo", FunctionKind::Scalar, request(&malformed))
+            .is_err()
+    );
+    let nested = [argument(
+        DataType::List(Arc::new(
+            Field::new("item", DataType::Utf8, true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+        )),
+        false,
+    )];
+    assert!(
+        catalog
+            .resolve_bound_user("echo", FunctionKind::Scalar, request(&nested))
+            .is_err()
+    );
+    let mut invalid = bound.clone();
+    invalid.selected.result_type = FunctionResultType::Scalar(FunctionValueType {
+        data_type: DataType::Int64,
+        nullable: false,
+        logical_type: ValueLogicalType::Variant,
+    });
+    assert!(catalog.validate_bound(&invalid, request(&arguments)).is_err());
 }

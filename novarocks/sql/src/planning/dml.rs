@@ -2056,6 +2056,7 @@ pub fn statistics_provider_read_need(
             (
                 Box::<str>::from(column.name()),
                 novarocks_physical_plan::ValueType {
+                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                     data_type: column.data_type().clone(),
                     nullable: column.nullable(),
                 },
@@ -2587,6 +2588,7 @@ mod tests {
                 0,
                 "id",
                 ValueType {
+                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: true,
                 },

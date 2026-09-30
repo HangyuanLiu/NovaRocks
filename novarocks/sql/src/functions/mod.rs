@@ -523,6 +523,7 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         let argument_types = request
             .arguments
             .iter()
@@ -569,6 +570,7 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         let argument_types = request
             .arguments
             .iter()
@@ -1151,6 +1153,26 @@ fn builtin_scalar_semantics(name: &str) -> FunctionSemantics {
     }
 }
 
+fn validate_legacy_root_domains(
+    request: FunctionBindingRequest<'_>,
+) -> Result<(), FunctionBindingError> {
+    let physical = |ty: &FunctionValueType| {
+        ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+    };
+    if request.arguments.iter().any(|argument| match argument {
+        FunctionArgument::Value { value_type, .. } => !physical(value_type),
+        FunctionArgument::Lambda {
+            parameter_types,
+            result_type,
+        } => parameter_types.iter().any(|ty| !physical(ty)) || !physical(result_type),
+    }) {
+        return Err(FunctionBindingError::InvalidBinding(
+            "legacy builtin resolver does not declare root logical identities".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn scalar_request_types(
     request: FunctionBindingRequest<'_>,
 ) -> Result<Vec<DataType>, FunctionBindingError> {
@@ -1260,6 +1282,7 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         let argument_types = scalar_request_types(request)?;
         let (index, resolved) = resolver::resolve_scalar_function_signature_with_overload(
             &self.canonical_name,
@@ -1294,6 +1317,7 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         let overload_index = self
             .overloads
             .iter()
@@ -1420,6 +1444,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         bind_builtin_unnest(request)
     }
 
@@ -1428,6 +1453,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         if selected.overload.as_str() != BUILTIN_UNNEST_OVERLOAD_ID {
             return Err(FunctionBindingError::UnknownOverload(
                 selected.overload.clone(),
@@ -1794,6 +1820,7 @@ fn bind_dynamic_scalar_result(
                         argument,
                         FunctionArgument::Value {
                             value_type: FunctionValueType {
+                                logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                                 data_type: DataType::List(_) | DataType::Null,
                                 ..
                             },
@@ -1933,6 +1960,7 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         if request.logical_argument_count != request.arguments.len() {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
@@ -1956,6 +1984,7 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
+        validate_legacy_root_domains(request)?;
         if selected.overload != self.overload {
             return Err(FunctionBindingError::UnknownOverload(
                 selected.overload.clone(),

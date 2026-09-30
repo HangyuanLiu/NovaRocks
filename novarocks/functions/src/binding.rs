@@ -202,10 +202,7 @@ impl FunctionArgument {
             // one, inside a nested type as much as at the top: a map's keys are
             // never null and the signature that takes a map says they may be.
             (Self::Value { value_type, .. }, FunctionArgumentType::Value(expected)) => {
-                novarocks_type_contract::fits_nested_nullability(
-                    &value_type.data_type,
-                    &expected.data_type,
-                ) && (expected.nullable || !value_type.nullable)
+                value_type.fits_value_type(expected)
             }
             (
                 Self::Lambda {
@@ -364,7 +361,15 @@ impl ParametricAggregateBindingResolver {
             .arguments
             .iter()
             .map(|argument| match argument {
-                FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type.clone()),
+                FunctionArgument::Value { value_type, .. }
+                    if value_type.logical_type
+                        == novarocks_type_contract::ValueLogicalType::Physical =>
+                {
+                    Ok(value_type.data_type.clone())
+                }
+                FunctionArgument::Value { .. } => Err(invalid(
+                    "legacy aggregate resolver does not declare root logical identities",
+                )),
                 FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
             })
             .collect()
@@ -665,6 +670,20 @@ fn validate_request(
     kind: FunctionKind,
     request: FunctionBindingRequest<'_>,
 ) -> Result<(), FunctionBindingError> {
+    for argument in request.arguments {
+        match argument {
+            FunctionArgument::Value { value_type, .. } => validate_value_type(value_type)?,
+            FunctionArgument::Lambda {
+                parameter_types,
+                result_type,
+            } => {
+                for ty in parameter_types {
+                    validate_value_type(ty)?;
+                }
+                validate_value_type(result_type)?;
+            }
+        }
+    }
     if request.logical_argument_count > request.arguments.len()
         || (kind != FunctionKind::Aggregate
             && request.logical_argument_count != request.arguments.len())
@@ -690,6 +709,20 @@ fn validate_selection(
     request: FunctionBindingRequest<'_>,
 ) -> Result<(), FunctionBindingError> {
     validate_request(declaration.kind, request)?;
+    for argument in &selected.argument_types {
+        validate_argument_type(argument)?;
+    }
+    match &selected.result_type {
+        FunctionResultType::Scalar(ty) => validate_value_type(ty)?,
+        FunctionResultType::Relation(types) => {
+            for ty in types {
+                validate_value_type(ty)?;
+            }
+        }
+    }
+    if let Some(aggregate) = &selected.aggregate {
+        validate_value_type(&aggregate.intermediate_type)?;
+    }
     let overload = declaration.overload(&selected.overload)?;
     if selected.argument_types.len() != request.arguments.len() {
         return Err(invalid(
@@ -738,6 +771,27 @@ fn validate_selection(
         }
     }
     Ok(())
+}
+
+fn validate_value_type(value: &FunctionValueType) -> Result<(), FunctionBindingError> {
+    value
+        .validate()
+        .map_err(|error| invalid(&error.to_string()))
+}
+
+fn validate_argument_type(argument: &FunctionArgumentType) -> Result<(), FunctionBindingError> {
+    match argument {
+        FunctionArgumentType::Value(value) => validate_value_type(value),
+        FunctionArgumentType::Lambda {
+            parameter_types,
+            result_type,
+        } => {
+            for ty in parameter_types {
+                validate_value_type(ty)?;
+            }
+            validate_value_type(result_type)
+        }
+    }
 }
 
 pub(crate) fn digest_binding_definition(

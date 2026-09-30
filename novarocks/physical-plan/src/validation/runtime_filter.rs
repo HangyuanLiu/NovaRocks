@@ -1129,7 +1129,7 @@ pub(crate) fn validate_runtime_filter_endpoint_in_fragment(
                 // fact -- a build side may never write one where the probe
                 // side may read one -- and whether a null matches is said
                 // once, by the domain's null semantics.
-                if expected_type.is_some_and(|expected| expected.data_type != value.ty.data_type) {
+                if expected_type.is_some_and(|expected| !expected.same_value_domain(&value.ty)) {
                     errors.push(ValidationError::new(
                         path,
                         "runtime filter endpoint type differs from its domain",
