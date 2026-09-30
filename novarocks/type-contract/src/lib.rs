@@ -24,6 +24,7 @@ mod arithmetic;
 mod array_generate;
 mod comparison;
 mod compile_control;
+mod control_flow;
 mod effects;
 mod function;
 mod largeint;
@@ -44,6 +45,7 @@ pub use compile_control::{
     CompileCheckpoints, CompileControlError, CompilePhase, MAX_UNOBSERVED_COMPILE_WORK,
     PureCompileControl,
 };
+pub use control_flow::*;
 pub use effects::*;
 pub use function::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,

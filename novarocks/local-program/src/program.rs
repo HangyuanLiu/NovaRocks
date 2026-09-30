@@ -40,7 +40,8 @@ pub const MAX_PROGRAM_NODE_DEPTH: usize = 64;
 pub const MAX_PROGRAM_NODES: usize = 65_536;
 /// A flat DAG must also bound its expanded execution shape; sharing nodes must
 /// not permit exponential pipeline construction.
-pub const MAX_PROGRAM_EXPANDED_OCCURRENCES: usize = 65_536;
+pub const MAX_PROGRAM_EXPANDED_OCCURRENCES: usize =
+    novarocks_type_contract::MAX_CONTROL_USE_REFERENCES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RowAssertion {

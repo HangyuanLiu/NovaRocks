@@ -29,9 +29,9 @@ use novarocks_types::logical::LogicalType;
 
 /// Matches the native-v1 expanded-expression budget. This bounds the arena
 /// independently of the encoded descriptor's byte budget.
-pub const MAX_STATIC_EXPRESSIONS: usize = 262_144;
+pub const MAX_STATIC_EXPRESSIONS: usize = novarocks_type_contract::MAX_CONTROL_DEFINITIONS;
 pub const MAX_STATIC_EXPRESSION_DYNAMIC_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_STATIC_EXPRESSION_DEPTH: usize = 96;
+pub const MAX_STATIC_EXPRESSION_DEPTH: usize = novarocks_type_contract::MAX_CONTROL_DEPTH;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProgramExprId(usize);
