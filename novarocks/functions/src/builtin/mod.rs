@@ -36,6 +36,8 @@ mod abs;
 mod abs_owner;
 mod numeric_binary;
 mod numeric_binary_owner;
+mod numeric_elementary;
+mod numeric_elementary_owner;
 mod numeric_mod;
 mod numeric_mod_owner;
 mod numeric_unary;

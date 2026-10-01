@@ -859,6 +859,56 @@ fn actual_builtin_mod_and_pmod_install_all_72_exact_cpu_records() {
 }
 
 #[test]
+fn actual_builtin_log_sign_e_pi_install_all_52_exact_cpu_records() {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
+    let mut installed_count = 0;
+    for (name, count) in [("log", 43), ("sign", 7), ("e", 1), ("pi", 1)] {
+        let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
+        let binding = definition.binding.as_ref().unwrap();
+        let attachment = binding
+            .pure
+            .as_ref()
+            .expect("actual elementary numeric CPU owner");
+        assert_eq!(
+            binding.declaration.function_id().as_str(),
+            format!("builtin.scalar/{name}/v1")
+        );
+        assert_eq!(binding.declaration.overloads().len(), count);
+        assert_eq!(attachment.implementations.len(), count);
+        for (overload, installed) in binding
+            .declaration
+            .overloads()
+            .iter()
+            .zip(attachment.implementations.iter())
+        {
+            assert_eq!(installed.overload, overload.identity);
+            assert_eq!(
+                installed.implementation.as_str(),
+                format!("builtin.scalar/{name}/selected-v1")
+            );
+            assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
+            let effects = overload.effects.as_ref().unwrap();
+            assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
+            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
+            assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
+            assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.instance_state, FunctionInstanceState::None);
+            assert_eq!(effects.observable_effects, ObservableEffects::NONE);
+            assert!(effects.environment_dependencies.is_empty());
+        }
+        installed_count += attachment.implementations.len();
+    }
+    assert_eq!(installed_count, 52);
+    assert!(matches!(
+        builder.seal_pure(std::iter::empty()),
+        Err(PureCatalogError::MissingOwner(_)
+            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
+    ));
+}
+
+#[test]
 fn metadata_without_actual_owner_and_legacy_effects_cannot_be_pure_sealed() {
     let owner = Arc::new(Owner::new(false));
     let metadata = FunctionDefinition::try_new_bound(

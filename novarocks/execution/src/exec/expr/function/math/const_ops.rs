@@ -51,3 +51,72 @@ pub fn eval_pi(
 ) -> Result<ArrayRef, String> {
     eval_const_f64(chunk.len(), std::f64::consts::PI, arena.data_type(expr))
 }
+
+#[cfg(test)]
+mod legacy_elementary_contract_tests {
+    use super::*;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::ExprNode;
+    use crate::exec::expr::function::FunctionKind;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    fn evaluate(name: &'static str, rows: usize) -> ArrayRef {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unused",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![0; rows])) as ArrayRef],
+        )
+        .unwrap();
+        let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        let mut arena = ExprArena::default();
+        let call = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Math(name),
+                args: vec![],
+            },
+            DataType::Float64,
+        );
+        let frozen = arena.into_immutable().unwrap();
+        let result = ExprArena::from_immutable(&frozen)
+            .eval(call, &chunk)
+            .unwrap();
+        assert_eq!(result.data_type(), &DataType::Float64);
+        result
+    }
+
+    #[test]
+    fn legacy_elementary_e_pi_have_exact_double_bits_for_every_batch_row() {
+        for (name, bits) in [("e", 0x4005bf0a8b145769u64), ("pi", 0x400921fb54442d18u64)] {
+            let result = evaluate(name, 3);
+            let result = result.as_any().downcast_ref::<Float64Array>().unwrap();
+            assert_eq!(result.len(), 3);
+            assert_eq!(
+                result
+                    .iter()
+                    .map(|v| v.unwrap().to_bits())
+                    .collect::<Vec<_>>(),
+                vec![bits; 3]
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_elementary_e_pi_empty_batch_remains_empty_double() {
+        for name in ["e", "pi"] {
+            let result = evaluate(name, 0);
+            assert_eq!(result.len(), 0);
+            assert_eq!(result.data_type(), &DataType::Float64);
+        }
+    }
+}
