@@ -179,6 +179,13 @@ codegen-units = 256
 # and OverwriteCommit (Plan Tasks 9 / 10) until upstream ships native RowDelta
 # and OverwriteFiles actions. See vendor/iceberg-0.9.0/PATCH.md for the diff.
 [patch.crates-io]
+# Borrowed allocation-capacity introspection for bounded root input owners.
+# Existing Arrow data/encoding/capacity semantics stay unchanged; Custom
+# buffers require a source-owner proof rather than a declared-length guess.
+# See vendor/arrow-buffer-58.2.0/PATCH.md and vendor/arrow-array-58.2.0/PATCH.md.
+arrow-buffer = { path = "vendor/arrow-buffer-58.2.0" }
+arrow-array = { path = "vendor/arrow-array-58.2.0" }
+arrow-schema = { path = "vendor/arrow-schema-58.2.0" }
 iceberg = { path = "vendor/iceberg-0.9.0" }
 # Vendored to add Iceberg view REST endpoints (create/load/commit/drop/
 # exists/list) that upstream 0.9.0 does not implement. See
