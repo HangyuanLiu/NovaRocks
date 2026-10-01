@@ -31,6 +31,7 @@
 //! static-predicate extraction inspects the plan.
 
 use crate::compiler::SqlCompileError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
@@ -185,7 +186,10 @@ impl LogicalRewriteRule for FoldConstant {
         expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, SqlCompileError> {
+        let control = ctx.control_view();
+        let work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
         let Some(evaluator) = ctx.constant_evaluator() else {
+            work.finish()?;
             return Ok(RewriteResult::Unchanged);
         };
 
@@ -198,8 +202,10 @@ impl LogicalRewriteRule for FoldConstant {
         let arena = ctx.scalar_arena();
         let changed = {
             let mut arena = arena.borrow_mut();
-            let mut folder = ConstantFolder::new(&mut arena, evaluator);
-            folder.fold_operator(&mut op)
+            let mut folder = ConstantFolder::new(&mut arena, evaluator, work);
+            let changed = folder.fold_operator(&mut op)?;
+            folder.work.finish()?;
+            changed
         };
 
         let expr = OptExpr {
@@ -223,53 +229,71 @@ impl LogicalRewriteRule for FoldConstant {
 ///
 /// `memo` maps an original `ScalarId` to its folded replacement so a shared
 /// (hash-consed) sub-expression is folded once per `apply`, not once per
-/// reference.
-struct ConstantFolder<'a> {
+/// reference. The work scope borrows the original request and never enters
+/// the arena, memo values or rewritten output.
+struct ConstantFolder<'a, 'control> {
     arena: &'a mut ScalarArena,
     evaluator: &'static dyn SqlConstantEvaluator,
     memo: HashMap<ScalarId, ScalarId>,
+    work: CompileCheckpoints<'control>,
 }
 
-impl<'a> ConstantFolder<'a> {
-    fn new(arena: &'a mut ScalarArena, evaluator: &'static dyn SqlConstantEvaluator) -> Self {
+impl<'a, 'control> ConstantFolder<'a, 'control> {
+    fn new(
+        arena: &'a mut ScalarArena,
+        evaluator: &'static dyn SqlConstantEvaluator,
+        work: CompileCheckpoints<'control>,
+    ) -> Self {
         Self {
             arena,
             evaluator,
             memo: HashMap::new(),
+            work,
         }
     }
 
-    fn fold_slot(&mut self, slot: &mut ScalarId) -> bool {
-        match fold_scalar(self.arena, *slot, self.evaluator, &mut self.memo) {
-            Some(folded) => {
-                *slot = folded;
-                true
-            }
+    fn fold_slot(&mut self, slot: &mut ScalarId) -> Result<bool, SqlCompileError> {
+        Ok(
+            match fold_scalar(
+                self.arena,
+                *slot,
+                self.evaluator,
+                &mut self.memo,
+                &mut self.work,
+            )? {
+                Some(folded) => {
+                    *slot = folded;
+                    true
+                }
+                None => false,
+            },
+        )
+    }
+
+    fn fold_optional_slot(&mut self, slot: &mut Option<ScalarId>) -> Result<bool, SqlCompileError> {
+        self.work.step()?;
+        Ok(match slot {
+            Some(id) => self.fold_slot(id)?,
             None => false,
-        }
+        })
     }
 
-    fn fold_optional_slot(&mut self, slot: &mut Option<ScalarId>) -> bool {
-        match slot {
-            Some(id) => self.fold_slot(id),
-            None => false,
-        }
-    }
-
-    fn fold_slots(&mut self, slots: &mut [ScalarId]) -> bool {
+    fn fold_slots(&mut self, slots: &mut [ScalarId]) -> Result<bool, SqlCompileError> {
+        self.work.step()?;
         let mut changed = false;
         for slot in slots {
-            changed |= self.fold_slot(slot);
+            changed |= self.fold_slot(slot)?;
         }
-        changed
+        Ok(changed)
     }
 
-    fn fold_sort_keys(&mut self, keys: &mut [SortKey]) -> bool {
+    fn fold_sort_keys(&mut self, keys: &mut [SortKey]) -> Result<bool, SqlCompileError> {
+        self.work.step()?;
         let mut changed = false;
         for key in keys {
-            changed |= self.fold_slot(&mut key.expr);
+            changed |= self.fold_slot(&mut key.expr)?;
         }
-        changed
+        Ok(changed)
     }
 
     /// Fold every scalar field carried by one operator.
@@ -277,90 +301,96 @@ impl<'a> ConstantFolder<'a> {
     /// The match is exhaustive on purpose: adding a scalar-bearing operator
     /// must be a compile error here, not a silently-skipped field. The covered
     /// field set mirrors `rewrite::required_columns::tag_required_columns`.
-    fn fold_operator(&mut self, op: &mut Operator) -> bool {
-        match op {
+    fn fold_operator(&mut self, op: &mut Operator) -> Result<bool, SqlCompileError> {
+        self.work.step()?;
+        Ok(match op {
             Operator::LogicalScan(scan) | Operator::PhysicalScan(scan) => {
-                self.fold_slots(&mut scan.predicates)
+                self.fold_slots(&mut scan.predicates)?
             }
             Operator::LogicalFilter(filter) | Operator::PhysicalFilter(filter) => {
-                self.fold_slot(&mut filter.predicate)
+                self.fold_slot(&mut filter.predicate)?
             }
             Operator::LogicalProject(project) | Operator::PhysicalProject(project) => {
+                self.work.step()?;
                 let mut changed = false;
                 for item in &mut project.items {
-                    changed |= self.fold_slot(&mut item.expr);
+                    changed |= self.fold_slot(&mut item.expr)?;
                 }
                 changed
             }
             Operator::LogicalAggregate(agg) => {
-                let mut changed = self.fold_slots(&mut agg.group_by);
+                let mut changed = self.fold_slots(&mut agg.group_by)?;
                 for aggregate in &mut agg.aggregates {
-                    changed |= self.fold_slots(&mut aggregate.args);
-                    changed |= self.fold_sort_keys(&mut aggregate.order_by);
+                    changed |= self.fold_slots(&mut aggregate.args)?;
+                    changed |= self.fold_sort_keys(&mut aggregate.order_by)?;
                 }
                 changed
             }
             Operator::PhysicalHashAggregate(agg) => {
-                let mut changed = self.fold_slots(&mut agg.group_by);
+                let mut changed = self.fold_slots(&mut agg.group_by)?;
                 for aggregate in &mut agg.aggregates {
-                    changed |= self.fold_slots(&mut aggregate.args);
-                    changed |= self.fold_sort_keys(&mut aggregate.order_by);
+                    changed |= self.fold_slots(&mut aggregate.args)?;
+                    changed |= self.fold_sort_keys(&mut aggregate.order_by)?;
                 }
                 changed
             }
-            Operator::LogicalJoin(join) => self.fold_optional_slot(&mut join.condition),
+            Operator::LogicalJoin(join) => self.fold_optional_slot(&mut join.condition)?,
             Operator::PhysicalHashJoin(join) => {
+                self.work.step()?;
                 let mut changed = false;
                 for condition in &mut join.eq_conditions {
-                    changed |= self.fold_slot(&mut condition.left);
-                    changed |= self.fold_slot(&mut condition.right);
+                    changed |= self.fold_slot(&mut condition.left)?;
+                    changed |= self.fold_slot(&mut condition.right)?;
                 }
-                changed |= self.fold_optional_slot(&mut join.other_condition);
+                changed |= self.fold_optional_slot(&mut join.other_condition)?;
                 changed
             }
-            Operator::PhysicalNestLoopJoin(join) => self.fold_optional_slot(&mut join.condition),
+            Operator::PhysicalNestLoopJoin(join) => self.fold_optional_slot(&mut join.condition)?,
             Operator::LogicalSort(sort) | Operator::PhysicalSort(sort) => {
-                let mut changed = self.fold_sort_keys(&mut sort.items);
-                changed |= self.fold_slots(&mut sort.analytic_partition_exprs);
+                let mut changed = self.fold_sort_keys(&mut sort.items)?;
+                changed |= self.fold_slots(&mut sort.analytic_partition_exprs)?;
                 changed
             }
             Operator::LogicalTopN(topn) | Operator::PhysicalTopN(topn) => {
-                self.fold_sort_keys(&mut topn.items)
+                self.fold_sort_keys(&mut topn.items)?
             }
             Operator::LogicalWindow(window) | Operator::PhysicalWindow(window) => {
+                self.work.step()?;
                 let mut changed = false;
                 for spec in &mut window.window_exprs {
-                    changed |= self.fold_slots(&mut spec.args);
-                    changed |= self.fold_slots(&mut spec.partition_by);
-                    changed |= self.fold_sort_keys(&mut spec.order_by);
+                    changed |= self.fold_slots(&mut spec.args)?;
+                    changed |= self.fold_slots(&mut spec.partition_by)?;
+                    changed |= self.fold_sort_keys(&mut spec.order_by)?;
                 }
                 changed
             }
             Operator::LogicalValues(values) | Operator::PhysicalValues(values) => {
+                self.work.step()?;
                 let mut changed = false;
                 for row in &mut values.rows {
-                    changed |= self.fold_slots(row);
+                    changed |= self.fold_slots(row)?;
                 }
                 changed
             }
             Operator::LogicalTableFunction(func) | Operator::PhysicalTableFunction(func) => {
-                self.fold_slots(&mut func.args)
+                self.fold_slots(&mut func.args)?
             }
             Operator::LogicalChangeEventExpand(expand)
             | Operator::PhysicalChangeEventExpand(expand) => {
+                self.work.step()?;
                 let mut changed = false;
                 for event in &mut expand.events {
-                    changed |= self.fold_optional_slot(&mut event.predicate);
+                    changed |= self.fold_optional_slot(&mut event.predicate)?;
                     for assignment in &mut event.assignments {
-                        changed |= self.fold_optional_slot(&mut assignment.expr);
+                        changed |= self.fold_optional_slot(&mut assignment.expr)?;
                     }
                 }
                 changed
             }
             Operator::LogicalApply(apply) => {
-                let mut changed = self.fold_slot(&mut apply.subquery_expr);
-                changed |= self.fold_slots(&mut apply.correlation_conjuncts);
-                changed |= self.fold_optional_slot(&mut apply.residual_predicate);
+                let mut changed = self.fold_slot(&mut apply.subquery_expr)?;
+                changed |= self.fold_slots(&mut apply.correlation_conjuncts)?;
+                changed |= self.fold_optional_slot(&mut apply.residual_predicate)?;
                 changed
             }
             // Operators without scalar fields.
@@ -388,7 +418,7 @@ impl<'a> ConstantFolder<'a> {
             | Operator::LogicalImvDelta(_)
             | Operator::LogicalImvVersion(_)
             | Operator::PhysicalDistribution(_) => false,
-        }
+        })
     }
 }
 
@@ -471,9 +501,10 @@ fn fold_scalar(
     id: ScalarId,
     evaluator: &'static dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
-) -> Option<ScalarId> {
-    let folded = fold_scalar_id(arena, id, evaluator, memo);
-    (folded != id).then_some(folded)
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    let folded = fold_scalar_id(arena, id, evaluator, memo, work)?;
+    Ok((folded != id).then_some(folded))
 }
 
 fn fold_scalar_id(
@@ -481,13 +512,15 @@ fn fold_scalar_id(
     id: ScalarId,
     evaluator: &'static dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
-) -> ScalarId {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ScalarId, SqlCompileError> {
+    work.step()?;
     if let Some(&cached) = memo.get(&id) {
-        return cached;
+        return Ok(cached);
     }
-    let folded = fold_scalar_uncached(arena, id, evaluator, memo);
+    let folded = fold_scalar_uncached(arena, id, evaluator, memo, work)?;
     memo.insert(id, folded);
-    folded
+    Ok(folded)
 }
 
 fn fold_scalar_uncached(
@@ -495,8 +528,11 @@ fn fold_scalar_uncached(
     id: ScalarId,
     evaluator: &'static dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
-) -> ScalarId {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ScalarId, SqlCompileError> {
+    work.step()?;
     let value_type = arena.value_type(id).clone();
+    work.step()?;
     let mut node = arena.node(id).clone();
 
     // Post-order: children first, so a node only ever sees already-folded
@@ -504,38 +540,38 @@ fn fold_scalar_uncached(
     match &mut node {
         ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
-            *left = fold_scalar_id(arena, *left, evaluator, memo);
-            *right = fold_scalar_id(arena, *right, evaluator, memo);
+            *left = fold_scalar_id(arena, *left, evaluator, memo, work)?;
+            *right = fold_scalar_id(arena, *right, evaluator, memo, work)?;
         }
         ScalarNode::UnaryOp { child, .. }
         | ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
         | ScalarNode::IsTruthValue { child, .. } => {
-            *child = fold_scalar_id(arena, *child, evaluator, memo);
+            *child = fold_scalar_id(arena, *child, evaluator, memo, work)?;
         }
         ScalarNode::Nested(child) => {
-            *child = fold_scalar_id(arena, *child, evaluator, memo);
+            *child = fold_scalar_id(arena, *child, evaluator, memo, work)?;
         }
         ScalarNode::FunctionCall { name, args, .. } => {
             for arg in args.iter_mut() {
                 // TIME_TO_SEC distinguishes a SEC_TO_TIME result from a raw
                 // string. Folding that producer would erase its provenance.
-                *arg = if name == "time_to_sec" && has_sec_to_time_source(arena, *arg) {
-                    fold_sec_to_time_source(arena, *arg, evaluator, memo)
+                *arg = if name == "time_to_sec" && has_sec_to_time_source(arena, *arg, work)? {
+                    fold_sec_to_time_source(arena, *arg, evaluator, memo, work)?
                 } else {
-                    fold_scalar_id(arena, *arg, evaluator, memo)
+                    fold_scalar_id(arena, *arg, evaluator, memo, work)?
                 };
             }
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
-            *body = fold_scalar_id(arena, *body, evaluator, memo);
+            *body = fold_scalar_id(arena, *body, evaluator, memo, work)?;
         }
         ScalarNode::AggregateCall { args, order_by, .. } => {
             for arg in args.iter_mut() {
-                *arg = fold_scalar_id(arena, *arg, evaluator, memo);
+                *arg = fold_scalar_id(arena, *arg, evaluator, memo, work)?;
             }
             for key in order_by.iter_mut() {
-                key.expr = fold_scalar_id(arena, key.expr, evaluator, memo);
+                key.expr = fold_scalar_id(arena, key.expr, evaluator, memo, work)?;
             }
         }
         ScalarNode::WindowCall {
@@ -545,31 +581,31 @@ fn fold_scalar_uncached(
             ..
         } => {
             for arg in args.iter_mut() {
-                *arg = fold_scalar_id(arena, *arg, evaluator, memo);
+                *arg = fold_scalar_id(arena, *arg, evaluator, memo, work)?;
             }
             for expr in partition_by.iter_mut() {
-                *expr = fold_scalar_id(arena, *expr, evaluator, memo);
+                *expr = fold_scalar_id(arena, *expr, evaluator, memo, work)?;
             }
             for key in order_by.iter_mut() {
-                key.expr = fold_scalar_id(arena, key.expr, evaluator, memo);
+                key.expr = fold_scalar_id(arena, key.expr, evaluator, memo, work)?;
             }
         }
         ScalarNode::InList { child, list, .. } => {
-            *child = fold_scalar_id(arena, *child, evaluator, memo);
+            *child = fold_scalar_id(arena, *child, evaluator, memo, work)?;
             for item in list.iter_mut() {
-                *item = fold_scalar_id(arena, *item, evaluator, memo);
+                *item = fold_scalar_id(arena, *item, evaluator, memo, work)?;
             }
         }
         ScalarNode::Between {
             child, low, high, ..
         } => {
-            *child = fold_scalar_id(arena, *child, evaluator, memo);
-            *low = fold_scalar_id(arena, *low, evaluator, memo);
-            *high = fold_scalar_id(arena, *high, evaluator, memo);
+            *child = fold_scalar_id(arena, *child, evaluator, memo, work)?;
+            *low = fold_scalar_id(arena, *low, evaluator, memo, work)?;
+            *high = fold_scalar_id(arena, *high, evaluator, memo, work)?;
         }
         ScalarNode::Like { child, pattern, .. } => {
-            *child = fold_scalar_id(arena, *child, evaluator, memo);
-            *pattern = fold_scalar_id(arena, *pattern, evaluator, memo);
+            *child = fold_scalar_id(arena, *child, evaluator, memo, work)?;
+            *pattern = fold_scalar_id(arena, *pattern, evaluator, memo, work)?;
         }
         ScalarNode::Case {
             operand,
@@ -577,14 +613,14 @@ fn fold_scalar_uncached(
             else_expr,
         } => {
             if let Some(operand) = operand {
-                *operand = fold_scalar_id(arena, *operand, evaluator, memo);
+                *operand = fold_scalar_id(arena, *operand, evaluator, memo, work)?;
             }
             for (when, then) in when_then.iter_mut() {
-                *when = fold_scalar_id(arena, *when, evaluator, memo);
-                *then = fold_scalar_id(arena, *then, evaluator, memo);
+                *when = fold_scalar_id(arena, *when, evaluator, memo, work)?;
+                *then = fold_scalar_id(arena, *then, evaluator, memo, work)?;
             }
             if let Some(else_expr) = else_expr {
-                *else_expr = fold_scalar_id(arena, *else_expr, evaluator, memo);
+                *else_expr = fold_scalar_id(arena, *else_expr, evaluator, memo, work)?;
             }
         }
     }
@@ -593,16 +629,21 @@ fn fold_scalar_uncached(
     // metadata. `intern` may canonicalize commutative operand order, so the
     // fold step below reads the children back out of the arena.
     let rebuilt = arena.intern(node, value_type);
-    try_fold_node(arena, rebuilt, evaluator).unwrap_or(rebuilt)
+    Ok(try_fold_node(arena, rebuilt, evaluator, work)?.unwrap_or(rebuilt))
 }
 
-fn has_sec_to_time_source(arena: &ScalarArena, id: ScalarId) -> bool {
-    match arena.node(id) {
-        ScalarNode::FunctionCall { name, .. } => name == "sec_to_time",
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            has_sec_to_time_source(arena, *child)
+fn has_sec_to_time_source(
+    arena: &ScalarArena,
+    mut id: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    loop {
+        work.step()?;
+        match arena.node(id) {
+            ScalarNode::FunctionCall { name, .. } => return Ok(name == "sec_to_time"),
+            ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => id = *child,
+            _ => return Ok(false),
         }
-        _ => false,
     }
 }
 
@@ -614,31 +655,35 @@ fn fold_sec_to_time_source(
     id: ScalarId,
     evaluator: &'static dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
-) -> ScalarId {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ScalarId, SqlCompileError> {
+    work.step()?;
     let mut node = arena.node(id).clone();
     match &mut node {
         ScalarNode::FunctionCall { args, .. } => {
             for arg in args {
-                *arg = fold_scalar_id(arena, *arg, evaluator, memo);
+                *arg = fold_scalar_id(arena, *arg, evaluator, memo, work)?;
             }
         }
         ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            *child = fold_sec_to_time_source(arena, *child, evaluator, memo);
+            *child = fold_sec_to_time_source(arena, *child, evaluator, memo, work)?;
         }
         _ => unreachable!("source path was checked before folding"),
     }
-    arena.intern(node, arena.value_type(id).clone())
+    Ok(arena.intern(node, arena.value_type(id).clone()))
 }
 
 /// Try to replace one node (whose children are already folded) with a literal.
 ///
-/// Returns `None` — leaving the node alone — whenever any safety gate fails or
-/// the evaluator declines or errors.
+/// Returns `Ok(None)` when a safety gate fails or the legacy evaluator declines
+/// or reports an evaluation error. Caller control failures remain typed errors.
 fn try_fold_node(
     arena: &mut ScalarArena,
     id: ScalarId,
     evaluator: &'static dyn SqlConstantEvaluator,
-) -> Option<ScalarId> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    work.step()?;
     let node = arena.node(id).clone();
     let out_type = arena.data_type(id).clone();
     let out_nullable = arena.nullable(id);
@@ -647,12 +692,15 @@ fn try_fold_node(
     // literal the wrapper collapses onto that literal, no evaluation needed.
     if let ScalarNode::Nested(inner) = &node {
         let ScalarNode::Literal(literal) = arena.node(*inner).clone() else {
-            return None;
+            return Ok(None);
         };
         if !is_wire_encodable_literal_type(&out_type) {
-            return None;
+            return Ok(None);
         }
-        return Some(arena.intern(ScalarNode::Literal(literal), arena.value_type(id).clone()));
+        return Ok(Some(arena.intern(
+            ScalarNode::Literal(literal),
+            arena.value_type(id).clone(),
+        )));
     }
 
     // Gate 2: a volatile or DISTINCT function is never a constant.
@@ -675,35 +723,36 @@ fn try_fold_node(
             ..
         } => {
             if *distinct || *volatility != FunctionVolatility::Immutable {
-                return None;
+                return Ok(None);
             }
             if is_environment_sensitive_function(name) || is_byte_carrying_string_function(name) {
-                return None;
+                return Ok(None);
             }
             FoldNodeKind::Function { name: name.clone() }
         }
         // Every other node shape stays unfolded in v1; its children were
         // already folded above.
-        _ => return None,
+        _ => return Ok(None),
     };
 
     // Gate 4: the folded literal has to survive the FE -> BE plan encoding.
     if !is_wire_encodable_literal_type(&out_type) {
-        return None;
+        return Ok(None);
     }
 
     let children: Vec<ScalarId> = match &node {
         ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],
         ScalarNode::UnaryOp { child, .. } | ScalarNode::Cast { child, .. } => vec![*child],
         ScalarNode::FunctionCall { args, .. } => args.clone(),
-        _ => return None,
+        _ => return Ok(None),
     };
 
     // Gate 1: every child must already be a literal.
     let mut args = Vec::with_capacity(children.len());
     for child in children {
+        work.step()?;
         let ScalarNode::Literal(HashableLiteral(value)) = arena.node(child) else {
-            return None;
+            return Ok(None);
         };
         args.push(FoldArg {
             value: value.clone(),
@@ -719,7 +768,10 @@ fn try_fold_node(
         out_nullable,
     };
 
-    match evaluator.eval_scalar(&request) {
+    work.step()?;
+    let evaluated = evaluator.eval_scalar(&request);
+    work.step()?;
+    Ok(match evaluated {
         Ok(Some(value)) => Some(arena.intern(
             ScalarNode::Literal(HashableLiteral(value)),
             arena.value_type(id).clone(),
@@ -730,7 +782,23 @@ fn try_fold_node(
         // runtime is still allowed to produce a value — or its own error — for
         // this expression, so a failed fold must never become a planning error.
         Err(_) => None,
-    }
+    })
+}
+
+#[cfg(test)]
+fn try_fold_test_node(
+    arena: &mut ScalarArena,
+    id: ScalarId,
+    evaluator: &'static dyn SqlConstantEvaluator,
+) -> Option<ScalarId> {
+    let mut work = CompileCheckpoints::try_new(
+        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        CompilePhase::Validate,
+    )
+    .unwrap();
+    let result = try_fold_node(arena, id, evaluator, &mut work).unwrap();
+    work.finish().unwrap();
+    result
 }
 
 #[cfg(test)]
@@ -939,7 +1007,7 @@ mod tests {
         fn apply(&mut self, plan: OptExpr) -> RewriteResult {
             FoldConstant
                 .apply(plan, &mut self.ctx)
-                .expect("FoldConstant must never return a planning error")
+                .expect("unbounded fold fixture must succeed")
         }
 
         fn matches(&self, plan: &OptExpr) -> bool {
@@ -984,6 +1052,154 @@ mod tests {
             }
             other => panic!("expected Literal(Int({expected})), got {other:?}"),
         }
+    }
+
+    struct FoldControl {
+        observations: std::sync::Mutex<Vec<u32>>,
+        failure: Option<novarocks_type_contract::CompileControlError>,
+        fail_at: usize,
+    }
+    impl novarocks_type_contract::PureCompileControl for FoldControl {
+        fn checkpoint(
+            &self,
+            phase: CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            let mut observations = self.observations.lock().unwrap();
+            observations.push(units);
+            if observations.len() == self.fail_at
+                && let Some(error) = self.failure
+            {
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+    fn apply_with_control(
+        fixture: &Fixture,
+        plan: OptExpr,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<RewriteResult, SqlCompileError> {
+        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), control);
+        ctx.set_scalar_arena(Rc::clone(&fixture.arena));
+        if let Some(evaluator) = fixture.evaluator {
+            ctx.set_constant_evaluator(evaluator);
+        }
+        FoldConstant.apply(plan, &mut ctx)
+    }
+
+    #[test]
+    fn fold_control_observes_real_nodes_cached_edges_and_final_publication() {
+        use novarocks_type_contract::{CompileControlError, PureCompileControl};
+        for shared in [false, true] {
+            let fixture = Fixture::with_mode(FakeMode::Fold);
+            let one = fixture.int_literal(1);
+            let items = (0..320)
+                .map(|index| {
+                    let value = fixture.int_literal(if shared { 0 } else { index });
+                    ScalarProjectItem {
+                        expr: fixture.binary(BinOp::Add, value, one),
+                        output_name: format!("c{index}"),
+                        output_column_id: ColumnId::new_for_test(index as u32 + 1),
+                        expr_display: None,
+                    }
+                })
+                .collect();
+            let plan = OptExpr::leaf(Operator::LogicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }));
+            let owner = FoldControl {
+                observations: Default::default(),
+                failure: None,
+                fail_at: usize::MAX,
+            };
+            let result = apply_with_control(&fixture, plan.clone(), &owner).unwrap();
+            let rewritten = changed(result);
+            let Operator::LogicalProject(project) = rewritten.op else {
+                panic!("project")
+            };
+            for (index, item) in project.items.iter().enumerate() {
+                assert_int_literal(
+                    &fixture,
+                    item.expr,
+                    if shared { 1 } else { index as i64 + 1 },
+                );
+            }
+            assert_eq!(fixture.calls(), if shared { 1 } else { 320 });
+            let observations = owner.observations.lock().unwrap().clone();
+            assert_eq!(observations[0], 0);
+            assert!(observations.iter().all(|units| *units <= 256));
+            assert!(observations.iter().sum::<u32>() >= 320);
+            for failure in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                for fail_at in [1, 2, observations.len()] {
+                    let owner = FoldControl {
+                        observations: Default::default(),
+                        failure: Some(failure),
+                        fail_at,
+                    };
+                    assert!(
+                        matches!(apply_with_control(&fixture, plan.clone(), &owner), Err(error) if error == SqlCompileError::from(failure))
+                    );
+                    assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
+                    // A later successful observation cannot recover this result.
+                    owner.checkpoint(CompilePhase::Validate, 0).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fold_control_covers_no_evaluator_and_declined_or_failed_folds() {
+        use novarocks_type_contract::CompileControlError;
+        for fixture in [
+            Fixture::without_evaluator(),
+            Fixture::with_mode(FakeMode::Decline),
+            Fixture::with_mode(FakeMode::Fail),
+        ] {
+            let one = fixture.int_literal(1);
+            let sum = fixture.binary(BinOp::Add, one, one);
+            for failure in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                for fail_at in [1, 2] {
+                    let owner = FoldControl {
+                        observations: Default::default(),
+                        failure: Some(failure),
+                        fail_at,
+                    };
+                    assert!(
+                        matches!(apply_with_control(&fixture, project(sum), &owner), Err(error) if error == SqlCompileError::from(failure))
+                    );
+                    assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn folded_output_and_arena_do_not_retain_request_control() {
+        let fixture = Fixture::with_mode(FakeMode::Fold);
+        let one = fixture.int_literal(1);
+        let sum = fixture.binary(BinOp::Add, one, one);
+        let owner = std::sync::Arc::new(FoldControl {
+            observations: Default::default(),
+            failure: None,
+            fail_at: usize::MAX,
+        });
+        let weak = std::sync::Arc::downgrade(&owner);
+        let rewritten =
+            changed(apply_with_control(&fixture, project(sum), owner.as_ref()).unwrap());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        assert_int_literal(&fixture, project_expr(&rewritten), 2);
     }
 
     // -- tests -------------------------------------------------------------
@@ -1097,8 +1313,16 @@ mod tests {
         let mut arena = fixture.arena.borrow_mut();
         let mut memo = HashMap::new();
         let evaluator = fixture.evaluator.unwrap();
-        let standalone = fold_scalar_id(&mut arena, source, evaluator, &mut memo);
-        let roundtrip = fold_scalar_id(&mut arena, consumer, evaluator, &mut memo);
+        let mut work = CompileCheckpoints::try_new(
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            CompilePhase::Validate,
+        )
+        .unwrap();
+        let standalone =
+            fold_scalar_id(&mut arena, source, evaluator, &mut memo, &mut work).unwrap();
+        let roundtrip =
+            fold_scalar_id(&mut arena, consumer, evaluator, &mut memo, &mut work).unwrap();
+        work.finish().unwrap();
         assert!(matches!(arena.node(standalone), ScalarNode::Literal(_)));
         let ScalarNode::FunctionCall { args, .. } = arena.node(roundtrip) else {
             panic!("roundtrip must not reuse the standalone folded literal");
@@ -1617,14 +1841,14 @@ mod overflow_policy_tests {
                 novarocks_type_contract::FunctionValueType::new(data_type, true),
             );
             let original = arena.node(throwing).clone();
-            assert!(try_fold_node(&mut arena, throwing, &EVALUATOR).is_none());
+            assert!(try_fold_test_node(&mut arena, throwing, &EVALUATOR).is_none());
             assert_eq!(arena.node(throwing), &original);
-            let folded = try_fold_node(&mut arena, nullable, &EVALUATOR).unwrap();
+            let folded = try_fold_test_node(&mut arena, nullable, &EVALUATOR).unwrap();
             assert!(matches!(
                 arena.node(folded),
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
             ));
-            assert!(try_fold_node(&mut arena, throwing, &EVALUATOR).is_none());
+            assert!(try_fold_test_node(&mut arena, throwing, &EVALUATOR).is_none());
         }
     }
     #[test]
@@ -1676,12 +1900,12 @@ mod overflow_policy_tests {
             );
             let guarded =
                 crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), true).unwrap();
-            assert!(try_fold_node(&mut arena, id, guarded).is_none());
+            assert!(try_fold_test_node(&mut arena, id, guarded).is_none());
             assert_eq!(arena.node(id), &original);
             let default =
                 crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), false)
                     .unwrap();
-            let folded = try_fold_node(&mut arena, id, default).unwrap();
+            let folded = try_fold_test_node(&mut arena, id, default).unwrap();
             assert!(matches!(
                 arena.node(folded),
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
@@ -1690,7 +1914,7 @@ mod overflow_policy_tests {
                 ScalarNode::Nested(literal),
                 novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), false),
             );
-            let pure = try_fold_node(&mut arena, nested, guarded).unwrap();
+            let pure = try_fold_test_node(&mut arena, nested, guarded).unwrap();
             assert!(matches!(arena.node(pure), ScalarNode::Literal(_)));
         }
         assert!(crate::compiler::constant_evaluator_for_legacy_mode(None, true).is_none());
