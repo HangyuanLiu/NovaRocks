@@ -408,7 +408,13 @@ mod tests {
         );
 
         assert!(
-            bind_tree(&rule.pattern(), &expr).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "QuantifiedApplyToJoin pattern must only match Apply roots"
         );
     }

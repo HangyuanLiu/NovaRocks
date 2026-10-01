@@ -370,7 +370,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         let RewriteResult::Changed(out) = result else {
@@ -411,7 +419,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
@@ -437,7 +453,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
@@ -462,7 +486,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(!rule.matches(&filter, &ctx));
     }
 }

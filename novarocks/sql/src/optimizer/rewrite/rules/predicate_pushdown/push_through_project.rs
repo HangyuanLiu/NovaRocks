@@ -651,7 +651,15 @@ mod tests {
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         let result = rule.apply(filter, &mut ctx).unwrap();
 
         match result {
@@ -763,7 +771,15 @@ mod tests {
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),

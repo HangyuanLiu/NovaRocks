@@ -351,7 +351,13 @@ mod tests {
         let expr = to_opt_expr(&scan("outer", OUTER_K), &mut ctx);
 
         assert!(
-            bind_tree(&rule.pattern(), &expr).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "ExistentialApplyToJoin pattern must only match Apply roots"
         );
     }

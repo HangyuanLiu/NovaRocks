@@ -685,7 +685,8 @@ fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataT
 /// same identity for itself when it registers implementations, so that sealing
 /// compares two independently written sets rather than one copied twice.
 /// Whether two argument types are the same but for what their nested fields
-/// admit. See the caller for why that is not part of a type's identity here.
+/// admit. This legacy nullability allowance never erases root or nested
+/// logical identities; provider-only decoration is still ignored.
 fn same_argument_up_to_nested_nullability(
     types: (
         &novarocks_functions::FunctionArgumentType,
@@ -696,6 +697,11 @@ fn same_argument_up_to_nested_nullability(
     match types {
         (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
             left.nullable == right.nullable
+                && left.logical_type == right.logical_type
+                && novarocks_type_contract::preserves_nested_logical_identity(
+                    &left.data_type,
+                    &right.data_type,
+                )
                 && crate::literal::arrow_type_equals_ignoring_metadata(
                     &left.data_type,
                     &right.data_type,
@@ -3742,5 +3748,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scalar_result(&bound).data_type, list(list(DataType::Int64)));
+    }
+}
+
+#[cfg(test)]
+mod logical_argument_identity_tests {
+    use super::same_argument_up_to_nested_nullability;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::{FunctionArgumentType, FunctionValueType};
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+    use std::sync::Arc;
+
+    fn value(ty: FunctionValueType) -> FunctionArgumentType {
+        FunctionArgumentType::Value(ty)
+    }
+    fn list(nullable: bool, logical: Option<&str>, decorated: bool) -> FunctionArgumentType {
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(logical) = logical {
+            metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), logical.to_string());
+        }
+        if decorated {
+            metadata.insert("iceberg.field.id".to_string(), "27".to_string());
+        }
+        value(FunctionValueType::new(
+            DataType::List(Arc::new(
+                Field::new("item", DataType::Utf8, nullable).with_metadata(metadata),
+            )),
+            false,
+        ))
+    }
+    #[test]
+    fn aggregate_argument_nullability_allowance_keeps_root_logical_identity() {
+        for (carrier, logical) in [
+            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Variant),
+            (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+            (DataType::Binary, ValueLogicalType::Hll),
+        ] {
+            let physical = value(FunctionValueType::new(carrier.clone(), false));
+            let semantic =
+                value(FunctionValueType::try_with_logical_type(carrier, false, logical).unwrap());
+            assert!(!same_argument_up_to_nested_nullability((
+                &physical, &semantic
+            )));
+            assert!(!same_argument_up_to_nested_nullability((
+                &semantic, &physical
+            )));
+            assert!(same_argument_up_to_nested_nullability((
+                &semantic, &semantic
+            )));
+        }
+        let integer = value(
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        );
+        let uuid = value(
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+        );
+        assert!(!same_argument_up_to_nested_nullability((&integer, &uuid)));
+    }
+    #[test]
+    fn aggregate_argument_nullability_allowance_keeps_nested_json_and_provider_rules() {
+        let json = list(false, Some("json"), false);
+        let nullable_json = list(true, Some("json"), true);
+        let physical = list(true, None, false);
+        assert!(same_argument_up_to_nested_nullability((
+            &json,
+            &nullable_json
+        )));
+        assert!(same_argument_up_to_nested_nullability((
+            &nullable_json,
+            &json
+        )));
+        assert!(!same_argument_up_to_nested_nullability((&json, &physical)));
+        assert!(!same_argument_up_to_nested_nullability((&physical, &json)));
+        let unknown = list(false, Some("not_a_declared_logical_type"), false);
+        assert!(!same_argument_up_to_nested_nullability((
+            &unknown, &unknown
+        )));
     }
 }

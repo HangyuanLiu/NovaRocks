@@ -59,7 +59,7 @@ fn rewrite_top_down(
     ctx: &mut RewriteContext,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(OptExpr, bool), SqlCompileError> {
-    let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx)?;
+    let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx, work)?;
     let (plan, child_changed) = rewrite_children(plan, rule, ctx, work)?;
     Ok((plan, node_changed || child_changed))
 }
@@ -71,7 +71,7 @@ fn rewrite_bottom_up(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(OptExpr, bool), SqlCompileError> {
     let (plan, child_changed) = rewrite_children(plan, rule, ctx, work)?;
-    let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx)?;
+    let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx, work)?;
     Ok((plan, child_changed || node_changed))
 }
 
@@ -79,8 +79,9 @@ fn apply_rule_to_node(
     plan: OptExpr,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<(OptExpr, bool), SqlCompileError> {
-    if super::tree_binder::bind_tree(&rule.pattern(), &plan).is_none() {
+    if super::tree_binder::bind_tree_observed(&rule.pattern(), &plan, work)?.is_none() {
         return Ok((plan, false));
     }
 
@@ -88,7 +89,11 @@ fn apply_rule_to_node(
         return Ok((plan, false));
     }
 
+    ctx.check_deadline(rule.name())?;
+    // OptExpr's derived clone remains opaque: these observations surround the
+    // clone but do not claim cooperative work inside its recursive payload.
     let original = plan.clone();
+    ctx.check_deadline(rule.name())?;
     let phase = rule.phase();
     let rule_name = rule.name();
     ctx.trace_mut().rule_matched(phase, rule_name);
@@ -761,7 +766,7 @@ mod tests {
         assert!(!changed);
         assert_eq!(output.children.len(), 320);
         assert_eq!(rule.visits.load(std::sync::atomic::Ordering::SeqCst), 321);
-        assert_eq!(*control.units.lock().unwrap(), vec![0, 256, 65]);
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 256, 256, 130]);
     }
     #[test]
     fn rewrite_keeps_all_control_categories_at_entry_batch_and_finish() {
@@ -796,7 +801,7 @@ mod tests {
                         assert_eq!(*units, vec![0, 256]);
                         assert!(rule.visits.load(std::sync::atomic::Ordering::SeqCst) < 320);
                     }
-                    StopPoint::Finish => assert_eq!(*units, vec![0, 256, 65]),
+                    StopPoint::Finish => assert_eq!(*units, vec![0, 256, 256, 130]),
                 }
             }
         }
@@ -819,5 +824,89 @@ mod tests {
         drop(owner);
         assert!(weak.upgrade().is_none());
         assert_eq!(output.children.len(), 320);
+    }
+
+    #[test]
+    fn actual_wide_structural_gate_stops_before_field_matching_or_rule_apply() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct StructuralRule {
+            matches: AtomicUsize,
+            applies: AtomicUsize,
+        }
+        impl LogicalRewriteRule for StructuralRule {
+            fn name(&self) -> &'static str {
+                "WideStructuralRule"
+            }
+            fn phase(&self) -> RewritePhase {
+                RewritePhase::StructuralRewrite
+            }
+            fn traversal(&self) -> RewriteTraversal {
+                RewriteTraversal::TopDown
+            }
+            fn pattern(&self) -> Pattern {
+                Pattern::Op {
+                    kind: OpKind::Union,
+                    children: (0..320)
+                        .map(|_| Pattern::Op {
+                            kind: OpKind::Values,
+                            children: vec![],
+                        })
+                        .collect(),
+                }
+            }
+            fn matches(&self, _: &OptExpr, _: &RewriteContext) -> bool {
+                self.matches.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn apply(
+                &self,
+                _: OptExpr,
+                _: &mut RewriteContext,
+            ) -> Result<RewriteResult, SqlCompileError> {
+                self.applies.fetch_add(1, Ordering::SeqCst);
+                Ok(RewriteResult::Unchanged)
+            }
+        }
+        struct OneShotBatch {
+            error: CompileControlError,
+            fired: AtomicBool,
+            units: std::sync::Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for OneShotBatch {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                self.units.lock().unwrap().push(units);
+                if units == 256 && !self.fired.swap(true, Ordering::SeqCst) {
+                    return Err(self.error);
+                }
+                Ok(())
+            }
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = OneShotBatch {
+                error,
+                fired: AtomicBool::new(false),
+                units: Default::default(),
+            };
+            let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+            let rule = StructuralRule {
+                matches: AtomicUsize::new(0),
+                applies: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                rewrite_with_rule(wide_union(), &rule, &mut ctx).unwrap_err(),
+                SqlCompileError::from(error)
+            );
+            assert_eq!(rule.matches.load(Ordering::SeqCst), 0);
+            assert_eq!(rule.applies.load(Ordering::SeqCst), 0);
+            assert!(ctx.trace().events().is_empty());
+            assert_eq!(*control.units.lock().unwrap(), vec![0, 256]);
+            control.checkpoint(CompilePhase::Validate, 0).unwrap();
+        }
     }
 }

@@ -177,8 +177,24 @@ mod tests {
         use crate::optimizer::rewrite::tree_binder::bind_tree;
 
         let rule = AggregatePushdownRule;
-        assert!(bind_tree(&rule.pattern(), &dummy_aggregate()).is_some());
-        assert!(bind_tree(&rule.pattern(), &dummy_scan("t", &["id"])).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &dummy_aggregate(),
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &dummy_scan("t", &["id"]),
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -196,7 +212,13 @@ mod tests {
         set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         assert!(
-            crate::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &plan).is_some()
+            crate::optimizer::rewrite::tree_binder::bind_tree(
+                &rule.pattern(),
+                &plan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
         );
         assert!(matches!(
             rule.apply(plan, &mut ctx).unwrap(),

@@ -659,7 +659,13 @@ mod tests {
         let expr = to_opt_expr(make_left_values(), &mut ctx);
 
         assert!(
-            bind_tree(&rule.pattern(), &expr).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "ScalarApplyToJoin pattern must only match Apply roots"
         );
     }

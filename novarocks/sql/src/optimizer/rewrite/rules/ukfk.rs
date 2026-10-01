@@ -805,8 +805,24 @@ mod tests {
         let project_join = empty_project(join_expr());
         let project_aggregate = empty_project(aggregate_expr(scan_expr("t", &[(1, "k")])));
 
-        assert!(bind_tree(&rule.pattern(), &project_join).is_some());
-        assert!(bind_tree(&rule.pattern(), &project_aggregate).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_join,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_aggregate,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -815,8 +831,24 @@ mod tests {
         let project_aggregate = empty_project(aggregate_expr(scan_expr("t", &[(1, "k")])));
         let project_join = empty_project(join_expr());
 
-        assert!(bind_tree(&rule.pattern(), &project_aggregate).is_some());
-        assert!(bind_tree(&rule.pattern(), &project_join).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_aggregate,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_join,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

@@ -1088,7 +1088,15 @@ mod tests {
         let plan = winmagic_filter_apply();
         let mut ctx = ctx();
         let expr = to_opt_expr(&plan, &mut ctx);
-        assert!(bind_tree(&rule.pattern(), &expr).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&expr, &ctx));
     }
 
@@ -1123,7 +1131,15 @@ mod tests {
         );
         let mut ctx = ctx();
         let expr = to_opt_expr(&apply, &mut ctx);
-        assert!(bind_tree(&rule.pattern(), &expr).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -1143,7 +1159,15 @@ mod tests {
         let mut ctx = ctx();
         let expr = to_opt_expr(&filter_over_join, &mut ctx);
 
-        assert!(bind_tree(&rule.pattern(), &expr).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -1157,7 +1181,15 @@ mod tests {
             let plan = make_filter_apply(predicate.clone(), apply, left.clone(), right.clone());
             let mut ctx = ctx();
             let expr = to_opt_expr(&plan, &mut ctx);
-            assert!(bind_tree(&rule.pattern(), &expr).is_some());
+            assert!(
+                bind_tree(
+                    &rule.pattern(),
+                    &expr,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap()
+                .is_some()
+            );
             rule.matches(&expr, &ctx)
         }
 

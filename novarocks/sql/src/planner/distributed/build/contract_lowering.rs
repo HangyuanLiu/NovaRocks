@@ -9149,10 +9149,11 @@ fn value_type(column: &OutputColumn) -> ValueType {
 /// so a nested argument carries the decoration into the result and the
 /// intermediate state. See [`value_type`].
 fn undecorated(ty: &ValueType) -> ValueType {
-    ValueType::new(
-        novarocks_types::undecorated_nested_type(&ty.data_type),
-        ty.nullable,
-    )
+    ValueType {
+        data_type: novarocks_types::undecorated_nested_type(&ty.data_type),
+        nullable: ty.nullable,
+        logical_type: ty.logical_type,
+    }
 }
 
 /// The same argument type with the provider's decoration off its nested
@@ -9354,10 +9355,11 @@ fn unstatable_runtime_filters(
 /// had read as never null -- the value admits it too. A value that admitted
 /// less would state something its own definition disproves.
 fn published_value_type(declared: &ValueType, expression: &ValueType) -> ValueType {
-    ValueType::new(
-        declared.data_type.clone(),
-        declared.nullable || expression.nullable,
-    )
+    ValueType {
+        data_type: declared.data_type.clone(),
+        nullable: declared.nullable || expression.nullable,
+        logical_type: declared.logical_type,
+    }
 }
 
 /// Whether an expression of this kind answers null wherever an operand does.
@@ -14093,5 +14095,80 @@ mod tests {
             fragment.expressions().get(rows[0][0]).unwrap().kind,
             ContractExprKind::Literal(ContractLiteralValue::LargeInt(i128::MIN))
         ));
+    }
+}
+
+#[cfg(test)]
+mod logical_projection_tests {
+    use super::{ValueType, published_value_type, undecorated, undecorated_argument};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_type_contract::{FunctionArgumentType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+    use std::sync::Arc;
+
+    fn semantic(carrier: DataType, logical: ValueLogicalType) -> ValueType {
+        ValueType::try_with_logical_type(carrier, false, logical).unwrap()
+    }
+    #[test]
+    fn contract_decoration_projection_preserves_all_declared_root_domains() {
+        for source in [
+            semantic(DataType::Utf8, ValueLogicalType::Json),
+            semantic(DataType::LargeBinary, ValueLogicalType::Variant),
+            semantic(DataType::Binary, ValueLogicalType::Hll),
+            semantic(DataType::LargeBinary, ValueLogicalType::Bitmap),
+            semantic(DataType::Binary, ValueLogicalType::Object),
+            semantic(DataType::LargeBinary, ValueLogicalType::Percentile),
+            semantic(DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+            semantic(DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+            ValueType::new(DataType::Int64, false),
+        ] {
+            let projected = undecorated(&source);
+            assert_eq!(projected, source);
+            projected.validate().unwrap();
+            let mut nullable = source.clone();
+            nullable.nullable = true;
+            let published = published_value_type(&source, &nullable);
+            assert_eq!(published, nullable);
+        }
+    }
+    #[test]
+    fn contract_decoration_projection_keeps_nested_json_and_lambda_root_domains() {
+        let source = ValueType::new(
+            DataType::List(Arc::new(
+                Field::new("provider_item", DataType::Utf8, true).with_metadata(
+                    [
+                        (NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string()),
+                        ("iceberg.field.id".to_string(), "19".to_string()),
+                    ]
+                    .into(),
+                ),
+            )),
+            false,
+        );
+        let projected = undecorated(&source);
+        let DataType::List(field) = &projected.data_type else {
+            panic!("list projection");
+        };
+        assert_eq!(field.name(), "item");
+        assert!(field.is_nullable());
+        assert_eq!(field.metadata().len(), 1);
+        assert_eq!(field.metadata()[NR_LOGICAL_TYPE_KEY], "json");
+        assert_eq!(projected.logical_type, ValueLogicalType::Physical);
+        projected.validate().unwrap();
+        let json = semantic(DataType::Utf8, ValueLogicalType::Json);
+        let variant = semantic(DataType::LargeBinary, ValueLogicalType::Variant);
+        let lambda = FunctionArgumentType::Lambda {
+            parameter_types: vec![json.clone(), source.clone()].into_boxed_slice(),
+            result_type: variant.clone(),
+        };
+        let FunctionArgumentType::Lambda {
+            parameter_types,
+            result_type,
+        } = undecorated_argument(&lambda)
+        else {
+            panic!("lambda projection");
+        };
+        assert_eq!(parameter_types[0], json);
+        assert_eq!(parameter_types[1], projected);
+        assert_eq!(result_type, variant);
     }
 }

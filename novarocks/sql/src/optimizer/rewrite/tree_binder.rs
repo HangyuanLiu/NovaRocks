@@ -33,9 +33,11 @@
 //! Unlike the memo binder, an `OptExpr` child is one concrete subtree, so a
 //! successful match produces at most one binding.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{Pattern, op_kind};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 /// A successful tree pattern match.
 ///
@@ -82,24 +84,51 @@ impl<'t> TreeBinding<'t> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn bind_tree<'t>(pattern: &Pattern, expr: &'t OptExpr) -> Option<TreeBinding<'t>> {
-    match_pattern(pattern, expr).map(|interiors| TreeBinding {
-        root: expr,
-        interiors,
-    })
+pub(crate) fn bind_tree<'t>(
+    pattern: &Pattern,
+    expr: &'t OptExpr,
+    control: &dyn PureCompileControl,
+) -> Result<Option<TreeBinding<'t>>, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = bind_tree_observed(pattern, expr, &mut work)?;
+    work.finish()?;
+    Ok(result)
 }
 
-fn match_pattern<'t>(pattern: &Pattern, expr: &'t OptExpr) -> Option<Vec<&'t OptExpr>> {
+/// Reuse the rewrite traversal's same-request observation owner. The caller
+/// owns entry and finish; the successful binding retains only tree references.
+pub(crate) fn bind_tree_observed<'t>(
+    pattern: &Pattern,
+    expr: &'t OptExpr,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<TreeBinding<'t>>, SqlCompileError> {
+    let mut interiors = Vec::new();
+    if !match_pattern(pattern, expr, &mut interiors, work)? {
+        return Ok(None);
+    }
+    Ok(Some(TreeBinding {
+        root: expr,
+        interiors,
+    }))
+}
+
+fn match_pattern<'t>(
+    pattern: &Pattern,
+    expr: &'t OptExpr,
+    interiors: &mut Vec<&'t OptExpr>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    work.step()?;
     match pattern {
-        Pattern::Leaf | Pattern::MultiLeaf => Some(Vec::new()),
+        Pattern::Leaf | Pattern::MultiLeaf => Ok(true),
         Pattern::Op { kind, children } => {
             if op_kind(&expr.op) != Some(*kind) {
-                return None;
+                return Ok(false);
             }
 
-            let mut interiors = vec![expr];
-            interiors.extend(match_children(children, &expr.children)?);
-            Some(interiors)
+            work.step()?;
+            interiors.push(expr);
+            match_children(children, &expr.children, interiors, work)
         }
     }
 }
@@ -107,7 +136,10 @@ fn match_pattern<'t>(pattern: &Pattern, expr: &'t OptExpr) -> Option<Vec<&'t Opt
 fn match_children<'t>(
     patterns: &[Pattern],
     child_exprs: &'t [OptExpr],
-) -> Option<Vec<&'t OptExpr>> {
+    interiors: &mut Vec<&'t OptExpr>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    work.step()?;
     let has_multi_leaf_tail = matches!(patterns.last(), Some(Pattern::MultiLeaf));
     let fixed_patterns = if has_multi_leaf_tail {
         &patterns[..patterns.len() - 1]
@@ -115,34 +147,36 @@ fn match_children<'t>(
         patterns
     };
 
-    if fixed_patterns
-        .iter()
-        .any(|pattern| matches!(pattern, Pattern::MultiLeaf))
-    {
-        return None;
+    for pattern in fixed_patterns {
+        work.step()?;
+        if matches!(pattern, Pattern::MultiLeaf) {
+            return Ok(false);
+        }
     }
 
     if has_multi_leaf_tail {
         if child_exprs.len() < fixed_patterns.len() {
-            return None;
+            return Ok(false);
         }
     } else if child_exprs.len() != fixed_patterns.len() {
-        return None;
+        return Ok(false);
     }
 
-    let mut interiors = Vec::new();
     for (pattern, child_expr) in fixed_patterns.iter().zip(child_exprs.iter()) {
-        interiors.extend(match_pattern(pattern, child_expr)?);
+        work.step()?;
+        if !match_pattern(pattern, child_expr, interiors, work)? {
+            return Ok(false);
+        }
     }
 
-    Some(interiors)
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use std::ptr;
 
-    use super::bind_tree;
+    use super::TreeBinding;
     use crate::common::{JoinKind, LiteralValue};
     use crate::optimizer::operator::{FilterOp, LogicalJoinOp, Operator, ScanOp};
     use crate::optimizer::opt_expr::OptExpr;
@@ -150,6 +184,15 @@ mod tests {
     use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
+
+    fn bind_tree<'t>(pattern: &Pattern, expr: &'t OptExpr) -> Option<TreeBinding<'t>> {
+        super::bind_tree(
+            pattern,
+            expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+    }
 
     fn bool_literal_scalar(arena: &mut ScalarArena) -> ScalarId {
         arena.intern(
@@ -306,5 +349,220 @@ mod tests {
         };
 
         assert!(bind_tree(&pattern, &join).is_none());
+    }
+
+    #[derive(Clone, Copy)]
+    enum Stop {
+        Entry,
+        Positive(u32),
+        Finish,
+    }
+
+    struct Control {
+        units: std::sync::Mutex<Vec<u32>>,
+        stop: Option<(Stop, novarocks_type_contract::CompileControlError)>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            use std::sync::atomic::Ordering;
+            assert_eq!(phase, novarocks_type_contract::CompilePhase::Validate);
+            let mut recorded = self.units.lock().unwrap();
+            recorded.push(units);
+            let total: u32 = recorded.iter().sum();
+            if let Some((stop, error)) = self.stop {
+                let hit = match stop {
+                    Stop::Entry => units == 0,
+                    Stop::Positive(limit) => units > 0 && total >= limit,
+                    Stop::Finish => units > 0 && units < 256,
+                };
+                if hit && !self.fired.swap(true, Ordering::SeqCst) {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+    }
+    impl Control {
+        fn new(stop: Option<(Stop, novarocks_type_contract::CompileControlError)>) -> Self {
+            Self {
+                units: Default::default(),
+                stop,
+                fired: Default::default(),
+            }
+        }
+    }
+
+    fn wide_scan_union(count: usize) -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalUnion(crate::optimizer::operator::UnionOp {
+                all: true,
+                output_columns: vec![],
+                child_output_columns: vec![vec![]; count],
+            }),
+            (0..count).map(|_| mk_scan()).collect(),
+        )
+    }
+    fn wide_scan_pattern(count: usize) -> Pattern {
+        Pattern::Op {
+            kind: OpKind::Union,
+            children: (0..count)
+                .map(|_| Pattern::Op {
+                    kind: OpKind::Scan,
+                    children: vec![Pattern::MultiLeaf],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn wide_actual_matching_preserves_preorder_and_borrowed_source_identity() {
+        let tree = wide_scan_union(320);
+        let pattern = wide_scan_pattern(320);
+        let control = Control::new(None);
+        let binding = super::bind_tree(&pattern, &tree, &control)
+            .unwrap()
+            .expect("all actual scan children match");
+        assert!(ptr::eq(binding.root(), &tree));
+        assert_eq!(binding.interiors.len(), 321);
+        assert!(ptr::eq(binding.node(0), &tree));
+        for (ordinal, child) in tree.children.iter().enumerate() {
+            assert!(ptr::eq(binding.node(ordinal + 1), child));
+            assert!(ptr::eq(binding.op(ordinal + 1), &child.op));
+        }
+        let units = control.units.lock().unwrap();
+        assert_eq!(units[0], 0);
+        assert_eq!(units.iter().sum::<u32>(), 1603);
+        assert!(units.iter().all(|units| *units <= 256));
+        drop(units);
+
+        let mut wrong = wide_scan_pattern(320);
+        let Pattern::Op { children, .. } = &mut wrong else {
+            unreachable!()
+        };
+        children[319] = Pattern::Op {
+            kind: OpKind::Filter,
+            children: vec![Pattern::MultiLeaf],
+        };
+        let mismatch_control = Control::new(None);
+        assert!(
+            super::bind_tree(&wrong, &tree, &mismatch_control)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            mismatch_control.units.lock().unwrap().iter().sum::<u32>(),
+            1601
+        );
+    }
+
+    #[test]
+    fn wildcard_and_multi_tail_do_not_traverse_captured_subtrees() {
+        let tree = wide_scan_union(320);
+        let owner = std::sync::Arc::new(Control::new(None));
+        let weak = std::sync::Arc::downgrade(&owner);
+        let binding = super::bind_tree(&Pattern::Leaf, &tree, owner.as_ref())
+            .unwrap()
+            .unwrap();
+        assert!(binding.interiors.is_empty());
+        assert_eq!(*owner.units.lock().unwrap(), vec![0, 1]);
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        assert!(ptr::eq(binding.root(), &tree));
+
+        let tail = Pattern::Op {
+            kind: OpKind::Union,
+            children: vec![
+                Pattern::Op {
+                    kind: OpKind::Scan,
+                    children: vec![Pattern::MultiLeaf],
+                },
+                Pattern::MultiLeaf,
+            ],
+        };
+        let control = Control::new(None);
+        let binding = super::bind_tree(&tail, &tree, &control).unwrap().unwrap();
+        assert_eq!(binding.interiors.len(), 2);
+        assert!(ptr::eq(binding.node(1), &tree.children[0]));
+        assert_eq!(*control.units.lock().unwrap(), vec![0, 8]);
+    }
+
+    #[test]
+    fn tree_matching_preserves_one_shot_controls_at_entry_child_scan_and_interiors() {
+        use crate::compiler::SqlCompileError;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for stop in [
+                Stop::Entry,
+                Stop::Positive(256),
+                Stop::Positive(512),
+                Stop::Finish,
+            ] {
+                let tree = wide_scan_union(320);
+                let pattern = wide_scan_pattern(320);
+                let control = Control::new(Some((stop, error)));
+                let result = super::bind_tree(&pattern, &tree, &control);
+                assert!(matches!(result, Err(failure) if failure == SqlCompileError::from(error)));
+                let before = control.units.lock().unwrap().clone();
+                assert_eq!(before[0], 0);
+                match stop {
+                    Stop::Entry => assert_eq!(before, vec![0]),
+                    Stop::Positive(limit) => {
+                        assert_eq!(before.iter().sum::<u32>(), limit);
+                        assert_eq!(before.last(), Some(&256));
+                    }
+                    Stop::Finish => assert_eq!(before.iter().sum::<u32>(), 1603),
+                }
+                // The same owner now permits progress. The first failure must
+                // remain a typed failure, never a structural non-match.
+                control.checkpoint(CompilePhase::Validate, 0).unwrap();
+            }
+            let tree = mk_scan();
+            let mismatch = Pattern::Op {
+                kind: OpKind::Filter,
+                children: vec![],
+            };
+            for pattern in [&Pattern::Leaf, &mismatch] {
+                let control = Control::new(Some((Stop::Entry, error)));
+                assert!(matches!(
+                    super::bind_tree(pattern, &tree, &control),
+                    Err(failure) if failure == SqlCompileError::from(error)
+                ));
+                assert_eq!(*control.units.lock().unwrap(), vec![0]);
+            }
+        }
+    }
+
+    #[test]
+    fn short_finish_failure_discards_both_match_and_non_match() {
+        use crate::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        let tree = mk_scan();
+        let mismatch = Pattern::Op {
+            kind: OpKind::Filter,
+            children: vec![],
+        };
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for pattern in [&Pattern::Leaf, &mismatch] {
+                let control = Control::new(Some((Stop::Finish, error)));
+                assert!(matches!(
+                    super::bind_tree(pattern, &tree, &control),
+                    Err(failure) if failure == SqlCompileError::from(error)
+                ));
+                assert_eq!(*control.units.lock().unwrap(), vec![0, 1]);
+            }
+        }
     }
 }

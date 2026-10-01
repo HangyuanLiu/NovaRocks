@@ -614,7 +614,13 @@ mod tests {
         let rule = JoinPredicateMoveAround;
 
         assert!(
-            bind_tree(&rule.pattern(), &scan).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &scan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "JoinPredicateMoveAround pattern must only match Join roots"
         );
     }

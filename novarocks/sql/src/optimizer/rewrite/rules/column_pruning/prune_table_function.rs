@@ -121,7 +121,13 @@ mod tests {
 
         // pattern gates the structural operator kind.
         assert!(
-            crate::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &expr).is_some()
+            crate::optimizer::rewrite::tree_binder::bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
         );
 
         // apply always returns Unchanged

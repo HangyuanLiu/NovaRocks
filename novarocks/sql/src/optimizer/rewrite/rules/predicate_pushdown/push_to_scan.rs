@@ -317,7 +317,15 @@ mod tests {
         let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), scan);
         let rule = PushDownPredicateScan;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         let result = rule.apply(filter, &mut ctx).unwrap();
         match result {
             RewriteResult::Changed(out) => match &out.op {
@@ -335,7 +343,15 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = scan_opt(&mut arena, &["a"]);
         let rule = PushDownPredicateScan;
-        assert!(bind_tree(&rule.pattern(), &scan).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &scan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -351,7 +367,15 @@ mod tests {
         );
         let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), project);
         let rule = PushDownPredicateScan;
-        assert!(bind_tree(&rule.pattern(), &filter).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
