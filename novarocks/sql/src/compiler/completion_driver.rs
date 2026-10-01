@@ -986,6 +986,14 @@ impl From<novarocks_type_contract::ValueTypeError> for ProviderColumnProjectionE
         Self::Source(error.into())
     }
 }
+impl ProviderColumnProjectionError {
+    fn into_compile_error(self) -> SqlCompileError {
+        match self {
+            Self::Control(error) => SqlCompileError::from(error),
+            Self::Source(error) => SqlCompileError::Compilation(error.to_string()),
+        }
+    }
+}
 
 type ProviderColumnProjection = (
     Box<[ProviderReadColumnNeed]>,
@@ -1064,16 +1072,21 @@ fn provider_columns(
             .declared_value_type_observed(|| {
                 work.step().map_err(ProviderColumnProjectionError::Control)
             })
-            .map_err(|error| match error {
-                ProviderColumnProjectionError::Control(error) => SqlCompileError::from(error),
-                ProviderColumnProjectionError::Source(error) => {
-                    SqlCompileError::Compilation(error.to_string())
-                }
-            })?;
+            .map_err(ProviderColumnProjectionError::into_compile_error)?;
         if logical.name != source.name
-            || logical.value_type != source_value_type
+            || !logical
+                .value_type
+                .exactly_equals_observed(&source_value_type, || {
+                    work.step().map_err(ProviderColumnProjectionError::Control)
+                })
+                .map_err(ProviderColumnProjectionError::into_compile_error)?
             || output.name != source.name
-            || output.value_type != source_value_type
+            || !output
+                .value_type
+                .exactly_equals_observed(&source_value_type, || {
+                    work.step().map_err(ProviderColumnProjectionError::Control)
+                })
+                .map_err(ProviderColumnProjectionError::into_compile_error)?
         {
             return Err(SqlCompileError::Compilation(format!(
                 "scan output '{}' differs from its exact provider schema column",
@@ -1393,6 +1406,86 @@ mod tests {
                 assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
             }
         }
+    }
+
+    #[test]
+    fn provider_completion_controls_interior_of_one_nested_column_comparison() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            failure: CompileControlError,
+            fail_at: usize,
+            observations: std::sync::Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::ProviderValidation);
+                let mut observations = self.observations.lock().unwrap();
+                observations.push(units);
+                if observations.len() == self.fail_at {
+                    Err(self.failure)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let value_type = ValueType::new(
+            DataType::Struct(
+                (0..100)
+                    .map(|index| {
+                        arrow::datatypes::Field::new(
+                            format!("child{index}"),
+                            DataType::Int32,
+                            false,
+                        )
+                    })
+                    .collect(),
+            ),
+            false,
+        );
+        let mut plan = provider_type_scan(value_type, 1);
+        let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
+            panic!("scan fixture");
+        };
+        // The actual physical source has no declaration to project. Count its
+        // traversal separately so the failure below must occur in comparison.
+        scan.table.columns[0].logical_type = None;
+        let mut source_work = 0;
+        scan.table.columns[0]
+            .declared_value_type_observed::<novarocks_types::ColumnValueTypeError>(|| {
+                source_work += 1;
+                Ok(())
+            })
+            .unwrap();
+        // Four outer steps precede this source projection. The first full
+        // checkpoint after those steps and the source walk is in exact Eq.
+        let fail_at = (source_work + 4) / 256 + 2;
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let owner = Owner {
+                failure,
+                fail_at,
+                observations: Default::default(),
+            };
+            assert!(
+                matches!(collect_provider_needs(plan.clone(), 0, false, &owner),
+                Err(actual) if actual == SqlCompileError::from(failure))
+            );
+            let observations = owner.observations.lock().unwrap();
+            assert_eq!(observations.len(), fail_at);
+            assert_eq!(observations[0], 0);
+            assert!(observations[1..].iter().all(|units| *units == 256));
+        }
+        let (_, needs) =
+            collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()).unwrap();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].columns().len(), 1);
     }
 
     struct CancelOnSecondObservation(AtomicUsize);

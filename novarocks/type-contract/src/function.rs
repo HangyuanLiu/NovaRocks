@@ -149,6 +149,21 @@ impl FunctionValueType {
             && expected.validate().is_ok()
     }
 
+    /// Compare the exact frozen value type, including nested provider and
+    /// dictionary facts. This observes the borrowed traversal; it does not
+    /// replace the owner's metadata admission or allocation policy.
+    pub fn exactly_equals_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        if self.nullable != other.nullable || self.logical_type != other.logical_type {
+            return Ok(false);
+        }
+        crate::arrow_data_types_exact_observed(&self.data_type, &other.data_type, observe)
+    }
+
     pub fn same_value_domain_observed<E: From<crate::ValueTypeError>>(
         &self,
         other: &Self,
@@ -400,6 +415,130 @@ pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
 #[cfg(test)]
 mod tests {
     use super::{AggregateStateFormatId, FunctionId, FunctionIdentityError};
+
+    #[test]
+    fn observed_value_type_equality_preserves_exact_frozen_identity() {
+        use crate::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType, ValueTypeError};
+        use arrow_schema::{DataType, Field};
+        #[allow(deprecated)]
+        let nested = |dict_id, ordered, nullable, annotation: &str, logical: &str| {
+            FunctionValueType::new(
+                DataType::Struct(
+                    vec![
+                        Field::new_dict(
+                            "dictionary",
+                            DataType::Dictionary(
+                                Box::new(DataType::Int8),
+                                Box::new(DataType::Utf8),
+                            ),
+                            nullable,
+                            dict_id,
+                            ordered,
+                        )
+                        .with_metadata([("provider".to_owned(), annotation.to_owned())].into()),
+                        if logical.is_empty() {
+                            Field::new("payload", DataType::Utf8, false)
+                        } else {
+                            Field::new("payload", DataType::Utf8, false).with_metadata(
+                                [(NR_LOGICAL_TYPE_KEY.to_owned(), logical.to_owned())].into(),
+                            )
+                        },
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let value = nested(7, false, true, "source", "json");
+        for other in [
+            value.clone(),
+            nested(8, false, true, "source", "json"),
+            nested(7, true, true, "source", "json"),
+            nested(7, false, false, "source", "json"),
+            nested(7, false, true, "other", "json"),
+            nested(7, false, true, "source", ""),
+        ] {
+            assert_eq!(
+                value
+                    .exactly_equals_observed::<ValueTypeError>(&other, || Ok(()))
+                    .unwrap(),
+                value == other,
+            );
+        }
+        let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
+        let uuid = FunctionValueType::try_with_logical_type(
+            physical.data_type.clone(),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        assert!(
+            !physical
+                .exactly_equals_observed::<ValueTypeError>(&uuid, || Ok(()))
+                .unwrap()
+        );
+        assert!(
+            !physical
+                .exactly_equals_observed::<ValueTypeError>(
+                    &FunctionValueType::new(physical.data_type.clone(), true),
+                    || Ok(()),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn observed_value_type_equality_preserves_control_failure_at_entry_and_interior() {
+        use crate::{CompileControlError, FunctionValueType, ValueTypeError};
+        use arrow_schema::{DataType, Field};
+        #[derive(Debug, PartialEq)]
+        enum Failure {
+            Type(ValueTypeError),
+            Control(CompileControlError),
+        }
+        impl From<ValueTypeError> for Failure {
+            fn from(value: ValueTypeError) -> Self {
+                Self::Type(value)
+            }
+        }
+        let value = FunctionValueType::new(
+            DataType::Struct(
+                (0..320)
+                    .map(|index| Field::new(index.to_string(), DataType::Int32, false))
+                    .collect(),
+            ),
+            false,
+        );
+        let mut visits = 0;
+        assert!(
+            value
+                .exactly_equals_observed::<ValueTypeError>(&value, || {
+                    visits += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(visits > 960);
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for stop in [1, 256, visits] {
+                let mut observed = 0;
+                let result = value.exactly_equals_observed::<Failure>(&value, || {
+                    observed += 1;
+                    if observed == stop {
+                        Err(Failure::Control(failure))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert_eq!(result, Err(Failure::Control(failure)));
+                assert_eq!(observed, stop);
+            }
+        }
+    }
 
     #[test]
     fn source_field_value_domain_is_explicit_and_validated() {
