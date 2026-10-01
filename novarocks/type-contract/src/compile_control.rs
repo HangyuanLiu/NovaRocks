@@ -92,11 +92,31 @@ impl<'a> CompileCheckpoints<'a> {
         }
         Ok(())
     }
-    pub fn finish(self) -> Result<(), CompileControlError> {
+    /// Observe the completed tail before handing work to an exact owner. The
+    /// next operation keeps this same control and budget; flushing is not a
+    /// new admission or a resource reset.
+    pub fn flush(&mut self) -> Result<(), CompileControlError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        self.owner.checkpoint(self.phase, self.pending)
+        match self.owner.checkpoint(self.phase, self.pending) {
+            Ok(()) => {
+                self.pending = 0;
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = Some(error);
+                Err(error)
+            }
+        }
+    }
+    /// Borrow the original caller control for work delegated to another owner.
+    /// The caller flushes its pending work before entering that owner.
+    pub fn control(&self) -> &'a dyn PureCompileControl {
+        self.owner
+    }
+    pub fn finish(mut self) -> Result<(), CompileControlError> {
+        self.flush()
     }
 }
 
@@ -161,6 +181,98 @@ mod tests {
                 *owner.units.lock().unwrap(),
                 vec![0, MAX_UNOBSERVED_COMPILE_WORK]
             );
+        }
+    }
+
+    struct PhaseOwner {
+        calls: Mutex<Vec<(CompilePhase, u32)>>,
+        fail_at: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for PhaseOwner {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((phase, units));
+            if let Some((index, error)) = self.fail_at
+                && calls.len() == index
+            {
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flush_observes_and_resets_tails_without_replacing_the_borrowed_control() {
+        let owner = PhaseOwner {
+            calls: Mutex::default(),
+            fail_at: None,
+        };
+        let phase = CompilePhase::FunctionSpecialization;
+        let mut checksum = 0u64;
+        let original_control = {
+            let mut scope = CompileCheckpoints::try_new(&owner, phase).unwrap();
+            for value in 0u64..7 {
+                checksum += value;
+                scope.step().unwrap();
+            }
+            scope.flush().unwrap();
+            // A flush with no intervening work still observes control.
+            scope.flush().unwrap();
+            for value in 7u64..266 {
+                checksum += value;
+                scope.step().unwrap();
+            }
+            let original = scope.control();
+            scope.finish().unwrap();
+            original
+        };
+        assert_eq!(checksum, (0u64..266).sum::<u64>());
+        assert_eq!(
+            *owner.calls.lock().unwrap(),
+            vec![(phase, 0), (phase, 7), (phase, 0), (phase, 256), (phase, 3)]
+        );
+        // The getter borrows the original owner's lifetime, rather than the
+        // completed checkpoint scope. This call still reaches that owner.
+        original_control
+            .checkpoint(CompilePhase::Encode, 0)
+            .unwrap();
+        assert_eq!(
+            owner.calls.lock().unwrap().last(),
+            Some(&(CompilePhase::Encode, 0))
+        );
+    }
+
+    #[test]
+    fn flush_failures_latch_short_and_zero_tails_without_repeated_charges() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for tail in [0u32, 7] {
+                let owner = PhaseOwner {
+                    calls: Mutex::default(),
+                    // Only the first flush fails. Re-entering the owner would
+                    // return success, exposing a lost latch or double charge.
+                    fail_at: Some((2, error)),
+                };
+                let phase = CompilePhase::LowerProgram;
+                let mut scope = CompileCheckpoints::try_new(&owner, phase).unwrap();
+                let mut checksum = 0u64;
+                for value in 0..tail {
+                    checksum += u64::from(value);
+                    scope.step().unwrap();
+                }
+                assert_eq!(checksum, (0..tail).map(u64::from).sum::<u64>());
+                assert_eq!(scope.flush(), Err(error));
+                assert_eq!(scope.step(), Err(error));
+                assert_eq!(scope.flush(), Err(error));
+                assert_eq!(scope.finish(), Err(error));
+                assert_eq!(
+                    *owner.calls.lock().unwrap(),
+                    vec![(phase, 0), (phase, tail)]
+                );
+            }
         }
     }
 }

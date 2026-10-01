@@ -41,8 +41,10 @@ use novarocks_execution::exec::expr::{
     ExprArena, ExprId, ExprNode, LiteralValue as ExecLiteralValue,
 };
 use novarocks_sql::compiler::{
-    BinOp, FoldNodeKind, FoldRequest, LiteralValue as SqlLiteralValue, SqlConstantEvaluator, UnOp,
+    BinOp, FoldNodeKind, FoldRequest, LiteralValue as SqlLiteralValue, SqlConstantEvaluationError,
+    SqlConstantEvaluator, UnOp,
 };
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::largeint;
 use std::sync::Arc;
 
@@ -65,24 +67,56 @@ pub(crate) fn constant_evaluator() -> &'static dyn SqlConstantEvaluator {
 }
 
 impl SqlConstantEvaluator for ExecutionConstantEvaluator {
-    fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<SqlLiteralValue>, String> {
-        let mut arena = ExprArena::default();
-        let mut arg_ids: Vec<ExprId> = Vec::with_capacity(request.args.len());
-        for arg in &request.args {
-            let Some(literal) = sql_literal_to_exec(&arg.value, &arg.data_type) else {
+    fn eval_scalar(
+        &self,
+        request: &FoldRequest,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<SqlLiteralValue>, SqlConstantEvaluationError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let evaluated = (|| -> Result<Option<SqlLiteralValue>, SqlConstantEvaluationError> {
+            let mut arena = ExprArena::default();
+            let mut arg_ids: Vec<ExprId> = Vec::with_capacity(request.args.len());
+            for arg in &request.args {
+                work.step()?;
+                let Some(literal) = sql_literal_to_exec(&arg.value, &arg.data_type) else {
+                    return Ok(None);
+                };
+                arg_ids.push(arena.push_typed(ExprNode::Literal(literal), arg.data_type.clone()));
+            }
+
+            work.step()?;
+            let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
                 return Ok(None);
             };
-            arg_ids.push(arena.push_typed(ExprNode::Literal(literal), arg.data_type.clone()));
-        }
+            let root = arena.push_typed(root_node, request.out_type.clone());
 
-        let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
-            return Ok(None);
-        };
-        let root = arena.push_typed(root_node, request.out_type.clone());
+            let chunk = single_row_chunk()?;
+            // The legacy kernel and literal/type cloning remain opaque here.
+            // Flush the adapter's work and observe the original request before
+            // entering it; this is not an internal kernel work/MEM guarantee.
+            work.flush()?;
+            let output = arena.eval(root, &chunk)?;
+            work.step()?;
+            Ok(read_back_row0(&output, &request.out_type)?)
+        })();
+        // Success, conversion/shape declines and ordinary kernel/readback
+        // errors all observe completion. Control failures remain typed and
+        // never become a fail-open legacy evaluation String.
+        work.finish()?;
+        evaluated
+    }
+}
 
-        let chunk = single_row_chunk()?;
-        let output = arena.eval(root, &chunk)?;
-        read_back_row0(&output, &request.out_type)
+#[cfg(test)]
+struct TestControl;
+#[cfg(test)]
+impl PureCompileControl for TestControl {
+    fn checkpoint(
+        &self,
+        _: CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
     }
 }
 
@@ -402,13 +436,16 @@ mod tests {
         kind: FoldNodeKind,
         args: Vec<FoldArg>,
         out_type: DataType,
-    ) -> Result<Option<SqlLiteralValue>, String> {
-        constant_evaluator().eval_scalar(&FoldRequest {
-            kind,
-            args,
-            out_type,
-            out_nullable: true,
-        })
+    ) -> Result<Option<SqlLiteralValue>, SqlConstantEvaluationError> {
+        constant_evaluator().eval_scalar(
+            &FoldRequest {
+                kind,
+                args,
+                out_type,
+                out_nullable: true,
+            },
+            &TestControl,
+        )
     }
 
     #[test]
@@ -660,15 +697,14 @@ mod overflow_policy_tests {
                 out_type: DataType::Decimal128(38, 0),
                 out_nullable: true,
             };
-            let result = constant_evaluator().eval_scalar(&request);
+            let result = constant_evaluator().eval_scalar(&request, &TestControl);
             if policy == OutputNull {
                 assert_eq!(result, Ok(Some(SqlLiteralValue::Null)));
             } else {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .contains("'add' operation involving decimal values overflows")
-                );
+                let SqlConstantEvaluationError::Evaluation(message) = result.unwrap_err() else {
+                    panic!("ordinary decimal overflow must remain an evaluation error");
+                };
+                assert!(message.contains("'add' operation involving decimal values overflows"));
             }
             let request = FoldRequest {
                 kind: FoldNodeKind::Cast(policy),
@@ -676,12 +712,211 @@ mod overflow_policy_tests {
                 out_type: DataType::Decimal128(9, 0),
                 out_nullable: true,
             };
-            let result = constant_evaluator().eval_scalar(&request);
+            let result = constant_evaluator().eval_scalar(&request, &TestControl);
             if policy == OutputNull {
                 assert_eq!(result, Ok(Some(SqlLiteralValue::Null)));
             } else {
-                assert!(result.unwrap_err().contains("overflows"));
+                let SqlConstantEvaluationError::Evaluation(message) = result.unwrap_err() else {
+                    panic!("ordinary decimal overflow must remain an evaluation error");
+                };
+                assert!(message.contains("overflows"));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_control_tests {
+    use super::*;
+    use novarocks_sql::compiler::FoldArg;
+    use novarocks_type_contract::{
+        CompileControlError, DecimalOverflowPolicy, MAX_UNOBSERVED_COMPILE_WORK,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Control {
+        checks: Mutex<Vec<u32>>,
+        fail_at: Option<(usize, CompileControlError)>,
+    }
+    impl Control {
+        fn checks(&self) -> Vec<u32> {
+            self.checks.lock().unwrap().clone()
+        }
+        fn failing(at: usize, error: CompileControlError) -> Self {
+            Self {
+                checks: Mutex::default(),
+                fail_at: Some((at, error)),
+            }
+        }
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::FunctionSpecialization);
+            assert!(units <= MAX_UNOBSERVED_COMPILE_WORK);
+            let mut checks = self.checks.lock().unwrap();
+            let index = checks.len();
+            checks.push(units);
+            if let Some((at, error)) = self.fail_at
+                && index == at
+            {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn arg(value: SqlLiteralValue, data_type: DataType) -> FoldArg {
+        FoldArg {
+            value,
+            data_type,
+            nullable: false,
+        }
+    }
+    fn request(kind: FoldNodeKind, args: Vec<FoldArg>, out_type: DataType) -> FoldRequest {
+        FoldRequest {
+            kind,
+            args,
+            out_type,
+            out_nullable: true,
+        }
+    }
+    fn all_errors() -> [CompileControlError; 3] {
+        [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ]
+    }
+    fn assert_stopped(
+        request: &FoldRequest,
+        checks: &[u32],
+        at: usize,
+        error: CompileControlError,
+    ) {
+        let control = Control::failing(at, error);
+        assert_eq!(
+            constant_evaluator().eval_scalar(request, &control),
+            Err(SqlConstantEvaluationError::Control(error))
+        );
+        assert_eq!(control.checks(), checks[..=at]);
+    }
+
+    #[test]
+    fn real_wide_arguments_observe_entry_interior_and_decline_completion() {
+        let request = request(
+            FoldNodeKind::Function {
+                name: "no_such_novarocks_function".into(),
+            },
+            vec![arg(SqlLiteralValue::Int(7), DataType::Int64); 320],
+            DataType::Int64,
+        );
+        let control = Control::default();
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &control),
+            Ok(None)
+        );
+        let checks = control.checks();
+        assert_eq!(checks[0], 0);
+        let interior = checks.iter().position(|units| *units == 256).unwrap();
+        let finish = checks.len() - 1;
+        assert!(finish > interior);
+        assert!((1..256).contains(&checks[finish]));
+        for error in all_errors() {
+            for at in [0, interior, finish] {
+                assert_stopped(&request, &checks, at, error);
+            }
+        }
+    }
+
+    #[test]
+    fn literal_conversion_decline_still_observes_completion() {
+        let request = request(
+            FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
+            vec![arg(SqlLiteralValue::String("7".into()), DataType::Int32)],
+            DataType::Int64,
+        );
+        let control = Control::default();
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &control),
+            Ok(None)
+        );
+        let checks = control.checks();
+        assert_eq!(checks, [0, 1]);
+        for error in all_errors() {
+            assert_stopped(&request, &checks, 1, error);
+        }
+    }
+
+    #[test]
+    fn output_tail_cancellation_never_returns_the_completed_kernel_value() {
+        let request = request(
+            FoldNodeKind::BinaryOp(BinOp::Add, DecimalOverflowPolicy::OutputNull),
+            vec![arg(SqlLiteralValue::Int(1), DataType::Int32); 2],
+            DataType::Int32,
+        );
+        let control = Control::default();
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &control),
+            Ok(Some(SqlLiteralValue::Int(2)))
+        );
+        let checks = control.checks();
+        assert_eq!(checks[0], 0);
+        assert_eq!(checks.len(), 3);
+        assert!(checks[1] > 0); // Actual argument/root work flushes before eval.
+        assert!(checks[2] > 0); // The actual produced row observes completion.
+        for error in all_errors() {
+            for at in [1, 2] {
+                assert_stopped(&request, &checks, at, error);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_kernel_errors_remain_evaluation_errors_and_observe_completion() {
+        let request = request(
+            FoldNodeKind::BinaryOp(BinOp::Add, DecimalOverflowPolicy::ReportError),
+            vec![
+                arg(
+                    SqlLiteralValue::Decimal("99999999999999999999999999999999999999".into()),
+                    DataType::Decimal128(38, 0),
+                ),
+                arg(SqlLiteralValue::Int(1), DataType::Int64),
+            ],
+            DataType::Decimal128(38, 0),
+        );
+        let control = Control::default();
+        let SqlConstantEvaluationError::Evaluation(message) = constant_evaluator()
+            .eval_scalar(&request, &control)
+            .unwrap_err()
+        else {
+            panic!("the actual decimal kernel error must not become request control");
+        };
+        assert!(message.contains("'add' operation involving decimal values overflows"));
+        let checks = control.checks();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[2], 0); // A failed opaque call still observes exit.
+        for error in all_errors() {
+            assert_stopped(&request, &checks, 2, error);
+        }
+    }
+
+    #[test]
+    fn unreadable_output_decline_observes_the_same_original_control() {
+        let request = request(
+            FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
+            vec![arg(SqlLiteralValue::Int(7), DataType::Int32)],
+            DataType::UInt32,
+        );
+        let control = Control::default();
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &control),
+            Ok(None)
+        );
+        let checks = control.checks();
+        assert_eq!(checks.len(), 3);
+        for error in all_errors() {
+            assert_stopped(&request, &checks, checks.len() - 1, error);
         }
     }
 }

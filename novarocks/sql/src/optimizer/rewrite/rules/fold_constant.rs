@@ -36,7 +36,9 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::compiler::{FoldArg, FoldNodeKind, FoldRequest, SqlConstantEvaluator};
+use crate::compiler::{
+    FoldArg, FoldNodeKind, FoldRequest, SqlConstantEvaluationError, SqlConstantEvaluator,
+};
 use crate::functions::FunctionVolatility;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
@@ -769,7 +771,12 @@ fn try_fold_node(
     };
 
     work.step()?;
-    let evaluated = evaluator.eval_scalar(&request);
+    work.flush()?;
+    let evaluated = match evaluator.eval_scalar(&request, work.control()) {
+        Ok(value) => Ok(value),
+        Err(SqlConstantEvaluationError::Evaluation(error)) => Err(error),
+        Err(SqlConstantEvaluationError::Control(error)) => return Err(error.into()),
+    };
     work.step()?;
     Ok(match evaluated {
         Ok(Some(value)) => Some(arena.intern(
@@ -852,11 +859,15 @@ mod tests {
     }
 
     impl SqlConstantEvaluator for FakeEvaluator {
-        fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+        fn eval_scalar(
+            &self,
+            request: &FoldRequest,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.mode {
                 FakeMode::Decline => return Ok(None),
-                FakeMode::Fail => return Err("fake evaluator failure".to_string()),
+                FakeMode::Fail => return Err("fake evaluator failure".to_string().into()),
                 FakeMode::Fold => {}
             }
             match &request.kind {
@@ -1081,9 +1092,25 @@ mod tests {
         plan: OptExpr,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<RewriteResult, SqlCompileError> {
+        apply_with_evaluator(
+            fixture,
+            plan,
+            fixture
+                .evaluator
+                .map(|value| value as &'static dyn SqlConstantEvaluator),
+            control,
+        )
+    }
+
+    fn apply_with_evaluator(
+        fixture: &Fixture,
+        plan: OptExpr,
+        evaluator: Option<&'static dyn SqlConstantEvaluator>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let mut ctx = RewriteContext::for_query_with_settings(Default::default(), control);
         ctx.set_scalar_arena(Rc::clone(&fixture.arena));
-        if let Some(evaluator) = fixture.evaluator {
+        if let Some(evaluator) = evaluator {
             ctx.set_constant_evaluator(evaluator);
         }
         FoldConstant.apply(plan, &mut ctx)
@@ -1200,6 +1227,143 @@ mod tests {
         drop(owner);
         assert!(weak.upgrade().is_none());
         assert_int_literal(&fixture, project_expr(&rewritten), 2);
+    }
+
+    #[test]
+    fn evaluator_receives_original_phase_control_and_control_errors_never_decline() {
+        use novarocks_type_contract::{CompileControlError, PureCompileControl};
+        struct ObservedEvaluator;
+        impl SqlConstantEvaluator for ObservedEvaluator {
+            fn eval_scalar(
+                &self,
+                request: &FoldRequest,
+                control: &dyn PureCompileControl,
+            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+                let mut work =
+                    CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+                let mut sum = 0;
+                for argument in &request.args {
+                    work.step()?;
+                    let LiteralValue::Int(value) = argument.value else {
+                        panic!("expected the real integer fold arguments");
+                    };
+                    sum += value;
+                }
+                work.finish()?;
+                Ok(Some(LiteralValue::Int(sum)))
+            }
+        }
+        static EVALUATOR: ObservedEvaluator = ObservedEvaluator;
+        struct Owner {
+            checks: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+            failure: Option<(bool, CompileControlError)>,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                self.checks.lock().unwrap().push((phase, units));
+                if phase == CompilePhase::FunctionSpecialization
+                    && let Some((positive, error)) = self.failure
+                    && (units > 0) == positive
+                {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+        let fixture = Fixture::without_evaluator();
+        let lhs = fixture.int_literal(1);
+        let rhs = fixture.int_literal(2);
+        let sum = fixture.binary(BinOp::Add, lhs, rhs);
+        let owner = Owner {
+            checks: Default::default(),
+            failure: None,
+        };
+        let rewritten = changed(
+            apply_with_evaluator(&fixture, project(sum), Some(&EVALUATOR), &owner).unwrap(),
+        );
+        assert_int_literal(&fixture, project_expr(&rewritten), 3);
+        let checks = owner.checks.lock().unwrap();
+        let specialization = checks
+            .iter()
+            .filter(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            specialization,
+            [
+                (CompilePhase::FunctionSpecialization, 0),
+                (CompilePhase::FunctionSpecialization, 2),
+            ]
+        );
+        let entry = checks
+            .iter()
+            .position(|check| *check == specialization[0])
+            .unwrap();
+        assert_eq!(checks[entry - 1].0, CompilePhase::Validate);
+        assert!(
+            checks[entry - 1].1 > 0,
+            "caller work must be flushed before the owner"
+        );
+        drop(checks);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for positive in [false, true] {
+                let owner = Owner {
+                    checks: Default::default(),
+                    failure: Some((positive, error)),
+                };
+                assert!(matches!(
+                    apply_with_evaluator(&fixture, project(sum), Some(&EVALUATOR), &owner),
+                    Err(actual) if actual == SqlCompileError::from(error)
+                ));
+                assert_eq!(
+                    owner.checks.lock().unwrap().last(),
+                    Some(&(
+                        CompilePhase::FunctionSpecialization,
+                        if positive { 2 } else { 0 }
+                    ))
+                );
+                // A later successful observation cannot undo the returned failure.
+                owner.checkpoint(CompilePhase::Validate, 0).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_evaluation_error_text_does_not_impersonate_typed_request_failure() {
+        struct LegacyError;
+        impl SqlConstantEvaluator for LegacyError {
+            fn eval_scalar(
+                &self,
+                _: &FoldRequest,
+                _: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+                Err(SqlConstantEvaluationError::Evaluation(
+                    "pure compilation was cancelled".to_string(),
+                ))
+            }
+        }
+        static EVALUATOR: LegacyError = LegacyError;
+        let fixture = Fixture::without_evaluator();
+        let one = fixture.int_literal(1);
+        let sum = fixture.binary(BinOp::Add, one, one);
+        let owner = FoldControl {
+            observations: Default::default(),
+            failure: None,
+            fail_at: usize::MAX,
+        };
+        assert!(matches!(
+            apply_with_evaluator(&fixture, project(sum), Some(&EVALUATOR), &owner).unwrap(),
+            RewriteResult::Unchanged
+        ));
+        assert!(matches!(fixture.node(sum), ScalarNode::BinaryOp { .. }));
     }
 
     // -- tests -------------------------------------------------------------
@@ -1789,10 +1953,14 @@ mod overflow_policy_tests {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
     struct CheckedEvaluator;
     impl SqlConstantEvaluator for CheckedEvaluator {
-        fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+        fn eval_scalar(
+            &self,
+            request: &FoldRequest,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
             match request.kind {
                 FoldNodeKind::BinaryOp(BinOp::Add, ReportError)
-                | FoldNodeKind::Cast(ReportError) => Err("checked overflow".to_string()),
+                | FoldNodeKind::Cast(ReportError) => Err("checked overflow".to_string().into()),
                 FoldNodeKind::BinaryOp(BinOp::Add, OutputNull) | FoldNodeKind::Cast(OutputNull) => {
                     Ok(Some(LiteralValue::Null))
                 }
@@ -1856,7 +2024,11 @@ mod overflow_policy_tests {
         use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
         struct NullableEvaluator;
         impl SqlConstantEvaluator for NullableEvaluator {
-            fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+            fn eval_scalar(
+                &self,
+                request: &FoldRequest,
+                _control: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
                 match request.kind {
                     FoldNodeKind::BinaryOp(BinOp::Mul, OutputNull)
                     | FoldNodeKind::Cast(OutputNull) => Ok(Some(LiteralValue::Null)),

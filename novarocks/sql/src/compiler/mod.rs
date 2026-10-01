@@ -23,6 +23,7 @@
 // Design: ADR-0073 (docs/adr/ADR-0073-sql-compilation-freezes-statistics-after-analysis.md)
 // Design: ADR-0040 (docs/adr/ADR-0040-sql-compiler-dependency-inversion.md)
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -378,13 +379,50 @@ pub struct FoldRequest {
 /// Fail-open contract:
 /// - `Ok(Some(literal))` — folded; the literal has type `request.out_type`.
 /// - `Ok(None)` — evaluator declines (unmapped node shape or literal type).
-/// - `Err(_)` — evaluation failed. Callers keep the original expression and
+/// - `Err(Evaluation(_))` — evaluation failed. Callers keep the original expression and
 ///   must never surface this as a planning error, because the runtime is
 ///   still allowed to produce a value or its own error for that expression.
+/// - `Err(Control(_))` — request cancellation, deadline or resource exhaustion;
+///   compilation stops with that exact category, never an optimization decline.
 // Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub trait SqlConstantEvaluator: Send + Sync {
-    fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String>;
+    fn eval_scalar(
+        &self,
+        request: &FoldRequest,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError>;
 }
+
+/// Request failures stay distinct from a failed optional legacy evaluation.
+/// Kernel strings are not interpreted to infer a control category.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlConstantEvaluationError {
+    Control(novarocks_type_contract::CompileControlError),
+    Evaluation(String),
+}
+
+impl From<novarocks_type_contract::CompileControlError> for SqlConstantEvaluationError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl From<String> for SqlConstantEvaluationError {
+    fn from(error: String) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+impl fmt::Display for SqlConstantEvaluationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Control(error) => error.fmt(f),
+            Self::Evaluation(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for SqlConstantEvaluationError {}
 
 /// A constant evaluator that never folds.
 ///
@@ -394,7 +432,16 @@ pub trait SqlConstantEvaluator: Send + Sync {
 struct NoopConstantEvaluator;
 
 impl SqlConstantEvaluator for NoopConstantEvaluator {
-    fn eval_scalar(&self, _request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+    fn eval_scalar(
+        &self,
+        _request: &FoldRequest,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+        let work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        )?;
+        work.finish()?;
         Ok(None)
     }
 }
@@ -2706,10 +2753,74 @@ mod tests {
     }
 
     #[test]
+    fn noop_constant_evaluator_observes_request_entry_and_decline_completion() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            checks: std::sync::Mutex<Vec<u32>>,
+            failure: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::FunctionSpecialization);
+                let mut checks = self.checks.lock().unwrap();
+                checks.push(units);
+                if let Some((at, error)) = self.failure
+                    && checks.len() == at
+                {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+        let request = FoldRequest {
+            kind: FoldNodeKind::Function {
+                name: "fixture/no-op".into(),
+            },
+            args: Vec::new(),
+            out_type: arrow::datatypes::DataType::Int64,
+            out_nullable: true,
+        };
+        let owner = Owner {
+            checks: Default::default(),
+            failure: None,
+        };
+        assert_eq!(
+            noop_constant_evaluator().eval_scalar(&request, &owner),
+            Ok(None)
+        );
+        assert_eq!(*owner.checks.lock().unwrap(), [0, 0]);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at in [1, 2] {
+                let owner = Owner {
+                    checks: Default::default(),
+                    failure: Some((at, error)),
+                };
+                assert_eq!(
+                    noop_constant_evaluator().eval_scalar(&request, &owner),
+                    Err(SqlConstantEvaluationError::Control(error))
+                );
+                assert_eq!(owner.checks.lock().unwrap().len(), at);
+            }
+        }
+    }
+
+    #[test]
     fn analyzed_root_allow_mode_freezes_only_the_numeric_fold_eligibility() {
         struct NullableEvaluator;
         impl SqlConstantEvaluator for NullableEvaluator {
-            fn eval_scalar(&self, _: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+            fn eval_scalar(
+                &self,
+                _: &FoldRequest,
+                _: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
                 Ok(Some(LiteralValue::Null))
             }
         }
@@ -2733,7 +2844,8 @@ mod tests {
             ),
         ] {
             let cancellation = Arc::new(Cancellation::default());
-            let mut input = request(control(None, &cancellation));
+            let request_control = control(None, &cancellation);
+            let mut input = request(request_control.clone());
             input.statement = SqlStatementInput::sql(sql);
             input.constant_evaluator = Some(&EVALUATOR);
             input.session.sql_semantics = input
@@ -2745,14 +2857,17 @@ mod tests {
             let result = pending
                 .constant_evaluator
                 .unwrap()
-                .eval_scalar(&FoldRequest {
-                    kind: FoldNodeKind::Cast(
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    ),
-                    args: Vec::new(),
-                    out_type: arrow::datatypes::DataType::Decimal128(3, 0),
-                    out_nullable: true,
-                })
+                .eval_scalar(
+                    &FoldRequest {
+                        kind: FoldNodeKind::Cast(
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        ),
+                        args: Vec::new(),
+                        out_type: arrow::datatypes::DataType::Decimal128(3, 0),
+                        out_nullable: true,
+                    },
+                    &request_control,
+                )
                 .unwrap();
             assert_eq!(result.is_none(), disabled);
         }
