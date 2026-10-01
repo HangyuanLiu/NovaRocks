@@ -221,7 +221,7 @@ fn write_support_denial(
             && request.target_ref.as_str() == "main";
         let managed_full_replacement = if full_replacement_shape {
             match crate::document_storage::observation::managed_marker(metadata) {
-                Ok(marker) => marker.kind() == "mv",
+                Ok(marker) => marker.kind() == "materialized-view",
                 Err(error) if error.kind() == ConnectorErrorKind::NotFound => false,
                 Err(error) => return Some(error),
             }
@@ -1354,7 +1354,7 @@ mod tests {
         let managed = with_equality(HashMap::from([
             (
                 crate::document_storage::observation::MANAGED_KIND_PROPERTY.into(),
-                "mv".into(),
+                "materialized-view".into(),
             ),
             (
                 crate::document_storage::observation::MANAGED_OWNER_PROPERTY.into(),
