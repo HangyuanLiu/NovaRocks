@@ -2331,6 +2331,9 @@ pub(super) fn scalar_definition_parts(
                 effects: match name {
                     "abs" => Some(super::abs_owner::effects()),
                     "rand" | "random" => Some(super::rand_owner::effects()),
+                    name if super::numeric_mod_owner::operation(name).is_some() => {
+                        Some(super::numeric_mod_owner::effects())
+                    }
                     name if super::numeric_binary_owner::operation(name).is_some() => {
                         Some(super::numeric_binary_owner::effects())
                     }
@@ -2433,6 +2436,9 @@ pub fn contribute_builtin_functions(
         let definition = match name.as_str() {
             "abs" => super::abs_owner::definition(declaration, resolver)?,
             "rand" | "random" => super::rand_owner::definition(&name, declaration, resolver)?,
+            name if super::numeric_mod_owner::operation(name).is_some() => {
+                super::numeric_mod_owner::definition(name, declaration, resolver)?
+            }
             name if super::numeric_binary_owner::operation(name).is_some() => {
                 super::numeric_binary_owner::definition(name, declaration, resolver)?
             }
