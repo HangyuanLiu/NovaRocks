@@ -4854,7 +4854,9 @@ mod tests {
         );
         assert!(matches!(
             fixture.registry.context_root_result_route(&read),
-            ContextRootRoute::AwaitTerminalControl
+            ContextRootRoute::AwaitTerminalControl {
+                accepted_consumed: 0
+            }
         ));
         drop(replay);
         fixture.registry.advance_deadlines();

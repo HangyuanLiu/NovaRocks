@@ -691,7 +691,9 @@ async fn root_release_seals_before_late_reads_and_waits_for_body_only_alias() {
     );
     assert!(matches!(
         fixture.registry.context_root_result_route(&request),
-        ContextRootRoute::AwaitTerminalControl
+        ContextRootRoute::AwaitTerminalControl {
+            accepted_consumed: 0
+        }
     ));
     assert!(
         budget.retained_bytes_for_test() > 1024 * 1024,
@@ -720,6 +722,84 @@ async fn root_release_seals_before_late_reads_and_waits_for_body_only_alias() {
         replay.outcome(),
         OperationOutcome::ContextTerminalReceipt,
         "lost ACK still resolves to original context"
+    );
+}
+
+#[tokio::test]
+async fn closed_context_root_route_returns_frozen_ack_watermark_before_late_ack() {
+    use crate::root_result_channel::ContextRootRoute;
+    use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(31_007);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let (root, _budget) = bounded_root(identity);
+    install_bounded_root(&fixture, identity, &root);
+    finish_bounded_root(&fixture, &root);
+    let request = bounded_read(&root, 1);
+    let ContextRootRoute::Read(read) = fixture.registry.context_root_result_route(&request) else {
+        panic!("read original data");
+    };
+    let delivery = read.read().await.unwrap();
+    let alias = match &delivery.reply().outcome {
+        RootReadOutcome::Data(data) => data.body().clone(),
+        _ => panic!("original Data"),
+    };
+    drop(delivery);
+    let ack = RootResultRead::try_new(
+        identity,
+        root.spec().contract.profile(),
+        root.spec().contract.kind(),
+        None,
+        1,
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    let ContextRootRoute::Read(admitted) = fixture.registry.context_root_result_route(&ack) else {
+        panic!("apply ACK before seal");
+    };
+    let acknowledged = admitted.read().await.unwrap();
+    assert_eq!(acknowledged.reply().accepted_consumed, 1);
+    assert_eq!(acknowledged.reply().outcome, RootReadOutcome::AckOnly);
+    drop(acknowledged);
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    let late_ack = RootResultRead::try_new(
+        identity,
+        root.spec().contract.profile(),
+        root.spec().contract.kind(),
+        None,
+        2,
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.registry.context_root_result_route(&late_ack),
+        ContextRootRoute::AwaitTerminalControl {
+            accepted_consumed: 1
+        },
+    ));
+    assert_eq!(root.snapshot().consumed_through, 1);
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Releasing
+    );
+    drop(alias);
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained,
     );
 }
 
@@ -759,7 +839,9 @@ fn root_read_admission_under_context_fence_survives_until_actual_handler_exit() 
     );
     assert!(matches!(
         fixture.registry.context_root_result_route(&request),
-        ContextRootRoute::AwaitTerminalControl
+        ContextRootRoute::AwaitTerminalControl {
+            accepted_consumed: 0
+        }
     ));
     drop(admitted);
     fixture.registry.advance_deadlines();
@@ -810,7 +892,9 @@ fn finished_root_abort_and_lease_expiry_wait_for_real_reservation_exit() {
             fixture
                 .registry
                 .context_root_result_route(&bounded_read(&root, 1)),
-            ContextRootRoute::AwaitTerminalControl
+            ContextRootRoute::AwaitTerminalControl {
+                accepted_consumed: 0
+            }
         ));
         assert_eq!(
             fixture.task_host.retired_executions.lock().unwrap().len(),

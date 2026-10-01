@@ -53,3 +53,5 @@ P04来源接线进一步覆盖Native scan/Project和生产Project/hydration，�
 P04 有限 Native producer/session 与固定唤醒槽位已完成模块切片，184 项定向测试及 check/Clippy/fmt 通过；[收据](evidence/p04-native-producer/README.md)。实际 host、显式 domain/read ingress/lane/source 接线继续，V1 未 advertise；不称 C4/native/performance 验收完成。Docker Desktop all-consumer live 校验通过，无缺失镜像。
 
 P04 真实 Host 的 ClientRows/CountOnly 接管与 context 留存已保存本地行为切片，553 项相关测试及四包 all-target Clippy/fmt/diff 通过；[收据](evidence/p04-native-host/README.md)。包含准确取消原因 fan-out 竞态、多 DOP、准备回滚、连续 observer panic 的真实释放反例；InternalFacts/source/read ingress/Native lane 仍继续，P04 未完成、V1 未 advertise，无性能验收结论。完整 desktop-linux fixture 校验通过，当前无缺失镜像或 JAR。
+
+P04 seal/ACK 竞态端口已准确携带实际接受水位，codec 仅允许 closed marker 保留未生效 ACK；[收据](evidence/p04-seal-watermark/README.md)，Worker309/codec5/真实Host61共375定向通过。实际Native服务和传输copy生命周期继续，P04未完成。

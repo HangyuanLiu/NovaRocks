@@ -738,12 +738,16 @@ impl TaskExecutionRegistry {
             entry.state,
             QueryContextState::Active | QueryContextState::Quiescing
         ) {
-            return Route::AwaitTerminalControl;
+            return Route::AwaitTerminalControl {
+                accepted_consumed: root.snapshot().consumed_through,
+            };
         }
         match root.begin_read(read) {
             Ok(admitted) => Route::Read(admitted),
             Err(RootChannelError::Capacity) => Route::Busy,
-            Err(RootChannelError::Closed) => Route::AwaitTerminalControl,
+            Err(RootChannelError::Closed) => Route::AwaitTerminalControl {
+                accepted_consumed: root.snapshot().consumed_through,
+            },
             Err(_) => Route::Mismatch,
         }
     }

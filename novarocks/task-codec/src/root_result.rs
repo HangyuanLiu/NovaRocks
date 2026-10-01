@@ -158,7 +158,10 @@ pub fn decode_reply(
     // One read/ACK RPC is in flight. Older legal cumulative requests may
     // return a newer applied watermark, bounded by the caller's actual socket
     // delivery proofs rather than by prefetch or validation.
-    if value.accepted_consumed_sequence < expected.consumed()
+    // A seal can win before this request applies its ACK. The closed marker
+    // reports the actual frozen watermark, not a fabricated acknowledgement.
+    let sealed = matches!(value.outcome, Some(Outcome::AwaitTerminalControl(true)));
+    if (!sealed && value.accepted_consumed_sequence < expected.consumed())
         || value.accepted_consumed_sequence > maximum_delivered_consumed
     {
         return Err(invalid(
@@ -410,6 +413,49 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn seal_before_ack_preserves_actual_watermark_without_fabricating_consumption() {
+        for wanted in [None, Some(3)] {
+            let request = read(wanted, 2);
+            let reply = RootResultReply {
+                root_task: request.root_task(),
+                profile: request.profile(),
+                kind: request.kind(),
+                accepted_consumed: 1,
+                outcome: RootReadOutcome::AwaitTerminalControl,
+            };
+            assert_eq!(
+                decode_reply(
+                    encode_reply(&reply).unwrap(),
+                    &request,
+                    2,
+                    FieldPath::root("reply"),
+                )
+                .unwrap(),
+                reply,
+            );
+            assert!(
+                decode_reply(
+                    encode_reply(&reply).unwrap(),
+                    &request,
+                    0,
+                    FieldPath::root("reply"),
+                )
+                .is_err(),
+                "closed replies cannot exceed actual socket delivery proofs",
+            );
+            let mut wire = encode_reply(&reply).unwrap();
+            wire.outcome = Some(wire::fetch_root_result_response::Outcome::AckOnly(true));
+            assert!(decode_reply(wire, &request, 2, FieldPath::root("reply")).is_err());
+            let mut wire = encode_reply(&reply).unwrap();
+            wire.outcome = Some(wire::fetch_root_result_response::Outcome::NotReady(true));
+            assert!(decode_reply(wire, &request, 2, FieldPath::root("reply")).is_err());
+            let mut wire = encode_reply(&reply).unwrap();
+            wire.outcome = Some(wire::fetch_root_result_response::Outcome::Retired(true));
+            assert!(decode_reply(wire, &request, 2, FieldPath::root("reply")).is_err());
         }
     }
 }

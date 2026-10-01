@@ -57,7 +57,7 @@ pub enum RootChannelError {
 }
 pub enum ContextRootRoute {
     Read(RootChannelRead),
-    AwaitTerminalControl,
+    AwaitTerminalControl { accepted_consumed: u64 },
     Preparing,
     UnknownRoot,
     Mismatch,
