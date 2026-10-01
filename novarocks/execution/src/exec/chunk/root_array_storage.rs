@@ -70,6 +70,39 @@ pub fn borrowed_root_array_storage(
     Ok(state.bytes)
 }
 
+/// Inspect one batch's complete column-vector backing and all standard array
+/// storage under a single shared work/byte budget. Schema and DataType metadata
+/// remain separate source-origin obligations, exactly as for one array above.
+pub fn borrowed_root_batch_storage(
+    batch: &RecordBatch,
+    limits: RootArrayStorageLimits,
+) -> Result<usize, RootArrayStorageError> {
+    if batch.num_columns() > RootProfileV1::MAX_COLUMNS {
+        return Err(RootArrayStorageError::WorkExceeded);
+    }
+    let limits = RootArrayStorageLimits {
+        bytes: limits.bytes.min(96 * 1024 * 1024),
+        nodes: limits.nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES),
+        depth: limits.depth.min(RootProfileV1::MAX_DEPTH),
+    };
+    let mut state = Inspection {
+        limits,
+        bytes: 0,
+        nodes: 0,
+    };
+    state.charge(size_of::<RecordBatch>())?;
+    state.charge(
+        batch
+            .columns_capacity()
+            .checked_mul(size_of::<ArrayRef>())
+            .ok_or(RootArrayStorageError::CapacityExceeded)?,
+    )?;
+    for array in batch.columns() {
+        state.array(array.as_ref(), 0)?;
+    }
+    Ok(state.bytes)
+}
+
 struct Inspection {
     limits: RootArrayStorageLimits,
     bytes: usize,

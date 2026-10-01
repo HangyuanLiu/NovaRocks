@@ -473,3 +473,72 @@ fn standard_owner_metadata_descriptor_is_borrowed_and_custom_is_unknown() {
         None
     );
 }
+
+#[test]
+fn whole_batch_storage_checks_real_spare_column_backing_and_shared_work_limit() {
+    use novarocks_execution::exec::chunk::{
+        RootArrayStorageError, RootArrayStorageLimits, borrowed_root_batch_storage,
+    };
+    let array = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
+    let mut columns = Vec::with_capacity(8192);
+    columns.push(Arc::clone(&array));
+    let spare_bytes = columns.capacity() * std::mem::size_of::<ArrayRef>();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+        columns,
+    )
+    .unwrap();
+    let bound =
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(spare_bytes + 4096)))
+            .unwrap();
+    assert!(bound >= spare_bytes);
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(spare_bytes - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ])),
+        vec![Arc::clone(&array), array],
+    )
+    .unwrap();
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(
+            &batch,
+            RootArrayStorageLimits {
+                bytes: 4096,
+                nodes: 1,
+                depth: 64,
+            }
+        )),
+        Err(RootArrayStorageError::WorkExceeded)
+    );
+    assert!(
+        no_allocation(|| borrowed_root_batch_storage(
+            &batch,
+            RootArrayStorageLimits {
+                bytes: 4096,
+                nodes: 2,
+                depth: 64,
+            }
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn whole_batch_storage_rejects_wide_inputs_without_scanning_columns() {
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_batch_storage};
+    let schema = Schema::new(
+        (0..=novarocks_result_contract::RootProfileV1::MAX_COLUMNS)
+            .map(|i| Field::new(i.to_string(), DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::new_empty(Arc::new(schema));
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(96 * 1024 * 1024))),
+        Err(RootArrayStorageError::WorkExceeded)
+    );
+}

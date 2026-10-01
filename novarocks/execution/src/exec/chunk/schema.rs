@@ -1021,6 +1021,61 @@ mod tests {
     }
 
     #[test]
+    fn retagged_actual_nested_array_shares_only_the_exact_known_target_field() {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let limits = MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        };
+        let child =
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+                .unwrap()
+                .into_field("item".into(), DataType::Utf8, true);
+        let exact_child = Arc::clone(child.field());
+        let root = ArrowMetadataOwner::try_new(vec![], limits)
+            .unwrap()
+            .into_field(
+                "root".into(),
+                DataType::Struct(vec![Arc::clone(&exact_child)].into()),
+                false,
+            );
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    SlotId::new(1),
+                    Arc::clone(root.field()),
+                    FieldMetadataOrigins::try_new(vec![child, root], 2).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let foreign = Arc::new(Field::new("item", DataType::Utf8, true));
+        let values = Arc::new(StructArray::new(
+            vec![Arc::clone(&foreign)].into(),
+            vec![Arc::new(StringArray::from(vec![Some("{}")]))],
+            None,
+        )) as ArrayRef;
+        let chunk = Chunk::try_new_with_columns(schema, vec![values]).unwrap();
+        let DataType::Struct(actual_fields) = chunk.columns()[0].data_type() else {
+            panic!("struct")
+        };
+        assert!(Arc::ptr_eq(&exact_child, &actual_fields[0]));
+        assert!(!Arc::ptr_eq(&foreign, &actual_fields[0]));
+        let origins = chunk.chunk_schema().field_metadata_origins().unwrap();
+        assert!(origins.metadata_bytes_for(&actual_fields[0]).is_some());
+        assert!(origins.metadata_bytes_for(&foreign).is_none());
+        assert!(Arc::ptr_eq(
+            &chunk.schema(),
+            &chunk.chunk_schema().arrow_schema_ref()
+        ));
+    }
+
+    #[test]
     fn static_layout_thaw_narrows_each_slot_and_keeps_actual_schema_owner() {
         use novarocks_local_program::{StaticFieldSchema, StaticLayout};
         // A whole-layout index on every slot would produce 66,049 entries and

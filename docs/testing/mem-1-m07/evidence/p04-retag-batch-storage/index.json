@@ -1,0 +1,28 @@
+{
+  "parent": "8f490583e4786e7044e251061ba73c7a75040e62",
+  "scope": "unchanged retag Field identity and storage-only whole-batch shared capacity/work limits; full Chunk proof remains pending",
+  "logs": [
+    {
+      "file": "chunk-tests.log.gz",
+      "raw_sha256": "492ea5ab9205872f50cb768ba0463cb69cb365bec156ee9689fbb1a869bbe8b0",
+      "gzip_sha256": "bbac236c865ce97b039f25b37f44fdf1131bca80a5446b39cd1df765823240df"
+    },
+    {
+      "file": "batch-storage-tests.log.gz",
+      "raw_sha256": "da53920caf1c4ea18db0404f6580520b2fbe1432310f334123431ed67d3a6fcd",
+      "gzip_sha256": "7cdcf96bfb1ad0764ebc670453afd57f8c3adb7e59316e0c8f4e2af5da950742"
+    },
+    {
+      "file": "clippy.log.gz",
+      "raw_sha256": "6f23a262a603818e678b325b43f8421d455542cd62615c4f0ec1b42a804bc818",
+      "gzip_sha256": "953477b03c76ebc487fdc14ffbf60bf3078d8187f5ed892c04b8807e2144e02d"
+    }
+  ],
+  "sources": {
+    "novarocks/execution/src/exec/chunk/mod.rs": "8b0889ef9def99b7a1fa99a3277a048a3467c28c244b7f797c9779ac1dcd6b4b",
+    "novarocks/execution/src/exec/chunk/root_array_storage.rs": "6a3ee4b9bf50742075315452d8de06e103464f867e4d0c27b7d2c353a37b1967",
+    "novarocks/execution/src/exec/chunk/schema.rs": "1818189d0d1fb7b1aa9e4a08bb44a3f9734536eeec1d998302dceceef6ffc473",
+    "novarocks/execution/src/exec/chunk/type_compatibility.rs": "1b7d9e2095ae127d036ea67118c4cb74e9d8b7c023f1df941db5ae7df2269cf2",
+    "novarocks/execution/tests/root_capacity_introspection.rs": "c1b684db53a96e76f83cab6b5fde10f6349b307e1e1a0bf124c883db68f72a68"
+  }
+}
