@@ -58,7 +58,7 @@ components = {
 fe_peak = checked_sum(*components.values())
 assert fe_peak <= a['frontend_declared_result_envelope_bytes']
 b = p['be_root_result']
-be_peak = checked_sum(b['original_input_backing_capacity_bytes'], b['additional_hydrate_backing_capacity_bytes'], b['scratch_capacity_bytes'], b['small_row_staging_bytes'], (b['active_segment_positions'] + b['queued_segment_positions'] + b['live_send_holders'] * b['independent_payload_copies_per_send']) * b['segment_backing_capacity_bytes'], b['fixed_schema_cursor_driver_capacity_bytes'], 4096)
+be_peak = checked_sum(b['original_input_backing_capacity_bytes'], b['additional_hydrate_backing_capacity_bytes'], b['scratch_capacity_bytes'], b['small_row_staging_bytes'], (b['active_segment_positions'] + b['queued_segment_positions'] + b['retired_segment_tail_positions'] + b['live_send_holders'] * b['independent_payload_copies_per_send']) * b['segment_backing_capacity_bytes'], b['fixed_schema_cursor_driver_capacity_bytes'], 4096)
 assert be_peak <= b['joint_retained_bytes_per_root'] <= b['joint_retained_bytes_per_process']
 report = {'status': 'TARGET_ARITHMETIC_PASS_NOT_PRODUCT_ENFORCEMENT', 'frontend_component_bytes': components, 'frontend_total_bytes': fe_peak, 'native_actual_target_bytes': native_peak, 'native_connections': connections, 'native_streams': streams, 'be_root_target_bytes': be_peak, 'local_target_bytes': local_peak, 'domain_target_bytes': domain_peak, 'tail_positions': tail}
 print(json.dumps(report, indent=2))

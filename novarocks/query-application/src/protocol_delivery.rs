@@ -30,7 +30,8 @@ use crate::session_control::{
 use crate::session_error::QueryServiceError;
 use arrow::record_batch::RecordBatch;
 use novarocks_workload_control::{
-    LocalResourceAuthority, ResultCredit, ResultCreditStage, WorkError, WorkScope,
+    LocalResourceAuthority, ResultCredit, ResultCreditStage, ResultWindowClass, ResultWindowGrant,
+    WorkError, WorkScope,
 };
 
 /// A move-only decoded Arrow batch for an immediate statement result.
@@ -221,6 +222,19 @@ impl GovernedProtocolOwner {
             .seal_success_visibility()
     }
 
+    pub fn accept_cancel_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        self.statement
+            .as_mut()
+            .ok_or(WorkError::Released)?
+            .accept_cancel_delivery_cut()
+    }
+    pub fn accept_failed_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        self.statement
+            .as_mut()
+            .ok_or(WorkError::Released)?
+            .accept_failed_delivery_cut()
+    }
+
     pub fn complete(&mut self) -> GovernedStatementFinishOutcome {
         self.settled = true;
         self.statement
@@ -262,6 +276,136 @@ impl Drop for GovernedProtocolOwner {
         if !self.settled {
             drop(self.statement.take());
         }
+    }
+}
+
+/// Move-only protocol tail with its own complete capacity position. `W` owns
+/// the detached socket writer, frozen metadata, packet cursor and validated
+/// resident current-row tail; it has no root fetch/render capability. Any
+/// physical writer alias must retain `retained_guard()` through actual exit.
+#[must_use = "a closing delivery retains its statement generation and writer until actual exit"]
+pub struct ClosingDelivery<W> {
+    writer: Option<W>,
+    tail: Option<std::sync::Arc<ClosingTailOwner>>,
+    completion: Option<tokio::sync::oneshot::Receiver<GovernedStatementFinishOutcome>>,
+}
+struct ClosingTailOwner {
+    protocol: Option<GovernedProtocolOwner>,
+    capacity: ResultWindowGrant,
+    writer_exited: std::sync::atomic::AtomicBool,
+    completion: Option<tokio::sync::oneshot::Sender<GovernedStatementFinishOutcome>>,
+}
+impl Drop for ClosingTailOwner {
+    fn drop(&mut self) {
+        let mut protocol = self
+            .protocol
+            .take()
+            .expect("closing retains its protocol owner");
+        let outcome = if !self
+            .writer_exited
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            protocol.client_disconnected()
+        } else {
+            match self
+                .capacity
+                .closing_cut()
+                .expect("closing requires an accepted cut")
+            {
+                novarocks_workload_control::ResultClosingCut::AcceptedCancellation => {
+                    protocol.settle_cancellation()
+                }
+                novarocks_workload_control::ResultClosingCut::OriginatingFailure => protocol.fail(),
+            }
+        };
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(outcome);
+        }
+    }
+}
+/// Every physical writer/backing alias retains BOTH the statement generation
+/// and the independent closing position. Its last drop is the actual exit cut.
+#[derive(Clone)]
+pub struct ClosingDeliveryAlias {
+    tail: std::sync::Arc<ClosingTailOwner>,
+}
+impl ClosingDeliveryAlias {
+    pub fn scope_id(&self) -> novarocks_workload_control::WorkId {
+        self.tail.capacity.scope_id()
+    }
+}
+impl<W> ClosingDelivery<W> {
+    /// The caller checks full simultaneous backing capacity before moving the
+    /// writer. A closing grant with preexisting raw aliases cannot transfer:
+    /// all subsequent physical aliases must retain the protocol owner as well.
+    /// Rejection returns every owner intact for immediate disconnect.
+    pub fn try_new(
+        writer: W,
+        protocol: GovernedProtocolOwner,
+        capacity: ResultWindowGrant,
+        simultaneously_live_backing_bytes: u64,
+    ) -> Result<Self, (W, GovernedProtocolOwner, ResultWindowGrant)> {
+        let valid_scope = protocol.statement.as_ref().is_some_and(|owner| {
+            capacity.is_for_scope(owner.scope())
+                && owner.accepted_delivery_cut().is_some()
+                && owner.accepted_delivery_cut() == capacity.closing_cut()
+        });
+        if capacity.class() != ResultWindowClass::Closing
+            || !valid_scope
+            || capacity.has_retained_aliases()
+            || capacity
+                .check_backing_total(simultaneously_live_backing_bytes)
+                .is_err()
+        {
+            return Err((writer, protocol, capacity));
+        }
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        Ok(Self {
+            writer: Some(writer),
+            tail: Some(std::sync::Arc::new(ClosingTailOwner {
+                protocol: Some(protocol),
+                capacity,
+                writer_exited: std::sync::atomic::AtomicBool::new(false),
+                completion: Some(completion),
+            })),
+            completion: Some(receiver),
+        })
+    }
+    pub fn writer_mut(&mut self) -> &mut W {
+        self.writer
+            .as_mut()
+            .expect("closing owns its detached writer")
+    }
+    pub fn retained_guard(&self) -> ClosingDeliveryAlias {
+        ClosingDeliveryAlias {
+            tail: std::sync::Arc::clone(
+                self.tail.as_ref().expect("closing retains its tail owner"),
+            ),
+        }
+    }
+    /// Invoke after ERR/flush completes or disconnect. Generation settlement
+    /// still waits for every physical alias. Cancelling this wait cannot settle
+    /// or release a still-live alias; its owner retains the protocol authority.
+    pub async fn settle_after_writer_exit(mut self) -> GovernedStatementFinishOutcome {
+        drop(self.writer.take());
+        self.tail
+            .as_ref()
+            .expect("closing owns tail")
+            .writer_exited
+            .store(true, std::sync::atomic::Ordering::Release);
+        let completion = self.completion.take().expect("closing owns completion");
+        drop(self.tail.take());
+        completion
+            .await
+            .expect("last closing holder publishes settlement")
+    }
+}
+impl<W> Drop for ClosingDelivery<W> {
+    fn drop(&mut self) {
+        // Writer destruction precedes its tail owner. Last-alias destruction
+        // settles cancellation/disconnect; dropping a waiter never proves exit.
+        drop(self.writer.take());
+        drop(self.tail.take());
     }
 }
 

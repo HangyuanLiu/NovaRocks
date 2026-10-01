@@ -262,9 +262,7 @@ pub struct NativeIngressService<S> {
     ordinary: Gate,
     control: Gate,
     config: NativeIngressConfig,
-    control_path: String,
-    exchange_path: String,
-    subscribe_path: String,
+    service_prefix: String,
     backend_metrics: bool,
 }
 
@@ -293,20 +291,36 @@ impl<S> NativeIngressService<S> {
                 config.control_request_max_bytes,
             ),
             config,
-            control_path: format!("{prefix}ApplyTaskControlOperations"),
-            exchange_path: format!("{prefix}Exchange"),
-            subscribe_path: format!("{prefix}SubscribeTaskStatus"),
+            service_prefix: prefix,
             backend_metrics,
         }
     }
 
     fn classify(&self, path: &str) -> MethodClass {
-        if path == self.control_path {
-            MethodClass::Control
-        } else if path == self.exchange_path || path == self.subscribe_path {
-            MethodClass::Stream
-        } else {
-            MethodClass::Ordinary
+        use novarocks_proto_codec::native_rpc::{
+            FrontendNativeLane, NATIVE_METHODS, NativeBodyKind, NativeTrafficClass,
+        };
+        let method = path.strip_prefix(&self.service_prefix).and_then(|name| {
+            NATIVE_METHODS
+                .iter()
+                .find(|entry| entry.path.rsplit('/').next() == Some(name))
+        });
+        match method {
+            Some(method)
+                if method.traffic
+                    == NativeTrafficClass::Frontend(FrontendNativeLane::LifecycleControl) =>
+            {
+                MethodClass::Control
+            }
+            Some(method)
+                if matches!(
+                    method.body,
+                    NativeBodyKind::ServerStream | NativeBodyKind::RetiredStream
+                ) =>
+            {
+                MethodClass::Stream
+            }
+            _ => MethodClass::Ordinary,
         }
     }
 }
@@ -680,6 +694,31 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Ready(self.0.take().map(|bytes| Ok(Frame::data(bytes))))
         }
+    }
+
+    #[test]
+    fn method_manifest_is_the_only_ingress_classification_source() {
+        let ingress = NativeIngressService::new((), NativeIngressConfig::default(), "Test", false);
+        for name in ["Heartbeat", "ApplyTaskControlOperations"] {
+            assert!(matches!(
+                ingress.classify(&format!("/Test/{name}")),
+                MethodClass::Control
+            ));
+        }
+        for name in ["ApplyTaskOperations", "FetchTaskResult", "Unknown"] {
+            assert!(matches!(
+                ingress.classify(&format!("/Test/{name}")),
+                MethodClass::Ordinary
+            ));
+        }
+        assert!(matches!(
+            ingress.classify("/Test/SubscribeTaskStatus"),
+            MethodClass::Stream
+        ));
+        assert!(matches!(
+            ingress.classify("/Other/Heartbeat"),
+            MethodClass::Ordinary
+        ));
     }
 
     #[test]

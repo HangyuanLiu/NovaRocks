@@ -159,7 +159,8 @@
     "fixed_schema_cursor_driver_capacity_bytes": 1048576,
     "actual_exit_deadline_ms": 2000,
     "shared_transport_charge": "existing process retained budget, reserved control/connection classes before root growth; no second allocator wallet",
-    "worst_input_admission": "one root final upstream pull token; reserve complete exact overlap before growth, other DOP drivers wait without a final pending input"
+    "worst_input_admission": "one root final upstream pull token; reserve complete exact overlap before growth, other DOP drivers wait without a final pending input",
+    "retired_segment_tail_positions": 2
   },
   "frontend_additional_owners": {
     "control_owner_bytes": 134217728,

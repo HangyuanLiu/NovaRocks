@@ -874,7 +874,10 @@ impl SourceSinkEdgeIndex {
                         );
                     }
                 }
-                FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {}
+                FragmentSink::Result
+                | FragmentSink::RootResult(_)
+                | FragmentSink::SealedArtifact(_)
+                | FragmentSink::Noop => {}
             }
         }
         index

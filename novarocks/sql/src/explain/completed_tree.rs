@@ -297,7 +297,10 @@ impl<'a> TreeContext<'a> {
                     self.render_edge_sink(route.edge, out);
                 }
             }
-            FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {}
+            FragmentSink::Result
+            | FragmentSink::RootResult(_)
+            | FragmentSink::SealedArtifact(_)
+            | FragmentSink::Noop => {}
         }
     }
 

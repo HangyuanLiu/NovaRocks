@@ -14,6 +14,7 @@ test-support = []
 arrow.workspace = true
 async-trait.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-result-contract.workspace = true
 novarocks-parser.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-spi.workspace = true

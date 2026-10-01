@@ -938,6 +938,7 @@ pub struct PipelineDopDomain {
 #[derive(Clone, Debug, PartialEq)]
 pub enum FragmentSink {
     Result,
+    RootResult(Box<novarocks_result_contract::RootOutputContract>),
     Stream {
         edge: EdgeId,
     },
@@ -1480,6 +1481,33 @@ pub struct PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    /// Freeze the final root purpose once the application has resolved the
+    /// ordered render or domain facts. The complete plan is revalidated.
+    pub fn with_root_output(
+        mut self,
+        contract: novarocks_result_contract::RootOutputContract,
+    ) -> Result<Self, crate::ValidationErrors> {
+        let mut errors = crate::validation::ValidationContext::new();
+        let fragment = self
+            .result_port
+            .as_ref()
+            .and_then(|port| self.fragments.get_mut(&port.fragment));
+        match fragment {
+            Some(fragment) if matches!(fragment.sink, FragmentSink::Result) => {
+                fragment.sink = FragmentSink::RootResult(Box::new(contract));
+            }
+            _ => errors.push(crate::ValidationError::new(
+                "result_port",
+                "root purpose requires exactly one unfrozen result sink",
+            )),
+        }
+        if !errors.is_empty() {
+            return Err(crate::ValidationErrors::from_collector(errors));
+        }
+        crate::validate_plan(&self)?;
+        Ok(self)
+    }
+
     pub const fn version(&self) -> PlanVersionId {
         self.version
     }

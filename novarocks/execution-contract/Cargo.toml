@@ -13,4 +13,5 @@ doctest = false
 [dependencies]
 bytes.workspace = true
 novarocks-types.workspace = true
+novarocks-result-contract.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }

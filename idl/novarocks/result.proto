@@ -1,0 +1,129 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+syntax = "proto3";
+package novarocks.result;
+
+// Frozen semantic vocabulary. Runtime dictionary/view encodings are absent.
+enum RenderTypeKind {
+  RENDER_TYPE_KIND_UNSPECIFIED = 0;
+  NULL_VALUE = 1;
+  BOOLEAN = 2;
+  SIGNED_INTEGER = 3;
+  UNSIGNED_INTEGER = 4;
+  LARGE_INT = 5;
+  FLOAT32 = 6;
+  FLOAT64 = 7;
+  DECIMAL = 8;
+  STRING = 9;
+  BINARY = 10;
+  DATE = 11;
+  TIME = 12;
+  TIMESTAMP = 13;
+  JSON = 14;
+  VARIANT = 15;
+  OPAQUE = 16;
+  LIST = 17;
+  MAP = 18;
+  STRUCT = 19;
+}
+enum RenderTimeUnit {
+  RENDER_TIME_UNIT_UNSPECIFIED = 0;
+  SECOND = 1;
+  MILLISECOND = 2;
+  MICROSECOND = 3;
+  NANOSECOND = 4;
+}
+enum OpaqueKind {
+  OPAQUE_KIND_UNSPECIFIED = 0;
+  HLL = 1;
+  BITMAP = 2;
+  OBJECT = 3;
+  PERCENTILE = 4;
+}
+enum RenderPresentation {
+  RENDER_PRESENTATION_UNSPECIFIED = 0;
+  SCALAR_TEXT = 1;
+  TIMESTAMP_UTC_MICROS = 2;
+  JSON_TEXT = 3;
+  VARIANT_SERIALIZED_BYTES = 4;
+  VARIANT_JSON = 5;
+  OPAQUE_NULL = 6;
+  MYSQL_CONTAINER = 7;
+  TIMESTAMP_CONTAINER_TEXT = 8;
+}
+message RenderField {
+  bool nullable = 1;
+  NativeRenderType native_type = 2;
+  RenderPresentation presentation = 3;
+  // Required only for VARIANT_JSON. Absent is not an implicit UTC offset.
+  optional sint32 variant_json_timezone_offset_seconds = 4;
+}
+message NamedRenderField {
+  string name = 1;
+  uint32 field_node_id = 2; // One-based index into the schema node table.
+}
+message NativeRenderType {
+  RenderTypeKind kind = 1;
+  uint32 bits = 2;
+  uint32 precision = 3;
+  sint32 scale = 4;
+  RenderTimeUnit time_unit = 5;
+  optional string time_zone = 6;
+  OpaqueKind opaque_kind = 7;
+  // List: one child named item. Map: key then value. Struct: ordered names.
+  repeated NamedRenderField children = 8;
+}
+message RenderColumn {
+  uint32 source_ordinal = 1;
+  optional uint32 source_slot = 2;
+  string name = 3;
+  uint32 field_node_id = 4; // One-based index into the schema node table.
+}
+// A tree encoded as a flat table: protobuf depth is independent of semantic
+// nesting. Every node is referenced exactly once; sharing/cycles are refused.
+message ClientRenderSchema {
+  repeated RenderColumn columns = 1;
+  repeated RenderField field_nodes = 2;
+}
+enum InternalResultDomain {
+  INTERNAL_RESULT_DOMAIN_UNSPECIFIED = 0;
+  SCALAR_VALUE_V1 = 1;
+  COW_SELECTION_ARROW_V1 = 2;
+  STATISTICS_ARTIFACT_V1 = 3;
+  PREPARED_WRITE_COMMIT_V1 = 4;
+}
+message RootOutputKind {
+  oneof kind {
+    bool client_rows = 1;
+    InternalResultDomain internal_facts = 2;
+    bool count_only = 3;
+  }
+}
+message RootOutputContract {
+  uint32 profile_id = 1;
+  RootOutputKind output_kind = 2;
+  // Required exactly for ClientRows. Domains own their private codec schema.
+  ClientRenderSchema client_schema = 3;
+}
+// Sequence starts at one. End is a separate logical item even when sent with
+// Data. The body is one flat bounded allocation; no row-piece/repeated index.
+message RootEnd { uint64 sequence = 1; uint64 output_rows = 2; }
+message RootData {
+  uint64 sequence = 1;
+  bytes body = 2;
+  RootEnd end_after_data = 3;
+}

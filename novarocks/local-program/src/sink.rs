@@ -121,6 +121,7 @@ impl StaticStreamBranch {
 #[derive(Clone, Debug)]
 pub enum StaticSinkProgram {
     Result,
+    RootResult(Arc<novarocks_result_contract::RootOutputContract>),
     Noop,
     DataStream {
         branch: StaticStreamBranch,
@@ -141,7 +142,7 @@ pub enum StaticSinkProgram {
 impl StaticSinkProgram {
     pub fn validate(&self) -> Result<(), StaticSinkError> {
         match self {
-            Self::Result | Self::Noop => Ok(()),
+            Self::Result | Self::RootResult(_) | Self::Noop => Ok(()),
             Self::DataStream { branch, arena } => validate_branch(branch, arena),
             Self::MultiCastDataStream { branches, arena } => validate_branches(branches, arena),
             Self::SplitDataStream {
@@ -208,7 +209,7 @@ impl StaticSinkProgram {
             Self::MultiCastDataStream { branches, .. } | Self::SplitDataStream { branches, .. } => {
                 branches
             }
-            Self::Result | Self::Noop => &[],
+            Self::Result | Self::RootResult(_) | Self::Noop => &[],
         }
     }
 
@@ -217,7 +218,7 @@ impl StaticSinkProgram {
             Self::DataStream { arena, .. }
             | Self::MultiCastDataStream { arena, .. }
             | Self::SplitDataStream { arena, .. } => Some(arena),
-            Self::Result | Self::Noop => None,
+            Self::Result | Self::RootResult(_) | Self::Noop => None,
         }
     }
 

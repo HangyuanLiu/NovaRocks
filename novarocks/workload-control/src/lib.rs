@@ -71,6 +71,7 @@ mod cancellation;
 mod observation;
 mod queue;
 mod resource;
+mod result_window;
 mod scope;
 
 pub use admission::{QueryAdmission, Stage, StageAdmission, StagePermit, StageRequest};
@@ -84,6 +85,10 @@ pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,
     ResourceSnapshot, ResultCredit, ResultCreditReservationError, ResultCreditSnapshot,
     ResultCreditStage,
+};
+pub use result_window::{
+    ResultCapacityConfig, ResultCapacityHandle, ResultCapacitySnapshot, ResultClosingCut,
+    ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
 };
 pub use scope::{
     BusinessPermit, DeadlineExpiryHandle, PendingQueryRoot, QueryConcurrencyPermit,

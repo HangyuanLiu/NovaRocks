@@ -66,7 +66,9 @@ impl FragmentSinkSpec {
 
         program.validate().map_err(static_sink_binding_error)?;
         let (kind, assignment_requirement) = match &program {
-            FragmentSinkProgram::Result => (FragmentSinkKind::Result, None),
+            FragmentSinkProgram::Result | FragmentSinkProgram::RootResult(_) => {
+                (FragmentSinkKind::Result, None)
+            }
             FragmentSinkProgram::Noop => (FragmentSinkKind::Noop, None),
             FragmentSinkProgram::DataStream(_) => {
                 (FragmentSinkKind::DataStream, Required(StreamDestinations))
@@ -241,7 +243,9 @@ fn static_sink_spec(
     use FragmentSinkAssignmentRequirement::{None, Required};
 
     let spec = match sink {
-        StaticSinkProgram::Result => (FragmentSinkKind::Result, None),
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) => {
+            (FragmentSinkKind::Result, None)
+        }
         StaticSinkProgram::Noop => (FragmentSinkKind::Noop, None),
         StaticSinkProgram::DataStream { .. } => {
             (FragmentSinkKind::DataStream, Required(StreamDestinations))

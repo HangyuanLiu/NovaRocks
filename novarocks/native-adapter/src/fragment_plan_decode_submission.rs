@@ -134,7 +134,9 @@ pub(crate) fn decode_fragment_submission(
         )
     })?;
     let sink_requirements = match &static_sink {
-        StaticSinkProgram::Result => vec![ExternalSinkRequirement::Result],
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) => {
+            vec![ExternalSinkRequirement::Result]
+        }
         StaticSinkProgram::Noop => Vec::new(),
         StaticSinkProgram::DataStream { .. }
         | StaticSinkProgram::MultiCastDataStream { .. }

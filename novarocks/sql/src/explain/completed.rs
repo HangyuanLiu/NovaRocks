@@ -1075,6 +1075,7 @@ fn render_sink(
 ) -> Result<(), SqlCompileError> {
     match sink {
         FragmentSink::Result => lines.push(format_args!("  SINK result"))?,
+        FragmentSink::RootResult(contract) => lines.push(format_args!("  SINK root-result {:?} profile={}", contract.kind(), contract.profile().get()))?,
         FragmentSink::Stream { edge } => {
             lines.push(format_args!("  SINK stream edge=edge{}", edge.get()))?
         }

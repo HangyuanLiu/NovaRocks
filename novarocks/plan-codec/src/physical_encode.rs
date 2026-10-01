@@ -1492,8 +1492,10 @@ fn preflight_encoder(
                     })?;
                 }
             }
-            FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
-            }
+            FragmentSink::Result
+            | FragmentSink::RootResult(_)
+            | FragmentSink::Stream { .. }
+            | FragmentSink::Multicast { .. } => {}
             FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {
                 unreachable!("shared preflight rejects these sinks")
             }
@@ -3717,6 +3719,27 @@ fn encode_sink(
 
     let kind = match fragment.sink() {
         FragmentSink::Result => Kind::Result(true),
+        FragmentSink::RootResult(contract) => {
+            let root = &fragment.nodes()[&fragment.root()];
+            let slots = (0..root.output.columns.len())
+                .map(|ordinal| {
+                    let ordinal = u32::try_from(ordinal)
+                        .map_err(|_| "root result ordinal exceeds u32".to_string())?;
+                    let slot = layout
+                        .output_slot(root.id, ordinal)
+                        .map_err(|error| error.to_string())?;
+                    u32::try_from(slot.get())
+                        .map_err(|_| "root result slot must be nonnegative".to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let bound = contract
+                .clone()
+                .bind_native_slots(&slots)
+                .map_err(|error| error.to_string())?;
+            Kind::RootResult(novarocks_proto_codec::root_result::encode_root_contract(
+                &bound,
+            ))
+        }
         FragmentSink::Stream { edge } => {
             Kind::DataStream(encode_stream_sink(physical, fragment, layout, *edge)?)
         }

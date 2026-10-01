@@ -98,6 +98,256 @@ pub fn check_status_subscription(raw: &[u8]) -> Result<(), ResourcePreflightErro
     finish(scan_status_subscription(raw))
 }
 
+/// Bounds a root read before prost builds its fixed identity and kind.
+pub fn check_root_result_read(raw: &[u8]) -> Result<(), ResourcePreflightError> {
+    if raw.len() > novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES {
+        return Err(ResourcePreflightError("root read exceeds fixed envelope"));
+    }
+    Ok(())
+}
+/// Flat body and fixed metadata are separate bounds. Count every occurrence,
+/// including repeated singular messages that prost merges.
+pub fn check_root_result_reply(raw: &[u8]) -> Result<(), ResourcePreflightError> {
+    use novarocks_result_contract::RootProfileV1;
+    if raw.len() > RootProfileV1::SEGMENT_BYTES + RootProfileV1::ENVELOPE_BYTES {
+        return Err(ResourcePreflightError(
+            "root reply exceeds segment and envelope",
+        ));
+    }
+    let mut body_bytes = 0usize;
+    let mut data_objects = 0usize;
+    finish(for_fields(raw, |field, value| {
+        if field == 9
+            && let Value::Bytes(data) = value
+        {
+            checked_increment(&mut data_objects, 1, "root reply repeats Data objects")?;
+            for_fields(data, |field, value| {
+                if field == 2
+                    && let Value::Bytes(body) = value
+                {
+                    body_bytes = body_bytes
+                        .checked_add(body.len())
+                        .ok_or_else(|| limit("root body size overflow"))?;
+                    if body_bytes > RootProfileV1::SEGMENT_BYTES {
+                        return Err(limit("root reply body exceeds segment"));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }))?;
+    if raw.len().saturating_sub(body_bytes) > RootProfileV1::ENVELOPE_BYTES {
+        return Err(ResourcePreflightError(
+            "root reply metadata exceeds fixed envelope",
+        ));
+    }
+    Ok(())
+}
+/// Root schema vocabulary has no live capability. Bound protobuf object
+/// expansion and depth before decoding the canonical semantic projection.
+pub fn check_client_render_schema(raw: &[u8]) -> Result<(), ResourcePreflightError> {
+    finish(RenderSchemaScan::new().scan(raw))
+}
+struct RenderSchemaScan {
+    columns: usize,
+    nodes: usize,
+    wire_bytes: usize,
+    root_wire_bytes: usize,
+    expansion: RenderExpansion,
+}
+impl RenderSchemaScan {
+    fn new() -> Self {
+        Self {
+            columns: 0,
+            nodes: 0,
+            wire_bytes: 0,
+            root_wire_bytes: 0,
+            expansion: RenderExpansion {
+                backing: size_of::<novarocks_proto_models::result::ClientRenderSchema>(),
+                growth_old: 0,
+            },
+        }
+    }
+    fn scan(&mut self, raw: &[u8]) -> ScanResult {
+        use novarocks_proto_models::result as wire;
+        use novarocks_result_contract::RootProfileV1;
+        self.wire_bytes = self
+            .wire_bytes
+            .checked_add(raw.len())
+            .ok_or_else(|| limit("render schema size overflow"))?;
+        if self.wire_bytes > RootProfileV1::SCHEMA_WIRE_BYTES {
+            return Err(limit("render schema exceeds wire profile"));
+        }
+        self.expansion.backing = self
+            .expansion
+            .backing
+            .checked_add(raw.len())
+            .ok_or_else(|| limit("render schema expansion overflow"))?;
+        self.expansion.check()?;
+        let Self {
+            columns,
+            nodes,
+            expansion,
+            ..
+        } = self;
+        for_fields(raw, |field, value| {
+            match (field, value) {
+                (1, Value::Bytes(column)) => {
+                    checked_increment(
+                        columns,
+                        RootProfileV1::MAX_COLUMNS,
+                        "render schema exceeds column profile",
+                    )?;
+                    expansion.grow_vec(*columns, size_of::<wire::RenderColumn>())?;
+                    for_fields(column, |field, value| {
+                        if let (3, Value::Bytes(name)) = (field, value) {
+                            if name.len() > RootProfileV1::MAX_NAME_BYTES {
+                                return Err(limit("render column name exceeds profile"));
+                            }
+                            expansion.string(name.len())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                (2, Value::Bytes(node)) => {
+                    checked_increment(
+                        nodes,
+                        RootProfileV1::SCHEMA_TYPE_NODES,
+                        "render schema exceeds decoded node profile",
+                    )?;
+                    expansion.grow_vec(*nodes, size_of::<wire::RenderField>())?;
+                    scan_render_field(node, expansion)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+    }
+    fn scan_root(&mut self, raw: &[u8]) -> ScanResult {
+        use novarocks_result_contract::RootProfileV1;
+        self.root_wire_bytes = self
+            .root_wire_bytes
+            .checked_add(raw.len())
+            .ok_or_else(|| limit("root contract size overflow"))?;
+        if self.root_wire_bytes > RootProfileV1::SCHEMA_WIRE_BYTES + RootProfileV1::ENVELOPE_BYTES {
+            return Err(limit("root output contract exceeds its profile"));
+        }
+        for_fields(raw, |field, value| {
+            if let (3, Value::Bytes(schema)) = (field, value) {
+                self.scan(schema)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+struct RenderExpansion {
+    backing: usize,
+    growth_old: usize,
+}
+impl RenderExpansion {
+    fn grow_vec(&mut self, count: usize, item_bytes: usize) -> ScanResult {
+        // prost repeated-message decode pushes into an initially empty Vec.
+        // These DTO elements use Rust's four-element minimum capacity.
+        let capacity = count
+            .max(4)
+            .checked_next_power_of_two()
+            .ok_or_else(|| limit("render schema capacity overflow"))?;
+        let previous = if count == 1 {
+            0
+        } else {
+            (count - 1)
+                .max(4)
+                .checked_next_power_of_two()
+                .ok_or_else(|| limit("render schema capacity overflow"))?
+        };
+        if capacity != previous {
+            let added = (capacity - previous)
+                .checked_mul(item_bytes)
+                .ok_or_else(|| limit("render schema expansion overflow"))?;
+            self.backing = self
+                .backing
+                .checked_add(added)
+                .ok_or_else(|| limit("render schema expansion overflow"))?;
+            self.growth_old = self.growth_old.max(
+                previous
+                    .checked_mul(item_bytes)
+                    .ok_or_else(|| limit("render schema expansion overflow"))?,
+            );
+        }
+        self.check()
+    }
+    fn string(&mut self, bytes: usize) -> ScanResult {
+        if bytes != 0 {
+            let capacity = bytes
+                .max(8)
+                .checked_next_power_of_two()
+                .ok_or_else(|| limit("render string capacity overflow"))?;
+            // Repeated string replacements retain their old capacity while
+            // reserve may allocate its replacement. Counting every occurrence
+            // covers that overlap without relying on semantic validity.
+            self.backing = self
+                .backing
+                .checked_add(capacity)
+                .ok_or_else(|| limit("render string capacity overflow"))?;
+        }
+        self.check()
+    }
+    fn check(&self) -> ScanResult {
+        if self
+            .backing
+            .checked_add(self.growth_old)
+            .is_none_or(|peak| {
+                peak > novarocks_result_contract::RootProfileV1::SCHEMA_BACKING_BYTES
+            })
+        {
+            return Err(limit("render schema exceeds decoded backing profile"));
+        }
+        Ok(())
+    }
+}
+fn scan_render_field(raw: &[u8], expansion: &mut RenderExpansion) -> ScanResult {
+    use novarocks_proto_models::result as wire;
+    use novarocks_result_contract::RootProfileV1;
+    let mut children = 0usize;
+    for_fields(raw, |field, value| {
+        if let (2, Value::Bytes(ty)) = (field, value) {
+            for_fields(ty, |field, value| {
+                match (field, value) {
+                    (6, Value::Bytes(zone)) => {
+                        if zone.len() > RootProfileV1::MAX_NAME_BYTES {
+                            return Err(limit("render timezone exceeds profile"));
+                        }
+                        expansion.string(zone.len())?;
+                    }
+                    (8, Value::Bytes(child)) => {
+                        checked_increment(
+                            &mut children,
+                            RootProfileV1::MAX_COLUMNS,
+                            "render type exceeds child profile",
+                        )?;
+                        // Even an empty or malformed child allocates a DTO.
+                        expansion.grow_vec(children, size_of::<wire::NamedRenderField>())?;
+                        for_fields(child, |field, value| {
+                            if let (1, Value::Bytes(name)) = (field, value) {
+                                if name.len() > RootProfileV1::MAX_NAME_BYTES {
+                                    return Err(limit("render child name exceeds profile"));
+                                }
+                                expansion.string(name.len())?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })
+}
+
 fn scan_status_subscription(raw: &[u8]) -> ScanResult {
     let mut status_cursors = 0;
     let mut convergence_cursors = 0;
@@ -198,6 +448,23 @@ fn scan_batch(raw: &[u8], control: bool) -> ScanResult {
             )?;
             if !control {
                 scan_operation(operation)?;
+            } else {
+                let mut count = 0;
+                for_fields(operation, |field, value| {
+                    if let (7, Value::Bytes(close)) = (field, value) {
+                        for_fields(close, |field, value| {
+                            if let (2, Value::Bytes(_)) = (field, value) {
+                                checked_increment(
+                                    &mut count,
+                                    MAX_DOMAIN_UPDATES,
+                                    "close projection exceeds 256 destinations",
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
@@ -205,9 +472,10 @@ fn scan_batch(raw: &[u8], control: bool) -> ScanResult {
 }
 
 fn scan_operation(raw: &[u8]) -> ScanResult {
+    let mut update_domains = 0;
     for_fields(raw, |field, value| {
         match (field, value) {
-            (3, Value::Bytes(update)) => scan_update_task(update)?,
+            (3, Value::Bytes(update)) => scan_update_task(update, &mut update_domains)?,
             (4, Value::Bytes(update)) => scan_update_context(update)?,
             _ => {}
         }
@@ -215,19 +483,13 @@ fn scan_operation(raw: &[u8]) -> ScanResult {
     })
 }
 
-fn scan_update_task(raw: &[u8]) -> ScanResult {
-    // TaskOperation.operation is a oneof. Prost replaces an earlier variant,
-    // so count each candidate without combining duplicates.
-    let mut count = 0;
+fn scan_update_task(raw: &[u8], count: &mut usize) -> ScanResult {
+    // Repeated instances of the same oneof message merge in prost.
     for_fields(raw, |field, value| {
         if field == 2
             && let Value::Bytes(domain) = value
         {
-            checked_increment(
-                &mut count,
-                MAX_DOMAIN_UPDATES,
-                "task update exceeds 256 domains",
-            )?;
+            checked_increment(count, MAX_DOMAIN_UPDATES, "task update exceeds 256 domains")?;
             scan_task_domain(domain)?;
         }
         Ok(())
@@ -305,22 +567,31 @@ fn scan_credential_domain(raw: &[u8], count: &mut usize) -> ScanResult {
 
 fn scan_frozen_fragment(raw: &[u8]) -> ScanResult {
     let mut nodes = 0;
+    let mut schema = RenderSchemaScan::new();
     for_fields(raw, |field, value| {
         if field == 5
             && let Value::Bytes(plan) = value
         {
-            scan_plan_fragment(plan, &mut nodes)?;
+            scan_plan_fragment(plan, &mut nodes, &mut schema)?;
         }
         Ok(())
     })
 }
 
-fn scan_plan_fragment(raw: &[u8], nodes: &mut usize) -> ScanResult {
+fn scan_plan_fragment(raw: &[u8], nodes: &mut usize, schema: &mut RenderSchemaScan) -> ScanResult {
     for_fields(raw, |field, value| {
         if field == 2
             && let Value::Bytes(root) = value
         {
             scan_plan_node(root, 1, nodes)?;
+        }
+        if let (5, Value::Bytes(sink)) = (field, value) {
+            for_fields(sink, |field, value| {
+                if let (9, Value::Bytes(root)) = (field, value) {
+                    schema.scan_root(root)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     })
@@ -950,5 +1221,183 @@ mod tests {
             value >>= 7;
         }
         destination.push(value as u8);
+    }
+}
+
+#[cfg(test)]
+mod root_preflight_tests {
+    use super::*;
+    use novarocks_proto_models::{novarocks, result};
+    use novarocks_result_contract::RootProfileV1;
+    use prost::Message;
+    fn bytes_field(out: &mut Vec<u8>, field: u8, body: &[u8]) {
+        out.push(field << 3 | 2);
+        let mut n = body.len();
+        while n >= 128 {
+            out.push((n as u8 & 127) | 128);
+            n >>= 7;
+        }
+        out.push(n as u8);
+        out.extend_from_slice(body);
+    }
+    #[test]
+    fn root_reply_distinguishes_payload_and_envelope() {
+        let data = result::RootData {
+            sequence: 1,
+            body: vec![0; RootProfileV1::SEGMENT_BYTES].into(),
+            end_after_data: None,
+        };
+        let response = novarocks::FetchRootResultResponse {
+            outcome: Some(novarocks::fetch_root_result_response::Outcome::Data(
+                data.clone(),
+            )),
+            ..Default::default()
+        };
+        assert!(check_root_result_reply(&response.encode_to_vec()).is_ok());
+        let mut large = data;
+        large.body = vec![0; RootProfileV1::SEGMENT_BYTES + 1].into();
+        let response = novarocks::FetchRootResultResponse {
+            outcome: Some(novarocks::fetch_root_result_response::Outcome::Data(large)),
+            ..Default::default()
+        };
+        assert!(check_root_result_reply(&response.encode_to_vec()).is_err());
+        let mut metadata = Vec::new();
+        bytes_field(&mut metadata, 15, &vec![0; RootProfileV1::ENVELOPE_BYTES]);
+        assert!(check_root_result_reply(&metadata).is_err());
+        assert!(check_root_result_read(&metadata).is_err());
+    }
+    #[test]
+    fn repeated_singular_data_and_schema_columns_are_bounded_before_prost() {
+        let mut repeated = Vec::new();
+        bytes_field(&mut repeated, 9, &[]);
+        bytes_field(&mut repeated, 9, &[]);
+        assert!(check_root_result_reply(&repeated).is_err());
+        let mut columns = Vec::new();
+        for _ in 0..RootProfileV1::MAX_COLUMNS {
+            bytes_field(&mut columns, 1, &[]);
+        }
+        assert!(check_client_render_schema(&columns).is_ok());
+        bytes_field(&mut columns, 1, &[]);
+        assert!(check_client_render_schema(&columns).is_err());
+    }
+    #[test]
+    fn widest_short_primitive_schema_passes_raw_prost_and_neutral_decode() {
+        use novarocks_result_contract::{
+            ClientRenderSchema, NativeRenderType, RenderColumn, RenderField, RenderPresentation,
+        };
+        let columns = (0..RootProfileV1::MAX_COLUMNS)
+            .map(|index| RenderColumn {
+                source_ordinal: index as u32,
+                source_slot: Some(index as u32),
+                name: "x".into(),
+                field: RenderField {
+                    nullable: true,
+                    native_type: NativeRenderType::String,
+                    presentation: RenderPresentation::ScalarText,
+                },
+            })
+            .collect();
+        let schema = ClientRenderSchema::try_new(columns, RootProfileV1::MAX_COLUMNS).unwrap();
+        let encoded =
+            novarocks_proto_codec::root_result::encode_client_schema(&schema).encode_to_vec();
+        check_client_render_schema(&encoded).unwrap();
+        let decoded =
+            novarocks_proto_models::result::ClientRenderSchema::decode(encoded.as_slice()).unwrap();
+        assert_eq!(
+            novarocks_proto_codec::root_result::decode_client_schema(
+                &decoded,
+                RootProfileV1::MAX_COLUMNS,
+                novarocks_proto_codec::FieldPath::root("schema")
+            )
+            .unwrap(),
+            schema
+        );
+    }
+    #[test]
+    fn merged_close_and_update_messages_share_their_domain_counter() {
+        for control in [false, true] {
+            let batch = |last_count| {
+                let mut first = Vec::new();
+                let mut second = Vec::new();
+                for _ in 0..128 {
+                    bytes_field(&mut first, 2, &[]);
+                }
+                for _ in 0..last_count {
+                    bytes_field(&mut second, 2, &[]);
+                }
+                let mut operation = Vec::new();
+                let field = if control { 7 } else { 3 };
+                bytes_field(&mut operation, field, &first);
+                bytes_field(&mut operation, field, &second);
+                let mut batch = Vec::new();
+                bytes_field(&mut batch, 1, &operation);
+                batch
+            };
+            assert!(finish(scan_batch(&batch(128), control)).is_ok());
+            assert!(finish(scan_batch(&batch(129), control)).is_err());
+        }
+    }
+    #[test]
+    fn frozen_root_schema_preflight_follows_every_merged_plan_wrapper() {
+        let columns = |count| {
+            let mut schema = Vec::new();
+            for _ in 0..count {
+                bytes_field(&mut schema, 1, &[]);
+            }
+            schema
+        };
+        let root = |schema: &[u8]| {
+            let mut root = Vec::new();
+            bytes_field(&mut root, 3, schema);
+            root
+        };
+        let frozen = |root: &[u8]| {
+            let mut sink = Vec::new();
+            bytes_field(&mut sink, 9, root);
+            let mut plan = Vec::new();
+            bytes_field(&mut plan, 5, &sink);
+            let mut frozen = Vec::new();
+            bytes_field(&mut frozen, 5, &plan);
+            frozen
+        };
+        let mut merged_schema = Vec::new();
+        bytes_field(&mut merged_schema, 3, &columns(2048));
+        bytes_field(&mut merged_schema, 3, &columns(2048));
+        assert!(check_frozen_fragment(&frozen(&merged_schema)).is_ok());
+        merged_schema.clear();
+        bytes_field(&mut merged_schema, 3, &columns(2048));
+        bytes_field(&mut merged_schema, 3, &columns(2049));
+        assert!(check_frozen_fragment(&frozen(&merged_schema)).is_err());
+        let mut merged_plans = frozen(&root(&columns(2048)));
+        merged_plans.extend(frozen(&root(&columns(2049))));
+        assert!(check_frozen_fragment(&merged_plans).is_err());
+        let mut nodes = Vec::new();
+        for _ in 0..=RootProfileV1::SCHEMA_TYPE_NODES {
+            bytes_field(&mut nodes, 2, &[]);
+        }
+        assert!(check_frozen_fragment(&frozen(&root(&nodes))).is_err());
+    }
+    #[test]
+    fn empty_children_and_repeated_merged_types_are_bounded_before_prost() {
+        let mut ty = Vec::new();
+        for _ in 0..65_537 {
+            bytes_field(&mut ty, 8, &[]);
+        }
+        let mut field = Vec::new();
+        bytes_field(&mut field, 2, &ty);
+        let mut schema = Vec::new();
+        bytes_field(&mut schema, 2, &field);
+        assert!(schema.len() < RootProfileV1::SCHEMA_WIRE_BYTES);
+        assert!(check_client_render_schema(&schema).is_err());
+        let mut half = Vec::new();
+        for _ in 0..2049 {
+            bytes_field(&mut half, 8, &[]);
+        }
+        field.clear();
+        bytes_field(&mut field, 2, &half);
+        bytes_field(&mut field, 2, &half);
+        schema.clear();
+        bytes_field(&mut schema, 2, &field);
+        assert!(check_client_render_schema(&schema).is_err());
     }
 }

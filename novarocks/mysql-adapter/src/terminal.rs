@@ -98,7 +98,8 @@ pub async fn write_governed_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
                 .await
                 .map(|_| crate::governed_result_writer::MysqlStatementWriteOutcome::Terminated)
         }
-        GovernedStatementVisibilitySealOutcome::Stale => {
+        GovernedStatementVisibilitySealOutcome::Stale
+        | GovernedStatementVisibilitySealOutcome::Failed => {
             let _ = protocol.fail();
             results
                 .error(
@@ -136,7 +137,8 @@ pub async fn write_governed_init_ok<W: AsyncWrite + Unpin>(
                 )
                 .await
         }
-        GovernedStatementVisibilitySealOutcome::Stale => {
+        GovernedStatementVisibilitySealOutcome::Stale
+        | GovernedStatementVisibilitySealOutcome::Failed => {
             let _ = protocol.fail();
             writer
                 .error(

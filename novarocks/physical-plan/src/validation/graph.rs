@@ -203,7 +203,7 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
             }
         }
         FragmentSink::SealedArtifact(spec) => validate_artifact_sink(fragment, spec, errors),
-        FragmentSink::Result => {
+        FragmentSink::Result | FragmentSink::RootResult(_) => {
             if root_multiplicity != Some(RowMultiplicity::SingleCopy) {
                 errors.push(ValidationError::new(
                     &path,
@@ -588,7 +588,10 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
                 }
                 &[]
             }
-            FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => &[],
+            FragmentSink::Result
+            | FragmentSink::RootResult(_)
+            | FragmentSink::SealedArtifact(_)
+            | FragmentSink::Noop => &[],
         };
         for edge_id in edges {
             if !referenced.insert(*edge_id) {
@@ -705,7 +708,10 @@ pub(crate) fn edge_kind_matches_sink(sink: &FragmentSink, kind: crate::EdgeKind)
         FragmentSink::Stream { .. } => kind == crate::EdgeKind::Stream,
         FragmentSink::Multicast { .. } => kind == crate::EdgeKind::CteMulticast,
         FragmentSink::Router { .. } => kind == crate::EdgeKind::ChangeStreamRouter,
-        FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => false,
+        FragmentSink::Result
+        | FragmentSink::RootResult(_)
+        | FragmentSink::SealedArtifact(_)
+        | FragmentSink::Noop => false,
     }
 }
 
@@ -903,7 +909,12 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
     let result_sinks = plan
         .fragments()
         .values()
-        .filter(|fragment| matches!(fragment.sink(), FragmentSink::Result))
+        .filter(|fragment| {
+            matches!(
+                fragment.sink(),
+                FragmentSink::Result | FragmentSink::RootResult(_)
+            )
+        })
         .collect::<Vec<_>>();
     match (plan.result_port(), result_sinks.as_slice()) {
         (None, []) => {}
@@ -942,6 +953,32 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
                     "result_port.output",
                     "result node is not defined",
                 )),
+            }
+            if let FragmentSink::RootResult(contract) = fragment.sink()
+                && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
+                    contract.output()
+            {
+                if schema.columns().len() != result.fields.len() {
+                    errors.push(ValidationError::new(
+                        "result_port.render_schema",
+                        "render schema width differs from ordered result occurrences",
+                    ));
+                }
+                for (ordinal, (column, field)) in
+                    schema.columns().iter().zip(&result.fields).enumerate()
+                {
+                    let name = field.alias.as_deref().unwrap_or(&field.name);
+                    if column.source_ordinal as usize != ordinal
+                        || column.name != name
+                        || !novarocks_type_contract::result_render_type::render_field_matches_storage(
+                            &column.field, &field.ty.data_type, field.ty.nullable)
+                    {
+                        errors.push(ValidationError::new(
+                            "result_port.render_schema",
+                            format!("render occurrence differs at ordinal {ordinal}"),
+                        ));
+                    }
+                }
             }
             if result.fields.len() != result.output.columns.len() {
                 errors.push(ValidationError::new(

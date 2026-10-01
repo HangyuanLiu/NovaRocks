@@ -26,6 +26,7 @@ use std::fmt;
 use novarocks_types::{BackendProcessId, NativeCompatibilityId};
 
 use crate::RuntimeEndpoint;
+use crate::native_result_support::BoundedRootSupport;
 
 const MAX_DEPLOYMENT_ID_BYTES: usize = 256;
 const MAX_BUILD_IDENTITY_BYTES: usize = 256;
@@ -46,6 +47,7 @@ pub struct BackendProcessDescriptor {
     build_identity: String,
     native_compatibility_id: NativeCompatibilityId,
     preparing_positions: usize,
+    bounded_root_support: Option<BoundedRootSupport>,
 }
 
 impl BackendProcessDescriptor {
@@ -79,9 +81,39 @@ impl BackendProcessDescriptor {
             build_identity,
             native_compatibility_id,
             preparing_positions,
+            bounded_root_support: None,
         })
     }
 
+    /// An independently configured control endpoint; it is never inferred
+    /// from the data endpoint or from the all-in-one topology.
+    pub fn with_bounded_root_support(
+        mut self,
+        support: BoundedRootSupport,
+    ) -> Result<Self, BackendProcessDescriptorError> {
+        if support.control_endpoint() == &self.endpoint {
+            return Err(BackendProcessDescriptorError::IndependentEndpoints);
+        }
+        if self
+            .bounded_root_support
+            .as_ref()
+            .is_some_and(|current| current != &support)
+        {
+            return Err(BackendProcessDescriptorError::ConflictingRootSupport);
+        }
+        self.bounded_root_support = Some(support);
+        Ok(self)
+    }
+    pub fn bounded_root_support(&self) -> Option<&BoundedRootSupport> {
+        self.bounded_root_support.as_ref()
+    }
+    pub fn require_bounded_root_support(
+        &self,
+    ) -> Result<&BoundedRootSupport, BackendProcessDescriptorError> {
+        self.bounded_root_support
+            .as_ref()
+            .ok_or(BackendProcessDescriptorError::MissingRootSupport)
+    }
     pub const fn process_id(&self) -> BackendProcessId {
         self.process_id
     }
@@ -111,6 +143,9 @@ impl BackendProcessDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendProcessDescriptorError {
     PreparingPositions,
+    IndependentEndpoints,
+    ConflictingRootSupport,
+    MissingRootSupport,
     DeploymentId,
     BuildIdentity,
 }
@@ -118,6 +153,15 @@ pub enum BackendProcessDescriptorError {
 impl fmt::Display for BackendProcessDescriptorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IndependentEndpoints => {
+                formatter.write_str("root control and data endpoints must be distinct")
+            }
+            Self::ConflictingRootSupport => {
+                formatter.write_str("backend root support is immutable")
+            }
+            Self::MissingRootSupport => {
+                formatter.write_str("backend does not advertise bounded root delivery")
+            }
             Self::PreparingPositions => {
                 formatter.write_str("backend preparation positions must be positive")
             }
@@ -174,6 +218,47 @@ mod tests {
                 4096,
             ),
             Err(BackendProcessDescriptorError::BuildIdentity)
+        );
+    }
+
+    #[test]
+    fn root_support_is_explicit_and_immutable_for_one_process() {
+        use crate::native_result_support::BoundedRootSupport;
+        use novarocks_result_contract::RootProfileId;
+        let base = BackendProcessDescriptor::try_new(
+            BackendProcessId::new_v7(),
+            RuntimeEndpoint::new("be", 9060).unwrap(),
+            "deployment",
+            "build",
+            NativeCompatibilityId::new([7; 32]),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            base.require_bounded_root_support(),
+            Err(BackendProcessDescriptorError::MissingRootSupport)
+        );
+        assert!(
+            base.clone()
+                .with_bounded_root_support(BoundedRootSupport::new(
+                    base.endpoint().clone(),
+                    RootProfileId::V1,
+                ))
+                .is_err()
+        );
+        let support =
+            BoundedRootSupport::new(RuntimeEndpoint::new("be", 9061).unwrap(), RootProfileId::V1);
+        let enabled = base.with_bounded_root_support(support.clone()).unwrap();
+        assert_eq!(
+            enabled.clone().with_bounded_root_support(support).unwrap(),
+            enabled
+        );
+        assert_eq!(
+            enabled.with_bounded_root_support(BoundedRootSupport::new(
+                RuntimeEndpoint::new("be", 9062).unwrap(),
+                RootProfileId::V1,
+            )),
+            Err(BackendProcessDescriptorError::ConflictingRootSupport)
         );
     }
 }

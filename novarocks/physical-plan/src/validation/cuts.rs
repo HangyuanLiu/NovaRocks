@@ -1144,7 +1144,10 @@ pub(crate) fn validate_fragment_cuts_into(
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
         FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
-        FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => Vec::new(),
+        FragmentSink::Result
+        | FragmentSink::RootResult(_)
+        | FragmentSink::SealedArtifact(_)
+        | FragmentSink::Noop => Vec::new(),
     };
     let sink_edge_ids = sink_edges.iter().copied().collect::<BTreeSet<_>>();
     if sink_edge_ids.len() != sink_edges.len() {

@@ -245,7 +245,9 @@ pub(crate) fn completed_plan_submission_facts(
     let mut fragments = Vec::with_capacity(plan.fragments().len());
     for fragment in plan.fragments().values() {
         let role = match fragment.sink() {
-            FragmentSink::Result => NativeSubmissionFragmentRole::Result,
+            FragmentSink::Result | FragmentSink::RootResult(_) => {
+                NativeSubmissionFragmentRole::Result
+            }
             FragmentSink::Stream { .. }
             | FragmentSink::Multicast { .. }
             | FragmentSink::Router { .. } => NativeSubmissionFragmentRole::NonTerminal,

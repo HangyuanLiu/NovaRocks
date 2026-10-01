@@ -1203,6 +1203,14 @@ fn add_sink_usage(
         FragmentSink::SealedArtifact(spec) => {
             add_artifact_sink_usage(spec, path, usage, errors);
         }
+        FragmentSink::RootResult(contract) => {
+            if let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
+                contract.output()
+            {
+                usage.add_items(schema.columns().len());
+                usage.add_bytes(schema.backing_bytes());
+            }
+        }
         FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Noop => {}
     }
 }

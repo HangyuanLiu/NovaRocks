@@ -1400,3 +1400,146 @@ fn physical_plan_nest_loop_subset_executes_through_terminal_projection() {
     ));
     assert_i64_rows(&chunks, &slots, &[vec![Some(47)]]);
 }
+
+#[test]
+fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_slots() {
+    use novarocks_execution::exec::fragment::sink::FragmentSinkProgram;
+    use novarocks_local_program::StaticSinkProgram;
+    use novarocks_result_contract::{
+        ClientRenderSchema, FrozenRootOutput, InternalResultDomain, NativeRenderType, RenderColumn,
+        RenderField, RenderPresentation, RootOutputContract, RootProfileId,
+    };
+    let physical = finish_nest_loop_projection_plan(99);
+    let columns = physical
+        .result_port()
+        .unwrap()
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| RenderColumn {
+            source_ordinal: ordinal as u32,
+            source_slot: None,
+            name: field.name.to_string(),
+            field: RenderField {
+                nullable: field.ty.nullable,
+                native_type: NativeRenderType::SignedInteger(64),
+                presentation: RenderPresentation::ScalarText,
+            },
+        })
+        .collect::<Vec<_>>();
+    let schema = ClientRenderSchema::try_new(columns.clone(), columns.len()).unwrap();
+    let mut wrong = columns;
+    wrong[0].field.native_type = NativeRenderType::String;
+    assert!(
+        physical
+            .clone()
+            .with_root_output(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::ClientRows(
+                    ClientRenderSchema::try_new(wrong, schema.columns().len()).unwrap()
+                )
+            ))
+            .is_err()
+    );
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    for output in [
+        FrozenRootOutput::ClientRows(schema),
+        FrozenRootOutput::CountOnly,
+        FrozenRootOutput::InternalFacts(InternalResultDomain::ScalarValueV1),
+    ] {
+        let kind = output.kind();
+        let physical = physical
+            .clone()
+            .with_root_output(RootOutputContract::new(RootProfileId::V1, output))
+            .unwrap();
+        assert!(
+            physical
+                .clone()
+                .with_root_output(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::CountOnly
+                ))
+                .is_err()
+        );
+        let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        )
+        .unwrap();
+        let mut fragment = encoded.fragments[0].clone();
+        let mut arena = ExprArena::default();
+        let decoded = decode_node(
+            fragment.root.as_ref().unwrap(),
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap();
+        let program = decode_fragment_sink_program(&fragment, &decoded.layout).unwrap();
+        let FragmentSinkProgram::RootResult(contract) = &program else {
+            panic!("expected frozen root");
+        };
+        assert_eq!(contract.kind(), kind);
+        let StaticSinkProgram::RootResult(retained) = program.into_static().unwrap() else {
+            panic!("expected pure root sink");
+        };
+        assert_eq!(retained.kind(), kind);
+        let prepare = |fragment: &plan::PlanFragment| {
+            let mut arena = ExprArena::default();
+            let decoded = decode_node(
+                fragment.root.as_ref().unwrap(),
+                &mut arena,
+                &NativePlanDecodeContext::default(),
+            )
+            .unwrap();
+            let sink = decode_fragment_sink_program(fragment, &decoded.layout)
+                .unwrap()
+                .into_static()
+                .unwrap();
+            let plan = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
+            let profile = plan
+                .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
+                .unwrap();
+            plan.into_local_program_and_bindings(
+                profile,
+                std::collections::BTreeMap::new(),
+                vec![novarocks_execution::exec::node::ExternalSinkRequirement::Result],
+                sink,
+            )
+        };
+        assert!(prepare(&fragment).is_ok());
+        if let Some(plan::data_sink::Kind::RootResult(wire)) =
+            fragment.sink.as_ref().unwrap().kind.as_ref()
+            && wire.client_schema.is_some()
+        {
+            for nullable_only in [false, true] {
+                let mut corrupt = fragment.clone();
+                let Some(plan::data_sink::Kind::RootResult(wire)) =
+                    corrupt.sink.as_mut().unwrap().kind.as_mut()
+                else {
+                    unreachable!();
+                };
+                let field = &mut wire.client_schema.as_mut().unwrap().field_nodes[0];
+                if nullable_only {
+                    field.nullable = !field.nullable;
+                } else {
+                    field.native_type.as_mut().unwrap().kind =
+                        novarocks_proto_models::result::RenderTypeKind::String as i32;
+                    field.native_type.as_mut().unwrap().bits = 0;
+                }
+                assert!(
+                    prepare(&corrupt).is_err(),
+                    "wrong render type or nullable must fail before installation"
+                );
+            }
+        }
+
+        if let Some(plan::data_sink::Kind::RootResult(wire)) =
+            fragment.sink.as_mut().unwrap().kind.as_mut()
+            && let Some(schema) = wire.client_schema.as_mut()
+        {
+            schema.columns[0].source_slot = Some(u32::MAX);
+            assert!(decode_fragment_sink_program(&fragment, &decoded.layout).is_err());
+        }
+    }
+}

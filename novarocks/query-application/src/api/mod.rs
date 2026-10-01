@@ -22,6 +22,7 @@ mod execution;
 mod native;
 mod plan_scheduling;
 pub(crate) mod result;
+mod root_delivery;
 mod topology;
 
 pub use backend_topology::*;
@@ -31,4 +32,5 @@ pub use execution::*;
 pub use native::*;
 pub use plan_scheduling::*;
 pub use result::*;
+pub use root_delivery::*;
 pub use topology::*;

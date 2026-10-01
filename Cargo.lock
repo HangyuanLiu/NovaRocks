@@ -3823,6 +3823,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-local-program",
  "novarocks-memory",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-type-contract",
@@ -3853,6 +3854,7 @@ name = "novarocks-execution-contract"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "novarocks-result-contract",
  "novarocks-types",
  "uuid",
 ]
@@ -3974,6 +3976,7 @@ dependencies = [
  "novarocks-connector-contract",
  "novarocks-execution-contract",
  "novarocks-functions",
+ "novarocks-result-contract",
  "novarocks-type-contract",
  "novarocks-types",
  "serde_json",
@@ -4064,6 +4067,7 @@ dependencies = [
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
@@ -4126,6 +4130,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-schema",
  "novarocks-connector-contract",
+ "novarocks-result-contract",
  "novarocks-type-contract",
 ]
 
@@ -4141,6 +4146,7 @@ dependencies = [
  "novarocks-physical-plan",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-type-contract",
  "novarocks-types",
@@ -4156,6 +4162,7 @@ dependencies = [
  "bytes",
  "novarocks-execution-contract",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-types",
  "once_cell",
@@ -4187,6 +4194,7 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-parser",
  "novarocks-physical-plan",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
@@ -4196,6 +4204,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "novarocks-result-contract"
+version = "0.1.0"
+
+[[package]]
+name = "novarocks-result-render"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "chrono",
+ "novarocks-result-contract",
+ "novarocks-type-contract",
+ "novarocks-types",
 ]
 
 [[package]]
@@ -4478,9 +4501,11 @@ dependencies = [
 name = "novarocks-task-codec"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "novarocks-execution-contract",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-types",
  "prost 0.13.5",
@@ -4515,6 +4540,7 @@ name = "novarocks-type-contract"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "novarocks-result-contract",
 ]
 
 [[package]]

@@ -404,7 +404,8 @@ pub async fn write_governed_query_result_one<'writer, W: AsyncWrite + Unpin>(
             return finish_stream_error_terminated(writer, ErrorKind::ER_QUERY_INTERRUPTED, &error)
                 .await;
         }
-        GovernedStatementVisibilitySealOutcome::Stale => {
+        GovernedStatementVisibilitySealOutcome::Stale
+        | GovernedStatementVisibilitySealOutcome::Failed => {
             let error = failed_query_result_delivery(
                 "governed query lost its statement generation before success visibility",
             );
@@ -773,7 +774,8 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                         )
                         .await;
                     }
-                    GovernedStatementVisibilitySealOutcome::Stale => {
+                    GovernedStatementVisibilitySealOutcome::Stale
+                    | GovernedStatementVisibilitySealOutcome::Failed => {
                         let error = failed_query_result_delivery(
                             "governed query lost its statement generation before success visibility",
                         );

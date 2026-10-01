@@ -859,7 +859,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
                 Ok(operation) => {
-                    operations.push((is_small_control(intent.shape()), operation));
+                    operations.push((is_small_control(&intent), operation));
                     sent.push(SentOperation {
                         operation_id: intent.operation_id(),
                         kind: intent.kind(),
@@ -968,21 +968,9 @@ fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
     }
 }
 
-const fn is_small_control(shape: OperationShape) -> bool {
-    match shape {
-        OperationShape::RenewQueryExecutionLease
-        | OperationShape::CancelTask
-        | OperationShape::QuiesceQueryContext
-        | OperationShape::AbortQueryContext
-        | OperationShape::ReleaseQueryContext => true,
-        OperationShape::AcquireQueryContextAdmissionTicket
-        | OperationShape::EstablishQueryContext
-        | OperationShape::AdvanceQueryContextDomain
-        | OperationShape::CreateTask
-        | OperationShape::UpdateTask
-        | OperationShape::FetchTaskDynamicFilters
-        | OperationShape::GetFinalTaskInfo => false,
-    }
+fn is_small_control(intent: &OperationIntent) -> bool {
+    intent.native_method()
+        == novarocks_proto_codec::native_rpc::NativeRpcMethod::ApplyTaskControlOperations
 }
 
 enum EncodedMethodRequest {
@@ -1010,7 +998,8 @@ impl EncodedMethodBatch {
 }
 
 /// Preserve dispatcher order while directing each contiguous run to the
-/// method whose closed input grammar accepts it.
+/// method whose closed input grammar accepts it. A run also shares one
+/// absolute submit deadline: a longer item must not renew a shorter item.
 fn encode_method_batches(
     operations: Vec<(bool, proto::TaskOperation)>,
     budget: TransportBudget,
@@ -1018,19 +1007,22 @@ fn encode_method_batches(
     let mut batches = Vec::new();
     let mut iter = operations.into_iter().peekable();
     while let Some((control, first)) = iter.next() {
+        let wait_millis = first
+            .envelope
+            .as_ref()
+            .map(|envelope| envelope.max_wait_millis);
         let mut run = vec![first];
-        while iter
-            .peek()
-            .is_some_and(|(next_control, _)| *next_control == control)
-        {
+        while iter.peek().is_some_and(|(next_control, operation)| {
+            *next_control == control
+                && operation
+                    .envelope
+                    .as_ref()
+                    .map(|envelope| envelope.max_wait_millis)
+                    == wait_millis
+        }) {
             run.push(iter.next().expect("peeked operation exists").1);
         }
-        let deadline = run
-            .iter()
-            .filter_map(|operation| operation.envelope.as_ref())
-            .map(|envelope| Duration::from_millis(envelope.max_wait_millis))
-            .max()
-            .unwrap_or_default();
+        let deadline = Duration::from_millis(wait_millis.unwrap_or_default());
         let items = run.len();
         let request = if control {
             EncodedMethodRequest::Control(encode_control_operation_batch(run, budget)?)
@@ -1292,7 +1284,7 @@ fn acknowledgement(
 
 /// One `ApplyTaskOperations` round trip, classified by type.
 ///
-/// The deadline is the longest wait the batch itself requested. A batch that
+/// The deadline is the shared absolute submit deadline of this run. A batch that
 /// has not answered by then has a genuinely unknown outcome, which is exactly
 /// what the retry rule exists for.
 async fn send_operations(
@@ -3263,6 +3255,14 @@ mod tests {
                 .into_iter()
                 .map(|operation| {
                     let body = match operation.control.expect("control body") {
+                        proto::task_control_operation::Control::CloseExchangeDestinations(close) => {
+                            proto::task_operation::Operation::UpdateTask(proto::UpdateTaskRequest {
+                                identity: close.identity,
+                                domains: close.destinations.into_iter().map(|destination| proto::TaskDomainUpdate {
+                                    domain: Some(proto::task_domain_update::Domain::CloseExchangeDestination(destination)),
+                                }).collect(),
+                            })
+                        }
                         proto::task_control_operation::Control::RenewLease(renew) => {
                             proto::task_operation::Operation::UpdateQueryContext(
                                 proto::UpdateQueryContextRequest {
@@ -3558,7 +3558,7 @@ mod tests {
             .iter()
             .map(|intent| {
                 (
-                    is_small_control(intent.shape()),
+                    is_small_control(&intent),
                     encode_operation(intent, &test_attempt_facts()).expect("encodable intent"),
                 )
             })
@@ -3567,7 +3567,7 @@ mod tests {
             .expect("mixed batch fits transport budget");
         assert_eq!(
             batches.iter().map(|batch| batch.items).collect::<Vec<_>>(),
-            vec![1, 2, 1]
+            vec![1, 1, 1, 1]
         );
         let actual_ids = batches
             .iter()
@@ -3603,6 +3603,10 @@ mod tests {
         ));
         assert!(matches!(
             batches[2].request,
+            EncodedMethodRequest::Control(_)
+        ));
+        assert!(matches!(
+            batches[3].request,
             EncodedMethodRequest::Ordinary(_)
         ));
     }
@@ -3623,7 +3627,7 @@ mod tests {
                     .as_mut()
                     .expect("envelope")
                     .max_wait_millis = if index == 0 { 300_000 } else { 100 };
-                (is_small_control(intent.shape()), operation)
+                (is_small_control(&intent), operation)
             })
             .collect();
         let batches =
@@ -3662,6 +3666,53 @@ mod tests {
             "expired control run must not reach its RPC"
         );
         assert_eq!(fixture.loopback.peer.control_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adjacent_control_items_with_different_waits_keep_each_submit_deadline() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let intents = [
+            update_intent(1, backend, 1),
+            cancel_intent(1, backend),
+            renew_intent(backend),
+        ];
+        let operations = intents
+            .iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                let mut operation = encode_operation(intent, &test_attempt_facts()).unwrap();
+                operation.envelope.as_mut().unwrap().max_wait_millis =
+                    if index == 1 { 100 } else { 300_000 };
+                (is_small_control(intent), operation)
+            })
+            .collect();
+        let batches = encode_method_batches(operations, TransportBudget::DEFAULT).unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.items).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+        let submitted_at = tokio::time::Instant::now() - Duration::from_secs(10);
+        let client = &fixture.sink.targets[&backend].client;
+        let mut batches = batches.into_iter();
+        let first = batches.next().unwrap();
+        let deadline = first.expires_at(submitted_at);
+        send_operations(client, first.request, deadline, &fixture.acks.handle(), &[])
+            .await
+            .unwrap();
+        let short = batches.next().unwrap();
+        let deadline = short.expires_at(submitted_at);
+        assert_eq!(
+            send_operations(client, short.request, deadline, &fixture.acks.handle(), &[]).await,
+            Err(OperationDispatchResult::TransportUnknown)
+        );
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
+        let long = batches.next().unwrap();
+        let deadline = long.expires_at(submitted_at);
+        send_operations(client, long.request, deadline, &fixture.acks.handle(), &[])
+            .await
+            .unwrap();
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

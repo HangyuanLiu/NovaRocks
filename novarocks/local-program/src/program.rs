@@ -897,7 +897,9 @@ impl LocalProgram {
                 })
                 .collect::<BTreeSet<_>>();
             match sink {
-                StaticSinkProgram::Result if result_count != 1 || !outputs.is_empty() => {
+                StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
+                    if result_count != 1 || !outputs.is_empty() =>
+                {
                     return Err(LocalProgramError::InvalidSink);
                 }
                 StaticSinkProgram::Noop if result_count != 0 || !outputs.is_empty() => {
@@ -911,6 +913,33 @@ impl LocalProgram {
                     return Err(LocalProgramError::InvalidSink);
                 }
                 _ => {}
+            }
+            if let StaticSinkProgram::RootResult(contract) = sink
+                && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
+                    contract.output()
+            {
+                let slots = nodes[root.index()]
+                    .output_layout
+                    .slots()
+                    .iter()
+                    .map(|slot| slot.as_u32())
+                    .collect::<Vec<_>>();
+                schema
+                    .validate_native_slots(&slots)
+                    .map_err(|_| LocalProgramError::InvalidSink)?;
+                let fields = nodes[root.index()].output_layout.schema().fields();
+                for column in schema.columns() {
+                    let field = fields
+                        .get(column.source_ordinal as usize)
+                        .ok_or(LocalProgramError::InvalidSink)?;
+                    if !novarocks_type_contract::result_render_type::render_field_matches_storage(
+                        &column.field,
+                        field.data_type(),
+                        field.is_nullable(),
+                    ) {
+                        return Err(LocalProgramError::InvalidSink);
+                    }
+                }
             }
             for requirement in requirements.entries() {
                 if let BindingRequirement::ExchangeOutput { branch, layout } = requirement {

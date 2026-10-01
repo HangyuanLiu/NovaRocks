@@ -121,7 +121,17 @@ impl BackendProcessDescriptor {
                 "backend preparation capacity cannot be represented on this host",
             )
         })?;
-        ContractBackendProcessDescriptor::try_new(
+        let support = raw
+            .bounded_root_support
+            .as_ref()
+            .map(|support| {
+                decode_bounded_root_support(
+                    support,
+                    FieldPath::root("backend_process_descriptor").field("bounded_root_support"),
+                )
+            })
+            .transpose()?;
+        let descriptor = ContractBackendProcessDescriptor::try_new(
             process_id,
             endpoint,
             raw.deployment_id,
@@ -129,13 +139,24 @@ impl BackendProcessDescriptor {
             native_compatibility_id,
             preparing_positions,
         )
-        .map(Self::from_contract)
         .map_err(|error| {
             invalid(
                 FieldPath::root("backend_process_descriptor"),
                 error.to_string(),
             )
-        })
+        })?;
+        let descriptor = match support {
+            Some(support) => descriptor
+                .with_bounded_root_support(support)
+                .map_err(|error| {
+                    invalid(
+                        FieldPath::root("backend_process_descriptor").field("bounded_root_support"),
+                        error.to_string(),
+                    )
+                })?,
+            None => descriptor,
+        };
+        Ok(Self::from_contract(descriptor))
     }
 
     pub fn from_contract(descriptor: ContractBackendProcessDescriptor) -> Self {
@@ -152,6 +173,9 @@ impl BackendProcessDescriptor {
                     .clone(),
                 ),
                 preparing_positions: descriptor.preparing_positions() as u64,
+                bounded_root_support: descriptor
+                    .bounded_root_support()
+                    .map(encode_bounded_root_support),
                 deployment_id: descriptor.deployment_id().to_string(),
                 build_identity: descriptor.build_identity().to_string(),
                 native_compatibility_id: Some(novarocks::NativeCompatibilityId {
@@ -162,27 +186,33 @@ impl BackendProcessDescriptor {
     }
 
     pub fn to_contract(&self) -> Result<ContractBackendProcessDescriptor, ProtocolError> {
-        Self::parse(self.raw.clone()).map(|descriptor| {
-            let process_id = descriptor
-                .process_id()
-                .expect("validated backend process descriptor retains its process id");
-            let endpoint = descriptor
-                .endpoint()
-                .expect("validated backend process descriptor retains its endpoint");
-            ContractBackendProcessDescriptor::try_new(
-                process_id,
-                RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
-                    .expect("validated backend process descriptor retains a runtime endpoint"),
-                descriptor.deployment_id(),
-                descriptor.build_identity(),
-                descriptor
-                    .native_compatibility_id()
-                    .expect("validated backend process descriptor retains compatibility"),
-                usize::try_from(descriptor.raw.preparing_positions)
-                    .expect("validated capacity fits host"),
-            )
-            .expect("validated backend process descriptor retains contract invariants")
-        })
+        let validated = Self::parse(self.raw.clone())?;
+        let endpoint = validated.endpoint()?;
+        let descriptor = ContractBackendProcessDescriptor::try_new(
+            validated.process_id()?,
+            RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+                .expect("validated endpoint retains host/port"),
+            validated.deployment_id(),
+            validated.build_identity(),
+            validated.native_compatibility_id()?,
+            usize::try_from(validated.raw.preparing_positions)
+                .expect("validated capacity fits host"),
+        )
+        .expect("validated base descriptor retains its invariants");
+        match validated.raw.bounded_root_support.as_ref() {
+            None => Ok(descriptor),
+            Some(support) => descriptor
+                .with_bounded_root_support(decode_bounded_root_support(
+                    support,
+                    FieldPath::root("backend_process_descriptor").field("bounded_root_support"),
+                )?)
+                .map_err(|error| {
+                    invalid(
+                        FieldPath::root("backend_process_descriptor"),
+                        error.to_string(),
+                    )
+                }),
+        }
     }
 
     pub const fn as_proto(&self) -> &novarocks::BackendProcessDescriptor {
@@ -495,6 +525,167 @@ fn prefix_path(prefix: FieldPath, error: ProtocolError) -> ProtocolError {
     )
 }
 
+fn encode_bounded_root_support(
+    value: &novarocks_execution_contract::native_result_support::BoundedRootSupport,
+) -> novarocks::BoundedRootSupport {
+    novarocks::BoundedRootSupport {
+        control_endpoint: Some(
+            QueryControlEndpoint::new(
+                value.control_endpoint().host(),
+                value.control_endpoint().port() as u16,
+            )
+            .expect("validated control endpoint")
+            .as_proto()
+            .clone(),
+        ),
+        profile_id: value.profile().get(),
+        geometry: Some(encode_support_geometry(value.geometry())),
+    }
+}
+fn decode_bounded_root_support(
+    value: &novarocks::BoundedRootSupport,
+    path: FieldPath,
+) -> Result<novarocks_execution_contract::native_result_support::BoundedRootSupport, ProtocolError>
+{
+    let profile =
+        crate::root_result::decode_profile(value.profile_id, path.clone().field("profile_id"))?;
+    let geometry = value.geometry.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("geometry"),
+            "complete Native support geometry is required",
+        )
+    })?;
+    if geometry
+        != &encode_support_geometry(
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1,
+        )
+    {
+        return Err(invalid(
+            path.clone().field("geometry"),
+            "Native support geometry does not match the frozen profile",
+        ));
+    }
+    let control =
+        QueryControlEndpoint::parse(value.control_endpoint.clone().ok_or_else(|| {
+            missing(
+                path.clone().field("control_endpoint"),
+                "independent control endpoint is required",
+            )
+        })?)?;
+    let control = RuntimeEndpoint::new(control.host(), i32::from(control.port()))
+        .map_err(|error| invalid(path.field("control_endpoint"), error.to_string()))?;
+    Ok(
+        novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+            control, profile,
+        ),
+    )
+}
+fn encode_support_geometry(
+    value: novarocks_execution_contract::native_result_support::NativeResultSupportGeometry,
+) -> novarocks::NativeResultSupportGeometry {
+    novarocks::NativeResultSupportGeometry {
+        frontend_client_compute_positions: value.frontend_client_compute_positions,
+        frontend_short_tail_positions: value.frontend_short_tail_positions,
+        frontend_client_window_positions: value.frontend_client_window_positions,
+        frontend_closing_positions: value.frontend_closing_positions,
+        frontend_ordinary_connections: value.frontend_ordinary_connections,
+        frontend_control_connections: value.frontend_control_connections,
+        frontend_local_positions: value.frontend_local_positions,
+        frontend_internal_positions: value.frontend_internal_positions,
+        frontend_supported_cancel_burst: value.frontend_supported_cancel_burst,
+        frontend_sustained_cancels_per_second: value.frontend_sustained_cancels_per_second,
+        transport_authenticated_live_frontends_per_backend: value
+            .transport_authenticated_live_frontends_per_backend,
+        transport_worst_case_roots_per_frontend_per_backend: value
+            .transport_worst_case_roots_per_frontend_per_backend,
+        transport_connections_per_frontend_backend_result: value
+            .transport_connections_per_frontend_backend_result,
+        transport_connections_per_frontend_backend_observation: value
+            .transport_connections_per_frontend_backend_observation,
+        transport_connections_per_frontend_backend_submission: value
+            .transport_connections_per_frontend_backend_submission,
+        transport_connections_per_frontend_backend_lifecycle_control: value
+            .transport_connections_per_frontend_backend_lifecycle_control,
+        transport_streams_per_connection: value.transport_streams_per_connection,
+        transport_tonic_pending_per_connection: value.transport_tonic_pending_per_connection,
+        transport_h2_frame_bytes: value.transport_h2_frame_bytes,
+        transport_h2_header_bytes: value.transport_h2_header_bytes,
+        transport_h2_send_buffer_bytes: value.transport_h2_send_buffer_bytes,
+        transport_h2_adaptive_window: value.transport_h2_adaptive_window,
+        transport_connect_deadline_ms: value.transport_connect_deadline_ms,
+        transport_fetch_deadline_ms: value.transport_fetch_deadline_ms,
+        transport_short_tail_exit_deadline_ms: value.transport_short_tail_exit_deadline_ms,
+        transport_handshake_deadline_ms: value.transport_handshake_deadline_ms,
+        transport_maximum_live_backends: value.transport_maximum_live_backends,
+        transport_h2_connection_receive_window_bytes: value
+            .transport_h2_connection_receive_window_bytes,
+        transport_h2_stream_receive_window_bytes: value.transport_h2_stream_receive_window_bytes,
+        transport_h2_pending_resets: value.transport_h2_pending_resets,
+        transport_connection_all_independent_backings_bytes: value
+            .transport_connection_all_independent_backings_bytes,
+        transport_stream_bookkeeping_bytes: value.transport_stream_bookkeeping_bytes,
+        transport_idle_decoder_bytes: value.transport_idle_decoder_bytes,
+        transport_header_raw_and_expanded_bytes: value.transport_header_raw_and_expanded_bytes,
+        transport_nonroot_producer_positions: value.transport_nonroot_producer_positions,
+        transport_nonroot_encode_positions: value.transport_nonroot_encode_positions,
+        transport_nonroot_decode_positions: value.transport_nonroot_decode_positions,
+        transport_nonroot_producer_expanded_bytes: value.transport_nonroot_producer_expanded_bytes,
+        transport_nonroot_wire_actual_backing_bytes: value
+            .transport_nonroot_wire_actual_backing_bytes,
+        transport_nonroot_decoded_expanded_bytes: value.transport_nonroot_decoded_expanded_bytes,
+        transport_nonroot_wire_logical_bytes: value.transport_nonroot_wire_logical_bytes,
+        transport_nonroot_compression: value.transport_nonroot_compression,
+        transport_frontend_native_additional_bytes: value
+            .transport_frontend_native_additional_bytes,
+        transport_data_handshake_positions: value.transport_data_handshake_positions,
+        transport_control_handshake_positions: value.transport_control_handshake_positions,
+        transport_exchange_connections_per_peer: value.transport_exchange_connections_per_peer,
+        transport_runtime_filter_connections_per_peer: value
+            .transport_runtime_filter_connections_per_peer,
+        transport_exchange_inflight_per_peer: value.transport_exchange_inflight_per_peer,
+        transport_exchange_short_tails_per_peer: value.transport_exchange_short_tails_per_peer,
+        transport_runtime_filter_inflight_per_peer: value
+            .transport_runtime_filter_inflight_per_peer,
+        transport_runtime_filter_short_tails_per_peer: value
+            .transport_runtime_filter_short_tails_per_peer,
+        root_joint_retained_bytes_per_root: value.root_joint_retained_bytes_per_root,
+        root_joint_retained_bytes_per_process: value.root_joint_retained_bytes_per_process,
+        root_maximum_root_drivers: value.root_maximum_root_drivers,
+        root_shared_input_positions: value.root_shared_input_positions,
+        root_shared_encoding_cursors: value.root_shared_encoding_cursors,
+        root_original_input_backing_capacity_bytes: value
+            .root_original_input_backing_capacity_bytes,
+        root_additional_hydrate_backing_capacity_bytes: value
+            .root_additional_hydrate_backing_capacity_bytes,
+        root_scratch_capacity_bytes: value.root_scratch_capacity_bytes,
+        root_small_row_staging_bytes: value.root_small_row_staging_bytes,
+        root_active_segment_positions: value.root_active_segment_positions,
+        root_queued_segment_positions: value.root_queued_segment_positions,
+        root_terminal_positions: value.root_terminal_positions,
+        root_segment_backing_capacity_bytes: value.root_segment_backing_capacity_bytes,
+        root_live_send_holders: value.root_live_send_holders,
+        root_independent_payload_copies_per_send: value.root_independent_payload_copies_per_send,
+        root_fixed_schema_cursor_driver_capacity_bytes: value
+            .root_fixed_schema_cursor_driver_capacity_bytes,
+        root_actual_exit_deadline_ms: value.root_actual_exit_deadline_ms,
+        root_retired_segment_tail_positions: value.root_retired_segment_tail_positions,
+        frontend_window_all_objects_bytes: value.frontend_window_all_objects_bytes,
+        frontend_closing_all_objects_bytes: value.frontend_closing_all_objects_bytes,
+        frontend_minimum_open_file_limit: value.frontend_minimum_open_file_limit,
+        backend_minimum_open_file_limit: value.backend_minimum_open_file_limit,
+        transport_connecting_positions_per_lane: value.transport_connecting_positions_per_lane,
+        transport_closing_positions_per_lane: value.transport_closing_positions_per_lane,
+        transport_exchange_connecting_positions_per_peer: value
+            .transport_exchange_connecting_positions_per_peer,
+        transport_exchange_closing_positions_per_peer: value
+            .transport_exchange_closing_positions_per_peer,
+        transport_runtime_filter_connecting_positions_per_peer: value
+            .transport_runtime_filter_connecting_positions_per_peer,
+        transport_runtime_filter_closing_positions_per_peer: value
+            .transport_runtime_filter_closing_positions_per_peer,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -604,5 +795,81 @@ mod tests {
             BackendProcessDescriptor::parse(raw).is_err(),
             "a missing hard-cut capability cannot be defaulted from another backend"
         );
+    }
+
+    #[test]
+    fn bounded_root_support_is_preserved_in_membership_and_requires_exact_geometry() {
+        use novarocks_execution_contract::{
+            RuntimeEndpoint, native_result_support::BoundedRootSupport,
+        };
+        use novarocks_result_contract::RootProfileId;
+
+        let legacy = descriptor().to_contract().unwrap();
+        assert!(legacy.require_bounded_root_support().is_err());
+        let contract = legacy
+            .with_bounded_root_support(BoundedRootSupport::new(
+                RuntimeEndpoint::new("be-0.internal", 9091).unwrap(),
+                RootProfileId::V1,
+            ))
+            .unwrap();
+        let encoded = BackendProcessDescriptor::from_contract(contract.clone());
+        assert_eq!(
+            BackendProcessDescriptor::parse(encoded.as_proto().clone())
+                .unwrap()
+                .to_contract()
+                .unwrap(),
+            contract
+        );
+        let announce =
+            BackendAnnounceRequest::new(encoded.clone(), BackendReportedState::Running).unwrap();
+        assert_eq!(
+            announce.descriptor().unwrap().to_contract().unwrap(),
+            contract
+        );
+
+        let mut missing_control = encoded.as_proto().clone();
+        missing_control
+            .bounded_root_support
+            .as_mut()
+            .unwrap()
+            .control_endpoint = None;
+        assert!(BackendProcessDescriptor::parse(missing_control).is_err());
+        let mut same_endpoint = encoded.as_proto().clone();
+        same_endpoint
+            .bounded_root_support
+            .as_mut()
+            .unwrap()
+            .control_endpoint = same_endpoint.endpoint.clone();
+        assert!(BackendProcessDescriptor::parse(same_endpoint).is_err());
+        let mut missing_geometry = encoded.as_proto().clone();
+        missing_geometry
+            .bounded_root_support
+            .as_mut()
+            .unwrap()
+            .geometry = None;
+        assert!(BackendProcessDescriptor::parse(missing_geometry).is_err());
+        let mut insufficient = encoded.as_proto().clone();
+        insufficient
+            .bounded_root_support
+            .as_mut()
+            .unwrap()
+            .geometry
+            .as_mut()
+            .unwrap()
+            .transport_streams_per_connection = 127;
+        assert!(BackendProcessDescriptor::parse(insufficient).is_err());
+        let mut excessive = encoded.as_proto().clone();
+        excessive
+            .bounded_root_support
+            .as_mut()
+            .unwrap()
+            .geometry
+            .as_mut()
+            .unwrap()
+            .root_live_send_holders = 3;
+        assert!(BackendProcessDescriptor::parse(excessive).is_err());
+        let mut unknown = encoded.as_proto().clone();
+        unknown.bounded_root_support.as_mut().unwrap().profile_id = 2;
+        assert!(BackendProcessDescriptor::parse(unknown).is_err());
     }
 }

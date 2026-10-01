@@ -14,6 +14,7 @@ doctest = false
 core-pipeline-integration = []
 
 [dependencies]
+novarocks-result-contract.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
 arrow-data = { version = "58.2.0" }

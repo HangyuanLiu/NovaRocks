@@ -1405,7 +1405,7 @@ impl FrontendQuerySession {
                 drop(live_state);
                 Ok(self.governed_typed_error(governed_cancellation_error(reason), statement))
             }
-            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Stale => {
+            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Stale | novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Failed => {
                 drop(live_state);
                 Ok(self.governed_typed_error(
                     internal_error(

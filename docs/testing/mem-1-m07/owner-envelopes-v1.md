@@ -34,7 +34,7 @@ checked小计为1216MiB connections +768MiB nonroot +65.25MiB bookkeeping +130.5
 
 ## BE root 与同一 retained 防护
 
-root共享一个输入位置和一个编码cursor，最多64个准确driver。最后一次upstream pull之前取得root资格及整个合法共存能力；其他DOP driver不再生成一个待投root输入再等待。96MiB原input +96MiB新增hydrate +2MiB scratch +64KiB staging +3×(S+4096) queued/active segments +4×(S+4096)独立send copies +1MiB schema/cursor/driver metadata +有限End，约202.1MiB，小于256MiB joint root cap。原batch slice不缩小backing；完整输入identity/capacity必须preflight。dictionary合法且可准确游标读取；必要hydrate先检查展开、取得能力并有限推进，不先generic整批cast再补检查。
+root共享一个输入位置和一个编码cursor，最多64个准确driver。最后一次upstream pull之前取得root资格及整个合法共存能力；其他DOP driver不再生成一个待投root输入再等待。96MiB原input +96MiB新增hydrate +2MiB scratch +64KiB staging +3×(S+4096) queued/active segments +2×(S+4096) ACK后仍由send alias持有的retired segments +4×(S+4096)独立send copies +1MiB schema/cursor/driver metadata +有限End，约204.1MiB，小于256MiB joint root cap。原batch slice不缩小backing；完整输入identity/capacity必须preflight。dictionary合法且可准确游标读取；必要hydrate先检查展开、取得能力并有限推进，不先generic整批cast再补检查。
 
 64MiB指完整MysqlText row payload，含cell length prefix。不构造完整encoded row；大值仍需驻留原input，因此当前16MiB root默认不支持该最大行。row合法不代表所有nested/dictionary backing都合法；同时须满足输入96MiB、新增hydrate96MiB、scratch/depth/elements界。超过任一界准确 originating failure。
 

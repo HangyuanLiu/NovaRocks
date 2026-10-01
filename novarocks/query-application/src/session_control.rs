@@ -26,7 +26,7 @@ use crate::cancellation::{
 };
 use crate::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
-    BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit,
+    BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit, ResultClosingCut,
     RootAdmissionHandle, WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner,
     WorkRequest, WorkScope, WorkSuccessSealer,
 };
@@ -241,6 +241,7 @@ pub enum GovernedStatementFinishOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GovernedStatementVisibilitySealOutcome {
     Sealed,
+    Failed,
     Cancelled(CancellationReason),
     Stale,
 }
@@ -479,6 +480,7 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: None,
             query_concurrency: Some(permit),
+            accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
             finished: false,
@@ -534,6 +536,7 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: Some(root.business),
             query_concurrency: None,
+            accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
             finished: false,
@@ -650,6 +653,7 @@ pub struct GovernedQueryStatementOwner {
     execution_owner: Option<WorkOwner>,
     business: Option<BusinessPermit>,
     query_concurrency: Option<QueryConcurrencyPermit>,
+    accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
     finished: bool,
@@ -706,11 +710,57 @@ impl GovernedQueryStatementOwner {
         self.business.take();
     }
 
+    /// Accept a cancellation delivery cut after publication/fetch dispatch has
+    /// stopped. Only the computation permit is returned here. The statement
+    /// generation, business responsibility and external effects stay owned
+    /// through the protocol's independent closing/actual exit boundary.
+    pub fn accept_cancel_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        if self.finished || self.success_visibility_sealed || self.cancellation().reason().is_none()
+        {
+            return Err(WorkError::Conflict);
+        }
+        if self.accepted_delivery_cut.is_some() {
+            return Ok(false);
+        }
+        self.accepted_delivery_cut = Some(ResultClosingCut::AcceptedCancellation);
+        Ok(self.query_concurrency.take().is_some())
+    }
+
+    /// The originating failure owner uses this only after its failure cut has
+    /// stopped new delivery work. It does not invent client cancellation or
+    /// settle business/external effects, even after success visibility sealed.
+    pub fn accept_failed_delivery_cut(&mut self) -> Result<bool, WorkError> {
+        if self.finished {
+            return Err(WorkError::Released);
+        }
+        if self.accepted_delivery_cut.is_some() {
+            return Ok(false);
+        }
+        self.accepted_delivery_cut = Some(ResultClosingCut::OriginatingFailure);
+        Ok(self.query_concurrency.take().is_some())
+    }
+    pub(crate) fn accepted_delivery_cut(&self) -> Option<ResultClosingCut> {
+        self.accepted_delivery_cut
+    }
+
     /// Atomically wins the terminal success boundary against every later
     /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         if self.finished {
             return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        match self.accepted_delivery_cut {
+            Some(ResultClosingCut::OriginatingFailure) => {
+                return GovernedStatementVisibilitySealOutcome::Failed;
+            }
+            Some(ResultClosingCut::AcceptedCancellation) => {
+                return GovernedStatementVisibilitySealOutcome::Cancelled(
+                    self.cancellation()
+                        .reason()
+                        .expect("accepted cancellation cut retains its reason"),
+                );
+            }
+            None => {}
         }
         if self.success_visibility_sealed {
             return GovernedStatementVisibilitySealOutcome::Sealed;
@@ -734,17 +784,7 @@ impl GovernedQueryStatementOwner {
     /// external-effect owner exists, so the known cancellation control reaches
     /// its terminal boundary with the local read start failure.
     pub fn finish_unstarted_read_after_cancellation(mut self) -> GovernedStatementFinishOutcome {
-        if self.finished {
-            return GovernedStatementFinishOutcome::Stale;
-        }
-        self.finished = true;
-        self.complete_local_owner_after_terminal();
-        self.release_terminal_concurrency();
-        let outcome = self
-            .service
-            .port
-            .finish_governed_statement(self.registration.token());
-        outcome
+        self.finish_inner()
     }
 
     pub fn fail(mut self, reason: CancellationReason) -> GovernedStatementFinishOutcome {
@@ -782,6 +822,9 @@ impl GovernedQueryStatementOwner {
     }
 
     fn finish_inner(&mut self) -> GovernedStatementFinishOutcome {
+        if self.accepted_delivery_cut == Some(ResultClosingCut::OriginatingFailure) {
+            return self.protocol_fail_inner();
+        }
         if self.finished {
             return GovernedStatementFinishOutcome::Stale;
         }

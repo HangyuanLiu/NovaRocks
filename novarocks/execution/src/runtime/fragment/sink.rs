@@ -354,6 +354,7 @@ fn materialization_error(detail: impl Into<String>) -> FragmentLaunchError {
 fn sink_program_name(program: &StaticSinkProgram) -> &'static str {
     match program {
         StaticSinkProgram::Result => "result",
+        StaticSinkProgram::RootResult(_) => "root_result",
         StaticSinkProgram::Noop => "noop",
         StaticSinkProgram::DataStream { .. } => "data_stream",
         StaticSinkProgram::MultiCastDataStream { .. } => "multi_cast_data_stream",
