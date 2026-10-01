@@ -248,7 +248,41 @@ struct RootInputPosition {
     closed: bool,
 }
 impl RootInputAuthority {
+    // Each of the 64 admitted drivers may register separate sink and finish
+    // callbacks. One additional scoped observer is reserved for its host.
+    const READINESS_CAPACITY: usize = 129;
+    /// Initial fixed issuer and finite readiness backing, including all scoped
+    /// registration slots. Driver callback captures remain with their own
+    /// metadata owner when the drivers register later.
+    pub fn initial_backing_bytes() -> usize {
+        use std::alloc::Layout;
+        use std::sync::atomic::AtomicUsize;
+        #[repr(C, align(2))]
+        struct Header {
+            strong: AtomicUsize,
+            weak: AtomicUsize,
+        }
+        fn arc<T>() -> usize {
+            Layout::new::<Header>()
+                .extend(Layout::new::<T>())
+                .expect("fixed Arc layout fits usize")
+                .0
+                .pad_to_align()
+                .size()
+        }
+        let bytes = arc::<RootInputAuthorityInner>()
+            + arc::<Observable>()
+            + Observable::bounded_backing_bytes(Self::READINESS_CAPACITY)
+                .expect("frozen root readiness capacity is supported");
+        // The issuer mutex is a lazy pinned pthread allocation on Darwin.
+        #[cfg(target_vendor = "apple")]
+        let bytes = bytes + Layout::new::<(isize, [u8; 56])>().size();
+        bytes
+    }
     pub fn new(spec: &RootResultWriteSpec) -> Self {
+        Self::try_new(spec).expect("root input readiness allocation")
+    }
+    pub fn try_new(spec: &RootResultWriteSpec) -> Result<Self, FragmentIoError> {
         let geometry =
             novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
         let required_bytes = geometry.root_original_input_backing_capacity_bytes as usize
@@ -257,14 +291,30 @@ impl RootInputAuthority {
             } else {
                 geometry.root_additional_hydrate_backing_capacity_bytes as usize
             };
-        Self {
+        let observable = Observable::try_bounded(Self::READINESS_CAPACITY).map_err(|_| {
+            FragmentIoError::new(
+                super::FragmentIoOperation::ResultOpen,
+                super::FragmentIoErrorKind::Unavailable,
+                "root input readiness backing allocation failed",
+            )
+        })?;
+        let authority = Self {
             inner: Arc::new(RootInputAuthorityInner {
                 task: spec.task,
                 required_bytes,
                 state: std::sync::Mutex::new(RootInputPosition::default()),
-                observable: Arc::new(Observable::new()),
+                observable: Arc::new(observable),
             }),
-        }
+        };
+        // Pin the platform mutex before publishing this issuer to drivers.
+        drop(
+            authority
+                .inner
+                .state
+                .lock()
+                .expect("root input initial state lock"),
+        );
+        Ok(authority)
     }
     pub fn required_bytes(&self) -> usize {
         self.inner.required_bytes

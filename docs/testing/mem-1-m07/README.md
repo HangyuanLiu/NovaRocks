@@ -49,3 +49,5 @@ P04 metadata 来源已接真实 Native output / ChunkSchema / ExecPlan lowering 
 P04来源接线进一步覆盖Native scan/Project和生产Project/hydration，包含重复occurrence/CSE/empty输出及known/unknown同结果反例；[收据](evidence/p04-scan-project-hydration/README.md)。完整Arrow/Chunk source proof、exchange与Native finite producer仍继续。
 
 [P04 input backing and process-pool reservation](evidence/p04-input-backing-pool/README.md)
+
+P04 有限 Native producer/session 与固定唤醒槽位已完成模块切片，184 项定向测试及 check/Clippy/fmt 通过；[收据](evidence/p04-native-producer/README.md)。实际 host、显式 domain/read ingress/lane/source 接线继续，V1 未 advertise；不称 C4/native/performance 验收完成。Docker Desktop all-consumer live 校验通过，无缺失镜像。

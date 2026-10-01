@@ -232,6 +232,9 @@ impl RootResultChannel {
     // This is part of the fixed 1MiB grant, not an additional charge. The
     // concrete core types/queue capacities are checked against it at open.
     const CORE_METADATA_CAPACITY: usize = RootProfileV1::ENVELOPE_BYTES;
+    // One installed producer bridge and one scoped host observer. Driver
+    // readiness lives in the separate RootInputAuthority registry.
+    const WRITABLE_CALLBACK_CAPACITY: usize = 2;
     pub fn try_open(
         spec: RootResultWriteSpec,
         budget: Arc<ResultRetainedBudget>,
@@ -280,6 +283,8 @@ impl RootResultChannel {
             + payloads.capacity() * std::mem::size_of::<RootResultData>()
             + std::mem::size_of::<ResultBufferKey>()
             + std::mem::size_of::<Weak<ResultRetainedBudget>>()
+            + Observable::bounded_backing_bytes(Self::WRITABLE_CALLBACK_CAPACITY)
+                .map_err(|_| RootChannelError::Capacity)?
             + 32 * std::mem::size_of::<usize>();
         if core_bytes > Self::CORE_METADATA_CAPACITY {
             return Err(RootChannelError::Capacity);
@@ -291,7 +296,10 @@ impl RootResultChannel {
             fixed_metadata_bytes: AtomicUsize::new(metadata_bytes),
             fixed_metadata_holders: AtomicUsize::new(0),
             changed: Notify::new(),
-            writable: Arc::new(Observable::new()),
+            writable: Arc::new(
+                Observable::try_bounded(Self::WRITABLE_CALLBACK_CAPACITY)
+                    .map_err(|_| RootChannelError::Capacity)?,
+            ),
             progress: OnceLock::new(),
             _fixed_credit: credit,
             _budget_owner: Arc::clone(&budget),
@@ -473,6 +481,9 @@ impl RootResultChannel {
         drop(state);
         self.physical.wake();
         Ok(())
+    }
+    pub fn is_closed(&self) -> bool {
+        !self.state.lock().unwrap().lifetime.allows_read()
     }
     pub fn producer_state(&self) -> RootProducerState {
         let state = self.state.lock().unwrap();

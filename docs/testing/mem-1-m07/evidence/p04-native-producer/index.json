@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "parent_commit": "c666f0c808bb94ccfca1acd285b5dff3f9fec633",
+  "sources": {
+    "Cargo.lock": "c3c5fe5282860cff54acefd948ba0eb2541e3316aa5b7c76e35152c0a241a169",
+    "novarocks/native-adapter/Cargo.toml": "399447f7ea0c2ab524695e659efb4ea5d91c073348467c076dbac92bc112499e",
+    "novarocks/native-adapter/src/lib.rs": "1a8752023e4024ab6157b0b1c6cbff599595124fd3d7366ad9204e37f3eceaa7",
+    "novarocks/native-adapter/src/root_producer_pool.rs": "896050d44f832d370221dd552ca22e85bf48c4f65ec85f3995f811d1a569e89b",
+    "novarocks/native-adapter/src/root_result_session.rs": "a58806d3928cf1ef52fa104e082b9e0e69f6add1ed375301a5a4bc7e48d644b1",
+    "novarocks/native-adapter/tests/root_producer_session.rs": "03a518d4873978e26bd2127539443bda7a390613de8ab085502644cc4e2ab0a0",
+    "novarocks/execution/src/runtime/observable.rs": "d0cc5f2a018457b755312a2f6346869c2a95dbaab54da8e4918957c2fc28abe5",
+    "novarocks/execution/src/runtime/fragment/io/result.rs": "127d393991875dff578354f22305fad0d520f1f7c95b06e83a2fe64aa263afe9",
+    "novarocks/execution/tests/root_bounded_observable.rs": "baca2d5c1c27570a2dddd3e55fed487b396ccd21f42d8e8770f95c9e0e1d26fa",
+    "novarocks/worker/src/root_result_channel.rs": "67ac9eb0a4aa4d63dc532b6840936e9a70a2e258b855cade272fc92bbaf727ea"
+  },
+  "logs": {
+    "pool-tests.log.gz": {
+      "raw_sha256": "3cf929295bf96bf11c4e5e9ad783ab24cd68d1e6acf51127bbb2329be7bf045d",
+      "gzip_sha256": "7ef9943d4424a8f09cc410c0f9bce54bbe191be3b74447833e0f31cd128e4daf",
+      "raw_bytes": 45501,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-native-adapter --lib root_producer_pool -- --test-threads=1"
+    },
+    "session-tests.log.gz": {
+      "raw_sha256": "1c2fdda970f50a0fc342d1ce76480e644e01158c87a41b10ac82438bcd7ed9fe",
+      "gzip_sha256": "df2f78f7954c2995bb051e2ab62ca7b21106ba112709f22d79fedcb6c57a8a04",
+      "raw_bytes": 45277,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-native-adapter --test root_producer_session -- --test-threads=1"
+    },
+    "observable-unit-tests.log.gz": {
+      "raw_sha256": "0763bc8af71ec81bb0daa51c672c1fff09d2e77e2b97e9666e6d187d39a135fc",
+      "gzip_sha256": "e401a053319c4eea51a36965d00f1bff56d7b0a15dc4492baf4a14efa1574e23",
+      "raw_bytes": 46689,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-execution --lib runtime::observable::tests -- --test-threads=1"
+    },
+    "observable-allocation-tests.log.gz": {
+      "raw_sha256": "c1526e4ecf973a1af8f7ac498b9ca8b2c532b8b2d01e69b5346708f580b62e06",
+      "gzip_sha256": "593845443238d94a49679ccf6be770eb74c3c67f9eb6418be6547cb1c862ff46",
+      "raw_bytes": 44287,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-execution --test root_bounded_observable -- --test-threads=1"
+    },
+    "channel-tests.log.gz": {
+      "raw_sha256": "3a9cb141f31b52d360ef61deb3e3db08007bbc533acdbfbf97b1dc2cfc155366",
+      "gzip_sha256": "497acf3d310c4860c618d47bd0d4e667723e972932d79b625909e255e7feef3a",
+      "raw_bytes": 2392,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-worker --lib root_result_channel -- --test-threads=1"
+    },
+    "pipeline-tests.log.gz": {
+      "raw_sha256": "033a792ed12edeea28d8ed13d8b04c8b92874761d76d6bed3e43d1055b50c06a",
+      "gzip_sha256": "a126b21fc7cc3fc73f1ac724e8307d9b57b170954ed6bb7fe5c32759e53005ea",
+      "raw_bytes": 58931,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-execution --lib exec::pipeline -- --test-threads=1"
+    },
+    "original-carrier-tests.log.gz": {
+      "raw_sha256": "58db04f15b41765a0321d16ae26e953d4c6957a4e841783c408b64c5d5c240be",
+      "gzip_sha256": "d2d791556b9f7e63f6db2c8c83bea48f0e4644c0eb9b47d8a3ca1bdc4e8d16ad",
+      "raw_bytes": 43962,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-execution --test root_original_carrier -- --test-threads=1"
+    },
+    "input-tests.log.gz": {
+      "raw_sha256": "68d0a66e0c504bed62a18d36725c8a575de4c22e26493883e9e3bbd238d9fe84",
+      "gzip_sha256": "e8821c0fd0c7e41494d52d7fd47e11d300f8154e41766267676eebbf4e497576",
+      "raw_bytes": 45578,
+      "exit_code": 0,
+      "command": "cargo test --offline --locked -p novarocks-execution --lib runtime::fragment::io::result::root_input_tests -- --test-threads=1"
+    },
+    "clippy.log.gz": {
+      "raw_sha256": "fd3274dfbf457e1e3069eb690643fa170abe1c026886c5e0ac807ca924913f96",
+      "gzip_sha256": "5f90787b531437ea35064459712f375d05b9b002df1309d7696cc6a44b0b22a8",
+      "raw_bytes": 124111,
+      "exit_code": 0,
+      "command": "cargo clippy --offline --locked -p novarocks-native-adapter -p novarocks-worker -p novarocks-execution --all-targets"
+    },
+    "native-check.log.gz": {
+      "raw_sha256": "7af6c023ba220669b4cbe1e459def54c1190604f6970012de7115761d5029d5e",
+      "gzip_sha256": "7bd3691a7d1338feddbfe352d7c54576e74b16c58b4ca4c90f642683672601a3",
+      "raw_bytes": 44373,
+      "exit_code": 0,
+      "command": "cargo check --offline --locked -p novarocks-native-adapter --all-targets"
+    },
+    "fmt-check.log.gz": {
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "raw_bytes": 0,
+      "exit_code": 0,
+      "command": "cargo fmt --all --check"
+    },
+    "exit-order-failure.log.gz": {
+      "raw_sha256": "b874d4cdf264a1af3339bd0439b4d4c82e40d0b3291caccc310759eaeba86721",
+      "gzip_sha256": "76741ec805729457407ff5d0876a447793fd85bd1fe6230279dbbfc50b7aee72",
+      "raw_bytes": 46091,
+      "exit_code": 101,
+      "command": "cargo test --offline --locked -p novarocks-native-adapter --test root_producer_session -- --test-threads=1"
+    }
+  }
+}

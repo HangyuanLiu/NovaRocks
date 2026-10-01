@@ -62,6 +62,8 @@ pub mod fragment_variant_path;
 pub mod fragment_window;
 pub mod management_http;
 pub mod native_client;
+mod root_producer_pool;
+pub mod root_result_session;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
 pub mod native_control_executor;
