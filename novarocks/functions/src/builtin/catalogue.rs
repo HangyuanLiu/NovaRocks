@@ -952,6 +952,25 @@ fn scalar_result_nullable(
         None => false,
     };
     Ok(match name {
+        // POSITIVE uses the math output conversion, which turns non-finite
+        // Float32/Float64 values into SQL NULL. Only admitted signed integers
+        // and decimals prove a finite Float64 result for every non-NULL value.
+        "positive" => match request.arguments.first() {
+            Some(FunctionArgument::Value { value_type, .. })
+                if value_type.logical_type == ValueLogicalType::Physical
+                    && matches!(
+                        value_type.data_type,
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Decimal128(_, _)
+                    ) =>
+            {
+                value_type.nullable
+            }
+            _ => true,
+        },
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
         "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
@@ -1024,7 +1043,6 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     // error here, not a null.
     "abs",
     "negative",
-    "positive",
     "sign",
     // Measuring a string cannot fail.
     "bit_length",
@@ -2313,6 +2331,9 @@ pub(super) fn scalar_definition_parts(
                 effects: match name {
                     "abs" => Some(super::abs_owner::effects()),
                     "rand" | "random" => Some(super::rand_owner::effects()),
+                    name if super::numeric_unary_owner::operation(name).is_some() => {
+                        Some(super::numeric_unary_owner::effects())
+                    }
                     _ => None,
                 },
                 semantics: builtin_scalar_semantics(name),
@@ -2409,6 +2430,9 @@ pub fn contribute_builtin_functions(
         let definition = match name.as_str() {
             "abs" => super::abs_owner::definition(declaration, resolver)?,
             "rand" | "random" => super::rand_owner::definition(&name, declaration, resolver)?,
+            name if super::numeric_unary_owner::operation(name).is_some() => {
+                super::numeric_unary_owner::definition(name, declaration, resolver)?
+            }
             _ => FunctionDefinition::try_new_bound(
                 &name,
                 FunctionVisibility::Public,
@@ -2603,6 +2627,36 @@ mod tests {
         assert!(first.definitions().windows(2).all(|pair| {
             (pair[0].canonical_name(), pair[0].kind()) < (pair[1].canonical_name(), pair[1].kind())
         }));
+    }
+
+    #[test]
+    fn positive_result_nullability_preserves_nonfinite_float_and_total_numeric_domains() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for data_type in [DataType::Float32, DataType::Float64] {
+            for nullable in [false, true] {
+                let arguments = [value_argument(data_type.clone(), nullable, None)];
+                let selected = resolve_exact_scalar(&catalog, "positive", &arguments);
+                assert_eq!(scalar_result(&selected).data_type, DataType::Float64);
+                assert!(scalar_result(&selected).nullable);
+            }
+        }
+        for data_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Decimal128(38, -2),
+        ] {
+            for nullable in [false, true] {
+                let arguments = [value_argument(data_type.clone(), nullable, None)];
+                let selected = resolve_exact_scalar(&catalog, "positive", &arguments);
+                assert_eq!(scalar_result(&selected).data_type, DataType::Float64);
+                assert_eq!(scalar_result(&selected).nullable, nullable);
+            }
+        }
+        let float = [value_argument(DataType::Float64, false, None)];
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &float)).nullable);
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "sign", &float)).nullable);
     }
 
     #[test]

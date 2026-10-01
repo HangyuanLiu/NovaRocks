@@ -34,5 +34,7 @@ mod binding_control_tests;
 
 mod abs;
 mod abs_owner;
+mod numeric_unary;
+mod numeric_unary_owner;
 mod rand;
 mod rand_owner;
