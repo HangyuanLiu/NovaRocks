@@ -909,6 +909,48 @@ fn actual_builtin_log_sign_e_pi_install_all_52_exact_cpu_records() {
 }
 
 #[test]
+fn actual_builtin_dround_installs_all_eight_exact_cpu_records() {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
+    let definition = builder.definition("dround", FunctionKind::Scalar).unwrap();
+    let binding = definition.binding.as_ref().unwrap();
+    let attachment = binding.pure.as_ref().expect("actual DROUND CPU owner");
+    assert_eq!(
+        binding.declaration.function_id().as_str(),
+        "builtin.scalar/dround/v1"
+    );
+    assert_eq!(binding.declaration.overloads().len(), 8);
+    assert_eq!(attachment.implementations.len(), 8);
+    for (overload, installed) in binding
+        .declaration
+        .overloads()
+        .iter()
+        .zip(attachment.implementations.iter())
+    {
+        assert_eq!(installed.overload, overload.identity);
+        assert_eq!(
+            installed.implementation.as_str(),
+            "builtin.scalar/dround/selected-v1"
+        );
+        assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
+        let effects = overload.effects.as_ref().unwrap();
+        assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
+        assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
+        assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
+        assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+        assert_eq!(effects.argument_control, ArgumentControl::Eager);
+        assert_eq!(effects.instance_state, FunctionInstanceState::None);
+        assert_eq!(effects.observable_effects, ObservableEffects::NONE);
+        assert!(effects.environment_dependencies.is_empty());
+    }
+    assert!(matches!(
+        builder.seal_pure(std::iter::empty()),
+        Err(PureCatalogError::MissingOwner(_)
+            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
+    ));
+}
+
+#[test]
 fn metadata_without_actual_owner_and_legacy_effects_cannot_be_pure_sealed() {
     let owner = Arc::new(Owner::new(false));
     let metadata = FunctionDefinition::try_new_bound(

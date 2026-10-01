@@ -2330,6 +2330,7 @@ pub(super) fn scalar_definition_parts(
             .map(|(identity, signature)| FunctionOverloadDeclaration {
                 effects: match name {
                     "abs" => Some(super::abs_owner::effects()),
+                    "dround" => Some(super::dround_owner::effects()),
                     "rand" | "random" => Some(super::rand_owner::effects()),
                     name if super::numeric_elementary_owner::is_installed(name) => {
                         Some(super::numeric_elementary_owner::effects())
@@ -2438,6 +2439,7 @@ pub fn contribute_builtin_functions(
         let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
         let definition = match name.as_str() {
             "abs" => super::abs_owner::definition(declaration, resolver)?,
+            "dround" => super::dround_owner::definition(declaration, resolver)?,
             "rand" | "random" => super::rand_owner::definition(&name, declaration, resolver)?,
             name if super::numeric_elementary_owner::is_installed(name) => {
                 super::numeric_elementary_owner::definition(name, declaration, resolver)?
