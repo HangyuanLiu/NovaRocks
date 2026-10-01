@@ -487,6 +487,13 @@ pub fn compose_backend_server_config(
             runtime_config.result_retained_bytes_per_process,
         )
         .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
+        root_producer_limits:
+            novarocks_native_adapter::root_result_session::RootProducerLimits::try_new(
+                runtime_config.root_result_producer_threads,
+                runtime_config.root_result_producer_positions,
+                runtime_config.root_result_producer_stack_bytes,
+            )
+            .map_err(|error| anyhow::anyhow!("resolve root result producer limits: {error}"))?,
         preparation_limits: novarocks_worker::TaskPreparationLimits::try_new(
             config.runtime.task_preparation_max_tasks_per_context,
             config.runtime.task_preparation_max_tasks,

@@ -115,10 +115,11 @@ impl Drop for RootMetadataReservation {
 impl PhysicalOwners {
     fn wake(&self) {
         self.changed.notify_waiters();
-        self.writable.notify_observers();
         if let Some(source) = self.progress.get().and_then(Weak::upgrade) {
             source.note_progress();
         }
+        // Context release progress must not depend on callback success.
+        self.writable.notify_observers();
     }
 }
 struct PhysicalSegmentPosition(Arc<PhysicalOwners>);

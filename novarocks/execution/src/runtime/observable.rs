@@ -43,6 +43,9 @@ pub struct Observable {
     subscriptions: Mutex<Subscriptions>,
     generation: AtomicU64,
     bounded_capacity: Option<usize>,
+    // Drop callbacks, registry slots and their Vec backing before this lease.
+    // Each fixed slot independently keeps it through late token/snapshot Drop.
+    _backing_owner: Option<ObserverOwner>,
 }
 
 impl Observable {
@@ -52,12 +55,31 @@ impl Observable {
             subscriptions: Mutex::new(Subscriptions::Unbounded(Vec::new())),
             generation: AtomicU64::new(0),
             bounded_capacity: None,
+            _backing_owner: None,
         }
     }
 
     /// Creates a registry whose permanent and live scoped callbacks together
     /// never exceed capacity. Backing admission must precede this constructor.
     pub fn try_bounded(capacity: usize) -> Result<Self, ObservableCapacityError> {
+        Self::try_bounded_with_owner(capacity, None)
+    }
+
+    /// Creates the same fixed, zero-growth registry while retaining its
+    /// pre-admitted backing owner through Observable, slot, subscription and
+    /// notification-snapshot destruction. This creates no new backing lease.
+    /// Caller must admit bounded_backing_bytes plus Self/Arc before this call.
+    pub fn try_bounded_retained(
+        capacity: usize,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Self, ObservableCapacityError> {
+        Self::try_bounded_with_owner(capacity, Some(owner))
+    }
+
+    fn try_bounded_with_owner(
+        capacity: usize,
+        backing_owner: Option<ObserverOwner>,
+    ) -> Result<Self, ObservableCapacityError> {
         Self::bounded_backing_bytes(capacity)?;
         let mut observers = Vec::new();
         let mut subscriptions = Vec::new();
@@ -73,6 +95,7 @@ impl Observable {
         for _ in 0..capacity {
             let slot = Arc::new(BoundedRegistration {
                 observer: Mutex::new(None),
+                _backing_owner: backing_owner.clone(),
             });
             drop(slot.observer.lock().expect("observable bounded slot lock"));
             subscriptions.push(slot);
@@ -82,6 +105,7 @@ impl Observable {
             subscriptions: Mutex::new(Subscriptions::Bounded(subscriptions)),
             generation: AtomicU64::new(0),
             bounded_capacity: Some(capacity),
+            _backing_owner: backing_owner,
         };
         // Initialize platform mutex backings before publication, so concurrent
         // first use cannot temporarily allocate duplicate OnceBox candidates.
@@ -293,11 +317,33 @@ impl Observable {
         }
         // Callback invocation and captured-owner destruction happen after both
         // locks are released. Snapshots retain scoped slots until actual exit.
+        // A callback panic must not strand the remaining captured waiters.
+        // Preserve its original payload, but release every snapshot before
+        // resuming the first unwind. The normal path allocates no new backing.
+        let mut first_panic = None;
         for observer in observers.into_iter().flatten() {
-            observer();
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer();
+            })) && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
         }
         for registration in subscriptions.into_iter().flatten() {
-            (registration.observer)();
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (registration.observer)();
+            })) && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        // Physical-owner Drop can notify again while an earlier callback is
+        // unwinding. Every waiter still runs, but a second resumed panic would
+        // abort the process before the remaining backing owners can exit.
+        if let Some(payload) = first_panic
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -317,6 +363,9 @@ enum Subscriptions {
 
 struct BoundedRegistration {
     observer: Mutex<Option<(Observer, Option<ObserverOwner>)>>,
+    // The callback (including arbitrary captures) must die before the lease
+    // covering this fixed slot's allocation, even after Observable is gone.
+    _backing_owner: Option<ObserverOwner>,
 }
 
 fn occupied_slots(slots: &[Arc<BoundedRegistration>]) -> usize {
@@ -678,6 +727,125 @@ mod tests {
     }
 
     #[test]
+    fn bounded_panic_notifies_later_waiter_and_releases_snapshot_before_unwind() {
+        // Exercise both permanent -> scoped and scoped -> scoped notification.
+        for scoped_panic in [false, true] {
+            let observable = Observable::try_bounded(2).unwrap();
+            let panic_callback: Observer = Arc::new(|| std::panic::panic_any(17_u64));
+            let panic_subscription = if scoped_panic {
+                Some(observable.try_subscribe(panic_callback).unwrap())
+            } else {
+                observable.try_add_observer(panic_callback).unwrap();
+                None
+            };
+            let callback_dropped = Arc::new(AtomicBool::new(false));
+            let owner_dropped = Arc::new(AtomicBool::new(false));
+            let owner = Arc::new(BackingOwner {
+                callback_dropped: Arc::clone(&callback_dropped),
+                dropped: Arc::clone(&owner_dropped),
+            });
+            let weak_owner = Arc::downgrade(&owner);
+            let capture = BackingCapture {
+                owner: weak_owner.clone(),
+                dropped: Arc::clone(&callback_dropped),
+            };
+            let token = Arc::new(Mutex::new(None::<ObserverSubscription>));
+            let callback_token = Arc::clone(&token);
+            let notified = Arc::new(AtomicBool::new(false));
+            let callback_notified = Arc::clone(&notified);
+            let subscription = observable
+                .try_subscribe_retained(
+                    Arc::new(move || {
+                        let _ = &capture;
+                        callback_notified.store(true, Ordering::Release);
+                        // Leave only the running snapshot's callback and owner.
+                        drop(callback_token.lock().unwrap().take());
+                    }),
+                    owner.clone(),
+                )
+                .unwrap();
+            *token.lock().unwrap() = Some(subscription);
+            drop(owner);
+
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observable.notify_observers();
+            }))
+            .unwrap_err();
+            assert_eq!(payload.downcast_ref::<u64>(), Some(&17));
+            assert!(notified.load(Ordering::Acquire));
+            assert!(callback_dropped.load(Ordering::Acquire));
+            assert!(owner_dropped.load(Ordering::Acquire));
+            assert!(weak_owner.upgrade().is_none());
+            assert_eq!(scoped_len(&observable), usize::from(scoped_panic));
+            drop(panic_subscription);
+            assert_eq!(scoped_len(&observable), 0);
+            // Snapshot exit makes the fixed physical position reusable.
+            let replacement = observable.try_subscribe(Arc::new(|| {})).unwrap();
+            drop(replacement);
+        }
+    }
+
+    #[test]
+    fn bounded_multiple_callback_panics_preserve_first_payload_and_notify_tail() {
+        let observable = Observable::try_bounded(3).unwrap();
+        let first = observable
+            .try_subscribe(Arc::new(|| std::panic::panic_any(17_u64)))
+            .unwrap();
+        let second = observable
+            .try_subscribe(Arc::new(|| std::panic::panic_any(23_u64)))
+            .unwrap();
+        let notified = Arc::new(AtomicBool::new(false));
+        let callback_notified = Arc::clone(&notified);
+        let third = observable
+            .try_subscribe(Arc::new(move || {
+                callback_notified.store(true, Ordering::Release);
+            }))
+            .unwrap();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observable.notify_observers();
+        }))
+        .unwrap_err();
+        assert_eq!(payload.downcast_ref::<u64>(), Some(&17));
+        assert!(notified.load(Ordering::Acquire));
+        drop((first, second, third));
+        assert_eq!(scoped_len(&observable), 0);
+        let replacement = observable.try_subscribe(Arc::new(|| {})).unwrap();
+        drop(replacement);
+    }
+
+    #[test]
+    fn bounded_notification_during_owner_unwind_preserves_original_panic() {
+        struct NotifyOnDrop(Arc<Observable>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_observers();
+            }
+        }
+        let observable = Arc::new(Observable::try_bounded(2).unwrap());
+        let first = observable
+            .try_subscribe(Arc::new(|| std::panic::panic_any(17_u64)))
+            .unwrap();
+        let notified = Arc::new(AtomicBool::new(false));
+        let callback_notified = Arc::clone(&notified);
+        let tail = observable
+            .try_subscribe(Arc::new(move || {
+                callback_notified.store(true, Ordering::Release);
+            }))
+            .unwrap();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owner = NotifyOnDrop(Arc::clone(&observable));
+            std::panic::panic_any(13_u64);
+        }))
+        .unwrap_err();
+        assert_eq!(payload.downcast_ref::<u64>(), Some(&13));
+        assert!(notified.load(Ordering::Acquire));
+        drop((first, tail));
+        assert_eq!(scoped_len(&observable), 0);
+        let replacement = observable.try_subscribe(Arc::new(|| {})).unwrap();
+        drop(replacement);
+    }
+
+    #[test]
     fn retained_owner_outlives_callback_and_last_slot_handle() {
         struct Owner {
             slot: Mutex<Weak<BoundedRegistration>>,
@@ -753,5 +921,185 @@ mod tests {
             assert!(owner_dropped.load(Ordering::Relaxed));
             assert!(weak_owner.upgrade().is_none());
         }
+    }
+
+    struct BackingOwner {
+        callback_dropped: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for BackingOwner {
+        fn drop(&mut self) {
+            assert!(self.callback_dropped.load(Ordering::Acquire));
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct BackingCapture {
+        owner: Weak<BackingOwner>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for BackingCapture {
+        fn drop(&mut self) {
+            assert!(self.owner.upgrade().is_some());
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn fixed_backing_owner_follows_late_subscription_and_snapshot() {
+        for retain_snapshot in [false, true] {
+            let callback_dropped = Arc::new(AtomicBool::new(false));
+            let backing_dropped = Arc::new(AtomicBool::new(false));
+            let owner = Arc::new(BackingOwner {
+                callback_dropped: Arc::clone(&callback_dropped),
+                dropped: Arc::clone(&backing_dropped),
+            });
+            let weak_owner = Arc::downgrade(&owner);
+            let backing: ObserverOwner = owner.clone();
+            let observable = Observable::try_bounded_retained(1, backing).unwrap();
+            let capture = BackingCapture {
+                owner: weak_owner.clone(),
+                dropped: Arc::clone(&callback_dropped),
+            };
+            let subscription = observable
+                .try_subscribe(Arc::new(move || {
+                    let _ = &capture;
+                }))
+                .unwrap();
+            let SubscriptionRegistration::Bounded { slot, .. } = &subscription.registration else {
+                unreachable!();
+            };
+            let snapshot = retain_snapshot.then(|| {
+                let stored = slot.observer.lock().unwrap();
+                let (observer, owner) = stored.as_ref().unwrap();
+                BoundedSnapshot {
+                    observer: Arc::clone(observer),
+                    _slot: Arc::clone(slot),
+                    _owner: owner.clone(),
+                }
+            });
+            drop(owner);
+            drop(observable);
+            assert!(weak_owner.upgrade().is_some());
+            assert!(!backing_dropped.load(Ordering::Acquire));
+            drop(subscription);
+            if let Some(snapshot) = &snapshot {
+                (snapshot.observer)();
+                assert!(!callback_dropped.load(Ordering::Acquire));
+                assert!(!backing_dropped.load(Ordering::Acquire));
+            }
+            drop(snapshot);
+            assert!(callback_dropped.load(Ordering::Acquire));
+            assert!(backing_dropped.load(Ordering::Acquire));
+            assert!(weak_owner.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn detached_running_snapshot_covers_observable_and_token_drop_inside_callback() {
+        let callback_dropped = Arc::new(AtomicBool::new(false));
+        let backing_dropped = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(BackingOwner {
+            callback_dropped: Arc::clone(&callback_dropped),
+            dropped: Arc::clone(&backing_dropped),
+        });
+        let weak_owner = Arc::downgrade(&owner);
+        let callback_owner = weak_owner.clone();
+        let owners = Arc::new(Mutex::new(None));
+        let callback_owners = Arc::clone(&owners);
+        let backing: ObserverOwner = owner.clone();
+        let observable = Observable::try_bounded_retained(1, backing).unwrap();
+        let capture = BackingCapture {
+            owner: weak_owner.clone(),
+            dropped: Arc::clone(&callback_dropped),
+        };
+        let subscription = observable
+            .try_subscribe(Arc::new(move || {
+                let _ = &capture;
+                let live: Option<(Observable, ObserverSubscription)> =
+                    callback_owners.lock().unwrap().take();
+                drop(live);
+                assert!(callback_owner.upgrade().is_some());
+            }))
+            .unwrap();
+        let SubscriptionRegistration::Bounded { slot, .. } = &subscription.registration else {
+            unreachable!();
+        };
+        // The same fixed holder used by notify_bounded, detached here so the
+        // test can destroy the Observable itself while the callback runs.
+        let snapshot = {
+            let stored = slot.observer.lock().unwrap();
+            let (observer, owner) = stored.as_ref().unwrap();
+            BoundedSnapshot {
+                observer: Arc::clone(observer),
+                _slot: Arc::clone(slot),
+                _owner: owner.clone(),
+            }
+        };
+        *owners.lock().unwrap() = Some((observable, subscription));
+        drop(owner);
+        (snapshot.observer)();
+        assert!(!callback_dropped.load(Ordering::Acquire));
+        assert!(!backing_dropped.load(Ordering::Acquire));
+        drop(snapshot);
+        assert!(callback_dropped.load(Ordering::Acquire));
+        assert!(backing_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn empty_retained_registry_keeps_backing_until_observable_drop() {
+        let callback_dropped = Arc::new(AtomicBool::new(true));
+        let backing_dropped = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(BackingOwner {
+            callback_dropped,
+            dropped: Arc::clone(&backing_dropped),
+        });
+        let observable = Observable::try_bounded_retained(0, owner.clone()).unwrap();
+        drop(owner);
+        observable.notify_observers();
+        assert!(!backing_dropped.load(Ordering::Acquire));
+        drop(observable);
+        assert!(backing_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn retained_notifications_and_slot_reuse_keep_the_same_fixed_backings() {
+        let backing_dropped = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(BackingOwner {
+            callback_dropped: Arc::new(AtomicBool::new(true)),
+            dropped: Arc::clone(&backing_dropped),
+        });
+        let observable = Observable::try_bounded_retained(2, owner.clone()).unwrap();
+        drop(owner);
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&calls);
+        let callback: Observer = Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let observers = observable.observers.lock().unwrap().as_ptr();
+        let subscriptions = {
+            let registry = observable.subscriptions.lock().unwrap();
+            let Subscriptions::Bounded(slots) = &*registry else {
+                unreachable!();
+            };
+            slots.as_ptr()
+        };
+        for _ in 0..1024 {
+            let subscription = observable.try_subscribe(Arc::clone(&callback)).unwrap();
+            observable.notify_observers();
+            drop(subscription);
+            observable.notify_observers();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1024);
+        let registry = observable.subscriptions.lock().unwrap();
+        let Subscriptions::Bounded(slots) = &*registry else {
+            unreachable!();
+        };
+        assert_eq!(slots.capacity(), 2);
+        assert_eq!(slots.as_ptr(), subscriptions);
+        drop(registry);
+        assert_eq!(observable.observers.lock().unwrap().as_ptr(), observers);
+        assert!(!backing_dropped.load(Ordering::Acquire));
+        drop(observable);
+        assert!(backing_dropped.load(Ordering::Acquire));
     }
 }

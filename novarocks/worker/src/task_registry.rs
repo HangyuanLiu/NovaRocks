@@ -3160,6 +3160,25 @@ impl TaskExecutionRegistry {
             } else {
                 novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted
             };
+            // Fix each live bounded root's exact lifecycle cause before its
+            // seal becomes visible to producer/driver threads. Runnable abort
+            // remains outside the registry fence; until that fan-out arrives,
+            // completion reads this Worker-owned cause rather than treating
+            // the closed channel as an originating execution failure.
+            let cause = entry
+                .termination_cause()
+                .expect("a latched context has an abort cause");
+            for identity in entry.roots.keys() {
+                if let Some(TaskEntry::Live(live)) = entry.tasks.get(identity)
+                    && !live.status.is_terminal()
+                {
+                    live.status.advance(
+                        TaskState::Aborting,
+                        Some(TerminationDetail::Aborted(cause)),
+                        TaskOutputFacts::default(),
+                    );
+                }
+            }
             for root in entry.roots.values() {
                 root.seal_reads(root_close);
             }

@@ -496,6 +496,55 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
 }
 
 #[tokio::test]
+async fn repeated_cancel_observer_panics_cannot_defer_original_input_exit() {
+    let fixture = Fixture::new(client(1));
+    let value = "x".repeat(3 << 20);
+    let array: ArrayRef = Arc::new(StringArray::from(vec![value.as_str()]));
+    let weak = Arc::downgrade(&array);
+    fixture
+        .session
+        .submit_input(owned_chunk(array), input(&fixture.session).await)
+        .unwrap();
+    wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
+    let observed = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&observed);
+    let original = weak.clone();
+    let subscription = fixture
+        .session
+        .writable_observable()
+        .subscribe(Arc::new(move || {
+            if original.upgrade().is_some() {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                // The cap keeps a broken implementation's failure finite.
+                // The oracle requires actual cleanup before it can exhaust
+                // these repeated panics, rather than passing after retries.
+                if call < 64 {
+                    panic!("injected repeated cancellation observer panic");
+                }
+            }
+        }));
+    shutdown(&fixture.pool).await;
+    assert!(fixture.session.producer_exited());
+    assert!(weak.upgrade().is_none());
+    assert!(
+        observed.load(Ordering::SeqCst) < 64,
+        "original input exit depended on exhausting the observer's panic budget"
+    );
+    assert!(matches!(
+        fixture.session.producer_state(),
+        RootProducerState::Failed(_)
+    ));
+    drop(subscription);
+    let available = (512 << 20) - fixture.pool.reserved_bytes() - (1 << 20);
+    let ResultWriteAdmission::Granted(credit) =
+        fixture.budget.try_reserve_process(available).unwrap()
+    else {
+        panic!("original input grant remained retained after its physical exit");
+    };
+    drop(credit);
+}
+
+#[tokio::test]
 async fn count_only_panicking_input_credit_observer_cannot_strand_shutdown_or_grant() {
     let fixture = Fixture::new(FrozenRootOutput::CountOnly);
     let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
@@ -637,6 +686,10 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         .expect("observer gate owner disappeared");
     assert_eq!(Arc::strong_count(&session), 1);
     drop(session);
+    // The exported readiness token now also retains the fixed backing grant.
+    // Drop it while the already captured notification is still blocked, so
+    // the remaining holder below is the real callback/snapshot itself.
+    drop(_subscription);
     assert!(
         weak_session.upgrade().is_none(),
         "the notification snapshot must not pin the Session itself"

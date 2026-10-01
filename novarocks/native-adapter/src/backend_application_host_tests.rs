@@ -74,6 +74,12 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             32 * 1024 * 1024,
         )
         .expect("valid test result retained-byte limits"),
+        root_producer_limits: crate::root_result_session::RootProducerLimits::try_new(
+            1,
+            64,
+            1024 * 1024,
+        )
+        .expect("finite test root producer limits"),
         inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
         preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
         execution_runtime_config: ExecutionRuntimeConfig {

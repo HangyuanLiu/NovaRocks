@@ -38,11 +38,11 @@ use novarocks_worker::root_result_channel::{
     RootMetadataReservation, RootProducerExit, RootResultChannel, RootSegmentBuilder,
 };
 
-pub use crate::root_producer_pool::RootProducerPool;
 use crate::root_producer_pool::{
     RootProducerJob, RootProducerRegistration, RootProducerTurn, RootProducerWake,
     weak_core_backing_bytes,
 };
+pub use crate::root_producer_pool::{RootProducerLimits, RootProducerPool};
 
 // Destruction order is deliberate: original/cursor Arrow owners are gone
 // before input overlap credit can wake another driver. Scratch follows cursor.
@@ -59,6 +59,16 @@ struct ProducerState {
     sealed: bool,
     failed: Option<&'static str>,
     producer: Option<RootProducerExit>,
+    cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
+}
+impl ProducerState {
+    fn cleanup(&mut self, action: impl FnOnce()) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
+            && self.cleanup_panic.is_none()
+        {
+            self.cleanup_panic = Some(payload);
+        }
+    }
 }
 // A notification snapshot can outlive the session subscription. Its guard
 // follows the real callback and its Weak control tails through that exit.
@@ -116,6 +126,10 @@ impl NativeRootResultSession {
                 .size()
         }
         let metadata_bytes = arc::<Self>()
+            + novarocks_execution::exec::operators::RootResultSinkFactory::metadata_capacity_bytes(
+                NativeResultSupportGeometry::V1.root_maximum_root_drivers as usize,
+            )
+            .map_err(|_| io_error("root driver metadata exceeds its frozen profile"))?
             + RootInputAuthority::initial_backing_bytes()
             + arc::<WakeBridge>()
             + arc::<Arc<dyn Fn() + Send + Sync>>()
@@ -127,7 +141,11 @@ impl NativeRootResultSession {
         let metadata = channel
             .try_reserve_metadata(metadata_bytes)
             .map_err(|_| io_error("root session fixed metadata exceeds its envelope"))?;
-        let authority = RootInputAuthority::try_new(channel.spec())?;
+        let metadata = Arc::new(metadata);
+        let authority = RootInputAuthority::try_new_retained(
+            channel.spec(),
+            Arc::clone(&metadata) as Arc<dyn std::any::Any + Send + Sync>,
+        )?;
         let session = Arc::new(Self {
             channel,
             authority,
@@ -138,11 +156,12 @@ impl NativeRootResultSession {
                 sealed: false,
                 failed: None,
                 producer: None,
+                cleanup_panic: None,
             }),
             registration: OnceLock::new(),
             wake_subscription: OnceLock::new(),
             exited: AtomicBool::new(true),
-            _metadata: Arc::new(metadata),
+            _metadata: metadata,
         });
         drop(
             session
@@ -223,11 +242,17 @@ impl NativeRootResultSession {
     fn fail(&self, state: &mut ProducerState, message: &'static str) -> RootProducerTurn {
         state.failed.get_or_insert(message);
         state.sealed = true;
-        self.authority.close();
-        self.channel.close(RootRetentionClose::ContextAborted);
+        // Observer panics cannot turn a finite cleanup into repeated turns
+        // that never destroy input. Each independent release/notification is
+        // attempted once, and the first unwind is resumed by exited() only
+        // after actual input, segment and producer ownership have ended.
+        state.cleanup(|| self.authority.close());
+        state.cleanup(|| self.channel.close(RootRetentionClose::ContextAborted));
         // Original owners, cursor and scratch are destroyed before exited().
-        drop(state.input.take());
-        drop(state.builder.take());
+        let input = state.input.take();
+        state.cleanup(|| drop(input));
+        let builder = state.builder.take();
+        state.cleanup(|| drop(builder));
         state.used = 0;
         RootProducerTurn::Complete
     }
@@ -431,9 +456,19 @@ impl RootResultSession for NativeRootResultSession {
         }
         self.start(&mut state)?;
         state.sealed = true;
-        self.authority.close();
+        state.cleanup(|| self.authority.close());
+        let notification_failed = state.cleanup_panic.is_some();
+        if notification_failed {
+            state
+                .failed
+                .get_or_insert("root readiness notification panicked");
+        }
         drop(state);
-        self.wake()
+        self.wake()?;
+        if notification_failed {
+            return Err(io_error("root readiness notification panicked"));
+        }
+        Ok(())
     }
     fn producer_state(&self) -> RootProducerState {
         let state = self.state();
@@ -457,8 +492,8 @@ impl RootResultSession for NativeRootResultSession {
         let mut state = self.state();
         state.failed.get_or_insert("root producer was cancelled");
         state.sealed = true;
-        self.authority.close();
-        self.channel.close(RootRetentionClose::ContextAborted);
+        state.cleanup(|| self.authority.close());
+        state.cleanup(|| self.channel.close(RootRetentionClose::ContextAborted));
         drop(state);
         let _ = self.wake();
     }
@@ -471,13 +506,13 @@ impl RootProducerJob for NativeRootResultSession {
         self.abort(ResultAbort::Cancelled(String::new()));
     }
     fn exited(&self) {
-        let producer = {
+        let (producer, cleanup_panic) = {
             let mut state = self.state();
             assert!(
                 state.input.is_none() && state.builder.is_none(),
                 "producer's real backing exits before its guard"
             );
-            state.producer.take()
+            (state.producer.take(), state.cleanup_panic.take())
         };
         // Input/cursor/builder destruction and the actual pool turn have
         // completed. Publish this physical fact before guard notification:
@@ -485,8 +520,23 @@ impl RootProducerJob for NativeRootResultSession {
         // a synchronous callback unwind cannot skip it. Fixed control backing
         // remains covered by the metadata lease until its actual owner drops.
         self.exited.store(true, Ordering::Release);
-        drop(producer);
-        self.authority.observable().notify_observers();
+        let producer_exit =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(producer)));
+        let readiness_exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.authority.observable().notify_observers();
+        }));
+        // A channel observer cannot strand the independent driver waiters
+        // after the pool has removed this completed job. Preserve the first
+        // unwind only after both finite notification domains have advanced.
+        if let Some(panic) = cleanup_panic {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = producer_exit {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = readiness_exit {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 fn io_error(message: &'static str) -> FragmentIoError {

@@ -93,6 +93,7 @@ use tracing::debug;
 use crate::fragment_instance::project_task_instance;
 use crate::fragment_request::NativeFragmentRequest;
 use crate::native_fragment_query::{NativeFragmentQueryRuntime, NativeFragmentRegistrationLease};
+use crate::root_result_session::{NativeRootResultSession, RootProducerPool};
 use crate::task_protocol_fault as fault;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
@@ -198,6 +199,9 @@ pub struct NativeTaskExecutionHost {
     capabilities: Arc<TaskInboundCapabilities>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     result_writer: Arc<dyn FragmentResultWriter>,
+    result_retained_budget: Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
+    result_retained_limits: novarocks_worker::WorkerResultRetainedLimits,
+    root_producer_pool: Arc<RootProducerPool>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
@@ -227,6 +231,9 @@ struct TaskRuntime {
     attempt: TaskAttemptKey,
     stop: ConnectorStopOwner,
     sink_kind: FragmentSinkKind,
+    /// Only retained output survives task execution. A Session here would
+    /// keep its metadata live while context release waits for that same exit.
+    root_channel: Option<Arc<novarocks_worker::root_result_channel::RootResultChannel>>,
     /// Taken exactly once, by `submit_runnable`. While it is still here the
     /// fragment is prepared but not started, and dropping it rolls every
     /// acquired resource back.
@@ -392,6 +399,9 @@ impl NativeTaskExecutionHost {
         capabilities: Arc<TaskInboundCapabilities>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn FragmentResultWriter>,
+        result_retained_budget: Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
+        result_retained_limits: novarocks_worker::WorkerResultRetainedLimits,
+        root_producer_pool: Arc<RootProducerPool>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
@@ -404,6 +414,9 @@ impl NativeTaskExecutionHost {
             capabilities,
             exchange_transmitter,
             result_writer,
+            result_retained_budget,
+            result_retained_limits,
+            root_producer_pool,
             exchange_receiver_port,
             commit_port,
             execution_runtime,
@@ -790,6 +803,44 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .enable_profile()
             .then(|| fragment_root_profiler(request.root_plan_node_id()));
         let submission = request.into_submission();
+        // The frozen program, not the shared Result sink kind, chooses the
+        // new producer. Its complete metadata/input pool exists before any
+        // factory or driver can grow. The registry takes the provisional
+        // channel under its existing creation/context fence below.
+        let root_session = match submission.program().local_program().sink() {
+            Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) => {
+                if matches!(
+                    contract.kind(),
+                    novarocks_result_contract::RootOutputKind::InternalFacts(_)
+                ) {
+                    return Err(protocol("explicit internal root codec is not installed"));
+                }
+                let channel = novarocks_worker::root_result_channel::RootResultChannel::try_open(
+                    novarocks_execution::runtime::fragment::io::RootResultWriteSpec {
+                        task: identity,
+                        contract: Arc::clone(contract),
+                    },
+                    Arc::clone(&self.result_retained_budget),
+                    self.result_retained_limits,
+                )
+                .map_err(|error| {
+                    resource_exhausted(format!("open task {identity} root channel: {error}"))
+                })?;
+                Some(
+                    NativeRootResultSession::try_open(channel, &self.root_producer_pool).map_err(
+                        |error| {
+                            resource_exhausted(format!(
+                                "open task {identity} root producer: {error}"
+                            ))
+                        },
+                    )?,
+                )
+            }
+            _ => None,
+        };
+        let root_channel = root_session
+            .as_ref()
+            .map(|session| Arc::clone(session.channel()));
 
         let edges = ExchangeEdgeGates::from_frozen_edges(descriptor.topology().outbound())
             .map_err(|error| {
@@ -843,7 +894,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     "task {identity} could not install connector resource accounting: {error}"
                 ))
             })?;
-        let context = admission
+        let mut context = admission
             .into_prepare_context(
                 profiler,
                 Arc::clone(&self.exchange_transmitter),
@@ -859,6 +910,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             // send, so a producer cannot reach a destination that has not
             // acknowledged its own creation.
             .with_edge_gates(Arc::clone(&edges));
+        if let Some(session) = root_session {
+            context = context.with_root_result_session(session);
+        }
 
         // This is the receiver install. It registers every inbound exchange
         // receiver and builds the pipeline in one step, and its rollback is
@@ -873,12 +927,18 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             descriptor.pipeline_dop().get(),
         );
 
+        let installation = novarocks_worker::PreparedTaskInstallation::new(
+            PreparedTaskFacts::new(sink_kind),
+            root_channel.clone(),
+        )?;
+
         self.tasks.lock().expect(TASK_LOCK).insert(
             identity,
             Arc::new(TaskRuntime {
                 attempt,
                 stop: task_stop,
                 sink_kind,
+                root_channel,
                 dormant: Mutex::new(Some(dormant)),
                 edges,
                 splits,
@@ -889,7 +949,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         );
         lease.retain();
         stop_guard.transfer_to_task();
-        novarocks_worker::PreparedTaskInstallation::new(PreparedTaskFacts::new(sink_kind), None)
+        Ok(installation)
     }
 
     /// Drops everything `install_receiver` prepared.
@@ -1003,6 +1063,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let split_queues = Arc::clone(&self.split_queues);
         let attempt = runtime.attempt;
         let sink_kind = runtime.sink_kind;
+        let root_channel = runtime.root_channel.clone();
         let operator_statistics = Arc::clone(&runtime.operator_statistics);
         let completion_reporter = reporter.clone();
         let completion = self
@@ -1022,14 +1083,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     if let Some(profile) = fact.profile() {
                         operator_statistics.record_profile(profile);
                     }
-                    report_terminal(
+                    report_terminal_with_root(
                         &completion_reporter,
                         sink_kind,
+                        root_channel.as_deref(),
                         &fact,
                         completion_worker.stand_down(),
                     );
                     completion_worker.finish(
-                        (sink_kind == FragmentSinkKind::Result).then_some(&completion_reporter),
+                        (sink_kind == FragmentSinkKind::Result && root_channel.is_none())
+                            .then_some(&completion_reporter),
                     );
                     split_queues.close_attempt(attempt);
                     queries.unregister_fragment_execution(execution, kernel_key);
@@ -1458,16 +1521,52 @@ impl RunnableTask for NativeRunnableTask {
 
 /// Publishes one fragment's terminal fact as this task's terminal status.
 ///
-/// The root task is the one asymmetry, and it is deliberate: its output
-/// responsibility ends when the frontend drains the result stream, not when
-/// the pipeline stops producing. So a successful root reports `FLUSHING` and
-/// lets the result plane finish it; every other sink owes nothing further.
+/// Bounded roots finish after actual production and context handoff. The S0
+/// legacy Result program still waits in FLUSHING for its old result reader.
+#[cfg(test)]
 fn report_terminal(
     reporter: &TaskStatusReporter,
     sink_kind: FragmentSinkKind,
     fact: &FragmentTerminalFact,
     stand_down: Option<StandDown>,
 ) {
+    report_terminal_with_root(reporter, sink_kind, None, fact, stand_down);
+}
+
+fn report_terminal_with_root(
+    reporter: &TaskStatusReporter,
+    sink_kind: FragmentSinkKind,
+    root_channel: Option<&novarocks_worker::root_result_channel::RootResultChannel>,
+    fact: &FragmentTerminalFact,
+    stand_down: Option<StandDown>,
+) {
+    // Context sealing publishes the Worker-owned task cause before waking
+    // the root. Its runnable fan-out can arrive later; a closed root error
+    // during that interval must not invent an originating execution failure.
+    let stand_down = stand_down.or_else(|| {
+        if !root_channel.is_some_and(|channel| channel.is_closed()) {
+            return None;
+        }
+        match reporter.current().termination() {
+            Some(
+                novarocks_execution_contract::task_execution::status::TerminationDetail::Aborted(
+                    cause,
+                ),
+            ) => Some(StandDown::Abort(*cause)),
+            Some(
+                novarocks_execution_contract::task_execution::status::TerminationDetail::Canceled(
+                    reason,
+                ),
+            ) => Some(StandDown::Cancel(*reason)),
+            _ => None,
+        }
+    });
+    let context_handoff = root_channel.is_some_and(|channel| {
+        matches!(
+            channel.producer_state(),
+            novarocks_execution::runtime::fragment::io::RootProducerState::ContextHeld,
+        )
+    });
     // A task that was told to stand down completes that stand-down whatever
     // its pipeline did next. The owner latched the termination and already
     // published the terminating state, and first-wins means the pipeline's own
@@ -1478,7 +1577,7 @@ fn report_terminal(
             StandDown::Cancel(reason) => {
                 reporter.canceling(reason);
                 let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
-                    && !matches!(sink_kind, FragmentSinkKind::Result)
+                    && (!matches!(sink_kind, FragmentSinkKind::Result) || context_handoff)
                 {
                     // The cancellation won the lifecycle race, but the
                     // non-root sink still ran to success. Preserve that
@@ -1502,7 +1601,7 @@ fn report_terminal(
                 } else {
                     reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
                     let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
-                        && !matches!(sink_kind, FragmentSinkKind::Result)
+                        && (!matches!(sink_kind, FragmentSinkKind::Result) || context_handoff)
                     {
                         TaskOutputFacts::new(true)
                     } else {
@@ -1518,6 +1617,7 @@ fn report_terminal(
         }
         if !matches!(stand_down, StandDown::Quiesce)
             || !matches!(sink_kind, FragmentSinkKind::Result)
+            || root_channel.is_some()
         {
             reporter.release_output();
         }
@@ -1528,6 +1628,25 @@ fn report_terminal(
             // The root's output responsibility ends when the frontend drains
             // the result stream, not when the pipeline stops producing, so it
             // is the result plane that publishes FINISHED.
+            FragmentSinkKind::Result if root_channel.is_some() => {
+                if context_handoff {
+                    reporter.finished(TaskOutputFacts::new(true));
+                    // This is responsibility handoff to Context, not free or
+                    // a consumer acknowledgement. Retired tasks keep reading
+                    // through the context-owned map.
+                    reporter.release_output();
+                } else {
+                    report_failure(
+                        reporter,
+                        TaskFailure::new(
+                            TaskFailureCategory::Internal,
+                            SafeDetail::truncating(
+                                "root stopped without completed context handoff",
+                            ),
+                        ),
+                    );
+                }
+            }
             FragmentSinkKind::Result => {
                 // Logged because this is the one terminal that deliberately
                 // is not FINISHED, and the frontend's read completion waits on
@@ -1612,8 +1731,9 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
-        PreparationStopGuard, QueryContextOptions, StandDown, TaskCompletionSupervisor,
-        TaskOperatorStatisticsSink, TaskQueryContextFacts, report_terminal,
+        PreparationStopGuard, QueryContextOptions, RootProducerPool, StandDown,
+        TaskCompletionSupervisor, TaskOperatorStatisticsSink, TaskQueryContextFacts,
+        report_terminal,
     };
     use crate::task_query_context_options::query_options_fingerprint;
 
@@ -1720,6 +1840,56 @@ mod tests {
     }
 
     impl Body {
+        fn bounded_root(output: novarocks_result_contract::FrozenRootOutput, rows: &[i64]) -> Self {
+            use novarocks_proto_models::{common, expr};
+            let contract = novarocks_result_contract::RootOutputContract::new(
+                novarocks_result_contract::RootProfileId::V1,
+                output,
+            );
+            let mut body = Self::with_sink(
+                1,
+                plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::RootResult(
+                        novarocks_proto_codec::root_result::encode_root_contract(&contract),
+                    )),
+                },
+                Vec::new(),
+            );
+            let data_type =
+                novarocks_plan_codec::encode_native_type(&arrow::datatypes::DataType::Int64)
+                    .unwrap();
+            let column = common::OutputColumn {
+                column_id: 10,
+                name: "v".into(),
+                r#type: Some(data_type.clone()),
+                nullable: false,
+                is_internal: false,
+            };
+            let node = body.frozen.plan.as_mut().unwrap().root.as_mut().unwrap();
+            let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+            else {
+                unreachable!()
+            };
+            physical.output_columns = vec![column.clone()];
+            physical.kind = Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                columns: vec![column],
+                rows: rows
+                    .iter()
+                    .map(|value| plan::ExprList {
+                        values: vec![expr::Expr {
+                            r#type: Some(data_type.clone()),
+                            nullable: false,
+                            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                                value: Some(common::LiteralValue {
+                                    value: Some(common::literal_value::Value::IntValue(*value)),
+                                }),
+                            })),
+                        }],
+                    })
+                    .collect(),
+            }));
+            body
+        }
         /// A decodable, self-contained fragment: one VALUES node into a NOOP
         /// sink, frozen for exactly `pipeline_dop`.
         fn values(pipeline_dop: u32) -> Self {
@@ -2093,6 +2263,20 @@ mod tests {
     }
 
     fn host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
+        let limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
+            256 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        )
+        .expect("valid root test limits");
+        let budget =
+            novarocks_worker::result_buffer::ResultRetainedBudget::new(limits.per_process());
+        let pool = RootProducerPool::try_new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+            1024 * 1024,
+            Arc::clone(&budget),
+        )
+        .expect("finite test producer pool");
         let data_runtime =
             novarocks_native_adapter::backend_test_support::test_backend_data_runtime();
         let completion_supervisor =
@@ -2107,7 +2291,13 @@ mod tests {
                 data_runtime,
                 Duration::from_millis(120_000),
             ),
-            novarocks_native_adapter::fragment_result_writer::test_native_result_writer(),
+            novarocks_native_adapter::fragment_result_writer::native_result_writer(
+                Arc::clone(&budget),
+                limits.per_root(),
+            ),
+            budget,
+            limits,
+            pool,
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             test_execution_runtime(),
@@ -4107,8 +4297,12 @@ mod tests {
 
     impl OwnerFixture {
         fn new(query: i64) -> Self {
+            Self::new_with_context_dop(query, 1)
+        }
+        fn new_with_context_dop(query: i64, dop: i32) -> Self {
             let backend = BackendProcessId::new_v7();
             let facts = Arc::new(StubContextFacts::default());
+            facts.set_context_dop(dop);
             let counting = Arc::new(CountingHost {
                 inner: host(facts),
                 installs: AtomicUsize::new(0),
@@ -4358,6 +4552,484 @@ mod tests {
             "{accepted:?}"
         );
         assert_eq!(fixture.host.installs.load(Ordering::SeqCst), 2);
+    }
+
+    fn wait_bounded_root_finished(fixture: &OwnerFixture, root: TaskIdentity) {
+        let source = fixture.registry.status_source(fixture.context).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = source.latest(root) {
+                if status.state() == TaskState::Finished {
+                    return;
+                }
+                assert!(
+                    !status.is_terminal(),
+                    "unexpected root terminal: {status:?}"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "root did not finish without ACK: {:?}",
+                source.latest(root)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    struct PausedRootWorker {
+        open: Mutex<bool>,
+        changed: std::sync::Condvar,
+        started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    }
+    impl crate::root_producer_pool::RootProducerJob for PausedRootWorker {
+        fn turn(&self) -> crate::root_producer_pool::RootProducerTurn {
+            if let Some(sender) = self.started.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+            crate::root_producer_pool::RootProducerTurn::Complete
+        }
+        fn cancel(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+        fn exited(&self) {}
+    }
+    struct RootWorkerPause {
+        job: Arc<dyn crate::root_producer_pool::RootProducerJob>,
+        _registration: crate::root_producer_pool::RootProducerRegistration,
+    }
+    impl RootWorkerPause {
+        fn new(pool: &Arc<RootProducerPool>) -> Self {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let job: Arc<dyn crate::root_producer_pool::RootProducerJob> =
+                Arc::new(PausedRootWorker {
+                    open: Mutex::new(false),
+                    changed: std::sync::Condvar::new(),
+                    started: Mutex::new(Some(sender)),
+                });
+            let registration = pool.register(Arc::downgrade(&job)).unwrap();
+            let pause = Self {
+                job,
+                _registration: registration,
+            };
+            pause._registration.wake().unwrap();
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            pause
+        }
+        fn open(&self) {
+            self.job.cancel();
+        }
+    }
+    impl Drop for RootWorkerPause {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+    struct CallbackPause(Arc<PausedRootWorker>);
+    impl Drop for CallbackPause {
+        fn drop(&mut self) {
+            *self.0.open.lock().unwrap() = true;
+            self.0.changed.notify_all();
+        }
+    }
+
+    #[test]
+    fn bounded_root_seal_preserves_worker_abort_before_runnable_fanout() {
+        use novarocks_execution_contract::task_execution::status::TerminationDetail;
+        for (query, cause) in [
+            (91_005, AbortCause::QueryFailed),
+            (91_006, AbortCause::PeerTaskFailed),
+            (91_007, AbortCause::LeaseExpired),
+        ] {
+            let fixture = OwnerFixture::new(query);
+            let pause = RootWorkerPause::new(&fixture.host.inner.root_producer_pool);
+            let root = fixture.identity(1);
+            let descriptor = consistent_descriptor(root, UniqueId::new(query, 1));
+            let receipt = fixture.create(
+                &descriptor,
+                &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
+            );
+            assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+            let channel = fixture
+                .host
+                .inner
+                .task_runtime(root)
+                .unwrap()
+                .root_channel
+                .clone()
+                .unwrap();
+            let source = fixture.registry.status_source(fixture.context).unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let fanout_gate = Arc::new(PausedRootWorker {
+                open: Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+                started: Mutex::new(None),
+            });
+            let callback_gate = fanout_gate.clone();
+            let fanout_pause = CallbackPause(fanout_gate.clone());
+            let abort_thread_id = Arc::new(Mutex::new(None));
+            let callback_thread_id = abort_thread_id.clone();
+            let source_at_seal = source.clone();
+            let weak_channel = Arc::downgrade(&channel);
+            let once = std::sync::atomic::AtomicBool::new(true);
+            let observer = channel.writable_observable().subscribe(Arc::new(move || {
+                if weak_channel
+                    .upgrade()
+                    .is_some_and(|channel| channel.is_closed())
+                    && *callback_thread_id.lock().unwrap() == Some(std::thread::current().id())
+                    && once.swap(false, Ordering::AcqRel)
+                {
+                    sender.send(source_at_seal.latest(root).unwrap()).unwrap();
+                    let mut open = callback_gate.open.lock().unwrap();
+                    while !*open {
+                        open = callback_gate.changed.wait(open).unwrap();
+                    }
+                }
+            }));
+            let registry = fixture.registry.clone();
+            let context = fixture.context;
+            let abort = std::thread::spawn(move || {
+                *abort_thread_id.lock().unwrap() = Some(std::thread::current().id());
+                registry.abort_query_context(&novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(TaskOperationId::new_v7(), context, cause))
+            });
+            let at_seal = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Unblock the actual producer while the runnable abort is still
+            // held behind finish_seal's callback. The driver must conclude
+            // from the cause fixed under the Worker fence.
+            pause.open();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let terminal = loop {
+                let current = source.latest(root).unwrap();
+                if current.is_terminal() {
+                    break current;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break current;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            drop(fanout_pause);
+            let receipt = abort.join().unwrap();
+            assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+            assert_eq!(at_seal.state(), TaskState::Aborting);
+            assert_eq!(
+                at_seal.termination(),
+                Some(&TerminationDetail::Aborted(cause))
+            );
+            assert_eq!(
+                terminal.state(),
+                TaskState::Aborted,
+                "real driver must complete while runnable fan-out is paused: {terminal:?}"
+            );
+            assert_eq!(
+                terminal.termination(),
+                Some(&TerminationDetail::Aborted(cause))
+            );
+            drop(observer);
+            fixture.host.inner.root_producer_pool.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_root_exit_observer_panic_still_wakes_real_pending_finish_driver() {
+        let fixture = OwnerFixture::new(91_008);
+        let pause = RootWorkerPause::new(&fixture.host.inner.root_producer_pool);
+        let root = fixture.identity(1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_008, 1));
+        let receipt = fixture.create(
+            &descriptor,
+            &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
+        );
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        let channel = fixture
+            .host
+            .inner
+            .task_runtime(root)
+            .unwrap()
+            .root_channel
+            .clone()
+            .unwrap();
+        let weak = Arc::downgrade(&channel);
+        let panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_panicked = panicked.clone();
+        channel.writable_observable().try_add_observer(Arc::new(move || {
+            if weak.upgrade().is_some_and(|channel| channel.producer_state() == novarocks_execution::runtime::fragment::io::RootProducerState::ContextHeld)
+                && !callback_panicked.swap(true, Ordering::AcqRel)
+            { panic!("injected root exit observer failure"); }
+        })).unwrap();
+        pause.open();
+        wait_bounded_root_finished(&fixture, root);
+        assert!(panicked.load(Ordering::Acquire));
+        fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::QueryFailed,
+            ),
+        );
+        fixture.host.inner.root_producer_pool.shutdown().unwrap();
+    }
+
+    fn bounded_read(
+        root: TaskIdentity,
+        kind: novarocks_result_contract::RootOutputKind,
+    ) -> novarocks_execution_contract::root_result::RootResultRead {
+        novarocks_execution_contract::root_result::RootResultRead::try_new(
+            root,
+            novarocks_result_contract::RootProfileId::V1,
+            kind,
+            Some(NonZeroU64::new(1).unwrap()),
+            0,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bounded_root_count_finishes_before_read_and_survives_task_retirement() {
+        use novarocks_execution_contract::root_result::RootReadOutcome;
+        use novarocks_result_contract::{FrozenRootOutput, RootOutputKind};
+        use novarocks_worker::root_result_channel::ContextRootRoute;
+        let fixture = OwnerFixture::new(91_001);
+        let root = fixture.identity(1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_001, 1));
+        let receipt = fixture.create(
+            &descriptor,
+            &Body::bounded_root(FrozenRootOutput::CountOnly, &[4, 5, 6]),
+        );
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+        wait_bounded_root_finished(&fixture, root);
+        fixture.registry.advance_deadlines();
+        assert!(
+            fixture.host.inner.task_runtime(root).is_none(),
+            "producer task retired"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let read = bounded_read(root, RootOutputKind::CountOnly);
+        let ContextRootRoute::Read(first) = fixture.registry.context_root_result_route(&read)
+        else {
+            panic!("retired producer lost context output")
+        };
+        let first = runtime.block_on(first.read()).unwrap();
+        assert!(
+            matches!(first.reply().outcome, RootReadOutcome::End(end) if end.output_rows == 3 && end.sequence.get() == 1)
+        );
+        let reply = first.reply().clone();
+        drop(first);
+        let ContextRootRoute::Read(replay) = fixture.registry.context_root_result_route(&read)
+        else {
+            panic!("context cannot replay End")
+        };
+        let replay = runtime.block_on(replay.read()).unwrap();
+        assert_eq!(replay.reply(), &reply);
+        let quiesced = fixture.registry.quiesce_query_context(
+            &novarocks_execution_contract::task_execution::operation::QuiesceQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+            ),
+        );
+        assert_eq!(quiesced.outcome(), OperationOutcome::Accepted);
+        let released = fixture
+            .registry
+            .release_query_context(&ReleaseQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+            ));
+        assert_eq!(
+            released.outcome(),
+            OperationOutcome::Accepted,
+            "no final ACK needed"
+        );
+        assert_eq!(
+            fixture.registry.context_state(fixture.context),
+            novarocks_execution_contract::QueryContextState::Releasing,
+            "End delivery guard remains a physical holder"
+        );
+        assert!(matches!(
+            fixture.registry.context_root_result_route(&read),
+            ContextRootRoute::AwaitTerminalControl
+        ));
+        drop(replay);
+        fixture.registry.advance_deadlines();
+        assert_eq!(
+            fixture.registry.context_state(fixture.context),
+            novarocks_execution_contract::QueryContextState::TerminalRetained
+        );
+        fixture.host.inner.root_producer_pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn bounded_root_dop_64_values_collapse_counts_actual_rows_once() {
+        use novarocks_execution_contract::root_result::RootReadOutcome;
+        use novarocks_result_contract::{FrozenRootOutput, RootOutputKind};
+        use novarocks_worker::root_result_channel::ContextRootRoute;
+        let fixture = OwnerFixture::new_with_context_dop(91_009, 64);
+        let root = fixture.identity(1);
+        let descriptor = descriptor_with(
+            root,
+            UniqueId::new(91_009, 1),
+            64,
+            ExchangeTopology::default(),
+        );
+        let mut body = Body::bounded_root(FrozenRootOutput::CountOnly, &[1, 2]);
+        body.frozen.pipeline_dop_domain = Some(proto::PipelineDopDomain {
+            min: 64,
+            max: 64,
+            requires_power_of_two: false,
+        });
+        let receipt = fixture.create(&descriptor, &body);
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+        wait_bounded_root_finished(&fixture, root);
+        let ContextRootRoute::Read(read) = fixture
+            .registry
+            .context_root_result_route(&bounded_read(root, RootOutputKind::CountOnly))
+        else {
+            panic!("context lost count")
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let delivery = runtime.block_on(read.read()).unwrap();
+        assert!(
+            matches!(delivery.reply().outcome, RootReadOutcome::End(end) if end.output_rows == 2)
+        );
+        drop(delivery);
+        fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::QueryFailed,
+            ),
+        );
+        fixture.host.inner.root_producer_pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn bounded_root_client_bytes_finish_without_legacy_arrow_or_ack() {
+        use novarocks_execution_contract::root_result::RootReadOutcome;
+        use novarocks_result_contract::{
+            ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
+            RenderPresentation, RootOutputKind,
+        };
+        use novarocks_worker::root_result_channel::ContextRootRoute;
+        let schema = ClientRenderSchema::try_new(
+            vec![RenderColumn {
+                source_ordinal: 0,
+                source_slot: Some(10),
+                name: "v".into(),
+                field: RenderField {
+                    nullable: false,
+                    native_type: NativeRenderType::SignedInteger(64),
+                    presentation: RenderPresentation::ScalarText,
+                },
+            }],
+            1,
+        )
+        .unwrap();
+        let fixture = OwnerFixture::new(91_002);
+        let root = fixture.identity(1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_002, 1));
+        let receipt = fixture.create(
+            &descriptor,
+            &Body::bounded_root(FrozenRootOutput::ClientRows(schema), &[42]),
+        );
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+        wait_bounded_root_finished(&fixture, root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ContextRootRoute::Read(read) = fixture
+            .registry
+            .context_root_result_route(&bounded_read(root, RootOutputKind::ClientRows))
+        else {
+            panic!("finished root absent")
+        };
+        let delivery = runtime.block_on(read.read()).unwrap();
+        let RootReadOutcome::Data(data) = &delivery.reply().outcome else {
+            panic!("root did not encode client bytes")
+        };
+        assert_eq!(data.body().as_ref(), &[3, 0, 0, 0, 2, b'4', b'2']);
+        assert!(
+            data.end_after_data()
+                .is_some_and(|end| end.output_rows == 1 && end.sequence.get() == 2)
+        );
+        assert!(
+            matches!(
+                runtime.block_on(novarocks_worker::result_buffer::wait_fetch_task_typed(
+                    root,
+                    None,
+                    Duration::ZERO,
+                    novarocks_execution_contract::task_execution::operation::ResultByteLimit::new(
+                        1024
+                    )
+                    .unwrap()
+                )),
+                novarocks_worker::result_buffer::TryFetchTypedResult::Error(_)
+            ),
+            "bounded root never registered legacy Arrow result"
+        );
+        drop(delivery);
+        fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::QueryFailed,
+            ),
+        );
+        fixture.host.inner.root_producer_pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn bounded_root_provisional_install_rolls_back_actual_session_metadata() {
+        let (host, _) = isolated_resource_host();
+        let root = identity(91_003, 1, 1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_003, 1));
+        let body = Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]);
+        let installation = host
+            .install_receiver(&descriptor, body.input(&descriptor))
+            .unwrap();
+        let (_, channel) = installation.into_parts();
+        let channel = channel.expect("explicit bounded root installs its provisional channel");
+        assert_eq!(channel.spec().task, root);
+        assert!(
+            !channel.physical_idle(),
+            "prepared drivers retain covered session metadata"
+        );
+        host.remove_receiver(&descriptor);
+        host.root_producer_pool.shutdown().unwrap();
+        assert!(channel.is_closed());
+        assert!(
+            channel.physical_idle(),
+            "task runtime cannot retain a Session after rollback"
+        );
+    }
+
+    #[test]
+    fn bounded_root_missing_domain_codec_is_protocol_refusal_before_channel_install() {
+        let (host, _) = isolated_resource_host();
+        let root = identity(91_004, 1, 1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_004, 1));
+        let body = Body::bounded_root(
+            novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                novarocks_result_contract::InternalResultDomain::ScalarValueV1,
+            ),
+            &[],
+        );
+        let rejected = host
+            .install_receiver(&descriptor, body.input(&descriptor))
+            .unwrap_err();
+        assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
+        assert!(host.task_runtime(root).is_none());
+        host.root_producer_pool.shutdown().unwrap();
     }
     #[test]
     fn real_owner_result_revocation_waits_for_terminal_control() {

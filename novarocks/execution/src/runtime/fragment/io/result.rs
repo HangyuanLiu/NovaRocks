@@ -283,6 +283,21 @@ impl RootInputAuthority {
         Self::try_new(spec).expect("root input readiness allocation")
     }
     pub fn try_new(spec: &RootResultWriteSpec) -> Result<Self, FragmentIoError> {
+        Self::try_new_with_owner(spec, None)
+    }
+    /// Keep the already admitted issuer/readiness backing grant alive through
+    /// exported Observable Arcs, scoped slots and notification snapshots.
+    /// initial_backing_bytes must be covered before invoking this constructor.
+    pub fn try_new_retained(
+        spec: &RootResultWriteSpec,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, FragmentIoError> {
+        Self::try_new_with_owner(spec, Some(owner))
+    }
+    fn try_new_with_owner(
+        spec: &RootResultWriteSpec,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Self, FragmentIoError> {
         let geometry =
             novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
         let required_bytes = geometry.root_original_input_backing_capacity_bytes as usize
@@ -291,7 +306,11 @@ impl RootInputAuthority {
             } else {
                 geometry.root_additional_hydrate_backing_capacity_bytes as usize
             };
-        let observable = Observable::try_bounded(Self::READINESS_CAPACITY).map_err(|_| {
+        let observable = match owner {
+            Some(owner) => Observable::try_bounded_retained(Self::READINESS_CAPACITY, owner),
+            None => Observable::try_bounded(Self::READINESS_CAPACITY),
+        }
+        .map_err(|_| {
             FragmentIoError::new(
                 super::FragmentIoOperation::ResultOpen,
                 super::FragmentIoErrorKind::Unavailable,
@@ -412,7 +431,9 @@ impl RootInputPermit {
 }
 impl Drop for RootInputPermit {
     fn drop(&mut self) {
-        drop(self.credit.take());
+        let credit_exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(self.credit.take());
+        }));
         {
             let mut state = self.issuer.state.lock().unwrap();
             assert!(
@@ -421,7 +442,20 @@ impl Drop for RootInputPermit {
             );
             state.occupied = false;
         }
-        self.issuer.observable.notify_observers();
+        let position_exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.issuer.observable.notify_observers();
+        }));
+        // Returning credit can invoke a channel observer. Even if it unwinds,
+        // the actual input exit must vacate its issuer position and notify the
+        // independent driver waiters. Preserve the first failure afterwards.
+        if !std::thread::panicking() {
+            if let Err(payload) = credit_exit {
+                std::panic::resume_unwind(payload);
+            }
+            if let Err(payload) = position_exit {
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 }
 
@@ -528,6 +562,103 @@ impl FragmentResultSession for DiscardResultSession {
 #[cfg(test)]
 mod root_input_tests {
     use super::*;
+
+    #[test]
+    fn credit_exit_panic_still_vacates_input_and_notifies_before_readmission() {
+        use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let spec = RootResultWriteSpec {
+            task: TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            ),
+            contract: Arc::new(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::CountOnly,
+            )),
+        };
+        let authority = Arc::new(RootInputAuthority::new(&spec));
+        let released = Arc::new(AtomicBool::new(false));
+        let credit_released = Arc::clone(&released);
+        let credit = ResultWriteCredit::new(authority.required_bytes(), move |_| {
+            credit_released.store(true, Ordering::Release);
+            std::panic::panic_any(17_u64);
+        });
+        let RootInputAdmission::Granted(permit) = authority.try_acquire(credit).unwrap() else {
+            panic!("first input");
+        };
+        let generation = permit.generation();
+        let notified = Arc::new(AtomicBool::new(false));
+        let callback_notified = Arc::clone(&notified);
+        let callback_authority = Arc::downgrade(&authority);
+        let subscription = authority
+            .observable()
+            .try_subscribe(Arc::new(move || {
+                assert!(released.load(Ordering::Acquire));
+                assert!(callback_authority.upgrade().unwrap().is_available());
+                callback_notified.store(true, Ordering::Release);
+                std::panic::panic_any(23_u64);
+            }))
+            .unwrap();
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(permit))).unwrap_err();
+        assert_eq!(payload.downcast_ref::<u64>(), Some(&17));
+        assert!(notified.load(Ordering::Acquire));
+        drop(subscription);
+        let RootInputAdmission::Granted(next) = authority
+            .try_acquire(ResultWriteCredit::new(authority.required_bytes(), |_| {}))
+            .unwrap()
+        else {
+            panic!("actual input exit must allow readmission");
+        };
+        assert!(next.generation() > generation);
+        drop(next);
+    }
+    #[test]
+    fn retained_readiness_backing_follows_observable_and_late_subscription() {
+        use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Owner(Arc<AtomicBool>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(Owner(Arc::clone(&dropped)));
+        let spec = RootResultWriteSpec {
+            task: TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            ),
+            contract: Arc::new(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::CountOnly,
+            )),
+        };
+        let authority = RootInputAuthority::try_new_retained(&spec, owner.clone()).unwrap();
+        let observable = authority.observable();
+        let subscription = observable.try_subscribe(Arc::new(|| {})).unwrap();
+        drop(owner);
+        drop(authority);
+        assert!(!dropped.load(Ordering::Acquire));
+        observable.notify_observers();
+        drop(observable);
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(subscription);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
     #[test]
     fn root_input_is_issuer_bound_single_position_and_retained_until_actual_drop() {
         use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};

@@ -199,6 +199,44 @@ fn construction_bytes(threads: usize, positions: usize, stack: usize) -> Result<
     )?;
     Ok(total)
 }
+/// Validated local CPU resources, independent of task transport capacity.
+/// This does not advertise result transport or product support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootProducerLimits {
+    threads: NonZeroUsize,
+    positions: NonZeroUsize,
+    stack_bytes: usize,
+}
+impl RootProducerLimits {
+    pub fn try_new(threads: usize, positions: usize, stack_bytes: usize) -> Result<Self, String> {
+        let threads = NonZeroUsize::new(threads).ok_or("root producer threads must be positive")?;
+        let positions =
+            NonZeroUsize::new(positions).ok_or("root producer positions must be positive")?;
+        if threads.get() > MAX_THREADS
+            || positions.get() > MAX_POSITIONS
+            || !(MIN_STACK..=MAX_STACK).contains(&stack_bytes)
+        {
+            return Err(
+                "root producer pool requires threads<=64, positions<=4096 and stack in 1..=8 MiB"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            threads,
+            positions,
+            stack_bytes,
+        })
+    }
+    pub fn threads(self) -> NonZeroUsize {
+        self.threads
+    }
+    pub fn positions(self) -> NonZeroUsize {
+        self.positions
+    }
+    pub fn stack_bytes(self) -> usize {
+        self.stack_bytes
+    }
+}
 impl RootProducerPool {
     pub fn try_new(
         threads: NonZeroUsize,
@@ -206,22 +244,14 @@ impl RootProducerPool {
         stack_bytes: usize,
         budget: Arc<ResultRetainedBudget>,
     ) -> Result<Arc<Self>, String> {
-        let threads = threads.get();
-        let positions = positions.get();
+        let limits = RootProducerLimits::try_new(threads.get(), positions.get(), stack_bytes)?;
+        let threads = limits.threads().get();
+        let positions = limits.positions().get();
         if !cfg!(all(
             target_pointer_width = "64",
             any(target_vendor = "apple", target_os = "linux")
         )) {
             return Err("root producer pool layout audit requires 64-bit Darwin or Linux".into());
-        }
-        if threads > MAX_THREADS
-            || positions > MAX_POSITIONS
-            || !(MIN_STACK..=MAX_STACK).contains(&stack_bytes)
-        {
-            return Err(
-                "root producer pool requires threads<=64, positions<=4096 and stack in 1..=8 MiB"
-                    .into(),
-            );
         }
         // Supply a 64 KiB-aligned stack request, covering the audited Darwin
         // 16 KiB and Linux <=64 KiB page rounding without post-grant growth.

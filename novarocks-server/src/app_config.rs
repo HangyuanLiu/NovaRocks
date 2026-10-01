@@ -708,6 +708,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
+    validate_root_producer_config(&cfg.runtime)?;
     validate_scan_io_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
@@ -1352,6 +1353,15 @@ pub struct RuntimeConfig {
     pub io_coalesce_read_max_distance_size: u64,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
+    /// Fixed CPU workers for bounded BE root result production.
+    #[serde(default = "default_root_result_producer_threads")]
+    pub root_result_producer_threads: usize,
+    /// Finite root registrations, including dormant and active producers.
+    #[serde(default = "default_root_result_producer_positions")]
+    pub root_result_producer_positions: usize,
+    /// Requested stack bytes for each root CPU worker; zero is rejected.
+    #[serde(default = "default_root_result_producer_stack_bytes")]
+    pub root_result_producer_stack_bytes: usize,
     #[serde(default = "default_data_runtime_worker_threads")]
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
@@ -2127,6 +2137,17 @@ fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_root_producer_config(runtime: &RuntimeConfig) -> Result<()> {
+    novarocks_native_adapter::root_result_session::RootProducerLimits::try_new(
+        runtime.root_result_producer_threads,
+        runtime.root_result_producer_positions,
+        runtime.root_result_producer_stack_bytes,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("validate runtime root result producer limits")?;
+    Ok(())
+}
+
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     let nonzero_durations = [
         (
@@ -2347,6 +2368,19 @@ fn default_pipeline_exec_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores
 }
 
+fn default_root_result_producer_threads() -> usize {
+    1
+}
+
+fn default_root_result_producer_positions() -> usize {
+    // Both active and overlapping registrations for 320 client and 4 internal roots.
+    648
+}
+
+fn default_root_result_producer_stack_bytes() -> usize {
+    1024 * 1024
+}
+
 fn default_data_runtime_worker_threads() -> usize {
     0 // 0 means use CPU cores for global data runtime
 }
@@ -2559,6 +2593,9 @@ impl Default for RuntimeConfig {
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
             io_coalesce_read_max_distance_size: default_io_coalesce_read_max_distance_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
+            root_result_producer_threads: default_root_result_producer_threads(),
+            root_result_producer_positions: default_root_result_producer_positions(),
+            root_result_producer_stack_bytes: default_root_result_producer_stack_bytes(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             scan_io_worker_threads: default_scan_io_worker_threads(),
@@ -2884,7 +2921,7 @@ mod tests {
         NativeIngressRuntimeConfig, NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig,
         RuntimeMemoryConfig, StandaloneServerConfig, validate_query_blocking_config,
         validate_query_control_config, validate_result_retained_config,
-        validate_task_execution_config,
+        validate_root_producer_config, validate_task_execution_config,
     };
 
     /// One gibibyte, used as a readable stand-in for `P` throughout these
@@ -2998,6 +3035,79 @@ mod tests {
 
         runtime.query_blocking_queue_capacity = 0;
         assert!(validate_query_blocking_config(&runtime).is_err());
+    }
+
+    #[test]
+    fn root_producer_defaults_are_explicit_and_independent_of_other_pools() {
+        for runtime in [
+            RuntimeConfig::default(),
+            toml::from_str::<RuntimeConfig>("").expect("omitted root settings use defaults"),
+            toml::from_str::<RuntimeConfig>(
+                "pipeline_exec_thread_pool_thread_num = 96\ndata_runtime_worker_threads = 32\n",
+            )
+            .expect("unrelated pool settings parse"),
+        ] {
+            assert_eq!(runtime.root_result_producer_threads, 1);
+            assert_eq!(runtime.root_result_producer_positions, 648);
+            assert_eq!(runtime.root_result_producer_stack_bytes, 1_048_576);
+            validate_root_producer_config(&runtime).expect("finite root defaults are valid");
+        }
+    }
+
+    #[test]
+    fn root_producer_settings_preserve_explicit_values() {
+        let runtime = toml::from_str::<RuntimeConfig>(
+            "root_result_producer_threads = 3\n\
+             root_result_producer_positions = 128\n\
+             root_result_producer_stack_bytes = 2097152\n",
+        )
+        .expect("explicit root producer settings parse");
+        assert_eq!(runtime.root_result_producer_threads, 3);
+        assert_eq!(runtime.root_result_producer_positions, 128);
+        assert_eq!(runtime.root_result_producer_stack_bytes, 2_097_152);
+        validate_root_producer_config(&runtime).expect("explicit finite settings are valid");
+    }
+
+    #[test]
+    fn root_producer_settings_reject_zero_and_values_outside_local_bounds() {
+        for (threads, positions, stack_bytes) in [
+            (0, 648, 1_048_576),
+            (65, 648, 1_048_576),
+            (usize::MAX, 648, 1_048_576),
+            (1, 0, 1_048_576),
+            (1, 4097, 1_048_576),
+            (1, usize::MAX, 1_048_576),
+            (1, 648, 0),
+            (1, 648, 1_048_575),
+            (1, 648, 8_388_609),
+            (1, 648, usize::MAX),
+        ] {
+            let runtime = RuntimeConfig {
+                root_result_producer_threads: threads,
+                root_result_producer_positions: positions,
+                root_result_producer_stack_bytes: stack_bytes,
+                ..Default::default()
+            };
+            let error = validate_root_producer_config(&runtime)
+                .expect_err("invalid root pool settings must fail before composition");
+            assert!(
+                error.to_string().contains("root result producer"),
+                "{threads}/{positions}/{stack_bytes}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_producer_settings_accept_exact_local_bounds() {
+        for (threads, positions, stack_bytes) in [(1, 1, 1_048_576), (64, 4096, 8_388_608)] {
+            let runtime = RuntimeConfig {
+                root_result_producer_threads: threads,
+                root_result_producer_positions: positions,
+                root_result_producer_stack_bytes: stack_bytes,
+                ..Default::default()
+            };
+            validate_root_producer_config(&runtime).expect("exact local bounds are valid");
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::backend_metrics::BackendMetricsRegistry;
 use crate::backend_rpc_service::BackendRpcService;
 use crate::fragment_result_writer::native_result_writer;
 use crate::management_http::MetricsHttpServer;
+use crate::root_result_session::{RootProducerLimits, RootProducerPool};
 use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 use crate::task_execution_observation::backend_task_execution_ports;
@@ -102,6 +103,8 @@ pub struct BackendServerConfig {
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     /// Server-validated hierarchy for retained native query results.
     pub result_retained_limits: WorkerResultRetainedLimits,
+    /// Independent finite CPU/installation/stack resources for root encoding.
+    pub root_producer_limits: RootProducerLimits,
     /// Active and retained exact late-frame records use one Worker budget.
     pub inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
     pub preparation_limits: novarocks_worker::TaskPreparationLimits,
@@ -168,6 +171,7 @@ pub struct BackendApplicationHost {
     ready_marker: String,
     grpc_server: NativeRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
+    root_producer_pool: Arc<RootProducerPool>,
     task_completion_supervisor: Arc<novarocks_worker::TaskCompletionSupervisor>,
     task_deadline_tick: WorkerDeadlineSupervisor,
     metrics_http_server: MetricsHttpServer,
@@ -191,6 +195,7 @@ struct BackendApplicationServices {
     backend_process_id: BackendProcessId,
     drain: Arc<WorkerDrainState>,
     execution_runtime: Arc<ExecutionRuntime>,
+    root_producer_pool: Arc<RootProducerPool>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
     task_completion_supervisor: Arc<novarocks_worker::TaskCompletionSupervisor>,
@@ -336,6 +341,7 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
+    root_producer_limits: RootProducerLimits,
     inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
     preparation_limits: novarocks_worker::TaskPreparationLimits,
     scan_stream_host: novarocks_worker::ScanStreamHost,
@@ -403,6 +409,18 @@ fn compose_backend_application_services(
     let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
+    let root_producer_pool = RootProducerPool::try_new(
+        root_producer_limits.threads(),
+        root_producer_limits.positions(),
+        root_producer_limits.stack_bytes(),
+        Arc::clone(&result_retained_budget),
+    )
+    .map_err(|error| {
+        BackendApplicationError::new(
+            BackendApplicationErrorKind::Configuration,
+            format!("compose bounded root producer pool: {error}"),
+        )
+    })?;
     let task_execution_registry_config = TaskExecutionRegistryConfig::for_process(
         backend_process_id,
         novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
@@ -434,7 +452,13 @@ fn compose_backend_application_services(
             data_runtime.clone(),
             Duration::from_millis(execution_runtime.config().exchange_wait_ms),
         ),
-        native_result_writer(result_retained_budget, result_retained_limits.per_root()),
+        native_result_writer(
+            Arc::clone(&result_retained_budget),
+            result_retained_limits.per_root(),
+        ),
+        result_retained_budget,
+        result_retained_limits,
+        Arc::clone(&root_producer_pool),
         Arc::clone(&exchange_receiver_port),
         Arc::new(ConfiguredWorkerSinkCommitPort::new(
             write_commit_evidence_limits,
@@ -458,6 +482,7 @@ fn compose_backend_application_services(
         backend_process_id,
         drain,
         execution_runtime,
+        root_producer_pool,
         exchange_receiver_port,
         task_execution_registry,
         task_completion_supervisor,
@@ -550,6 +575,10 @@ impl BackendApplicationHost {
         // Close ingress before draining drivers, so no CreateTask can
         // install a new completion slot behind the shutdown boundary.
         let listener_shutdown = self.grpc_server.stop();
+        // Cancel and join root producers before driver pending_finish waits.
+        // Completion of this join does not free pool backings; their owner is
+        // still retained here until Host destruction.
+        let producer_result = self.root_producer_pool.shutdown();
         let execution_result = self.execution_runtime.shutdown_driver_execution();
         // Driver shutdown publishes every actual-stop fact. Only after that
         // may the fixed completion owner drain its exact slots and return.
@@ -557,7 +586,10 @@ impl BackendApplicationHost {
         let metrics_result = self.metrics_http_server.stop();
         combine_shutdown_results(
             combine_shutdown_results(
-                combine_shutdown_results(listener_shutdown, execution_result),
+                combine_shutdown_results(
+                    combine_shutdown_results(listener_shutdown, producer_result),
+                    execution_result,
+                ),
                 completion_result,
             ),
             metrics_result,
@@ -587,6 +619,7 @@ impl BackendApplicationHost {
             announce_max_backoff,
             write_commit_evidence_limits,
             result_retained_limits,
+            root_producer_limits,
             inbound_capability_limits,
             preparation_limits,
             execution_runtime_config,
@@ -617,6 +650,7 @@ impl BackendApplicationHost {
             native_compatibility_id,
             write_commit_evidence_limits,
             result_retained_limits,
+            root_producer_limits,
             inbound_capability_limits,
             preparation_limits,
             novarocks_worker::ScanStreamHost::new(scan_preparation_config, scan_stream_runtime),
@@ -782,6 +816,7 @@ impl BackendApplicationHost {
             ),
             grpc_server,
             execution_runtime: services.execution_runtime,
+            root_producer_pool: services.root_producer_pool,
             task_completion_supervisor: services.task_completion_supervisor,
             task_deadline_tick,
             metrics_http_server,
@@ -1012,6 +1047,8 @@ mod tests {
                 32 * 1024 * 1024,
             )
             .expect("valid test result retained-byte limits"),
+            root_producer_limits: super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
+                .expect("finite root producer limits"),
             inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
             preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
             execution_runtime_config: execution_runtime_config(),
@@ -1080,6 +1117,8 @@ mod tests {
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
+            super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
+                .expect("finite root producer limits"),
             novarocks_worker::TaskInboundCapabilityLimits::default(),
             novarocks_worker::TaskPreparationLimits::default(),
             novarocks_worker::ScanStreamHost::new(
