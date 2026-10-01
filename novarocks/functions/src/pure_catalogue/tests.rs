@@ -996,6 +996,49 @@ fn actual_builtin_truncate_installs_its_exact_dynamic_cpu_record_and_complete_ef
 }
 
 #[test]
+fn actual_builtin_round_installs_its_exact_dynamic_cpu_record_and_complete_effects() {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
+    let definition = builder.definition("round", FunctionKind::Scalar).unwrap();
+    let binding = definition.binding.as_ref().unwrap();
+    let attachment = binding.pure.as_ref().expect("actual ROUND CPU owner");
+    assert_eq!(
+        binding.declaration.function_id().as_str(),
+        "builtin.scalar/round/v1"
+    );
+    assert_eq!(binding.declaration.overloads().len(), 1);
+    assert_eq!(attachment.implementations.len(), 1);
+    let declared = &binding.declaration.overloads()[0];
+    let installed = &attachment.implementations[0];
+    assert_eq!(
+        declared.identity.as_str(),
+        "builtin.scalar/round/dynamic-v1"
+    );
+    assert_eq!(installed.overload, declared.identity);
+    assert_eq!(
+        installed.implementation.as_str(),
+        "builtin.scalar/round/selected-v1"
+    );
+    assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
+    let effects = declared.effects.as_ref().unwrap();
+    assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
+    assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::MayRaise);
+    assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
+    assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+    assert_eq!(effects.argument_control, ArgumentControl::Eager);
+    assert_eq!(effects.instance_state, FunctionInstanceState::None);
+    assert_eq!(effects.observable_effects, ObservableEffects::NONE);
+    assert!(effects.environment_dependencies.is_empty());
+    // This complete owner contributes to the whole catalogue; unfinished
+    // owners are still refused rather than creating a partial sealed service.
+    assert!(matches!(
+        builder.seal_pure(std::iter::empty()),
+        Err(PureCatalogError::MissingOwner(_)
+            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
+    ));
+}
+
+#[test]
 fn metadata_without_actual_owner_and_legacy_effects_cannot_be_pure_sealed() {
     let owner = Arc::new(Owner::new(false));
     let metadata = FunctionDefinition::try_new_bound(

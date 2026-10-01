@@ -3977,6 +3977,7 @@ dependencies = [
  "arrow-schema",
  "novarocks-constant-contract",
  "novarocks-type-contract",
+ "num-traits",
  "rand 0.8.5",
  "sha2",
 ]

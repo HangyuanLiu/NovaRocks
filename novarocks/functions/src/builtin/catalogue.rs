@@ -2375,13 +2375,18 @@ pub(super) fn dynamic_definition_parts(
             subject: "dynamic scalar overload",
             value: error.to_string().into(),
         })?;
-    let overload_declaration = if name == "truncate" {
+    let pure_effects = match name {
+        "truncate" => Some(super::truncate_owner::effects()),
+        "round" => Some(super::round_owner::effects()),
+        _ => None,
+    };
+    let overload_declaration = if let Some(effects) = pure_effects {
         FunctionOverloadDeclaration::from_effects(
             overload.clone(),
             "owner-derived",
             "owner-derived",
             None,
-            super::truncate_owner::effects(),
+            effects,
         )
     } else {
         FunctionOverloadDeclaration {
@@ -2416,15 +2421,15 @@ pub fn contribute_builtin_functions(
     builder.register(super::value_conversion::value_conversion_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
-        let definition = if *name == "truncate" {
-            super::truncate_owner::definition(declaration, resolver)?
-        } else {
-            FunctionDefinition::try_new_bound(
+        let definition = match *name {
+            "truncate" => super::truncate_owner::definition(declaration, resolver)?,
+            "round" => super::round_owner::definition(declaration, resolver)?,
+            _ => FunctionDefinition::try_new_bound(
                 name,
                 FunctionVisibility::Public,
                 declaration,
                 Arc::new(resolver),
-            )?
+            )?,
         };
         builder.register(definition)?;
     }

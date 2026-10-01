@@ -342,6 +342,14 @@ mod legacy_rounding_contract_tests {
     }
 
     fn evaluate(value: ArrayRef, digits: Option<Digits>, output_type: DataType) -> ArrayRef {
+        evaluate_result(value, digits, output_type).unwrap()
+    }
+
+    fn evaluate_result(
+        value: ArrayRef,
+        digits: Option<Digits>,
+        output_type: DataType,
+    ) -> Result<ArrayRef, String> {
         let mut inputs = vec![value];
         let literal = match digits {
             Some(Digits::Column(array)) => {
@@ -384,11 +392,9 @@ mod legacy_rounding_contract_tests {
             output_type.clone(),
         );
         let frozen = arena.into_immutable().unwrap();
-        let output = ExprArena::from_immutable(&frozen)
-            .eval(call, &chunk)
-            .unwrap();
+        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
         assert_eq!(output.data_type(), &output_type);
-        output
+        Ok(output)
     }
 
     fn floats(values: Vec<Option<f64>>) -> ArrayRef {
@@ -632,5 +638,151 @@ mod legacy_rounding_contract_tests {
         );
         assert_eq!(decimals(&output), vec![Some(bound)]);
         assert!(decimals(&output)[0].unwrap() > bound - 1);
+    }
+
+    #[test]
+    fn round_interval_digits_report_real_outer_cast_failure_despite_arrow_capability() {
+        use arrow::array::types::IntervalDayTimeType;
+        use arrow::array::{IntervalDayTimeArray, IntervalYearMonthArray};
+        let intervals: Vec<ArrayRef> = vec![
+            Arc::new(IntervalYearMonthArray::from(vec![Some(1), None])),
+            Arc::new(IntervalDayTimeArray::from(vec![
+                Some(IntervalDayTimeType::make_value(1, 0)),
+                None,
+            ])),
+        ];
+        for digits in intervals {
+            assert!(arrow::compute::can_cast_types(
+                digits.data_type(),
+                &DataType::Int64
+            ));
+            let error = evaluate_result(
+                floats(vec![Some(1.25), None]),
+                Some(Digits::Column(digits)),
+                DataType::Float64,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("round: failed to cast decimals to Int64:"),
+                "{error}"
+            );
+            assert!(error.contains("Interval"), "{error}");
+        }
+    }
+
+    fn overflowing_negative_scale_digits(all_null: bool) -> Vec<(ArrayRef, i8)> {
+        use arrow::array::{Decimal32Array, Decimal64Array, Decimal256Array};
+        use arrow::datatypes::i256;
+        let i32_value = if all_null { None } else { Some(0_i32) };
+        let i64_value = if all_null { None } else { Some(0_i64) };
+        let i128_value = if all_null { None } else { Some(0_i128) };
+        let i256_value = if all_null {
+            None
+        } else {
+            Some(i256::from_i128(0))
+        };
+        vec![
+            (
+                Arc::new(
+                    Decimal32Array::from(vec![i32_value, None])
+                        .with_precision_and_scale(9, -10)
+                        .unwrap(),
+                ),
+                -10,
+            ),
+            (
+                Arc::new(
+                    Decimal64Array::from(vec![i64_value, None])
+                        .with_precision_and_scale(18, -19)
+                        .unwrap(),
+                ),
+                -19,
+            ),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![i128_value, None])
+                        .with_precision_and_scale(38, -39)
+                        .unwrap(),
+                ),
+                -39,
+            ),
+            (
+                Arc::new(
+                    Decimal256Array::from(vec![i256_value, None])
+                        .with_precision_and_scale(76, -77)
+                        .unwrap(),
+                ),
+                -77,
+            ),
+        ]
+    }
+
+    #[test]
+    fn round_all_null_decimal_digits_still_fail_static_native_factor_construction() {
+        for (digits, scale) in overflowing_negative_scale_digits(true) {
+            assert!(arrow::compute::can_cast_types(
+                digits.data_type(),
+                &DataType::Int64
+            ));
+            let error = evaluate_result(
+                floats(vec![Some(1.25), Some(2.5)]),
+                Some(Digits::Column(digits)),
+                DataType::Float64,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("round: failed to cast decimals to Int64:"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("The scale {scale} causes overflow.")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn round_null_source_does_not_hide_decimal_digits_static_factor_failure() {
+        for all_null in [false, true] {
+            for (digits, scale) in overflowing_negative_scale_digits(all_null) {
+                let error = evaluate_result(
+                    floats(vec![None, None]),
+                    Some(Digits::Column(digits)),
+                    DataType::Float64,
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains("round: failed to cast decimals to Int64:"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains(&format!("The scale {scale} causes overflow.")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_decimal32_digits_native_multiplication_overflow_is_safe_null_even_when_i64_fits() {
+        use arrow::array::Decimal32Array;
+        let digits: ArrayRef = Arc::new(
+            Decimal32Array::from(vec![Some(300_000_000_i32), Some(1), None])
+                .with_precision_and_scale(9, -1)
+                .unwrap(),
+        );
+        // The mathematical integer 3,000,000,000 fits BIGINT; Arrow first
+        // multiplies in the source i32 carrier, whose safe cast produces NULL.
+        let output = evaluate(
+            floats(vec![Some(1.25), Some(1.25), Some(1.25)]),
+            Some(Digits::Column(digits.clone())),
+            DataType::Float64,
+        );
+        assert_eq!(doubles(&output), vec![None, Some(1.25), None]);
+        // The same legal decimal used as the value follows the Float64 path.
+        assert_eq!(
+            integers(&evaluate(digits, None, DataType::Int64)),
+            vec![Some(3_000_000_000), Some(10), None]
+        );
     }
 }

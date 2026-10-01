@@ -38,7 +38,7 @@ pub(super) enum CastCapability {
 
 /// Checked scalar target types are deliberately restricted to non-nested
 /// primitives, so neither equality nor Arrow's leaf probe recurses.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum CastTarget {
     Float64,
     Int64,
