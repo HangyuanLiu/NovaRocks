@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "parent_commit": "08a98733236c2ec11b5401a483c6b77dd3eaba52",
+  "sources": {
+    "novarocks/execution/src/exec/chunk/chunk_impl.rs": "3dda78d85acf64330c0b9b8af3563b55f211299cac93c7eeddf5d55e0416883e",
+    "novarocks/execution/src/exec/chunk/mod.rs": "0ca9c8ebc028830153abeada3a3301faa3d4fc044b2dbdc09a9fed4b8cb91227",
+    "novarocks/execution/src/exec/chunk/root_array_storage.rs": "83553956cc344a41455c7f0fe14efdd5561e899d58e43229db0472c51dee91e8",
+    "novarocks/execution/src/exec/chunk/root_chunk_storage.rs": "e54d2610db4dad6762a29459b28a6a975057b4134f310c4338a8137adc1120a7",
+    "novarocks/execution/src/exec/chunk/root_schema_backing.rs": "8c3b0b594ee644cb97c4e829045277446110272a1c41f546eac51acad02401bf",
+    "novarocks/execution/src/exec/chunk/schema.rs": "41b18c876a4bdf50c0f23cf146b1541eb0e9450d46db741453f811d4f838d0d6",
+    "novarocks/execution/tests/root_capacity_introspection.rs": "28ca315c58b23d54c789b33d2edd8ccfa935819f90884c675c900529d99d042d",
+    "novarocks/worker/src/result_buffer.rs": "c7fc685404256262bcce18ba4514f3d1524e0b49ba764816737e120f0a070934"
+  },
+  "logs": {
+    "capacity-tests.log.gz": {
+      "raw_sha256": "fa7f3a4ef641a705c91241589fdba368cc0da661f6cf459bcf3b1fbf1ebaf2ef",
+      "gzip_sha256": "32231273b43c52e3e0c555bee8e013bfdce63fb1180a334745a26b60c7c37e81",
+      "raw_bytes": 45738,
+      "exit_code": 0
+    },
+    "schema-tests.log.gz": {
+      "raw_sha256": "aa802a72504527ec76b5918ab01096f5da25ec10e285c8b68bc03dea39f70f73",
+      "gzip_sha256": "8f1eadef9210b541abc592b56d58593ac4f390776c26ea192dd67256bd005fdf",
+      "raw_bytes": 46885,
+      "exit_code": 0
+    },
+    "chunk-tests.log.gz": {
+      "raw_sha256": "4d218acb274211263a4da6027da588c31b6fbb5b49550f61fad7889ad2871d84",
+      "gzip_sha256": "59b00b8a2136dcbcce87675256074f29699b9e9902e8cb5799def6a038b5869d",
+      "raw_bytes": 53338,
+      "exit_code": 0
+    },
+    "original-carrier-tests.log.gz": {
+      "raw_sha256": "3537a3c7dd9e0685dc5453e09a880e70ad01f8791efbd2cceb107f14ff292ccc",
+      "gzip_sha256": "b13effd8ab349ae726b7abdafb3a5c39d2097f3f3bb4139d40306509fcb32dcf",
+      "raw_bytes": 43962,
+      "exit_code": 0
+    },
+    "channel-tests.log.gz": {
+      "raw_sha256": "b28bde7fdd2576452990c0a66e1ea3d2d0c5ddb6446e12865faab140a30da419",
+      "gzip_sha256": "5955c13fc00760e825f02dd983639237ede11a7f687a550bd5a85cf16bc1cfc0",
+      "raw_bytes": 2392,
+      "exit_code": 0
+    },
+    "budget-tests.log.gz": {
+      "raw_sha256": "03e23a0027ee1f14b191fbcd1a979203de0528103d5d3e1b1914a2e233b272b9",
+      "gzip_sha256": "11e4f9fba4ddc0b408d587c21e737a468ffc1886482ea9ce27e879b79e4dbd11",
+      "raw_bytes": 3842,
+      "exit_code": 0
+    },
+    "clippy.log.gz": {
+      "raw_sha256": "0c59347ae9e6afd5d118ec638d7088e2708444c314283eec86ed3a486fee8b22",
+      "gzip_sha256": "d604a77c42d99f30afcf11262fbe64072d5d2107958b6bd9da1af38e972e68a2",
+      "raw_bytes": 35503,
+      "exit_code": 0
+    },
+    "native-check.log.gz": {
+      "raw_sha256": "43c994058432e0d8be1cdeede2ad060715a6d064a522ddaa125882686c64d215",
+      "gzip_sha256": "af6a765fcf90fe6dbfd8d2ff4cbbf268b264d1697e9860c1b651e0ba81154eea",
+      "raw_bytes": 44373,
+      "exit_code": 0
+    }
+  }
+}

@@ -19,6 +19,8 @@ mod chunk_impl;
 mod hydrate;
 mod memory;
 mod root_array_storage;
+mod root_chunk_storage;
+mod root_schema_backing;
 mod schema;
 mod slot_layout;
 #[cfg(test)]
@@ -36,5 +38,6 @@ pub use root_array_storage::{
     RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
     borrowed_root_batch_storage,
 };
+pub use root_chunk_storage::borrowed_root_chunk_storage;
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 pub use slot_layout::SlotLayout;

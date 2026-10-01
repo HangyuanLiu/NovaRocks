@@ -115,6 +115,23 @@ impl Chunk {
         self.chunk_schema.as_ref()
     }
 
+    /// Fixed input holder scaffolds are part of the result input allowance.
+    /// Shared MEM tracker/provider governance authorities retain their existing
+    /// accounting owner and are not traversed as if they were Arrow payload.
+    pub(super) fn inspect_root_holder_scaffolds(
+        &self,
+        inspection: &mut super::root_schema_backing::RootSchemaInspection,
+    ) -> Result<(), super::root_schema_backing::RootSchemaBackingError> {
+        inspection.charge(std::mem::size_of::<Self>())?;
+        if let Some(accounting) = &self.accounting {
+            inspection.charge_arc(accounting.as_ref())?;
+        }
+        if let Some(output_memory) = &self.connector_output_memory {
+            inspection.charge_arc(output_memory.as_ref())?;
+        }
+        Ok(())
+    }
+
     pub fn chunk_schema_ref(&self) -> ChunkSchemaRef {
         Arc::clone(&self.chunk_schema)
     }

@@ -542,3 +542,186 @@ fn whole_batch_storage_rejects_wide_inputs_without_scanning_columns() {
         Err(RootArrayStorageError::WorkExceeded)
     );
 }
+
+fn owned_root_field(
+    name: String,
+    data_type: DataType,
+) -> novarocks_types::arrow_metadata_owner::MetadataOwnedField {
+    use novarocks_types::arrow_metadata_owner::{ArrowMetadataOwner, MetadataOwnerLimits};
+    ArrowMetadataOwner::try_new(
+        Vec::new(),
+        MetadataOwnerLimits {
+            entries: 65536,
+            construction_bytes: 96 * 1024 * 1024,
+        },
+    )
+    .unwrap()
+    .into_field(name, data_type, false)
+}
+
+fn owned_root_schema(
+    field: novarocks_types::arrow_metadata_owner::MetadataOwnedField,
+    extras: Vec<novarocks_types::arrow_metadata_owner::MetadataOwnedField>,
+) -> Arc<novarocks_execution::exec::chunk::ChunkSchema> {
+    use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use novarocks_types::arrow_metadata_owner::FieldMetadataOrigins;
+    let mut owners = vec![field.clone()];
+    owners.extend(extras);
+    let origins = FieldMetadataOrigins::try_new(owners, 65536).unwrap();
+    let slot = ChunkSlotSchema::try_new_with_metadata_origins(
+        novarocks_types::SlotId::new(1),
+        Arc::clone(field.field()),
+        origins,
+        None,
+        Some(7),
+    )
+    .unwrap();
+    Arc::new(ChunkSchema::try_new(vec![slot]).unwrap())
+}
+
+#[test]
+fn whole_chunk_proof_counts_name_and_original_columns_spare_without_allocation() {
+    use novarocks_execution::exec::chunk::{
+        Chunk, RootArrayStorageError, borrowed_root_chunk_storage,
+    };
+    let mut name = String::with_capacity(512 * 1024);
+    name.push_str("value");
+    let name_capacity = name.capacity();
+    let schema = owned_root_schema(owned_root_field(name, DataType::Int32), Vec::new());
+    let array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+    let mut columns = Vec::with_capacity(8192);
+    columns.push(array);
+    let spare = columns.capacity() * std::mem::size_of::<ArrayRef>();
+    let batch = RecordBatch::try_new(schema.arrow_schema_ref(), columns).unwrap();
+    let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+    let bytes =
+        no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(96 * 1024 * 1024)))
+            .unwrap();
+    assert!(bytes >= name_capacity + spare);
+    assert_eq!(
+        no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(name_capacity - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+}
+
+#[test]
+fn whole_chunk_proof_refuses_foreign_equal_schema_with_unknown_empty_table_history() {
+    use novarocks_execution::exec::chunk::{
+        Chunk, RootArrayStorageError, borrowed_root_chunk_storage,
+    };
+    let schema = owned_root_schema(
+        owned_root_field("value".into(), DataType::Int32),
+        Vec::new(),
+    );
+    let mut unknown = std::collections::HashMap::with_capacity(8192);
+    unknown.insert("deleted".into(), "value".into());
+    unknown.clear();
+    let actual = Arc::new(Schema::new_with_metadata(
+        schema.arrow_schema_ref().fields().clone(),
+        unknown,
+    ));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&actual),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )
+    .unwrap();
+    let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&schema)).unwrap();
+    assert!(Arc::ptr_eq(&chunk.batch.schema(), &actual));
+    assert!(!Arc::ptr_eq(&actual, &schema.arrow_schema_ref()));
+    assert_eq!(
+        no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(96 * 1024 * 1024))),
+        Err(RootArrayStorageError::UnknownMetadataOwner)
+    );
+}
+
+#[test]
+fn whole_chunk_proof_refuses_foreign_nested_array_field_even_with_known_batch_schema() {
+    use novarocks_execution::exec::chunk::{
+        Chunk, RootArrayStorageError, borrowed_root_chunk_storage,
+    };
+    let child = owned_root_field("child".into(), DataType::Int32);
+    let parent = owned_root_field(
+        "parent".into(),
+        DataType::Struct(vec![Arc::clone(child.field())].into()),
+    );
+    let schema = owned_root_schema(parent, vec![child.clone()]);
+    let mut unknown = std::collections::HashMap::with_capacity(8192);
+    unknown.insert("deleted".into(), "value".into());
+    unknown.clear();
+    let foreign = Arc::new(Field::new("child", DataType::Int32, false).with_metadata(unknown));
+    let array = StructArray::try_new(
+        vec![foreign].into(),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![Arc::new(array)]).unwrap();
+    let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+    assert_eq!(
+        no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(96 * 1024 * 1024))),
+        Err(RootArrayStorageError::UnknownMetadataOwner)
+    );
+}
+
+#[test]
+fn whole_chunk_proof_counts_unreachable_field_owners_kept_by_origin_indices() {
+    use novarocks_execution::exec::chunk::{
+        Chunk, RootArrayStorageError, borrowed_root_chunk_storage,
+    };
+    let mut spare = String::with_capacity(1024 * 1024);
+    spare.push_str("unused");
+    let root = owned_root_field("value".into(), DataType::Int32);
+    let extra = owned_root_field(spare, DataType::Int64);
+    let schema = owned_root_schema(root, vec![extra]);
+    let batch = RecordBatch::try_new(
+        schema.arrow_schema_ref(),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )
+    .unwrap();
+    let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+    assert_eq!(
+        no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(512 * 1024))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+    let bytes =
+        no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(96 * 1024 * 1024)))
+            .unwrap();
+    assert!(bytes >= 1024 * 1024);
+}
+
+#[test]
+fn whole_chunk_proof_accepts_maximum_flat_dictionary_columns_with_shared_physical_owners() {
+    use arrow::array::DictionaryArray;
+    use arrow::datatypes::Int32Type;
+    use novarocks_execution::exec::chunk::{
+        Chunk, ChunkSchema, ChunkSlotSchema, borrowed_root_chunk_storage,
+    };
+    use novarocks_types::arrow_metadata_owner::FieldMetadataOrigins;
+    let dictionary = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0]),
+            Arc::new(arrow::array::StringArray::from(vec!["x"])),
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let mut slots = Vec::with_capacity(4096);
+    for index in 0..4096 {
+        let field = owned_root_field(format!("c{index}"), dictionary.data_type().clone());
+        let origins = FieldMetadataOrigins::try_new(vec![field.clone()], 1).unwrap();
+        slots.push(
+            ChunkSlotSchema::try_new_with_metadata_origins(
+                novarocks_types::SlotId::new(index),
+                Arc::clone(field.field()),
+                origins,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    let schema = Arc::new(ChunkSchema::try_new(slots).unwrap());
+    let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![dictionary; 4096]).unwrap();
+    let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+    no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(96 * 1024 * 1024)))
+        .unwrap();
+}

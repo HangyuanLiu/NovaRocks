@@ -738,6 +738,77 @@ impl ChunkSchema {
         self.schema_metadata_origin.as_ref()
     }
 
+    /// Inspect only this immutable ChunkSchema's own scaffolds. Field/schema
+    /// owners and their genuine metadata receipts are inspected separately.
+    pub(super) fn inspect_root_scaffolds(
+        &self,
+        inspection: &mut super::root_schema_backing::RootSchemaInspection,
+    ) -> Result<(), super::root_schema_backing::RootSchemaBackingError> {
+        use super::root_schema_backing::RootSchemaBackingError;
+        use std::alloc::Layout;
+        use std::mem::{align_of, size_of};
+
+        inspection.charge_arc(self)?;
+        for (capacity, width) in [
+            (self.slots.capacity(), size_of::<ChunkSlotSchema>()),
+            (self.slot_ids.capacity(), size_of::<SlotId>()),
+        ] {
+            inspection.charge(
+                capacity
+                    .checked_mul(width)
+                    .ok_or(RootSchemaBackingError::CapacityExceeded)?,
+            )?;
+        }
+        // Private build creates this map fresh with capacity for all slots,
+        // inserts each key once, and exposes no mutation/removal API. Its
+        // never-deleted table history is known; no arbitrary map is accepted.
+        if self.index_by_slot.capacity() != 0 {
+            let buckets = self
+                .index_by_slot
+                .capacity()
+                .checked_add(1)
+                .and_then(usize::checked_next_power_of_two)
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?;
+            let payload = buckets
+                .checked_mul(size_of::<(SlotId, usize)>())
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?;
+            let alignment = align_of::<(SlotId, usize)>().max(16);
+            let aligned = payload
+                .checked_add(alignment - 1)
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?
+                & !(alignment - 1);
+            let bytes = aligned
+                .checked_add(buckets)
+                .and_then(|b| b.checked_add(16))
+                .ok_or(RootSchemaBackingError::CapacityExceeded)?;
+            Layout::from_size_align(bytes, alignment)
+                .map_err(|_| RootSchemaBackingError::CapacityExceeded)?;
+            inspection.charge(bytes)?;
+        }
+        fn logical(
+            schema: &ChunkFieldSchema,
+            depth: usize,
+            inspection: &mut super::root_schema_backing::RootSchemaInspection,
+        ) -> Result<(), RootSchemaBackingError> {
+            inspection.enter_auxiliary_node(depth)?;
+            inspection.charge(
+                schema
+                    .children
+                    .capacity()
+                    .checked_mul(size_of::<ChunkFieldSchema>())
+                    .ok_or(RootSchemaBackingError::CapacityExceeded)?,
+            )?;
+            for child in &schema.children {
+                logical(child, depth + 1, inspection)?;
+            }
+            Ok(())
+        }
+        for slot in &self.slots {
+            logical(&slot.field_schema, 0, inspection)?;
+        }
+        Ok(())
+    }
+
     pub fn slots(&self) -> &[ChunkSlotSchema] {
         &self.slots
     }

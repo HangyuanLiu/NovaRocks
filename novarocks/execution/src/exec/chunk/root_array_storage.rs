@@ -32,6 +32,7 @@ use novarocks_result_contract::RootProfileV1;
 pub enum RootArrayStorageError {
     UnsupportedCarrier,
     UnknownBufferOwner,
+    UnknownMetadataOwner,
     CapacityExceeded,
     WorkExceeded,
 }
@@ -61,10 +62,12 @@ pub fn borrowed_root_array_storage(
         nodes: limits.nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES),
         depth: limits.depth.min(RootProfileV1::MAX_DEPTH),
     };
+    let mut no_types = |_: &DataType| Ok(());
     let mut state = Inspection {
         limits,
         bytes: 0,
         nodes: 0,
+        inspect_type: &mut no_types,
     };
     state.array(array, 0)?;
     Ok(state.bytes)
@@ -76,6 +79,17 @@ pub fn borrowed_root_array_storage(
 pub fn borrowed_root_batch_storage(
     batch: &RecordBatch,
     limits: RootArrayStorageLimits,
+) -> Result<usize, RootArrayStorageError> {
+    borrowed_root_batch_storage_with_types(batch, limits, &mut |_| Ok(()))
+}
+
+/// The type visitor runs only after a carrier's exact standard downcast was
+/// validated. It sees every physical array's own immutable DataType, including
+/// map entries, dictionary keys, and complete dictionary values.
+pub(crate) fn borrowed_root_batch_storage_with_types(
+    batch: &RecordBatch,
+    limits: RootArrayStorageLimits,
+    inspect_type: &mut dyn FnMut(&DataType) -> Result<(), RootArrayStorageError>,
 ) -> Result<usize, RootArrayStorageError> {
     if batch.num_columns() > RootProfileV1::MAX_COLUMNS {
         return Err(RootArrayStorageError::WorkExceeded);
@@ -89,6 +103,7 @@ pub fn borrowed_root_batch_storage(
         limits,
         bytes: 0,
         nodes: 0,
+        inspect_type,
     };
     state.charge(size_of::<RecordBatch>())?;
     state.charge(
@@ -103,13 +118,14 @@ pub fn borrowed_root_batch_storage(
     Ok(state.bytes)
 }
 
-struct Inspection {
+struct Inspection<'a> {
+    inspect_type: &'a mut dyn FnMut(&DataType) -> Result<(), RootArrayStorageError>,
     limits: RootArrayStorageLimits,
     bytes: usize,
     nodes: usize,
 }
 
-impl Inspection {
+impl Inspection<'_> {
     fn charge(&mut self, bytes: usize) -> Result<(), RootArrayStorageError> {
         self.bytes = self
             .bytes
@@ -216,6 +232,7 @@ impl Inspection {
                 // children consume the one Map semantic level.
                 self.enter_node(depth)?;
                 self.structure(a.entries(), depth)?;
+                (self.inspect_type)(a.entries().data_type())?;
             }
             DataType::Dictionary(key, value)
                 if key.as_ref() == &DataType::Int32
@@ -230,7 +247,7 @@ impl Inspection {
             }
             _ => return Err(RootArrayStorageError::UnsupportedCarrier),
         }
-        Ok(())
+        (self.inspect_type)(array.data_type())
     }
 
     fn enter_node(&mut self, depth: usize) -> Result<(), RootArrayStorageError> {

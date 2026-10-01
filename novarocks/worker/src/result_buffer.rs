@@ -84,6 +84,7 @@ pub struct ResultRetainedBudget {
 #[derive(Default)]
 struct ResultRetainedState {
     process_retained_bytes: usize,
+    process_only_retained_bytes: usize,
     process_high_water_bytes: usize,
     stream_retained_bytes: HashMap<ResultBufferKey, usize>,
 }
@@ -104,6 +105,65 @@ impl ResultRetainedBudget {
             state: Mutex::new(ResultRetainedState::default()),
             writable: Arc::new(Observable::new()),
         })
+    }
+
+    /// Reserves fixed process-owned producer capacity from the same budget as
+    /// retained Task results, without inventing a stream identity or charging
+    /// any stream. The caller keeps this credit beside the actual thread-stack
+    /// or pool allocation until that allocation exits; shrinking releases only
+    /// an unused suffix. Neither reservation nor release creates a stream entry.
+    pub fn try_reserve_process(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<ResultWriteAdmission, String> {
+        if bytes > self.process_byte_cap {
+            return Err(format!(
+                "single process result reservation of {bytes} bytes exceeds process retained-byte cap {}",
+                self.process_byte_cap
+            ));
+        }
+        {
+            let mut state = self.state.lock().expect("result retained budget lock");
+            let Some(next_process) = state.process_retained_bytes.checked_add(bytes) else {
+                return Ok(ResultWriteAdmission::Blocked);
+            };
+            let Some(next_process_only) = state.process_only_retained_bytes.checked_add(bytes)
+            else {
+                return Ok(ResultWriteAdmission::Blocked);
+            };
+            if next_process > self.process_byte_cap {
+                return Ok(ResultWriteAdmission::Blocked);
+            }
+            state.process_only_retained_bytes = next_process_only;
+            state.process_retained_bytes = next_process;
+            state.process_high_water_bytes = state.process_high_water_bytes.max(next_process);
+        }
+        let budget = Arc::downgrade(self);
+        Ok(ResultWriteAdmission::Granted(ResultWriteCredit::new(
+            bytes,
+            move |released| {
+                if released == 0 {
+                    return;
+                }
+                let Some(budget) = budget.upgrade() else {
+                    return;
+                };
+                {
+                    let mut state = budget.state.lock().expect("result retained budget lock");
+                    let next_process_only = state
+                        .process_only_retained_bytes
+                        .checked_sub(released)
+                        .expect("released process-only result bytes were retained");
+                    let next_process = state
+                        .process_retained_bytes
+                        .checked_sub(released)
+                        .expect("released process result bytes were retained");
+                    state.process_only_retained_bytes = next_process_only;
+                    state.process_retained_bytes = next_process;
+                }
+                budget.writable.notify_observers();
+            },
+        )))
     }
 
     pub(crate) fn try_reserve(
@@ -143,6 +203,9 @@ impl ResultRetainedBudget {
         Ok(ResultWriteAdmission::Granted(ResultWriteCredit::new(
             bytes,
             move |released| {
+                if released == 0 {
+                    return;
+                }
                 let Some(budget) = budget.upgrade() else {
                     return;
                 };
@@ -1289,6 +1352,230 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId as NativeQueryId, StageId, TaskId,
     };
+
+    fn granted_result_credit(admission: ResultWriteAdmission) -> ResultWriteCredit {
+        match admission {
+            ResultWriteAdmission::Granted(credit) => credit,
+            ResultWriteAdmission::Blocked => panic!("reservation must fit the shared budget"),
+        }
+    }
+
+    fn assert_budget_conservation(
+        budget: &ResultRetainedBudget,
+        expected_process: usize,
+        expected_process_only: usize,
+        expected_streams: usize,
+        expected_high_water: usize,
+    ) {
+        let state = budget.state.lock().unwrap();
+        let stream_bytes = state.stream_retained_bytes.values().copied().sum::<usize>();
+        assert_eq!(state.process_retained_bytes, expected_process);
+        assert_eq!(state.process_only_retained_bytes, expected_process_only);
+        assert_eq!(state.stream_retained_bytes.len(), expected_streams);
+        assert_eq!(state.process_high_water_bytes, expected_high_water);
+        assert_eq!(
+            state.process_only_retained_bytes.checked_add(stream_bytes),
+            Some(state.process_retained_bytes),
+        );
+    }
+
+    #[test]
+    fn process_only_and_task_reservations_contend_in_the_same_budget() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(12).unwrap());
+        let identity = test_task_identity(730);
+        let handle = ResultBufferWriteHandle::open(
+            ResultBufferKey::Task(identity),
+            true,
+            NonZeroUsize::new(8).unwrap(),
+            Arc::clone(&budget),
+            None,
+        )
+        .unwrap();
+        let mut pool = granted_result_credit(budget.try_reserve_process(6).unwrap());
+        assert_budget_conservation(&budget, 6, 6, 0, 6);
+        assert!(matches!(
+            handle.try_acquire(8).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        assert_budget_conservation(&budget, 6, 6, 0, 6);
+        let writable = handle.writable_observable();
+        let generation = writable.generation();
+        pool.shrink_to(4).unwrap();
+        assert!(writable.generation() > generation);
+        let mut task = granted_result_credit(handle.try_acquire(8).unwrap());
+        assert_eq!(handle.retained_bytes(), 8);
+        assert_budget_conservation(&budget, 12, 4, 1, 12);
+        assert!(matches!(
+            budget.try_reserve_process(1).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        let generation = writable.generation();
+        task.shrink_to(3).unwrap();
+        assert!(writable.generation() > generation);
+        let other_pool = granted_result_credit(budget.try_reserve_process(5).unwrap());
+        assert_budget_conservation(&budget, 12, 9, 1, 12);
+        assert!(pool.shrink_to(5).is_err(), "credits must not grow");
+        assert_budget_conservation(&budget, 12, 9, 1, 12);
+        drop(task);
+        assert_budget_conservation(&budget, 9, 9, 0, 12);
+        drop(pool);
+        assert_budget_conservation(&budget, 5, 5, 0, 12);
+        drop(other_pool);
+        assert_budget_conservation(&budget, 0, 0, 0, 12);
+        handle.abort(ResultAbort::NeverStarted);
+    }
+
+    #[test]
+    fn process_only_credit_outlives_retired_root_keys_without_a_stream_entry() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(12).unwrap());
+        let pool = granted_result_credit(budget.try_reserve_process(4).unwrap());
+        for seed in [731, 732] {
+            let identity = test_task_identity(seed);
+            let handle = ResultBufferWriteHandle::open(
+                ResultBufferKey::Task(identity),
+                true,
+                NonZeroUsize::new(8).unwrap(),
+                Arc::clone(&budget),
+                None,
+            )
+            .unwrap();
+            let task = granted_result_credit(handle.try_acquire(8).unwrap());
+            handle
+                .write_typed_bytes_with_credit_for_test(Bytes::from_static(b"12345678"), task)
+                .unwrap();
+            handle.finish().unwrap();
+            assert_budget_conservation(&budget, 12, 4, 1, 12);
+            assert_eq!(retire_task_result(identity), ResultPublication::Removed);
+            assert_budget_conservation(&budget, 4, 4, 0, 12);
+            discard_task(identity);
+            drop(handle);
+            assert_budget_conservation(&budget, 4, 4, 0, 12);
+        }
+        drop(pool);
+        assert_budget_conservation(&budget, 0, 0, 0, 12);
+    }
+
+    #[test]
+    fn process_only_release_wakes_after_unlock_with_exact_released_state() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(10).unwrap());
+        let mut pool = granted_result_credit(budget.try_reserve_process(10).unwrap());
+        let writable = budget.writable_observable();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observations = Arc::clone(&observed);
+        let weak = Arc::downgrade(&budget);
+        let subscription = writable.subscribe(Arc::new(move || {
+            let budget = weak.upgrade().expect("budget still owns its pool");
+            // try_lock fails immediately if release notified under the mutex.
+            let state = budget
+                .state
+                .try_lock()
+                .expect("release must unlock before notifying");
+            observations.lock().unwrap().push((
+                state.process_retained_bytes,
+                state.process_only_retained_bytes,
+                state.stream_retained_bytes.len(),
+            ));
+        }));
+        let generation = writable.generation();
+        assert!(matches!(
+            budget.try_reserve_process(1).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        pool.shrink_to(6).unwrap();
+        assert!(writable.generation() > generation);
+        let released = granted_result_credit(budget.try_reserve_process(4).unwrap());
+        drop(released);
+        drop(pool);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[(6, 6, 0), (6, 6, 0), (0, 0, 0)]
+        );
+        assert_budget_conservation(&budget, 0, 0, 0, 10);
+        drop(subscription);
+    }
+
+    #[test]
+    fn process_and_task_credit_shrink_to_zero_then_drop_is_a_no_op() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(10).unwrap());
+        let identity = test_task_identity(733);
+        let handle = ResultBufferWriteHandle::open(
+            ResultBufferKey::Task(identity),
+            true,
+            NonZeroUsize::new(6).unwrap(),
+            Arc::clone(&budget),
+            None,
+        )
+        .unwrap();
+        let mut task = granted_result_credit(handle.try_acquire(6).unwrap());
+        let mut pool = granted_result_credit(budget.try_reserve_process(4).unwrap());
+        let writable = budget.writable_observable();
+        task.shrink_to(0).unwrap();
+        assert_budget_conservation(&budget, 4, 4, 0, 10);
+        let generation = writable.generation();
+        drop(task);
+        assert_eq!(writable.generation(), generation);
+        pool.shrink_to(0).unwrap();
+        assert_budget_conservation(&budget, 0, 0, 0, 10);
+        let generation = writable.generation();
+        drop(pool);
+        let zero = granted_result_credit(budget.try_reserve_process(0).unwrap());
+        assert_eq!(zero.bytes(), 0);
+        drop(zero);
+        assert_eq!(writable.generation(), generation);
+        assert_budget_conservation(&budget, 0, 0, 0, 10);
+        handle.abort(ResultAbort::NeverStarted);
+    }
+
+    #[test]
+    fn process_only_reservation_errors_above_cap_and_checks_sum_overflow() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(8).unwrap());
+        assert!(
+            budget
+                .try_reserve_process(9)
+                .unwrap_err()
+                .contains("exceeds process retained-byte cap")
+        );
+        assert_budget_conservation(&budget, 0, 0, 0, 0);
+        let credit = granted_result_credit(budget.try_reserve_process(8).unwrap());
+        assert!(matches!(
+            budget.try_reserve_process(8).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        assert_budget_conservation(&budget, 8, 8, 0, 8);
+        drop(credit);
+        assert_budget_conservation(&budget, 0, 0, 0, 8);
+
+        // Reservation arithmetic is independent of allocating the owned object.
+        // These synthetic byte amounts exercise checked addition at usize::MAX.
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(usize::MAX).unwrap());
+        let mut credit = granted_result_credit(budget.try_reserve_process(usize::MAX).unwrap());
+        assert!(matches!(
+            budget.try_reserve_process(1).unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        assert_budget_conservation(&budget, usize::MAX, usize::MAX, 0, usize::MAX);
+        credit.shrink_to(usize::MAX - 1).unwrap();
+        let suffix = granted_result_credit(budget.try_reserve_process(1).unwrap());
+        assert_budget_conservation(&budget, usize::MAX, usize::MAX, 0, usize::MAX);
+        drop(credit);
+        assert_budget_conservation(&budget, 1, 1, 0, usize::MAX);
+        drop(suffix);
+        assert_budget_conservation(&budget, 0, 0, 0, usize::MAX);
+    }
+
+    #[test]
+    fn process_only_credit_release_holds_a_weak_budget_reference() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(8).unwrap());
+        let weak = Arc::downgrade(&budget);
+        let mut credit = granted_result_credit(budget.try_reserve_process(8).unwrap());
+        drop(budget);
+        assert!(
+            weak.upgrade().is_none(),
+            "credit must not retain the process owner"
+        );
+        credit.shrink_to(3).unwrap();
+        drop(credit);
+    }
 
     fn test_result_cap() -> NonZeroUsize {
         NonZeroUsize::new(1024 * 1024).expect("nonzero test result cap")
