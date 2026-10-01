@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "verification": "old-product-functional-baseline-only",
+  "profile": "dev-opt",
+  "note": "16/64/256 are logical clients; the existing scenario admits three computations, not 256 concurrent roots",
+  "scenarios": [
+    {
+      "scenario": "query-concurrency/16-64-256-governance",
+      "outcome": "passed",
+      "source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
+      "source_dirty": true,
+      "artifacts": {
+        "query-concurrency-16-64-256-governance/scenario-evidence.json": "d867c438c2394951877310cfff89d2777aa0580f83df14d8d72170c3443277f5",
+        "query-concurrency-16-64-256-governance/process-resources.json": "b7f580d1aff83ebec12e22accc10a11ed82131da547d337fc191ba31e90ab8cf"
+      }
+    },
+    {
+      "scenario": "query-lifecycle/mysql-disconnect",
+      "outcome": "passed",
+      "source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
+      "source_dirty": true,
+      "artifacts": {
+        "query-lifecycle-mysql-disconnect/scenario-evidence.json": "111a28e4100d4c26ea4dd1b6ac44843c47223756b82eaadb60c345d7bd01f8e6"
+      }
+    },
+    {
+      "scenario": "query-lifecycle/query-timeout",
+      "outcome": "passed",
+      "source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
+      "source_dirty": true,
+      "artifacts": {
+        "query-lifecycle-query-timeout/scenario-evidence.json": "6f66f0b3f97f202f1a586fafa0297eb4ea74c09da357765d8cb201ee4c75084a"
+      }
+    },
+    {
+      "scenario": "query-output/schema-once",
+      "outcome": "passed",
+      "source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
+      "source_dirty": true,
+      "artifacts": {
+        "query-output-schema-once/scenario-evidence.json": "bd8162ab283860fe38d826e6e09d2ea01927d3d62047aa80b60ba67baf442116"
+      }
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "concurrency": [
+    16,
+    64,
+    256
+  ],
+  "repetitions": 3,
+  "query_deadline_ms": 30000,
+  "queries": [
+    {
+      "name": "integer",
+      "sql": "SELECT i FROM TABLE(generate_series(1,1000)) AS t(i) ORDER BY i",
+      "expected_rows": 1000,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "float",
+      "sql": "SELECT CAST(i AS DOUBLE)/7 FROM TABLE(generate_series(1,1000)) AS t(i) ORDER BY i",
+      "expected_rows": 1000,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "decimal",
+      "sql": "SELECT CAST(i AS DECIMAL(18,4))/CAST(7 AS DECIMAL(18,4)) FROM TABLE(generate_series(1,1000)) AS t(i) ORDER BY i",
+      "expected_rows": 1000,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "date-time",
+      "sql": "SELECT CAST('2026-09-30' AS DATE), CAST('2026-09-30 23:59:59.123456' AS DATETIME) FROM TABLE(generate_series(1,1000)) AS t(i)",
+      "expected_rows": 1000,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "nested",
+      "sql": "SELECT [i,i+1,NULL],map('a',i,'b',i+1),json_object('v',i) FROM TABLE(generate_series(1,1000)) AS t(i) ORDER BY i",
+      "expected_rows": 1000,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "wide",
+      "sql": "SELECT i,repeat('x',4096) FROM TABLE(generate_series(1,100)) AS t(i) ORDER BY i",
+      "expected_rows": 100,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "wide-slow",
+      "sql": "SELECT i,repeat('x',4096) FROM TABLE(generate_series(1,100)) AS t(i) ORDER BY i",
+      "expected_rows": 100,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 1
+    },
+    {
+      "name": "local-show",
+      "sql": "SHOW BACKENDS",
+      "expected_rows": 3,
+      "deterministic_rows": false,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "count",
+      "sql": "EXPLAIN ANALYZE SELECT i FROM TABLE(generate_series(1,1000)) AS t(i)",
+      "expected_rows": null,
+      "deterministic_rows": false,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "short",
+      "sql": "SELECT 42",
+      "expected_rows": 1,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    },
+    {
+      "name": "over-staging",
+      "sql": "SELECT repeat('y',65537)",
+      "expected_rows": 1,
+      "deterministic_rows": true,
+      "slow_read_delay_ms": 0
+    }
+  ]
+}

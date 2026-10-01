@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "status": "frozen-before-candidate-v1",
+  "frozen_on": "2026-10-01",
+  "source_baseline": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
+  "scope": "matching release builds on the same native 1FE+3BE host; macOS local evidence and user-manual Linux evidence remain separate",
+  "baseline_quality": {
+    "paired_runs": 3,
+    "window_goodput_max_relative_spread": 0.15,
+    "p95_max_relative_spread": 0.2,
+    "p99_max_relative_spread": 0.3,
+    "on_excess_noise": "inconclusive; identify external load and repeat the exact manifest, never relax candidate gates"
+  },
+  "candidate_to_baseline": {
+    "goodput_min_ratio": 0.9,
+    "first_complete_row_p95_max_ratio": 1.2,
+    "completion_p95_max_ratio": 1.2,
+    "completion_p99_max_ratio": 1.3,
+    "fe_plus_be_cpu_seconds_per_success_max_ratio": 1.15,
+    "unexplained_error_or_rejection_rate_max_increase": 0.0,
+    "deterministic_rows_bytes_digest_and_metadata": "exact match; any accepted semantic correction requires separate evidence, never edit expected bytes to pass",
+    "fixed_supported_queries_unexplained_failure_count_max": 0
+  },
+  "native_result_network_amplification": {
+    "integer_float_decimal_max_ratio": 3.5,
+    "date_time_max_ratio": 3.5,
+    "wide_string_max_ratio": 1.1,
+    "nested_json_max_ratio": 1.5,
+    "small_results": "record fixed envelope separately; ratio gates apply to result payloads >=64KiB",
+    "per_row_prefix_bytes": 4,
+    "on_excess": "fix encoding/protocol; no cap or workload reduction"
+  },
+  "lifecycle_and_control": {
+    "short_completed_data_fetches_max": 1,
+    "optional_final_ack_only_max": 1,
+    "typical_seal_then_quiesce_and_release_operations": 2,
+    "control_p95_ms_max": 100,
+    "control_p99_ms_max": 250,
+    "short_tail_actual_exit_ms_max": 2000,
+    "closing_writer_actual_exit_ms_max": 5000,
+    "closing_pool_saturated": "disconnect immediately without retaining a queued closing payload",
+    "tail_oracle": "actual handler/job exit and last backing alias; deadline expiry alone never counts as exit"
+  },
+  "coverage": [
+    "16/64/256 logical clients",
+    "more than 200 roots on one backend with exact placement/status evidence",
+    "all legal frontends simultaneously",
+    "fast numeric and wide string",
+    "slow/fast mixed readers",
+    "local SHOW",
+    "internal domain collectors",
+    "CountOnly execution via EXPLAIN ANALYZE",
+    "T-1/T/T+1",
+    "cross segment and U24",
+    "half-written metadata/rows",
+    "cancel burst 32 and sustained16/s",
+    "beyond supported burst retains bounded admission queue"
+  ],
+  "acceptance_state": "NOT_RUN; freezing gates is not performance acceptance; Linux execution delegated to user"
+}

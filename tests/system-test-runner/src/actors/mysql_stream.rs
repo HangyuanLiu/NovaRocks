@@ -23,6 +23,8 @@
 //! they use this actor instead of a second ad-hoc handshake implementation.
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
@@ -46,6 +48,24 @@ pub struct AsyncMysqlStream {
 pub struct MysqlPacket {
     sequence: u8,
     payload: Vec<u8>,
+}
+
+/// A bounded wire observation. Row payloads are hashed as they arrive rather
+/// than accumulated, including rows spanning multiple U24 packets.
+#[derive(Debug, Default, Serialize)]
+pub struct TextResultObservation {
+    pub rows: u64,
+    pub row_payload_bytes: u64,
+    pub wire_bytes: u64,
+    pub packets: u64,
+    pub columns: u64,
+    pub metadata_sha256: String,
+    pub wire_prefix_sha256: String,
+    pub first_payload_chunk_micros: Option<u128>,
+    pub first_row_micros: Option<u128>,
+    pub elapsed_micros: u128,
+    pub row_sha256: String,
+    pub error: Option<String>,
 }
 
 impl MysqlPacket {
@@ -221,6 +241,170 @@ impl MysqlStream {
 }
 
 impl AsyncMysqlStream {
+    /// Observes one text result using 64 KiB scratch and an absolute deadline.
+    /// The actor does not negotiate deprecated EOF, so 0x00 is a valid empty
+    /// first cell in a row; only the short 0xfe packet terminates row delivery.
+    pub async fn observe_text_query(
+        &mut self,
+        sql: &str,
+        read_delay: Duration,
+    ) -> TextResultObservation {
+        let started = std::time::Instant::now();
+        let mut observation = TextResultObservation::default();
+        let mut digest = Sha256::new();
+        let mut committed_digest = digest.clone();
+        let mut wire_digest = Sha256::new();
+        let mut metadata_digest = Sha256::new();
+        let result = async_timeout(self.timeout, async {
+            self.send_query(sql).await?;
+            let mut expected_sequence = 1u8;
+            let first = self
+                .observation_metadata_packet(
+                    &mut expected_sequence,
+                    &mut observation,
+                    &mut wire_digest,
+                )
+                .await?;
+            ensure!(
+                first.first() != Some(&0xff),
+                "server error code {}",
+                error_code(&first)
+            );
+            let columns = decode_column_count(&first)?;
+            ensure!(
+                (1..=4096).contains(&columns),
+                "invalid text-result column count"
+            );
+            observation.columns = columns;
+            metadata_digest.update(&first);
+            for _ in 0..columns {
+                let column = self
+                    .observation_metadata_packet(
+                        &mut expected_sequence,
+                        &mut observation,
+                        &mut wire_digest,
+                    )
+                    .await?;
+                metadata_digest.update(&column);
+                ensure!(
+                    column.first() != Some(&0xff),
+                    "server metadata error code {}",
+                    error_code(&column)
+                );
+            }
+            let end = self
+                .observation_metadata_packet(
+                    &mut expected_sequence,
+                    &mut observation,
+                    &mut wire_digest,
+                )
+                .await?;
+            validate_observation_eof(&end)?;
+            metadata_digest.update(&end);
+            let mut scratch = vec![0u8; 65536];
+            let mut row_bytes = 0u64;
+            let mut continuation = false;
+            let mut row_validator = TextRowValidator::default();
+            loop {
+                let length = self
+                    .observation_header(&mut expected_sequence, &mut observation, &mut wire_digest)
+                    .await?;
+                if length == 0 {
+                    ensure!(continuation, "unexpected zero-length row packet");
+                }
+                let mut remaining = length;
+                let mut first_chunk = true;
+                while remaining != 0 {
+                    let count = remaining.min(scratch.len());
+                    read_observed(
+                        &mut self.stream,
+                        &mut scratch[..count],
+                        &mut observation,
+                        &mut wire_digest,
+                    )
+                    .await?;
+                    if first_chunk && !continuation {
+                        if scratch[0] == 0xff {
+                            bail!("server result error code {}", error_code(&scratch[..count]));
+                        }
+                        if scratch[0] == 0xfe && length < 9 {
+                            validate_observation_eof(&scratch[..count])?;
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        observation
+                            .first_payload_chunk_micros
+                            .get_or_insert_with(|| started.elapsed().as_micros());
+                    }
+                    first_chunk = false;
+                    row_validator.consume(&scratch[..count], columns)?;
+                    digest.update(&scratch[..count]);
+                    row_bytes += count as u64;
+                    observation.row_payload_bytes += count as u64;
+                    remaining -= count;
+                    if !read_delay.is_zero() {
+                        tokio::time::sleep(read_delay).await;
+                    }
+                }
+                ensure!(
+                    row_bytes <= 1024 * 1024 * 1024,
+                    "logical row exceeds probe bound"
+                );
+                continuation = length == 0x00ff_ffff;
+                if !continuation {
+                    row_validator.finish(columns)?;
+                    row_validator = TextRowValidator::default();
+                    observation
+                        .first_row_micros
+                        .get_or_insert_with(|| started.elapsed().as_micros());
+                    digest.update(row_bytes.to_le_bytes());
+                    committed_digest = digest.clone();
+                    observation.rows += 1;
+                    row_bytes = 0;
+                }
+            }
+        })
+        .await;
+        observation.error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string().chars().take(512).collect()),
+            Err(_) => Some("absolute query deadline exceeded".to_string()),
+        };
+        observation.elapsed_micros = started.elapsed().as_micros();
+        observation.row_sha256 = format!("{:x}", committed_digest.finalize());
+        observation.wire_prefix_sha256 = format!("{:x}", wire_digest.finalize());
+        observation.metadata_sha256 = format!("{:x}", metadata_digest.finalize());
+        observation
+    }
+
+    async fn observation_header(
+        &mut self,
+        expected: &mut u8,
+        observation: &mut TextResultObservation,
+        wire_digest: &mut Sha256,
+    ) -> Result<usize> {
+        let mut header = [0u8; 4];
+        read_observed(&mut self.stream, &mut header, observation, wire_digest).await?;
+        observation.packets += 1;
+        ensure!(header[3] == *expected, "response packet sequence mismatch");
+        *expected = expected.wrapping_add(1);
+        Ok(usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16))
+    }
+
+    async fn observation_metadata_packet(
+        &mut self,
+        expected: &mut u8,
+        observation: &mut TextResultObservation,
+        wire_digest: &mut Sha256,
+    ) -> Result<Vec<u8>> {
+        let length = self
+            .observation_header(expected, observation, wire_digest)
+            .await?;
+        ensure!(length <= 1024 * 1024, "metadata packet exceeds probe bound");
+        let mut payload = vec![0u8; length];
+        read_observed(&mut self.stream, &mut payload, observation, wire_digest).await?;
+        Ok(payload)
+    }
+
     pub async fn connect(user: &str, port: u16, timeout: Duration) -> Result<Self> {
         const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
         const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
@@ -351,6 +535,118 @@ fn mysql_error_text(payload: &[u8]) -> Result<String> {
     Ok(String::from_utf8_lossy(&payload[message_offset..]).into_owned())
 }
 
+async fn read_observed(
+    stream: &mut AsyncTcpStream,
+    mut buffer: &mut [u8],
+    observation: &mut TextResultObservation,
+    wire_digest: &mut Sha256,
+) -> Result<()> {
+    while !buffer.is_empty() {
+        let count = stream.read(buffer).await?;
+        ensure!(count != 0, "truncated server response");
+        observation.wire_bytes += count as u64;
+        wire_digest.update(&buffer[..count]);
+        buffer = &mut buffer[count..];
+    }
+    Ok(())
+}
+
+fn validate_observation_eof(payload: &[u8]) -> Result<()> {
+    ensure!(
+        payload.len() == 5 && payload[0] == 0xfe,
+        "invalid protocol-41 EOF"
+    );
+    let status = u16::from_le_bytes([payload[3], payload[4]]);
+    ensure!(status & 0x0008 == 0, "unexpected additional result set");
+    Ok(())
+}
+
+#[derive(Default)]
+struct TextRowValidator {
+    cells: u64,
+    remaining: u64,
+    prefix_bytes: usize,
+    prefix_offset: usize,
+    prefix_value: u64,
+}
+
+impl TextRowValidator {
+    fn consume(&mut self, mut bytes: &[u8], columns: u64) -> Result<()> {
+        while !bytes.is_empty() {
+            if self.remaining != 0 {
+                let count = self.remaining.min(bytes.len() as u64) as usize;
+                self.remaining -= count as u64;
+                bytes = &bytes[count..];
+                if self.remaining == 0 {
+                    self.cells += 1;
+                }
+            } else if self.prefix_bytes != 0 {
+                self.prefix_value |= u64::from(bytes[0]) << (8 * self.prefix_offset);
+                self.prefix_offset += 1;
+                self.prefix_bytes -= 1;
+                bytes = &bytes[1..];
+                if self.prefix_bytes == 0 {
+                    ensure!(
+                        self.prefix_value <= 1024 * 1024 * 1024,
+                        "cell exceeds probe bound"
+                    );
+                    self.remaining = self.prefix_value;
+                    if self.remaining == 0 {
+                        self.cells += 1;
+                    }
+                }
+            } else {
+                ensure!(self.cells < columns, "too many text row cells");
+                let first = bytes[0];
+                bytes = &bytes[1..];
+                match first {
+                    0 | 0xfb => self.cells += 1,
+                    1..=250 => self.remaining = u64::from(first),
+                    0xfc..=0xfe => {
+                        self.prefix_bytes = match first {
+                            0xfc => 2,
+                            0xfd => 3,
+                            _ => 8,
+                        };
+                        self.prefix_offset = 0;
+                        self.prefix_value = 0;
+                    }
+                    _ => bail!("invalid text cell length prefix"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self, columns: u64) -> Result<()> {
+        ensure!(
+            self.cells == columns && self.remaining == 0 && self.prefix_bytes == 0,
+            "truncated text row or column-count mismatch"
+        );
+        Ok(())
+    }
+}
+
+fn error_code(payload: &[u8]) -> u16 {
+    payload
+        .get(1..3)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .unwrap_or(0)
+}
+
+fn decode_column_count(payload: &[u8]) -> Result<u64> {
+    let first = *payload.first().context("empty result header")?;
+    match first {
+        0..=250 if payload.len() == 1 => Ok(u64::from(first)),
+        0xfc if payload.len() == 3 => Ok(u64::from(u16::from_le_bytes([payload[1], payload[2]]))),
+        0xfd if payload.len() == 4 => Ok(u64::from(payload[1])
+            | (u64::from(payload[2]) << 8)
+            | (u64::from(payload[3]) << 16)),
+        0xfe if payload.len() == 9 => Ok(u64::from_le_bytes(payload[1..9].try_into()?)),
+        _ => bail!("invalid column-count encoding"),
+    }
+}
+
 fn is_mysql_result_terminator(payload: &[u8]) -> bool {
     matches!(payload.first().copied(), Some(0xfe) if payload.len() < 9)
         || payload.first().copied() == Some(0)
@@ -441,7 +737,133 @@ async fn write_packet_async(
 
 #[cfg(test)]
 mod tests {
-    use super::mysql_error_text;
+    use super::{AsyncMysqlStream, mysql_error_text, read_wire_packet_async, write_packet_async};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn observation_counts_empty_first_cells_and_wrapped_sequences() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.expect("accept");
+            let timeout = Duration::from_secs(2);
+            read_wire_packet_async(&mut peer, timeout)
+                .await
+                .expect("query");
+            for (sequence, payload) in [(1, &[1][..]), (2, &[3][..]), (3, &[0xfe, 0, 0, 0, 0][..])]
+            {
+                write_packet_async(&mut peer, sequence, payload, timeout)
+                    .await
+                    .expect("metadata");
+            }
+            for row in 0..260u16 {
+                write_packet_async(&mut peer, (4 + row) as u8, &[0], timeout)
+                    .await
+                    .expect("empty cell row");
+            }
+            write_packet_async(&mut peer, 8, &[0xfe, 0, 0, 0, 0], timeout)
+                .await
+                .expect("EOF");
+        });
+        let observation = AsyncMysqlStream {
+            stream: client,
+            timeout: Duration::from_secs(2),
+        }
+        .observe_text_query("SELECT ''", Duration::ZERO)
+        .await;
+        peer.await.expect("peer");
+        assert_eq!(observation.error, None);
+        assert_eq!(observation.rows, 260);
+        assert_eq!(observation.row_payload_bytes, 260);
+        assert_eq!(observation.packets, 264);
+    }
+
+    #[tokio::test]
+    async fn observation_hashes_u24_continuations_without_row_assembly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.expect("accept");
+            let timeout = Duration::from_secs(5);
+            read_wire_packet_async(&mut peer, timeout)
+                .await
+                .expect("query");
+            for (sequence, payload) in [(1, &[1][..]), (2, &[3][..]), (3, &[0xfe, 0, 0, 0, 0][..])]
+            {
+                write_packet_async(&mut peer, sequence, payload, timeout)
+                    .await
+                    .expect("metadata");
+            }
+            peer.write_all(&[255, 255, 255, 4])
+                .await
+                .expect("U24 header");
+            let scratch = [7u8; 65536];
+            peer.write_all(&[0xfe]).await.expect("cell marker");
+            peer.write_all(&(0x00ff_ffffu64 - 9).to_le_bytes())
+                .await
+                .expect("cell length");
+            let mut remaining = 0x00ff_ffff - 9;
+            while remaining != 0 {
+                let count = remaining.min(scratch.len());
+                peer.write_all(&scratch[..count])
+                    .await
+                    .expect("bounded slice");
+                remaining -= count;
+            }
+            write_packet_async(&mut peer, 5, &[], timeout)
+                .await
+                .expect("zero terminal");
+            write_packet_async(&mut peer, 6, &[0xfe, 0, 0, 0, 0], timeout)
+                .await
+                .expect("EOF");
+        });
+        let observation = AsyncMysqlStream {
+            stream: client,
+            timeout: Duration::from_secs(5),
+        }
+        .observe_text_query("SELECT large_value", Duration::ZERO)
+        .await;
+        peer.await.expect("peer");
+        assert_eq!(observation.error, None);
+        assert_eq!(observation.rows, 1);
+        assert_eq!(observation.row_payload_bytes, 0x00ff_ffff);
+    }
+
+    #[tokio::test]
+    async fn observation_retains_truncated_response_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.expect("accept");
+            read_wire_packet_async(&mut peer, Duration::from_secs(2))
+                .await
+                .expect("query");
+            peer.write_all(&[1, 0, 0, 1]).await.expect("header");
+        });
+        let observation = AsyncMysqlStream {
+            stream: client,
+            timeout: Duration::from_secs(2),
+        }
+        .observe_text_query("SELECT 1", Duration::ZERO)
+        .await;
+        peer.await.expect("peer");
+        assert!(observation.error.is_some());
+        assert_eq!(observation.wire_bytes, 4);
+        assert_eq!(observation.rows, 0);
+    }
 
     #[test]
     fn mysql_error_text_reads_sqlstate_and_plain_packets() {

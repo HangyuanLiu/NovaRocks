@@ -23,6 +23,7 @@ mod preparation_capacity;
 mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
+mod result_delivery_baseline;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;
@@ -42,6 +43,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(uea1_performance::scenarios());
+    scenarios.extend(result_delivery_baseline::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(uea4_range_reads::scenarios());
     scenarios.extend(uea4_rss_baselines::scenarios());

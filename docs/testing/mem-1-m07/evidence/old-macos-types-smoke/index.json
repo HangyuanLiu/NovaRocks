@@ -1,0 +1,142 @@
+{
+  "verification": "old-macos-type-smoke-only",
+  "formal_performance_gate": "NOT_RUN",
+  "cases": [
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/date-time.json",
+      "exit_code": 0,
+      "failure_class": null,
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-realization.json": "91c5ca97c336a4f7609363ee6dd3f5eb5cee02f0a522e98d0f3058f4e606d104",
+        "fixture-spec.json": "2b36633181e5337270342d03c28c1da3af8e7c119bcfe1aac47083d308516964",
+        "process-resources.json": "79d0e513552f4d11f438e0f32ce3f1b2a4ef25afa53dcd9c790bd3083deaaeb5",
+        "raw-artifact-inventory.json": "97d932101545cab75a4a30befbd25c9bef627f5d51e2a17e383c4c3e3607bdf3",
+        "run-completion.json": "c7fef6246eddd72528955518823411e5c534fd74df072f4dec8b2fde0af49b6b",
+        "run-manifest.json": "26e1e18deff4664a8bd65f75e01aa7ab087d924bb954f6e5930a83cc5966f440",
+        "scenario-evidence.json": "4ff7e6184dade5397d9ed2ce465ba0d81f585e3f1c5f886403bcececf94cca5c",
+        "uea1-performance.json": "aec1dc55c1751058ef7c6163629490abec9ec059ddd76e104d8b8bd895269981",
+        "workload-manifest.json": "000a969d1b670286adbc6e9ef7c41c5b76bdc4dfd1ed7004a1f5bc126eb97ec7"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/decimal.json",
+      "exit_code": 0,
+      "failure_class": null,
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-realization.json": "91c5ca97c336a4f7609363ee6dd3f5eb5cee02f0a522e98d0f3058f4e606d104",
+        "fixture-spec.json": "4aab03781aa815752f03f7780bde09ea2f826ae2c7b084a7847266ee6b7e7f46",
+        "process-resources.json": "b90948109f113f52981ee7d1edcd3f24d2866bae94bc7547bf120e4ed7f41a60",
+        "raw-artifact-inventory.json": "97d932101545cab75a4a30befbd25c9bef627f5d51e2a17e383c4c3e3607bdf3",
+        "run-completion.json": "28b7e19f76969f34f162e592692ea4a7d9fde1d5579fe340358e70958fcbeb24",
+        "run-manifest.json": "6babcce1b7fe68467a1b1c09ec021e65f322cd73bd7a0435b051f14cc75dabb7",
+        "scenario-evidence.json": "2e500a38a93ec4113dc70fe0c1d6f9a116e1f74999160f32a554eff9d525401d",
+        "uea1-performance.json": "2ffc841735eba76147fe6bbf2eeb70a389253491c185b63bc5672fdb3538fd9f",
+        "workload-manifest.json": "f1198f5b437bfb46b37aec14169a528c3c78ed27a5e2fd7c8d16d07fa08a63e4"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/explain-count.json",
+      "exit_code": 1,
+      "failure_class": "controller_requires_preparation_events_for_local_path",
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-spec.json": "ed22c5598f753185be2576f80a11c037d93ebd550704c387b35a5332e4978c4b",
+        "process-resources.json": "45e597f16c314ccc46384c9a895f5cfd74bf70fbad7f1b63f318ed8e4cf2a069",
+        "run-manifest.json": "b6037258b7e91d1bd8a0a947f8f8437a15b71849c014a1647f0089e42ad80f7f",
+        "scenario-evidence.json": "72967a00947cee73e6f252345195d707f1fe52caaf73c08abfdecc07141550c7",
+        "workload-manifest.json": "4fb7d30a7bcd9c68b7f37a19b0bcb9c1f6d6dadc33dab12ebcb8b56653116d7a"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/float.json",
+      "exit_code": 0,
+      "failure_class": null,
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-realization.json": "91c5ca97c336a4f7609363ee6dd3f5eb5cee02f0a522e98d0f3058f4e606d104",
+        "fixture-spec.json": "e8c575a401ff2e4ee78a6fc4fb076501fe2157a89fbef39d4c38acf88ba55fa2",
+        "process-resources.json": "b906a1330c2207ba770c74882635692da90c667664f3c944ca68f44ca46d6f63",
+        "raw-artifact-inventory.json": "97d932101545cab75a4a30befbd25c9bef627f5d51e2a17e383c4c3e3607bdf3",
+        "run-completion.json": "85e59879d2e9c34a29d0427952b9afb89c70fb496ff995aa20935b36cd49fe9a",
+        "run-manifest.json": "91cfe7279d269d084815a90cbe2e756b5b0c35223c308d464539352eff8ee9ac",
+        "scenario-evidence.json": "06ee31b36c3ce0128e0a4dfd1f372a5be08425a9865a1c3f1b76f4e710f88fd3",
+        "uea1-performance.json": "bef92b8f5b8c37a907fd6b29428abd7d661b67a0f6784883e7a3e6262db9b1d3",
+        "workload-manifest.json": "d4365f14e4df9fb64c0f6382e63480ca6a24644cb269ea86043af59bacec6529"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/integer.json",
+      "exit_code": 0,
+      "failure_class": null,
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-realization.json": "91c5ca97c336a4f7609363ee6dd3f5eb5cee02f0a522e98d0f3058f4e606d104",
+        "fixture-spec.json": "fce7bbb3b0c933a9a5c04e1346463761a919450705ea8d362631fefaa9abdacf",
+        "process-resources.json": "25a795ffd89f9306e499b598972b186a22184c280031bcca7cfcfb9d1821df73",
+        "raw-artifact-inventory.json": "97d932101545cab75a4a30befbd25c9bef627f5d51e2a17e383c4c3e3607bdf3",
+        "run-completion.json": "155783e580059a38da815c56b85498085d7c36c3cb348deaac8297daf1472752",
+        "run-manifest.json": "3958165601ce77d3db59b43dd756aea9fc2462b90b59d515f5522f4cc0894e7e",
+        "scenario-evidence.json": "fac07024965b94f02c9654cb826aa7904767b06f25e6eae1b30497c8dc01e146",
+        "uea1-performance.json": "4d09f37a0141cdf44dd1ad0a11a3268e0ec291c5ddf94839a422fcda3350bb8c",
+        "workload-manifest.json": "603e87452735a2c05146cafc43247c82080cbd398030846d2235f0a8260cc6d8"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/local-show.json",
+      "exit_code": 1,
+      "failure_class": "controller_requires_preparation_events_for_local_path",
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-spec.json": "11430731e2cc122bd95773f070d1d6655024676d3992081f8bca919f883d7eee",
+        "process-resources.json": "70a12c45532b703a0b7f3278cd5504481f248c4b13541ff607e49fb90645839b",
+        "run-manifest.json": "847853ba4e89538b4c8b2d9696ec5e46c950a3775d5fcc85693f1b9c04449c68",
+        "scenario-evidence.json": "6c7cf009dace273f0c346ba6c0f7eb317bd77ee4e24efafd82fcb76ae3c27cb2",
+        "workload-manifest.json": "da7326b77f2c9f758b1fe7df2f28b72d06e4f0c0e14d7c849381ba583d7185e6"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/nested.json",
+      "exit_code": 0,
+      "failure_class": null,
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-realization.json": "91c5ca97c336a4f7609363ee6dd3f5eb5cee02f0a522e98d0f3058f4e606d104",
+        "fixture-spec.json": "ad895ae60a1f521c8875e9abbc0c2264ad9ad6d656eeb1cf2a6f5e0a46385142",
+        "process-resources.json": "d5d2c6c1af3a94813a48b61ff065ebd501e88fb1058be8c05a0486a1c39b3860",
+        "raw-artifact-inventory.json": "97d932101545cab75a4a30befbd25c9bef627f5d51e2a17e383c4c3e3607bdf3",
+        "run-completion.json": "6007fd377e68871fcf292b4d283a1ad3685703c7c01422faae77cb220805f0b7",
+        "run-manifest.json": "a75ef54f7e3a5fba87a1739d05c140da747921d9f606e7f5078c8eae0c24eeac",
+        "scenario-evidence.json": "b4894b4a5ab6e5585aeb1bee2ba0069abc1b28a1ac3632a0e3d01e9cb63a5f57",
+        "uea1-performance.json": "28b10caee8ce753b19af040b19591fd0b6f999497a5184f7b548c77b180b4969",
+        "workload-manifest.json": "4d4e0e9b16cce32818a3ecc8b8e80a28dd64d74499316cdb5dc0844574fdde5d"
+      }
+    },
+    {
+      "input": "docs/testing/mem-1-m07/inputs/old-macos-type-smoke/wide.json",
+      "exit_code": 0,
+      "failure_class": null,
+      "artifacts": {
+        "descriptor.json": "0bff0e4865f998c9f4a83a533a6343f1b6e2b538a6311243d81422e98bb89c0a",
+        "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361",
+        "fixture-realization.json": "91c5ca97c336a4f7609363ee6dd3f5eb5cee02f0a522e98d0f3058f4e606d104",
+        "fixture-spec.json": "e0d1ec4eccfd7df6eea5613effa98fc8c40a2fbee8240b40d20a31618e77cadd",
+        "process-resources.json": "e8d10322b16f30932a6d170e10abe9d7143a78452b3f9082ea6c6433fe59bdd2",
+        "raw-artifact-inventory.json": "97d932101545cab75a4a30befbd25c9bef627f5d51e2a17e383c4c3e3607bdf3",
+        "run-completion.json": "7776f6db445910424c2788e058107e247d62ff27d19343a60a78ab5f607bd84a",
+        "run-manifest.json": "cde3f2d2d5ceb07f44950003334817065a46f946a7dbd2bdc127e8fd4d5c7767",
+        "scenario-evidence.json": "7fe6732d84640b1be52d904c348e47aab682f5aa0b647d21c91e4b077d54f457",
+        "uea1-performance.json": "6b97e4c74894694aa9f6dc77739c69c230f1e2415c324820fce9305a5dd165c4",
+        "workload-manifest.json": "f823f605489c498d26d60e39889f7a39c9f69bfa48a288a8bccf2b3c6877b8c0"
+      }
+    }
+  ]
+}
