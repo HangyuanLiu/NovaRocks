@@ -1,6 +1,6 @@
 # NovaRocks patches to arrow-schema 58.2.0
 
-Upstream source is the exact Cargo registry copy previously pinned in Cargo.lock; the original source revision is in .cargo_vcs_info.json. No existing Arrow schema/type/serialization behavior changes.
+Upstream source is the exact Cargo registry copy previously pinned in Cargo.lock; the original registry source/checksum and unmodified file hashes are in UPSTREAM.json. No existing Arrow schema/type/serialization behavior changes.
 
 ## 1. Clone with caller-owned replacement metadata
 

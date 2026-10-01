@@ -1,6 +1,6 @@
 # NovaRocks patches to arrow-array 58.2.0
 
-Upstream source is the exact Cargo registry copy previously pinned in Cargo.lock; its original source revision is recorded in .cargo_vcs_info.json. No array layout, data type, ownership, validation, encoding, or mutation behavior changes.
+Upstream source is the exact Cargo registry copy previously pinned in Cargo.lock; its original registry source/checksum and unmodified file hashes are in UPSTREAM.json. No array layout, data type, ownership, validation, encoding, or mutation behavior changes.
 
 ## 1. Borrowed column-vector allocation capacity
 

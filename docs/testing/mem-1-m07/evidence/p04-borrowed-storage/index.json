@@ -1,0 +1,53 @@
+{
+  "parent": "451e7c270",
+  "scope": "storage-only borrowed oracle; source/schema ownership proof and Native producer pending",
+  "logs": [
+    {
+      "name": "check",
+      "raw_sha256": "891e93b74adce62dde95ac336d7cfcaa90d76c466e775b2c57f374432fec0ca7",
+      "file": "check.log.gz"
+    },
+    {
+      "name": "test",
+      "raw_sha256": "328dce0fc686a754193da1b063ffb37d207fa8dc365fff9b7744dfb3f126aa16",
+      "file": "test.log.gz"
+    },
+    {
+      "name": "test-final",
+      "raw_sha256": "50dfe53d79257d14a7b4686e65f4a73bad8bfd2b96c3dd59c2253ca25121bb67",
+      "file": "test-final.log.gz"
+    },
+    {
+      "name": "test-boundaries",
+      "raw_sha256": "9c063daaf033e3255d436803980d43aacf97e2165e1a26596f873d0f4de64b9b",
+      "file": "test-boundaries.log.gz"
+    },
+    {
+      "name": "tests",
+      "raw_sha256": "24f02cb31aeced5c0ecc81aa225566f1bbe8a28f6e9720e7c27958911ad54252",
+      "file": "tests.log.gz"
+    },
+    {
+      "name": "clippy",
+      "raw_sha256": "f6fec4427263d672bde3dc078479beab2dfc0623e88f61d9ada76c946cb406b8",
+      "file": "clippy.log.gz"
+    },
+    {
+      "name": "native-check",
+      "raw_sha256": "51bbc114ffa135f1cc598dd595e9d51d1a890b745a112d00db964149b6958aa4",
+      "file": "native-check.log.gz"
+    },
+    {
+      "name": "original",
+      "raw_sha256": "3de0c736680640c250c98aa9571f6f15ede8c23d9e39df0ecf1b26dda157ec8f",
+      "file": "original.log.gz"
+    }
+  ],
+  "sources": {
+    "novarocks/execution/src/exec/chunk/root_array_storage.rs": "82517a43af7996845c4f1fabd998242ba75af2d9e15a67e1f09ae3207b34dc6b",
+    "novarocks/execution/src/exec/chunk/mod.rs": "5f6ee4efd02058214a158f0a420e090d3083ec33ce236472719cd5399f420c68",
+    "novarocks/execution/tests/root_capacity_introspection.rs": "b09a52b2e046737b99ff4860d4e5294e6a1abfa3690981df6a7092f29763e88d",
+    "vendor/arrow-buffer-58.2.0/src/bytes.rs": "ca66d7ebeb54fee6f59b26af6620214eeb10621078d1226353cc19d9430707e1",
+    "vendor/arrow-buffer-58.2.0/src/buffer/immutable.rs": "5b6187aad9713aa602880d8723a123ddff0ef7fc908a99aee131333e8fb5009c"
+  }
+}

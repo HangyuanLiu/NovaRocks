@@ -18,6 +18,7 @@
 mod chunk_impl;
 mod hydrate;
 mod memory;
+mod root_array_storage;
 mod schema;
 mod slot_layout;
 #[cfg(test)]
@@ -30,6 +31,9 @@ pub use memory::record_batch_bytes;
 pub(crate) use memory::{
     ChunkMemoryLease, TransferredChunkBytes, record_batch_additional_bytes,
     record_batch_shared_owner_bytes,
+};
+pub use root_array_storage::{
+    RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
 };
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 pub use slot_layout::SlotLayout;

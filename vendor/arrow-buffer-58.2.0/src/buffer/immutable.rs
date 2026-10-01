@@ -210,6 +210,14 @@ impl Buffer {
         self.data.standard_allocation_capacity()
     }
 
+    /// Fixed metadata retained by an unpooled standard owner. This excludes
+    /// the allocation region returned by `standard_allocation_capacity()`.
+    /// Pool reservations and custom deallocators need an explicit source proof
+    /// and return None, without calling their opaque owner or locking it.
+    pub fn standard_owner_metadata_size(&self) -> Option<usize> {
+        self.data.standard_owner_metadata_size()
+    }
+
     /// Tries to shrink the capacity of the buffer as much as possible, freeing unused memory.
     ///
     /// If the buffer is shared, this is a no-op.

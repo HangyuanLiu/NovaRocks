@@ -113,6 +113,27 @@ impl Bytes {
         }
     }
 
+    /// Complete fixed metadata of an unpooled standard owner, including a
+    /// conservative Arc layout/alignment allowance. A pool reservation or
+    /// custom deallocator can retain additional opaque owners.
+    pub(crate) fn standard_owner_metadata_size(&self) -> Option<usize> {
+        #[cfg(feature = "pool")]
+        {
+            None
+        }
+        #[cfg(not(feature = "pool"))]
+        {
+            match self.deallocation {
+                Deallocation::Standard(_) => Some(
+                    std::mem::size_of::<Self>()
+                        + 3 * std::mem::size_of::<usize>()
+                        + std::mem::align_of::<Self>(),
+                ),
+                Deallocation::Custom(..) => None,
+            }
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         match self.deallocation {
             Deallocation::Standard(layout) => layout.size(),

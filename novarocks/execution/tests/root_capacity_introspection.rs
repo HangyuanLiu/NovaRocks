@@ -185,3 +185,291 @@ fn field_replacement_metadata_preserves_exact_dictionary_ipc_properties() {
     assert_eq!(cloned.dict_id(), field.dict_id());
     assert_eq!(cloned.dict_is_ordered(), field.dict_is_ordered());
 }
+
+fn storage_limits(bytes: usize) -> novarocks_execution::exec::chunk::RootArrayStorageLimits {
+    novarocks_execution::exec::chunk::RootArrayStorageLimits {
+        bytes,
+        nodes: 65536,
+        depth: 64,
+    }
+}
+
+#[test]
+fn borrowed_storage_rejects_sliced_away_standard_capacity_without_cell_scan() {
+    use arrow::buffer::ScalarBuffer;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let mut backing = Vec::<i32>::with_capacity(32768);
+    backing.push(42);
+    let capacity = backing.capacity() * std::mem::size_of::<i32>();
+    let array = Int32Array::new(ScalarBuffer::from(backing), None).slice(0, 1);
+    assert_eq!(array.len(), 1);
+    let bytes =
+        no_allocation(|| borrowed_root_array_storage(&array, storage_limits(capacity + 4096)))
+            .unwrap();
+    assert!(bytes >= capacity);
+    assert_eq!(
+        no_allocation(|| { borrowed_root_array_storage(&array, storage_limits(capacity - 1)) }),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+}
+
+#[test]
+fn borrowed_storage_rejects_unknown_custom_buffer_without_copy_or_hydration() {
+    use arrow::buffer::ScalarBuffer;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let mut backing = Vec::<i32>::with_capacity(32768);
+    backing.push(42);
+    let pointer = NonNull::new(backing.as_mut_ptr().cast::<u8>()).unwrap();
+    let owner = Arc::new(backing);
+    let weak = Arc::downgrade(&owner);
+    // SAFETY: The owner retains the initialized aligned i32 value and all
+    // backing until the final array/buffer alias exits.
+    let buffer = unsafe { Buffer::from_custom_allocation(pointer, 4, owner) };
+    let array = Int32Array::new(ScalarBuffer::new(buffer, 0, 1), None);
+    assert_eq!(
+        no_allocation(|| { borrowed_root_array_storage(&array, storage_limits(96 * 1024 * 1024)) }),
+        Err(RootArrayStorageError::UnknownBufferOwner)
+    );
+    assert!(weak.upgrade().is_some());
+    drop(array);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn dictionary_storage_includes_unreferenced_complete_values_backing() {
+    use arrow::array::{DictionaryArray, StringArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Int32Type;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let mut backing = Vec::<u8>::with_capacity(1024 * 1024);
+    backing.extend_from_slice(b"aunused");
+    let capacity = backing.capacity();
+    let values = Arc::new(StringArray::new(
+        OffsetBuffer::new(vec![0_i32, 1, 7].into()),
+        Buffer::from_vec(backing),
+        None,
+    )) as ArrayRef;
+    let dictionary =
+        DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), values).unwrap();
+    let bytes =
+        no_allocation(|| borrowed_root_array_storage(&dictionary, storage_limits(capacity + 4096)))
+            .unwrap();
+    assert!(bytes >= capacity);
+    assert_eq!(
+        no_allocation(|| {
+            borrowed_root_array_storage(&dictionary, storage_limits(capacity - 1))
+        }),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+}
+
+#[test]
+fn borrowed_storage_counts_struct_spare_and_stops_at_finite_work() {
+    use novarocks_execution::exec::chunk::{
+        RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
+    };
+    let mut columns = Vec::with_capacity(8192);
+    columns.push(Arc::new(Int32Array::from(vec![1])) as ArrayRef);
+    let spare_bytes = columns.capacity() * std::mem::size_of::<ArrayRef>();
+    let structure = StructArray::try_new(
+        vec![Arc::new(Field::new("v", DataType::Int32, false))].into(),
+        columns,
+        None,
+    )
+    .unwrap();
+    let bytes = no_allocation(|| {
+        borrowed_root_array_storage(&structure, storage_limits(spare_bytes + 4096))
+    })
+    .unwrap();
+    assert!(bytes >= spare_bytes);
+    for (nodes, depth) in [(1, 64), (65536, 0)] {
+        assert_eq!(
+            no_allocation(|| {
+                borrowed_root_array_storage(
+                    &structure,
+                    RootArrayStorageLimits {
+                        bytes: spare_bytes + 4096,
+                        nodes,
+                        depth,
+                    },
+                )
+            }),
+            Err(RootArrayStorageError::WorkExceeded)
+        );
+    }
+}
+
+#[test]
+fn borrowed_storage_includes_list_child_and_sliced_null_backing() {
+    use arrow::array::ListArray;
+    use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+    use novarocks_execution::exec::chunk::borrowed_root_array_storage;
+    let mut values = Vec::<i32>::with_capacity(8192);
+    values.push(5);
+    let values_capacity = values.capacity() * std::mem::size_of::<i32>();
+    let mut validity = Vec::<u8>::with_capacity(8192);
+    validity.push(0xff);
+    let null_capacity = validity.capacity();
+    let nulls = NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(validity), 0, 1));
+    let values = Arc::new(Int32Array::new(ScalarBuffer::from(values), Some(nulls))) as ArrayRef;
+    let list = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        OffsetBuffer::new(vec![0_i32, 1].into()),
+        values,
+        None,
+    )
+    .unwrap();
+    let bytes = no_allocation(|| {
+        borrowed_root_array_storage(
+            &list,
+            storage_limits(values_capacity + null_capacity + 4096),
+        )
+    })
+    .unwrap();
+    assert!(bytes >= values_capacity + null_capacity);
+}
+
+#[test]
+fn storage_inspection_does_not_accept_unclosed_view_carriers() {
+    use arrow::array::StringViewArray;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let view = StringViewArray::from(vec!["value"]);
+    assert_eq!(
+        no_allocation(|| { borrowed_root_array_storage(&view, storage_limits(96 * 1024 * 1024)) }),
+        Err(RootArrayStorageError::UnsupportedCarrier)
+    );
+}
+
+#[test]
+fn physical_map_entries_do_not_spend_an_extra_semantic_depth_level() {
+    use arrow::array::{Array, MapArray};
+    use arrow::buffer::OffsetBuffer;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let mut child = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
+    for _ in 0..64 {
+        let fields = vec![
+            Arc::new(Field::new("key", DataType::Int32, false)),
+            Arc::new(Field::new("value", child.data_type().clone(), false)),
+        ]
+        .into();
+        let entries = StructArray::try_new(
+            fields,
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef, child],
+            None,
+        )
+        .unwrap();
+        child = Arc::new(
+            MapArray::try_new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::new(vec![0_i32, 1].into()),
+                entries,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+    }
+    let bytes =
+        no_allocation(|| borrowed_root_array_storage(child.as_ref(), storage_limits(1024 * 1024)))
+            .expect("64 legal semantic Map levels");
+    assert!(bytes > 0);
+    let mut limits = storage_limits(1024 * 1024);
+    limits.depth = 63;
+    assert_eq!(
+        no_allocation(|| borrowed_root_array_storage(child.as_ref(), limits)),
+        Err(RootArrayStorageError::WorkExceeded)
+    );
+}
+
+#[test]
+fn dictionary_physical_keys_do_not_spend_the_last_list_semantic_level() {
+    use arrow::array::{DictionaryArray, ListArray, StringArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Int32Type;
+    use novarocks_execution::exec::chunk::borrowed_root_array_storage;
+    let mut child = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0]),
+            Arc::new(StringArray::from(vec!["value"])),
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    for _ in 0..64 {
+        child = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new("item", child.data_type().clone(), false)),
+                OffsetBuffer::new(vec![0_i32, 1].into()),
+                child,
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    no_allocation(|| borrowed_root_array_storage(child.as_ref(), storage_limits(1024 * 1024)))
+        .expect("dictionary leaf at semantic depth 64");
+}
+
+#[test]
+fn forwarded_as_any_cannot_hide_the_actual_outer_owner() {
+    use arrow::array::Array;
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let inner = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
+    // Arrow's ArrayRef trait implementation forwards as_any to the concrete
+    // array, but this borrowed wrapper is a distinct outer object. Callers
+    // must inspect inner.as_ref(), or supply an explicit source-owner proof.
+    let wrapper = &inner as &dyn Array;
+    assert_eq!(
+        no_allocation(|| borrowed_root_array_storage(wrapper, storage_limits(4096))),
+        Err(RootArrayStorageError::UnsupportedCarrier)
+    );
+    no_allocation(|| borrowed_root_array_storage(inner.as_ref(), storage_limits(4096))).unwrap();
+}
+
+#[test]
+fn caller_cannot_relax_the_frozen_structural_work_ceiling() {
+    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    let array = Int32Array::from(vec![1]);
+    let mut limits = storage_limits(4096);
+    limits.nodes = 0;
+    assert_eq!(
+        no_allocation(|| borrowed_root_array_storage(&array, limits)),
+        Err(RootArrayStorageError::WorkExceeded)
+    );
+    // Array aliases stay alive; the fixed maximum prevents repeated references
+    // from turning a single root inspection into unbounded structural work.
+    let count = 2 * novarocks_result_contract::RootProfileV1::SCHEMA_TYPE_NODES;
+    let children = vec![Arc::new(array) as ArrayRef; count];
+    let fields = (0..count)
+        .map(|_| Arc::new(Field::new("", DataType::Int32, false)))
+        .collect::<Vec<_>>()
+        .into();
+    let structure = StructArray::try_new(fields, children, None).unwrap();
+    limits.bytes = usize::MAX;
+    limits.nodes = usize::MAX;
+    limits.depth = usize::MAX;
+    assert_eq!(
+        no_allocation(|| borrowed_root_array_storage(&structure, limits)),
+        Err(RootArrayStorageError::WorkExceeded)
+    );
+}
+
+#[test]
+fn standard_owner_metadata_descriptor_is_borrowed_and_custom_is_unknown() {
+    let buffer = Buffer::from_vec(vec![1_u8]);
+    let metadata = no_allocation(|| buffer.standard_owner_metadata_size()).unwrap();
+    assert!(metadata > 0);
+    assert_eq!(
+        no_allocation(|| buffer.slice(0).standard_owner_metadata_size()),
+        Some(metadata)
+    );
+    let mut backing = Vec::<u8>::with_capacity(8192);
+    backing.push(1);
+    let ptr = NonNull::new(backing.as_mut_ptr()).unwrap();
+    // SAFETY: The owner retains the initialized declared region and the larger
+    // whole backing for the complete custom buffer lifetime.
+    let custom = unsafe { Buffer::from_custom_allocation(ptr, 1, Arc::new(backing)) };
+    assert_eq!(
+        no_allocation(|| custom.standard_owner_metadata_size()),
+        None
+    );
+}
