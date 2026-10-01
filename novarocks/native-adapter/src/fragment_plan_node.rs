@@ -2206,6 +2206,17 @@ fn project_output_plan(
     path: FieldPath,
 ) -> Result<ProjectOutputPlan, NativeFragmentDecodeError> {
     let decoded = (|| -> Result<ProjectOutputPlan, NativeFragmentLeafDecodeError> {
+        novarocks_plan_codec::native_type::preflight_native_field_types(project.items.iter().map(
+            |item| {
+                (
+                    item.output_name.as_str(),
+                    item.expr.as_ref().and_then(|expr| expr.r#type.as_ref()),
+                )
+            },
+        ))
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::Capacity, "items", error)
+        })?;
         let item_outputs = project
             .items
             .iter()
@@ -2272,12 +2283,16 @@ fn project_output_plan(
                 computed_item_indices.push(item.item_index);
                 let compute_slot_id = SlotId::new(compute_column_id);
                 computed_slot_ids.push(compute_slot_id);
-                computed_slot_schemas.push(ChunkSlotSchema::new_with_field(
-                    compute_slot_id,
-                    item.field.clone(),
-                    Some(item.field_schema.clone()),
-                    None,
-                ));
+                computed_slot_schemas.push(
+                    ChunkSlotSchema::try_new_with_metadata_origins(
+                        compute_slot_id,
+                        Arc::clone(item.field.field()),
+                        item.field.metadata_origins().clone(),
+                        Some(item.field_schema.clone()),
+                        None,
+                    )
+                    .map_err(project_synthetic_id_error)?,
+                );
                 (computed_idx, false)
             };
 
@@ -2291,12 +2306,16 @@ fn project_output_plan(
                 )
                 .map_err(project_synthetic_id_error)?
             };
-            output_slot_schemas.push(ChunkSlotSchema::new_with_field(
-                SlotId::new(output_column_id),
-                item.field,
-                Some(item.field_schema),
-                None,
-            ));
+            output_slot_schemas.push(
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    SlotId::new(output_column_id),
+                    Arc::clone(item.field.field()),
+                    item.field.metadata_origins().clone(),
+                    Some(item.field_schema),
+                    None,
+                )
+                .map_err(project_synthetic_id_error)?,
+            );
             if is_duplicate_compute
                 || computed_idx != output_indices.len()
                 || compute_column_id != output_column_id
@@ -2359,7 +2378,7 @@ struct ProjectItemOutput {
     preferred_compute_column_id: u32,
     output_column_id: u32,
     can_reuse_input_slot: bool,
-    field: Field,
+    field: novarocks_plan_codec::native_type::OwnedNativeField,
     field_schema: ChunkFieldSchema,
 }
 
@@ -2375,7 +2394,7 @@ fn project_item_output(
         .append_index(idx)
         .append_field("expr")
     })?;
-    let r#type = expr.r#type.clone().ok_or_else(|| {
+    let r#type = expr.r#type.as_ref().ok_or_else(|| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::MissingField,
             "items",
@@ -2391,13 +2410,13 @@ fn project_item_output(
             .append_field("expr")
             .append_field("type")
     };
-    let field = novarocks_plan_codec::native_type::decode_field_type(
+    let field = novarocks_plan_codec::native_type::decode_field_type_owned(
         &item.output_name,
         expr.nullable,
-        &r#type,
+        r#type,
     )
     .map_err(type_error)?;
-    let field_schema = ChunkFieldSchema::from_field(&field).map_err(type_error)?;
+    let field_schema = ChunkFieldSchema::from_field(field.field()).map_err(type_error)?;
     let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
         Some(expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
         _ => (item.output_column_id, false),

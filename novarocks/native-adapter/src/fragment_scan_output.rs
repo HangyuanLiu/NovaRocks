@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema, SlotLayout};
-use novarocks_plan_codec::native_type::decode_field_type;
+use novarocks_plan_codec::native_type::{decode_field_type_owned, preflight_native_output_fields};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
@@ -50,10 +50,16 @@ impl ProvenancedOutputColumn {
                 format!("ScanNode column {} type missing", column.name),
             )
         })?;
-        let field = decode_field_type(&column.name, column.nullable, type_desc)
+        let field = decode_field_type_owned(&column.name, column.nullable, type_desc)
             .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
-        let slot_schema = ChunkSlotSchema::from_field(SlotId::new(column.column_id), &field, None)
-            .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
+        let slot_schema = ChunkSlotSchema::try_new_with_metadata_origins(
+            SlotId::new(column.column_id),
+            Arc::clone(field.field()),
+            field.metadata_origins().clone(),
+            None,
+            None,
+        )
+        .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
         Ok(Self {
             column,
             source_path,
@@ -122,6 +128,31 @@ pub fn decode_scan_output_columns(
         return Err(NativeFragmentDecodeError::missing(
             scan_path.field("columns"),
             "ScanNode columns are empty",
+        ));
+    }
+    preflight_native_output_fields(&scan.columns).map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(scan_path.clone().field("columns"), error)
+    })?;
+    if scan.required_columns.len() > 65536
+        || scan.required_columns.iter().any(|name| name.len() > 65536)
+    {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            scan_path.clone().field("required_columns"),
+            "ScanNode required columns exceed the source profile",
+        ));
+    }
+    let required_name_bytes = scan
+        .required_columns
+        .iter()
+        .try_fold(0usize, |bytes, name| {
+            bytes
+                .checked_add(name.len())
+                .filter(|bytes| *bytes <= 96 * 1024 * 1024)
+        });
+    if required_name_bytes.is_none() {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            scan_path.clone().field("required_columns"),
+            "ScanNode required column names exceed the source profile",
         ));
     }
     let required = (!scan.required_columns.is_empty()).then(|| {

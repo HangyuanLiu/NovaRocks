@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, new_empty_array};
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::DataType;
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::dict_peel::{
@@ -45,40 +45,64 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
-fn projected_field_from_existing(
-    existing: &Field,
-    data_type: &arrow::datatypes::DataType,
-) -> Field {
-    Field::new(existing.name(), data_type.clone(), existing.is_nullable())
-        .with_metadata(existing.metadata().clone())
-}
-
-fn field_from_slot_schema(slot_schema: &ChunkSlotSchema, data_type: &DataType) -> Field {
-    Field::new(
-        slot_schema.name(),
-        data_type.clone(),
-        slot_schema.nullable(),
-    )
-    .with_metadata(slot_schema.field().metadata().clone())
-}
-
-fn with_nullable_preserving_metadata(field: &Field, nullable: bool) -> Field {
-    Field::new(field.name(), field.data_type().clone(), nullable)
-        .with_metadata(field.metadata().clone())
-}
-
-fn projected_slot_schema_from_existing(
+fn projected_slot_schema(
     existing: &ChunkSlotSchema,
     slot_id: SlotId,
-    field: &Field,
-) -> ChunkSlotSchema {
-    existing
-        .with_field_and_slot_id(slot_id, field.clone())
-        .unwrap_or_else(|e| panic!("{e}"))
+    data_type: &DataType,
+    actual_nullable: bool,
+) -> Result<ChunkSlotSchema, String> {
+    let derived = if existing.metadata_origins().is_some()
+        && crate::exec::chunk::type_compatibility::check_exact(existing.data_type(), data_type)
+            .is_ok()
+    {
+        existing.reconcile_to_carrier(data_type, actual_nullable)?
+    } else {
+        existing
+            .with_type_and_nullable(data_type.clone(), existing.nullable() || actual_nullable)?
+    };
+    derived.with_slot_id(slot_id)
 }
 
-fn synthetic_slot_schema(slot_id: SlotId, field: &Field) -> ChunkSlotSchema {
-    ChunkSlotSchema::new_with_field(slot_id, field.clone(), None, None)
+fn synthetic_slot_schema(
+    slot_id: SlotId,
+    name: String,
+    data_type: &DataType,
+) -> Result<ChunkSlotSchema, String> {
+    use novarocks_types::arrow_metadata_owner::{
+        ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+    };
+    let owner = ArrowMetadataOwner::try_new(
+        Vec::new(),
+        MetadataOwnerLimits {
+            entries: 0,
+            construction_bytes: 0,
+        },
+    )
+    .map_err(|_| "project synthetic field metadata construction failed")?
+    .into_field(name, data_type.clone(), true);
+    let field = Arc::clone(owner.field());
+    let origins = FieldMetadataOrigins::try_new(vec![owner], 1)
+        .map_err(|_| "project synthetic metadata origin construction failed")?;
+    if let Ok(scoped) = origins.for_field_tree(&field, 65536, 64) {
+        ChunkSlotSchema::try_new_with_metadata_origins(slot_id, field, scoped, None, None)
+    } else {
+        ChunkSlotSchema::try_new_with_field_ref(slot_id, field, None, None)
+    }
+}
+
+fn projected_chunk_schema(
+    slots: Vec<ChunkSlotSchema>,
+    declared: &ChunkSchema,
+) -> Result<ChunkSchemaRef, String> {
+    let schema = if let Some(source) = declared.schema_metadata_origin() {
+        ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else {
+        ChunkSchema::try_new_with_schema_metadata(
+            slots,
+            declared.arrow_schema_ref().metadata().clone(),
+        )?
+    };
+    Ok(Arc::new(schema))
 }
 
 fn cast_project_output_to_slot(
@@ -117,19 +141,15 @@ fn cast_project_output_to_slot(
 fn slots_adjusted_for_actual_nullability(
     slot_schemas: &[ChunkSlotSchema],
     columns: &[ArrayRef],
-) -> Vec<ChunkSlotSchema> {
+) -> Result<Vec<ChunkSlotSchema>, String> {
     slot_schemas
         .iter()
         .zip(columns.iter())
         .map(|(schema, array)| {
-            if !schema.nullable() && array.null_count() > 0 {
-                let nullable_field = with_nullable_preserving_metadata(schema.field(), true);
-                schema
-                    .with_field(nullable_field)
-                    .unwrap_or_else(|_| schema.clone())
-            } else {
-                schema.clone()
-            }
+            schema.with_type_and_nullable(
+                schema.data_type().clone(),
+                schema.nullable() || array.null_count() > 0,
+            )
         })
         .collect()
 }
@@ -369,32 +389,24 @@ impl ProjectProcessorOperator {
                 let mut columns = working_chunk.batch.columns().to_vec();
                 columns[existing_idx] = array;
 
-                let working_schema = working_chunk.batch.schema();
-                let mut fields = working_schema.fields().to_vec();
-                let old_field = working_schema.field(existing_idx);
                 let data_type = computed_columns.last().unwrap().data_type();
                 let preferred_slot_schema = self
                     .declared_slot_schema(*slot_id)
                     .or_else(|| working_chunk.chunk_schema().slot(*slot_id).cloned());
-                let replaced = preferred_slot_schema
-                    .as_ref()
-                    .map(|schema| {
-                        let f = field_from_slot_schema(schema, data_type);
-                        if array_has_nulls && !f.is_nullable() {
-                            with_nullable_preserving_metadata(&f, true)
-                        } else {
-                            f
-                        }
-                    })
-                    .unwrap_or_else(|| projected_field_from_existing(old_field, data_type));
-                fields[existing_idx] = Arc::new(replaced.clone());
+                let replacement = if let Some(schema) = preferred_slot_schema {
+                    projected_slot_schema(&schema, *slot_id, data_type, array_has_nulls)?
+                } else {
+                    synthetic_slot_schema(
+                        *slot_id,
+                        format!("_cse_{}", computed_columns.len() - 1),
+                        data_type,
+                    )?
+                };
                 let mut slot_schemas = slots_adjusted_for_actual_nullability(
                     working_chunk.chunk_schema().slots(),
                     &columns,
-                );
-                slot_schemas[existing_idx] = preferred_slot_schema
-                    .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &replaced))
-                    .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &replaced));
+                )?;
+                slot_schemas[existing_idx] = replacement;
                 working_chunk =
                     Chunk::try_new_with_columns(Self::build_chunk_schema(slot_schemas)?, columns)
                         .map_err(|e| format!("Failed to replace chunk column: {}", e))?;
@@ -405,57 +417,27 @@ impl ProjectProcessorOperator {
             let mut columns = working_chunk.batch.columns().to_vec();
             columns.push(array);
 
-            // Create new schema with appended field
-            let mut fields = working_chunk.batch.schema().fields().to_vec();
             let data_type = computed_columns.last().unwrap().data_type();
-            let declared_slot_schema = self.declared_slot_schema(*slot_id);
-            let field = if let Some(slot_schema) = declared_slot_schema.as_ref() {
-                let f = field_from_slot_schema(slot_schema, data_type);
-                if array_has_nulls && !f.is_nullable() {
-                    with_nullable_preserving_metadata(&f, true)
+            let source_schema = self.declared_slot_schema(*slot_id).or_else(|| {
+                if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
+                    working_chunk.chunk_schema().slot(*source_slot).cloned()
                 } else {
-                    f
+                    None
                 }
-            } else if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
-                if let Some(source_idx) = working_chunk.slot_id_to_index().get(source_slot) {
-                    projected_field_from_existing(
-                        working_chunk.batch.schema().field(*source_idx),
-                        data_type,
-                    )
-                } else {
-                    Field::new(
-                        format!("_cse_{}", computed_columns.len() - 1),
-                        data_type.clone(),
-                        true,
-                    )
-                }
+            });
+            let slot_schema = if let Some(schema) = source_schema {
+                projected_slot_schema(&schema, *slot_id, data_type, array_has_nulls)?
             } else {
-                Field::new(
+                synthetic_slot_schema(
+                    *slot_id,
                     format!("_cse_{}", computed_columns.len() - 1),
-                    data_type.clone(),
-                    true,
-                )
+                    data_type,
+                )?
             };
-            fields.push(Arc::new(field.clone()));
-            let slot_schema = declared_slot_schema
-                .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &field))
-                .or_else(|| {
-                    if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
-                        working_chunk
-                            .chunk_schema()
-                            .slot(*source_slot)
-                            .map(|schema| {
-                                projected_slot_schema_from_existing(schema, *slot_id, &field)
-                            })
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &field));
             let mut slot_schemas = slots_adjusted_for_actual_nullability(
                 working_chunk.chunk_schema().slots(),
                 working_chunk.batch.columns(),
-            );
+            )?;
             slot_schemas.push(slot_schema);
 
             working_chunk =
@@ -491,56 +473,32 @@ impl ProjectProcessorOperator {
         }
 
         let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(final_columns.len());
-        let mut fields: Vec<Field> = Vec::with_capacity(final_columns.len());
-        let working_schema = working_chunk.batch.schema();
-        for (idx, (array, slot_id)) in final_columns
+        let mut slots = Vec::with_capacity(final_columns.len());
+        for (array, slot_id) in final_columns
             .iter()
-            .zip(self.output_chunk_schema.slot_ids().iter())
-            .enumerate()
+            .zip(self.output_chunk_schema.slot_ids())
         {
-            let declared_output_slot_schema = self
+            let declared = self
                 .output_chunk_schema
                 .slot(*slot_id)
-                .cloned()
-                .or_else(|| self.declared_slot_schema(*slot_id));
-            let array =
-                cast_project_output_to_slot(array.clone(), declared_output_slot_schema.as_ref())?;
-            let runtime_nullable = array.null_count() > 0;
-            let base = declared_output_slot_schema
-                .as_ref()
-                .map(|schema| {
-                    let field_data_type = if schema.data_type() == &DataType::Utf8
-                        && is_supported_i32_string_dictionary(array.data_type())
-                    {
-                        array.data_type()
-                    } else {
-                        schema.data_type()
-                    };
-                    let field = field_from_slot_schema(schema, field_data_type);
-                    if runtime_nullable && !field.is_nullable() {
-                        with_nullable_preserving_metadata(&field, true)
-                    } else {
-                        field
-                    }
-                })
-                .or_else(|| {
-                    working_chunk
-                        .slot_id_to_index()
-                        .get(slot_id)
-                        .map(|field_idx| {
-                            projected_field_from_existing(
-                                working_schema.field(*field_idx),
-                                array.data_type(),
-                            )
-                        })
-                })
-                .unwrap_or_else(|| {
-                    Field::new(format!("col_{}", idx), array.data_type().clone(), true)
-                });
-            fields.push(base);
+                .ok_or_else(|| format!("project output slot {slot_id} is missing"))?;
+            let array = cast_project_output_to_slot(Arc::clone(array), Some(declared))?;
+            let field_type = if declared.data_type() == &DataType::Utf8
+                && is_supported_i32_string_dictionary(array.data_type())
+            {
+                array.data_type()
+            } else {
+                declared.data_type()
+            };
+            slots.push(projected_slot_schema(
+                declared,
+                *slot_id,
+                field_type,
+                array.null_count() > 0,
+            )?);
             output_columns.push(array);
         }
-        let output_chunk_schema = Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?);
+        let output_chunk_schema = projected_chunk_schema(slots, &self.output_chunk_schema)?;
 
         Ok(Some(
             Chunk::try_new_with_columns(output_chunk_schema, output_columns)
@@ -574,7 +532,7 @@ impl ProjectProcessorOperator {
             ));
         }
 
-        let mut fields: Vec<Field> = Vec::with_capacity(selected_exprs.len());
+        let mut slots = Vec::with_capacity(selected_exprs.len());
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(selected_exprs.len());
         for (idx, (expr_id, slot_id)) in selected_exprs
             .iter()
@@ -595,17 +553,16 @@ impl ProjectProcessorOperator {
                 .as_ref()
                 .map(|schema| schema.data_type().clone())
                 .unwrap_or(data_type);
-            let field = declared_slot_schema
-                .as_ref()
-                .map(|schema| field_from_slot_schema(schema, &output_data_type))
-                .unwrap_or_else(|| {
-                    Field::new(format!("col_{}", idx), output_data_type.clone(), true)
-                });
-            fields.push(field);
+            let slot = if let Some(schema) = declared_slot_schema {
+                projected_slot_schema(&schema, *slot_id, &output_data_type, false)?
+            } else {
+                synthetic_slot_schema(*slot_id, format!("col_{idx}"), &output_data_type)?
+            };
+            slots.push(slot);
             columns.push(new_empty_array(&output_data_type));
         }
 
-        let output_chunk_schema = Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?);
+        let output_chunk_schema = projected_chunk_schema(slots, &self.output_chunk_schema)?;
         Chunk::try_new_with_columns(output_chunk_schema, columns)
             .map_err(|e| format!("Failed to create empty output batch: {}", e))
     }
@@ -665,6 +622,233 @@ mod tests {
             )])
             .expect("output schema"),
         )
+    }
+
+    #[test]
+    fn generic_project_type_overwrite_has_same_values_with_known_and_unknown_sources() {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let owner = ArrowMetadataOwner::try_new(
+            vec![],
+            MetadataOwnerLimits {
+                entries: 0,
+                construction_bytes: 0,
+            },
+        )
+        .unwrap()
+        .into_field("s17".into(), DataType::Int32, true);
+        let known = ChunkSlotSchema::try_new_with_metadata_origins(
+            SlotId::new(17),
+            Arc::clone(owner.field()),
+            FieldMetadataOrigins::try_new(vec![owner], 1).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let unknown = ChunkSlotSchema::try_new_with_field_ref(
+            SlotId::new(17),
+            Arc::clone(known.field_ref()),
+            None,
+            None,
+        )
+        .unwrap();
+        for original in [known, unknown] {
+            let mut arena = ExprArena::default();
+            let write = arena.push_typed(ExprNode::SlotId(SlotId::new(18)), DataType::Int64);
+            let read = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int64);
+            let schema = Arc::new(
+                ChunkSchema::try_new(vec![
+                    original,
+                    ChunkSlotSchema::new_with_field(
+                        SlotId::new(18),
+                        Field::new("s18", DataType::Int64, true),
+                        None,
+                        None,
+                    ),
+                ])
+                .unwrap(),
+            );
+            let input = Chunk::try_new_with_columns(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int64Array::from(vec![11, 12])),
+                ],
+            )
+            .unwrap();
+            let mut op = ProjectProcessorOperator {
+                name: "PROJECT".into(),
+                arena: Arc::new(arena),
+                exprs: vec![write, read],
+                expr_slot_ids: vec![SlotId::new(17), SlotId::new(19)],
+                expr_slot_schemas: HashMap::new(),
+                output_indices: None,
+                output_chunk_schema: Arc::new(
+                    ChunkSchema::try_new(vec![
+                        ChunkSlotSchema::new_with_field(
+                            SlotId::new(17),
+                            Field::new("s17", DataType::Int64, true),
+                            None,
+                            None,
+                        ),
+                        ChunkSlotSchema::new_with_field(
+                            SlotId::new(19),
+                            Field::new("s19", DataType::Int64, true),
+                            None,
+                            None,
+                        ),
+                    ])
+                    .unwrap(),
+                ),
+                pending_output: None,
+                finishing: false,
+                finished: false,
+            };
+            let output = op.process_one(input).unwrap().unwrap();
+            for column in output.columns() {
+                let column = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(column.values().as_ref(), &[11, 12]);
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_nested_project_source_stays_unknown_without_changing_values() {
+        // A fresh root map does not prove a foreign nested child map.
+        let mut map = HashMap::with_capacity(8192);
+        map.insert("source".into(), "unknown".into());
+        let child = Arc::new(Field::new("child", DataType::Int32, false).with_metadata(map));
+        let data_type = DataType::Struct(vec![Arc::clone(&child)].into());
+        let slot =
+            super::synthetic_slot_schema(SlotId::new(1), "computed".into(), &data_type).unwrap();
+        assert!(slot.metadata_origins().is_none());
+        let array = Arc::new(arrow::array::StructArray::new(
+            vec![Arc::clone(&child)].into(),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+            None,
+        )) as ArrayRef;
+        let chunk = Chunk::try_new_with_columns(
+            Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
+            vec![array],
+        )
+        .unwrap();
+        assert!(chunk.chunk_schema().field_metadata_origins().is_none());
+        let array = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        assert_eq!(
+            array
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        let DataType::Struct(fields) = array.data_type() else {
+            panic!("struct")
+        };
+        assert!(Arc::ptr_eq(&child, &fields[0]));
+    }
+
+    #[test]
+    fn project_runtime_keeps_exact_occurrence_metadata_and_derived_schema_owners() {
+        use novarocks_types::arrow_metadata_owner::{
+            ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+        };
+        let limits = MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        };
+        let field =
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+                .unwrap()
+                .into_field("payload".into(), DataType::Utf8, true);
+        let source_slot = ChunkSlotSchema::try_new_with_metadata_origins(
+            SlotId::new(1),
+            Arc::clone(field.field()),
+            FieldMetadataOrigins::try_new(vec![field], 1).unwrap(),
+            None,
+            Some(17),
+        )
+        .unwrap();
+        let compute = source_slot.with_slot_id(SlotId::new(3)).unwrap();
+        let duplicate = source_slot.with_slot_id(SlotId::new(4)).unwrap();
+        let top =
+            ArrowMetadataOwner::try_new(vec![("schema".into(), "project".into())], limits).unwrap();
+        let output_schema = Arc::new(
+            ChunkSchema::try_new_with_owned_schema_metadata(vec![compute.clone(), duplicate], top)
+                .unwrap(),
+        );
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let mut op = ProjectProcessorOperator {
+            name: "PROJECT".into(),
+            arena: Arc::new(arena),
+            exprs: vec![expr],
+            expr_slot_ids: vec![SlotId::new(3)],
+            expr_slot_schemas: HashMap::from([(SlotId::new(3), compute)]),
+            output_indices: Some(vec![0, 0]),
+            output_chunk_schema: Arc::clone(&output_schema),
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        };
+        let input_schema = Arc::new(ChunkSchema::try_new(vec![source_slot.clone()]).unwrap());
+        let input = Chunk::try_new_with_columns(
+            input_schema,
+            vec![Arc::new(StringArray::from(vec![Some("{}")]))],
+        )
+        .unwrap();
+        let output = op.process_one(input).unwrap().unwrap();
+        assert_eq!(
+            output.chunk_schema().slot_ids(),
+            &[SlotId::new(3), SlotId::new(4)]
+        );
+        for slot in output.chunk_schema().slots() {
+            assert!(Arc::ptr_eq(slot.field_ref(), source_slot.field_ref()));
+            assert_eq!(slot.unique_id(), Some(17));
+            assert!(
+                slot.metadata_origins()
+                    .unwrap()
+                    .metadata_bytes_for(slot.field_ref())
+                    .is_some()
+            );
+        }
+        let first = output.columns()[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let second = output.columns()[1]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(first.values().data_ptr(), second.values().data_ptr());
+        assert_eq!(
+            output.schema().metadata(),
+            output_schema.arrow_schema_ref().metadata()
+        );
+        assert!(
+            output
+                .chunk_schema()
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(&output.schema())
+                .is_some()
+        );
+        let empty = op.empty_output_chunk().unwrap();
+        assert_eq!(empty.len(), 0);
+        for slot in empty.chunk_schema().slots() {
+            assert!(Arc::ptr_eq(slot.field_ref(), source_slot.field_ref()));
+            assert!(
+                slot.metadata_origins()
+                    .unwrap()
+                    .metadata_bytes_for(slot.field_ref())
+                    .is_some()
+            );
+        }
     }
 
     #[test]

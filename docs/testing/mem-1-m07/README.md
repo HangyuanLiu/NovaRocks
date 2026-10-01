@@ -45,3 +45,5 @@ P04 context-root 核心收据已保存：新增 immutable 通道/物理 backing 
 P04最后pull/Execution生命周期检查点：唯一事前input grant、original-carrier直移、built DOP绑定、explicit RootRegistration与actual-exit成功门已定向通过；[收据](evidence/p04-last-pull/README.md)。P04仍执行，原始Arrow/schema metadata实际backing证明与Native producer/fetch/lane产品接线继续。
 
 P04 metadata 来源已接真实 Native output / ChunkSchema / ExecPlan lowering / LocalProgram projection，且覆盖嵌套 carrier 派生和独立 work 上限；[定向收据](evidence/p04-source-origin/README.md)。完整 actual Arrow/Chunk backing proof 与 Native producer 仍继续，未宣称产品验收。
+
+P04来源接线进一步覆盖Native scan/Project和生产Project/hydration，包含重复occurrence/CSE/empty输出及known/unknown同结果反例；[收据](evidence/p04-scan-project-hydration/README.md)。完整Arrow/Chunk source proof、exchange与Native finite producer仍继续。

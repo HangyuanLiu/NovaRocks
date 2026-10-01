@@ -165,6 +165,25 @@ impl ChunkSlotSchema {
         })
     }
 
+    /// Share a field without inferring metadata provenance from its values.
+    pub fn try_new_with_field_ref(
+        slot_id: SlotId,
+        field: FieldRef,
+        field_schema: Option<ChunkFieldSchema>,
+        unique_id: Option<i32>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            slot_id,
+            field_schema: match field_schema {
+                Some(schema) => schema,
+                None => ChunkFieldSchema::from_field(&field)?,
+            },
+            field,
+            metadata_origins: None,
+            unique_id,
+        })
+    }
+
     pub fn try_new_with_metadata_origins(
         slot_id: SlotId,
         field: FieldRef,
@@ -222,15 +241,26 @@ impl ChunkSlotSchema {
             let field = Arc::clone(replacement.field());
             let origins = origins
                 .replacing_root(&self.field, replacement, 65536)
-                .and_then(|origins| origins.for_field_tree(&field, 65536, 64))
-                .map_err(|_| "chunk field metadata origins exceed the node profile or lack a child owner")?;
-            Self::try_new_with_metadata_origins(
-                self.slot_id,
-                field,
-                origins,
-                Some(self.field_schema.clone()),
-                self.unique_id,
-            )
+                .map_err(|_| "chunk field metadata origins exceed the node profile")?;
+            if let Ok(scoped) = origins.for_field_tree(&field, 65536, 64) {
+                Self::try_new_with_metadata_origins(
+                    self.slot_id,
+                    field,
+                    scoped,
+                    Some(self.field_schema.clone()),
+                    self.unique_id,
+                )
+            } else {
+                // A legal generic type replacement can introduce fields whose
+                // metadata backing is unknown. Keep its semantics and exact
+                // Field Arc, but never issue a complete source-origin claim.
+                Self::try_new_with_field_ref(
+                    self.slot_id,
+                    field,
+                    Some(self.field_schema.clone()),
+                    self.unique_id,
+                )
+            }
         } else {
             self.with_field(
                 self.field
@@ -242,7 +272,11 @@ impl ChunkSlotSchema {
         }
     }
 
-    fn reconcile_to_carrier(&self, actual: &DataType, nullable: bool) -> Result<Self, String> {
+    pub(crate) fn reconcile_to_carrier(
+        &self,
+        actual: &DataType,
+        nullable: bool,
+    ) -> Result<Self, String> {
         let Some(origins) = &self.metadata_origins else {
             let field = reconcile_chunk_field_to_data_type(self.field(), actual, nullable)?;
             return self.with_type_and_nullable(field.data_type().clone(), field.is_nullable());
@@ -606,20 +640,28 @@ impl ChunkSchema {
         slots: Vec<ChunkSlotSchema>,
         metadata: HashMap<String, String>,
     ) -> Result<Self, String> {
-        Self::build(slots, Some(metadata), None)
+        Self::build(slots, Some(metadata), None, None)
     }
 
     pub fn try_new_with_owned_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         metadata: ArrowMetadataOwner,
     ) -> Result<Self, String> {
-        Self::build(slots, None, Some(metadata))
+        Self::build(slots, None, Some(metadata), None)
+    }
+
+    pub fn try_new_with_derived_schema_metadata(
+        slots: Vec<ChunkSlotSchema>,
+        source: &MetadataOwnedSchema,
+    ) -> Result<Self, String> {
+        Self::build(slots, None, None, Some(source))
     }
 
     fn build(
         slots: Vec<ChunkSlotSchema>,
         unknown_metadata: Option<HashMap<String, String>>,
         owned_metadata: Option<ArrowMetadataOwner>,
+        derived_metadata: Option<&MetadataOwnedSchema>,
     ) -> Result<Self, String> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
         let mut slot_ids = Vec::with_capacity(slots.len());
@@ -655,7 +697,18 @@ impl ChunkSchema {
         } else {
             None
         };
-        let (arrow_schema, schema_metadata_origin) = if let Some(metadata) = owned_metadata {
+        let (arrow_schema, schema_metadata_origin) = if let Some(source) = derived_metadata {
+            let origin = source
+                .derive_schema(
+                    fields.into(),
+                    MetadataOwnerLimits {
+                        entries: 65536,
+                        construction_bytes: 96 * 1024 * 1024,
+                    },
+                )
+                .map_err(|_| "chunk schema metadata derivation exceeds its source profile")?;
+            (Arc::clone(origin.schema()), Some(origin))
+        } else if let Some(metadata) = owned_metadata {
             let origin = metadata.into_schema(fields.into());
             (Arc::clone(origin.schema()), Some(origin))
         } else {
@@ -825,7 +878,12 @@ pub(super) fn align_chunk_schema_to_batch(
         check_chunk_data_type(expected.data_type(), field.data_type(), &root)?;
         slots.push(expected.reconcile_to_carrier(field.data_type(), field.is_nullable())?);
     }
-    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+    let schema = if let Some(source) = chunk_schema.schema_metadata_origin() {
+        ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else {
+        ChunkSchema::try_new(slots)?
+    };
+    Ok(Arc::new(schema))
 }
 
 pub(super) fn align_chunk_schema_to_columns(
@@ -849,7 +907,12 @@ pub(super) fn align_chunk_schema_to_columns(
         check_chunk_data_type(expected.data_type(), column.data_type(), &root)?;
         slots.push(expected.reconcile_to_carrier(column.data_type(), column.null_count() > 0)?);
     }
-    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+    let schema = if let Some(source) = chunk_schema.schema_metadata_origin() {
+        ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else {
+        ChunkSchema::try_new(slots)?
+    };
+    Ok(Arc::new(schema))
 }
 
 #[cfg(test)]

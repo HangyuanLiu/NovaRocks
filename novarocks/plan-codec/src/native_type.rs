@@ -86,17 +86,24 @@ pub fn decode_field_type_owned(
 /// Check the whole output layout before constructing any field or provenance
 /// vector. Per-field checks alone cannot bound a wide combined tree.
 pub fn preflight_native_output_fields(columns: &[common::OutputColumn]) -> Result<(), String> {
-    if columns.len() > 65_536 {
-        return Err("native output layout exceeds the source field profile".to_string());
-    }
+    preflight_native_field_types(
+        columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.r#type.as_ref())),
+    )
+}
+
+/// Borrowed whole-source preflight for output columns or project occurrences.
+/// Malformed absent types retain the owning adapter's precise error path.
+pub fn preflight_native_field_types<'a>(
+    fields: impl IntoIterator<Item = (&'a str, Option<&'a common::TypeDesc>)>,
+) -> Result<(), String> {
     let mut preflight = NativeFieldPreflight { nodes: 0, bytes: 0 };
-    for column in columns {
-        if let Some(desc) = &column.r#type {
-            preflight.field(&column.name, desc, 0)?;
+    for (name, desc) in fields {
+        if let Some(desc) = desc {
+            preflight.field(name, desc, 0)?;
         } else {
-            // Capacity preflight does not replace the adapter's exact missing
-            // field error or allocate any Arrow owner for malformed input.
-            preflight.charge_field(&column.name)?;
+            preflight.charge_field(name)?;
         }
     }
     Ok(())

@@ -1,0 +1,68 @@
+{
+  "parent": "3f0756483cc75b9c26f5b5c8084da925a18bbcb9",
+  "scope": "Native scan and project source metadata identity, runtime project and hydration propagation; complete Chunk/source backing and finite Native producer remain pending",
+  "logs": [
+    {
+      "file": "chunk-tests.log.gz",
+      "raw_sha256": "defbd5b2446fc281c925773bcf7d2739e2f268b8552f282d85dfb6ce54e06e49",
+      "gzip_sha256": "3a62d8ebfa55b95da16181b6143868368815e40c60668f61c70566a8076f4cfa"
+    },
+    {
+      "file": "project-tests.log.gz",
+      "raw_sha256": "642db18cbd30dbc70f6c69621526d5118e597e8fbdd87955069bbee5e85f1415",
+      "gzip_sha256": "c063013d724f3fbb2d2362b4dde3a3d8367d049958c6e9d9051c4c9a7c683d56"
+    },
+    {
+      "file": "native-integration-tests.log.gz",
+      "raw_sha256": "bc70497fa9a879200e3f724556a4551678ac87df0f519f23fc4f60fac44089f8",
+      "gzip_sha256": "a93df3d94f257c624be98bcb588083f5b2bbe66195a585f148b189be435690b8"
+    },
+    {
+      "file": "native-node-tests.log.gz",
+      "raw_sha256": "e28010ef29d3f5aa3d65e747be203f7ec6cc178e0ee8ba4cbf5ca093705d7fea",
+      "gzip_sha256": "da7234d1f2db578b7b3e4414370677fb7172a4e6e4d5a8ae76a7b04bb4728118"
+    },
+    {
+      "file": "local-program-tests.log.gz",
+      "raw_sha256": "0b465891714dbed74132c5ea53c6e0d701823462de52ed14d9ac893647a53c26",
+      "gzip_sha256": "c1a04a38a1cdd92d6ce43205a26391f191f9b1d2805ab97df2987e9ba6b88097"
+    },
+    {
+      "file": "lowering-tests.log.gz",
+      "raw_sha256": "8c1131b4b9eaff3c923275eaf1b7c5f9d7b037bdfcde8dcee19566b163a1c72f",
+      "gzip_sha256": "6b07cbe4553f61cf535abc097e248d5afa7be5748a5d934ce1602188ba154cfa"
+    },
+    {
+      "file": "codec-tests.log.gz",
+      "raw_sha256": "72bc933bbbe612ca4f9f1787629091e5a846bacaf52540159976f15c0dd40580",
+      "gzip_sha256": "8215922ace11ca617f097fb75964c472a350db4f0422b221b340bd04999858e6"
+    },
+    {
+      "file": "carrier-tests.log.gz",
+      "raw_sha256": "df889533559532db0445d6306e76323deba8adea38a2abab278c2f9cf24d6630",
+      "gzip_sha256": "6d0d4266845de379829ded2dcf7e90a47b4dfe7614a05262bb51cb4146cdc045"
+    },
+    {
+      "file": "clippy.log.gz",
+      "raw_sha256": "b6406438cb54910f2b0e08040f2d71e31a12f6c65d111d1504275afbc08afd24",
+      "gzip_sha256": "f74b90a2af8d456dd91b23bb4a8b38baa675e33bd45796985661a4b71c5ee3ce"
+    },
+    {
+      "file": "check.log.gz",
+      "raw_sha256": "63275650ecd6a945714c48385332bc33c3f845143ec34ac566b4b08fd2b73606",
+      "gzip_sha256": "f947a1ddeba8bc8b896e69fdada09dfc7a5606eba6adc479520c60315ef87411"
+    }
+  ],
+  "sources": {
+    "novarocks/execution/src/exec/chunk/hydrate.rs": "aa01ef7bd81fa5c5f41e455b99f4dd9e997ae218cb0f622b70f0400afdb19bb5",
+    "novarocks/execution/src/exec/chunk/schema.rs": "e326333b1f344c5cf0f3cf4b2e9b5226fa6ce7133dad2131d7d52e84c2b7b6d6",
+    "novarocks/execution/src/exec/node/lowering.rs": "4581c47699c4fff156c6b7ff5fad009a91ad59ac30fee5a74ba80a84fac441a7",
+    "novarocks/execution/src/exec/operators/project_processor.rs": "ab6776c83c9c49b755e5ac9211bbb81402943ccb21c5afb16d9d16d6ce6efed1",
+    "novarocks/execution/src/exec/pipeline/builder/local.rs": "55eb12a3c35f5b0062afdb830f9cd798bbf8853268fe8714c6b45ca3d932000f",
+    "novarocks/local-program/src/program.rs": "839a1d427ad59c9b1cfbc560615b2dc996bddf05359524ae50c95d0786090d23",
+    "novarocks/native-adapter/src/fragment_plan_node.rs": "761618ab3273b8d2613a5a4f8b49fa4a69b126eb5013fd5dd0b4fb66256d4c63",
+    "novarocks/native-adapter/src/fragment_scan_output.rs": "255b0afe8e4eb7cabbbc1b12f6bfbc7fcc04f62974f01ef2718f8fae92ba3e1f",
+    "novarocks/native-adapter/tests/root_metadata_origin.rs": "a285eb8ecd21a7179efe11e6c1f9e9d663654d185ef5b52361b8f2d642839689",
+    "novarocks/plan-codec/src/native_type.rs": "ecc33d6ad0cb6efbe289b6c90745099ca6ff5fa18564817736f41998b61a40e1"
+  }
+}

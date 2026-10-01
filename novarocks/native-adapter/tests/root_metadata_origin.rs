@@ -21,15 +21,21 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, new_null_array};
 use arrow::datatypes::{DataType, FieldRef, Schema, TimeUnit};
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::chunk::{
+    Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema, SlotLayout,
+};
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-use novarocks_local_program::{LayoutError, StaticLayout, StaticSinkProgram};
+use novarocks_local_program::{
+    LayoutError, LocalProgram, ProgramNodeKind, StaticLayout, StaticSinkProgram,
+};
 use novarocks_native_adapter::fragment_layout::decode_output_layout;
+use novarocks_native_adapter::fragment_plan_node::{NativeLoweredPlanNode, lower_project_node};
+use novarocks_native_adapter::fragment_scan_output::decode_scan_output_columns;
 use novarocks_plan_codec::native_type::decode_field_type;
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_models::common;
+use novarocks_proto_models::{common, expr, plan};
 use novarocks_types::SlotId;
 use novarocks_types::arrow_metadata_owner::FieldMetadataOrigins;
 use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY, logical_type_of_field};
@@ -120,6 +126,22 @@ fn assert_tree_origins(field: &FieldRef, origins: &FieldMetadataOrigins) -> usiz
 // Exercise the production lowering entry rather than rebuilding a StaticLayout
 // and manually attaching the receipts under test.
 fn production_layout(schema: ChunkSchemaRef) -> StaticLayout {
+    let plan = ExecPlan {
+        arena: ExprArena::default(),
+        root: ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk: null_chunk(schema),
+                node_id: 7,
+            }),
+        },
+    };
+    let program = production_program(plan);
+    program.nodes()[program.root().index()]
+        .output_layout()
+        .clone()
+}
+
+fn null_chunk(schema: ChunkSchemaRef) -> Chunk {
     let arrow_schema = schema.arrow_schema_ref();
     let arrays = arrow_schema
         .fields()
@@ -127,13 +149,10 @@ fn production_layout(schema: ChunkSchemaRef) -> StaticLayout {
         .map(|field| new_null_array(field.data_type(), 1))
         .collect();
     let batch = RecordBatch::try_new(arrow_schema, arrays).unwrap();
-    let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
-    let plan = ExecPlan {
-        arena: ExprArena::default(),
-        root: ExecNode {
-            kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 7 }),
-        },
-    };
+    Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
+}
+
+fn production_program(plan: ExecPlan) -> LocalProgram {
     let profile = plan
         .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
         .unwrap();
@@ -148,9 +167,7 @@ fn production_layout(schema: ChunkSchemaRef) -> StaticLayout {
     assert_eq!(bindings.scan_count(), 0);
     assert_eq!(bindings.writer_count(), 0);
     assert_eq!(bindings.finish_count(), 0);
-    program.nodes()[program.root().index()]
-        .output_layout()
-        .clone()
+    program
 }
 
 #[test]
@@ -302,4 +319,164 @@ fn equal_unknown_large_metadata_tables_cannot_inherit_native_construction_origin
             .unwrap_err(),
         LayoutError::MetadataOwnerConflict
     );
+}
+
+#[test]
+fn actual_scan_decoder_preserves_selected_nested_field_owners_and_wire_semantics() {
+    let scan = plan::ScanNode {
+        columns: nested_columns(),
+        required_columns: vec!["PAYLOAD".to_string(), "NESTED".to_string()],
+        ..Default::default()
+    };
+    let decoded = decode_scan_output_columns(&scan, FieldPath::root("scan")).unwrap();
+    let schema = decoded.output_schema();
+    let arrow_schema = schema.arrow_schema_ref();
+    let origins = schema.field_metadata_origins().unwrap();
+    assert_eq!(schema.slot_ids(), &[SlotId::new(41), SlotId::new(42)]);
+    assert_eq!(decoded.provenanced().len(), 2);
+    let mut nodes = 0;
+    for (index, source) in decoded.provenanced().iter().enumerate() {
+        let field = &arrow_schema.fields()[index];
+        assert!(Arc::ptr_eq(field, source.slot_schema().field_ref()));
+        assert_eq!(source.column(), &scan.columns[index]);
+        let legacy = decode_field_type(
+            &source.column().name,
+            source.column().nullable,
+            source.column().r#type.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(field.as_ref(), &legacy);
+        nodes += assert_tree_origins(field, origins);
+    }
+    assert_eq!(nodes, 9);
+    assert_eq!(origins.owners().len(), nodes);
+    assert_eq!(
+        schema
+            .schema_metadata_origin()
+            .unwrap()
+            .backing_bytes_for(&arrow_schema),
+        Some(0)
+    );
+    let frozen = production_layout(schema);
+    assert!(Arc::ptr_eq(frozen.schema(), &arrow_schema));
+    assert_eq!(
+        frozen.field_metadata_origins().unwrap().owners().len(),
+        nodes
+    );
+}
+
+#[test]
+fn actual_native_project_repeated_occurrences_keep_compute_and_output_origins_when_frozen() {
+    let source_column = nested_columns().remove(0);
+    let decoded = decode_output_layout(
+        std::slice::from_ref(&source_column),
+        FieldPath::root("columns"),
+    )
+    .unwrap();
+    let input_schema = decoded.chunk_schema();
+    let item = plan::ProjectItem {
+        expr: Some(expr::Expr {
+            r#type: source_column.r#type.clone(),
+            nullable: source_column.nullable,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id: source_column.column_id,
+                qualifier: None,
+                column: Some(source_column.name.clone()),
+            })),
+        }),
+        output_name: source_column.name.clone(),
+        output_column_id: source_column.column_id,
+    };
+    let project = plan::ProjectNode {
+        items: vec![item.clone(), item],
+        output_qualifier: None,
+    };
+    let child = NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk: null_chunk(Arc::clone(&input_schema)),
+                node_id: 7,
+            }),
+        },
+        layout: SlotLayout::for_slots(input_schema.slot_ids().iter().copied()),
+        output_schema: input_schema,
+    };
+    let mut arena = ExprArena::default();
+    let lowered = lower_project_node(
+        &plan::DistributedNode {
+            node_id: 8,
+            ..Default::default()
+        },
+        &project,
+        FieldPath::root("project"),
+        vec![child],
+        &mut arena,
+    )
+    .unwrap();
+    let output_schema = Arc::clone(&lowered.output_schema);
+    let output_arrow = output_schema.arrow_schema_ref();
+    assert_eq!(output_schema.slots().len(), 2);
+    assert_ne!(output_schema.slot_ids()[0], output_schema.slot_ids()[1]);
+    assert_eq!(
+        output_arrow.fields()[0].as_ref(),
+        output_arrow.fields()[1].as_ref()
+    );
+    let ExecNodeKind::Project(native_project) = &lowered.node.kind else {
+        panic!("native decoder must lower a Project node");
+    };
+    assert_eq!(
+        native_project.exprs.len(),
+        1,
+        "repeated source references share computation"
+    );
+    assert_eq!(native_project.output_indices.as_deref(), Some(&[0, 0][..]));
+    let native_compute = native_project.expr_slot_schemas.as_ref().unwrap();
+    assert_eq!(native_compute.len(), 1);
+    let compute_field = Arc::clone(native_compute[0].field_ref());
+    assert_eq!(
+        assert_tree_origins(
+            &compute_field,
+            native_compute[0].metadata_origins().unwrap()
+        ),
+        8
+    );
+    for field in output_arrow.fields() {
+        assert_eq!(
+            assert_tree_origins(field, output_schema.field_metadata_origins().unwrap()),
+            8
+        );
+    }
+    let program = production_program(ExecPlan {
+        arena,
+        root: lowered.node,
+    });
+    let root = &program.nodes()[program.root().index()];
+    let ProgramNodeKind::Project {
+        expr_slot_schemas,
+        output_indices,
+        ..
+    } = root.kind()
+    else {
+        panic!("production lowering must retain Project semantics");
+    };
+    assert_eq!(output_indices.as_deref(), Some(&[0, 0][..]));
+    let frozen_compute = expr_slot_schemas.as_ref().unwrap();
+    assert_eq!(frozen_compute.len(), 1);
+    assert!(Arc::ptr_eq(&frozen_compute[0].field, &compute_field));
+    assert_eq!(
+        assert_tree_origins(
+            &frozen_compute[0].field,
+            frozen_compute[0].metadata_origins.as_ref().unwrap()
+        ),
+        8
+    );
+    let layout = root.output_layout();
+    assert!(Arc::ptr_eq(layout.schema(), &output_arrow));
+    assert_eq!(layout.slots(), output_schema.slot_ids());
+    for field in layout.schema().fields() {
+        assert_eq!(
+            assert_tree_origins(field, layout.field_metadata_origins().unwrap()),
+            8
+        );
+    }
 }

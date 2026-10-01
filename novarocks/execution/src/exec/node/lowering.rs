@@ -376,7 +376,8 @@ impl Lowering<'_> {
                         .into_iter()
                         .map(|slot| lp::ProjectExpressionSlot {
                             slot_id: slot.slot_id(),
-                            field: slot.field().clone(),
+                            field: Arc::clone(slot.field_ref()),
+                            metadata_origins: slot.metadata_origins().cloned(),
                             field_schema: freeze_field_schema(slot.field_schema().clone()),
                             unique_id: slot.unique_id(),
                         })

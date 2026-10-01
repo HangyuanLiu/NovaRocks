@@ -1454,12 +1454,22 @@ fn build_pipeline_for_program_node(
                     schemas
                         .iter()
                         .map(|slot| {
-                            ChunkSlotSchema::try_new_with_field(
-                                slot.slot_id,
-                                slot.field.clone(),
-                                Some(thaw_field_schema(&slot.field_schema)),
-                                slot.unique_id,
-                            )
+                            if let Some(origins) = &slot.metadata_origins {
+                                ChunkSlotSchema::try_new_with_metadata_origins(
+                                    slot.slot_id,
+                                    Arc::clone(&slot.field),
+                                    origins.clone(),
+                                    Some(thaw_field_schema(&slot.field_schema)),
+                                    slot.unique_id,
+                                )
+                            } else {
+                                ChunkSlotSchema::try_new_with_field(
+                                    slot.slot_id,
+                                    slot.field.as_ref().clone(),
+                                    Some(thaw_field_schema(&slot.field_schema)),
+                                    slot.unique_id,
+                                )
+                            }
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })

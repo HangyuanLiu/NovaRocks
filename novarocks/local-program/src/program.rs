@@ -24,7 +24,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, FieldRef};
 use novarocks_connector_contract::{ConnectorRowMutationEffect, WriteTargetOrdinal};
 use novarocks_functions::ResolvedAggregateSignature;
 use novarocks_types::SlotId;
@@ -69,7 +69,8 @@ pub enum AssertRowsMode {
 #[derive(Clone, Debug)]
 pub struct ProjectExpressionSlot {
     pub slot_id: SlotId,
-    pub field: Field,
+    pub field: FieldRef,
+    pub metadata_origins: Option<novarocks_types::arrow_metadata_owner::FieldMetadataOrigins>,
     pub field_schema: StaticFieldSchema,
     pub unique_id: Option<i32>,
 }
