@@ -70,9 +70,12 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
         let function_catalog = ctx.function_catalog().snapshot();
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, function_catalog.as_ref(), &mut arena)
-            .map_err(SqlCompileError::Compilation)?
-        {
+        match apply_expr(
+            expr,
+            function_catalog.as_ref(),
+            &mut arena,
+            &ctx.control_view(),
+        )? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -94,7 +97,8 @@ fn apply_expr(
     expr: OptExpr,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
-) -> Result<Option<OptExpr>, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -158,7 +162,7 @@ fn apply_expr(
             return Ok(None);
         };
         let extra = if negated && arena.nullable(lifted_pred) {
-            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred)?
+            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred, control)?
         } else {
             lifted_pred
         };

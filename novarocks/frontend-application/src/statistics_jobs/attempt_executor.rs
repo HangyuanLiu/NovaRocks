@@ -177,6 +177,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
 
     fn failure(message: impl Into<String>) -> CoreStatisticsAttemptError {
         CoreStatisticsAttemptError::Failed(StatisticsFailure {
+            compile_control: None,
             message: Arc::from(message.into()),
         })
     }
@@ -184,6 +185,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
     fn scope_error(error: novarocks_workload_control::WorkError) -> CoreStatisticsAttemptError {
         if matches!(error, novarocks_workload_control::WorkError::Cancelled(_)) {
             CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from(error.to_string()),
             })
         } else {
@@ -194,6 +196,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
     fn application_error(error: StatisticsApplicationError) -> CoreStatisticsAttemptError {
         if error.target_binding_failure().is_some() {
             CoreStatisticsAttemptError::Stale(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from(error.to_string()),
             })
         } else if error.publication_terminal().is_some() {
@@ -249,6 +252,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
             );
         if cancellation.is_cancelled() {
             return Err(CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from("statistics attempt cancelled before phase start"),
             }));
         }
@@ -278,6 +282,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
                     finalization_failure: match finalization {
                         ExternalMutationFinalization::Complete => None,
                         ExternalMutationFinalization::Failed(error) => Some(StatisticsFailure {
+                            compile_control: None,
                             message: Arc::from(error.to_string()),
                         }),
                     },
@@ -335,16 +340,19 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
         match original {
             CoreStatisticsAttemptError::Failed(failure) => {
                 CoreStatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: failure.compile_control,
                     message: Arc::from(format!("{}; {context}", failure.message)),
                 })
             }
             CoreStatisticsAttemptError::Stale(failure) => {
                 CoreStatisticsAttemptError::Stale(StatisticsFailure {
+                    compile_control: failure.compile_control,
                     message: Arc::from(format!("{}; {context}", failure.message)),
                 })
             }
             CoreStatisticsAttemptError::Cancelled(failure) => {
                 CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                    compile_control: failure.compile_control,
                     message: Arc::from(format!("{}; {context}", failure.message)),
                 })
             }
@@ -445,7 +453,12 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                     program,
                     planning_lease,
                 )
-                .map_err(|error| Self::failure(error.to_string()))
+                .map_err(|error| {
+                    CoreStatisticsAttemptError::Failed(StatisticsFailure {
+                        compile_control: error.compile_control_error(),
+                        message: Arc::from(error.to_string()),
+                    })
+                })
             })();
             let request = match request {
                 Ok(request) => request,
@@ -689,5 +702,38 @@ mod tests {
 
         assert!(matches!(error, CoreStatisticsAttemptError::Failed(_)));
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn abort_context_preserves_statistics_attempt_class_and_compile_cause() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for class in 0..3 {
+                let failure = StatisticsFailure {
+                    compile_control: Some(control),
+                    message: Arc::from("compile failed"),
+                };
+                let original = match class {
+                    0 => CoreStatisticsAttemptError::Failed(failure),
+                    1 => CoreStatisticsAttemptError::Stale(failure),
+                    _ => CoreStatisticsAttemptError::Cancelled(failure),
+                };
+                let actual = FrontendThreePhaseStatisticsAttemptExecutor::with_abort_context(
+                    original,
+                    "abort failed",
+                );
+                let failure = match (class, actual) {
+                    (0, CoreStatisticsAttemptError::Failed(failure))
+                    | (1, CoreStatisticsAttemptError::Stale(failure))
+                    | (2, CoreStatisticsAttemptError::Cancelled(failure)) => failure,
+                    _ => panic!("cleanup must preserve the original attempt class"),
+                };
+                assert_eq!(failure.compile_control, Some(control));
+                assert_eq!(&*failure.message, "compile failed; abort failed");
+            }
+        }
     }
 }

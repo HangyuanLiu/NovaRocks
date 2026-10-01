@@ -538,7 +538,7 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
             request.statement,
             &self.connector_context,
         )
-        .map_err(engine_prepare_error)?;
+        .map_err(MvCreateProviderError::from_compile)?;
         let target = MvTarget {
             catalog: Some(prepared.target.catalog.clone()),
             database: prepared.target.namespace.clone(),
@@ -882,7 +882,7 @@ fn prepare_iceberg_mv_create_with_ports(
     current_database: &str,
     stmt: &MvCreateStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<IcebergMvCreatePreparation, String> {
+) -> Result<IcebergMvCreatePreparation, novarocks_sql::compiler::SqlCompileError> {
     crate::connector::validate_request_context(connector_context)?;
     let storage_engine = stmt
         .properties
@@ -892,10 +892,8 @@ fn prepare_iceberg_mv_create_with_ports(
         .unwrap_or_else(|| "iceberg".to_string());
     match storage_engine.as_str() {
         "iceberg" => {}
-        "starrocks" => return Err(
-            "storage_engine='starrocks' is no longer supported for standalone materialized views; use storage_engine='iceberg'".to_string(),
-        ),
-        _ => return Err(format!("unknown materialized view storage_engine `{storage_engine}`")),
+        "starrocks" => return Err(("storage_engine='starrocks' is no longer supported for standalone materialized views; use storage_engine='iceberg'".to_string()).into()),
+        _ => return Err((format!("unknown materialized view storage_engine `{storage_engine}`")).into()),
     }
     let current_catalog = current_catalog.ok_or_else(|| {
         "storage_engine='iceberg' requires current catalog to be an Iceberg catalog".to_string()
@@ -914,12 +912,17 @@ fn prepare_iceberg_mv_create_with_ports(
             normalize_identifier(table)?,
         ),
         [catalog, ..] => {
-            return Err(format!(
+            return Err((format!(
                 "materialized view name catalog must be `default_catalog`, got {}",
                 normalize_identifier(catalog)?
-            ));
+            ))
+            .into());
         }
-        _ => return Err("materialized view name must have one, two, or three parts".to_string()),
+        _ => {
+            return Err(
+                ("materialized view name must have one, two, or three parts".to_string()).into(),
+            );
+        }
     };
     let target = IcebergMvTarget {
         catalog: normalize_identifier(current_catalog)?,
@@ -1012,13 +1015,15 @@ fn prepare_iceberg_mv_create_with_ports(
                     )?),
                 )?;
             }
-            TargetIdentity::JoinRowKey(_, _) => return Err("iceberg-backed join materialized views do not support PRIMARY KEY in this phase".to_string()),
-            TargetIdentity::BranchScoped(_) => return Err("iceberg-backed UNION ALL materialized views do not support PRIMARY KEY in this phase".to_string()),
-            TargetIdentity::GroupRowId(_) => return Err("iceberg-backed aggregate materialized views do not support PRIMARY KEY".to_string()),
+            TargetIdentity::JoinRowKey(_, _) => return Err(("iceberg-backed join materialized views do not support PRIMARY KEY in this phase".to_string()).into()),
+            TargetIdentity::BranchScoped(_) => return Err(("iceberg-backed UNION ALL materialized views do not support PRIMARY KEY in this phase".to_string()).into()),
+            TargetIdentity::GroupRowId(_) => return Err(("iceberg-backed aggregate materialized views do not support PRIMARY KEY".to_string()).into()),
         }
     }
     if !partition_fields.is_empty() && property.is_composed_aggregate_schema_contract_fallback() {
-        return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
+        return Err(
+            ("partitioned composed aggregate Iceberg MV is not supported".to_string()).into(),
+        );
     }
     let apply_key_column_name = refresh_contract.apply_key.column_name;
     if analysis
@@ -1026,9 +1031,9 @@ fn prepare_iceberg_mv_create_with_ports(
         .iter()
         .any(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
     {
-        return Err(format!(
+        return Err((format!(
             "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
-        ));
+        )).into());
     }
     if identity_needs_branch_id_column(&property.identity)
         && analysis
@@ -1036,9 +1041,9 @@ fn prepare_iceberg_mv_create_with_ports(
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
     {
-        return Err(format!(
+        return Err((format!(
             "Iceberg MV output column name {BRANCH_ID_COLUMN_NAME} is reserved for internal branch id"
-        ));
+        )).into());
     }
     let mut columns =
         create_target_columns_from_property(&property, &canonical_select_query, &analysis)?;

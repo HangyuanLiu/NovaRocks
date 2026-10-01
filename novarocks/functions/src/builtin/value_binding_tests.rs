@@ -46,10 +46,15 @@ fn resolve(
 ) -> ResolvedFunctionBinding {
     let catalog = builtin_engine_function_catalog();
     let binding = catalog
-        .resolve_bound_user(name, kind, request(arguments))
+        .resolve_bound_user(
+            name,
+            kind,
+            request(arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
     catalog
-        .validate_bound(&binding, request(arguments))
+        .validate_bound(&binding, request(arguments), crate::binding_test_control())
         .unwrap();
     binding
 }
@@ -99,7 +104,7 @@ fn repeated_variables_select_owner_authorized_common_domains() {
             let binding = resolve_with_materialized_assignments(name, &arguments);
             assert!(
                 catalog
-                    .validate_bound(&binding, request(&arguments))
+                    .validate_bound(&binding, request(&arguments), crate::binding_test_control())
                     .is_err(),
                 "the frozen consumer must see the converted full argument domains"
             );
@@ -112,7 +117,7 @@ fn repeated_variables_select_owner_authorized_common_domains() {
     forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::Utf8));
     assert!(
         catalog
-            .validate_bound(&forged, request(&arguments))
+            .validate_bound(&forged, request(&arguments), crate::binding_test_control())
             .is_err()
     );
 }
@@ -124,7 +129,12 @@ fn resolve_with_materialized_assignments(
     use crate::builtin::value_conversion::{VALUE_CONVERSION_NAME, conversion_intermediate_type};
     let catalog = builtin_engine_function_catalog();
     let binding = catalog
-        .resolve_bound_user(name, FunctionKind::Scalar, request(arguments))
+        .resolve_bound_user(
+            name,
+            FunctionKind::Scalar,
+            request(arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
     let mut materialized = Vec::new();
     let mut conversions = 0;
@@ -152,10 +162,15 @@ fn resolve_with_materialized_assignments(
                     VALUE_CONVERSION_NAME,
                     FunctionKind::Scalar,
                     conversion_request,
+                    crate::binding_test_control(),
                 )
                 .unwrap();
             catalog
-                .validate_bound(&conversion, conversion_request)
+                .validate_bound(
+                    &conversion,
+                    conversion_request,
+                    crate::binding_test_control(),
+                )
                 .unwrap();
             assert_eq!(output(&conversion), &intermediate);
             conversions += 1;
@@ -167,7 +182,11 @@ fn resolve_with_materialized_assignments(
         "the domain change must have a real owner binding"
     );
     catalog
-        .validate_bound(&binding, request(&materialized))
+        .validate_bound(
+            &binding,
+            request(&materialized),
+            crate::binding_test_control(),
+        )
         .unwrap();
     binding
 }
@@ -211,7 +230,12 @@ fn undeclared_domains_do_not_gain_conversion_authority_from_carriers() {
         for name in ["coalesce", "ifnull", "bitand"] {
             assert!(
                 catalog
-                    .resolve_bound_user(name, FunctionKind::Scalar, request(&arguments))
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        request(&arguments),
+                        crate::binding_test_control()
+                    )
                     .is_err()
             );
         }
@@ -222,7 +246,12 @@ fn undeclared_domains_do_not_gain_conversion_authority_from_carriers() {
     ];
     assert!(
         catalog
-            .resolve_bound_user("coalesce", FunctionKind::Scalar, request(&arguments))
+            .resolve_bound_user(
+                "coalesce",
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control()
+            )
             .is_err()
     );
 }
@@ -278,7 +307,12 @@ fn actual_ordinary_integer_widening_keeps_physical_targets() {
         value(physical(DataType::Int16)),
     ];
     let binding = builtin_engine_function_catalog()
-        .resolve_bound_user("left", FunctionKind::Scalar, request(&arguments))
+        .resolve_bound_user(
+            "left",
+            FunctionKind::Scalar,
+            request(&arguments),
+            crate::binding_test_control(),
+        )
         .unwrap();
     assert_eq!(
         binding.selected.argument_types[1],
@@ -286,7 +320,11 @@ fn actual_ordinary_integer_widening_keeps_physical_targets() {
     );
     let materialized = [arguments[0].clone(), value(physical(DataType::Int64))];
     builtin_engine_function_catalog()
-        .validate_bound(&binding, request(&materialized))
+        .validate_bound(
+            &binding,
+            request(&materialized),
+            crate::binding_test_control(),
+        )
         .unwrap();
 }
 
@@ -300,12 +338,22 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         let arguments = [value(source)];
         assert!(
             catalog
-                .resolve_bound_user("abs", FunctionKind::Scalar, request(&arguments))
+                .resolve_bound_user(
+                    "abs",
+                    FunctionKind::Scalar,
+                    request(&arguments),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
         assert!(
             catalog
-                .resolve_bound_user("sum", FunctionKind::Aggregate, request(&arguments))
+                .resolve_bound_user(
+                    "sum",
+                    FunctionKind::Aggregate,
+                    request(&arguments),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
     }
@@ -386,7 +434,7 @@ fn json_producer_domains_follow_exact_registered_owners() {
         forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::Utf8));
         assert!(
             catalog
-                .validate_bound(&forged, request(&arguments))
+                .validate_bound(&forged, request(&arguments), crate::binding_test_control())
                 .is_err(),
             "{name}"
         );
@@ -401,7 +449,12 @@ fn json_producer_domains_follow_exact_registered_owners() {
         assert!(catalog.definition(name, FunctionKind::Scalar).is_none());
         let arguments = [value(json())];
         assert!(matches!(
-            catalog.resolve_bound_user(name, FunctionKind::Scalar, request(&arguments)),
+            catalog.resolve_bound_user(
+                name,
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control()
+            ),
             Err(FunctionBindingError::UnknownFunction)
         ));
     }
@@ -434,7 +487,12 @@ fn one_accessor_overload_preserves_document_text_json_and_variant_domains() {
     ];
     assert!(
         builtin_engine_function_catalog()
-            .resolve_bound_user("get_json_int", FunctionKind::Scalar, request(&arguments))
+            .resolve_bound_user(
+                "get_json_int",
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control()
+            )
             .is_err()
     );
 }
@@ -453,9 +511,16 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
             expected_result_type: None,
         };
         let binding = catalog
-            .resolve_bound_user("array_agg", FunctionKind::Aggregate, request)
+            .resolve_bound_user(
+                "array_agg",
+                FunctionKind::Aggregate,
+                request,
+                crate::binding_test_control(),
+            )
             .unwrap();
-        catalog.validate_bound(&binding, request).unwrap();
+        catalog
+            .validate_bound(&binding, request, crate::binding_test_control())
+            .unwrap();
         assert_eq!(output(&binding).data_type, DataType::List(json_item(true)));
         let state = &binding
             .selected
@@ -493,7 +558,11 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
         forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::List(
             Arc::new(Field::new("item", DataType::Utf8, true)),
         )));
-        assert!(catalog.validate_bound(&forged, request).is_err());
+        assert!(
+            catalog
+                .validate_bound(&forged, request, crate::binding_test_control())
+                .is_err()
+        );
     }
 }
 
@@ -529,7 +598,7 @@ fn value_domain_aggregate_states_preserve_complete_source_identity() {
             if source.logical_type != ValueLogicalType::Physical {
                 assert!(
                     builtin_engine_function_catalog()
-                        .validate_bound(&forged, request(&arguments))
+                        .validate_bound(&forged, request(&arguments), crate::binding_test_control())
                         .is_err()
                 );
             }
@@ -563,7 +632,11 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
     );
     assert!(
         builtin_engine_function_catalog()
-            .validate_bound(&text_literal, request(&mixed))
+            .validate_bound(
+                &text_literal,
+                request(&mixed),
+                crate::binding_test_control()
+            )
             .is_err()
     );
     let list = physical(DataType::List(json_item(false)));
@@ -583,7 +656,7 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
     ))));
     assert!(
         builtin_engine_function_catalog()
-            .validate_bound(&forged, request(&arguments))
+            .validate_bound(&forged, request(&arguments), crate::binding_test_control())
             .is_err()
     );
 }
@@ -603,11 +676,20 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
         expected_result_type: Some(&expected),
     };
     let binding = catalog
-        .resolve_bound_user("__array_literal", FunctionKind::Scalar, explicit)
+        .resolve_bound_user(
+            "__array_literal",
+            FunctionKind::Scalar,
+            explicit,
+            crate::binding_test_control(),
+        )
         .unwrap();
     assert_eq!(output(&binding), &expected);
-    catalog.validate_bound(&binding, explicit).unwrap();
-    catalog.validate_bound(&binding, request(&[])).unwrap();
+    catalog
+        .validate_bound(&binding, explicit, crate::binding_test_control())
+        .unwrap();
+    catalog
+        .validate_bound(&binding, request(&[]), crate::binding_test_control())
+        .unwrap();
     let conflicting = FunctionValueType::new(
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
         false,
@@ -619,7 +701,8 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
                 FunctionBindingRequest {
                     expected_result_type: Some(&conflicting),
                     ..request(&[])
-                }
+                },
+                crate::binding_test_control()
             )
             .is_err()
     );
@@ -647,7 +730,8 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
                     FunctionBindingRequest {
                         expected_result_type: Some(&wrong),
                         ..request(&[])
-                    }
+                    },
+                    crate::binding_test_control()
                 )
                 .is_err()
         );
@@ -661,6 +745,7 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
                 expected_result_type: Some(&expected),
                 ..request(&arguments)
             },
+            crate::binding_test_control(),
         )
         .unwrap();
     let DataType::List(item) = &output(&binding).data_type else {
@@ -694,7 +779,12 @@ fn higher_order_array_result_carries_actual_lambda_result_domain() {
     ];
     assert!(
         builtin_engine_function_catalog()
-            .resolve_bound_user("array_map", FunctionKind::Scalar, request(&wrong))
+            .resolve_bound_user(
+                "array_map",
+                FunctionKind::Scalar,
+                request(&wrong),
+                crate::binding_test_control()
+            )
             .is_err()
     );
 }

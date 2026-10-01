@@ -66,12 +66,52 @@ use novarocks_sql::planning::catalog::TableLookupMode;
 pub(crate) enum FrontendQueryCompilerError {
     Engine(String),
     Analyze(AnalyzeError),
+    Control(novarocks_type_contract::CompileControlError),
 }
 
 impl FrontendQueryCompilerError {
     fn from_compile(error: SqlCompileError) -> Self {
         match error {
-            SqlCompileError::Analyze(error) => Self::Analyze(error),
+            SqlCompileError::Analyze(error) => match error.control_error() {
+                Some(control) => Self::Control(control),
+                None => Self::Analyze(error),
+            },
+            SqlCompileError::Cancelled => {
+                Self::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            SqlCompileError::DeadlineExceeded => {
+                Self::Control(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+            }
+            SqlCompileError::ResourceExhausted => {
+                Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
+            }
+            error => Self::Engine(error.to_string()),
+        }
+    }
+    fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
+        match error {
+            novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
+        }
+    }
+    fn from_completion(
+        error: &novarocks_query_application::preparation::FinalPlanCompletionError,
+    ) -> Self {
+        use novarocks_query_application::preparation::FinalPlanCompletionError as E;
+        match error {
+            E::Cancelled { .. } => {
+                Self::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            E::DeadlineExceeded => {
+                Self::Control(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+            }
+            E::ResourceExhausted => {
+                Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
+            }
+            E::Analyze { error } => match error.control_error() {
+                Some(control) => Self::Control(control),
+                None => Self::Analyze(error.clone()),
+            },
             error => Self::Engine(error.to_string()),
         }
     }
@@ -504,12 +544,7 @@ impl FrontendQueryCompiler {
             .connector_blocking_io
             .runtime()
             .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
-            .map_err(|failure| match failure.error() {
-                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                    error,
-                } => FrontendQueryCompilerError::Analyze(error.clone()),
-                error => FrontendQueryCompilerError::Engine(error.to_string()),
-            })?;
+            .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let lines = completed
             .candidate()
             .render_explain_lines(novarocks_sql::compiler::ExplainRenderBudget::default())
@@ -591,6 +626,7 @@ impl FrontendQueryCompiler {
         // actual preparation edge under the reserved logical query identity;
         // the older analyze/optimize hooks belong to the sealed path and no
         // longer run for this statement shape.
+        let encoding_control = request.control().clone();
         let completed = crate::preparation_diagnostics::observe_result(
             "compile",
             "final_plan_complete",
@@ -602,15 +638,7 @@ impl FrontendQueryCompiler {
                 )
             },
         )
-        .map_err(|failure| match failure.error() {
-            // A statement the analyzer rejected reaches the client as the
-            // analyzer stated it -- code, phase and place in the text --
-            // exactly as it does when the sealed path compiles it.
-            novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                error,
-            } => FrontendQueryCompilerError::Analyze(error.clone()),
-            error => FrontendQueryCompilerError::Engine(error.to_string()),
-        })?;
+        .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         // What this statement delivers is a property of the plan, read before
         // the plan is consumed by encoding.
         let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
@@ -629,8 +657,9 @@ impl FrontendQueryCompiler {
             completed,
             self.functions.as_ref(),
             None,
+            &encoding_control,
         )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        .map_err(FrontendQueryCompilerError::from_encode)?;
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
@@ -732,16 +761,12 @@ impl FrontendQueryCompiler {
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
+        let encoding_control = request.control().clone();
         let completed = self
             .connector_blocking_io
             .runtime()
             .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
-            .map_err(|failure| match failure.error() {
-                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                    error,
-                } => FrontendQueryCompilerError::Analyze(error.clone()),
-                error => FrontendQueryCompilerError::Engine(error.to_string()),
-            })?;
+            .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let plan = Arc::clone(completed.candidate().plan());
         let annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]> =
             completed.candidate().display_annotations().to_vec().into();
@@ -754,8 +779,9 @@ impl FrontendQueryCompiler {
             completed,
             self.functions.as_ref(),
             None,
+            &encoding_control,
         )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        .map_err(FrontendQueryCompilerError::from_encode)?;
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description = novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
             novarocks_query_application::api::QueryExecutionKind::Read,
@@ -999,4 +1025,40 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
         level,
         explain.logical || matches!(explain.format, ExplainFormat::Logical),
     )
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn query_compile_encode_and_analyze_preserve_control_category() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let errors = [
+                FrontendQueryCompilerError::from_compile(control.into()),
+                FrontendQueryCompilerError::from_encode(
+                    novarocks_plan_codec::PhysicalEncodeError::Control(control),
+                ),
+                FrontendQueryCompilerError::from_compile(SqlCompileError::Analyze(
+                    AnalyzeError::control(control),
+                )),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(error, FrontendQueryCompilerError::Control(actual) if actual == control)
+                );
+            }
+            assert!(matches!(
+                FrontendQueryCompilerError::from_encode(
+                    novarocks_plan_codec::PhysicalEncodeError::Invalid(control.to_string())
+                ),
+                FrontendQueryCompilerError::Engine(_)
+            ));
+        }
+    }
 }

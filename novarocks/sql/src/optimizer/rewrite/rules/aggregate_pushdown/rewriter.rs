@@ -152,7 +152,8 @@ pub(crate) fn rewrite(
     column_ref_factory: &mut ColumnRefFactory,
     arena: &mut ScalarArena,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<OptExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, crate::compiler::SqlCompileError> {
     let PushPlan {
         side: plan_side,
         target_subtree,
@@ -205,7 +206,7 @@ pub(crate) fn rewrite(
                 };
                 Ok((partial_spec, output_col))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
 
     // 2. Partial group-by output columns (column-ref pass-through).
     let partial_groupby_outputs: Vec<OutputColumn> = partial_groupby
@@ -271,29 +272,34 @@ pub(crate) fn rewrite(
         .aggregates
         .iter()
         .zip(partial_agg_output_cols.iter())
-        .map(|(orig_spec, pc)| -> Result<_, String> {
-            let arg_id =
-                column_ref_scalar(arena, pc.column_id, pc.name.clone(), pc.value_type.clone());
-            let name = final_fn_name(&orig_spec.name);
-            let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
-                function_catalog,
-                arena,
-                &name,
-                &[arg_id],
-                &orig_spec.order_by,
-                true,
-            )
-            .map_err(|error| format!("failed to resolve aggregate pushdown `{name}`: {error}"))?;
-            Ok(ScalarAggregateSpec {
-                output_column_id: orig_spec.output_column_id,
-                name,
-                args: vec![arg_id],
-                distinct: false,
-                order_by: orig_spec.order_by.clone(),
-                resolved,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .map(
+            |(orig_spec, pc)| -> Result<_, crate::compiler::SqlCompileError> {
+                let arg_id =
+                    column_ref_scalar(arena, pc.column_id, pc.name.clone(), pc.value_type.clone());
+                let name = final_fn_name(&orig_spec.name);
+                let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+                    function_catalog,
+                    arena,
+                    &name,
+                    &[arg_id],
+                    &orig_spec.order_by,
+                    true,
+                    control,
+                )
+                .map_err(|error| {
+                    format!("failed to resolve aggregate pushdown `{name}`: {error}")
+                })?;
+                Ok(ScalarAggregateSpec {
+                    output_column_id: orig_spec.output_column_id,
+                    name,
+                    args: vec![arg_id],
+                    distinct: false,
+                    order_by: orig_spec.order_by.clone(),
+                    resolved,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
 
     // 5. Final aggregate output columns.
     let final_group_output_cols: Vec<OutputColumn> = original
@@ -733,6 +739,7 @@ mod tests {
             &mut factory,
             &mut arena,
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("aggregate pushdown rewrite");
         let (_, top_plan) = unwrap_exposure_project(out);
@@ -822,6 +829,7 @@ mod tests {
                 &[arg],
                 &[],
                 false,
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
             let mut expected = crate::functions::aggregate_result_type(&resolved).clone();
@@ -861,6 +869,7 @@ mod tests {
                 &mut factory,
                 &mut arena,
                 crate::functions::builtin_sql_function_catalog(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
             let (exposure, final_plan) = unwrap_exposure_project(out);
@@ -930,6 +939,7 @@ mod tests {
             &mut factory,
             &mut arena,
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("aggregate pushdown rewrite");
         let (_, top_plan) = unwrap_exposure_project(out);
@@ -997,6 +1007,7 @@ mod tests {
             &mut factory,
             &mut arena,
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("aggregate pushdown rewrite");
         let (items, top_plan) = unwrap_exposure_project(out);
@@ -1136,6 +1147,7 @@ mod tests {
             &mut factory,
             &mut arena,
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("aggregate pushdown rewrite");
 
@@ -1305,6 +1317,7 @@ mod tests {
             &mut factory,
             &mut arena,
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("aggregate pushdown rewrite");
         let (_, top_plan) = unwrap_exposure_project(rewritten);
@@ -1436,6 +1449,7 @@ mod tests {
             &mut factory,
             &mut arena,
             crate::functions::builtin_sql_function_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("aggregate pushdown rewrite");
         let (items, top_plan) = unwrap_exposure_project(rewritten);

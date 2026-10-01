@@ -107,65 +107,87 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         &self,
         name: &str,
         arg_types: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedScalarFunction, ResolveError> {
-        let arguments = arg_types
-            .iter()
-            .cloned()
-            .map(|data_type| FunctionArgument::Value {
-                value_type: FunctionValueType::new(data_type, true),
-                constant: None,
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        )?;
+        let result = (|| {
+            if arg_types.len() > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
+                return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
+            }
+            let mut arguments = Vec::with_capacity(arg_types.len());
+            for data_type in arg_types {
+                work.step()?;
+                arguments.push(FunctionArgument::Value {
+                    value_type: FunctionValueType::new(data_type.clone(), true),
+                    constant: None,
+                });
+            }
+            work.flush()?;
+            let bound = self
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Scalar,
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                    },
+                    control,
+                )
+                .map_err(|error| match error {
+                    FunctionBindingError::Control(error) => ResolveError::Control(error),
+                    FunctionBindingError::UnknownFunction => ResolveError::UnknownFunction,
+                    FunctionBindingError::HiddenFunction => ResolveError::HiddenFunction,
+                    FunctionBindingError::NoMatchingOverload => ResolveError::NoMatchingSignature {
+                        candidates: self
+                            .definition(name, FunctionKind::Scalar)
+                            .map(|definition| definition.canonical_signatures().len())
+                            .unwrap_or_default(),
+                        binding_enforced: true,
+                    },
+                    other => ResolveError::BadSignature(other.to_string()),
+                })?;
+            let FunctionResultType::Scalar(result) = bound.selected.result_type else {
+                return Err(ResolveError::BadSignature(
+                    "scalar function selected a relation result".into(),
+                ));
+            };
+            let argument_types = bound
+                .selected
+                .argument_types
+                .into_vec()
+                .into_iter()
+                .map(|argument| {
+                    work.step()?;
+                    match argument {
+                        FunctionArgumentType::Value(value) => Ok(value.data_type),
+                        FunctionArgumentType::Lambda { .. } => Err(ResolveError::BadSignature(
+                            "legacy scalar signature cannot represent a lambda argument".into(),
+                        )),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ResolvedScalarFunction {
+                return_type: result.data_type,
+                argument_types,
+                enforce_argument_binding: true,
             })
-            .collect::<Vec<_>>();
-        let bound = self
-            .resolve_bound_user(
-                name,
-                FunctionKind::Scalar,
-                FunctionBindingRequest {
-                    expected_result_type: None,
-                    arguments: &arguments,
-                    logical_argument_count: arguments.len(),
-                },
-            )
-            .map_err(|error| match error {
-                FunctionBindingError::UnknownFunction => ResolveError::UnknownFunction,
-                FunctionBindingError::HiddenFunction => ResolveError::HiddenFunction,
-                FunctionBindingError::NoMatchingOverload => ResolveError::NoMatchingSignature {
-                    candidates: self
-                        .definition(name, FunctionKind::Scalar)
-                        .map(|definition| definition.canonical_signatures().len())
-                        .unwrap_or_default(),
-                    binding_enforced: true,
-                },
-                other => ResolveError::BadSignature(other.to_string()),
-            })?;
-        let FunctionResultType::Scalar(result) = bound.selected.result_type else {
-            return Err(ResolveError::BadSignature(
-                "scalar function selected a relation result".into(),
-            ));
-        };
-        let argument_types = bound
-            .selected
-            .argument_types
-            .into_vec()
-            .into_iter()
-            .map(|argument| match argument {
-                FunctionArgumentType::Value(value) => Ok(value.data_type),
-                FunctionArgumentType::Lambda { .. } => Err(ResolveError::BadSignature(
-                    "legacy scalar signature cannot represent a lambda argument".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ResolvedScalarFunction {
-            return_type: result.data_type,
-            argument_types,
-            enforce_argument_binding: true,
-        })
+        })();
+        if matches!(result, Err(ResolveError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
     }
 
     fn resolve_scalar_binding(
         &self,
         name: &str,
         arguments: &[FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_user(
             name,
@@ -175,6 +197,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments,
                 logical_argument_count: arguments.len(),
             },
+            control,
         )
     }
 
@@ -183,6 +206,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         name: &str,
         arguments: &[FunctionArgument],
         expected: &FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_user(
             name,
@@ -192,6 +216,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 logical_argument_count: arguments.len(),
                 expected_result_type: Some(expected),
             },
+            control,
         )
     }
 
@@ -199,6 +224,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         &self,
         argument: &FunctionArgument,
         target: &FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_trusted(
             novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME,
@@ -208,6 +234,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 logical_argument_count: 1,
                 expected_result_type: Some(target),
             },
+            control,
         )
     }
 
@@ -215,6 +242,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         &self,
         name: &str,
         arguments: &[FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_user(
             name,
@@ -224,6 +252,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments,
                 logical_argument_count: arguments.len(),
             },
+            control,
         )
     }
 
@@ -231,6 +260,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         &self,
         name: &str,
         arguments: &[FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_user(
             name,
@@ -240,6 +270,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments,
                 logical_argument_count: arguments.len(),
             },
+            control,
         )
     }
 
@@ -252,6 +283,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         name: &str,
         logical_argument_count: usize,
         arguments: &[FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_user(
             name,
@@ -261,6 +293,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments,
                 logical_argument_count,
             },
+            control,
         )
     }
 
@@ -269,6 +302,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         name: &str,
         logical_argument_count: usize,
         arguments: &[FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         self.resolve_bound_trusted(
             name,
@@ -278,6 +312,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments,
                 logical_argument_count,
             },
+            control,
         )
     }
 
@@ -285,8 +320,9 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         &self,
         name: &str,
         arg_types: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        resolve_bound_aggregate(self, name, arg_types, arg_types, false)
+        resolve_bound_aggregate(self, name, arg_types, arg_types, false, control)
     }
 
     fn resolve_aggregate_update_signature(
@@ -294,16 +330,25 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         name: &str,
         logical_arg_types: &[DataType],
         update_arg_types: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        resolve_bound_aggregate(self, name, logical_arg_types, update_arg_types, false)
+        resolve_bound_aggregate(
+            self,
+            name,
+            logical_arg_types,
+            update_arg_types,
+            false,
+            control,
+        )
     }
 
     fn resolve_aggregate_trusted(
         &self,
         name: &str,
         arg_types: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        resolve_bound_aggregate(self, name, arg_types, arg_types, true)
+        resolve_bound_aggregate(self, name, arg_types, arg_types, true, control)
     }
 
     fn volatility(&self, name: &str) -> FunctionVolatility {
@@ -320,23 +365,35 @@ pub(crate) fn resolve_sql_aggregate_binding(
     args: &[crate::analysis::TypedExpr],
     order_by: &[crate::analysis::SortItem],
     trusted: bool,
-) -> Result<ResolvedFunctionBinding, String> {
-    let arguments = args
-        .iter()
-        .map(crate::analysis::function_argument)
-        .chain(
-            order_by
-                .iter()
-                .map(|item| crate::analysis::function_argument(&item.expr)),
-        )
-        .collect::<Vec<_>>();
-    let exact = if trusted {
-        catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments)
-    } else {
-        catalog.resolve_aggregate_binding(name, args.len(), &arguments)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+    )?;
+    let result = (|| {
+        let count = args
+            .len()
+            .checked_add(order_by.len())
+            .filter(|count| *count <= novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS)
+            .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+        let mut arguments = Vec::with_capacity(count);
+        for argument in args.iter().chain(order_by.iter().map(|item| &item.expr)) {
+            work.step()?;
+            arguments.push(crate::analysis::function_argument(argument));
+        }
+        work.flush()?;
+        if trusted {
+            catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments, control)
+        } else {
+            catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
+        }
+    })();
+    if matches!(result, Err(FunctionBindingError::Control(_))) {
+        return result;
     }
-    .map_err(|error| error.to_string())?;
-    Ok(exact)
+    work.finish()?;
+    result
 }
 
 pub fn builtin_sql_function_catalog() -> &'static dyn crate::compiler::SqlFunctionCatalog {
@@ -368,6 +425,7 @@ pub(crate) fn test_resolved_aggregate(
                 arguments: &arguments,
                 logical_argument_count: arguments.len(),
             },
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap_or_else(|error| {
             panic!("test aggregate `{executable_name}` must resolve exactly: {error}")
@@ -433,6 +491,7 @@ impl FunctionBindingResolver for TestExactAggregateBindingResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.resolve_exact(request)
     }
@@ -441,6 +500,7 @@ impl FunctionBindingResolver for TestExactAggregateBindingResolver {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if &self.resolve_exact(request)? == selected {
             Ok(())
@@ -518,6 +578,7 @@ mod tests {
         fn resolve(
             &self,
             _: FunctionBindingRequest<'_>,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<FunctionBindingSelection, FunctionBindingError> {
             Ok(self.0.clone())
         }
@@ -525,6 +586,7 @@ mod tests {
             &self,
             selected: &FunctionBindingSelection,
             _: FunctionBindingRequest<'_>,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<(), FunctionBindingError> {
             if selected == &self.0 {
                 Ok(())
@@ -559,6 +621,7 @@ mod tests {
                     arguments,
                     logical_argument_count: arguments.len(),
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap_or_else(|error| panic!("{name} must bind exactly: {error}"))
     }
@@ -647,7 +710,11 @@ mod tests {
     #[test]
     fn sqlx1_function_snapshot_resolves_registered_signature() {
         let resolved = builtin_sql_function_catalog()
-            .resolve_scalar_signature("lower", &[DataType::Utf8])
+            .resolve_scalar_signature(
+                "lower",
+                &[DataType::Utf8],
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
             .expect("registered function resolves through snapshot");
         assert_eq!(resolved.return_type, DataType::Utf8);
     }
@@ -674,7 +741,8 @@ mod tests {
             crate::compiler::SqlFunctionCatalog::resolve_aggregate_signature(
                 &catalog,
                 "$hidden_stat",
-                &[DataType::Int64]
+                &[DataType::Int64],
+                &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(FunctionResolutionError::HiddenFunction)
         );

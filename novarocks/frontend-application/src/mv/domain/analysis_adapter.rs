@@ -325,7 +325,7 @@ pub fn analyze_mv_select_with_provider(
     query: &novarocks_parser::ast::Query,
     functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
     control: novarocks_sql::compiler::SqlCompileControl,
-) -> Result<MvAnalysis, String> {
+) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(provider);
@@ -337,8 +337,7 @@ pub fn analyze_mv_select_with_provider(
             functions,
             control,
         },
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     let output_columns = refresh_input.analysis_facts().output_columns;
     Ok(MvAnalysis {
         resolved_refs: prepared.resolved_refs().to_vec(),
@@ -691,5 +690,58 @@ mod manageability_tests {
                 .any(|column| column.name() == "Manageability"),
             "SHOW has to report why a listed MV cannot be refreshed"
         );
+    }
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::analyze_mv_select_with_provider;
+    use novarocks_sql::compiler::{SqlCancellationObservation, SqlCompileControl, SqlCompileError};
+    use std::sync::Arc;
+
+    struct Cancelled(bool);
+    impl SqlCancellationObservation for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            self.0
+        }
+    }
+
+    struct NoLookupAfterControl;
+    impl novarocks_sql::planning::catalog::PlannerTableProvider for NoLookupAfterControl {
+        fn resolve_table_for_analysis(
+            &self,
+            _catalog: Option<&str>,
+            _database: &str,
+            _table: &str,
+        ) -> Result<novarocks_sql::planning::catalog::ResolvedAnalyzerTable, String> {
+            panic!("entry control failure must precede catalog materialization")
+        }
+    }
+
+    #[test]
+    fn aggregate_preanalysis_preserves_original_request_entry_control() {
+        let query =
+            crate::mv::domain::refresh::definition::parse_mv_select_query("SELECT sum(x) FROM t")
+                .unwrap();
+        let provider = NoLookupAfterControl;
+        for deadline in [false, true] {
+            let control = SqlCompileControl::new(
+                deadline.then(std::time::Instant::now),
+                Arc::new(Cancelled(!deadline)),
+            );
+            let result = analyze_mv_select_with_provider(
+                Some("default_catalog"),
+                &provider,
+                "default_db",
+                &query,
+                novarocks_sql::compiler::builtin_sql_function_catalog(),
+                control,
+            );
+            assert!(matches!(
+                (deadline, result),
+                (false, Err(SqlCompileError::Cancelled))
+                    | (true, Err(SqlCompileError::DeadlineExceeded))
+            ));
+        }
     }
 }

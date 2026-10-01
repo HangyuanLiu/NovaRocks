@@ -230,16 +230,16 @@ impl FrontendMvProductAdapter {
     /// Run one foreground DDL path under the same per-target FIFO gate as
     /// refresh and background maintenance. The SQL session cancellation scope
     /// remains the authority while the statement waits for its turn.
-    pub(crate) fn execute_serialized<T>(
+    pub(crate) fn execute_serialized<T, E: From<String>>(
         &self,
         target: &novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        action: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         let _gate_lease = self
             .acquire_activity_lease(target, owner, execution)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| E::from(error.to_string()))?;
         action()
     }
 
@@ -281,7 +281,8 @@ fn preparation_application_error(
         }
         RefreshErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
     };
-    MvApplicationError::new(kind, error.message)
+    MvApplicationError::new(kind, error.message.clone())
+        .with_compile_control(error.compile_control_error())
 }
 
 #[derive(Clone)]
@@ -559,23 +560,25 @@ fn scheduler_outcome_log_fields(
 ) -> Option<(&'static str, &str)> {
     match disposition {
         ScheduledRefreshDisposition::TransientUnavailable(reason) => {
-            Some(("transient_unavailable", reason))
+            Some(("transient_unavailable", reason.message()))
         }
         ScheduledRefreshDisposition::InvalidDefinition(reason) => {
-            Some(("invalid_definition", reason))
+            Some(("invalid_definition", reason.message()))
         }
-        ScheduledRefreshDisposition::TerminalFailure(reason) => Some(("terminal_failure", reason)),
-        ScheduledRefreshDisposition::Corruption(reason) => Some(("corruption", reason)),
+        ScheduledRefreshDisposition::TerminalFailure(reason) => {
+            Some(("terminal_failure", reason.message()))
+        }
+        ScheduledRefreshDisposition::Corruption(reason) => Some(("corruption", reason.message())),
         ScheduledRefreshDisposition::InvariantViolation(reason) => {
-            Some(("invariant_violation", reason))
+            Some(("invariant_violation", reason.message()))
         }
-        ScheduledRefreshDisposition::TargetGone => {
+        ScheduledRefreshDisposition::TargetGone(_) => {
             Some(("target_gone", "MV target no longer exists"))
         }
         ScheduledRefreshDisposition::Completed
         | ScheduledRefreshDisposition::NoOp
-        | ScheduledRefreshDisposition::AlreadyActive
-        | ScheduledRefreshDisposition::ShutdownCancelled => None,
+        | ScheduledRefreshDisposition::AlreadyActive(_)
+        | ScheduledRefreshDisposition::ShutdownCancelled(_) => None,
     }
 }
 
@@ -585,25 +588,29 @@ fn execute_scheduled_refresh(
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> ScheduledRefreshDisposition {
     if scheduled_refresh_test_barrier(&request.target, &cancellation) {
-        return ScheduledRefreshDisposition::ShutdownCancelled;
+        return ScheduledRefreshDisposition::ShutdownCancelled(None);
     }
     let topology = match dependencies.topology.snapshot() {
         Ok(snapshot) => snapshot,
-        Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.to_string()),
+        Err(error) => {
+            return ScheduledRefreshDisposition::TransientUnavailable(error.to_string().into());
+        }
     };
     // FE restart begins before authenticated BE announces have rebuilt the
     // runtime topology. The MV definition remains valid, so retry after the
     // frontend observes at least one admitted backend instead of blocking it.
     if topology.targets().is_empty() {
         return ScheduledRefreshDisposition::TransientUnavailable(
-            "scheduler refresh is waiting for a non-empty admitted backend topology".to_string(),
+            "scheduler refresh is waiting for a non-empty admitted backend topology"
+                .to_string()
+                .into(),
         );
     }
     let deadline = match Instant::now().checked_add(dependencies.attempt_timeout) {
         Some(deadline) => deadline,
         None => {
             return ScheduledRefreshDisposition::InvariantViolation(
-                "MV worker deadline overflow".to_string(),
+                "MV worker deadline overflow".to_string().into(),
             );
         }
     };
@@ -629,10 +636,10 @@ fn execute_scheduled_refresh(
             &dependencies.runtime,
         ) {
             Ok(context) => context,
-            Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error),
+            Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.into()),
         };
     if cancellation.is_cancelled() {
-        return ScheduledRefreshDisposition::ShutdownCancelled;
+        return ScheduledRefreshDisposition::ShutdownCancelled(None);
     }
     let steps = match dependencies
         .background_engine
@@ -645,7 +652,7 @@ fn execute_scheduled_refresh(
     let mut any_effect = false;
     for step in steps {
         if cancellation.is_cancelled() {
-            return ScheduledRefreshDisposition::ShutdownCancelled;
+            return ScheduledRefreshDisposition::ShutdownCancelled(None);
         }
         let attempt = dependencies.product_service.reserve_refresh_attempt();
         let publication_id = attempt.publication_id.as_uuid();
@@ -721,45 +728,53 @@ fn repository_disposition(
 ) -> ScheduledRefreshDisposition {
     use novarocks_mv_application::repository::MvRepositoryErrorKind;
     match error.kind() {
-        MvRepositoryErrorKind::Conflict => ScheduledRefreshDisposition::AlreadyActive,
-        MvRepositoryErrorKind::NotFound => ScheduledRefreshDisposition::TargetGone,
+        MvRepositoryErrorKind::Conflict => ScheduledRefreshDisposition::AlreadyActive(None),
+        MvRepositoryErrorKind::NotFound => ScheduledRefreshDisposition::TargetGone(None),
         MvRepositoryErrorKind::Unavailable => {
-            ScheduledRefreshDisposition::TransientUnavailable(error.to_string())
+            ScheduledRefreshDisposition::TransientUnavailable(error.to_string().into())
         }
         MvRepositoryErrorKind::Corruption => {
-            ScheduledRefreshDisposition::Corruption(error.to_string())
+            ScheduledRefreshDisposition::Corruption(error.to_string().into())
         }
         MvRepositoryErrorKind::CommitUnknown => {
-            ScheduledRefreshDisposition::TerminalFailure(error.to_string())
+            ScheduledRefreshDisposition::TerminalFailure(error.to_string().into())
         }
         MvRepositoryErrorKind::InvalidRequest => {
-            ScheduledRefreshDisposition::InvariantViolation(error.to_string())
+            ScheduledRefreshDisposition::InvariantViolation(error.to_string().into())
         }
     }
 }
 
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
     use crate::mv::domain::application::MvApplicationErrorKind;
+    let failure = novarocks_mv_application::scheduler_runtime::MvRefreshFailure::new(
+        error.message(),
+        error.compile_control_error(),
+    );
     match error.kind() {
-        MvApplicationErrorKind::AlreadyActive => ScheduledRefreshDisposition::AlreadyActive,
-        MvApplicationErrorKind::TargetGone => ScheduledRefreshDisposition::TargetGone,
+        MvApplicationErrorKind::AlreadyActive => {
+            ScheduledRefreshDisposition::AlreadyActive(error.compile_control_error())
+        }
+        MvApplicationErrorKind::TargetGone => {
+            ScheduledRefreshDisposition::TargetGone(error.compile_control_error())
+        }
         MvApplicationErrorKind::Unavailable | MvApplicationErrorKind::BindingInvalidated => {
-            ScheduledRefreshDisposition::TransientUnavailable(error.message().to_owned())
+            ScheduledRefreshDisposition::TransientUnavailable(failure)
         }
         MvApplicationErrorKind::InvalidRequest => {
-            ScheduledRefreshDisposition::InvalidDefinition(error.message().to_owned())
+            ScheduledRefreshDisposition::InvalidDefinition(failure)
         }
-        MvApplicationErrorKind::Corruption => {
-            ScheduledRefreshDisposition::Corruption(error.message().to_owned())
-        }
+        MvApplicationErrorKind::Corruption => ScheduledRefreshDisposition::Corruption(failure),
         MvApplicationErrorKind::TerminalFailure
         | MvApplicationErrorKind::CommitUnknown
         | MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
-            ScheduledRefreshDisposition::TerminalFailure(error.message().to_owned())
+            ScheduledRefreshDisposition::TerminalFailure(failure)
         }
-        MvApplicationErrorKind::ShutdownCancelled => ScheduledRefreshDisposition::ShutdownCancelled,
+        MvApplicationErrorKind::ShutdownCancelled => {
+            ScheduledRefreshDisposition::ShutdownCancelled(error.compile_control_error())
+        }
         MvApplicationErrorKind::Engine | MvApplicationErrorKind::Repository => {
-            ScheduledRefreshDisposition::InvariantViolation(error.message().to_owned())
+            ScheduledRefreshDisposition::InvariantViolation(failure)
         }
     }
 }
@@ -856,5 +871,59 @@ mod shutdown_tests {
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("retry must join the retained MV maintenance worker");
+    }
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::preparation_application_error;
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use crate::mv::domain::lifecycle::RefreshError;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn foreground_preparation_terminal_retains_control_without_changing_kind() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = preparation_application_error(RefreshError::from(
+                novarocks_sql::compiler::SqlCompileError::from(control),
+            ));
+            assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
+        }
+    }
+    #[test]
+    fn application_compile_control_cause_reaches_actual_scheduler_terminal() {
+        use super::{application_disposition, scheduler_outcome_log_fields};
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = preparation_application_error(RefreshError::from(
+                novarocks_sql::compiler::SqlCompileError::from(control),
+            ));
+            let message = error.message().to_owned();
+            let disposition = application_disposition(error);
+            assert_eq!(disposition.compile_control_error(), Some(control));
+            assert_eq!(
+                scheduler_outcome_log_fields(&disposition),
+                Some(("invalid_definition", message.as_str()))
+            );
+            let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
+                true, 1, 1, 10, 40,
+            ));
+            let decision = runtime.record(&7, disposition, 100);
+            assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
+            assert_eq!(decision.compile_control_error(), Some(control));
+            assert!(runtime.is_suppressed(&7, 100));
+        }
     }
 }

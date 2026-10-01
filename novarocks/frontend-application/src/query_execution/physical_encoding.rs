@@ -153,56 +153,70 @@ pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     functions: &EngineFunctionCatalog,
     write_targets: Option<&WriteTargetFacts<'_>>,
-) -> Result<EncodedCompletedPlan, String> {
-    let semantic_candidate = paired.candidate().clone();
-    let (candidate, reads) = paired.into_parts();
-    let plan = candidate.plan();
-    let mut encodings = BTreeMap::new();
-    let mut capabilities = BTreeMap::new();
-    for (occurrence, read) in reads.into_occurrences() {
-        let FrozenProviderRead {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    // Legacy materialization is opaque work here. Entry and exit observation
+    // do not claim that its internal operations are cooperatively bounded.
+    let result = (|| -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+        let semantic_candidate = paired.candidate().clone();
+        let (candidate, reads) = paired.into_parts();
+        let plan = candidate.plan();
+        let mut encodings = BTreeMap::new();
+        let mut capabilities = BTreeMap::new();
+        for (occurrence, read) in reads.into_occurrences() {
+            let FrozenProviderRead {
+                access,
+                generation,
+                catalog,
+                encoding,
+            } = read.access;
+            encodings.insert(occurrence, encoding);
+            capabilities.insert(occurrence, (read.binding, access, generation, catalog));
+        }
+        let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
+        let encoded = encode_physical_plan_v1(plan, functions, &facts, control)?;
+        let access = attempt_access_for_completed_plan(plan, capabilities)?;
+        let scans = completed_plan_scan_facts(plan, &encodings)?;
+        let provenance = mint_native_encoding_provenance();
+        let topology = completed_plan_topology(plan)?;
+        let submission = completed_plan_submission_facts(plan, &encoded, &topology)?;
+        // A static plan is a property of the plan, not of an attempt: every
+        // fragment is frozen here, once, and every attempt -- a recovery
+        // included -- creates its tasks from these bytes.
+        let native = NativeFragmentAttachment::for_completed_plan(
+            freeze_completed_fragments(encoded.fragments, &submission, topology.anchor)?,
+            topology.anchor,
+            provenance,
+        )?;
+        let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
+        let plan_facts = AttemptPlanFacts::from_completed(
+            scheduling,
+            completed_plan_edge_facts(plan)?,
+            scans,
+            submission,
+            AttemptRuntimeFilterFacts::from_completed(plan)?,
+            // A plan that writes states which targets its root delivers, because
+            // that is what the commit is taken over. A read plan writes none, and
+            // says none rather than an empty list.
+            Some(completed_plan_write_targets(plan)).filter(|targets| !targets.is_empty()),
+        );
+        Ok(EncodedCompletedPlan {
+            semantic_candidate,
+            native,
+            topology,
+            plan_facts,
             access,
-            generation,
-            catalog,
-            encoding,
-        } = read.access;
-        encodings.insert(occurrence, encoding);
-        capabilities.insert(occurrence, (read.binding, access, generation, catalog));
+        })
+    })();
+    if matches!(
+        &result,
+        Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
+    ) {
+        return result;
     }
-    let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
-    let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
-    let access = attempt_access_for_completed_plan(plan, capabilities)?;
-    let scans = completed_plan_scan_facts(plan, &encodings)?;
-    let provenance = mint_native_encoding_provenance();
-    let topology = completed_plan_topology(plan)?;
-    let submission = completed_plan_submission_facts(plan, &encoded, &topology)?;
-    // A static plan is a property of the plan, not of an attempt: every
-    // fragment is frozen here, once, and every attempt -- a recovery
-    // included -- creates its tasks from these bytes.
-    let native = NativeFragmentAttachment::for_completed_plan(
-        freeze_completed_fragments(encoded.fragments, &submission, topology.anchor)?,
-        topology.anchor,
-        provenance,
-    )?;
-    let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
-    let plan_facts = AttemptPlanFacts::from_completed(
-        scheduling,
-        completed_plan_edge_facts(plan)?,
-        scans,
-        submission,
-        AttemptRuntimeFilterFacts::from_completed(plan)?,
-        // A plan that writes states which targets its root delivers, because
-        // that is what the commit is taken over. A read plan writes none, and
-        // says none rather than an empty list.
-        Some(completed_plan_write_targets(plan)).filter(|targets| !targets.is_empty()),
-    );
-    Ok(EncodedCompletedPlan {
-        semantic_candidate,
-        native,
-        topology,
-        plan_facts,
-        access,
-    })
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    result
 }
 
 /// How one completed plan's fragments relate to each other.
@@ -938,6 +952,7 @@ mod tests {
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
             None,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("a completed plan encodes");
         // The shape is the distributed one - rows are produced somewhere and
@@ -972,6 +987,85 @@ mod tests {
         assert_eq!(encoded.native.fragment_ids().count(), plan_fragments);
     }
 
+    #[test]
+    fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CompletedTailControl {
+            encode_checkpoints: AtomicUsize,
+            tail_error: CompileControlError,
+            earlier_error: Option<CompileControlError>,
+        }
+        impl PureCompileControl for CompletedTailControl {
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                // FE entry, codec entry, codec exit, then FE exit after the
+                // actual native fragment freezes and attempt-fact projection.
+                if phase == CompilePhase::Encode
+                    && self.encode_checkpoints.fetch_add(1, Ordering::SeqCst) == 3
+                {
+                    return Err(self.tail_error);
+                }
+                if phase == CompilePhase::Validate
+                    && let Some(error) = self.earlier_error
+                {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let (_root, scope) = query_scope();
+            let completed = runtime
+                .block_on(
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                )
+                .expect("the actual admitted VALUES plan completes");
+            let fragments = completed.candidate().plan().fragments().len();
+            let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
+            let control = CompletedTailControl {
+                encode_checkpoints: AtomicUsize::new(0),
+                tail_error: error,
+                earlier_error: None,
+            };
+            assert!(matches!(
+                encode_completed_plan(completed, &functions, None, &control),
+                Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
+            ));
+            assert_eq!(control.encode_checkpoints.load(Ordering::SeqCst), 4);
+            assert_eq!(
+                crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread() - freezes,
+                fragments,
+                "tail refusal must occur after actual native freezing, rather than at entry",
+            );
+
+            let completed = runtime
+                .block_on(
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                )
+                .unwrap();
+            let first_failure = CompletedTailControl {
+                encode_checkpoints: AtomicUsize::new(0),
+                tail_error: CompileControlError::ResourceExhausted,
+                earlier_error: Some(error),
+            };
+            assert!(matches!(
+                encode_completed_plan(completed, &functions, None, &first_failure),
+                Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
+            ));
+            assert_eq!(first_failure.encode_checkpoints.load(Ordering::SeqCst), 2);
+        }
+    }
+
     /// A static plan is frozen once per plan, not once per attempt: every
     /// attempt of one template - a recovery included - is handed the very
     /// bytes the encoding froze, and making an attempt freezes nothing.
@@ -991,6 +1085,7 @@ mod tests {
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
             None,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("a completed plan encodes");
         let template = encoded.into_attempt_template(version);

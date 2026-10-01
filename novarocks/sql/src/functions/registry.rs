@@ -43,7 +43,12 @@ mod bitmap_base64_type_tests {
                 logical_argument_count: 1,
             };
             let binding = catalog
-                .resolve_bound_user("bitmap_to_base64", FunctionKind::Scalar, request)
+                .resolve_bound_user(
+                    "bitmap_to_base64",
+                    FunctionKind::Scalar,
+                    request,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
                 .unwrap();
             assert_eq!(
                 binding.selected.result_type,
@@ -69,6 +74,7 @@ mod bitmap_base64_type_tests {
                         arguments: &coerced,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
         }
@@ -94,7 +100,8 @@ mod bitmap_base64_type_tests {
                             expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len()
-                        }
+                        },
+                        &crate::compiler::SqlCompileControl::unbounded()
                     )
                     .is_err()
             );

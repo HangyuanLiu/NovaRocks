@@ -42,12 +42,19 @@ impl Rule for SplitAggregateRule {
         matches!(op, Operator::LogicalAggregate(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalAggregate(agg) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if !is_eligible(agg) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let local_output_columns = local_output_columns(agg, &memo.scalars);
@@ -103,11 +110,10 @@ impl Rule for SplitAggregateRule {
             vec![true; agg.aggregates.len()],
             true,
         );
-
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::LogicalAggregate(global),
             children: vec![local_group],
-        }]
+        }])
     }
 }
 
@@ -472,7 +478,13 @@ mod tests {
     fn splits_grouped_aggregate_into_global_over_local() {
         let mut memo = Memo::new();
         let expr = single_grouped_expr(&mut memo);
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -506,7 +518,13 @@ mod tests {
     fn split_global_group_by_uses_local_group_key_layout_not_select_order_output() {
         let mut memo = Memo::new();
         let expr = select_order_grouped_expr(&mut memo);
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -576,7 +594,13 @@ mod tests {
             children: vec![values_group(&mut memo)],
         };
 
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -593,12 +617,24 @@ mod tests {
     fn repeated_apply_reuses_existing_local_group() {
         let mut memo = Memo::new();
         let expr = single_grouped_expr(&mut memo);
-        let first = SplitAggregateRule.apply(&expr, &mut memo);
+        let first = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1);
         let first_local_group = first[0].children[0];
         let group_count_after_first = memo.groups.len();
 
-        let second = SplitAggregateRule.apply(&expr, &mut memo);
+        let second = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].children[0], first_local_group);
         assert_eq!(memo.groups.len(), group_count_after_first);
@@ -608,7 +644,13 @@ mod tests {
     fn splits_scalar_aggregate() {
         let mut memo = Memo::new();
         let expr = single_scalar_expr(&mut memo);
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -686,7 +728,12 @@ mod tests {
             }];
             let resolved: crate::binding::SqlFunctionBinding =
                 crate::functions::builtin_sql_function_catalog()
-                    .resolve_aggregate_binding(name, 1, &arguments)
+                    .resolve_aggregate_binding(
+                        name,
+                        1,
+                        &arguments,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
                     .unwrap()
                     .into();
             let result = crate::functions::aggregate_result_type(&resolved).clone();
@@ -750,7 +797,13 @@ mod tests {
                 op: Operator::LogicalAggregate(aggregate),
                 children: vec![child],
             };
-            let alternative = SplitAggregateRule.apply(&expr, &mut memo);
+            let alternative = SplitAggregateRule
+                .apply(
+                    &expr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
             assert_eq!(
                 alternative.len(),
                 1,
@@ -797,7 +850,13 @@ mod tests {
             )),
             children: vec![child],
         };
-        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        let out = SplitAggregateRule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "avg must now produce a split alternative");
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -833,7 +892,16 @@ mod tests {
             )),
             children: vec![child],
         };
-        assert!(SplitAggregateRule.apply(&distinct, &mut memo).is_empty());
+        assert!(
+            SplitAggregateRule
+                .apply(
+                    &distinct,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
 
         let already_split = MExpr {
             id: memo.next_expr_id(),
@@ -850,7 +918,12 @@ mod tests {
         };
         assert!(
             SplitAggregateRule
-                .apply(&already_split, &mut memo)
+                .apply(
+                    &already_split,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
                 .is_empty()
         );
     }

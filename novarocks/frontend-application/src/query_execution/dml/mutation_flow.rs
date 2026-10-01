@@ -542,6 +542,7 @@ fn compile_dml_change_stream_write(
                 field_names,
             },
         ),
+        &completion_control,
     )?;
     Ok(
         crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
@@ -1359,7 +1360,10 @@ pub(crate) fn stage_prepared_update_mutation(
             });
             let staged = match execution_handle.run_stage() {
                 Ok(staged) => staged,
-                Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
+                Err(
+                    error @ (crate::dml::error::DmlExecutionError::Analyze(_)
+                    | crate::dml::error::DmlExecutionError::Control(_)),
+                ) => {
                     return Err(error);
                 }
                 Err(error) => {
@@ -3092,6 +3096,7 @@ fn execute_exact_cow_match_query(
         paired,
         state.function_catalog().as_ref(),
         None,
+        &completion_control,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
     let description =
@@ -3676,7 +3681,10 @@ pub(crate) fn stage_prepared_merge_mutation(
     });
     let staged = match execution_handle.run_stage() {
         Ok(staged) => staged,
-        Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
+        Err(
+            error @ (crate::dml::error::DmlExecutionError::Analyze(_)
+            | crate::dml::error::DmlExecutionError::Control(_)),
+        ) => {
             return Err(error);
         }
         Err(error) => {

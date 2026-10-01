@@ -282,6 +282,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         _: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         panic!("must not reselect")
     }
@@ -289,6 +290,7 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
             || request.logical_argument_count != self.logical
@@ -317,7 +319,7 @@ impl FunctionEffectOwner for Owner {
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
         self.counts.refine.fetch_add(1, Ordering::Relaxed);
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         if input.function_id != &self.id
             || input.kind != FunctionKind::Aggregate
             || !input.environment.is_empty()

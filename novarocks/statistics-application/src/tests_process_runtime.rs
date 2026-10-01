@@ -90,6 +90,7 @@ impl StatisticsAttemptExecutor for PublishExecutor {
         Ok(StatisticsPublicationOutcome {
             fact: self.outcome,
             finalization_failure: self.finalization_failure.then(|| StatisticsFailure {
+                compile_control: None,
                 message: Arc::from("finalization projection failed"),
             }),
         })
@@ -97,6 +98,7 @@ impl StatisticsAttemptExecutor for PublishExecutor {
 }
 fn failed(error: novarocks_workload_control::WorkError) -> StatisticsAttemptError {
     StatisticsAttemptError::Failed(StatisticsFailure {
+        compile_control: None,
         message: Arc::from(error.to_string()),
     })
 }

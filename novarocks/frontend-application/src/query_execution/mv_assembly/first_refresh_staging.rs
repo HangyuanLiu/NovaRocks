@@ -186,7 +186,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     // The session is opened before the plan is compiled because the plan's
     // writer node carries the recipe it seals: a plan and the session that
     // sealed it must not be separable.
@@ -244,7 +244,7 @@ fn bind_first_refresh_write_dataflow(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
     let target_catalog = prepared.target_catalog().to_string();
     let target_namespace = prepared.target_namespace().to_string();
@@ -342,6 +342,7 @@ fn bind_first_refresh_write_dataflow(
                 |version, dop, reads, targets| {
                     completion.finish(version, dop, reads, targets, &finish_control)
                 },
+                &finish_control,
             )
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
@@ -449,6 +450,7 @@ fn bind_first_refresh_write_dataflow(
                 |version, dop, reads, targets| {
                     completion.finish(version, dop, reads, targets, &finish_control)
                 },
+                &finish_control,
             )
         }
     }

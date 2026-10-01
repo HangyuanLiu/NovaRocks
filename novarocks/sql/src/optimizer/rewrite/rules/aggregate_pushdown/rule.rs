@@ -90,17 +90,15 @@ impl RewriteRule for AggregatePushdownRule {
         let mut factory = factory.borrow_mut();
         let mut arena = arena_rc.borrow_mut();
 
-        Ok(RewriteResult::Changed(
-            super::rewriter::rewrite(
-                &agg,
-                expr.unary_input(),
-                push,
-                &mut factory,
-                &mut arena,
-                ctx.function_catalog(),
-            )
-            .map_err(SqlCompileError::Compilation)?,
-        ))
+        Ok(RewriteResult::Changed(super::rewriter::rewrite(
+            &agg,
+            expr.unary_input(),
+            push,
+            &mut factory,
+            &mut arena,
+            ctx.function_catalog(),
+            &ctx.control_view(),
+        )?))
     }
 }
 

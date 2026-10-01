@@ -151,7 +151,11 @@ mod tests {
     #[test]
     fn unknown_function_cannot_enter_the_aggregate_plan() {
         let error = crate::functions::builtin_sql_function_catalog()
-            .resolve_aggregate_trusted("my_udaf", &[DataType::Int64])
+            .resolve_aggregate_trusted(
+                "my_udaf",
+                &[DataType::Int64],
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
             .expect_err("unregistered aggregate must fail exact resolution");
         assert!(matches!(
             error,
@@ -177,7 +181,10 @@ mod tests {
                 &[DataType::Int64]
             };
             let resolved = crate::compiler::SqlFunctionCatalog::resolve_aggregate_signature(
-                &catalog, name, args,
+                &catalog,
+                name,
+                args,
+                &crate::compiler::SqlCompileControl::unbounded(),
             );
             assert!(
                 resolved.is_ok(),

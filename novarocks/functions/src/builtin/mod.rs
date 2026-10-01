@@ -26,3 +26,8 @@ pub mod signature;
 pub mod catalogue;
 
 pub mod value_conversion;
+
+mod binding_control;
+
+#[cfg(test)]
+mod binding_control_tests;

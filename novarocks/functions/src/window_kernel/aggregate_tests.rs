@@ -216,6 +216,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         _: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         panic!("aggregate OVER must not reselect or resolve by name")
     }
@@ -223,6 +224,7 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
             || request.arguments != self.arguments
@@ -251,7 +253,7 @@ impl FunctionEffectOwner for Owner {
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
         self.counts.refine.fetch_add(1, Ordering::Relaxed);
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         assert_eq!(input.kind, FunctionKind::Aggregate);
         assert_eq!(input.function_id, &self.id);
         assert!(std::ptr::eq(input.parameters, &self.parameters));

@@ -958,6 +958,7 @@ mod intrinsic_error_consumer_tests {
                     arguments: &arguments,
                     logical_argument_count: args.len(),
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         catalog
@@ -968,6 +969,7 @@ mod intrinsic_error_consumer_tests {
                     arguments: &arguments,
                     logical_argument_count: args.len(),
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         let FunctionResultType::Scalar(output) = binding.selected.result_type.clone() else {

@@ -571,6 +571,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
         fn resolve(
             &self,
             _: FunctionBindingRequest<'_>,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<FunctionBindingSelection, FunctionBindingError> {
             panic!("specialization must not resolve an overload")
         }
@@ -578,6 +579,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             &self,
             selected: &FunctionBindingSelection,
             request: FunctionBindingRequest<'_>,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<(), FunctionBindingError> {
             self.validations.fetch_add(1, Ordering::Relaxed);
             if selected.overload.as_str() != "fixture/i64" || request.arguments.len() != 1 {
@@ -606,7 +608,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
             control
                 .checkpoint(CompilePhase::FunctionSpecialization, 0)
                 .map_err(FunctionEffectOwnerError::Control)?;
-            self.validate_selected(input.selected, input.request)?;
+            self.validate_selected(input.selected, input.request, control)?;
             Ok(CallEffects {
                 value_stability: self.base.value_stability,
                 own_row_error: self.base.own_row_error,

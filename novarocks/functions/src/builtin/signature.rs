@@ -916,11 +916,11 @@ pub(crate) fn unify_value(
                 || (ty.logical_type == ValueLogicalType::LargeInt
                     && anchor_matches(spec, &ty.data_type))
                 || realize_value(spec, bindings, ty.nullable).is_ok_and(|target| {
-                    super::value_conversion::resolve_value_conversion(ty, &target).is_ok()
+                    super::value_conversion::recipe_selection(ty, &target).is_ok()
                 })
         }
         TypeSpec::Utf8 if ty.logical_type == ValueLogicalType::Json => {
-            super::value_conversion::resolve_value_conversion(
+            super::value_conversion::recipe_selection(
                 ty,
                 &FunctionValueType::new(DataType::Utf8, ty.nullable),
             )

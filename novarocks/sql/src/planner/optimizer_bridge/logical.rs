@@ -1024,7 +1024,13 @@ mod tests {
         };
         logical_scan.stats_ref = Some(stats_ref);
 
-        let physical = ScanToPhysical.apply(&logical_expr, &mut memo);
+        let physical = ScanToPhysical
+            .apply(
+                &logical_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(physical.len(), 1);
         let Operator::PhysicalScan(scan) = &physical[0].op else {
@@ -1067,7 +1073,13 @@ mod tests {
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo_for_test(&scan, &mut memo);
         let logical_expr = memo.groups[gid].logical_exprs[0].clone();
-        let mut physical = ScanToPhysical.apply(&logical_expr, &mut memo);
+        let mut physical = ScanToPhysical
+            .apply(
+                &logical_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(physical.len(), 1);
 
         let execution_props = PlanExecutionProps {

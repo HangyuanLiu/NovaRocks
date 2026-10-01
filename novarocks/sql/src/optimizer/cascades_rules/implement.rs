@@ -387,11 +387,18 @@ impl Rule for ScanToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalScan(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalScan(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalScan(ScanOp {
                 database: op.database.clone(),
                 table: op.table.clone(),
@@ -408,7 +415,7 @@ impl Rule for ScanToPhysical {
                 mv_rewritten_from: op.mv_rewritten_from.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -428,16 +435,23 @@ impl Rule for FilterToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalFilter(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalFilter(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalFilter(FilterOp {
                 predicate: op.predicate,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -457,17 +471,24 @@ impl Rule for ProjectToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalProject(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalProject(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalProject(ProjectOp {
                 items: op.items.clone(),
                 output_qualifier: op.output_qualifier.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -487,9 +508,16 @@ impl Rule for JoinToHashJoin {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalJoin(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalJoin(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         let (raw_eq_conds, mut other) =
             extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars);
@@ -536,7 +564,7 @@ impl Rule for JoinToHashJoin {
 
         if eq_conds.is_empty() {
             // No equality conditions — JoinToNestLoop should handle this.
-            return vec![];
+            return Ok(vec![]);
         }
         let eq_conditions = eq_conds
             .into_iter()
@@ -549,9 +577,9 @@ impl Rule for JoinToHashJoin {
         let other_condition = other;
         let Some(build_side) = crate::optimizer::operator::exact_hash_join_build_side(op.join_type)
         else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: op.join_type,
                 eq_conditions,
@@ -560,7 +588,7 @@ impl Rule for JoinToHashJoin {
                 distribution: JoinDistribution::Unknown,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -580,9 +608,16 @@ impl Rule for JoinToNestLoop {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalJoin(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalJoin(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         // NestLoop is used for cross joins or joins without equality
         // conditions. We must check feasibility after `orient_eq_pair`,
@@ -603,19 +638,19 @@ impl Rule for JoinToNestLoop {
                 .any(|p| coerce_hash_join_eq_condition(&memo.scalars, p).is_some());
             if has_orientable_pair {
                 // Has at least one usable equi-key — JoinToHashJoin handles this.
-                return vec![];
+                return Ok(vec![]);
             }
         } else if !eq_conds.is_empty() && op.join_type != JoinKind::Cross {
             // 1-child join (shouldn't happen for binary joins) — defer.
-            return vec![];
+            return Ok(vec![]);
         }
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: op.join_type,
                 condition: op.condition,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -635,11 +670,18 @@ impl Rule for AggToHashAgg {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAggregate(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalAggregate(op) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: op.stage.to_physical_mode(),
                 group_by: op.group_by.clone(),
@@ -649,7 +691,7 @@ impl Rule for AggToHashAgg {
                 is_merge: op.is_merge.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -669,11 +711,18 @@ impl Rule for SortToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalSort(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalSort(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalSort(SortOp {
                 items: op.items.clone(),
                 // Propagate the analytic-partition tag through Logical→Physical
@@ -683,7 +732,7 @@ impl Rule for SortToPhysical {
                 topn_type: op.topn_type,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -703,11 +752,17 @@ impl Rule for LimitToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalLimit(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        let Operator::LogicalLimit(op) = &expr.op else {
-            return vec![];
-        };
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
 
+        let Operator::LogicalLimit(op) = &expr.op else {
+            return Ok(vec![]);
+        };
         // If the Limit has a Sort directly underneath, SortLimitToTopN has
         // already added an equivalent LogicalTopN to this same group; defer
         // exclusively to that path. Producing both PhysicalLimit (here) and
@@ -724,17 +779,17 @@ impl Rule for LimitToPhysical {
                 .iter()
                 .any(|m| matches!(m.op, Operator::LogicalSort(_)));
             if child_has_sort {
-                return vec![];
+                return Ok(vec![]);
             }
         }
 
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalLimit(LimitOp {
                 limit: op.limit,
                 offset: op.offset,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -754,16 +809,23 @@ impl Rule for AssertOneRowToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAssertOneRow(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalAssertOneRow(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalAssertOneRow(AssertOneRowOp {
                 subquery_text: op.subquery_text.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -783,11 +845,18 @@ impl Rule for TopNToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalTopN(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalTopN(TopNOp {
                 items: op.items.clone(),
                 limit: op.limit,
@@ -796,7 +865,7 @@ impl Rule for TopNToPhysical {
                 is_split: op.is_split,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -869,30 +938,38 @@ impl Rule for WindowToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalWindow(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalWindow(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         if expr.children.len() != 1 {
-            return vec![];
+            return Ok(vec![]);
         }
         let child_group = expr.children[0];
-
-        // Emit a single PhysicalWindow with all window expressions.
-        // The fragment builder groups expressions by (partition_by, order_by)
-        // signature internally and emits one Sort+Analytic node per group —
-        // all within the same fragment, without cross-group exchanges.
-        // Cascades-level splitting (one PhysicalWindow per signature group)
-        // would cause the CBO to insert distribution enforcers (HASH EXCHANGE)
-        // between window nodes when their partition key sets differ, which
-        // breaks pipelined analytic execution.
-        vec![NewExpr {
-            op: Operator::PhysicalWindow(WindowOp {
-                window_exprs: op.window_exprs.clone(),
-                output_columns: op.output_columns.clone(),
-            }),
-            children: vec![child_group],
-        }]
+        Ok(
+            // Emit a single PhysicalWindow with all window expressions.
+            // The fragment builder groups expressions by (partition_by, order_by)
+            // signature internally and emits one Sort+Analytic node per group —
+            // all within the same fragment, without cross-group exchanges.
+            // Cascades-level splitting (one PhysicalWindow per signature group)
+            // would cause the CBO to insert distribution enforcers (HASH EXCHANGE)
+            // between window nodes when their partition key sets differ, which
+            // breaks pipelined analytic execution.
+            vec![NewExpr {
+                op: Operator::PhysicalWindow(WindowOp {
+                    window_exprs: op.window_exprs.clone(),
+                    output_columns: op.output_columns.clone(),
+                }),
+                children: vec![child_group],
+            }],
+        )
     }
 }
 
@@ -912,14 +989,21 @@ impl Rule for CTEAnchorToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalCTEAnchor(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalCTEAnchor(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: op.cte_id }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -939,17 +1023,24 @@ impl Rule for CTEProduceToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalCTEProduce(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalCTEProduce(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalCTEProduce(CTEProduceOp {
                 cte_id: op.cte_id,
                 output_columns: op.output_columns.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -969,11 +1060,18 @@ impl Rule for CTEConsumeToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalCTEConsume(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalCTEConsume(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id: op.cte_id,
                 alias: op.alias.clone(),
@@ -981,7 +1079,7 @@ impl Rule for CTEConsumeToPhysical {
                 producer_column_ids: op.producer_column_ids.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1001,11 +1099,18 @@ impl Rule for RepeatToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalRepeat(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalRepeat(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
@@ -1018,7 +1123,7 @@ impl Rule for RepeatToPhysical {
                 grouping_fn_ids: op.grouping_fn_ids.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1038,14 +1143,21 @@ impl Rule for ChangeEventExpandToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalChangeEventExpand(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalChangeEventExpand(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalChangeEventExpand(op.clone()),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1088,9 +1200,16 @@ impl Rule for UnionToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalUnion(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalUnion(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         let child_output_columns = refresh_set_op_child_output_columns(
             memo,
@@ -1098,14 +1217,14 @@ impl Rule for UnionToPhysical {
             op.output_columns.len(),
             &op.child_output_columns,
         );
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalUnion(UnionOp {
                 all: op.all,
                 output_columns: op.output_columns.clone(),
                 child_output_columns,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1125,9 +1244,16 @@ impl Rule for IntersectToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalIntersect(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalIntersect(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         let child_output_columns = refresh_set_op_child_output_columns(
             memo,
@@ -1135,13 +1261,13 @@ impl Rule for IntersectToPhysical {
             op.output_columns.len(),
             &op.child_output_columns,
         );
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalIntersect(IntersectOp {
                 output_columns: op.output_columns.clone(),
                 child_output_columns,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1161,9 +1287,16 @@ impl Rule for ExceptToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalExcept(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalExcept(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         let child_output_columns = refresh_set_op_child_output_columns(
             memo,
@@ -1171,13 +1304,13 @@ impl Rule for ExceptToPhysical {
             op.output_columns.len(),
             &op.child_output_columns,
         );
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalExcept(ExceptOp {
                 output_columns: op.output_columns.clone(),
                 child_output_columns,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1197,17 +1330,24 @@ impl Rule for ValuesToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalValues(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalValues(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: op.rows.clone(),
                 columns: op.columns.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1227,11 +1367,18 @@ impl Rule for GenerateSeriesToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalGenerateSeries(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalGenerateSeries(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalGenerateSeries(GenerateSeriesOp {
                 start: op.start,
                 end: op.end,
@@ -1241,7 +1388,7 @@ impl Rule for GenerateSeriesToPhysical {
                 output_column_id: op.output_column_id,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1261,11 +1408,18 @@ impl Rule for TableFunctionToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalTableFunction(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTableFunction(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
-        vec![NewExpr {
+        Ok(vec![NewExpr {
             op: Operator::PhysicalTableFunction(TableFunctionOp {
                 function_name: op.function_name.clone(),
                 args: op.args.clone(),
@@ -1275,7 +1429,7 @@ impl Rule for TableFunctionToPhysical {
                 is_left_join: op.is_left_join,
             }),
             children: expr.children.clone(),
-        }]
+        }])
     }
 }
 
@@ -1310,7 +1464,13 @@ mod top_n_tests {
             children: vec![dummy_child],
         };
         let rule = TopNToPhysical;
-        let out = rule.apply(&expr, &mut memo);
+        let out = rule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         match &out[0].op {
             Operator::PhysicalTopN(p) => {
@@ -1339,7 +1499,13 @@ mod top_n_tests {
             children: vec![],
         };
 
-        let out = GenerateSeriesToPhysical.apply(&expr, &mut memo);
+        let out = GenerateSeriesToPhysical
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::PhysicalGenerateSeries(p) = &out[0].op else {
             panic!("expected PhysicalGenerateSeries");
@@ -1404,7 +1570,13 @@ mod set_op_tests {
             children: vec![left_group, right_group],
         };
 
-        let out = UnionToPhysical.apply(&logical, &mut memo);
+        let out = UnionToPhysical
+            .apply(
+                &logical,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::PhysicalUnion(union) = &out[0].op else {
             panic!("expected PhysicalUnion");
@@ -1674,7 +1846,13 @@ mod join_demotion_tests {
         );
 
         let rule = JoinToHashJoin;
-        let alternatives = rule.apply(&join_mexpr, &mut memo);
+        let alternatives = rule
+            .apply(
+                &join_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(alternatives.len(), 1);
 
@@ -1762,7 +1940,13 @@ mod join_demotion_tests {
         );
 
         let rule = JoinToHashJoin;
-        let alternatives = rule.apply(&join_mexpr, &mut memo);
+        let alternatives = rule
+            .apply(
+                &join_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alternatives.len(), 1);
         let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
@@ -1796,7 +1980,13 @@ mod join_demotion_tests {
             vec![left_group, right_group],
         );
 
-        let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
+        let alternatives = JoinToHashJoin
+            .apply(
+                &join_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(
             alternatives.len(),
             1,
@@ -1841,13 +2031,25 @@ mod join_demotion_tests {
             vec![left_group, right_group],
         );
 
-        let hash_alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
+        let hash_alternatives = JoinToHashJoin
+            .apply(
+                &join_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert!(
             hash_alternatives.is_empty(),
             "cross-type complex equality must not become a raw hash key"
         );
 
-        let nested_alternatives = JoinToNestLoop.apply(&join_mexpr, &mut memo);
+        let nested_alternatives = JoinToNestLoop
+            .apply(
+                &join_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(
             nested_alternatives.len(),
             1,
@@ -1878,7 +2080,13 @@ mod join_demotion_tests {
             vec![left_group, right_group],
         );
 
-        let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
+        let alternatives = JoinToHashJoin
+            .apply(
+                &join_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alternatives.len(), 1);
         let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
@@ -1909,7 +2117,13 @@ mod join_demotion_tests {
             vec![left_group, right_group],
         );
         let rule = JoinToHashJoin;
-        let alternatives = rule.apply(&expr, &mut memo);
+        let alternatives = rule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(alternatives.len(), 1);
         let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
@@ -2081,7 +2295,13 @@ mod window_split_tests {
         };
 
         let rule = WindowToPhysical;
-        let out = rule.apply(&logical_window_mexpr, &mut memo);
+        let out = rule
+            .apply(
+                &logical_window_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         let terminal = &out[0];
@@ -2246,7 +2466,13 @@ mod two_phase_agg_tests {
             children: vec![child_group],
         };
 
-        let out = AggToHashAgg.apply(&expr, &mut memo);
+        let out = AggToHashAgg
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let Operator::PhysicalHashAggregate(op) = &out[0].op else {
             panic!("expected physical hash aggregate");
@@ -2273,7 +2499,13 @@ mod two_phase_agg_tests {
             )),
             children: vec![child_group],
         };
-        let local_out = AggToHashAgg.apply(&local_expr, &mut memo);
+        let local_out = AggToHashAgg
+            .apply(
+                &local_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(local_out.len(), 1);
         let Operator::PhysicalHashAggregate(local) = &local_out[0].op else {
             panic!("expected local physical aggregate");
@@ -2296,7 +2528,13 @@ mod two_phase_agg_tests {
             )),
             children: vec![local_group],
         };
-        let global_out = AggToHashAgg.apply(&global_expr, &mut memo);
+        let global_out = AggToHashAgg
+            .apply(
+                &global_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(global_out.len(), 1);
         let Operator::PhysicalHashAggregate(global) = &global_out[0].op else {
             panic!("expected global physical aggregate");
@@ -2356,7 +2594,13 @@ mod two_phase_agg_tests {
         };
 
         let rule = AggToHashAgg;
-        let out = rule.apply(&expr, &mut memo);
+        let out = rule
+            .apply(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1, "DISTINCT agg should only produce Single");
         match &out[0].op {

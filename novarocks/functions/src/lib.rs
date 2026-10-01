@@ -341,6 +341,7 @@ pub trait AggregateSignatureResolver: Send + Sync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionResolutionError {
+    Control(novarocks_type_contract::CompileControlError),
     UnknownFunction,
     HiddenFunction,
     NoMatchingSignature {
@@ -353,6 +354,7 @@ pub enum FunctionResolutionError {
 impl fmt::Display for FunctionResolutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Control(error) => error.fmt(formatter),
             Self::UnknownFunction => formatter.write_str("function not registered"),
             Self::HiddenFunction => formatter.write_str("function is hidden from user SQL"),
             Self::NoMatchingSignature { candidates, .. } => write!(
@@ -365,6 +367,36 @@ impl fmt::Display for FunctionResolutionError {
 }
 
 impl std::error::Error for FunctionResolutionError {}
+
+impl From<novarocks_type_contract::CompileControlError> for FunctionResolutionError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl FunctionResolutionError {
+    pub fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        match self {
+            Self::Control(error) => Some(*error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn binding_test_control() -> &'static dyn novarocks_type_contract::PureCompileControl {
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    &Control
+}
 
 /// Safe type-level resolver supplied by a statically linked function bundle.
 pub trait FunctionSignatureResolver: Send + Sync {

@@ -203,6 +203,7 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionSignature,
         novarocks_functions::FunctionResolutionError,
@@ -212,10 +213,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -225,10 +231,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
         _expected: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -236,10 +247,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _argument: &novarocks_functions::FunctionArgument,
         _target: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -247,10 +263,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -258,10 +279,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -272,10 +298,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         _name: &str,
         _logical_argument_count: usize,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -284,17 +315,19 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         name: &str,
         logical_argument_count: usize,
         arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.resolve_aggregate_binding(name, logical_argument_count, arguments)
+        self.resolve_aggregate_binding(name, logical_argument_count, arguments, control)
     }
 
     fn resolve_aggregate_signature(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
@@ -308,22 +341,28 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         name: &str,
         logical_arg_types: &[arrow::datatypes::DataType],
         update_arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         if logical_arg_types != update_arg_types {
             return Err(novarocks_functions::FunctionResolutionError::BadSignature(
                 "function catalog does not support ordered aggregate update signatures".into(),
             ));
         }
-        self.resolve_aggregate_signature(name, logical_arg_types)
+        self.resolve_aggregate_signature(name, logical_arg_types, control)
     }
 
     fn resolve_aggregate_trusted(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
@@ -1037,6 +1076,21 @@ pub enum SqlCompileError {
     Compilation(String),
 }
 
+impl From<String> for SqlCompileError {
+    fn from(error: String) -> Self {
+        Self::Compilation(error)
+    }
+}
+
+impl From<novarocks_functions::FunctionBindingError> for SqlCompileError {
+    fn from(error: novarocks_functions::FunctionBindingError) -> Self {
+        match error {
+            novarocks_functions::FunctionBindingError::Control(error) => error.into(),
+            other => Self::Compilation(other.to_string()),
+        }
+    }
+}
+
 impl From<novarocks_type_contract::CompileControlError> for SqlCompileError {
     fn from(error: novarocks_type_contract::CompileControlError) -> Self {
         SqlCompileControl::compile_error(error)
@@ -1608,6 +1662,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
@@ -1621,6 +1676,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
@@ -1630,6 +1686,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
@@ -2879,3 +2936,9 @@ mod completion_driver;
 mod completion_predicate;
 pub use completion::*;
 pub(crate) mod mv_rewrite;
+
+impl From<&str> for SqlCompileError {
+    fn from(error: &str) -> Self {
+        Self::Compilation(error.into())
+    }
+}

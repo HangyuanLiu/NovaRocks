@@ -497,8 +497,8 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         _session: &DistributedRewriteMaintenanceSession,
         _cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string().into())
     }
 
     fn accumulate_distributed_rewrite_group(
@@ -545,8 +545,10 @@ pub trait TableMaintenanceService: Send + Sync {
         _statement: crate::table_maintenance::ParsedMaintenanceStatement,
         _spark_procedure: bool,
         _context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceStatementResult, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    ) -> Result<MaintenanceStatementResult, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            TABLE_MAINTENANCE_SERVICE_UNAVAILABLE,
+        ))
     }
 
     /// Executes the read-only typed `SHOW ALTER TABLE OPTIMIZE` presentation
@@ -567,14 +569,14 @@ pub trait TableMaintenanceService: Send + Sync {
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String>;
+    ) -> Result<MaintenanceActionOutcome, TerminalError>;
 
     async fn execute_automatic_action_with_context(
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
         context: &AutomaticMaintenanceContext,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         context.ensure_active()?;
         self.execute_automatic_action(engine, request).await
     }
@@ -1158,7 +1160,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         session: &DistributedRewriteMaintenanceSession,
         cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, String> {
+    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
         prepare_frozen_rewrite_cohort_with_ports(
             self.kernel.connector_control().as_ref(),
             self.kernel.typed_connector_control(),
@@ -1168,6 +1170,9 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             cohort_id,
             session.execution(),
             session.context(),
+            &crate::query_execution::planning::sql_compile_control_from_execution(
+                session.execution(),
+            ),
         )
     }
 
@@ -1434,7 +1439,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         &self,
         session: &DistributedRewriteMaintenanceSession,
         cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, String> {
+    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
         self.request_engine()?
             .prepare_distributed_rewrite_cohort(session, cohort_id)
     }
@@ -1484,7 +1489,8 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     cohort_id: ConnectorWriteCohortId,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedDistributedRewriteCohort, String> {
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
     let cohort = session
         .plan()
         .cohorts()
@@ -1662,7 +1668,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 },
             ])?,
         ),
-        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
+        control,
     )?;
     let version = plan.version();
     let candidate =
@@ -1676,7 +1682,9 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         paired,
         function_catalog,
         Some(&write_target_facts),
-    )?;
+        control,
+    )
+    .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
     PreparedDistributedRewriteCohort::new(
         encoded,
         version,
@@ -1684,6 +1692,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         execution.clone(),
         write_session.clone(),
     )
+    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
 }
 
 /// How much one rewrite cohort's scan may return in a batch.

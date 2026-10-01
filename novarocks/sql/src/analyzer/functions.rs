@@ -698,7 +698,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         crate::functions::builtin_sql_function_catalog(),
         name,
         arg_types,
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
+    .unwrap()
 }
 
 /// Infer an unregistered scalar return type using the function snapshot that
@@ -709,12 +711,15 @@ pub(super) fn infer_scalar_return_type_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     arg_types: &[DataType],
-) -> DataType {
-    legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types)
-        // This compatibility helper is retained for staged non-analysis
-        // consumers. SQL analysis checks the Option-returning function below
-        // before it accepts an arbitrary scalar function name.
-        .unwrap_or(DataType::Utf8)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<DataType, crate::analyze_error::AnalyzeError> {
+    Ok(
+        legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types, control)?
+            // This compatibility helper is retained for staged non-analysis
+            // consumers. SQL analysis checks the Option-returning function below
+            // before it accepts an arbitrary scalar function name.
+            .unwrap_or(DataType::Utf8),
+    )
 }
 
 /// Return the legacy scalar type only when the name is known by either the
@@ -723,7 +728,8 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     arg_types: &[DataType],
-) -> Option<DataType> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<DataType>, crate::analyze_error::AnalyzeError> {
     // Step B: the central signature registry is the single source of
     // truth for nearly all scalar built-ins (~250 names) including the
     // `coalesce`/`if`/`ifnull` cast-match family. If the registry knows
@@ -733,10 +739,16 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
     // extractors (`__array_element_at`, `map_keys`), and functions
     // whose permissive type fallbacks haven't been formalised as
     // signatures yet.
-    if let Ok(resolved) = function_catalog.resolve_scalar_signature(name, arg_types) {
-        return Some(resolved.return_type);
+    match function_catalog.resolve_scalar_signature(name, arg_types, control) {
+        Ok(resolved) => return Ok(Some(resolved.return_type)),
+        Err(error @ novarocks_functions::FunctionResolutionError::Control(_)) => {
+            return Err(crate::analyze_error::AnalyzeError::function_resolution(
+                error,
+            ));
+        }
+        Err(_) => {}
     }
-    dynamic_scalar_return_type(name, arg_types)
+    Ok(dynamic_scalar_return_type(name, arg_types))
 }
 
 /// Type-only portion of the dynamic builtin binder. Literal-dependent result
@@ -1383,6 +1395,7 @@ mod tests {
                     logical_argument_count: arguments.len(),
                     expected_result_type: None,
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap_or_else(|error| panic!("aggregate {name} must resolve: {error}"));
         crate::functions::aggregate_result_type(&binding)
@@ -1907,6 +1920,7 @@ mod tests {
                     logical_argument_count: arguments.len(),
                     expected_result_type: None,
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         let result = crate::functions::aggregate_result_type(&binding);

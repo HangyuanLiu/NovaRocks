@@ -584,7 +584,8 @@ fn explore(
                         };
                         for binding in bindings_slice {
                             work.step()?;
-                            let new_exprs = rule.apply_bound(binding, memo);
+                            work.flush()?;
+                            let new_exprs = rule.apply_bound(binding, memo, control)?;
                             for new_expr in new_exprs {
                                 work.step()?;
                                 // Dedup: compare operator AND children to avoid
@@ -701,7 +702,8 @@ fn implement(
                         };
                         for binding in bindings_slice {
                             work.step()?;
-                            let new_exprs = rule.apply_bound(binding, memo);
+                            work.flush()?;
+                            let new_exprs = rule.apply_bound(binding, memo, control)?;
                             for new_expr in new_exprs {
                                 work.step()?;
                                 let mut already_exists = false;
@@ -841,14 +843,21 @@ mod is_known_rule_name_tests {
             matches!(op, Operator::LogicalLimit(_))
         }
 
-        fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        fn apply(
+            &self,
+            expr: &MExpr,
+            memo: &mut Memo,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+            let _ = control;
+
             let previous_count = self.apply_count.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 previous_count, 0,
                 "same logical expression should not be implemented twice by one rule"
             );
             let Operator::LogicalLimit(limit) = &expr.op else {
-                return vec![];
+                return Ok(vec![]);
             };
             let child_group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
@@ -858,13 +867,13 @@ mod is_known_rule_name_tests {
                 }),
                 children: vec![],
             });
-            vec![NewExpr {
+            Ok(vec![NewExpr {
                 op: Operator::PhysicalLimit(LimitOp {
                     limit: limit.limit,
                     offset: limit.offset,
                 }),
                 children: vec![child_group],
-            }]
+            }])
         }
     }
 
@@ -883,17 +892,24 @@ mod is_known_rule_name_tests {
             matches!(op, Operator::LogicalLimit(_))
         }
 
-        fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        fn apply(
+            &self,
+            expr: &MExpr,
+            _memo: &mut Memo,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+            let _ = control;
+
             let Operator::LogicalLimit(limit) = &expr.op else {
-                return vec![];
+                return Ok(vec![]);
             };
-            vec![NewExpr {
+            Ok(vec![NewExpr {
                 op: Operator::PhysicalLimit(LimitOp {
                     limit: limit.limit,
                     offset: limit.offset,
                 }),
                 children: expr.children.clone(),
-            }]
+            }])
         }
     }
 

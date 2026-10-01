@@ -44,7 +44,9 @@ use crate::planner::imv_rewrite::join_refresh_descriptor::{
 };
 use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::planner::imv_rewrite::target_locator::is_target_locator_join;
-use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result_mut, opt_expr_to_plan};
+use crate::planner::imv_rewrite::{
+    PlanRewriteResult, bridge_apply_result_mut_typed, opt_expr_to_plan,
+};
 use crate::planner::logical::{
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
     LogicalUnionNode,
@@ -88,7 +90,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
         expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, SqlCompileError> {
-        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+        bridge_apply_result_mut_typed(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
             } = plan;
@@ -109,7 +111,8 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                 return Err(format!(
                     "Iceberg IMV join delta rewrite supports inner/cross joins only, got {:?}",
                     join.join_type
-                ));
+                )
+                .into());
             }
 
             let action_column = match delta.action_column {
@@ -203,7 +206,7 @@ impl LogicalRewriteRule for InjectJoinApplyKeyRule {
         expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, SqlCompileError> {
-        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+        bridge_apply_result_mut_typed(expr, ctx, |plan, ctx| {
             if project_needs_join_refresh_internal_outputs(&plan) {
                 return Ok(PlanRewriteResult::Changed(
                     propagate_join_refresh_internal_outputs_through_project(plan)?,
@@ -242,7 +245,7 @@ impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
         expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, SqlCompileError> {
-        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+        bridge_apply_result_mut_typed(expr, ctx, |plan, ctx| {
             record_join_refresh_descriptor(ctx, &plan)?;
             Ok(PlanRewriteResult::Unchanged)
         })
@@ -316,7 +319,7 @@ fn is_join_refresh_union_with_apply_key(plan: &LogicalPlanNode) -> bool {
 fn inject_join_apply_key(
     mut plan: LogicalPlanNode,
     ctx: &mut RewriteContext,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let ext = ctx
         .extension::<ImvExtension>()
         .ok_or_else(|| "InjectJoinApplyKey requires ImvExtension".to_string())?;
@@ -338,6 +341,7 @@ fn inject_join_apply_key(
             branch,
             evidence,
             &join_apply_key_column,
+            &ctx.control_view(),
         )?;
         prune_raw_join_row_id_output_from_branch(branch, evidence)?;
     }
@@ -419,9 +423,14 @@ fn inject_join_apply_key_into_branch(
     branch: &mut LogicalPlanNode,
     evidence: &JoinDeltaBranchEvidence,
     join_apply_key_column: &OutputColumn,
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), crate::compiler::SqlCompileError> {
     let LogicalPlanKind::Project(project) = &mut branch.kind else {
-        return Err("join apply-key injection expected normalized Project branch".to_string());
+        return Err(
+            "join apply-key injection expected normalized Project branch"
+                .to_string()
+                .into(),
+        );
     };
     if project.items.iter().any(|item| {
         item.output_name
@@ -430,7 +439,7 @@ fn inject_join_apply_key_into_branch(
         return Ok(());
     }
     project.items.push(ProjectItem {
-        expr: join_row_key_expr(function_catalog, evidence)?,
+        expr: join_row_key_expr(function_catalog, evidence, control)?,
         output_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         output_column_id: join_apply_key_column.column_id,
     });
@@ -458,18 +467,23 @@ fn prune_raw_join_row_id_output_from_branch(
 fn join_row_key_expr(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     evidence: &JoinDeltaBranchEvidence,
-) -> Result<TypedExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         object_id_binary_literal(&evidence.left_base.table_object_id),
         column_ref_expr(&evidence.left_row_id_column),
         object_id_binary_literal(&evidence.right_base.table_object_id),
         column_ref_expr(&evidence.right_row_id_column),
     ];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "join_row_key",
+        &args,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("join_row_key must return a scalar value".to_string());
+        return Err("join_row_key must return a scalar value".to_string().into());
     };
     let value_type = result.clone();
     Ok(TypedExpr {
@@ -1664,8 +1678,12 @@ mod tests {
             right_row_id_column: right_row_id,
         };
 
-        let expr = join_row_key_expr(crate::functions::builtin_sql_function_catalog(), &evidence)
-            .expect("join-row-key binding");
+        let expr = join_row_key_expr(
+            crate::functions::builtin_sql_function_catalog(),
+            &evidence,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("join-row-key binding");
         let ExprKind::FunctionCall { args, .. } = expr.kind else {
             panic!("expected join_row_key call");
         };
@@ -1904,7 +1922,7 @@ mod tests {
         let SqlCompileError::Compilation(err) = err else {
             panic!("expected an ordinary rewrite error");
         };
-        assert!(err.contains("inner/cross"), "unexpected: {err}");
+        assert!(err.to_string().contains("inner/cross"), "unexpected: {err}");
     }
 
     #[test]

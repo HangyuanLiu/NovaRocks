@@ -22,38 +22,90 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use super::scheduler::MvSchedulerConfig;
 use crate::maintenance::{MvBackgroundEngineError, MvBackgroundEngineErrorKind};
 
+/// Process-local failure detail. The cause does not determine scheduler policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvRefreshFailure {
+    message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
+}
+
+impl MvRefreshFailure {
+    pub fn new(
+        message: impl Into<String>,
+        compile_control: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            compile_control,
+        }
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
+    }
+}
+impl From<String> for MvRefreshFailure {
+    fn from(message: String) -> Self {
+        Self::new(message, None)
+    }
+}
+impl From<&str> for MvRefreshFailure {
+    fn from(message: &str) -> Self {
+        Self::new(message, None)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvRefreshDisposition {
     Completed,
     NoOp,
-    AlreadyActive,
-    TargetGone,
-    TransientUnavailable(String),
-    InvalidDefinition(String),
-    TerminalFailure(String),
-    Corruption(String),
-    InvariantViolation(String),
-    ShutdownCancelled,
+    AlreadyActive(Option<novarocks_type_contract::CompileControlError>),
+    TargetGone(Option<novarocks_type_contract::CompileControlError>),
+    TransientUnavailable(MvRefreshFailure),
+    InvalidDefinition(MvRefreshFailure),
+    TerminalFailure(MvRefreshFailure),
+    Corruption(MvRefreshFailure),
+    InvariantViolation(MvRefreshFailure),
+    ShutdownCancelled(Option<novarocks_type_contract::CompileControlError>),
 }
 
 impl MvRefreshDisposition {
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        match self {
+            Self::TransientUnavailable(failure)
+            | Self::InvalidDefinition(failure)
+            | Self::TerminalFailure(failure)
+            | Self::Corruption(failure)
+            | Self::InvariantViolation(failure) => failure.compile_control_error(),
+            Self::AlreadyActive(control)
+            | Self::TargetGone(control)
+            | Self::ShutdownCancelled(control) => *control,
+            Self::Completed | Self::NoOp => None,
+        }
+    }
+
     pub fn from_background_error(error: MvBackgroundEngineError) -> Self {
+        let failure = || MvRefreshFailure::new(error.message(), error.compile_control_error());
         match error.kind() {
-            MvBackgroundEngineErrorKind::TargetGone => Self::TargetGone,
+            MvBackgroundEngineErrorKind::TargetGone => {
+                Self::TargetGone(error.compile_control_error())
+            }
             MvBackgroundEngineErrorKind::TransientUnavailable => {
-                Self::TransientUnavailable(error.message().to_owned())
+                Self::TransientUnavailable(failure())
             }
-            MvBackgroundEngineErrorKind::InvalidDefinition => {
-                Self::InvalidDefinition(error.message().to_owned())
+            MvBackgroundEngineErrorKind::InvalidDefinition => Self::InvalidDefinition(failure()),
+            MvBackgroundEngineErrorKind::TerminalFailure => Self::TerminalFailure(failure()),
+            MvBackgroundEngineErrorKind::Corruption => Self::Corruption(failure()),
+            MvBackgroundEngineErrorKind::InvariantViolation => Self::InvariantViolation(failure()),
+            MvBackgroundEngineErrorKind::ShutdownCancelled => {
+                Self::ShutdownCancelled(error.compile_control_error())
             }
-            MvBackgroundEngineErrorKind::TerminalFailure => {
-                Self::TerminalFailure(error.message().to_owned())
-            }
-            MvBackgroundEngineErrorKind::Corruption => Self::Corruption(error.message().to_owned()),
-            MvBackgroundEngineErrorKind::InvariantViolation => {
-                Self::InvariantViolation(error.message().to_owned())
-            }
-            MvBackgroundEngineErrorKind::ShutdownCancelled => Self::ShutdownCancelled,
         }
     }
 }
@@ -61,9 +113,30 @@ impl MvRefreshDisposition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvRefreshRuntimeDecision {
     Success,
-    TransientBackoff { error: String, retry_at_ms: i64 },
-    Blocked { error: String },
-    NoChange,
+    TransientBackoff {
+        error: MvRefreshFailure,
+        retry_at_ms: i64,
+    },
+    Blocked {
+        error: MvRefreshFailure,
+    },
+    NoChange {
+        compile_control: Option<novarocks_type_contract::CompileControlError>,
+    },
+}
+
+impl MvRefreshRuntimeDecision {
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        match self {
+            Self::TransientBackoff { error, .. } | Self::Blocked { error } => {
+                error.compile_control_error()
+            }
+            Self::NoChange { compile_control } => *compile_control,
+            Self::Success => None,
+        }
+    }
 }
 
 /// Coalesced product runtime.  Hosts interpret durable MV definitions and
@@ -77,7 +150,7 @@ pub struct MvRefreshSchedulerRuntime<K, R> {
     running: BTreeSet<K>,
     failures: BTreeMap<K, u32>,
     retry_not_before_ms: BTreeMap<K, i64>,
-    blocked: BTreeMap<K, String>,
+    blocked: BTreeMap<K, MvRefreshFailure>,
 }
 
 /// The complete process-local refresh runtime.  In addition to queue and
@@ -275,9 +348,11 @@ where
             | MvRefreshDisposition::InvariantViolation(error) => {
                 MvRefreshRuntimeDecision::Blocked { error }
             }
-            MvRefreshDisposition::AlreadyActive
-            | MvRefreshDisposition::TargetGone
-            | MvRefreshDisposition::ShutdownCancelled => MvRefreshRuntimeDecision::NoChange,
+            MvRefreshDisposition::AlreadyActive(compile_control)
+            | MvRefreshDisposition::TargetGone(compile_control)
+            | MvRefreshDisposition::ShutdownCancelled(compile_control) => {
+                MvRefreshRuntimeDecision::NoChange { compile_control }
+            }
         };
         match &decision {
             MvRefreshRuntimeDecision::Success => {
@@ -294,7 +369,7 @@ where
                 self.retry_not_before_ms.remove(key);
                 self.blocked.insert(key.clone(), error.clone());
             }
-            MvRefreshRuntimeDecision::NoChange => {}
+            MvRefreshRuntimeDecision::NoChange { .. } => {}
         }
         decision
     }
@@ -371,5 +446,60 @@ mod tests {
         ));
         assert!(!runtime.begin_observation(7, "first", 101));
         assert!(runtime.begin_observation(7, "changed", 101));
+    }
+    #[test]
+    fn compile_control_cause_survives_scheduler_disposition_decision_and_blocked_state() {
+        use crate::maintenance::{MvBackgroundEngineError, MvBackgroundEngineErrorKind as K};
+        use novarocks_type_contract::CompileControlError as C;
+        for control in [C::Cancelled, C::DeadlineExceeded, C::ResourceExhausted] {
+            for kind in [
+                K::TargetGone,
+                K::TransientUnavailable,
+                K::InvalidDefinition,
+                K::TerminalFailure,
+                K::Corruption,
+                K::InvariantViolation,
+                K::ShutdownCancelled,
+            ] {
+                let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(
+                    MvSchedulerConfig::new(true, 1, 1, 10, 40),
+                );
+                let error = MvBackgroundEngineError::new(kind, "actual failure")
+                    .with_compile_control(Some(control));
+                let disposition = MvRefreshDisposition::from_background_error(error);
+                assert_eq!(disposition.compile_control_error(), Some(control));
+                let decision = runtime.record(&7, disposition, 100);
+                assert_eq!(decision.compile_control_error(), Some(control));
+                match kind {
+                    K::TransientUnavailable => {
+                        assert!(matches!(
+                            decision,
+                            MvRefreshRuntimeDecision::TransientBackoff {
+                                retry_at_ms: 110,
+                                ..
+                            }
+                        ));
+                        assert!(runtime.is_suppressed(&7, 109));
+                        assert!(!runtime.is_suppressed(&7, 110));
+                    }
+                    K::TargetGone | K::ShutdownCancelled => {
+                        assert!(matches!(
+                            decision,
+                            MvRefreshRuntimeDecision::NoChange { .. }
+                        ));
+                        assert!(!runtime.is_suppressed(&7, 100));
+                    }
+                    _ => {
+                        assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
+                        let retained = runtime.blocked.get(&7).expect("blocked terminal retained");
+                        assert_eq!(retained.compile_control_error(), Some(control));
+                        assert_eq!(retained.message(), "actual failure");
+                        assert!(runtime.is_suppressed(&7, 100));
+                    }
+                }
+                runtime.reset_after_source_change(&7);
+                assert!(!runtime.is_suppressed(&7, 100));
+            }
+        }
     }
 }

@@ -345,15 +345,17 @@ impl<O: PureFunctionMetadataOwner> FunctionBindingResolver for RegisteredOwner<O
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        self.owner.resolve(request)
+        self.owner.resolve(request, control)
     }
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        self.owner.validate_selected(selected, request)
+        self.owner.validate_selected(selected, request, control)
     }
 }
 impl<O: PureFunctionMetadataOwner> FunctionEffectOwner for RegisteredOwner<O> {
@@ -376,14 +378,35 @@ impl<O: PureFunctionMetadataOwner> FunctionEffectOwner for RegisteredOwner<O> {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(FunctionEffectOwnerError::Control)?;
-        let base = self.declaration(input.function_id, input.selected)?;
-        if self.owner.declaration(input.function_id, input.selected)? != base {
+        let base = self
+            .declaration(input.function_id, input.selected)
+            .map_err(effect_binding_failure)?;
+        if self
+            .owner
+            .declaration(input.function_id, input.selected)
+            .map_err(effect_binding_failure)?
+            != base
+        {
             return Err(FunctionBindingError::InvalidBinding(
                 "registered effect declaration differs from the exact implementation source".into(),
             )
             .into());
         }
-        self.owner.validate_and_refine(input, control)
+        self.owner
+            .validate_and_refine(input, control)
+            .map_err(|error| match error {
+                FunctionEffectOwnerError::Owner(error) => effect_binding_failure(error),
+                control => control,
+            })
+    }
+}
+
+fn effect_binding_failure(
+    error: FunctionBindingError,
+) -> FunctionEffectOwnerError<FunctionBindingError> {
+    match error {
+        FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+        other => FunctionEffectOwnerError::Owner(other),
     }
 }
 
@@ -1102,7 +1125,7 @@ impl PureEngineFunctionCatalog {
         binding
             .declaration
             .effect_declaration(&selected.overload)
-            .map_err(FunctionSpecializationFailure::Binding)?;
+            .map_err(FunctionSpecializationFailure::from)?;
         let attachment = binding
             .pure
             .as_ref()

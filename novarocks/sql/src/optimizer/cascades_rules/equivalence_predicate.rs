@@ -52,17 +52,24 @@ impl Rule for InnerJoinEquivalencePredicateRule {
         )
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalJoin(join) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if join.join_type != JoinKind::Inner || expr.children.len() != 2 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let left_group = expr.children[0];
         let right_group = expr.children[1];
-        apply_inner(join, left_group, right_group, memo)
+        Ok(apply_inner(join, left_group, right_group, memo))
     }
 
     fn pattern(&self) -> Pattern {
@@ -72,21 +79,28 @@ impl Rule for InnerJoinEquivalencePredicateRule {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalJoin(join) = binding.op(memo, 0) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if join.join_type != JoinKind::Inner {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let children = binding.children(0);
         if children.len() != 2 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let left_group = children[0];
         let right_group = children[1];
         let join = join.clone();
-        apply_inner(&join, left_group, right_group, memo)
+        Ok(apply_inner(&join, left_group, right_group, memo))
     }
 }
 
@@ -512,7 +526,13 @@ mod tests {
         let condition = and(&mut memo, join_pair, literal_eq);
         let join = join_mexpr(&mut memo, JoinKind::Inner, condition, vec![left, right]);
 
-        let out = InnerJoinEquivalencePredicateRule.apply(&join, &mut memo);
+        let out = InnerJoinEquivalencePredicateRule
+            .apply(
+                &join,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let new_right = out[0].children[1];
         let filter = memo.groups[new_right]
@@ -541,7 +561,12 @@ mod tests {
 
         assert!(
             InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
+                .apply(
+                    &join,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
                 .is_empty(),
             "strict-only pass must not use a null-safe join pair for literal propagation"
         );
@@ -559,7 +584,12 @@ mod tests {
         assert!(!InnerJoinEquivalencePredicateRule.matches(&join.op));
         assert!(
             InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
+                .apply(
+                    &join,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
                 .is_empty()
         );
     }
@@ -591,7 +621,12 @@ mod tests {
         );
         assert!(
             InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
+                .apply(
+                    &join,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
                 .is_empty()
         );
     }
@@ -623,7 +658,12 @@ mod tests {
 
         assert!(
             InnerJoinEquivalencePredicateRule
-                .apply(&join, &mut memo)
+                .apply(
+                    &join,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
                 .is_empty()
         );
     }

@@ -63,7 +63,7 @@ pub(crate) fn refine_once_for_specialization<
         None => crate::refine_call_effects(owner, input, control),
     }
     .map_err(|error| match error {
-        CallEffectRefinementError::Owner(error) => FunctionSpecializationFailure::Binding(error),
+        CallEffectRefinementError::Owner(error) => FunctionSpecializationFailure::from(error),
         CallEffectRefinementError::Control(error) => FunctionSpecializationFailure::Control(error),
         CallEffectRefinementError::Contract(error) => FunctionSpecializationFailure::Effects(error),
         CallEffectRefinementError::InvalidInput(error) => {
@@ -74,4 +74,13 @@ pub(crate) fn refine_once_for_specialization<
         .compose_for_use(input, arguments)
         .map_err(FunctionSpecializationFailure::Effects)?;
     Ok((receipt, effects))
+}
+
+impl From<FunctionBindingError> for FunctionSpecializationFailure {
+    fn from(error: FunctionBindingError) -> Self {
+        match error {
+            FunctionBindingError::Control(error) => Self::Control(error),
+            other => Self::Binding(other),
+        }
+    }
 }

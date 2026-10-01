@@ -70,7 +70,8 @@ mod tests {
                             expected_result_type: None,
                             arguments: &[],
                             logical_argument_count: 0
-                        }
+                        },
+                        &crate::compiler::SqlCompileControl::unbounded()
                     ),
                     Err(FunctionBindingError::UnknownFunction),
                     "{name}"
@@ -86,7 +87,8 @@ mod tests {
                         expected_result_type: None,
                         arguments: &[],
                         logical_argument_count: 0
-                    }
+                    },
+                    &crate::compiler::SqlCompileControl::unbounded()
                 )
                 .is_err()
         );

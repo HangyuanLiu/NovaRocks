@@ -214,6 +214,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.counts.resolve.fetch_add(1, Ordering::Relaxed);
         self.selections
@@ -233,6 +234,7 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if request.logical_argument_count != 1
             || !self
@@ -267,7 +269,7 @@ impl FunctionEffectOwner for Owner {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 1)
             .map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         self.counts.refine.fetch_add(1, Ordering::Relaxed);
         Ok(self.frozen(input.selected))
     }
@@ -825,7 +827,12 @@ fn registered_typed_aggregate_erases_real_cpu_and_drops_real_state() {
     assert_eq!(owner.counts.legacy.load(Ordering::Relaxed), 1);
     let bound = catalog
         .metadata()
-        .resolve_bound_user("typed_sum", FunctionKind::Aggregate, call.input().request)
+        .resolve_bound_user(
+            "typed_sum",
+            FunctionKind::Aggregate,
+            call.input().request,
+            crate::binding_test_control(),
+        )
         .unwrap();
     assert_eq!(bound.selected, *call.selected);
     let resolves = owner.counts.resolve.load(Ordering::Relaxed);

@@ -24,6 +24,8 @@
 //! structural binder uses the existing bounded FVT validation, not a resource
 //! admission or cooperative compilation receipt.
 
+use super::binding_control;
+use novarocks_type_contract::{CompileCheckpoints, PureCompileControl};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
@@ -115,15 +117,67 @@ struct ValueConversionResolver;
 pub fn resolve_value_conversion(
     source: &FunctionValueType,
     target: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    binding_control::scope(control, |work| {
+        binding_control::value_type(source, work)?;
+        binding_control::value_type(target, work)?;
+        let arguments = [FunctionArgument::Value {
+            value_type: source.clone(),
+            constant: None,
+        }];
+        work.flush()?;
+        ValueConversionResolver.resolve(
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 1,
+                expected_result_type: Some(target),
+            },
+            work.control(),
+        )
+    })
+}
+
+// A pure declaration recipe is not an invocation of a catalogue resolver. It
+// preserves the existing logical-coercion predicates without minting a control
+// capability or pretending their legacy recursive work is cooperative.
+pub(super) fn recipe_selection(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
 ) -> Result<FunctionBindingSelection, FunctionBindingError> {
     let arguments = [FunctionArgument::Value {
         value_type: source.clone(),
         constant: None,
     }];
-    ValueConversionResolver.resolve(FunctionBindingRequest {
+    let (source, target) = inputs(FunctionBindingRequest {
         arguments: &arguments,
         logical_argument_count: 1,
         expected_result_type: Some(target),
+    })?;
+    let id = [
+        JSON_TEXT,
+        SIGNED_LARGEINT,
+        LARGEINT_SIGNED,
+        LARGEINT_FLOAT,
+        NULL_LIFT,
+    ]
+    .into_iter()
+    .find(|id| pair_matches(id, source, target))
+    .ok_or(FunctionBindingError::NoMatchingOverload)?;
+    selection(id, source, target)
+}
+
+fn selection(
+    id: &str,
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    Ok(FunctionBindingSelection {
+        overload: FunctionOverloadId::try_new(id)
+            .map_err(|_| invalid("invalid conversion overload identity"))?,
+        argument_types: vec![FunctionArgumentType::Value(source.clone())].into_boxed_slice(),
+        result_type: FunctionResultType::Scalar(target.clone()),
+        aggregate: None,
     })
 }
 
@@ -160,7 +214,7 @@ pub fn conversion_intermediate_type(
         ));
     }
     if source.data_type == DataType::Null && source.logical_type == ValueLogicalType::Physical {
-        resolve_value_conversion(source, target)?;
+        recipe_selection(source, target)?;
         return Ok(Some(target.clone()));
     }
     if source.logical_type == target.logical_type
@@ -172,7 +226,7 @@ pub fn conversion_intermediate_type(
     {
         return Ok(None);
     }
-    if resolve_value_conversion(source, target).is_ok() {
+    if recipe_selection(source, target).is_ok() {
         return Ok(Some(target.clone()));
     }
     let logical_type = match (source.logical_type, target.logical_type) {
@@ -186,7 +240,7 @@ pub fn conversion_intermediate_type(
         logical_type,
     )
     .map_err(|_| invalid("invalid conversion intermediate type"))?;
-    resolve_value_conversion(source, &intermediate)?;
+    recipe_selection(source, &intermediate)?;
     if intermediate.logical_type != target.logical_type
         || (intermediate.nullable && !target.nullable)
         || !novarocks_type_contract::preserves_nested_logical_identity(
@@ -327,6 +381,19 @@ fn invalid(message: &str) -> FunctionBindingError {
 fn inputs<'a>(
     request: FunctionBindingRequest<'a>,
 ) -> Result<(&'a FunctionValueType, &'a FunctionValueType), FunctionBindingError> {
+    let (source, target) = input_shape(request)?;
+    source
+        .validate()
+        .map_err(|_| invalid("invalid conversion source type"))?;
+    target
+        .validate()
+        .map_err(|_| invalid("invalid conversion target type"))?;
+    Ok((source, target))
+}
+
+fn input_shape<'a>(
+    request: FunctionBindingRequest<'a>,
+) -> Result<(&'a FunctionValueType, &'a FunctionValueType), FunctionBindingError> {
     if request.logical_argument_count != 1 || request.arguments.len() != 1 {
         return Err(FunctionBindingError::NoMatchingOverload);
     }
@@ -339,12 +406,6 @@ fn inputs<'a>(
     let target = request.expected_result_type.ok_or_else(|| {
         invalid("internal value-domain conversion requires an explicit complete target")
     })?;
-    source
-        .validate()
-        .map_err(|_| invalid("invalid conversion source type"))?;
-    target
-        .validate()
-        .map_err(|_| invalid("invalid conversion target type"))?;
     if source.nullable && !target.nullable {
         return Err(invalid(
             "conversion target cannot narrow source nullability",
@@ -473,50 +534,163 @@ impl FunctionBindingResolver for ValueConversionResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        let (source, target) = inputs(request)?;
-        let id = [
-            JSON_TEXT,
-            SIGNED_LARGEINT,
-            LARGEINT_SIGNED,
-            LARGEINT_FLOAT,
-            NULL_LIFT,
-        ]
-        .into_iter()
-        .find(|id| pair_matches(id, source, target))
-        .ok_or(FunctionBindingError::NoMatchingOverload)?;
-        Ok(FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(id)
-                .map_err(|_| invalid("invalid conversion overload identity"))?,
-            argument_types: vec![FunctionArgumentType::Value(source.clone())].into_boxed_slice(),
-            result_type: FunctionResultType::Scalar(target.clone()),
-            aggregate: None,
+        binding_control::scope(control, |work| {
+            binding_control::request_types(request, work)?;
+            let (source, target) = input_shape(request)?;
+            for id in [
+                JSON_TEXT,
+                SIGNED_LARGEINT,
+                LARGEINT_SIGNED,
+                LARGEINT_FLOAT,
+                NULL_LIFT,
+            ] {
+                work.step()?;
+                if pair_matches_observed(id, source, target, work)? {
+                    return selection(id, source, target);
+                }
+            }
+            Err(FunctionBindingError::NoMatchingOverload)
         })
     }
-
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        let (source, target) = inputs(request)?;
-        if selected.aggregate.is_some()
-            || !matches!(selected.argument_types.as_ref(), [FunctionArgumentType::Value(actual)] if exact_value_type(actual, source))
-            || !matches!(&selected.result_type, FunctionResultType::Scalar(actual) if exact_value_type(actual, target))
-            || !pair_matches(selected.overload.as_str(), source, target)
-        {
-            return Err(invalid(
-                "frozen value-domain conversion differs from its exact source, target or overload",
-            ));
-        }
-        Ok(())
+        binding_control::scope(control, |work| {
+            binding_control::request_types(request, work)?;
+            let (source, target) = input_shape(request)?;
+            let arguments_match = match selected.argument_types.as_ref() {
+                [FunctionArgumentType::Value(actual)] => {
+                    binding_control::exact_type(actual, source, work)?
+                }
+                _ => false,
+            };
+            let result_matches = match &selected.result_type {
+                FunctionResultType::Scalar(actual) => {
+                    binding_control::exact_type(actual, target, work)?
+                }
+                _ => false,
+            };
+            if selected.aggregate.is_some()
+                || !arguments_match
+                || !result_matches
+                || !pair_matches_observed(selected.overload.as_str(), source, target, work)?
+            {
+                return Err(invalid(
+                    "frozen value-domain conversion differs from its exact source, target or overload",
+                ));
+            }
+            Ok(())
+        })
     }
 }
 
-fn exact_value_type(left: &FunctionValueType, right: &FunctionValueType) -> bool {
-    left.logical_type == right.logical_type
-        && left.nullable == right.nullable
-        && arrow_data_types_exact(&left.data_type, &right.data_type)
+fn pair_matches_observed(
+    id: &str,
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FunctionBindingError> {
+    work.step()?;
+    if id != JSON_TEXT {
+        return Ok(pair_matches(id, source, target));
+    }
+    let Some(changed) = json_domain_pair(source.logical_type, target.logical_type) else {
+        return Ok(false);
+    };
+    Ok(
+        json_carriers_observed(&source.data_type, &target.data_type, work)?
+            .is_some_and(|nested| changed || nested),
+    )
+}
+
+fn json_field_observed(
+    source: &Field,
+    target: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<bool>, FunctionBindingError> {
+    work.step()?;
+    let shape = source
+        .clone()
+        .with_data_type(target.data_type().clone())
+        .with_metadata(target.metadata().clone());
+    if !novarocks_type_contract::arrow_fields_exact_observed::<crate::KernelFailure>(
+        &shape,
+        target,
+        || work.step().map_err(crate::kernel_control::compile_failure),
+    )
+    .map_err(binding_control::type_error)?
+    {
+        return Ok(None);
+    }
+    let (Ok(source_domain), Ok(target_domain)) =
+        (field_logical_type(source), field_logical_type(target))
+    else {
+        return Ok(None);
+    };
+    let Some(changed) = json_domain_pair(source_domain, target_domain) else {
+        return Ok(None);
+    };
+    for (key, value) in source.metadata() {
+        work.step()?;
+        if if changed && key == NR_LOGICAL_TYPE_KEY {
+            target.metadata().contains_key(key)
+        } else {
+            target.metadata().get(key) != Some(value)
+        } {
+            return Ok(None);
+        }
+    }
+    for key in target.metadata().keys() {
+        work.step()?;
+        if !source.metadata().contains_key(key) {
+            return Ok(None);
+        }
+    }
+    Ok(
+        json_carriers_observed(source.data_type(), target.data_type(), work)?
+            .map(|nested| changed || nested),
+    )
+}
+
+fn json_carriers_observed(
+    source: &DataType,
+    target: &DataType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<bool>, FunctionBindingError> {
+    work.step()?;
+    match (source, target) {
+        (DataType::List(a), DataType::List(b))
+        | (DataType::LargeList(a), DataType::LargeList(b)) => json_field_observed(a, b, work),
+        (DataType::FixedSizeList(a, an), DataType::FixedSizeList(b, bn)) if an == bn => {
+            json_field_observed(a, b, work)
+        }
+        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
+            let mut changed = false;
+            for (a, b) in a.iter().zip(b) {
+                work.step()?;
+                let Some(nested) = json_field_observed(a, b, work)? else {
+                    return Ok(None);
+                };
+                changed |= nested;
+            }
+            Ok(Some(changed))
+        }
+        (DataType::Map(a, sa), DataType::Map(b, sb)) if sa == sb => json_field_observed(a, b, work),
+        _ => Ok(
+            novarocks_type_contract::arrow_data_types_exact_observed::<crate::KernelFailure>(
+                source,
+                target,
+                || work.step().map_err(crate::kernel_control::compile_failure),
+            )
+            .map_err(binding_control::type_error)?
+            .then_some(false),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +735,7 @@ mod tests {
                 VALUE_CONVERSION_NAME,
                 FunctionKind::Scalar,
                 request(&args, target),
+                crate::binding_test_control(),
             )
             .unwrap();
         assert_eq!(binding.function_id.as_str(), VALUE_CONVERSION_FUNCTION_ID);
@@ -570,7 +745,11 @@ mod tests {
             FunctionResultType::Scalar(target.clone())
         );
         catalog
-            .validate_bound(&binding, request(&args, target))
+            .validate_bound(
+                &binding,
+                request(&args, target),
+                crate::binding_test_control(),
+            )
             .unwrap();
     }
 
@@ -610,7 +789,8 @@ mod tests {
             catalog().resolve_bound_user(
                 VALUE_CONVERSION_NAME,
                 FunctionKind::Scalar,
-                request(&source, &target)
+                request(&source, &target),
+                crate::binding_test_control()
             ),
             Err(FunctionBindingError::HiddenFunction)
         ));
@@ -709,7 +889,8 @@ mod tests {
                     .resolve_bound_trusted(
                         VALUE_CONVERSION_NAME,
                         FunctionKind::Scalar,
-                        request(&[value(source.clone())], &wrong)
+                        request(&[value(source.clone())], &wrong),
+                        crate::binding_test_control()
                     )
                     .is_err()
             );
@@ -753,7 +934,8 @@ mod tests {
                     .resolve_bound_trusted(
                         VALUE_CONVERSION_NAME,
                         FunctionKind::Scalar,
-                        request(&[value(source)], &target)
+                        request(&[value(source)], &target),
+                        crate::binding_test_control()
                     )
                     .is_err()
             );
@@ -768,7 +950,8 @@ mod tests {
                         arguments: &arguments,
                         logical_argument_count: 1,
                         expected_result_type: None
-                    }
+                    },
+                    crate::binding_test_control()
                 )
                 .is_err()
         );
@@ -788,19 +971,28 @@ mod tests {
                 VALUE_CONVERSION_NAME,
                 FunctionKind::Scalar,
                 request(&source, &target),
+                crate::binding_test_control(),
             )
             .unwrap();
         let mut forged = binding.clone();
         forged.selected.overload = FunctionOverloadId::try_new(LARGEINT_FLOAT).unwrap();
         assert!(
             catalog
-                .validate_bound(&forged, request(&source, &target))
+                .validate_bound(
+                    &forged,
+                    request(&source, &target),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
         let wrong = physical(DataType::Int32, true);
         assert!(
             catalog
-                .validate_bound(&binding, request(&source, &wrong))
+                .validate_bound(
+                    &binding,
+                    request(&source, &wrong),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
         let uuid = [value(logical(
@@ -810,7 +1002,11 @@ mod tests {
         ))];
         assert!(
             catalog
-                .validate_bound(&binding, request(&uuid, &target))
+                .validate_bound(
+                    &binding,
+                    request(&uuid, &target),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
     }
@@ -871,7 +1067,8 @@ mod tests {
                 .resolve_bound_trusted(
                     VALUE_CONVERSION_NAME,
                     FunctionKind::Scalar,
-                    request(&source, &wrong_width)
+                    request(&source, &wrong_width),
+                    crate::binding_test_control()
                 )
                 .is_err()
         );
@@ -895,6 +1092,7 @@ mod tests {
                 VALUE_CONVERSION_NAME,
                 FunctionKind::Scalar,
                 request(&source, &target),
+                crate::binding_test_control(),
             )
             .unwrap();
         let changed_order = physical(
@@ -908,21 +1106,30 @@ mod tests {
                 .resolve_bound_trusted(
                     VALUE_CONVERSION_NAME,
                     FunctionKind::Scalar,
-                    request(&source, &changed_order)
+                    request(&source, &changed_order),
+                    crate::binding_test_control()
                 )
                 .is_err()
         );
         assert_ne!(target, changed_order);
         assert!(
             catalog
-                .validate_bound(&binding, request(&source, &changed_order))
+                .validate_bound(
+                    &binding,
+                    request(&source, &changed_order),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
         let mut forged = binding.clone();
         forged.selected.result_type = FunctionResultType::Scalar(changed_order);
         assert!(
             catalog
-                .validate_bound(&forged, request(&source, &target))
+                .validate_bound(
+                    &forged,
+                    request(&source, &target),
+                    crate::binding_test_control()
+                )
                 .is_err()
         );
     }
@@ -988,7 +1195,8 @@ mod tests {
                     &FunctionValueType {
                         nullable: false,
                         ..target
-                    }
+                    },
+                    crate::binding_test_control()
                 )
                 .is_err()
             );

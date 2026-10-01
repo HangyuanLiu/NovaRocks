@@ -55,6 +55,21 @@ use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_plan_decode::decode_node;
 use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
 
+fn compile_control() -> &'static dyn novarocks_type_contract::PureCompileControl {
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _phase: novarocks_type_contract::CompilePhase,
+            _work: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    static CONTROL: Control = Control;
+    &CONTROL
+}
+
 fn singleton_properties() -> PhysicalProperties {
     PhysicalProperties {
         distribution: Distribution::Singleton,
@@ -401,6 +416,7 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
         plan,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        compile_control(),
     )
     .unwrap();
     let fragment = &encoded.fragments[0];
@@ -1112,6 +1128,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        compile_control(),
     )
     .unwrap();
     let wire_fragment = &encoded.fragments[0];
@@ -1200,6 +1217,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        compile_control(),
     )
     .unwrap();
     let wire_fragment = &encoded.fragments[0];
@@ -1222,8 +1240,13 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
 fn physical_plan_finish_encode_decode_preserves_duplicate_router_occurrences() {
     let (physical, facts) = finish_duplicate_router_plan();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(&physical, &catalog, &facts)
-        .expect("duplicate router occurrences have distinct v1 slots");
+    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+        &physical,
+        &catalog,
+        &facts,
+        compile_control(),
+    )
+    .expect("duplicate router occurrences have distinct v1 slots");
     let source = encoded
         .fragments
         .iter()

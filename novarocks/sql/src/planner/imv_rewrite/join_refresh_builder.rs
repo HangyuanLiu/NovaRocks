@@ -49,7 +49,8 @@ pub(crate) fn build_join_apply_key_project(
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     build_join_apply_key_project_with_action(
         function_catalog,
         input,
@@ -61,6 +62,7 @@ pub(crate) fn build_join_apply_key_project(
             action_column_id,
             action: JoinApplyActionProjection::InputColumn,
         },
+        control,
     )
 }
 
@@ -76,7 +78,8 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     build_join_apply_key_project_with_action(
         function_catalog,
         input,
@@ -88,6 +91,7 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
             action_column_id,
             action: JoinApplyActionProjection::ConstantInsert,
         },
+        control,
     )
 }
 
@@ -104,7 +108,8 @@ pub(crate) fn build_join_apply_key_append_project(
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     desc.validate()?;
     let input_columns = crate::planner::plan_output_columns(&input).map_err(|err| {
         format!("join first-refresh append project cannot derive input columns: {err}")
@@ -114,7 +119,7 @@ pub(crate) fn build_join_apply_key_append_project(
         return Err(format!(
             "join first-refresh append project apply-key output id mismatch: descriptor has {}, builder requested {expected_apply_key}",
             desc.join_apply_key_column.column_id
-        ));
+        ).into());
     }
     let items = desc
         .output_mappings
@@ -129,13 +134,14 @@ pub(crate) fn build_join_apply_key_append_project(
                 left_object_id,
                 right_object_id,
                 JoinApplyActionProjection::InputColumn,
+                control,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
     if items.len() != desc.payload_columns.len() + 1 {
         return Err(
             "join first-refresh append project requires every payload and exactly one apply-key output"
-                .to_string(),
+                .into(),
         );
     }
     Ok(LogicalPlanNode::new(
@@ -165,7 +171,8 @@ fn build_join_apply_key_project_with_action(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     input: LogicalPlanNode,
     projection: JoinApplyKeyProjection<'_>,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let JoinApplyKeyProjection {
         desc,
         left_object_id,
@@ -192,6 +199,7 @@ fn build_join_apply_key_project_with_action(
                 left_object_id,
                 right_object_id,
                 action,
+                control,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -250,12 +258,15 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     locator_row_id_column_id: u32,
     locator_last_updated_seq_column_id: u32,
     #[cfg(not(test))] function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     #[cfg(test)]
     let function_catalog = crate::functions::builtin_sql_function_catalog();
     desc.validate()?;
     if desc.mode != JoinRefreshMode::Coalesce {
-        return Err("join refresh coalesce builder requires coalesce descriptor".to_string());
+        return Err("join refresh coalesce builder requires coalesce descriptor"
+            .to_string()
+            .into());
     }
 
     let input_columns = crate::planner::plan_output_columns(&branch_union)
@@ -340,9 +351,10 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &action_input,
         &net_column,
         function_catalog,
+        control,
     )?;
     let payload_checked =
-        build_payload_coalesce_assert_filter(aggregate, &net_column, function_catalog)?;
+        build_payload_coalesce_assert_filter(aggregate, &net_column, function_catalog, control)?;
     let key_shape_checked = build_key_shape_assert_join(
         payload_checked,
         &apply_key_input,
@@ -351,6 +363,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &pending_insert_count,
         &pending_delete_count,
         function_catalog,
+        control,
     )?;
     let locator_join = build_locator_join_shell(
         key_shape_checked,
@@ -370,6 +383,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
         function_catalog,
+        control,
     )?;
     build_final_coalesce_project(
         locator_checked,
@@ -383,6 +397,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_row_id_column_id),
         ColumnId(locator_last_updated_seq_column_id),
     )
+    .map_err(crate::compiler::SqlCompileError::from)
 }
 
 fn build_payload_coalesce_aggregate(
@@ -392,7 +407,8 @@ fn build_payload_coalesce_aggregate(
     action_input: &OutputColumn,
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let aggregate_args = vec![column_ref(action_input)];
     let resolved = crate::functions::resolve_sql_aggregate_binding(
         function_catalog,
@@ -400,8 +416,19 @@ fn build_payload_coalesce_aggregate(
         &aggregate_args,
         &[],
         true,
+        control,
     )
-    .map_err(|error| format!("failed to resolve join coalesce sum aggregate: {error}"))?;
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => {
+            let error = other;
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "failed to resolve join coalesce sum aggregate: {error}"
+            ))
+        }
+    })?;
     let mut group_by = payload_inputs.iter().map(column_ref).collect::<Vec<_>>();
     group_by.push(column_ref(apply_key_input));
     let output_columns = payload_inputs
@@ -485,7 +512,8 @@ fn build_payload_coalesce_assert_filter(
     aggregate: LogicalPlanNode,
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let net_ne_zero = binary(
         column_ref(net_column),
         BinOp::Ne,
@@ -493,11 +521,11 @@ fn build_payload_coalesce_assert_filter(
     );
     let abs_args = vec![column_ref(net_column)];
     let abs_binding =
-        crate::analysis::resolve_function_binding(function_catalog, "abs", &abs_args)?;
+        crate::analysis::resolve_function_binding(function_catalog, "abs", &abs_args, control)?;
     let novarocks_functions::FunctionResultType::Scalar(abs_result) =
         &abs_binding.selected.result_type
     else {
-        return Err("abs must return a scalar value".to_string());
+        return Err("abs must return a scalar value".to_string().into());
     };
     let value_type = abs_result.clone();
     let abs_net = TypedExpr {
@@ -515,6 +543,7 @@ fn build_payload_coalesce_assert_filter(
         function_catalog,
         abs_net_le_one,
         "join delta per-payload net change exceeds 1",
+        control,
     )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
@@ -533,7 +562,8 @@ fn build_key_shape_assert_join(
     pending_insert_count: &OutputColumn,
     pending_delete_count: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let insert_args = vec![pending_count_expr(net_column, BinOp::Gt)];
     let delete_args = vec![pending_count_expr(net_column, BinOp::Lt)];
     let resolved = crate::functions::resolve_sql_aggregate_binding(
@@ -542,6 +572,7 @@ fn build_key_shape_assert_join(
         &insert_args,
         &[],
         true,
+        control,
     )
     .map_err(|error| format!("failed to resolve join key-shape sum aggregate: {error}"))?;
     let key_shape = LogicalPlanNode::new(
@@ -593,6 +624,7 @@ fn build_key_shape_assert_join(
             ),
         ),
         "join delta multiple pending payloads for key",
+        control,
     )?;
     let checked_key_shape = LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
@@ -805,7 +837,8 @@ fn build_locator_assert_filter(
     locator_file_column_id: ColumnId,
     locator_pos_column_id: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let insert_or_noop = binary(
         column_ref(net_column),
         BinOp::Ge,
@@ -828,6 +861,7 @@ fn build_locator_assert_filter(
         function_catalog,
         binary(insert_or_noop, BinOp::Or, locator_present),
         "join delta DELETE row missing target locator",
+        control,
     )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode { predicate }),
@@ -1080,10 +1114,11 @@ fn assert_true_call(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     predicate: TypedExpr,
     message: &str,
-) -> Result<TypedExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![predicate, string_literal(message)];
     let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "assert_true", &args)?;
+        crate::analysis::resolve_function_binding(function_catalog, "assert_true", &args, control)?;
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("assert_true"),
@@ -1171,7 +1206,8 @@ fn project_item_for_mapping(
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
     action_projection: JoinApplyActionProjection,
-) -> Result<ProjectItem, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ProjectItem, crate::compiler::SqlCompileError> {
     let expr = match mapping.source {
         JoinRefreshOutputSource::Payload(column_id) => {
             let source = desc
@@ -1188,7 +1224,8 @@ fn project_item_for_mapping(
             if column_id != desc.action_column.column_id {
                 return Err(format!(
                     "join refresh apply-key project references unknown action column {column_id}"
-                ));
+                )
+                .into());
             }
             match action_projection {
                 JoinApplyActionProjection::InputColumn => {
@@ -1227,11 +1264,17 @@ fn project_item_for_mapping(
             if column_id != desc.join_apply_key_column.column_id {
                 return Err(format!(
                     "join refresh apply-key project references unknown join apply-key column {column_id}"
-                ));
+                ).into());
             }
             validate_input_column(input_columns, &desc.left_row_id_column)?;
             validate_input_column(input_columns, &desc.right_row_id_column)?;
-            join_row_key_expr(function_catalog, desc, left_object_id, right_object_id)?
+            join_row_key_expr(
+                function_catalog,
+                desc,
+                left_object_id,
+                right_object_id,
+                control,
+            )?
         }
     };
 
@@ -1298,18 +1341,23 @@ fn join_row_key_expr(
     desc: &JoinRefreshDescriptor,
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
-) -> Result<TypedExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         object_id_binary_literal(left_object_id),
         column_ref(&desc.left_row_id_column),
         object_id_binary_literal(right_object_id),
         column_ref(&desc.right_row_id_column),
     ];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "join_row_key",
+        &args,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("join_row_key must return a scalar value".to_string());
+        return Err("join_row_key must return a scalar value".to_string().into());
     };
     let value_type = result.clone();
     Ok(TypedExpr {
@@ -1410,6 +1458,7 @@ mod tests {
             &right_object_id,
             90,
             91,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("apply-key project");
 
@@ -1453,10 +1502,14 @@ mod tests {
             &right_object_id,
             90,
             91,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("missing right row-id should fail closed");
 
-        assert!(err.contains("missing input column c3"), "err={err}");
+        assert!(
+            err.to_string().contains("missing input column c3"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1474,10 +1527,14 @@ mod tests {
             &right_object_id,
             900,
             91,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("apply-key id mismatch should fail closed");
 
-        assert!(err.contains("apply-key output id mismatch"), "err={err}");
+        assert!(
+            err.to_string().contains("apply-key output id mismatch"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1511,6 +1568,7 @@ mod tests {
             &right_object_id,
             90,
             91,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("apply-key project with constant insert action");
 
@@ -1622,7 +1680,11 @@ mod tests {
             ColumnId(6),
         )
         .unwrap_err();
-        assert!(error.contains("invalid IMV locator apply-key declaration"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid IMV locator apply-key declaration")
+        );
     }
 
     #[test]
@@ -1641,6 +1703,7 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
 
@@ -1670,6 +1733,7 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
 
@@ -1703,6 +1767,7 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
 
@@ -1727,6 +1792,7 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
         let optimized_tree = optimize_for_test(plan);
@@ -1739,7 +1805,8 @@ mod tests {
 
         if let Err(err) = result {
             assert!(
-                !err.contains("ColumnId") && !err.contains("cannot be resolved"),
+                !err.to_string().contains("ColumnId")
+                    && !err.to_string().contains("cannot be resolved"),
                 "coalesce plan must not fail aggregate argument binding after physical optimization: {err}"
             );
         }
@@ -1761,10 +1828,14 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("coalesce requires locator");
 
-        assert!(err.contains("requires target locator"), "err={err}");
+        assert!(
+            err.to_string().contains("requires target locator"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1781,10 +1852,14 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("net id collision should fail closed");
 
-        assert!(err.contains("collides with existing column"), "err={err}");
+        assert!(
+            err.to_string().contains("collides with existing column"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1801,10 +1876,11 @@ mod tests {
             102,
             103,
             104,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("duplicate generated ids should fail closed");
 
-        assert!(err.contains("is duplicated"), "err={err}");
+        assert!(err.to_string().contains("is duplicated"), "err={err}");
     }
 
     #[test]
@@ -1827,11 +1903,13 @@ mod tests {
                 102,
                 103,
                 104,
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect_err("reserved locator payload output should fail closed");
 
             assert!(
-                err.contains("reserved target locator") && err.contains(reserved),
+                err.to_string().contains("reserved target locator")
+                    && err.to_string().contains(reserved),
                 "err={err}"
             );
         }
@@ -2433,5 +2511,62 @@ mod tests {
         };
         assert_eq!(*column_id, expected_id);
         assert!(column.eq_ignore_ascii_case(expected_name));
+    }
+    #[test]
+    fn real_join_apply_key_binding_preserves_each_request_control_category() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Stop(CompileControlError);
+        impl PureCompileControl for Stop {
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::FunctionSpecialization);
+                Err(self.0)
+            }
+        }
+        let input = test_values_plan(vec![
+            out(1, "k", DataType::Int64, false, false),
+            out(
+                2,
+                crate::common::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            out(
+                3,
+                crate::common::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            out(
+                4,
+                crate::common::CHANGE_OP_COLUMN,
+                DataType::Int8,
+                false,
+                true,
+            ),
+        ]);
+        let desc = test_descriptor(JoinRefreshMode::AppendOnly);
+        let left = test_object_id(b"left\x00object");
+        let right = test_object_id(b"right\xffobject");
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let result = super::build_join_apply_key_project(
+                crate::functions::builtin_sql_function_catalog(),
+                input.clone(),
+                &desc,
+                &left,
+                &right,
+                90,
+                91,
+                &Stop(error),
+            );
+            assert!(
+                matches!(result, Err(actual) if actual == crate::compiler::SqlCompileError::from(error))
+            );
+        }
     }
 }

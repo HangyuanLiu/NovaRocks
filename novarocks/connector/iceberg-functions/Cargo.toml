@@ -32,3 +32,6 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 datasketches = { workspace = true, features = ["theta"] }
 novarocks-functions.workspace = true
+
+[dev-dependencies]
+novarocks-type-contract.workspace = true

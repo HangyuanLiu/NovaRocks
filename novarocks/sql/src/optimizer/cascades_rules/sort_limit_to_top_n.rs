@@ -42,25 +42,32 @@ impl Rule for SortLimitToTopN {
         matches!(op, Operator::LogicalLimit(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalLimit(limit_op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         // A LogicalTopN without a limit is just a Sort -- don't rewrite that case,
         // let the plain Sort path handle it.
         if limit_op.limit.is_none() {
-            return vec![];
+            return Ok(vec![]);
         }
         // LogicalLimit has exactly one child.
         if expr.children.len() != 1 {
-            return vec![];
+            return Ok(vec![]);
         }
         let child_group_id = expr.children[0];
 
         // Look for any LogicalSort MExpr in the child group.
         let child_group = match memo.groups.get(child_group_id) {
             Some(g) => g,
-            None => return vec![],
+            None => return Ok(vec![]),
         };
 
         let mut results = Vec::new();
@@ -74,7 +81,7 @@ impl Rule for SortLimitToTopN {
             let grandchild_group_id = child_mexpr.children[0];
             results.extend(rewrite_one_sort(limit_op, sort_op, grandchild_group_id));
         }
-        results
+        Ok(results)
     }
 
     fn pattern(&self) -> Pattern {
@@ -87,18 +94,25 @@ impl Rule for SortLimitToTopN {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = Limit, interior 1 = Sort (binder guarantees both kinds;
         // field predicates live in `rewrite_one_sort`).
         let Operator::LogicalLimit(limit_op) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Operator::LogicalSort(sort_op) = binding.op(memo, 1).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         // The Sort's child group (its only child).
         let grandchild_group_id = binding.children(1)[0];
-        rewrite_one_sort(&limit_op, &sort_op, grandchild_group_id)
+        Ok(rewrite_one_sort(&limit_op, &sort_op, grandchild_group_id))
     }
 }
 
@@ -195,7 +209,13 @@ mod tests {
         };
 
         let rule = SortLimitToTopN;
-        let out = rule.apply(&limit_mexpr, &mut memo);
+        let out = rule
+            .apply(
+                &limit_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one TopN alternative");
         match &out[0].op {
             Operator::LogicalTopN(t) => {
@@ -224,7 +244,13 @@ mod tests {
         };
 
         let rule = SortLimitToTopN;
-        let out = rule.apply(&limit_mexpr, &mut memo);
+        let out = rule
+            .apply(
+                &limit_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert!(
             out.is_empty(),
             "expected no alternatives without a Sort child"
@@ -261,7 +287,13 @@ mod tests {
         };
 
         let rule = SortLimitToTopN;
-        let out = rule.apply(&limit_mexpr, &mut memo);
+        let out = rule
+            .apply(
+                &limit_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert!(out.is_empty(), "expected no rewrite when limit is None");
     }
 
@@ -310,7 +342,13 @@ mod tests {
         };
 
         let rule = SortLimitToTopN;
-        let out = rule.apply(&limit_mexpr, &mut memo);
+        let out = rule
+            .apply(
+                &limit_mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert!(
             out.is_empty(),
             "SortLimitToTopN must not rewrite a partition-topn Sort (partition_limit.is_some())"

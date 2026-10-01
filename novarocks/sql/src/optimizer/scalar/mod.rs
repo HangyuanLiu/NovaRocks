@@ -423,15 +423,17 @@ pub(crate) fn resolve_function_binding(
     arena: &ScalarArena,
     name: &str,
     args: &[ScalarId],
-) -> Result<crate::binding::SqlFunctionBinding, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let arguments = args
         .iter()
         .map(|arg| function_argument(arena, *arg))
         .collect::<Vec<_>>();
     catalog
-        .resolve_scalar_binding(name, &arguments)
+        .resolve_scalar_binding(name, &arguments, control)
         .map(crate::binding::SqlFunctionBinding::new)
-        .map_err(|error| error.to_string())
+        .map_err(crate::compiler::SqlCompileError::from)
 }
 
 fn function_argument(arena: &ScalarArena, arg: ScalarId) -> novarocks_functions::FunctionArgument {
@@ -491,7 +493,9 @@ pub(crate) fn resolve_aggregate_binding(
     args: &[ScalarId],
     order_by: &[SortKey],
     trusted: bool,
-) -> Result<crate::binding::SqlFunctionBinding, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let arguments = args
         .iter()
         .copied()
@@ -499,11 +503,11 @@ pub(crate) fn resolve_aggregate_binding(
         .map(|argument| function_argument(arena, argument))
         .collect::<Vec<_>>();
     let exact = if trusted {
-        catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments)
+        catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments, control)
     } else {
-        catalog.resolve_aggregate_binding(name, args.len(), &arguments)
+        catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(crate::compiler::SqlCompileError::from)?;
     Ok(crate::binding::SqlFunctionBinding::new(exact))
 }
 

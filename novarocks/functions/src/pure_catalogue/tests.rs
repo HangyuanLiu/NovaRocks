@@ -85,6 +85,7 @@ struct Owner {
     implementations: Vec<PureImplementationDeclaration>,
     counts: Arc<Counts>,
     source_override: Option<FunctionEffectDeclaration>,
+    binding_failure: Mutex<Option<CompileControlError>>,
 }
 impl Owner {
     fn new(higher: bool) -> Self {
@@ -118,6 +119,7 @@ impl Owner {
             implementations,
             counts: Arc::new(Counts::default()),
             source_override: None,
+            binding_failure: Mutex::new(None),
         }
     }
     fn mark(&self) {
@@ -157,6 +159,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.mark();
         self.counts.resolve.fetch_add(1, Ordering::Relaxed);
@@ -174,14 +177,18 @@ impl FunctionBindingResolver for Owner {
             result_type: FunctionResultType::Scalar(value_type()),
             aggregate: None,
         };
-        self.validate_selected(&selection, request)?;
+        self.validate_selected(&selection, request, control)?;
         Ok(selection)
     }
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
+        if let Some(error) = *self.binding_failure.lock().unwrap() {
+            return Err(error.into());
+        }
         self.declaration.effect_declaration(&selected.overload)?;
         let expected = if selected.overload == overload_id(SCALAR) {
             scalar_arguments()
@@ -230,7 +237,7 @@ impl FunctionEffectOwner for Owner {
         self.counts.refine.fetch_add(1, Ordering::Relaxed);
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         if input.function_id != self.declaration.function_id()
             || input.kind != FunctionKind::Scalar
             || !input.environment.is_empty()
@@ -254,7 +261,7 @@ impl PureScalarImplementation for Owner {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(crate::kernel_control::compile_failure)?;
-        self.validate_selected(input.selected, input.request)
+        self.validate_selected(input.selected, input.request, control)
             .map_err(|_| crate::kernel_control::internal("fixture changed selected signature"))?;
         self.mark();
         self.counts.prepare.fetch_add(1, Ordering::Relaxed);
@@ -326,7 +333,7 @@ impl PureHigherOrderImplementation for Owner {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(crate::kernel_control::compile_failure)?;
-        self.validate_selected(input.selected, input.request)
+        self.validate_selected(input.selected, input.request, control)
             .map_err(|_| crate::kernel_control::internal("fixture changed higher signature"))?;
         self.mark();
         self.counts.prepare.fetch_add(1, Ordering::Relaxed);
@@ -759,7 +766,12 @@ fn same_actual_owner_resolves_refines_and_prepares_fresh_and_frozen_and_scalar_c
     };
     let bound = catalog
         .metadata()
-        .resolve_bound_user("CATALOGUE_FIXTURE", FunctionKind::Scalar, request)
+        .resolve_bound_user(
+            "CATALOGUE_FIXTURE",
+            FunctionKind::Scalar,
+            request,
+            crate::binding_test_control(),
+        )
         .unwrap();
     let selected = Arc::new(bound.selected);
     let parameters = SemanticParameters::default();
@@ -859,7 +871,12 @@ fn mixed_scalar_higher_order_owner_chooses_exact_overload_abi_without_cross_life
     };
     let bound = catalog
         .metadata()
-        .resolve_bound_user("catalogue_fixture", FunctionKind::Scalar, request)
+        .resolve_bound_user(
+            "catalogue_fixture",
+            FunctionKind::Scalar,
+            request,
+            crate::binding_test_control(),
+        )
         .unwrap();
     let selected = Arc::new(bound.selected);
     assert_eq!(selected.overload, overload_id(HIGHER));
@@ -937,11 +954,14 @@ fn unknown_ids_overloads_and_inaccurate_frozen_selected_kind_options_fail_before
     let arguments = scalar_arguments();
     let selected = Arc::new(
         owner
-            .resolve(FunctionBindingRequest {
-                expected_result_type: None,
-                arguments: &arguments,
-                logical_argument_count: 1,
-            })
+            .resolve(
+                FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+                crate::binding_test_control(),
+            )
             .unwrap(),
     );
     let parameters = SemanticParameters::default();
@@ -1053,11 +1073,14 @@ fn registered_metadata_cannot_hide_different_owner_effect_source_and_control_typ
     let arguments = scalar_arguments();
     let selected = Arc::new(
         owner
-            .resolve(FunctionBindingRequest {
-                expected_result_type: None,
-                arguments: &arguments,
-                logical_argument_count: 1,
-            })
+            .resolve(
+                FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+                crate::binding_test_control(),
+            )
             .unwrap(),
     );
     let parameters = SemanticParameters::default();
@@ -1086,11 +1109,14 @@ fn registered_metadata_cannot_hide_different_owner_effect_source_and_control_typ
             let catalog = catalogue(owner.clone(), false);
             let selected = Arc::new(
                 owner
-                    .resolve(FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 1,
-                    })
+                    .resolve(
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &arguments,
+                            logical_argument_count: 1,
+                        },
+                        crate::binding_test_control(),
+                    )
                     .unwrap(),
             );
             let input = call_input(&function, &selected, &arguments, &uses, &parameters);
@@ -1206,6 +1232,7 @@ fn exact_control_intrinsic_coalesce_fresh_frozen_keeps_descriptor_and_skips_ordi
                 arguments: &arguments,
                 logical_argument_count: 1,
             },
+            crate::binding_test_control(),
         )
         .unwrap();
     let selected = Arc::new(bound.selected);
@@ -1329,6 +1356,44 @@ fn control_intrinsic_registration_rejects_own_errors_state_observables_environme
         ));
         assert_eq!(owner.counts.resolve.load(Ordering::Relaxed), 0);
         assert_eq!(owner.counts.refine.load(Ordering::Relaxed), 0);
+        assert_eq!(owner.counts.prepare.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn selected_owner_control_remains_a_top_level_specialization_failure() {
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let owner = Arc::new(Owner::new(false));
+        let catalog = catalogue(owner.clone(), false);
+        let arguments = scalar_arguments();
+        let selected = Arc::new(
+            owner
+                .resolve(
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                    crate::binding_test_control(),
+                )
+                .unwrap(),
+        );
+        *owner.binding_failure.lock().unwrap() = Some(error);
+        let parameters = SemanticParameters::default();
+        let uses = [Some(ExpressionUseId::new(1))];
+        let function = id(FUNCTION);
+        let input = call_input(&function, &selected, &arguments, &uses, &parameters);
+        assert!(matches!(crate::specialize_scalar(
+            owner.as_ref(), input, selected.clone(), ScopedExpressionEffects::pure_value(context()),
+            &CompileControl::default(),
+        ), Err(FunctionSpecializationFailure::Control(actual)) if actual == error));
+        assert!(
+            matches!(catalog.prepare_fresh(input, selected.clone(), scalar_options(), &CompileControl::default()), Err(FunctionSpecializationFailure::Control(actual)) if actual == error)
+        );
         assert_eq!(owner.counts.prepare.load(Ordering::Relaxed), 0);
     }
 }

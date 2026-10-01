@@ -218,6 +218,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.counts.resolve.fetch_add(1, Ordering::Relaxed);
         self.selections
@@ -237,6 +238,7 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if request.logical_argument_count != 1
             || !self
@@ -271,7 +273,7 @@ impl FunctionEffectOwner for Owner {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 1)
             .map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         self.counts.refine.fetch_add(1, Ordering::Relaxed);
         Ok(self.frozen(input.selected))
     }

@@ -42,17 +42,24 @@ impl Rule for PushTopNThroughJoin {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(topn) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if expr.children.len() != 1 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let join_group_id = expr.children[0];
         let Some(join_group) = memo.groups.get(join_group_id).cloned() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut candidates = Vec::new();
         for join_expr in &join_group.logical_exprs {
@@ -75,7 +82,7 @@ impl Rule for PushTopNThroughJoin {
                 memo,
             ));
         }
-        results
+        Ok(results)
     }
 
     fn pattern(&self) -> Pattern {
@@ -88,17 +95,30 @@ impl Rule for PushTopNThroughJoin {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Operator::LogicalJoin(join) = binding.op(memo, 1).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(&join_group_id) = binding.children(0).first() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        rewrite_topn_through_join(&topn, &join, binding.children(1), join_group_id, memo)
+        Ok(rewrite_topn_through_join(
+            &topn,
+            &join,
+            binding.children(1),
+            join_group_id,
+            memo,
+        ))
     }
 }
 
@@ -581,7 +601,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         assert_rewrite_pushes_preserved_side(&memo, &out[0], left, right, 0);
@@ -604,7 +630,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -649,7 +681,15 @@ mod tests {
 
         let rewrites = bindings
             .iter()
-            .flat_map(|binding| PushTopNThroughJoin.apply_bound(binding, &mut memo))
+            .flat_map(|binding| {
+                PushTopNThroughJoin
+                    .apply_bound(
+                        binding,
+                        &mut memo,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
 
         assert!(
@@ -685,7 +725,13 @@ mod tests {
                 join,
             );
 
-            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            let out = PushTopNThroughJoin
+                .apply(
+                    &topn,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
 
             assert!(out.is_empty(), "{kind:?} must not push TopN through Join");
         }
@@ -710,7 +756,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(out.is_empty());
     }
@@ -734,7 +786,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(out.is_empty());
     }
@@ -755,7 +813,13 @@ mod tests {
             let item = sort_key(&mut memo, 1);
             let topn = topn_with_key(&mut memo, item, limit, offset, phase, is_split, join);
 
-            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            let out = PushTopNThroughJoin
+                .apply(
+                    &topn,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
 
             assert!(out.is_empty());
         }
@@ -778,7 +842,13 @@ mod tests {
             join,
         );
 
-        let first = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let first = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1);
         let first = first.into_iter().next().unwrap();
         let pushed_root = MExpr {
@@ -787,7 +857,13 @@ mod tests {
             children: first.children,
         };
 
-        let second = PushTopNThroughJoin.apply(&pushed_root, &mut memo);
+        let second = PushTopNThroughJoin
+            .apply(
+                &pushed_root,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(second.is_empty());
     }
@@ -823,7 +899,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         assert!(
@@ -859,7 +941,13 @@ mod tests {
         .unwrap();
         assert_eq!(bindings.len(), 1);
 
-        let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);
+        let out = PushTopNThroughJoin
+            .apply_bound(
+                &bindings[0],
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         assert_rewrite_pushes_preserved_side(&memo, &out[0], left, right, 0);
@@ -1048,7 +1136,13 @@ mod tests {
                 join,
             );
             let groups_before = memo.groups.len();
-            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            let out = PushTopNThroughJoin
+                .apply(
+                    &topn,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
             if policy == Policy::ReportError {
                 assert!(out.is_empty());
                 assert_eq!(
@@ -1098,7 +1192,13 @@ mod tests {
             .unwrap();
             assert_eq!(bindings.len(), 1);
             let groups_before = memo.groups.len();
-            let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);
+            let out = PushTopNThroughJoin
+                .apply_bound(
+                    &bindings[0],
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
             if policy == Policy::ReportError {
                 assert!(out.is_empty());
                 assert_eq!(memo.groups.len(), groups_before);

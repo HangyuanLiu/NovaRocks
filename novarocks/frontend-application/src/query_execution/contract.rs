@@ -499,6 +499,7 @@ pub struct DistributedQueryError {
     message: String,
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
     pre_ready_topology_observation: bool,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl DistributedQueryError {
@@ -508,6 +509,7 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: false,
+            compile_control: None,
         }
     }
 
@@ -523,6 +525,7 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
+            compile_control: None,
         }
     }
 
@@ -536,6 +539,7 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: true,
+            compile_control: None,
         }
     }
 
@@ -552,7 +556,49 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
+            compile_control: None,
         }
+    }
+
+    pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        match crate::dml::error::DmlExecutionError::from_compile(error) {
+            crate::dml::error::DmlExecutionError::Control(error) => {
+                Self::from_compile_control(error)
+            }
+            crate::dml::error::DmlExecutionError::Analyze(error) => match error.control_error() {
+                Some(error) => Self::from_compile_control(error),
+                None => Self::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    error.to_string(),
+                ),
+            },
+            crate::dml::error::DmlExecutionError::Engine(error) => {
+                Self::new(DistributedQueryErrorKind::ContractViolation, error)
+            }
+        }
+    }
+    pub(crate) fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
+        match error {
+            novarocks_plan_codec::PhysicalEncodeError::Control(error) => {
+                Self::from_compile_control(error)
+            }
+            novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
+                Self::new(DistributedQueryErrorKind::ContractViolation, error)
+            }
+        }
+    }
+    fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
+        let mut failure = Self::new(
+            DistributedQueryErrorKind::ContractViolation,
+            error.to_string(),
+        );
+        failure.compile_control = Some(error);
+        failure
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub fn kind(&self) -> DistributedQueryErrorKind {

@@ -37,8 +37,10 @@
 //! 4. **Polymorphic widening.** Signatures that opt in to widening can
 //!    merge repeated `Any(name)` bindings through `wider_type`.
 
+use super::binding_control;
 use crate::{FunctionResolutionError, FunctionValueType, ResolvedFunctionSignature};
 use arrow_schema::DataType;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 use super::registry;
 use super::signature::{
@@ -186,23 +188,37 @@ pub struct ResolvedScalarValueSignature {
 pub fn resolve_scalar_value_signature_with_overload(
     name: &str,
     arguments: &[FunctionValueType],
+    control: &dyn PureCompileControl,
 ) -> Result<(usize, ResolvedScalarValueSignature), ResolveError> {
-    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
-    let carriers = arguments
-        .iter()
-        .map(|ty| ty.data_type.clone())
-        .collect::<Vec<_>>();
-    for pass in 0..5 {
-        for (index, signature) in candidates.iter().enumerate() {
-            if let Some(resolved) = value_signature_in_pass(signature, arguments, &carriers, pass)?
-            {
-                return Ok((index, resolved));
+    value_resolution_scope(control, |work| {
+        let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
+        let carriers = value_carriers(arguments, work)?;
+        for pass in 0..5 {
+            work.step()?;
+            for (index, signature) in candidates.iter().enumerate() {
+                work.step()?;
+                if let Some(resolved) =
+                    value_signature_in_pass(signature, arguments, &carriers, pass, work)?
+                {
+                    return Ok((index, resolved));
+                }
             }
         }
-    }
-    Err(ResolveError::NoMatchingSignature {
-        candidates: candidates.len(),
-        binding_enforced: binding_enforced_for_arity(candidates, arguments.len()),
+        let mut relevant = false;
+        let mut enforced = false;
+        let mut all_enforced = true;
+        for signature in candidates {
+            work.step()?;
+            all_enforced &= signature.argument_binding.is_enforced();
+            if check_arity(signature, arguments.len()) {
+                relevant = true;
+                enforced |= signature.argument_binding.is_enforced();
+            }
+        }
+        Err(ResolveError::NoMatchingSignature {
+            candidates: candidates.len(),
+            binding_enforced: if relevant { enforced } else { all_enforced },
+        })
     })
 }
 
@@ -210,24 +226,107 @@ pub fn resolve_scalar_value_signature_at_overload(
     name: &str,
     overload_index: usize,
     arguments: &[FunctionValueType],
+    control: &dyn PureCompileControl,
 ) -> Result<ResolvedScalarValueSignature, ResolveError> {
-    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
-    let signature = candidates
-        .get(overload_index)
-        .ok_or_else(|| ResolveError::BadSignature("selected overload index is unknown".into()))?;
-    let carriers = arguments
-        .iter()
-        .map(|ty| ty.data_type.clone())
-        .collect::<Vec<_>>();
-    for pass in 0..5 {
-        if let Some(resolved) = value_signature_in_pass(signature, arguments, &carriers, pass)? {
-            return Ok(resolved);
+    value_resolution_scope(control, |work| {
+        let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
+        let signature = candidates.get(overload_index).ok_or_else(|| {
+            ResolveError::BadSignature("selected overload index is unknown".into())
+        })?;
+        let carriers = value_carriers(arguments, work)?;
+        for pass in 0..5 {
+            work.step()?;
+            if let Some(resolved) =
+                value_signature_in_pass(signature, arguments, &carriers, pass, work)?
+            {
+                return Ok(resolved);
+            }
+        }
+        Err(ResolveError::NoMatchingSignature {
+            candidates: 1,
+            binding_enforced: signature.argument_binding.is_enforced(),
+        })
+    })
+}
+
+fn binding_to_resolution(error: crate::FunctionBindingError) -> ResolveError {
+    match error {
+        crate::FunctionBindingError::Control(error) => ResolveError::Control(error),
+        other => ResolveError::BadSignature(other.to_string()),
+    }
+}
+
+fn value_resolution_scope<T>(
+    control: &dyn PureCompileControl,
+    body: impl FnOnce(&mut CompileCheckpoints<'_>) -> Result<T, ResolveError>,
+) -> Result<T, ResolveError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = body(&mut work);
+    if matches!(result, Err(ResolveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+fn value_carriers(
+    arguments: &[FunctionValueType],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<DataType>, ResolveError> {
+    let mut carriers = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        work.step()?;
+        binding_control::value_type(argument, work).map_err(binding_to_resolution)?;
+        carriers.push(argument.data_type.clone());
+    }
+    Ok(carriers)
+}
+
+fn carrier_matches_observed(
+    sig: &Signature,
+    args: &[DataType],
+    pass: u8,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ResolveError> {
+    if !check_arity(sig, args.len())
+        || (pass == 3 && !sig.argument_binding.is_enforced())
+        || (pass == 4 && !sig.widening)
+    {
+        return Ok(false);
+    }
+    let mut bindings = Bindings::default();
+    let mut widened = false;
+    for (index, actual) in args.iter().enumerate() {
+        work.step()?;
+        let spec = signature_spec_at(sig, index);
+        // The declaration's recursive matcher is still a legacy opaque helper;
+        // the actual argument/pass traversal belongs to this controlled owner.
+        work.flush()?;
+        let matched = match pass {
+            0 => anchor_matches(spec, actual),
+            1 => unify(spec, actual, &mut bindings, BindMode::Strict),
+            2 => {
+                if anchor_matches(spec, actual) {
+                    true
+                } else if integer_widens_losslessly(spec, actual) {
+                    widened = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            3 => {
+                anchor_matches(spec, actual) || implicit_anchor_cast_target(spec, actual).is_some()
+            }
+            4 => unify(spec, actual, &mut bindings, BindMode::Widening),
+            _ => unreachable!("closed resolver pass"),
+        };
+        work.step()?;
+        if !matched {
+            return Ok(false);
         }
     }
-    Err(ResolveError::NoMatchingSignature {
-        candidates: 1,
-        binding_enforced: signature.argument_binding.is_enforced(),
-    })
+    Ok(pass != 2 || widened)
 }
 
 fn value_signature_in_pass(
@@ -235,24 +334,9 @@ fn value_signature_in_pass(
     arguments: &[FunctionValueType],
     carriers: &[DataType],
     pass: u8,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ResolvedScalarValueSignature>, ResolveError> {
-    let mut carrier_bindings = Bindings::default();
-    let carrier_match = match pass {
-        0 => strict_matches(signature, carriers),
-        1 => polymorphic_matches(signature, carriers, &mut carrier_bindings, BindMode::Strict),
-        2 => integer_widening_matches(signature, carriers),
-        3 => concrete_cast_matches(signature, carriers),
-        4 => {
-            signature.widening
-                && polymorphic_matches(
-                    signature,
-                    carriers,
-                    &mut carrier_bindings,
-                    BindMode::Widening,
-                )
-        }
-        _ => unreachable!("closed resolver pass"),
-    };
+    let carrier_match = carrier_matches_observed(signature, carriers, pass, work)?;
     if !carrier_match {
         return Ok(None);
     }
@@ -263,37 +347,43 @@ fn value_signature_in_pass(
     };
     let mut bindings = Bindings::default();
     for (index, actual) in arguments.iter().enumerate() {
-        if !unify_value(
+        work.step()?;
+        work.flush()?;
+        let matched = unify_value(
             signature_spec_at(signature, index),
             actual,
             &mut bindings,
             mode,
-        ) {
+        );
+        work.step()?;
+        if !matched {
             return Ok(None);
         }
     }
-    let argument_types = arguments
-        .iter()
-        .enumerate()
-        .map(
-            |(index, actual)| match signature_spec_at(signature, index) {
-                TypeSpec::AnyType | TypeSpec::AnyDecimal128 => Ok(actual.clone()),
-                spec => realize_value(spec, &bindings, actual.nullable)
-                    .map_err(ResolveError::BadSignature),
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    if arguments
-        .iter()
-        .zip(&argument_types)
-        .any(|(source, target)| {
-            !super::value_conversion::assignment_domains_authorized(source, target)
-        })
-    {
-        return Ok(None);
+    let mut argument_types = Vec::with_capacity(arguments.len());
+    for (index, actual) in arguments.iter().enumerate() {
+        work.step()?;
+        // Recursive realization/domain recipes retain their existing policies;
+        // their opaque internal allocation work is not certified by this step.
+        work.flush()?;
+        let target = match signature_spec_at(signature, index) {
+            TypeSpec::AnyType | TypeSpec::AnyDecimal128 => actual.clone(),
+            spec => realize_value(spec, &bindings, actual.nullable)
+                .map_err(ResolveError::BadSignature)?,
+        };
+        binding_control::value_type(&target, work).map_err(binding_to_resolution)?;
+        work.flush()?;
+        let authorized = super::value_conversion::assignment_domains_authorized(actual, &target);
+        work.step()?;
+        if !authorized {
+            return Ok(None);
+        }
+        argument_types.push(target);
     }
+    work.flush()?;
     let return_type =
         realize_value(&signature.ret, &bindings, true).map_err(ResolveError::BadSignature)?;
+    binding_control::value_type(&return_type, work).map_err(binding_to_resolution)?;
     Ok(Some(ResolvedScalarValueSignature {
         argument_types,
         return_type,

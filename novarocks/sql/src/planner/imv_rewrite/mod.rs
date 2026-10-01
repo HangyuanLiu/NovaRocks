@@ -108,7 +108,7 @@ where
 /// Mutable-context variant of [`bridge_apply_result`] for IMV rules that need
 /// to update [`RewriteContext`] extensions while still using
 /// `LogicalPlanNode` helpers.
-pub(crate) fn bridge_apply_result_mut<F>(
+pub(crate) fn bridge_apply_result_mut_typed<F>(
     expr: crate::optimizer::opt_expr::OptExpr,
     ctx: &mut crate::optimizer::rewrite::context::RewriteContext,
     f: F,
@@ -117,10 +117,10 @@ where
     F: FnOnce(
         crate::planner::logical::LogicalPlanNode,
         &mut crate::optimizer::rewrite::context::RewriteContext,
-    ) -> Result<PlanRewriteResult, String>,
+    ) -> Result<PlanRewriteResult, crate::compiler::SqlCompileError>,
 {
     let plan = opt_expr_to_plan(expr, ctx);
-    let result = f(plan, ctx).map_err(crate::compiler::SqlCompileError::Compilation)?;
+    let result = f(plan, ctx)?;
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {

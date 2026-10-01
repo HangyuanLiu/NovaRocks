@@ -3729,6 +3729,7 @@ dependencies = [
  "arrow-schema",
  "datasketches",
  "novarocks-functions",
+ "novarocks-type-contract",
 ]
 
 [[package]]
@@ -4023,6 +4024,7 @@ dependencies = [
  "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
  "novarocks-table-maintenance",
+ "novarocks-type-contract",
  "novarocks-types",
  "prost 0.13.5",
  "prost-build",
@@ -4210,6 +4212,7 @@ dependencies = [
  "novarocks-physical-plan",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
  "novarocks-workload-control",
@@ -4447,6 +4450,7 @@ name = "novarocks-statistics-application"
 version = "0.1.0"
 dependencies = [
  "novarocks-query-application",
+ "novarocks-type-contract",
  "novarocks-workload-control",
  "tokio",
  "uuid",
@@ -4492,6 +4496,7 @@ dependencies = [
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
+ "novarocks-type-contract",
  "serde",
  "serde_json",
  "tokio",

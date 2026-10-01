@@ -36,15 +36,31 @@ use super::scope::AnalyzerScope;
 
 type WindowSpecAnalysis = (Vec<TypedExpr>, Vec<SortItem>, Option<WindowFrame>);
 
+fn scalar_signature_is_unknown(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    arg_types: &[DataType],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, AnalyzeError> {
+    match function_catalog.resolve_scalar_signature(name, arg_types, control) {
+        Err(error @ novarocks_functions::FunctionResolutionError::Control(_)) => {
+            Err(AnalyzeError::function_resolution(error))
+        }
+        Err(crate::functions::ResolveError::UnknownFunction) => Ok(true),
+        _ => Ok(false),
+    }
+}
 fn scalar_function_is_unknown(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     arg_types: &[DataType],
-) -> bool {
-    matches!(
-        function_catalog.resolve_scalar_signature(name, arg_types),
-        Err(crate::functions::ResolveError::UnknownFunction)
-    ) && legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types).is_none()
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, AnalyzeError> {
+    Ok(
+        scalar_signature_is_unknown(function_catalog, name, arg_types, control)?
+            && legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types, control)?
+                .is_none(),
+    )
 }
 
 fn interval_field_name(field: ast::IntervalField) -> &'static str {
@@ -962,6 +978,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     vec![base, index_typed],
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )?;
                 debug_assert_eq!(result.value_type.data_type, output_type);
                 Ok(result)
@@ -1150,6 +1167,7 @@ impl<'a> super::AnalyzerContext<'a> {
             vec![base, field_name_expr],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         debug_assert_eq!(result.value_type.data_type, field_type);
         Ok(result)
@@ -1315,8 +1333,15 @@ impl<'a> super::AnalyzerContext<'a> {
             super::helpers::validate_value_type(&expected, self.control)?;
             let binding = self
                 .function_catalog
-                .resolve_scalar_binding_with_expected_result("__array_literal", &[], &expected)
-                .map_err(|error| AnalyzeError::type_mismatch(error.to_string(), array.span))?;
+                .resolve_scalar_binding_with_expected_result(
+                    "__array_literal",
+                    &[],
+                    &expected,
+                    self.control,
+                )
+                .map_err(|error| {
+                    AnalyzeError::function_binding(error).at_type_mismatch(array.span)
+                })?;
             let novarocks_functions::FunctionResultType::Scalar(value_type) =
                 &binding.selected.result_type
             else {
@@ -1342,6 +1367,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             array.span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )
     }
 
@@ -1363,6 +1389,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             right.span(),
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )
     }
 
@@ -1618,6 +1645,7 @@ impl<'a> super::AnalyzerContext<'a> {
             &right_typed,
             left.span(),
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )? {
             return Ok(date_shift);
         }
@@ -2040,6 +2068,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         function_name,
                         &args,
                         func.span,
+                        self.control,
                     )?,
                     args,
                     distinct: false,
@@ -2317,6 +2346,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             vec![arg],
                             func.span,
                             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                            self.control,
                         )
                     }
                 })
@@ -2511,11 +2541,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 if !self.function_catalog.contains_aggregate(&executable_name) {
                     // Legacy declarations are type-inspection facts, not installed selected bindings.
                     // A custom contribution of the same name is resolved by its own catalog identity.
-                    if matches!(
-                        self.function_catalog
-                            .resolve_scalar_signature(&name, &arg_types),
-                        Err(crate::functions::ResolveError::UnknownFunction)
-                    ) && matches!(
+                    if scalar_signature_is_unknown(
+                        self.function_catalog,
+                        &name,
+                        &arg_types,
+                        self.control,
+                    )? && matches!(
                         crate::functions::builtin_disposition(&name),
                         Some(
                             crate::functions::BuiltinDisposition::Unavailable
@@ -2529,7 +2560,12 @@ impl<'a> super::AnalyzerContext<'a> {
                             func.span,
                         ));
                     }
-                    if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
+                    if scalar_function_is_unknown(
+                        self.function_catalog,
+                        &name,
+                        &arg_types,
+                        self.control,
+                    )? {
                         return Err(AnalyzeError::unknown_function(
                             format!("Unknown function: {name}"),
                             func.span,
@@ -2546,6 +2582,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &args_typed,
                     &func_order_by,
                     func.span,
+                    self.control,
                 )?)
             };
             if is_distinct && (window_only || !aggregate_window_supports_distinct(&name)) {
@@ -2596,8 +2633,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     .map(crate::analysis::function_argument)
                     .collect::<Vec<_>>();
                 self.function_catalog
-                    .resolve_window_binding(&name, &arguments)
+                    .resolve_window_binding(&name, &arguments, self.control)
                     .map_err(|error| {
+                        if let novarocks_functions::FunctionBindingError::Control(error) = error { return AnalyzeError::control(error); }
                         AnalyzeError::type_mismatch(
                             format!(
                                 "cannot bind window function `{name}` for argument types {:?}: {error}",
@@ -2785,6 +2823,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 &args_typed,
                 &func_order_by,
                 func.span,
+                self.control,
             )?);
         } else if !aggregate_macro {
             if matches!(name.as_str(), "variant_get" | "try_variant_get") {
@@ -2819,17 +2858,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
             // Legacy declarations are type-inspection facts, not installed selected bindings.
             // A custom contribution of the same name is resolved by its own catalog identity.
-            if matches!(
-                self.function_catalog
-                    .resolve_scalar_signature(&name, &arg_types),
-                Err(crate::functions::ResolveError::UnknownFunction)
-            ) && matches!(
-                crate::functions::builtin_disposition(&name),
-                Some(
-                    crate::functions::BuiltinDisposition::Unavailable
-                        | crate::functions::BuiltinDisposition::LoweredOnly
+            if scalar_signature_is_unknown(self.function_catalog, &name, &arg_types, self.control)?
+                && matches!(
+                    crate::functions::builtin_disposition(&name),
+                    Some(
+                        crate::functions::BuiltinDisposition::Unavailable
+                            | crate::functions::BuiltinDisposition::LoweredOnly
+                    )
                 )
-            ) {
+            {
                 return Err(AnalyzeError::unsupported_expression(
                     format!(
                         "builtin function `{name}` has no admitted selected scalar implementation"
@@ -2837,7 +2874,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     func.span,
                 ));
             }
-            if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
+            if scalar_function_is_unknown(self.function_catalog, &name, &arg_types, self.control)? {
                 return Err(AnalyzeError::unknown_function(
                     format!("Unknown function: {name}"),
                     func.span,
@@ -2848,8 +2885,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 &name,
                 args_typed,
                 self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.control,
             )
-            .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
+            .map_err(|error| error.at_type_mismatch(func.span))?;
             arg_types = bound
                 .args
                 .iter()
@@ -2866,8 +2904,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_state",
                     args_typed,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )
-                .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
+                .map_err(|error| error.at_type_mismatch(func.span))?;
                 let state_value_type = match &bound_state.binding.selected.result_type {
                     novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
                     novarocks_functions::FunctionResultType::Relation(_) => unreachable!(),
@@ -2889,6 +2928,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_union",
                     std::slice::from_ref(&state_expr),
                     func.span,
+                    self.control,
                 )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
@@ -2913,6 +2953,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_union",
                     &args_typed,
                     func.span,
+                    self.control,
                 )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
@@ -2937,6 +2978,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_merge",
                     &args_typed,
                     func.span,
+                    self.control,
                 )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
@@ -2969,12 +3011,15 @@ impl<'a> super::AnalyzerContext<'a> {
             })
         } else {
             // Scalar function
-            let mut return_type = bound_scalar
-                .as_ref()
-                .map(|bound| bound.return_type().clone())
-                .unwrap_or_else(|| {
-                    infer_scalar_return_type_with_catalog(self.function_catalog, &name, &arg_types)
-                });
+            let mut return_type = match bound_scalar.as_ref() {
+                Some(bound) => bound.return_type().clone(),
+                None => infer_scalar_return_type_with_catalog(
+                    self.function_catalog,
+                    &name,
+                    &arg_types,
+                    self.control,
+                )?,
+            };
             // `named_struct(name0, val0, name1, val1, …)` needs to carry the
             // user-supplied field *names* in its returned STRUCT schema.
             // `infer_scalar_return_type` only sees arg types and falls back
@@ -3101,8 +3146,9 @@ impl<'a> super::AnalyzerContext<'a> {
             "map",
             args,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )
-        .map_err(|message| AnalyzeError::invalid_argument(message, map.span))?;
+        .map_err(|error| error.at_invalid_argument(map.span))?;
         let BoundScalarCall { args, binding } = bound;
         let return_type = match &binding.selected.result_type {
             novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
@@ -3212,6 +3258,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         debug_assert_eq!(
             result.value_type.data_type,
@@ -3314,6 +3361,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 args,
                 span,
                 self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.control,
             )
             .map(Some);
         }
@@ -3387,6 +3435,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )
                 .map(Some)
             }
@@ -3400,6 +3449,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     map_args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )?;
                 let args = vec![mapped];
                 resolved_scalar_call_at(
@@ -3408,6 +3458,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )
                 .map(Some)
             }
@@ -3424,6 +3475,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     map_args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )?;
                 let args = vec![source, filter];
                 resolved_scalar_call_at(
@@ -3432,6 +3484,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.control,
                 )
                 .map(Some)
             }
@@ -3680,6 +3733,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         let body_type = body_typed.value_type.data_type.clone();
         let body_nullable = body_typed.value_type.nullable;
@@ -4872,6 +4926,7 @@ fn date_day_arithmetic_expr(
     right: &TypedExpr,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<TypedExpr>, AnalyzeError> {
     match op {
         ast::BinaryOperator::Add if is_temporal_day_base(&left.value_type.data_type) => {
@@ -4882,6 +4937,7 @@ fn date_day_arithmetic_expr(
                 right.clone(),
                 span,
                 decimal_overflow_policy,
+                control,
             )
         }
         ast::BinaryOperator::Add if is_temporal_day_base(&right.value_type.data_type) => {
@@ -4892,6 +4948,7 @@ fn date_day_arithmetic_expr(
                 left.clone(),
                 span,
                 decimal_overflow_policy,
+                control,
             )
         }
         ast::BinaryOperator::Subtract if is_temporal_day_base(&left.value_type.data_type) => {
@@ -4902,6 +4959,7 @@ fn date_day_arithmetic_expr(
                 right.clone(),
                 span,
                 decimal_overflow_policy,
+                control,
             )
         }
         _ => Ok(None),
@@ -4915,6 +4973,7 @@ fn date_day_shift_expr(
     offset_expr: TypedExpr,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<TypedExpr>, AnalyzeError> {
     if !is_integer_day_offset(&offset_expr.value_type.data_type) {
         return Ok(None);
@@ -4934,6 +4993,7 @@ fn date_day_shift_expr(
         args,
         span,
         decimal_overflow_policy,
+        control,
     )
     .map(Some)
 }
@@ -5058,8 +5118,10 @@ fn resolve_scalar_binding(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-) -> Result<crate::binding::SqlFunctionBinding, String> {
-    crate::analysis::resolve_function_binding(function_catalog, name, args)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
+    crate::analysis::resolve_function_binding(function_catalog, name, args, control)
+        .map_err(AnalyzeError::function_binding)
 }
 
 pub(super) fn resolve_scalar_binding_at(
@@ -5067,9 +5129,10 @@ pub(super) fn resolve_scalar_binding_at(
     name: &str,
     args: &[TypedExpr],
     span: Span,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    resolve_scalar_binding(function_catalog, name, args)
-        .map_err(|message| AnalyzeError::type_mismatch(message, span))
+    resolve_scalar_binding(function_catalog, name, args, control)
+        .map_err(|error| error.at_type_mismatch(span))
 }
 
 pub(super) fn resolved_scalar_call_at(
@@ -5078,8 +5141,9 @@ pub(super) fn resolved_scalar_call_at(
     args: Vec<TypedExpr>,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
-    let binding = resolve_scalar_binding_at(function_catalog, name, &args, span)?;
+    let binding = resolve_scalar_binding_at(function_catalog, name, &args, span, control)?;
     let args = args
         .into_iter()
         .zip(binding.selected.argument_types.iter())
@@ -5108,6 +5172,7 @@ pub(super) fn resolved_scalar_call_at(
                         argument,
                         super::helpers::with_nullability(target.clone(), nullable),
                         decimal_overflow_policy,
+                        control,
                     )
                 } else {
                     Ok(argument)
@@ -5115,9 +5180,9 @@ pub(super) fn resolved_scalar_call_at(
             }
             novarocks_functions::FunctionArgumentType::Lambda { .. } => Ok(argument),
         })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
-    let exact = resolve_scalar_binding_at(function_catalog, name, &args, span)?;
+        .collect::<Result<Vec<_>, AnalyzeError>>()
+        .map_err(|error| error.at_type_mismatch(span))?;
+    let exact = resolve_scalar_binding_at(function_catalog, name, &args, span, control)?;
     if exact.function_id != binding.function_id
         || exact.selected.overload != binding.selected.overload
     {
@@ -5231,10 +5296,12 @@ fn coerce_selected_function_argument(
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<TypedExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
     if expr.value_type.same_value_domain(target) {
         let mut coerced =
-            coerce_function_argument(expr, &target.data_type, decimal_overflow_policy)?;
+            coerce_function_argument(expr, &target.data_type, decimal_overflow_policy)
+                .map_err(AnalyzeError::internal)?;
         coerced.value_type =
             super::helpers::with_nullability(target.clone(), coerced.value_type.nullable);
         return Ok(coerced);
@@ -5260,12 +5327,14 @@ fn coerce_selected_function_argument(
             expr,
             value_type,
             decimal_overflow_policy,
+            control,
         );
     }
     // Ordinary carrier coercion retains its checked integer-literal
     // normalization and runtime narrowing policy. The selected owner still
     // supplies the complete target domain, including nested field facts.
-    let mut coerced = coerce_function_argument(expr, &target.data_type, decimal_overflow_policy)?;
+    let mut coerced = coerce_function_argument(expr, &target.data_type, decimal_overflow_policy)
+        .map_err(AnalyzeError::internal)?;
     coerced.value_type =
         super::helpers::with_nullability(target.clone(), coerced.value_type.nullable);
     Ok(coerced)
@@ -5284,12 +5353,16 @@ fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) 
 }
 
 #[cfg(test)]
-fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundScalarCall, String> {
+fn bind_scalar_function_call(
+    name: &str,
+    args: Vec<TypedExpr>,
+) -> Result<BoundScalarCall, AnalyzeError> {
     bind_scalar_function_call_with_catalog(
         crate::functions::builtin_sql_function_catalog(),
         name,
         args,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
 
@@ -5406,17 +5479,19 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     name: &str,
     mut args: Vec<TypedExpr>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<BoundScalarCall, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<BoundScalarCall, AnalyzeError> {
     apply_implicit_string_function_casts(name, &mut args);
     if name.eq_ignore_ascii_case("field") {
-        args = normalize_field_arguments(args, decimal_overflow_policy)?;
+        args = normalize_field_arguments(args, decimal_overflow_policy)
+            .map_err(AnalyzeError::internal)?;
     }
     let arg_types = args
         .iter()
         .map(|arg| arg.value_type.data_type.clone())
         .collect::<Vec<_>>();
 
-    match resolve_scalar_binding(function_catalog, name, &args) {
+    match resolve_scalar_binding(function_catalog, name, &args, control) {
         Ok(binding) => {
             let args = args
                 .into_iter()
@@ -5428,6 +5503,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                             arg,
                             value,
                             decimal_overflow_policy,
+                            control,
                         )
                     }
                     novarocks_functions::FunctionArgumentType::Lambda { .. }
@@ -5435,28 +5511,31 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                     {
                         Ok(arg)
                     }
-                    novarocks_functions::FunctionArgumentType::Lambda { .. } => Err(format!(
-                        "function `{name}` selected a lambda target for a value argument"
-                    )),
+                    novarocks_functions::FunctionArgumentType::Lambda { .. } => {
+                        Err(AnalyzeError::internal(format!(
+                            "function `{name}` selected a lambda target for a value argument"
+                        )))
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            validate_scalar_function_call_typed(name, &args)?;
-            let exact = resolve_scalar_binding(function_catalog, name, &args)?;
+            validate_scalar_function_call_typed(name, &args).map_err(AnalyzeError::internal)?;
+            let exact = resolve_scalar_binding(function_catalog, name, &args, control)?;
             if exact.function_id != binding.function_id
                 || exact.selected.overload != binding.selected.overload
             {
-                return Err(format!(
+                return Err(AnalyzeError::internal(format!(
                     "function `{name}` changed selected identity after argument coercion"
-                ));
+                )));
             }
             Ok(BoundScalarCall {
                 args,
                 binding: exact,
             })
         }
-        Err(error) => Err(format!(
+        Err(error) if error.control_error().is_some() => Err(error),
+        Err(error) => Err(AnalyzeError::internal(format!(
             "cannot bind scalar function `{name}` for argument types {arg_types:?}: {error}"
-        )),
+        ))),
     }
 }
 
@@ -5465,8 +5544,9 @@ pub(super) fn resolve_aggregate_function_call(
     name: &str,
     args: &[TypedExpr],
     span: Span,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    resolve_aggregate_function_call_with_order(function_catalog, name, args, &[], span)
+    resolve_aggregate_function_call_with_order(function_catalog, name, args, &[], span, control)
 }
 
 fn resolve_aggregate_function_call_with_order(
@@ -5475,6 +5555,7 @@ fn resolve_aggregate_function_call_with_order(
     args: &[TypedExpr],
     function_order_by: &[SortItem],
     span: Span,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     let arg_types = args
         .iter()
@@ -5486,9 +5567,13 @@ fn resolve_aggregate_function_call_with_order(
         args,
         function_order_by,
         false,
+        control,
     )
     .map(crate::binding::SqlFunctionBinding::new)
     .map_err(|error| {
+        if let novarocks_functions::FunctionBindingError::Control(error) = error {
+            return AnalyzeError::control(error);
+        }
         AnalyzeError::type_mismatch(
             format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}"),
             span,
@@ -9114,7 +9199,7 @@ mod tests {
             Ok(_) => panic!("precision overflow must fail"),
             Err(error) => error,
         };
-        assert!(error.contains("precision overflow"), "{error}");
+        assert!(error.message().contains("precision overflow"), "{error}");
     }
 
     #[test]

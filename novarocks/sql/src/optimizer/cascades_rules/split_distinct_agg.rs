@@ -53,9 +53,16 @@ impl Rule for SplitDistinctAgg {
         matches!(op, Operator::LogicalAggregate(a) if a.aggregates.iter().any(|c| c.distinct))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalAggregate(agg) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
         // Ordered aggregates need all order-by inputs available at the update
         // phase. The current split-distinct lowering only preserves the
@@ -64,13 +71,13 @@ impl Rule for SplitDistinctAgg {
         // GLOBAL phase. Fall back to the single-stage aggregate for semantic
         // correctness until multi-phase ordered DISTINCT is implemented.
         if agg.aggregates.iter().any(|call| !call.order_by.is_empty()) {
-            return vec![];
+            return Ok(vec![]);
         }
 
         // Validate single-DISTINCT-column precondition.
         let distinct_col = match extract_single_distinct_col(&memo.scalars, &agg.aggregates) {
             Some(c) => c,
-            None => return vec![], // multi-column DISTINCT, or multiple different DISTINCT cols
+            None => return Ok(vec![]), // multi-column DISTINCT, or multiple different DISTINCT cols
         };
 
         // Partition aggregates into DISTINCT-bearing (which are deduped away at LOCAL)
@@ -85,7 +92,6 @@ impl Rule for SplitDistinctAgg {
             .iter()
             .map(|idx| agg.aggregates[*idx].clone())
             .collect();
-
         // Stateful sketch/bitmap aggregates preserve null/empty-state semantics
         // across the current split-distinct phase boundaries poorly. Fall back
         // to the single-stage plan for correctness until their merge path is
@@ -94,10 +100,10 @@ impl Rule for SplitDistinctAgg {
             .iter()
             .any(|call| split_distinct_sensitive_agg(call.name.as_str()))
         {
-            return vec![];
+            return Ok(vec![]);
         }
 
-        if agg.group_by.is_empty() {
+        Ok(if agg.group_by.is_empty() {
             apply_four_phase(
                 expr,
                 memo,
@@ -116,7 +122,7 @@ impl Rule for SplitDistinctAgg {
                 &non_distinct,
                 &non_distinct_indices,
             )
-        }
+        })
     }
 }
 
@@ -990,7 +996,16 @@ mod tests {
             children: vec![scan_group],
         };
 
-        assert!(SplitDistinctAgg.apply(&expression, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &expression,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1008,7 +1023,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1049,7 +1073,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1082,7 +1115,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1120,7 +1162,16 @@ mod tests {
             )),
             children: vec![sg],
         };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            SplitDistinctAgg
+                .apply(
+                    &mexpr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1196,7 +1247,13 @@ mod tests {
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
         // Top: GLOBAL, group_by=[g], aggregates[0] = count(distinct x), aggregates[1] = sum(a) (merge)
@@ -1252,7 +1309,13 @@ mod tests {
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
         let dg_group = &memo.groups[out[0].children[0]];
@@ -1295,7 +1358,13 @@ mod tests {
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
         let top = match &out[0].op {
@@ -1371,7 +1440,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1474,7 +1549,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1538,7 +1619,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1587,7 +1674,12 @@ mod tests {
             }];
             let resolved: crate::binding::SqlFunctionBinding =
                 crate::functions::builtin_sql_function_catalog()
-                    .resolve_aggregate_binding(name, 1, &arguments)
+                    .resolve_aggregate_binding(
+                        name,
+                        1,
+                        &arguments,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
                     .unwrap()
                     .into();
             let mut result = crate::functions::aggregate_result_type(&resolved).clone();
@@ -1653,7 +1745,13 @@ mod tests {
                 op: Operator::LogicalAggregate(aggregate.clone()),
                 children: vec![child],
             };
-            let alternatives = SplitDistinctAgg.apply(&expr, &mut memo);
+            let alternatives = SplitDistinctAgg
+                .apply(
+                    &expr,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
             assert_eq!(alternatives.len(), 1);
             let Operator::PhysicalHashAggregate(global) = &alternatives[0].op else {
                 panic!("GLOBAL");
@@ -1732,7 +1830,13 @@ mod tests {
             )),
             children: vec![sg],
         };
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
 
         // Top: GLOBAL, scalar, [count(x) merge, sum(a) merge]
@@ -1823,7 +1927,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1935,7 +2045,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -2033,7 +2149,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let dl_group = &memo.groups[out[0].children[0]];
         let dg_group = &memo.groups[dl_group.physical_exprs[0].children[0]];
@@ -2154,7 +2276,13 @@ mod tests {
             children: vec![sg],
         };
 
-        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        let out = SplitDistinctAgg
+            .apply(
+                &mexpr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         let dl_group = &memo.groups[out[0].children[0]];
         let dl = match &dl_group.physical_exprs[0].op {

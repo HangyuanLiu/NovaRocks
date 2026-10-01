@@ -145,6 +145,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         let selected = FunctionBindingSelection {
             overload: oid(),
@@ -152,13 +153,14 @@ impl FunctionBindingResolver for Owner {
             result_type: FunctionResultType::Scalar(int()),
             aggregate: None,
         };
-        self.validate_selected(&selected, request)?;
+        self.validate_selected(&selected, request, _control)?;
         Ok(selected)
     }
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if selected.overload != oid()
             || selected.argument_types != signature()
@@ -200,7 +202,7 @@ impl FunctionEffectOwner for Owner {
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(FunctionEffectOwnerError::Control)?;
         self.declaration(input.function_id, input.selected)?;
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         if !input.environment.is_empty() {
             return Err(
                 FunctionBindingError::InvalidBinding("fixture has no environment".into()).into(),

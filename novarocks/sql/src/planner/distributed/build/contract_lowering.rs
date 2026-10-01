@@ -7833,14 +7833,20 @@ impl<'a> ContractLoweringVisitor<'a> {
                 value_type: source.clone(),
                 constant: None,
             };
-            let binding = self
-                .functions
-                .resolve_value_conversion_binding(&argument, &intermediate);
+            let binding = self.functions.resolve_value_conversion_binding(
+                &argument,
+                &intermediate,
+                self.control,
+            );
+            let binding = binding.map_err(|error| match error {
+                novarocks_functions::FunctionBindingError::Control(error) => {
+                    ContractLoweringError::Control(error)
+                }
+                other => ContractLoweringError::InvalidFunctionBinding {
+                    detail: other.to_string(),
+                },
+            })?;
             self.control.checkpoint(CompilePhase::Validate, 0)?;
-            let binding =
-                binding.map_err(|error| ContractLoweringError::InvalidFunctionBinding {
-                    detail: error.to_string(),
-                })?;
             let novarocks_functions::FunctionResultType::Scalar(result) =
                 &binding.selected.result_type
             else {
@@ -11216,6 +11222,7 @@ mod tests {
                 requirements: &[requirement],
             }],
             &functions,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         let input = column(1, "order_id", DataType::Int64, false);

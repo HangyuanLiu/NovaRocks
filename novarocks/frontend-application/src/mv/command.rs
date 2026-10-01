@@ -98,7 +98,7 @@ impl MvCommandExecutor {
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
         match statement {
             MaterializedViewStatement::Create(statement) => {
                 let statement = lower_typed_create(statement)?;
@@ -133,11 +133,8 @@ impl MvCommandExecutor {
                     current_database,
                     &statement.name_parts,
                 )?;
-                self.refresh_service.execute_serialized(
-                    &target,
-                    MvActivityOwner::Drop,
-                    execution,
-                    || {
+                self.refresh_service
+                    .execute_serialized(&target, MvActivityOwner::Drop, execution, || {
                         drop_mv_with_ports(
                             self.refresh_service.product_service(),
                             &self.ports,
@@ -146,8 +143,8 @@ impl MvCommandExecutor {
                             &statement,
                             connector_context,
                         )
-                    },
-                )
+                    })
+                    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
             }
             MaterializedViewStatement::Alter(statement)
                 if !matches!(&statement.action, TypedAlterAction::Repartition(_)) =>
@@ -158,11 +155,8 @@ impl MvCommandExecutor {
                     current_database,
                     &statement.name_parts,
                 )?;
-                self.refresh_service.execute_serialized(
-                    &target,
-                    MvActivityOwner::Alter,
-                    execution,
-                    || {
+                self.refresh_service
+                    .execute_serialized(&target, MvActivityOwner::Alter, execution, || {
                         alter_mv_with_ports(
                             &self.ports,
                             current_catalog,
@@ -170,8 +164,8 @@ impl MvCommandExecutor {
                             &statement,
                             connector_context,
                         )
-                    },
-                )
+                    })
+                    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
             }
             MaterializedViewStatement::Alter(statement) => self.execute_repartition(
                 current_catalog,
@@ -191,7 +185,8 @@ impl MvCommandExecutor {
                 self.mv_backend.as_ref(),
                 current_catalog,
                 &lower_typed_show(statement)?,
-            ),
+            )
+            .map_err(novarocks_sql::compiler::SqlCompileError::Compilation),
             MaterializedViewStatement::ExplainRefresh(statement) => self.execute_explain_refresh(
                 current_catalog,
                 current_database,
@@ -237,7 +232,7 @@ impl MvCommandExecutor {
         statement: &MvRefreshRequest,
         level: novarocks_sql::compiler::ExplainLevel,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
         let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             &self.ports,
             current_catalog,
@@ -246,7 +241,9 @@ impl MvCommandExecutor {
             level,
             connector_context,
         )?;
-        build_string_query_result("Explain String", lines).map(StatementResult::Query)
+        build_string_query_result("Explain String", lines)
+            .map(StatementResult::Query)
+            .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
     }
 
     fn execute_repartition(
@@ -256,9 +253,11 @@ impl MvCommandExecutor {
         statement: &MvAlterStatement,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
         let MvAlterAction::Repartition(fields) = &statement.action else {
-            return Err("MV repartition executor received a non-repartition action".to_string());
+            return Err("MV repartition executor received a non-repartition action"
+                .to_string()
+                .into());
         };
         let target =
             resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
@@ -289,7 +288,7 @@ impl MvCommandExecutor {
                 execution,
             )
             .map(|()| StatementResult::Ok)
-            .map_err(|error| error.to_string())
+            .map_err(mv_compile_error)
     }
 
     fn execute_refresh(
@@ -299,7 +298,7 @@ impl MvCommandExecutor {
         statement: &MvRefreshRequest,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
         let requested_target =
             resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
         let target_catalog = requested_target.catalog.as_deref().ok_or_else(|| {
@@ -323,7 +322,7 @@ impl MvCommandExecutor {
                 return Err(format!(
                     "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views: {}",
                     step.display_name().trim_start_matches("mv:")
-                ));
+                ).into());
             }
             let target = step.into_target();
             let target_catalog = target.catalog.clone();
@@ -352,13 +351,26 @@ impl MvCommandExecutor {
                         execution,
                     )
                     .map(|()| StatementResult::Ok)
-                    .map_err(|error| error.to_string())?,
+                    .map_err(mv_compile_error)?,
             );
             // The next dependency must observe the upstream commit, not the
             // request-local metadata snapshot frozen before this step.
             step_context = step_context.after_external_effect();
         }
-        last_result.ok_or_else(|| "MV refresh dependency planner returned no steps".to_string())
+        last_result.ok_or_else(|| {
+            novarocks_sql::compiler::SqlCompileError::Compilation(
+                "MV refresh dependency planner returned no steps".to_string(),
+            )
+        })
+    }
+}
+
+fn mv_compile_error(
+    error: crate::mv::domain::application::MvApplicationError,
+) -> novarocks_sql::compiler::SqlCompileError {
+    match error.compile_control_error() {
+        Some(error) => error.into(),
+        None => novarocks_sql::compiler::SqlCompileError::Compilation(error.to_string()),
     }
 }
 
@@ -382,14 +394,47 @@ impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
         command: &MaterializedViewCommand,
         context: &RequestContext,
         command_context: &CommandContext,
-    ) -> Result<StatementResult, String> {
-        self.executor.execute(
-            command.statement(),
-            context.session().current_catalog(),
-            context.session().current_database(),
-            command_context.connector_context(),
-            context.execution(),
-        )
+    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
+        self.executor
+            .execute(
+                command.statement(),
+                context.session().current_catalog(),
+                context.session().current_database(),
+                command_context.connector_context(),
+                context.execution(),
+            )
+            .map_err(|error| match error {
+                novarocks_sql::compiler::SqlCompileError::Cancelled => {
+                    novarocks_query_application::api::CommandError::from_compile_control(
+                        novarocks_type_contract::CompileControlError::Cancelled,
+                    )
+                }
+                novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
+                    novarocks_query_application::api::CommandError::from_compile_control(
+                        novarocks_type_contract::CompileControlError::DeadlineExceeded,
+                    )
+                }
+                novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+                    novarocks_query_application::api::CommandError::from_compile_control(
+                        novarocks_type_contract::CompileControlError::ResourceExhausted,
+                    )
+                }
+                novarocks_sql::compiler::SqlCompileError::Analyze(error) => match error
+                    .control_error()
+                {
+                    Some(error) => {
+                        novarocks_query_application::api::CommandError::from_compile_control(error)
+                    }
+                    None => novarocks_query_application::api::CommandError::new(
+                        novarocks_query_application::api::CommandErrorKind::Failed,
+                        error.to_string(),
+                    ),
+                },
+                error => novarocks_query_application::api::CommandError::new(
+                    novarocks_query_application::api::CommandErrorKind::Failed,
+                    error.to_string(),
+                ),
+            })
     }
 }
 

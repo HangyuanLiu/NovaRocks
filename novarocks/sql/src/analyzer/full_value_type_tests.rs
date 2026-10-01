@@ -528,11 +528,13 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
         &self,
         name: &str,
         args: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionSignature,
         novarocks_functions::FunctionResolutionError,
     > {
-        crate::functions::builtin_sql_function_catalog().resolve_scalar_signature(name, args)
+        crate::functions::builtin_sql_function_catalog()
+            .resolve_scalar_signature(name, args, control)
     }
     fn contains_aggregate(&self, name: &str) -> bool {
         crate::functions::builtin_sql_function_catalog().contains_aggregate(name)
@@ -541,21 +543,25 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
         &self,
         name: &str,
         args: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
     > {
-        crate::functions::builtin_sql_function_catalog().resolve_aggregate_signature(name, args)
+        crate::functions::builtin_sql_function_catalog()
+            .resolve_aggregate_signature(name, args, control)
     }
     fn resolve_aggregate_trusted(
         &self,
         name: &str,
         args: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
     > {
-        crate::functions::builtin_sql_function_catalog().resolve_aggregate_trusted(name, args)
+        crate::functions::builtin_sql_function_catalog()
+            .resolve_aggregate_trusted(name, args, control)
     }
     fn volatility(&self, name: &str) -> novarocks_functions::FunctionVolatility {
         crate::functions::builtin_sql_function_catalog().volatility(name)
@@ -637,4 +643,159 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         novarocks_type_contract::field_logical_type(target),
         Ok(ValueLogicalType::Physical)
     );
+}
+
+fn control_binding_arguments(count: usize) -> Vec<crate::analysis::TypedExpr> {
+    (0..count)
+        .map(|index| crate::analysis::TypedExpr {
+            kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(index as i64)),
+            value_type: FunctionValueType::new(DataType::Int64, false),
+        })
+        .collect()
+}
+
+#[test]
+fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_arguments() {
+    let catalog = crate::functions::builtin_sql_function_catalog();
+    let arguments = control_binding_arguments(320);
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at_entry in [true, false] {
+            let control = StopAt { error, at_entry };
+            let failure = crate::analysis::resolve_function_binding(
+                catalog, "coalesce", &arguments, &control,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(failure, novarocks_functions::FunctionBindingError::Control(actual) if actual == error)
+            );
+            let failure = match super::resolve_expr::bind_scalar_function_call_with_catalog(
+                catalog,
+                "coalesce",
+                arguments.clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &control,
+            ) {
+                Ok(_) => panic!("stopped argument binding must fail"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failure.control_error(), Some(error));
+            assert_eq!(
+                failure
+                    .at_type_mismatch(novarocks_parser::Span::new(3, 9))
+                    .control_error(),
+                Some(error)
+            );
+        }
+    }
+    let binding = crate::analysis::resolve_function_binding(
+        catalog,
+        "coalesce",
+        &arguments,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    assert_eq!(binding.selected.argument_types.len(), 320);
+    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+    else {
+        panic!("coalesce must have a scalar result");
+    };
+    assert_eq!(result.data_type, DataType::Int64);
+    assert_eq!(result.logical_type, ValueLogicalType::Physical);
+}
+
+#[test]
+fn legacy_type_inspection_never_falls_back_after_request_control_failure() {
+    let catalog = crate::functions::builtin_sql_function_catalog();
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        // Unknown ordinary names and known dynamic fallback names must both
+        // retain a failure from the actual signature owner.
+        for name in ["unregistered_control_probe", "map_keys"] {
+            let failure = super::functions::legacy_scalar_return_type_with_catalog(
+                catalog,
+                name,
+                &[DataType::Int64],
+                &StopAt {
+                    error,
+                    at_entry: true,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.control_error(), Some(error));
+            let failure = super::functions::infer_scalar_return_type_with_catalog(
+                catalog,
+                name,
+                &[DataType::Int64],
+                &StopAt {
+                    error,
+                    at_entry: true,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.control_error(), Some(error));
+        }
+    }
+    assert_eq!(
+        super::functions::legacy_scalar_return_type_with_catalog(
+            catalog,
+            "unregistered_control_probe",
+            &[DataType::Int64],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
+    let catalog = crate::functions::builtin_sql_function_catalog();
+    let source = crate::analysis::TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: crate::column_id::ColumnId::UNSET,
+            qualifier: None,
+            column: "json_source".into(),
+        },
+        value_type: FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap(),
+    };
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = StopAt {
+            error,
+            at_entry: true,
+        };
+        let failure = super::resolve_expr::resolve_aggregate_function_call(
+            catalog,
+            "sum",
+            &control_binding_arguments(1),
+            novarocks_parser::Span::new(2, 8),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(failure.control_error(), Some(error));
+        let failure = super::value_conversion::convert_value_domain_with_catalog(
+            catalog,
+            source.clone(),
+            FunctionValueType::new(DataType::Utf8, true),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(failure.control_error(), Some(error));
+    }
 }

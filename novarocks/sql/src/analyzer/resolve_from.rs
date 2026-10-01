@@ -304,10 +304,9 @@ impl<'a> super::AnalyzerContext<'a> {
                                         l_q,
                                         r_q,
                                         self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                                        self.control,
                                     )
-                                    .map_err(|message| {
-                                        AnalyzeError::type_mismatch(message, join.span)
-                                    })?;
+                                    .map_err(|error| error.at_type_mismatch(join.span))?;
                             }
                         } else if matches!(join_kind, JoinKind::RightOuter) {
                             // RIGHT JOIN USING after a previous FULL OUTER
@@ -735,8 +734,11 @@ impl<'a> super::AnalyzerContext<'a> {
             .collect::<Vec<_>>();
         let binding = self
             .function_catalog
-            .resolve_table_binding("unnest", &function_arguments)
+            .resolve_table_binding("unnest", &function_arguments, self.control)
             .map_err(|error| {
+                if let novarocks_functions::FunctionBindingError::Control(error) = error {
+                    return AnalyzeError::control(error);
+                }
                 AnalyzeError::invalid_argument(format!("failed to bind UNNEST: {error}"), span)
             })?;
         let novarocks_functions::FunctionResultType::Relation(result_columns) =

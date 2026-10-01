@@ -179,7 +179,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         statement: ParsedMaintenanceStatement,
         spark_procedure: bool,
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceStatementResult, String> {
+    ) -> Result<MaintenanceStatementResult, TerminalError> {
         match statement {
             ParsedMaintenanceStatement::Execute { name_parts, action } => {
                 let target = engine.resolve_target(&name_parts, context)?;
@@ -189,7 +189,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     .execute_user_action(&FrontendMaintenanceEffectPort::new(engine), request)
                     .await?;
                 if spark_procedure {
-                    action_result(outcome)
+                    action_result(outcome).map_err(TerminalError::from)
                 } else {
                     Ok(MaintenanceStatementResult::Ok)
                 }
@@ -198,9 +198,12 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 engine.reject_user_action_on_mv(&engine.resolve_target(&name_parts, context)?)?;
                 self.submit_optimize(engine, engine.resolve_target(&name_parts, context)?)
                     .map(|_| MaintenanceStatementResult::Ok)
+                    .map_err(TerminalError::from)
             }
             ParsedMaintenanceStatement::ShowOptimize => Err(
-                "SHOW ALTER TABLE OPTIMIZE belongs to the read-only maintenance owner".to_string(),
+                "SHOW ALTER TABLE OPTIMIZE belongs to the read-only maintenance owner"
+                    .to_string()
+                    .into(),
             ),
         }
     }
@@ -217,7 +220,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         self.product
             .execute_action(&FrontendMaintenanceEffectPort::new(engine), request)
             .await
@@ -329,9 +332,10 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     | MaintenanceJobState::TargetReplaced
                     | MaintenanceJobState::CancelledBeforeDispatch
             ) {
-                TerminalError::known_uncommitted(message)
+                TerminalError::known_uncommitted(message).with_compile_control(job.compile_control)
             } else {
                 TerminalError {
+                    compile_control: job.compile_control,
                     state: job.state,
                     message,
                 }

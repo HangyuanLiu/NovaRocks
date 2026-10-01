@@ -204,6 +204,38 @@ impl AnalyzeError {
         }
     }
 
+    pub(crate) fn function_binding(error: novarocks_functions::FunctionBindingError) -> Self {
+        match error {
+            novarocks_functions::FunctionBindingError::Control(error) => Self::control(error),
+            error => Self::internal(error.to_string()),
+        }
+    }
+
+    pub(crate) fn function_resolution(error: novarocks_functions::FunctionResolutionError) -> Self {
+        match error {
+            novarocks_functions::FunctionResolutionError::Control(error) => Self::control(error),
+            error => Self::internal(error.to_string()),
+        }
+    }
+
+    /// Attach the existing user type-error context without reclassifying an
+    /// outer control failure as a user expression error.
+    pub(crate) fn at_type_mismatch(self, span: Span) -> Self {
+        if self.control.is_some() {
+            self
+        } else {
+            Self::type_mismatch(self.message, span)
+        }
+    }
+
+    pub(crate) fn at_invalid_argument(self, span: Span) -> Self {
+        if self.control.is_some() {
+            self
+        } else {
+            Self::invalid_argument(self.message, span)
+        }
+    }
+
     pub const fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.control
     }

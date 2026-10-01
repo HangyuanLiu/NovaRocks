@@ -176,57 +176,108 @@ impl PhysicalV1PrivateFacts for NoPhysicalV1PrivateFacts {
     }
 }
 
+/// Typed original-control failures remain distinct from invalid legacy wire facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PhysicalEncodeError {
+    Control(novarocks_type_contract::CompileControlError),
+    Invalid(String),
+}
+impl std::fmt::Display for PhysicalEncodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control(error) => error.fmt(formatter),
+            Self::Invalid(error) => formatter.write_str(error),
+        }
+    }
+}
+impl std::error::Error for PhysicalEncodeError {}
+impl From<String> for PhysicalEncodeError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
+}
+impl From<&str> for PhysicalEncodeError {
+    fn from(error: &str) -> Self {
+        Self::Invalid(error.into())
+    }
+}
+impl From<novarocks_type_contract::CompileControlError> for PhysicalEncodeError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl From<novarocks_functions::FunctionBindingError> for PhysicalEncodeError {
+    fn from(error: novarocks_functions::FunctionBindingError) -> Self {
+        match error {
+            novarocks_functions::FunctionBindingError::Control(error) => Self::Control(error),
+            other => Self::Invalid(other.to_string()),
+        }
+    }
+}
+
 /// Encode one complete immutable final plan without I/O or semantic repair.
 pub fn encode_physical_plan_v1(
     physical: &PhysicalPlan,
     function_catalog: &EngineFunctionCatalog,
     private_facts: &impl PhysicalV1PrivateFacts,
-) -> Result<plan::DistributedPlan, String> {
-    // Recursive node, expression, and type trees are constructed only after
-    // their complete nesting and expansion shape has passed preflight.
-    preflight_physical_plan_v1(physical).map_err(|error| error.to_string())?;
-    preflight_native_v1_wire_shape(physical)?;
-    preflight_encoder(physical, function_catalog, private_facts)?;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<plan::DistributedPlan, PhysicalEncodeError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    // Legacy materialization is opaque work here. Entry and exit observation
+    // do not claim that its internal operations are cooperatively bounded.
+    let result = (|| -> Result<plan::DistributedPlan, PhysicalEncodeError> {
+        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+        // Recursive node, expression, and type trees are constructed only after
+        // their complete nesting and expansion shape has passed preflight.
+        preflight_physical_plan_v1(physical).map_err(|error| error.to_string())?;
+        preflight_native_v1_wire_shape(physical)?;
+        preflight_encoder(physical, function_catalog, private_facts, control)?;
 
-    let layouts = physical
-        .fragments()
-        .iter()
-        .map(|(id, fragment)| {
-            WireLayout::try_new(fragment)
-                .map(|layout| (*id, layout))
-                .map_err(|error| error.to_string())
+        let layouts = physical
+            .fragments()
+            .iter()
+            .map(|(id, fragment)| {
+                WireLayout::try_new(fragment)
+                    .map(|layout| (*id, layout))
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let result = physical
+            .result_port()
+            .ok_or_else(|| "native wire v1 requires one result port".to_string())?;
+        let runtime_filters = encode_runtime_filters(physical, &layouts)?;
+        // Derived once: every fragment's columns read the same names.
+        let names = result_value_names(physical);
+        let fragments = physical
+            .fragments()
+            .values()
+            .map(|fragment| {
+                encode_fragment(
+                    physical,
+                    fragment,
+                    &layouts[&fragment.id()],
+                    private_facts,
+                    &runtime_filters,
+                    &names,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let edges = physical
+            .edges()
+            .values()
+            .map(|edge| encode_edge(physical, edge, &layouts))
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(plan::DistributedPlan {
+            fragments,
+            root_fragment_id: result.fragment.get(),
+            edges,
         })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
-    let result = physical
-        .result_port()
-        .ok_or_else(|| "native wire v1 requires one result port".to_string())?;
-    let runtime_filters = encode_runtime_filters(physical, &layouts)?;
-    // Derived once: every fragment's columns read the same names.
-    let names = result_value_names(physical);
-    let fragments = physical
-        .fragments()
-        .values()
-        .map(|fragment| {
-            encode_fragment(
-                physical,
-                fragment,
-                &layouts[&fragment.id()],
-                private_facts,
-                &runtime_filters,
-                &names,
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let edges = physical
-        .edges()
-        .values()
-        .map(|edge| encode_edge(physical, edge, &layouts))
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(plan::DistributedPlan {
-        fragments,
-        root_fragment_id: result.fragment.get(),
-        edges,
-    })
+    })();
+    if matches!(&result, Err(PhysicalEncodeError::Control(_))) {
+        return result;
+    }
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    result
 }
 
 struct EncodedRuntimeFilters {
@@ -1118,7 +1169,12 @@ fn preflight_encoder(
     physical: &PhysicalPlan,
     function_catalog: &EngineFunctionCatalog,
     private_facts: &impl PhysicalV1PrivateFacts,
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
     let Some(result) = physical.result_port() else {
         return Err("native wire v1 requires one result port".into());
     };
@@ -1135,6 +1191,7 @@ fn preflight_encoder(
     }
     let scan_dynamic_filters = preflight_runtime_filters(physical)?;
     for fragment in physical.fragments().values() {
+        work.step()?;
         let writer_count = fragment
             .nodes()
             .values()
@@ -1144,7 +1201,7 @@ fn preflight_encoder(
             return Err(format!(
                 "native wire v1 fragment {} cannot assign exact writer ordinals to {writer_count} writers",
                 fragment.id().get()
-            ));
+            ).into());
         }
         for value in fragment.values().values() {
             if !matches!(value.origin, ValueOrigin::WriterDerived { .. }) {
@@ -1158,6 +1215,7 @@ fn preflight_encoder(
             }
         }
         for (id, expression) in fragment.expressions().iter() {
+            work.step()?;
             let subject = |reason: String| {
                 format!(
                     "fragment {} expression {}: {reason}",
@@ -1177,7 +1235,8 @@ fn preflight_encoder(
                     })?
                 }
                 ExprKind::FunctionCall { function, args } => {
-                    validate_scalar_binding(function_catalog, fragment, function, args)?
+                    work.flush()?;
+                    validate_scalar_binding(function_catalog, fragment, function, args, control)?
                 }
                 ExprKind::WindowCall {
                     function,
@@ -1192,14 +1251,23 @@ fn preflight_encoder(
                             .copied()
                             .chain(function_order_by.iter().map(|item| item.expr))
                             .collect::<Vec<_>>();
+                        work.flush()?;
                         validate_aggregate_binding(
                             function_catalog,
                             fragment,
                             binding,
                             &arguments,
+                            control,
                         )?;
                     } else {
-                        validate_scalar_binding(function_catalog, fragment, function, args)?;
+                        work.flush()?;
+                        validate_scalar_binding(
+                            function_catalog,
+                            fragment,
+                            function,
+                            args,
+                            control,
+                        )?;
                     }
                 }
                 ExprKind::Lambda {
@@ -1213,13 +1281,14 @@ fn preflight_encoder(
                             fragment.id().get(),
                             expression.owner.get(),
                             parameter_types.len()
-                        ));
+                        ).into());
                     }
                 }
                 _ => {}
             }
         }
         for node in fragment.nodes().values() {
+            work.step()?;
             match &node.kind {
                 NodeKind::Scan {
                     occurrence,
@@ -1244,14 +1313,16 @@ fn preflight_encoder(
                             "native wire v1 scan occurrence mismatch at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
-                        ));
+                        )
+                        .into());
                     }
                     if &fact.read != relation.read() {
                         return Err(format!(
                             "native wire v1 scan fact relation mismatch at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
-                        ));
+                        )
+                        .into());
                     }
                     let typed = typed_scan_source(&fact.table).ok_or_else(|| {
                         format!(
@@ -1267,7 +1338,8 @@ fn preflight_encoder(
                             "native wire v1 scan fact read budget mismatch at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
-                        ));
+                        )
+                        .into());
                     }
                     let expected_work_source = match relation.work_source() {
                         ConnectorReadWorkSource::RuntimeSplits => {
@@ -1284,7 +1356,8 @@ fn preflight_encoder(
                             "native wire v1 scan fact work source mismatch at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
-                        ));
+                        )
+                        .into());
                     }
                     preflight_scan_source_identity(relation, fact, typed)?;
                     let scan_columns = preflight_scan_columns(
@@ -1313,7 +1386,8 @@ fn preflight_encoder(
                         fragment,
                         node,
                         "Repeat that moves a null-extended grouping column",
-                    );
+                    )
+                    .map_err(PhysicalEncodeError::Invalid);
                 }
                 NodeKind::TableWriter { target } => {
                     let fact = private_facts
@@ -1336,7 +1410,7 @@ fn preflight_encoder(
                         return Err(format!(
                             "native wire v1 writer handle payload or public header mismatch for target {}",
                             target.write_target_ordinal.get()
-                        ));
+                        ).into());
                     }
                     for field in &target.target_fields {
                         validate_v1_value_type(&field.ty)?;
@@ -1348,9 +1422,15 @@ fn preflight_encoder(
                                 fragment,
                                 node,
                                 "writer aggregate whose phase is not Partial",
-                            );
+                            )
+                            .map_err(PhysicalEncodeError::Invalid);
                         }
-                        validate_aggregate_binding_from_types(function_catalog, &call.binding)?;
+                        work.flush()?;
+                        validate_aggregate_binding_from_types(
+                            function_catalog,
+                            &call.binding,
+                            control,
+                        )?;
                     }
                 }
                 NodeKind::TableFinish(spec) => {
@@ -1362,9 +1442,15 @@ fn preflight_encoder(
                                 fragment,
                                 node,
                                 "table-finish aggregate whose phase is not Final",
-                            );
+                            )
+                            .map_err(PhysicalEncodeError::Invalid);
                         }
-                        validate_aggregate_binding_from_types(function_catalog, &call.binding)?;
+                        work.flush()?;
+                        validate_aggregate_binding_from_types(
+                            function_catalog,
+                            &call.binding,
+                            control,
+                        )?;
                     }
                 }
                 NodeKind::Aggregate { calls, .. } => {
@@ -1378,7 +1464,8 @@ fn preflight_encoder(
                             fragment,
                             node,
                             "Aggregate whose calls disagree about finalizing",
-                        );
+                        )
+                        .map_err(PhysicalEncodeError::Invalid);
                     }
                     for call in calls {
                         let arguments = call
@@ -1387,11 +1474,13 @@ fn preflight_encoder(
                             .copied()
                             .chain(call.order_by.iter().map(|item| item.expr))
                             .collect::<Vec<_>>();
+                        work.flush()?;
                         validate_aggregate_binding(
                             function_catalog,
                             fragment,
                             &call.binding,
                             &arguments,
+                            control,
                         )?;
                     }
                 }
@@ -1401,7 +1490,14 @@ fn preflight_encoder(
                     outputs,
                     ..
                 } => {
-                    validate_table_binding(function_catalog, fragment, function, arguments)?;
+                    work.flush()?;
+                    validate_table_binding(
+                        function_catalog,
+                        fragment,
+                        function,
+                        arguments,
+                        control,
+                    )?;
                     preflight_table_function_v1(fragment, node, function, outputs)?;
                 }
                 NodeKind::Sort {
@@ -1413,7 +1509,8 @@ fn preflight_encoder(
                             fragment,
                             node,
                             "partition TopN with a zero or unaddressable limit",
-                        );
+                        )
+                        .map_err(PhysicalEncodeError::Invalid);
                     }
                 }
                 NodeKind::TopN {
@@ -1428,14 +1525,16 @@ fn preflight_encoder(
                             fragment,
                             node,
                             "key-budgeted TopN state merging requires wire v2",
-                        );
+                        )
+                        .map_err(PhysicalEncodeError::Invalid);
                     }
                     if !v1_topn_phase_is_lossless(*phase) {
                         return unsupported(
                             fragment,
                             node,
                             "split TopN sequence requiring ExchangeReceiver TopNSplit",
-                        );
+                        )
+                        .map_err(PhysicalEncodeError::Invalid);
                     }
                     preflight_i64(*limit, fragment, node, "TopN limit")?;
                     preflight_i64(*offset, fragment, node, "TopN offset")?;
@@ -1457,16 +1556,19 @@ fn preflight_encoder(
                             fragment,
                             node,
                             &format!("{build_side:?}-build {kind:?} HashJoin"),
-                        );
+                        )
+                        .map_err(PhysicalEncodeError::Invalid);
                     }
                     if !v1_join_output_is_lossless(fragment, node, *kind) {
-                        return unsupported(fragment, node, "unrepresentable HashJoin output port");
+                        return unsupported(fragment, node, "unrepresentable HashJoin output port")
+                            .map_err(PhysicalEncodeError::Invalid);
                     }
                 }
                 NodeKind::NestLoopJoin { kind, .. }
                     if !v1_join_output_is_lossless(fragment, node, *kind) =>
                 {
-                    return unsupported(fragment, node, "unrepresentable NestLoopJoin output port");
+                    return unsupported(fragment, node, "unrepresentable NestLoopJoin output port")
+                        .map_err(PhysicalEncodeError::Invalid);
                 }
                 _ => {}
             }
@@ -1489,7 +1591,8 @@ fn preflight_encoder(
                         return Err(format!(
                             "router route edge {} is not a change-stream edge",
                             edge.id.get()
-                        ));
+                        )
+                        .into());
                     }
                     router_route_ordinals(root, route).map_err(|error| {
                         format!(
@@ -1507,6 +1610,7 @@ fn preflight_encoder(
             }
         }
     }
+    work.finish()?;
     Ok(())
 }
 
@@ -1618,7 +1722,8 @@ fn validate_scalar_binding(
     fragment: &Fragment,
     function: &novarocks_physical_plan::BoundFunction,
     arguments: &[ExprId],
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
     let request_arguments = arguments
         .iter()
         .map(|argument| physical_function_argument(fragment, *argument))
@@ -1630,6 +1735,7 @@ fn validate_scalar_binding(
         request_arguments.len(),
         FunctionResultType::Scalar(function.result_type.clone()),
         None,
+        control,
     )
 }
 
@@ -1638,7 +1744,8 @@ fn validate_table_binding(
     fragment: &Fragment,
     function: &novarocks_physical_plan::BoundTableFunction,
     arguments: &[ExprId],
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
     if !function.semantic_parameters.is_empty() {
         return Err("native wire v1 cannot carry frozen semantic parameter references".into());
     }
@@ -1678,12 +1785,16 @@ fn validate_table_binding(
                 arguments: &request_arguments,
                 logical_argument_count: request_arguments.len(),
             },
+            control,
         )
-        .map_err(|error| {
-            format!(
-                "native wire v1 table function binding `{}` is not in the exact catalog: {error}",
+        .map_err(|error| match error {
+            novarocks_functions::FunctionBindingError::Control(error) => {
+                PhysicalEncodeError::Control(error)
+            }
+            other => PhysicalEncodeError::Invalid(format!(
+                "native wire v1 table function binding `{}` is not in the exact catalog: {other}",
                 function.function_id.as_str()
-            )
+            )),
         })
 }
 
@@ -1692,7 +1803,8 @@ fn validate_aggregate_binding(
     fragment: &Fragment,
     binding: &AggregateBinding,
     arguments: &[ExprId],
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
     let request_arguments = if binding.phase.consumes_logical_arguments() {
         arguments
             .iter()
@@ -1717,13 +1829,15 @@ fn validate_aggregate_binding(
             intermediate_type: binding.intermediate_type.clone(),
             state_format: binding.state_format.clone(),
         }),
+        control,
     )
 }
 
 fn validate_aggregate_binding_from_types(
     catalog: &EngineFunctionCatalog,
     binding: &AggregateBinding,
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
     let arguments = binding
         .function
         .argument_types
@@ -1741,6 +1855,7 @@ fn validate_aggregate_binding_from_types(
             intermediate_type: binding.intermediate_type.clone(),
             state_format: binding.state_format.clone(),
         }),
+        control,
     )
 }
 
@@ -1751,7 +1866,8 @@ fn validate_bound_function(
     logical_argument_count: usize,
     result_type: FunctionResultType,
     aggregate: Option<AggregateBindingSelection>,
-) -> Result<(), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PhysicalEncodeError> {
     if !function.semantic_parameters.is_empty() {
         return Err("native wire v1 cannot carry frozen semantic parameter references".into());
     }
@@ -1789,12 +1905,16 @@ fn validate_bound_function(
                 arguments,
                 logical_argument_count,
             },
+            control,
         )
-        .map_err(|error| {
-            format!(
-                "native wire v1 function binding `{}` is not in the exact catalog: {error}",
+        .map_err(|error| match error {
+            novarocks_functions::FunctionBindingError::Control(error) => {
+                PhysicalEncodeError::Control(error)
+            }
+            other => PhysicalEncodeError::Invalid(format!(
+                "native wire v1 function binding `{}` is not in the exact catalog: {other}",
                 function.function_id.as_str()
-            )
+            )),
         })
 }
 
@@ -4742,6 +4862,17 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    struct CodecTestControl;
+    impl novarocks_type_contract::PureCompileControl for CodecTestControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
@@ -4767,6 +4898,7 @@ mod tests {
         fn resolve(
             &self,
             _request: FunctionBindingRequest<'_>,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<FunctionBindingSelection, FunctionBindingError> {
             Ok(self.selected.clone())
         }
@@ -4775,6 +4907,7 @@ mod tests {
             &self,
             selected: &FunctionBindingSelection,
             _request: FunctionBindingRequest<'_>,
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<(), FunctionBindingError> {
             if selected == &self.selected {
                 Ok(())
@@ -4849,7 +4982,7 @@ mod tests {
     fn validate_test_scalar(
         catalog: &EngineFunctionCatalog,
         function: &novarocks_physical_plan::BoundFunction,
-    ) -> Result<(), String> {
+    ) -> Result<(), PhysicalEncodeError> {
         let arguments = [FunctionArgument::Value {
             value_type: FunctionValueType::new(DataType::Int64, false),
             constant: Some(FunctionLiteral::Int64(7)),
@@ -4861,7 +4994,134 @@ mod tests {
             1,
             FunctionResultType::Scalar(function.result_type.clone()),
             None,
+            &CodecTestControl,
         )
+    }
+
+    struct RefusingCodecControl(novarocks_type_contract::CompileControlError);
+    impl novarocks_type_contract::PureCompileControl for RefusingCodecControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Err(self.0)
+        }
+    }
+
+    struct EncodeTailControl {
+        encode_checkpoints: std::sync::atomic::AtomicUsize,
+        validate_checkpoints: std::sync::atomic::AtomicUsize,
+        tail_error: novarocks_type_contract::CompileControlError,
+        earlier_error: Option<novarocks_type_contract::CompileControlError>,
+    }
+    impl EncodeTailControl {
+        fn new(error: novarocks_type_contract::CompileControlError) -> Self {
+            Self {
+                encode_checkpoints: std::sync::atomic::AtomicUsize::new(0),
+                validate_checkpoints: std::sync::atomic::AtomicUsize::new(0),
+                tail_error: error,
+                earlier_error: None,
+            }
+        }
+    }
+    impl novarocks_type_contract::PureCompileControl for EncodeTailControl {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            use novarocks_type_contract::CompilePhase;
+            use std::sync::atomic::Ordering;
+            if phase == CompilePhase::Encode
+                && self.encode_checkpoints.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                return Err(self.tail_error);
+            }
+            if phase == CompilePhase::Validate {
+                self.validate_checkpoints.fetch_add(1, Ordering::SeqCst);
+                if let Some(error) = self.earlier_error {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn public_encode_observes_materialization_exit_and_preserves_first_control_failure() {
+        use novarocks_type_contract::CompileControlError;
+        use std::sync::atomic::Ordering;
+        let (catalog, _) = exact_scalar_catalog();
+        let physical = finish_limit_chain_plan(1);
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("the actual plan can be materialized before its tail is refused");
+        assert!(!encoded.fragments.is_empty());
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = EncodeTailControl::new(error);
+            assert_eq!(
+                encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts, &control),
+                Err(PhysicalEncodeError::Control(error)),
+            );
+            assert_eq!(control.encode_checkpoints.load(Ordering::SeqCst), 2);
+            assert!(control.validate_checkpoints.load(Ordering::SeqCst) > 1);
+
+            let mut first_failure = EncodeTailControl::new(CompileControlError::ResourceExhausted);
+            first_failure.earlier_error = Some(error);
+            assert_eq!(
+                encode_physical_plan_v1(
+                    &physical,
+                    &catalog,
+                    &NoPhysicalV1PrivateFacts,
+                    &first_failure
+                ),
+                Err(PhysicalEncodeError::Control(error)),
+            );
+            assert_eq!(first_failure.encode_checkpoints.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn exact_binding_and_public_encode_preserve_all_original_control_categories() {
+        use novarocks_type_contract::CompileControlError;
+        let (catalog, function) = exact_scalar_catalog();
+        let arguments = [FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Int64, false),
+            constant: Some(FunctionLiteral::Int64(7)),
+        }];
+        let physical = finish_limit_chain_plan(1);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = RefusingCodecControl(error);
+            assert_eq!(
+                validate_bound_function(
+                    &catalog,
+                    &function,
+                    &arguments,
+                    1,
+                    FunctionResultType::Scalar(function.result_type.clone()),
+                    None,
+                    &control,
+                ),
+                Err(PhysicalEncodeError::Control(error))
+            );
+            assert_eq!(
+                encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts, &control),
+                Err(PhysicalEncodeError::Control(error))
+            );
+        }
     }
 
     #[test]
@@ -5169,8 +5429,13 @@ mod tests {
 
         let physical = finish_split_topn_plan(false);
         let (catalog, _) = exact_scalar_catalog();
-        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect("a split TopN states both halves as nodes of its own");
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("a split TopN states both halves as nodes of its own");
         let mut phases = Vec::new();
         for fragment in &encoded.fragments {
             let mut pending = fragment.root.iter().collect::<Vec<_>>();
@@ -5237,10 +5502,17 @@ mod tests {
 
         let physical = finish_ordered_join_build_filter_plan();
         let (catalog, _) = exact_scalar_catalog();
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("ordered JoinBuildKey must fail in encoder preflight");
+        let error = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect_err("ordered JoinBuildKey must fail in encoder preflight");
         assert!(
-            error.contains("cannot attach ordered runtime-filter 40 to a HashJoin build key"),
+            error
+                .to_string()
+                .contains("cannot attach ordered runtime-filter 40 to a HashJoin build key"),
             "{error}"
         );
     }
@@ -5406,8 +5678,13 @@ mod tests {
             .unwrap();
         let physical = plan_builder.finish().unwrap();
 
-        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect("HashJoin RightAnti preserved-side output is representable");
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("HashJoin RightAnti preserved-side output is representable");
         assert_eq!(encoded.fragments.len(), 1);
     }
 
@@ -5478,8 +5755,13 @@ mod tests {
             })
             .unwrap();
         let physical = plan_builder.finish().unwrap();
-        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect("the v1 backend projects cropped HashJoin output columns");
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("the v1 backend projects cropped HashJoin output columns");
         assert_eq!(encoded.fragments.len(), 1);
     }
 
@@ -5808,8 +6090,13 @@ mod tests {
     fn decoder_safe_tree_depth_encodes_and_prost_decodes() {
         let physical = finish_limit_chain_plan(crate::NATIVE_V1_MAX_TREE_DEPTH);
         let (catalog, _) = exact_scalar_catalog();
-        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect("the decoder-safe boundary is encodable");
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("the decoder-safe boundary is encodable");
         let bytes = encoded.encode_to_vec();
         let decoded = plan::DistributedPlan::decode(bytes.as_slice())
             .expect("the production prost decoder accepts the boundary");
@@ -5830,17 +6117,27 @@ mod tests {
             Err(crate::WireLayoutError::TreeDepthExceeded { .. })
         ));
         let (catalog, _) = exact_scalar_catalog();
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("preflight must reject before layout or protobuf tree construction");
-        assert!(error.contains("decoder-safe maximum"));
+        let error = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect_err("preflight must reject before layout or protobuf tree construction");
+        assert!(error.to_string().contains("decoder-safe maximum"));
     }
 
     #[test]
     fn combined_expression_depth_boundary_encodes_and_prost_decodes() {
         let physical = finish_project_expression_plan(41, 0);
         let (catalog, _) = exact_scalar_catalog();
-        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect("the combined decoder-safe expression boundary is encodable");
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("the combined decoder-safe expression boundary is encodable");
         let bytes = encoded.encode_to_vec();
         let decoded = plan::DistributedPlan::decode(bytes.as_slice())
             .expect("the production prost decoder accepts the expression boundary");
@@ -5851,18 +6148,31 @@ mod tests {
     fn combined_expression_depth_over_boundary_fails_before_encoding() {
         let physical = finish_project_expression_plan(42, 0);
         let (catalog, _) = exact_scalar_catalog();
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("combined node and expression nesting must fail closed");
-        assert!(error.contains("message depth"), "{error}");
+        let error = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect_err("combined node and expression nesting must fail closed");
+        assert!(error.to_string().contains("message depth"), "{error}");
     }
 
     #[test]
     fn diamond_expression_expansion_fails_before_tree_materialization() {
         let physical = finish_project_expression_plan(0, 15);
         let (catalog, _) = exact_scalar_catalog();
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("an exponentially expanded v1 expression must fail closed");
-        assert!(error.contains("expanded expressions"), "{error}");
+        let error = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect_err("an exponentially expanded v1 expression must fail closed");
+        assert!(
+            error.to_string().contains("expanded expressions"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6072,10 +6382,17 @@ mod tests {
     fn wire_v1_refuses_group_key_budgets_instead_of_encoding_row_topn() {
         let physical = finish_split_topn_plan(true);
         let (catalog, _) = exact_scalar_catalog();
-        let error =
-            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap_err();
+        let error = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .unwrap_err();
         assert!(
-            error.contains("key-budgeted TopN state merging requires wire v2"),
+            error
+                .to_string()
+                .contains("key-budgeted TopN state merging requires wire v2"),
             "{error}"
         );
     }
@@ -6873,8 +7190,13 @@ mod tests {
             })
             .unwrap();
         let physical = plan_builder.finish().unwrap();
-        let encoded =
-            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap();
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .unwrap();
         let fragment = &encoded.fragments[0];
         assert_eq!(fragment.fragment_id, 19);
         assert_eq!(fragment.output_columns.len(), 2);
@@ -6939,9 +7261,32 @@ mod tests {
             .unwrap();
         let physical = plan_builder.finish().unwrap();
 
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("Limit overflow must fail in encoder preflight");
-        assert!(error.contains("Limit limit exceeds i64"), "{error}");
+        let error = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect_err("Limit overflow must fail in encoder preflight");
+        assert!(
+            error.to_string().contains("Limit limit exceeds i64"),
+            "{error}"
+        );
+        let control =
+            EncodeTailControl::new(novarocks_type_contract::CompileControlError::Cancelled);
+        assert_eq!(
+            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts, &control),
+            Err(PhysicalEncodeError::Control(
+                novarocks_type_contract::CompileControlError::Cancelled
+            )),
+            "an ordinary preflight refusal still observes the original control on exit",
+        );
+        assert_eq!(
+            control
+                .encode_checkpoints
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
     }
 
     #[test]
@@ -7142,8 +7487,13 @@ mod tests {
         ));
         let physical = plan_builder.finish().unwrap();
         let (catalog, _) = exact_scalar_catalog();
-        encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect("a Repeat that nulls its grouping columns in place encodes");
+        encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            &CodecTestControl,
+        )
+        .expect("a Repeat that nulls its grouping columns in place encodes");
     }
 
     #[test]
@@ -7252,8 +7602,13 @@ mod tests {
             let physical =
                 finish_project_expression_plan_with_policies(1, 1, cast_policy, binary_policy);
             let (catalog, _) = exact_scalar_catalog();
-            let encoded =
-                encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap();
+            let encoded = encode_physical_plan_v1(
+                &physical,
+                &catalog,
+                &NoPhysicalV1PrivateFacts,
+                &CodecTestControl,
+            )
+            .unwrap();
             let decoded =
                 plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice()).unwrap();
             assert_eq!(

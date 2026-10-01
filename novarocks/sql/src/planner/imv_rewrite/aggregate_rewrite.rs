@@ -163,13 +163,12 @@ pub(crate) fn build_aggregate_state_merge(
     let (aggregate_calls, aggregate_layout) = ext
         .snapshot
         .aggregate_shape_and_layout_for_execution()
-        .map_err(SqlCompileError::Compilation)?;
-    let group_key_names = group_key_names(&aggregate).map_err(SqlCompileError::Compilation)?;
-    let aggregate_state_names = aggregate_state_names(ext, &aggregate, &aggregate_layout)
-        .map_err(SqlCompileError::Compilation)?;
-    let row_id_column_name =
-        aggregate_row_id_column_name(ext).map_err(SqlCompileError::Compilation)?;
-    let target_columns = target_columns(ext).map_err(SqlCompileError::Compilation)?;
+        .map_err(SqlCompileError::from)?;
+    let group_key_names = group_key_names(&aggregate).map_err(SqlCompileError::from)?;
+    let aggregate_state_names =
+        aggregate_state_names(ext, &aggregate, &aggregate_layout).map_err(SqlCompileError::from)?;
+    let row_id_column_name = aggregate_row_id_column_name(ext).map_err(SqlCompileError::from)?;
+    let target_columns = target_columns(ext).map_err(SqlCompileError::from)?;
     let target = &ext.snapshot.target;
     let aggregate_contract = ext
         .snapshot
@@ -179,7 +178,7 @@ pub(crate) fn build_aggregate_state_merge(
         .ok_or_else(|| {
             "Iceberg IMV aggregate rewrite requires aggregate state contract".to_string()
         })
-        .map_err(SqlCompileError::Compilation)?;
+        .map_err(SqlCompileError::from)?;
     let physical_column_names = aggregate_layout.physical_column_names.clone();
     let partition_constraint = if is_unpartitioned_target_contract(&ext.snapshot.schema_contract) {
         SqlMvTargetStatePartitionConstraint::Unpartitioned
@@ -219,21 +218,21 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
     )?;
     let old_input = branch_scoped_old_input(old_scan, branch_scope.clone(), &aggregate_layout)
-        .map_err(SqlCompileError::Compilation)?;
+        .map_err(SqlCompileError::from)?;
 
     let action_column = match action_column {
         Some(action_column) => action_column,
-        None => match existing_delta_action_column(&aggregate_input)
-            .map_err(SqlCompileError::Compilation)?
-        {
-            Some(action_column) => action_column,
-            None => allocate_imv_column(
-                ctx,
-                ImvActionColumn::NAME,
-                novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
-            )
-            .map_err(SqlCompileError::Compilation)?,
-        },
+        None => {
+            match existing_delta_action_column(&aggregate_input).map_err(SqlCompileError::from)? {
+                Some(action_column) => action_column,
+                None => allocate_imv_column(
+                    ctx,
+                    ImvActionColumn::NAME,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                )
+                .map_err(SqlCompileError::from)?,
+            }
+        }
     };
     let signed_aggregate = signed_aggregate(
         aggregate,
@@ -244,7 +243,7 @@ pub(crate) fn build_aggregate_state_merge(
         &aggregate_calls,
         &aggregate_layout,
     )
-    .map_err(SqlCompileError::Compilation)?;
+    .map_err(SqlCompileError::from)?;
 
     build_relational_aggregate_change_stream(
         old_input,
@@ -253,7 +252,7 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_layout,
     )
-    .map_err(SqlCompileError::Compilation)
+    .map_err(SqlCompileError::from)
 }
 
 #[expect(
@@ -333,7 +332,7 @@ fn target_state_branch_scoped_old_scan_columns(
                     .any(|name| name.eq_ignore_ascii_case(&column.name))
                     || column.name.eq_ignore_ascii_case(row_id_column_name),
             )
-            .map_err(SqlCompileError::Compilation)?,
+            .map_err(SqlCompileError::from)?,
         );
     }
     for column in locator_metadata_columns {
@@ -350,7 +349,7 @@ fn target_state_branch_scoped_old_scan_columns(
                 declared_imv_column_value_type(column, ctx)?,
                 true,
             )
-            .map_err(SqlCompileError::Compilation)?,
+            .map_err(SqlCompileError::from)?,
         );
     }
     Ok(old_columns)
@@ -395,12 +394,12 @@ fn target_state_compact_old_scan_columns(
                     format!(
                         "Iceberg IMV aggregate rewrite target-state old input cannot resolve public column {name}"
                     )
-                }).map_err(SqlCompileError::Compilation)?;
+                }).map_err(SqlCompileError::from)?;
             allocate_imv_output_column(ctx, &column.0.name, declared_imv_column_value_type(column.0, ctx)?, column.1
                     || aggregate_state_names
                         .iter()
                         .any(|state| state.eq_ignore_ascii_case(&column.0.name))
-                    || column.0.name.eq_ignore_ascii_case(row_id_column_name)).map_err(SqlCompileError::Compilation)
+                    || column.0.name.eq_ignore_ascii_case(row_id_column_name)).map_err(SqlCompileError::from)
         })
         .collect()
 }
@@ -479,7 +478,7 @@ fn build_relational_aggregate_change_stream(
     branch_scope: Option<crate::planner::table::BranchScope>,
     ctx: &RewriteContext,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let old_outputs = plan_output_columns(&old_input)?;
     let delta_with_row_id = delta_state_with_row_id(signed_delta, layout, ctx)?;
     let delta_outputs = plan_output_columns(&delta_with_row_id)?;
@@ -545,6 +544,7 @@ fn build_relational_aggregate_change_stream(
         ctx.function_catalog(),
         "state_all_zero",
         &state_all_zero_args,
+        &ctx.control_view(),
     )?;
     let insert_predicate = bool_and(
         branch_marker_eq(branch_marker, CHANGE_BRANCH_INSERT),
@@ -670,7 +670,7 @@ fn delta_state_with_row_id(
     signed_delta: LogicalPlanNode,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
     ctx: &RewriteContext,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let delta_outputs = plan_output_columns(&signed_delta)?;
     let mut row_id_args = Vec::with_capacity(layout.group_key_source_indexes.len());
     for &visible_source_index in &layout.group_key_source_indexes {
@@ -696,6 +696,7 @@ fn delta_state_with_row_id(
         ctx.function_catalog(),
         "mv_group_row_id",
         &row_id_args,
+        &ctx.control_view(),
     )?;
     items.push(ProjectItem {
         expr: TypedExpr {
@@ -735,7 +736,7 @@ fn merged_state_expr(
     join_outputs: &[OutputColumn],
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
-) -> Result<TypedExpr, String> {
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let delta = find_output_column_by_name(delta_outputs, &state_column.name)?;
     let delta = find_output_column_by_id(join_outputs, delta.column_id)?;
     let old = find_output_column_by_name(old_outputs, &state_column.name)?;
@@ -746,8 +747,12 @@ fn merged_state_expr(
         | SqlImvAggregateStateRole::AvgCount => {
             let name = state_union_function(state_column)?;
             let args = vec![column_ref(old), column_ref(delta)];
-            let binding =
-                crate::analysis::resolve_function_binding(ctx.function_catalog(), name, &args)?;
+            let binding = crate::analysis::resolve_function_binding(
+                ctx.function_catalog(),
+                name,
+                &args,
+                &ctx.control_view(),
+            )?;
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: crate::functions::builtin_function_volatility(name),
@@ -814,7 +819,7 @@ fn aggregate_change_stream_project(
     ctx: &RewriteContext,
     input: LogicalPlanNode,
     projection: AggregateChangeStreamProjection<'_>,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let AggregateChangeStreamProjection {
         input_outputs,
         delta_outputs,
@@ -934,10 +939,11 @@ fn aggregate_insert_expr_for_output(
     old_outputs: &[OutputColumn],
     output: &OutputColumn,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<TypedExpr, String> {
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let row_id_name = &layout.row_id_column_name;
     if output.name.eq_ignore_ascii_case(row_id_name) {
-        return source_expr_by_name(input_outputs, delta_outputs, row_id_name);
+        return source_expr_by_name(input_outputs, delta_outputs, row_id_name)
+            .map_err(SqlCompileError::from);
     }
 
     for (visible_index, visible) in layout.visible_columns.iter().enumerate() {
@@ -945,7 +951,8 @@ fn aggregate_insert_expr_for_output(
             continue;
         }
         if layout.group_key_source_indexes.contains(&visible_index) {
-            return source_expr_by_name(input_outputs, delta_outputs, &visible.name);
+            return source_expr_by_name(input_outputs, delta_outputs, &visible.name)
+                .map_err(SqlCompileError::from);
         }
         let state_column = single_state_column_for_visible(layout, visible_index)?;
         let args = if state_column.function == AggregateFunctionKind::Avg {
@@ -971,11 +978,15 @@ fn aggregate_insert_expr_for_output(
             visible_state_args(state_column, merged_state, &visible.value_type)?
         };
         let name = visible_state_function(state_column.function)?;
-        let binding =
-            crate::analysis::resolve_function_binding(ctx.function_catalog(), name, &args)?;
+        let binding = crate::analysis::resolve_function_binding(
+            ctx.function_catalog(),
+            name,
+            &args,
+            &ctx.control_view(),
+        )?;
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
         else {
-            return Err(format!("Iceberg IMV {name} must return a scalar value"));
+            return Err(format!("Iceberg IMV {name} must return a scalar value").into());
         };
         if result.logical_type != visible.value_type.logical_type
             || !novarocks_type_contract::arrow_data_types_exact(
@@ -987,7 +998,7 @@ fn aggregate_insert_expr_for_output(
             return Err(format!(
                 "Iceberg IMV {name} result domain {result:?} does not match admitted visible column {} domain {:?}",
                 visible.name, visible.value_type
-            ));
+            ).into());
         }
         let value_type = result.clone();
         return Ok(TypedExpr {
@@ -1009,7 +1020,8 @@ fn aggregate_insert_expr_for_output(
     }
 
     if is_reuse_lineage_metadata_column(&output.name) {
-        return source_expr_by_name(input_outputs, old_outputs, &output.name);
+        return source_expr_by_name(input_outputs, old_outputs, &output.name)
+            .map_err(SqlCompileError::from);
     }
 
     if is_locator_metadata_column(&output.name) {
@@ -1019,7 +1031,8 @@ fn aggregate_insert_expr_for_output(
     Err(format!(
         "Iceberg IMV aggregate rewrite cannot project change-stream output column {}",
         output.name
-    ))
+    )
+    .into())
 }
 
 fn typed_null(mut value_type: novarocks_type_contract::FunctionValueType) -> TypedExpr {
@@ -1712,7 +1725,7 @@ fn signed_aggregate(
     ctx: &RewriteContext,
     shape: &crate::compiler::mv_rewrite::SqlImvAggregateShape,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let input_columns = plan_output_columns(&aggregate_input)?;
     let mut signed_calls = layout
         .state_columns
@@ -1726,9 +1739,9 @@ fn signed_aggregate(
                 )
             })?;
             let call = align_aggregate_call_inputs_to_child(call, &input_columns)?;
-            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog())
+            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog(), &ctx.control_view())
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
     let hidden_retraction_call = layout.state_columns.iter().any(|column| {
         column.state_role == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount
     });
@@ -1736,6 +1749,7 @@ fn signed_aggregate(
         signed_calls.push(retraction_count_aggregate_call(
             action_column,
             ctx.function_catalog(),
+            &ctx.control_view(),
         )?);
     }
     let input = if plan_contains_imv_marker(&aggregate_input) {
@@ -2287,7 +2301,8 @@ fn state_shaped_state_value_type(
 fn retraction_count_aggregate_call(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<AggregateCall, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let args = vec![TypedExpr {
         kind: ExprKind::ColumnRef {
             column_id: action_column,
@@ -2296,9 +2311,25 @@ fn retraction_count_aggregate_call(
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     }];
-    let resolved =
-        crate::functions::resolve_sql_aggregate_binding(function_catalog, "sum", &args, &[], true)
-            .map_err(|error| format!("failed to resolve IMV retraction aggregate: {error}"))?;
+    let resolved = crate::functions::resolve_sql_aggregate_binding(
+        function_catalog,
+        "sum",
+        &args,
+        &[],
+        true,
+        control,
+    )
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => {
+            let error = other;
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "failed to resolve IMV retraction aggregate: {error}"
+            ))
+        }
+    })?;
     Ok(AggregateCall {
         name: "sum".to_string(),
         args,
@@ -2315,7 +2346,8 @@ fn signed_aggregate_call(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<AggregateCall, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let signed_name = match state_column.state_role {
         SqlImvAggregateStateRole::AvgSum => "sum_state_signed",
         SqlImvAggregateStateRole::AvgCount => "count_state_signed",
@@ -2323,20 +2355,31 @@ fn signed_aggregate_call(
         SqlImvAggregateStateRole::RetractionCount => {
             return Err(
                 "Iceberg IMV aggregate rewrite cannot build retraction count as a state call"
-                    .to_string(),
+                    .into(),
             );
         }
     };
     let value = signed_value_arg(call)?;
-    let input = signed_state_input(value, action_column, function_catalog)?;
+    let input = signed_state_input(value, action_column, function_catalog, control)?;
     let resolved = crate::functions::resolve_sql_aggregate_binding(
         function_catalog,
         signed_name,
         std::slice::from_ref(&input),
         &call.order_by,
         true,
+        control,
     )
-    .map_err(|error| format!("failed to resolve IMV signed aggregate `{signed_name}`: {error}"))?;
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => {
+            let error = other;
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "failed to resolve IMV signed aggregate `{signed_name}`: {error}"
+            ))
+        }
+    })?;
     Ok(AggregateCall {
         name: signed_name.to_string(),
         args: vec![input],
@@ -2370,7 +2413,8 @@ fn signed_state_input(
     value: TypedExpr,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<TypedExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         string_literal("value"),
         value,
@@ -2384,11 +2428,15 @@ fn signed_state_input(
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },
     ];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "named_struct", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "named_struct",
+        &args,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("named_struct must return a scalar value".to_string());
+        return Err("named_struct must return a scalar value".to_string().into());
     };
     let value_type = result.clone();
     Ok(TypedExpr {
@@ -2465,7 +2513,8 @@ mod tests {
     fn signed_state_function_rejects_unsupported_aggregate() {
         let err = signed_state_function("median").expect_err("median must be unsupported");
         assert!(
-            err.contains("unsupported IMV aggregate function median"),
+            err.to_string()
+                .contains("unsupported IMV aggregate function median"),
             "{err}"
         );
     }
@@ -4043,7 +4092,7 @@ mod tests {
             panic!("expected an ordinary rewrite error");
         };
         assert!(
-            err.contains("aggregate state column count"),
+            err.to_string().contains("aggregate state column count"),
             "unexpected error: {err}"
         );
     }
@@ -4067,7 +4116,7 @@ mod tests {
             panic!("expected an ordinary rewrite error");
         };
         assert!(
-            err.contains("must have binary type signature"),
+            err.to_string().contains("must have binary type signature"),
             "unexpected error: {err}"
         );
     }
@@ -4088,7 +4137,8 @@ mod tests {
             panic!("expected an ordinary rewrite error");
         };
         assert!(
-            err.contains("requires a retraction-count or COUNT(*) state column"),
+            err.to_string()
+                .contains("requires a retraction-count or COUNT(*) state column"),
             "unexpected error: {err}"
         );
     }

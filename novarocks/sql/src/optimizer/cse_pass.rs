@@ -3696,6 +3696,7 @@ mod intrinsic_eligibility_tests {
                         arguments: &arguments,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             catalog
@@ -3706,6 +3707,7 @@ mod intrinsic_eligibility_tests {
                         arguments: &arguments,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             let FunctionResultType::Scalar(output) = binding.selected.result_type.clone() else {

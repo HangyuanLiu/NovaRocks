@@ -214,11 +214,13 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
     if !exact_lease.matches_provider_binding_key(&request.observed_binding) {
-        return Err("MV incremental write lease drifted from prepared binding".to_string());
+        return Err("MV incremental write lease drifted from prepared binding"
+            .to_string()
+            .into());
     }
     let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
         ports,
@@ -291,7 +293,7 @@ fn bind_incremental_write_dataflow(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .expect("static Iceberg provider ID"),
@@ -420,6 +422,7 @@ fn bind_incremental_write_dataflow(
                         )
                         .map(|completed| completed.into_parts().0)
                 },
+                &finish_control,
             )
         }
         MvIncrementalExecutionArtifact::JoinLogical {
@@ -520,6 +523,7 @@ fn bind_incremental_write_dataflow(
                         )
                         .map(|completed| completed.into_parts().0)
                 },
+                &finish_control,
             )
         }
     }

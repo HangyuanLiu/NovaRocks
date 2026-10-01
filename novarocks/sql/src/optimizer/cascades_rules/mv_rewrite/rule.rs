@@ -87,9 +87,14 @@ impl Rule for MvRewriteRule {
         )
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
         let Some((query, shape)) = SpjgDescriptor::from_memo(expr, memo) else {
-            return vec![];
+            return Ok(vec![]);
         };
         let mut out = Vec::new();
         for (idx, cand) in self.candidates.iter().enumerate() {
@@ -99,11 +104,11 @@ impl Rule for MvRewriteRule {
                     continue;
                 }
             }
-            if let Some(alt) = try_rewrite(&query, &shape, cand, memo) {
+            if let Some(alt) = try_rewrite(&query, &shape, cand, memo, control)? {
                 out.push(alt);
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -160,27 +165,50 @@ fn try_rewrite(
     shape: &MatchedShape,
     cand: &MvRewriteCandidate,
     memo: &mut Memo,
-) -> Option<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<NewExpr>, crate::compiler::SqlCompileError> {
+    macro_rules! candidate {
+        ($value:expr) => {
+            match $value {
+                Some(value) => value,
+                None => return Ok(None),
+            }
+        };
+    }
+    macro_rules! binding_candidate {
+        ($value:expr) => {
+            match $value {
+                Ok(value) => value,
+                Err(
+                    error @ (crate::compiler::SqlCompileError::Cancelled
+                    | crate::compiler::SqlCompileError::DeadlineExceeded
+                    | crate::compiler::SqlCompileError::ResourceExhausted),
+                ) => return Err(error),
+                Err(_) => return Ok(None),
+            }
+        };
+    }
+
     if query.joins.is_some() || cand.mv.joins.is_some() {
-        return None;
+        return Ok(None);
     }
 
     // 1. Same physical base table (compare Iceberg identity, not names).
     if !same_iceberg_table(&query.table, &cand.mv.table) {
-        return None;
+        return Ok(None);
     }
     let q_names = query.base_name_of();
     let m_names = cand.mv.base_name_of();
 
     // 2. Predicate containment + compensation (still over base columns).
-    let containment = check_containment(
+    let containment = candidate!(check_containment(
         &query.predicates,
         &memo.scalars,
         &cand.mv.predicates,
         &cand.mv_scalars,
         &q_names,
         &m_names,
-    )?;
+    ));
 
     // 3. Allocate the MV scan: one new ColumnId per MV visible output,
     //    bound by NAME to the target table columns.
@@ -188,12 +216,13 @@ fn try_rewrite(
     let mut dims: Vec<(NormExpr, OutputColumn)> = Vec::new();
     let mut agg_cols: Vec<Option<OutputColumn>> = vec![None; cand.mv.outputs.len()];
     for (i, mv_out) in cand.mv.outputs.iter().enumerate() {
-        let col_def = cand
-            .target_table
-            .columns
-            .iter()
-            .find(|c| c.name == mv_out.name)?; // visible-by-name mapping (spec §5)
-        let value_type = col_def.declared_value_type().ok()?;
+        let col_def = candidate!(
+            cand.target_table
+                .columns
+                .iter()
+                .find(|c| c.name == mv_out.name)
+        ); // visible-by-name mapping (spec §5)
+        let value_type = candidate!(col_def.declared_value_type().ok());
         let id = memo.factory.create(
             Some(cand.target_table.name.clone()),
             col_def.name.clone(),
@@ -209,7 +238,7 @@ fn try_rewrite(
         scan_columns.push(oc.clone());
         match &mv_out.expr {
             SpjgOutputExpr::Dimension(e) => {
-                dims.push((normalize(&cand.mv_scalars, *e, &m_names)?, oc));
+                dims.push((candidate!(normalize(&cand.mv_scalars, *e, &m_names)), oc));
             }
             SpjgOutputExpr::Aggregate(_) => agg_cols[i] = Some(oc),
         }
@@ -221,11 +250,13 @@ fn try_rewrite(
     //    columns are not row-filterable. MvColumnMap only contains
     //    Dimension outputs, so any compensation touching an aggregate
     //    column simply fails to rewrite -> candidate dropped.
-    let compensation: Vec<ScalarId> = containment
-        .compensation
-        .iter()
-        .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names))
-        .collect::<Option<Vec<_>>>()?;
+    let compensation: Vec<ScalarId> = candidate!(
+        containment
+            .compensation
+            .iter()
+            .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names))
+            .collect::<Option<Vec<_>>>()
+    );
     let mut compensation_required_columns = HashSet::new();
     for predicate in &compensation {
         collect_required_columns(
@@ -236,13 +267,13 @@ fn try_rewrite(
     }
 
     // 5. Build the operator chain bottom-up.
-    let rewrite_selection = selected_candidate_marker(
+    let rewrite_selection = candidate!(selected_candidate_marker(
         &cand.mv_name,
         query,
         cand.selection
             .as_ref()
             .expect("MV rewrite rule retains only publication-proven candidates"),
-    )?;
+    ));
     let scan_group = memo.new_group(MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalScan(ScanOp {
@@ -260,7 +291,10 @@ fn try_rewrite(
     });
     let mut child_group = scan_group;
     if !compensation.is_empty() {
-        let predicate = scalar_expr::combine_conjuncts(&mut memo.scalars, compensation)?;
+        let predicate = candidate!(scalar_expr::combine_conjuncts(
+            &mut memo.scalars,
+            compensation
+        ));
         child_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -269,25 +303,27 @@ fn try_rewrite(
     }
 
     // 6. Top operator: reproduce the matched group's output ColumnIds.
-    match (shape, &cand.mv.aggregate) {
+    Ok(match (shape, &cand.mv.aggregate) {
         // SPJ query on SPJ MV: Project binding original output ids.
         (MatchedShape::Spj, None) => {
-            let items = query
-                .outputs
-                .iter()
-                .map(|o| {
-                    let SpjgOutputExpr::Dimension(e) = &o.expr else {
-                        return None;
-                    };
-                    let expr = col_map.rewrite(&mut memo.scalars, *e, &q_names)?;
-                    Some(project_item(
-                        &mut memo.scalars,
-                        expr,
-                        o.name.clone(),
-                        o.column_id,
-                    ))
-                })
-                .collect::<Option<Vec<_>>>()?;
+            let items = candidate!(
+                query
+                    .outputs
+                    .iter()
+                    .map(|o| {
+                        let SpjgOutputExpr::Dimension(e) = &o.expr else {
+                            return None;
+                        };
+                        let expr = col_map.rewrite(&mut memo.scalars, *e, &q_names)?;
+                        Some(project_item(
+                            &mut memo.scalars,
+                            expr,
+                            o.name.clone(),
+                            o.column_id,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            );
             let mut required_columns = compensation_required_columns.clone();
             collect_project_required_columns(&memo.scalars, &items, &mut required_columns);
             set_mv_scan_required_columns(memo, scan_group, &scan_columns, &required_columns);
@@ -303,16 +339,20 @@ fn try_rewrite(
         (MatchedShape::Spj, Some(_)) => None,
         // SPJG query on SPJ MV: keep the query aggregate, args rewritten.
         (MatchedShape::Spjg { original_agg }, None) => {
-            let group_by = original_agg
-                .group_by
-                .iter()
-                .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
-                .collect::<Option<Vec<_>>>()?;
-            let aggregates = original_agg
-                .aggregates
-                .iter()
-                .map(|c| rewrite_aggregate_to_mv(&mut memo.scalars, c, &col_map, &q_names))
-                .collect::<Option<Vec<_>>>()?;
+            let group_by = candidate!(
+                original_agg
+                    .group_by
+                    .iter()
+                    .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
+                    .collect::<Option<Vec<_>>>()
+            );
+            let aggregates = candidate!(
+                original_agg
+                    .aggregates
+                    .iter()
+                    .map(|c| rewrite_aggregate_to_mv(&mut memo.scalars, c, &col_map, &q_names))
+                    .collect::<Option<Vec<_>>>()
+            );
             let mut required_columns = compensation_required_columns.clone();
             for expr in &group_by {
                 collect_required_columns(&memo.scalars, *expr, &mut required_columns);
@@ -335,7 +375,7 @@ fn try_rewrite(
         }
         // SPJG query on SPJG MV: direct mapping or rollup.
         (MatchedShape::Spjg { original_agg }, Some(mv_agg)) => {
-            let plan = plan_rollup(
+            let plan = candidate!(plan_rollup(
                 &original_agg.group_by,
                 &original_agg.aggregates,
                 &memo.scalars,
@@ -344,25 +384,25 @@ fn try_rewrite(
                 &cand.mv.outputs,
                 &cand.mv_scalars,
                 &m_names,
-            )?;
+            ));
             match plan.kind {
                 RollupKind::Direct => {
                     // One row per group already: Project binding the original
                     // visible output ids.
                     let mut items: Vec<ScalarProjectItem> = Vec::new();
                     for oc in &original_agg.output_columns {
-                        let expr = match aggregate_output_position(
+                        let expr = match candidate!(aggregate_output_position(
                             &original_agg.output_layout,
                             oc.column_id,
-                        )? {
-                            AggregateOutputPosition::GroupKey(idx) => col_map.rewrite(
+                        )) {
+                            AggregateOutputPosition::GroupKey(idx) => candidate!(col_map.rewrite(
                                 &mut memo.scalars,
                                 original_agg.group_by[idx],
                                 &q_names,
-                            )?,
+                            )),
                             AggregateOutputPosition::Aggregate(idx) => {
                                 let item = &plan.items[idx];
-                                let mv_col = agg_cols[item.mv_output_index].clone()?;
+                                let mv_col = candidate!(agg_cols[item.mv_output_index].clone());
                                 column_ref(&mut memo.scalars, &mv_col)
                             }
                         };
@@ -390,11 +430,13 @@ fn try_rewrite(
                     })
                 }
                 RollupKind::Rollup => {
-                    let group_by = original_agg
-                        .group_by
-                        .iter()
-                        .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
-                        .collect::<Option<Vec<_>>>()?;
+                    let group_by = candidate!(
+                        original_agg
+                            .group_by
+                            .iter()
+                            .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
+                            .collect::<Option<Vec<_>>>()
+                    );
                     let needs_coalesce = plan.items.iter().any(|i| i.needs_coalesce);
                     // Aggregate outputs: reuse original ids directly unless a
                     // COALESCE wrapper project is needed (then mint fresh ids
@@ -412,32 +454,37 @@ fn try_rewrite(
                         original_agg.output_layout.group_key_columns.clone(),
                         aggregate_columns,
                     );
-                    let aggregates = plan
-                        .items
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, item)| {
-                            let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            let arg = column_ref(&mut memo.scalars, &mv_col);
-                            let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
-                                memo.function_catalog(),
-                                &memo.scalars,
-                                item.rollup_fn,
-                                &[arg],
-                                &[],
-                                true,
-                            )
-                            .ok()?;
-                            Some(ScalarAggregateSpec {
-                                output_column_id: output_layout.aggregate_columns[idx].column_id,
-                                name: item.rollup_fn.to_string(),
-                                args: vec![arg],
-                                distinct: false,
-                                order_by: vec![],
-                                resolved,
+                    let aggregates = candidate!(
+                        plan.items
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, item)| {
+                                let mv_col = candidate!(agg_cols[item.mv_output_index].clone());
+                                let arg = column_ref(&mut memo.scalars, &mv_col);
+                                let resolved = binding_candidate!(
+                                    crate::optimizer::scalar::resolve_aggregate_binding(
+                                        memo.function_catalog(),
+                                        &memo.scalars,
+                                        item.rollup_fn,
+                                        &[arg],
+                                        &[],
+                                        true,
+                                        control,
+                                    )
+                                );
+                                Ok(Some(ScalarAggregateSpec {
+                                    output_column_id: output_layout.aggregate_columns[idx]
+                                        .column_id,
+                                    name: item.rollup_fn.to_string(),
+                                    args: vec![arg],
+                                    distinct: false,
+                                    order_by: vec![],
+                                    resolved,
+                                }))
                             })
-                        })
-                        .collect::<Option<Vec<_>>>()?;
+                            .map(Result::transpose)
+                            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    )?;
                     let mut required_columns = compensation_required_columns.clone();
                     for expr in &group_by {
                         collect_required_columns(&memo.scalars, *expr, &mut required_columns);
@@ -455,11 +502,11 @@ fn try_rewrite(
                         &scan_columns,
                         &required_columns,
                     );
-                    let aggregate_visible_outputs = remap_visible_outputs_to_layout(
+                    let aggregate_visible_outputs = candidate!(remap_visible_outputs_to_layout(
                         &original_agg.output_columns,
                         &original_agg.output_layout,
                         &output_layout,
-                    )?;
+                    ));
                     let agg_op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                         group_by,
                         aggregates,
@@ -467,10 +514,10 @@ fn try_rewrite(
                         aggregate_visible_outputs,
                     ));
                     if !needs_coalesce {
-                        return Some(NewExpr {
+                        return Ok(Some(NewExpr {
                             op: agg_op,
                             children: vec![child_group],
-                        });
+                        }));
                     }
                     // Scalar COUNT rollup: wrap with COALESCE(sum, 0).
                     let agg_group = memo.new_group(MExpr {
@@ -479,44 +526,47 @@ fn try_rewrite(
                         children: vec![child_group],
                     });
                     let function_catalog = memo.function_catalog().snapshot();
-                    let items: Vec<ScalarProjectItem> = original_agg
-                        .output_columns
-                        .iter()
-                        .map(|oc| {
-                            let expr = match aggregate_output_position(
-                                &original_agg.output_layout,
-                                oc.column_id,
-                            )? {
-                                AggregateOutputPosition::GroupKey(idx) => column_ref(
-                                    &mut memo.scalars,
-                                    &output_layout.group_key_columns[idx],
-                                ),
-                                AggregateOutputPosition::Aggregate(idx) => {
-                                    let inner = column_ref(
+                    let items: Vec<ScalarProjectItem> = candidate!(
+                        original_agg
+                            .output_columns
+                            .iter()
+                            .map(|oc| {
+                                let expr = match candidate!(aggregate_output_position(
+                                    &original_agg.output_layout,
+                                    oc.column_id,
+                                )) {
+                                    AggregateOutputPosition::GroupKey(idx) => column_ref(
                                         &mut memo.scalars,
-                                        &output_layout.aggregate_columns[idx],
-                                    );
-                                    if plan.items[idx].needs_coalesce {
-                                        coalesce_zero(
-                                            function_catalog.as_ref(),
+                                        &output_layout.group_key_columns[idx],
+                                    ),
+                                    AggregateOutputPosition::Aggregate(idx) => {
+                                        let inner = column_ref(
                                             &mut memo.scalars,
-                                            inner,
-                                            oc,
-                                        )
-                                        .ok()?
-                                    } else {
-                                        inner
+                                            &output_layout.aggregate_columns[idx],
+                                        );
+                                        if plan.items[idx].needs_coalesce {
+                                            binding_candidate!(coalesce_zero(
+                                                function_catalog.as_ref(),
+                                                &mut memo.scalars,
+                                                inner,
+                                                oc,
+                                                control,
+                                            ))
+                                        } else {
+                                            inner
+                                        }
                                     }
-                                }
-                            };
-                            Some(project_item(
-                                &mut memo.scalars,
-                                expr,
-                                oc.name.clone(),
-                                oc.column_id,
-                            ))
-                        })
-                        .collect::<Option<Vec<_>>>()?;
+                                };
+                                Ok(Some(project_item(
+                                    &mut memo.scalars,
+                                    expr,
+                                    oc.name.clone(),
+                                    oc.column_id,
+                                )))
+                            })
+                            .map(Result::transpose)
+                            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    )?;
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
                             items,
@@ -527,7 +577,7 @@ fn try_rewrite(
                 }
             }
         }
-    }
+    })
 }
 
 fn selected_candidate_marker(
@@ -683,7 +733,8 @@ fn coalesce_zero(
     arena: &mut ScalarArena,
     value: ScalarId,
     output: &OutputColumn,
-) -> Result<ScalarId, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let zero = arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
         novarocks_type_contract::FunctionValueType {
@@ -697,6 +748,7 @@ fn coalesce_zero(
         arena,
         "coalesce",
         &args,
+        control,
     )?;
     Ok(arena.intern(
         ScalarNode::FunctionCall {
@@ -1111,6 +1163,156 @@ mod tests {
 
     // --- tests ------------------------------------------------------------
 
+    struct RefusingMvBindingControl(novarocks_type_contract::CompileControlError);
+    impl novarocks_type_contract::PureCompileControl for RefusingMvBindingControl {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            if phase == novarocks_type_contract::CompilePhase::FunctionSpecialization {
+                Err(self.0)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn rollup_binding_control_is_fatal_instead_of_an_optional_candidate_miss() {
+        use novarocks_type_contract::CompileControlError;
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a, v])],
+                None,
+            )],
+            None,
+        );
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = test_memo();
+            let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+            advance_factory(&mut memo, 200);
+            let root_expr = memo.groups[root].logical_exprs[0].clone();
+            let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
+            let result = rule.apply(&root_expr, &mut memo, &RefusingMvBindingControl(error));
+            assert!(
+                matches!(result, Err(ref actual) if actual == &crate::compiler::SqlCompileError::from(error)),
+                "the actual selected rollup owner must preserve {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollup_candidate_miss_stops_before_a_later_binding_control_failure() {
+        use novarocks_functions::{EngineFunctionCatalogBuilder, FunctionKind};
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AfterMissingOwnerControl {
+            checkpoints: AtomicUsize,
+            error: CompileControlError,
+        }
+        impl PureCompileControl for AfterMissingOwnerControl {
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::FunctionSpecialization
+                    && self.checkpoints.fetch_add(1, Ordering::SeqCst) >= 2
+                {
+                    return Err(self.error);
+                }
+                Ok(())
+            }
+        }
+
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let first = col(3, "first_sum");
+        let second = col(4, "second_sum");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &first), sum_call(&v, &second)],
+                output_columns: vec![a.clone(), first, second],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a, v])],
+                None,
+            )],
+            None,
+        );
+        // Both query channels can use the same actual materialized SUM output.
+        let make_memo = || {
+            let mut memo = test_memo();
+            let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+            advance_factory(&mut memo, 200);
+            (memo, root)
+        };
+        let (mut admitted, root) = make_memo();
+        let expression = admitted.groups[root].logical_exprs[0].clone();
+        assert_eq!(
+            MvRewriteRule::new(vec![agg_candidate(0)])
+                .apply(
+                    &expression,
+                    &mut admitted,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        for definition in crate::functions::builtin_engine_function_catalog().definitions() {
+            if definition.canonical_name() != "sum" || definition.kind() != FunctionKind::Aggregate
+            {
+                builder.register(definition.clone()).unwrap();
+            }
+        }
+        let missing_sum = Arc::new(builder.seal().unwrap());
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let (mut memo, root) = make_memo();
+            memo.function_catalog = Some(missing_sum.clone());
+            let expression = memo.groups[root].logical_exprs[0].clone();
+            let control = AfterMissingOwnerControl {
+                checkpoints: AtomicUsize::new(0),
+                error,
+            };
+            let alternatives = MvRewriteRule::new(vec![agg_candidate(0)])
+                .apply(&expression, &mut memo, &control)
+                .expect(
+                    "the first ordinary owner miss ends this candidate before the next binding",
+                );
+            assert!(alternatives.is_empty());
+            // Missing-owner lookup observes its entry and completed one-unit
+            // exit. A third specialization checkpoint would reject the next
+            // channel; it must never run after this candidate has missed.
+            assert_eq!(control.checkpoints.load(Ordering::SeqCst), 2);
+        }
+    }
+
     #[test]
     fn injects_rollup_alternative() {
         // Query: SELECT a, sum(v) FROM t WHERE a >= 10 GROUP BY a.
@@ -1142,7 +1344,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1, "exactly one rollup alternative");
 
         // Top must be a LogicalAggregate reusing the ORIGINAL output ids.
@@ -1165,7 +1373,13 @@ mod tests {
 
         // Idempotency: a second apply on the same expr injects nothing.
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "second apply must be a no-op"
         );
     }
@@ -1200,7 +1414,15 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![candidate]);
 
-        assert!(rule.apply(&root_expr, &mut memo).is_empty());
+        assert!(
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1235,7 +1457,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![direct_agg_candidate(0)]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         let Operator::LogicalProject(project) = &alts[0].op else {
@@ -1285,7 +1513,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         let Operator::LogicalAggregate(aggregate) = &alts[0].op else {
@@ -1354,7 +1588,13 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![candidate]);
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "multi-table MV descriptor must not rewrite before join matching exists"
         );
     }
@@ -1422,7 +1662,13 @@ mod tests {
             "test must exercise the query-side join descriptor path"
         );
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "multi-table query descriptor must not rewrite against a single-table candidate yet"
         );
     }
@@ -1457,7 +1703,13 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![agg_candidate(100)]);
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "predicate not contained -> no alternative"
         );
     }
@@ -1511,7 +1763,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         // Top must be a LogicalProject binding the ORIGINAL scan output ids.
@@ -1582,7 +1840,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         let scan = find_scan(&memo, alts[0].children[0]);
@@ -1636,7 +1900,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
         assert!(
             !has_filter(&memo, alts[0].children[0]),
@@ -1700,7 +1970,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
         let scan = find_scan(&memo, alts[0].children[0]);
         assert_eq!(scan.table.name, "or_mv");
@@ -1770,7 +2046,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         // Top must be a LogicalProject whose sole item is COALESCE(_, 0) bound

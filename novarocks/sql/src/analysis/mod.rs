@@ -483,12 +483,12 @@ pub(crate) fn resolve_function_binding(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-) -> Result<crate::binding::SqlFunctionBinding, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, novarocks_functions::FunctionBindingError> {
     let arguments = args.iter().map(function_argument).collect::<Vec<_>>();
     catalog
-        .resolve_scalar_binding(name, &arguments)
+        .resolve_scalar_binding(name, &arguments, control)
         .map(crate::binding::SqlFunctionBinding::new)
-        .map_err(|error| error.to_string())
 }
 
 /// Builds an explicit, fully typed function contract for structural IR tests

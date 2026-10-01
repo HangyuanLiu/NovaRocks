@@ -2981,7 +2981,7 @@ pub(crate) mod tests {
                 202,
                 203,
                 204,
-            )
+             &crate::compiler::SqlCompileControl::unbounded())
         }
         .expect("join projection coalesce plan");
 
@@ -3025,7 +3025,7 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                    )
+                     &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3074,7 +3074,7 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                    )
+                     &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection/filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3127,7 +3127,7 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                    )
+                     &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join side-filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3210,7 +3210,7 @@ pub(crate) mod tests {
                     204,
                     #[cfg(not(test))]
                     crate::functions::builtin_sql_function_catalog(),
-                )
+                 &crate::compiler::SqlCompileControl::unbounded())
             }
             .expect("join projection coalesce plan");
             optimize_logical_for_test(coalesce)

@@ -11,6 +11,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+novarocks-type-contract.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 novarocks-execution-contract.workspace = true

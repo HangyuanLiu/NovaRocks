@@ -1519,6 +1519,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         paired,
         DmlQueryExecutionKernel::function_catalog(state),
         Some(&write_target_facts),
+        &completion_control,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
         encoded,

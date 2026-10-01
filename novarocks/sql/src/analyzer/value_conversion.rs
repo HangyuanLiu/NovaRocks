@@ -76,8 +76,9 @@ impl super::AnalyzerContext<'_> {
             source,
             target,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )
-        .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+        .map_err(|error| error.at_type_mismatch(span))?;
         self.check_control()?;
         Ok(result)
     }
@@ -90,7 +91,11 @@ pub(super) fn convert_value_domain_with_catalog(
     source: TypedExpr,
     target: FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<TypedExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
     if matches!(source.kind, ExprKind::Literal(LiteralValue::Null)) {
         let mut value_type = target;
         value_type.nullable = true;
@@ -104,17 +109,21 @@ pub(super) fn convert_value_domain_with_catalog(
             &source.value_type,
             &target,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?
         .ok_or_else(|| {
-            "a logical-domain conversion requires an exact admitted implementation".to_string()
+            AnalyzeError::internal(
+                "a logical-domain conversion requires an exact admitted implementation",
+            )
         })?;
     let argument = function_argument(&source);
     let binding = catalog
-        .resolve_value_conversion_binding(&argument, &intermediate)
-        .map_err(|error| error.to_string())?;
+        .resolve_value_conversion_binding(&argument, &intermediate, control)
+        .map_err(AnalyzeError::function_binding)?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("value conversion owner must produce a scalar result".to_string());
+        return Err(AnalyzeError::internal(
+            "value conversion owner must produce a scalar result",
+        ));
     };
     let value_type = result.clone();
     let converted = TypedExpr {

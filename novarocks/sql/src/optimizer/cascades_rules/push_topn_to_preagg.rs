@@ -40,16 +40,23 @@ impl Rule for PushDownTopNToPreAgg {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(topn) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if expr.children.len() != 1 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let Some(global_group) = memo.groups.get(expr.children[0]) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut candidates = Vec::new();
         for global_expr in &global_group.logical_exprs {
@@ -81,7 +88,7 @@ impl Rule for PushDownTopNToPreAgg {
                 memo,
             ));
         }
-        results
+        Ok(results)
     }
 
     fn pattern(&self) -> Pattern {
@@ -97,19 +104,32 @@ impl Rule for PushDownTopNToPreAgg {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = TopN, 1 = global Aggregate, 2 = local Aggregate.
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Operator::LogicalAggregate(global) = binding.op(memo, 1).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Operator::LogicalAggregate(local) = binding.op(memo, 2).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let local_group_id = binding.children(1)[0];
-        rewrite_topn_preagg(&topn, &global, &local, local_group_id, memo)
+        Ok(rewrite_topn_preagg(
+            &topn,
+            &global,
+            &local,
+            local_group_id,
+            memo,
+        ))
     }
 }
 
@@ -465,7 +485,13 @@ mod tests {
 
     fn assert_does_not_fire(fixture: &mut PreAggMemo) {
         let expr = root_expr(fixture);
-        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(out.is_empty(), "expected PushDownTopNToPreAgg not to fire");
     }
@@ -622,7 +648,13 @@ mod tests {
         let mut fixture = preagg_memo();
         let expr = root_expr(&fixture);
 
-        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }
@@ -645,7 +677,13 @@ mod tests {
         global.output_columns = global.output_layout.aggregate_columns.clone();
 
         let expr = root_expr(&fixture);
-        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }
@@ -655,13 +693,25 @@ mod tests {
         let mut fixture = preagg_memo();
         let expr = root_expr(&fixture);
 
-        let first = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let first = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1);
         let groups_after_first = fixture.memo.groups.len();
         let first_global_group = first[0].children[0];
         let first_partial_group = partial_group_under_global(&fixture.memo, first_global_group);
 
-        let second = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let second = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(second.len(), 1);
         let second_global_group = second[0].children[0];
         let second_partial_group = partial_group_under_global(&fixture.memo, second_global_group);
@@ -767,7 +817,13 @@ mod tests {
             children: vec![global_group],
         };
 
-        let out = PushDownTopNToPreAgg.apply(&topn, &mut memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -860,7 +916,13 @@ mod tests {
             children: vec![single_group],
         };
 
-        let out = PushDownTopNToPreAgg.apply(&topn, &mut memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -907,7 +969,13 @@ mod tests {
         .unwrap();
         assert_eq!(bindings.len(), 1);
 
-        let out = PushDownTopNToPreAgg.apply_bound(&bindings[0], &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply_bound(
+                &bindings[0],
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }

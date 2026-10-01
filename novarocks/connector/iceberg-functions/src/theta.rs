@@ -525,6 +525,21 @@ mod tests {
     };
     use novarocks_functions::{EngineFunctionCatalogBuilder, FunctionResolutionError};
 
+    fn compile_control() -> &'static dyn novarocks_type_contract::PureCompileControl {
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _phase: novarocks_type_contract::CompilePhase,
+                _work: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        static CONTROL: Control = Control;
+        &CONTROL
+    }
+
     fn run_update(input: ArrayRef) -> Vec<u8> {
         let kernel = IcebergThetaKernel;
         let mut state = kernel.create_state().expect("state");
@@ -739,9 +754,12 @@ mod tests {
                         ICEBERG_THETA_AGGREGATE_NAME,
                         FunctionKind::Aggregate,
                         request,
+                        compile_control(),
                     )
                     .unwrap();
-                catalog.validate_bound(&bound, request).unwrap();
+                catalog
+                    .validate_bound(&bound, request, compile_control())
+                    .unwrap();
                 assert_eq!(
                     bound.selected.argument_types.as_ref(),
                     &[FunctionArgumentType::Value(value_type)]
@@ -795,6 +813,7 @@ mod tests {
                 ICEBERG_THETA_AGGREGATE_NAME,
                 FunctionKind::Aggregate,
                 theta_value_request(&arguments),
+                compile_control(),
             )
             .unwrap();
         // Even another admitted domain cannot replace a frozen source while
@@ -806,7 +825,7 @@ mod tests {
         ));
         assert!(
             catalog
-                .validate_bound(&changed, theta_value_request(&arguments))
+                .validate_bound(&changed, theta_value_request(&arguments), compile_control())
                 .is_err()
         );
         for value_type in [
@@ -843,6 +862,7 @@ mod tests {
                         ICEBERG_THETA_AGGREGATE_NAME,
                         FunctionKind::Aggregate,
                         request,
+                        compile_control(),
                     )
                     .is_err(),
                 "{value_type:?}"
@@ -852,7 +872,9 @@ mod tests {
             // Change both the request and selected root to exercise the
             // family gate after exact expression/selection correspondence.
             assert!(
-                catalog.validate_bound(&changed, request).is_err(),
+                catalog
+                    .validate_bound(&changed, request, compile_control())
+                    .is_err(),
                 "{value_type:?}"
             );
         }
@@ -884,9 +906,12 @@ mod tests {
                 ICEBERG_THETA_AGGREGATE_NAME,
                 FunctionKind::Aggregate,
                 request,
+                compile_control(),
             )
             .unwrap();
-        catalog.validate_bound(&bound, request).unwrap();
+        catalog
+            .validate_bound(&bound, request, compile_control())
+            .unwrap();
         assert_eq!(
             bound.selected.overload.as_str(),
             "iceberg/theta-stat/large-binary/v1"

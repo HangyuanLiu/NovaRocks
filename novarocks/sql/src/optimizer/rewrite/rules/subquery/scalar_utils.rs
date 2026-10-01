@@ -558,7 +558,8 @@ pub(super) fn coalesce_false(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     pred: ScalarId,
-) -> Result<ScalarId, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let false_lit = bool_literal(arena, false);
     let args = vec![pred, false_lit];
     let binding = crate::optimizer::scalar::resolve_function_binding(
@@ -566,6 +567,7 @@ pub(super) fn coalesce_false(
         arena,
         "coalesce",
         &args,
+        control,
     )?;
     Ok(arena.intern(
         ScalarNode::FunctionCall {
@@ -584,7 +586,8 @@ pub(super) fn ifnull_zero(
     arena: &mut ScalarArena,
     value: ScalarId,
     result_type: DataType,
-) -> Result<ScalarId, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let zero = int_literal(arena, 0);
     let args = vec![value, zero];
     let binding = crate::optimizer::scalar::resolve_function_binding(
@@ -592,6 +595,7 @@ pub(super) fn ifnull_zero(
         arena,
         "ifnull",
         &args,
+        control,
     )?;
     Ok(arena.intern(
         ScalarNode::FunctionCall {
@@ -610,7 +614,8 @@ pub(super) fn assert_true(
     arena: &mut ScalarArena,
     condition: ScalarId,
     message: impl Into<String>,
-) -> Result<ScalarId, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let message = string_literal(arena, message);
     let args = vec![condition, message];
     let binding = crate::optimizer::scalar::resolve_function_binding(
@@ -618,6 +623,7 @@ pub(super) fn assert_true(
         arena,
         "assert_true",
         &args,
+        control,
     )?;
     Ok(arena.intern(
         ScalarNode::FunctionCall {

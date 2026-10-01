@@ -895,17 +895,19 @@ impl novarocks_functions::FunctionBindingResolver for OrderedOwner {
     fn resolve(
         &self,
         request: novarocks_functions::FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::FunctionBindingSelection,
         novarocks_functions::FunctionBindingError,
     > {
-        self.validate_selected(&self.selected, request)?;
+        self.validate_selected(&self.selected, request, _control)?;
         Ok(self.selected.as_ref().clone())
     }
     fn validate_selected(
         &self,
         selected: &novarocks_functions::FunctionBindingSelection,
         request: novarocks_functions::FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), novarocks_functions::FunctionBindingError> {
         if selected != self.selected.as_ref()
             || request.logical_argument_count != 1
@@ -948,7 +950,7 @@ impl novarocks_functions::FunctionEffectOwner for OrderedOwner {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 1)
             .map_err(novarocks_functions::FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         Ok(self.inner.frozen(input.selected))
     }
 }

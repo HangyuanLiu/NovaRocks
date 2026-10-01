@@ -580,6 +580,7 @@ impl<'a> AnalyzerContext<'a> {
             "max",
             std::slice::from_ref(&marker_argument),
             novarocks_parser::Span::new(0, 0),
+            self.control,
         )?;
         let marker_query = match null_source_col {
             Some(source_col) => value_form_null_marker_query(
@@ -2241,6 +2242,7 @@ impl<'a> AnalyzerContext<'a> {
             "array_agg",
             std::slice::from_ref(&argument),
             span,
+            self.control,
         )?;
         let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
             unreachable!("array_agg has a scalar result");
@@ -2334,6 +2336,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![values.clone()],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         let probes = resolved_scalar_call_at(
             self.function_catalog,
@@ -2341,6 +2344,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![lhs, length],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         let mapped = resolved_scalar_call_at(
             self.function_catalog,
@@ -2348,6 +2352,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![lambda, probes, values],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         // ARRAY_AGG emits a non-null empty list for zero input rows;
         // ANY_MATCH reduces that list to FALSE even for a NULL probe.
@@ -2357,6 +2362,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![mapped],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
         )?;
         if negated {
             replacement = TypedExpr {
@@ -2508,6 +2514,7 @@ impl<'a> AnalyzerContext<'a> {
                         "coalesce",
                         &args,
                         subquery_span,
+                        self.control,
                     )?;
                     Ok(TypedExpr {
                         value_type: novarocks_type_contract::FunctionValueType::new(

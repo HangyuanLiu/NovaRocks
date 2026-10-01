@@ -37,6 +37,7 @@ pub struct DmlError {
     publication_terminal: Option<LakePublicationTerminal>,
     user_error: Option<UserError>,
     engine_error_code: Option<EngineErrorCode>,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 /// DML-local carrier for a SQL analysis error before the frontend client
@@ -48,21 +49,57 @@ pub struct DmlError {
 pub enum DmlExecutionError {
     Engine(String),
     Analyze(AnalyzeError),
+    Control(novarocks_type_contract::CompileControlError),
 }
 
 impl DmlExecutionError {
     pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
         match error {
-            novarocks_sql::compiler::SqlCompileError::Analyze(error) => Self::Analyze(error),
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => match error.control_error()
+            {
+                Some(control) => Self::Control(control),
+                None => Self::Analyze(error),
+            },
+            novarocks_sql::compiler::SqlCompileError::Cancelled => {
+                Self::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
+                Self::Control(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+            }
+            novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+                Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
+            }
             error => Self::Engine(error.to_string()),
+        }
+    }
+
+    pub(crate) fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
+        match error {
+            novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
         }
     }
 
     pub(crate) fn into_dml_error(self, source: Option<&str>) -> DmlError {
         match self {
             Self::Engine(error) => DmlError::executor(error),
-            Self::Analyze(error) => DmlError::admit(error.to_user_error(source)),
+            Self::Analyze(error) => match error.control_error() {
+                Some(error) => DmlError::compile_control(error),
+                None => DmlError::admit(error.to_user_error(source)),
+            },
+            Self::Control(error) => DmlError::compile_control(error),
         }
+    }
+}
+
+impl From<novarocks_sql::compiler::SqlCompileError> for DmlExecutionError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        Self::from_compile(error)
+    }
+}
+impl From<novarocks_plan_codec::PhysicalEncodeError> for DmlExecutionError {
+    fn from(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
+        Self::from_encode(error)
     }
 }
 
@@ -98,6 +135,7 @@ impl std::fmt::Display for DmlExecutionError {
         match self {
             Self::Engine(error) => formatter.write_str(error),
             Self::Analyze(error) => error.fmt(formatter),
+            Self::Control(error) => error.fmt(formatter),
         }
     }
 }
@@ -112,6 +150,7 @@ impl DmlError {
             publication_terminal: None,
             user_error: None,
             engine_error_code: None,
+            compile_control: None,
         }
     }
 
@@ -149,6 +188,7 @@ impl DmlError {
             publication_terminal: Some(terminal),
             user_error: None,
             engine_error_code: None,
+            compile_control: None,
         }
     }
 
@@ -165,6 +205,7 @@ impl DmlError {
             publication_terminal: None,
             user_error: Some(error),
             engine_error_code: None,
+            compile_control: None,
         }
     }
 
@@ -173,6 +214,17 @@ impl DmlError {
     pub(crate) fn with_engine_error_code(mut self, code: EngineErrorCode) -> Self {
         self.engine_error_code = Some(code);
         self
+    }
+
+    pub(crate) fn compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
+        let mut failure = Self::executor(error);
+        failure.compile_control = Some(error);
+        failure
+    }
+    pub(crate) const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub const fn kind(&self) -> DmlErrorKind {
@@ -222,3 +274,52 @@ impl fmt::Display for DmlError {
 }
 
 impl std::error::Error for DmlError {}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn compile_and_encode_failures_retain_exact_control_until_dml_terminal() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let compiled = DmlExecutionError::from_compile(control.into()).into_dml_error(None);
+            let encoded = DmlExecutionError::from_encode(
+                novarocks_plan_codec::PhysicalEncodeError::Control(control),
+            )
+            .into_dml_error(None);
+            let analyzed = DmlExecutionError::from_compile(
+                novarocks_sql::compiler::SqlCompileError::Analyze(AnalyzeError::control(control)),
+            )
+            .into_dml_error(None);
+            for failure in [compiled, encoded, analyzed] {
+                assert_eq!(failure.compile_control_error(), Some(control));
+                assert_eq!(failure.kind(), DmlErrorKind::Executor);
+                assert!(failure.user_error().is_none());
+                assert!(failure.publication_terminal().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_error_text_does_not_acquire_control_authority() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for failure in [
+                DmlExecutionError::from(control.to_string()),
+                DmlExecutionError::from_encode(novarocks_plan_codec::PhysicalEncodeError::Invalid(
+                    control.to_string(),
+                )),
+            ] {
+                assert_eq!(failure.into_dml_error(None).compile_control_error(), None);
+            }
+        }
+    }
+}

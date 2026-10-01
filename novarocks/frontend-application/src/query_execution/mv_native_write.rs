@@ -156,8 +156,12 @@ pub(crate) fn prepare_completed_mv_write(
         novarocks_physical_plan::PipelineDopDomain,
         novarocks_sql::planning::dml::DmlFinalizedProviderReadSet,
         novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet,
-    ) -> Result<novarocks_physical_plan::PhysicalPlan, String>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+    ) -> Result<
+        novarocks_physical_plan::PhysicalPlan,
+        novarocks_sql::compiler::SqlCompileError,
+    >,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
     let mut facts = Vec::with_capacity(needs.len());
@@ -219,8 +223,22 @@ pub(crate) fn prepare_completed_mv_write(
                 field_names,
             },
         ),
-    )?;
+        control,
+    )
+    .map_err(encode_compile_error)?;
     PreparedMvNativeWriteAssembly::session(encoded, version, None, write_session)
+        .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+}
+
+pub(crate) fn encode_compile_error(
+    error: novarocks_plan_codec::PhysicalEncodeError,
+) -> novarocks_sql::compiler::SqlCompileError {
+    match error {
+        novarocks_plan_codec::PhysicalEncodeError::Control(error) => error.into(),
+        novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
+            novarocks_sql::compiler::SqlCompileError::Compilation(error)
+        }
+    }
 }
 
 /// Provider activation and native fragment preparation for a SQL-shaped
@@ -236,7 +254,7 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
         connector_context: ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, String>;
+    ) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError>;
 
     /// Open the session one metadata-only publication commits through.
     ///

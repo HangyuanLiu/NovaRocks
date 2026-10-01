@@ -261,7 +261,9 @@ pub struct WriterStatisticsTargetInput<'a> {
 pub fn plan_writer_statistics(
     targets: &[WriterStatisticsTargetInput<'_>],
     functions: &dyn SqlFunctionCatalog,
-) -> Result<WriterAuxiliaryPlan, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<WriterAuxiliaryPlan, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     if targets.is_empty() {
         return Ok(WriterAuxiliaryPlan::empty());
     }
@@ -272,7 +274,8 @@ pub fn plan_writer_statistics(
         if previous_target.is_some_and(|previous: WriteTargetOrdinal| previous >= target.target) {
             return Err(
                 "write aggregate targets must be listed in strictly ascending ordinal order"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         previous_target = Some(target.target);
@@ -280,13 +283,15 @@ pub fn plan_writer_statistics(
             return Err(format!(
                 "write aggregate plan contains duplicate target {}",
                 target.target.get()
-            ));
+            )
+            .into());
         }
     }
     if targets.iter().all(|target| target.requirements.is_empty()) {
         return WriterAuxiliaryPlan::without_requirements(
             targets.iter().map(|target| target.target),
-        );
+        )
+        .map_err(Into::into);
     }
 
     let mut next_slot = first_free_internal_slot(targets)?;
@@ -322,7 +327,7 @@ pub fn plan_writer_statistics(
                     "write aggregate input ordinal {} does not match the pinned column for target {}",
                     requirement.input().ordinal(),
                     target.target.get()
-                ));
+                ).into());
             }
             let input_expr = TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -340,13 +345,17 @@ pub fn plan_writer_statistics(
                 std::slice::from_ref(&input_expr),
                 &[],
                 true,
+                control,
             )
-            .map_err(|error| {
-                format!(
+            .map_err(|error| match error {
+                novarocks_functions::FunctionBindingError::Control(error) => {
+                    crate::compiler::SqlCompileError::from(error)
+                }
+                error => crate::compiler::SqlCompileError::Compilation(format!(
                     "resolve trusted write aggregate `{}` for {:?}: {error}",
                     requirement.function_name(),
                     requirement.input().data_type()
-                )
+                )),
             })?;
             if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary
                 || crate::functions::aggregate_result_type(&resolved).logical_type
@@ -356,7 +365,8 @@ pub fn plan_writer_statistics(
                     "write aggregate `{}` output {:?} cannot feed the binary Root value slot",
                     requirement.function_name(),
                     crate::functions::aggregate_result_type(&resolved).data_type
-                ));
+                )
+                .into());
             }
             let occurrence = occurrence_by_signature.entry(resolved.clone()).or_default();
             let shared_key = (resolved.clone(), *occurrence);
@@ -645,9 +655,10 @@ mod tests {
                 requirements: &required,
             }],
             &build_builtin_engine_function_catalog().expect("builtin function catalog"),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("count does not produce a binary artifact body");
-        assert!(plan.contains("binary Root value slot"));
+        assert!(plan.to_string().contains("binary Root value slot"));
     }
 
     #[test]
@@ -662,6 +673,7 @@ mod tests {
                 requirements: &required,
             }],
             &binary_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         let original = &plan.schema().auxiliary_channels()[0];
@@ -708,6 +720,7 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
         assert_eq!(
@@ -739,6 +752,7 @@ mod tests {
                 requirements: &requirements,
             }],
             &binary_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
         assert_eq!(plan.schema().auxiliary_channels().len(), 2);
@@ -765,6 +779,7 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
         assert_eq!(plan.schema().auxiliary_channels().len(), 2);
@@ -806,8 +821,9 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("unordered targets");
-        assert!(error.contains("strictly ascending"));
+        assert!(error.to_string().contains("strictly ascending"));
     }
 }

@@ -29,7 +29,7 @@ mod physical_v1;
 mod write_targets;
 
 pub use physical_encode::{
-    NoPhysicalV1PrivateFacts, PhysicalV1CteConsumer, PhysicalV1PrivateFacts,
+    NoPhysicalV1PrivateFacts, PhysicalEncodeError, PhysicalV1CteConsumer, PhysicalV1PrivateFacts,
     PhysicalV1RuntimeFilterBinding, PhysicalV1RuntimeFilterBindingRole, PhysicalV1ScanColumn,
     PhysicalV1ScanFact, PhysicalV1WriteFact, ScanRuntimeFilterBindings, encode_physical_plan_v1,
     physical_v1_cte_consumers, physical_v1_runtime_filter_bindings,

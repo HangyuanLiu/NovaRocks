@@ -30,6 +30,7 @@ impl FunctionBindingResolver for MetadataResolver {
     fn resolve(
         &self,
         _: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         panic!("metadata catalogue must not resolve a call")
     }
@@ -37,6 +38,7 @@ impl FunctionBindingResolver for MetadataResolver {
         &self,
         _: &FunctionBindingSelection,
         _: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         panic!("metadata catalogue must not validate a call")
     }

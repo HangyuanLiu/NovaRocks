@@ -921,6 +921,7 @@ mod tests {
                         arguments: &args,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             catalog
@@ -931,6 +932,7 @@ mod tests {
                         arguments: &args,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             let FunctionResultType::Scalar(output) = bound.selected.result_type.clone() else {

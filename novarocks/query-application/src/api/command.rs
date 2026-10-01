@@ -108,6 +108,7 @@ pub enum CommandErrorKind {
 pub struct CommandError {
     kind: CommandErrorKind,
     message: Arc<str>,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl CommandError {
@@ -115,11 +116,33 @@ impl CommandError {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
+        let kind = match error {
+            novarocks_type_contract::CompileControlError::Cancelled => CommandErrorKind::Cancelled,
+            _ => CommandErrorKind::Failed,
+        };
+        let mut failure = Self::new(kind, error.to_string());
+        failure.compile_control = Some(error);
+        failure
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub const fn kind(&self) -> CommandErrorKind {
         self.kind
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(error: String) -> Self {
+        Self::new(CommandErrorKind::Failed, error)
     }
 }
 
@@ -183,7 +206,7 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
         command: &MaterializedViewCommand,
         context: &RequestContext,
         command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, String>;
+    ) -> Result<QuerySessionOutput, CommandError>;
 }
 
 #[cfg(test)]
@@ -250,5 +273,28 @@ mod tests {
             command.statement(),
             novarocks_parser::ast::MaterializedViewStatement::Show(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn command_terminal_retains_control_without_inferring_from_display_text() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = CommandError::from_compile_control(control);
+            assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(error.clone().compile_control_error(), Some(control));
+            assert_eq!(
+                CommandError::from(control.to_string()).compile_control_error(),
+                None
+            );
+        }
     }
 }

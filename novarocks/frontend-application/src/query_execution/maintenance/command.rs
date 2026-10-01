@@ -54,7 +54,7 @@ impl MaintenanceCommandExecutor {
         current_database: &str,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_table_maintenance::runtime::TerminalError> {
         let lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
             command,
             MaintenanceRequestContext {
@@ -151,8 +151,9 @@ mod tests {
             &self,
             _engine: &dyn TableMaintenanceEngine,
             _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            Err("not used".to_string())
+        ) -> Result<MaintenanceActionOutcome, novarocks_table_maintenance::runtime::TerminalError>
+        {
+            Err("not used".to_string().into())
         }
 
         fn submit_automatic_optimize(

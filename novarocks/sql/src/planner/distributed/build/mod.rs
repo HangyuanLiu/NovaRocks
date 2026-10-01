@@ -19,7 +19,7 @@
 mod contract_lowering;
 
 pub(crate) use contract_lowering::{
-    FinalChangeStreamWriteLowering, FinalWriteLowering, lower_final_change_stream_write_plan,
-    lower_final_physical_plan, lower_final_physical_plan_with_provider_reads,
-    lower_final_physical_write_plan,
+    ContractLoweringError, FinalChangeStreamWriteLowering, FinalWriteLowering,
+    lower_final_change_stream_write_plan, lower_final_physical_plan,
+    lower_final_physical_plan_with_provider_reads, lower_final_physical_write_plan,
 };

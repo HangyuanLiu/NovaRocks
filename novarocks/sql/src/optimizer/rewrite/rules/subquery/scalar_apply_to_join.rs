@@ -83,7 +83,7 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
     ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_opt(expr, ctx, &mut arena).map_err(SqlCompileError::Compilation)? {
+        match apply_opt(expr, ctx, &mut arena)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -105,7 +105,7 @@ fn apply_opt(
     expr: OptExpr,
     ctx: &mut RewriteContext,
     arena: &mut ScalarArena,
-) -> Result<Option<OptExpr>, String> {
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -133,6 +133,7 @@ fn apply_opt(
             &right,
             a.inner_output_column_id,
             &a.output_column,
+            &ctx.control_view(),
         )?;
 
         let inner_plan = if provably_le_one_row {
@@ -172,6 +173,7 @@ fn apply_opt(
             &right,
             a.inner_output_column_id,
             &a.output_column,
+            &ctx.control_view(),
         )?;
 
         let join = scalar_utils::join(left, right, JoinKind::LeftOuter, cond);
@@ -263,8 +265,8 @@ fn apply_opt(
         &[count_argument],
         &[],
         true,
-    )
-    .map_err(|error| format!("failed to resolve optimizer count aggregate: {error}"))?;
+        &ctx.control_view(),
+    )?;
     let any_value_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
         ctx.function_catalog(),
         arena,
@@ -272,8 +274,8 @@ fn apply_opt(
         &[inner_scalar_ref],
         &[],
         true,
-    )
-    .map_err(|error| format!("failed to resolve optimizer any_value aggregate: {error}"))?;
+        &ctx.control_view(),
+    )?;
     if let Some(inner_column) =
         scalar_utils::find_output_column(&agg_input_columns, a.inner_output_column_id)
     {
@@ -374,6 +376,7 @@ fn apply_opt(
         arena,
         assert_cond,
         "correlate scalar subquery result must 1 row",
+        &ctx.control_view(),
     )?;
     items.push(ScalarProjectItem {
         expr: assert_expr,
@@ -413,7 +416,8 @@ fn build_output_project_items(
     right: &OptExpr,
     inner_output_column_id: ColumnId,
     output_col: &OutputColumn,
-) -> Result<Vec<ScalarProjectItem>, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarProjectItem>, SqlCompileError> {
     let mut items = scalar_utils::left_project_items(left, arena)?;
     let inner_out_type = scalar_utils::find_column_type(right, arena, inner_output_column_id)
         .unwrap_or(DataType::Null);
@@ -429,7 +433,13 @@ fn build_output_project_items(
         if scalar_utils::is_count_aggregate_result(right, arena, inner_output_column_id) {
             // ifnull(count_result, 0): count(1) with LEFT OUTER returns NULL when no
             // match; normalize to 0 (SQL COUNT semantics).
-            scalar_utils::ifnull_zero(function_catalog, arena, inner_col_ref, inner_out_type)?
+            scalar_utils::ifnull_zero(
+                function_catalog,
+                arena,
+                inner_col_ref,
+                inner_out_type,
+                control,
+            )?
         } else {
             inner_col_ref
         };

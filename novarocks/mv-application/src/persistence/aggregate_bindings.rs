@@ -772,8 +772,10 @@ mod tests {
         let columns = vec![
             MvAggregateStateColumn::new(
                 "__agg_state_avg_avg_sum".to_string(),
-                arrow_schema::DataType::LargeBinary,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow_schema::DataType::LargeBinary,
+                    false,
+                ),
                 0,
                 0,
                 MvAggregateRuntimeKind::Avg,
@@ -782,8 +784,10 @@ mod tests {
             ),
             MvAggregateStateColumn::new(
                 "__agg_state_avg_avg_count".to_string(),
-                arrow_schema::DataType::LargeBinary,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow_schema::DataType::LargeBinary,
+                    false,
+                ),
                 0,
                 0,
                 MvAggregateRuntimeKind::Avg,
@@ -820,8 +824,10 @@ mod tests {
         let observations = vec![target_observation(0, "__agg_state_count", 11)];
         let column = MvAggregateStateColumn::new(
             "__agg_state_count".to_string(),
-            arrow_schema::DataType::LargeBinary,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow_schema::DataType::LargeBinary,
+                false,
+            ),
             0,
             0,
             MvAggregateRuntimeKind::Count,
@@ -847,8 +853,7 @@ mod tests {
         let observations = vec![target_observation(0, "__agg_state___ivm_row_count", 13)];
         let column = MvAggregateStateColumn::new(
             "__agg_state___ivm_row_count".to_string(),
-            arrow_schema::DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(arrow_schema::DataType::Int64, false),
             0,
             1,
             MvAggregateRuntimeKind::Count,
@@ -924,8 +929,10 @@ mod tests {
         let avg_columns = vec![
             MvAggregateStateColumn::new(
                 "__agg_state_avg_avg_sum".to_string(),
-                arrow_schema::DataType::LargeBinary,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow_schema::DataType::LargeBinary,
+                    false,
+                ),
                 0,
                 0,
                 MvAggregateRuntimeKind::Avg,
@@ -934,8 +941,10 @@ mod tests {
             ),
             MvAggregateStateColumn::new(
                 "__agg_state_avg_avg_count".to_string(),
-                arrow_schema::DataType::LargeBinary,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow_schema::DataType::LargeBinary,
+                    false,
+                ),
                 0,
                 0,
                 MvAggregateRuntimeKind::Avg,
@@ -945,8 +954,7 @@ mod tests {
         ];
         let retraction_column = MvAggregateStateColumn::new(
             "__agg_state___ivm_row_count".to_string(),
-            arrow_schema::DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(arrow_schema::DataType::Int64, false),
             0,
             1,
             MvAggregateRuntimeKind::Count,

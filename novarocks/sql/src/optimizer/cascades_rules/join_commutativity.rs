@@ -68,27 +68,35 @@ impl Rule for JoinCommutativity {
                 | JoinKind::LeftOuter | JoinKind::RightOuter))
     }
 
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalJoin(op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
 
         // A join must have exactly two children: [left, right].
         if expr.children.len() != 2 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let left = expr.children[0];
         let right = expr.children[1];
-
-        // Swap children and adjust the join type.
-        vec![NewExpr {
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: commute_join_kind(op.join_type),
-                condition: op.condition,
-            }),
-            children: vec![right, left],
-        }]
+        Ok(
+            // Swap children and adjust the join type.
+            vec![NewExpr {
+                op: Operator::LogicalJoin(LogicalJoinOp {
+                    join_type: commute_join_kind(op.join_type),
+                    condition: op.condition,
+                }),
+                children: vec![right, left],
+            }],
+        )
     }
 }
 

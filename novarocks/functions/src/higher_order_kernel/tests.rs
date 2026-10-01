@@ -274,6 +274,7 @@ impl FunctionBindingResolver for Owner {
     fn resolve(
         &self,
         _: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         panic!("exact specialization must not reselect")
     }
@@ -281,6 +282,7 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
             || request.arguments != self.arguments
@@ -485,7 +487,7 @@ impl PureHigherOrderImplementation for Owner {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(crate::kernel_control::compile_failure)?;
-        self.validate_selected(input.selected, input.request)
+        self.validate_selected(input.selected, input.request, control)
             .map_err(|_| crate::kernel_control::invalid("fixture changed selected binding"))?;
         self.prepares.fetch_add(1, Ordering::Relaxed);
         let contract = if self.replace == 1 {

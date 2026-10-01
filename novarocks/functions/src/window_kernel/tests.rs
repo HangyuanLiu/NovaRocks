@@ -252,7 +252,7 @@ impl FunctionEffectOwner for Fixture {
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
         self.counts.refine.fetch_add(1, Ordering::Relaxed);
-        self.validate_selected(input.selected, input.request)?;
+        self.validate_selected(input.selected, input.request, control)?;
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
         if input.function_id != &self.id
@@ -302,6 +302,7 @@ impl FunctionBindingResolver for Fixture {
     fn resolve(
         &self,
         _: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         panic!("must not reselect")
     }
@@ -309,6 +310,7 @@ impl FunctionBindingResolver for Fixture {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
             || request.arguments != self.arguments

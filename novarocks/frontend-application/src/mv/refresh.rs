@@ -258,7 +258,7 @@ fn execute_data(
     let assembly = dependencies
         .provider_activation
         .activate_write(prepared, planning, &write_lease, execution, context.clone())
-        .map_err(invalid)?;
+        .map_err(MvApplicationError::from_compile)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
     if let Err(error) = wait_for_mv_recovery_phase(MvRecoveryPhase::DataPrepared) {
@@ -634,6 +634,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
         | MvProductErrorKind::ShutdownCancelled => MvApplicationErrorKind::Engine,
     };
     MvApplicationError::new(kind, error.to_string())
+        .with_compile_control(error.compile_control_error())
 }
 
 /// Debug-only runner seam for the two durable MV recovery windows that are
@@ -888,6 +889,7 @@ fn provider_failure(error: MvApplicationError) -> MvProviderFailure {
         }
     };
     MvProviderFailure::new(kind, error.to_string())
+        .with_compile_control(error.compile_control_error())
 }
 fn unavailable(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Unavailable, message)

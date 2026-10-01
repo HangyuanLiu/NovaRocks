@@ -195,6 +195,7 @@ impl StatisticsConvergence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsFailure {
     pub message: Arc<str>,
+    pub compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,6 +445,7 @@ impl StatisticsJobRepository {
         if entry.job.state == StatisticsJobState::Active(StatisticsJobPhase::Submitted) {
             entry.job.state = StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled);
             entry.job.failure = Some(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from("statistics job cancelled before collection"),
             });
             entry.job.completed_at_ms = Some(at_ms);
@@ -499,6 +501,7 @@ impl StatisticsJobRepository {
             let mut entry = state.active.remove(&id).expect("queued job exists");
             entry.job.state = StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled);
             entry.job.failure = Some(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from("statistics job cancelled during process shutdown"),
             });
             entry.job.completed_at_ms = Some(at_ms);
@@ -857,6 +860,7 @@ impl StatisticsWorker {
                 StatisticsJobConclusion::CommitUnknown,
                 StatisticsPublicationFact::CommitUnknown,
                 Some(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from("provider returned an unknown publication outcome"),
                 }),
                 None,
@@ -868,6 +872,7 @@ impl StatisticsWorker {
                 StatisticsJobConclusion::Failed,
                 StatisticsPublicationFact::KnownUncommitted,
                 Some(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from("provider publication was not committed"),
                 }),
                 None,
@@ -879,6 +884,7 @@ impl StatisticsWorker {
                 StatisticsJobConclusion::Failed,
                 StatisticsPublicationFact::NotStarted,
                 Some(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from("publication executor returned no publication fact"),
                 }),
                 None,
@@ -1059,6 +1065,7 @@ mod tests {
                 .expect("test releases the background preparation");
             scope.check().map_err(|error| {
                 StatisticsAttemptError::Cancelled(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from(error.to_string()),
                 })
             })
@@ -1092,6 +1099,7 @@ mod tests {
         ) -> Result<(), StatisticsAttemptError> {
             scope.check().map_err(|error| {
                 StatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from(error.to_string()),
                 })
             })
@@ -1104,6 +1112,7 @@ mod tests {
         ) -> Result<(), StatisticsAttemptError> {
             scope.check().map_err(|error| {
                 StatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from(error.to_string()),
                 })
             })
@@ -1116,6 +1125,7 @@ mod tests {
         ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
             scope.check().map_err(|error| {
                 StatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from(error.to_string()),
                 })
             })?;
@@ -1124,6 +1134,7 @@ mod tests {
                 Ok(StatisticsPublicationOutcome {
                     fact: StatisticsPublicationFact::KnownCommitted,
                     finalization_failure: Some(StatisticsFailure {
+                        compile_control: None,
                         message: Arc::from("accelerator finalization failed"),
                     }),
                 })
@@ -1467,6 +1478,7 @@ mod tests {
         assert_eq!(
             terminal.publication_finalization_failure,
             Some(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from("accelerator finalization failed"),
             })
         );
@@ -1494,6 +1506,7 @@ mod tests {
                 _scope: &WorkScope,
             ) -> Result<(), StatisticsAttemptError> {
                 Err(StatisticsAttemptError::Stale(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from("captured table object was replaced"),
                 }))
             }
@@ -1542,6 +1555,7 @@ mod tests {
                 StatisticsJobConclusion::Failed,
                 StatisticsPublicationFact::NotStarted,
                 Some(StatisticsFailure {
+                    compile_control: None,
                     message: Arc::from("preparation failed"),
                 }),
                 3,

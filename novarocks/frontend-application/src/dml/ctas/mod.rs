@@ -392,6 +392,9 @@ fn unknown_failure(
 }
 
 fn ctas_failure(source_text: &str, failure: CtasFailure) -> DmlError {
+    if let Some(error) = failure.compile_control_error() {
+        return DmlError::compile_control(error);
+    }
     if let Some(error) = failure.user_error(Some(source_text)) {
         return DmlError::admit(error);
     }

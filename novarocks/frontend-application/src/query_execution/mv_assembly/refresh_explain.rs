@@ -21,7 +21,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     stmt: &MvRefreshRequest,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, novarocks_sql::compiler::SqlCompileError> {
     let (rewrite, target_planning_lease) =
         crate::query_execution::mv_assembly::refresh_preparation::freeze_statement_refresh_rewrite_context(
             ports,
@@ -56,14 +56,16 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     target_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, novarocks_sql::compiler::SqlCompileError> {
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
     if rewrite.target.catalog != target.catalog
         || rewrite.target.namespace != target.namespace
         || rewrite.target.table != target.table
     {
         return Err(
-            "EXPLAIN REFRESH target differs from its canonical rewrite context".to_string(),
+            "EXPLAIN REFRESH target differs from its canonical rewrite context"
+                .to_string()
+                .into(),
         );
     }
     let target_binding =
@@ -75,7 +77,11 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         )?;
     validate_target_snapshot(&target, &rewrite.mv_definition, &target_binding)?;
     if target_binding.table_uuid() != rewrite.target_table_uuid {
-        return Err("EXPLAIN REFRESH target UUID differs from its rewrite context".to_string());
+        return Err(
+            "EXPLAIN REFRESH target UUID differs from its rewrite context"
+                .to_string()
+                .into(),
+        );
     }
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding_id = bind_imv_target_query_table_in_store_from_rewrite(
@@ -123,5 +129,4 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             level,
         },
     )
-    .map_err(|error| error.to_string())
 }

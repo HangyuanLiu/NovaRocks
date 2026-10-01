@@ -348,6 +348,8 @@ pub fn prepare_completed_statistics_collection(
         .try_into_access()
         .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
 
+    let completion_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let plan = novarocks_sql::planning::dml::build_final_statistics_connector_plan(
         scan,
         program.required_aggregations(),
@@ -365,9 +367,9 @@ pub fn prepare_completed_statistics_collection(
             ])
             .map_err(contract_violation)?,
         ),
-        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
+        &completion_control,
     )
-    .map_err(contract_violation)?;
+    .map_err(DistributedQueryError::from_compile)?;
     let version = plan.version();
     let candidate = CompletedPhysicalPlanCandidate::for_program(plan)
         .map_err(|error| contract_violation(error.to_string()))?;
@@ -378,9 +380,13 @@ pub fn prepare_completed_statistics_collection(
     .map_err(contract_violation)?;
     let paired = CompletedPlanWithAccess::try_pair(candidate, access)
         .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
-    let encoded =
-        crate::query_execution::physical_encoding::encode_completed_plan(paired, functions, None)
-            .map_err(contract_violation)?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        functions,
+        None,
+        &completion_control,
+    )
+    .map_err(DistributedQueryError::from_encode)?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
     let description =
         novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(

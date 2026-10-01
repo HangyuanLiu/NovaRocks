@@ -296,7 +296,7 @@ pub struct SqlMvFirstRefreshAnalyzed {
 pub fn analyze_mv_first_refresh_connector_write(
     artifact: SqlMvFirstRefreshArtifact,
     context: SqlMvFirstRefreshAnalyzeContext<'_>,
-) -> Result<SqlMvFirstRefreshAnalyzed, String> {
+) -> Result<SqlMvFirstRefreshAnalyzed, crate::compiler::SqlCompileError> {
     let root_distribution = crate::compiler::RootDistributionRequirement::ShuffleOutputName(
         artifact.root_hash_column().to_string(),
     );
@@ -317,10 +317,7 @@ pub fn analyze_mv_first_refresh_connector_write(
         None,
         context.control,
     );
-    let analyzed = crate::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
-        .into_pending()
-        .map_err(|error| error.to_string())?;
+    let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
         sink: context.sink,
@@ -335,7 +332,7 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
     required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
@@ -357,7 +354,7 @@ pub fn begin_final_mv_first_refresh_connector_write_plan(
         crate::planning::dml::DmlWriteCompletion,
         Box<[crate::compiler::ProviderReadNeed]>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     crate::planning::dml::begin_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
@@ -397,7 +394,7 @@ pub struct SqlMvJoinFirstRefreshAnalyzed {
 /// frozen lineage and physicalizes the resulting append projection.
 pub fn analyze_join_first_refresh_connector_write(
     context: SqlMvJoinFirstRefreshAnalyzeContext<'_>,
-) -> Result<SqlMvJoinFirstRefreshAnalyzed, String> {
+) -> Result<SqlMvJoinFirstRefreshAnalyzed, crate::compiler::SqlCompileError> {
     let snapshot = context.rewrite_snapshot.snapshot();
     let root_hash_column = snapshot
         .schema_contract
@@ -408,7 +405,8 @@ pub fn analyze_join_first_refresh_connector_write(
     if !root_hash_column.eq_ignore_ascii_case(&context.expected_root_hash_column) {
         return Err(
             "join first-refresh root hash column does not match the sealed target contract"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     let settings = context.optimizer_settings.clone();
@@ -425,10 +423,8 @@ pub fn analyze_join_first_refresh_connector_write(
         context.constant_evaluator,
         context.control.clone(),
     );
-    let logical_output = crate::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
-        .into_complete()
-        .map_err(|error| error.to_string())?
+    let logical_output = crate::compiler::SqlCompiler::analyze(request)?
+        .into_complete()?
         .into_logical_output()
         .map_err(|_| {
             "join first-refresh logical intent did not produce logical SQL facts".to_string()
@@ -440,6 +436,7 @@ pub fn analyze_join_first_refresh_connector_write(
         logical_output.factory,
         snapshot,
         context.functions,
+        &context.control,
     )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
@@ -460,10 +457,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.control,
     )
     .with_function_catalog(context.functions.snapshot());
-    let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
-        .map_err(|error| error.to_string())?
-        .into_pending()
-        .map_err(|error| error.to_string())?;
+    let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
     Ok(SqlMvJoinFirstRefreshAnalyzed {
         analyzed,
         sink: context.sink,
@@ -478,7 +472,7 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
     required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
@@ -500,7 +494,7 @@ pub fn begin_final_join_first_refresh_connector_write_plan(
         crate::planning::dml::DmlWriteCompletion,
         Box<[crate::compiler::ProviderReadNeed]>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     crate::planning::dml::begin_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
@@ -563,7 +557,7 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzed {
 /// preserves the former Core logical-path semantics.
 pub fn analyze_join_incremental_refresh_change_stream(
     context: SqlMvJoinIncrementalRefreshAnalyzeContext<'_>,
-) -> Result<SqlMvJoinIncrementalRefreshAnalyzed, String> {
+) -> Result<SqlMvJoinIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> {
     validate_join_incremental_routes(&context.routes)?;
     let snapshot = context.rewrite_snapshot.snapshot();
     validate_join_incremental_snapshot(snapshot)?;
@@ -580,10 +574,8 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.constant_evaluator,
         context.control.clone(),
     );
-    let logical_output = crate::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
-        .into_complete()
-        .map_err(|error| error.to_string())?
+    let logical_output = crate::compiler::SqlCompiler::analyze(request)?
+        .into_complete()?
         .into_logical_output()
         .map_err(|_| {
             "join incremental refresh logical intent did not produce logical SQL facts".to_string()
@@ -598,8 +590,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         logical_output.factory,
         context.functions,
         &context.control,
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
         factory,
@@ -615,10 +606,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.control,
     )
     .with_function_catalog(context.functions.snapshot());
-    let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
-        .map_err(|error| error.to_string())?
-        .into_pending()
-        .map_err(|error| error.to_string())?;
+    let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
     Ok(SqlMvJoinIncrementalRefreshAnalyzed {
         analyzed,
         change_stream_override,
@@ -634,11 +622,10 @@ pub fn compile_final_join_incremental_refresh_change_stream(
     statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
-) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String> {
+) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
-    )
-    .map_err(|error| error.to_string())?
+    )?
     .into_optimized_output()
     .map_err(|_| {
         "join incremental logical input did not produce an optimized SQL plan".to_string()
@@ -686,12 +673,11 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         crate::planning::dml::DmlChangeStreamCompletion,
         Box<[crate::compiler::ProviderReadNeed]>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
-    )
-    .map_err(|error| error.to_string())?
+    )?
     .into_optimized_output()
     .map_err(|_| {
         "join incremental logical input did not produce an optimized SQL plan".to_string()
@@ -755,7 +741,7 @@ pub struct SqlMvIncrementalRefreshAnalyzed {
 /// and writer topology before returning only a sealed distributed plan.
 pub fn analyze_mv_incremental_refresh_change_stream(
     context: SqlMvIncrementalRefreshAnalyzeContext<'_>,
-) -> Result<SqlMvIncrementalRefreshAnalyzed, String> {
+) -> Result<SqlMvIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> {
     validate_join_incremental_routes(&context.routes)?;
     let mut query = *context.canonical_query;
     if matches!(
@@ -780,10 +766,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
         context.constant_evaluator,
         context.control,
     );
-    let analyzed = crate::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
-        .into_pending()
-        .map_err(|error| error.to_string())?;
+    let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvIncrementalRefreshAnalyzed {
         analyzed,
         write_mode: context.write_mode,
@@ -798,11 +781,10 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
     statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
-) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String> {
+) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
-    )
-    .map_err(|error| error.to_string())?
+    )?
     .into_optimized_output()
     .map_err(|_| {
         "canonical incremental MV intent did not produce an optimized SQL plan".to_string()
@@ -845,12 +827,11 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         crate::planning::dml::DmlChangeStreamCompletion,
         Box<[crate::compiler::ProviderReadNeed]>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
-    )
-    .map_err(|error| error.to_string())?
+    )?
     .into_optimized_output()
     .map_err(|_| {
         "canonical incremental MV intent did not produce an optimized SQL plan".to_string()
@@ -1133,9 +1114,11 @@ fn build_join_incremental_refresh_logical_plan(
                 locator_columns.last_updated_sequence_number,
                 #[cfg(not(test))]
                 functions,
+                control,
             )
-            .map_err(|error| crate::compiler::SqlCompileError::Compilation(
-                format!("build join refresh coalesce logical plan: {error}")))?
+            .map_err(|error| match error {
+                crate::compiler::SqlCompileError::Compilation(error)=>crate::compiler::SqlCompileError::Compilation(format!("build join refresh coalesce logical plan: {error}")), error=>error,
+            })?
         }
     };
     reserve_factory_for_plan(&mut factory, &plan)
@@ -1586,12 +1569,13 @@ fn build_join_first_refresh_append_logical_plan(
     mut factory: crate::column_id::ColumnRefFactory,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         crate::planner::logical::LogicalPlanNode,
         crate::column_id::ColumnRefFactory,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     crate::planner::imv_rewrite::entrypoint::bind_definition_occurrences(&mut plan, snapshot)?;
     let (left, right) = join_base_snapshots(snapshot)?;
@@ -1599,13 +1583,16 @@ fn build_join_first_refresh_append_logical_plan(
         kind, mut children, ..
     } = plan;
     let crate::planner::logical::LogicalPlanKind::Project(mut project) = kind else {
-        return Err("join first-refresh requires a root Project".to_string());
+        return Err("join first-refresh requires a root Project"
+            .to_string()
+            .into());
     };
     if children.len() != 1 {
         return Err(format!(
             "join first-refresh root Project expected one input, got {}",
             children.len()
-        ));
+        )
+        .into());
     }
     let input = children.remove(0);
     let payload_columns = project
@@ -1685,8 +1672,16 @@ fn build_join_first_refresh_append_logical_plan(
             &left.table_object_id,
             &right.table_object_id,
             join_apply_key_id.0,
+            control,
         )
-        .map_err(|error| format!("build join first-refresh append projection: {error}"))?;
+        .map_err(|error| match error {
+            crate::compiler::SqlCompileError::Compilation(error) => {
+                crate::compiler::SqlCompileError::Compilation(format!(
+                    "build join first-refresh append projection: {error}"
+                ))
+            }
+            error => error,
+        })?;
     reserve_factory_for_plan(&mut factory, &plan)?;
     Ok((plan, factory))
 }
@@ -2867,35 +2862,40 @@ mod tests {
 
     use super::*;
 
-    type FinalJoinFirstRefreshCompile = fn(
-        SqlMvJoinFirstRefreshAnalyzed,
+    type FinalJoinFirstRefreshCompile =
+        fn(
+            SqlMvJoinFirstRefreshAnalyzed,
+            &crate::planning::dml::DmlStatisticsSnapshot,
+            crate::compiler::SqlCompileControl,
+            &[novarocks_spi::connector::StatisticsRequiredAggregation],
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            crate::planning::dml::DmlFinalWritePlanContext,
+        )
+            -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError>;
+
+    type FinalJoinIncrementalCompile = fn(
+        SqlMvJoinIncrementalRefreshAnalyzed,
         &crate::planning::dml::DmlStatisticsSnapshot,
         crate::compiler::SqlCompileControl,
-        &[novarocks_spi::connector::StatisticsRequiredAggregation],
-        novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+        Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+        crate::planning::dml::DmlWritePlanShape,
         crate::planning::dml::DmlFinalWritePlanContext,
-    )
-        -> Result<novarocks_physical_plan::PhysicalPlan, String>;
+    ) -> Result<
+        crate::planning::dml::DmlFinalChangeStreamPlan,
+        crate::compiler::SqlCompileError,
+    >;
 
-    type FinalJoinIncrementalCompile =
-        fn(
-            SqlMvJoinIncrementalRefreshAnalyzed,
-            &crate::planning::dml::DmlStatisticsSnapshot,
-            crate::compiler::SqlCompileControl,
-            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
-            crate::planning::dml::DmlWritePlanShape,
-            crate::planning::dml::DmlFinalWritePlanContext,
-        ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String>;
-
-    type FinalMvIncrementalCompile =
-        fn(
-            SqlMvIncrementalRefreshAnalyzed,
-            &crate::planning::dml::DmlStatisticsSnapshot,
-            crate::compiler::SqlCompileControl,
-            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
-            crate::planning::dml::DmlWritePlanShape,
-            crate::planning::dml::DmlFinalWritePlanContext,
-        ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String>;
+    type FinalMvIncrementalCompile = fn(
+        SqlMvIncrementalRefreshAnalyzed,
+        &crate::planning::dml::DmlStatisticsSnapshot,
+        crate::compiler::SqlCompileControl,
+        Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+        crate::planning::dml::DmlWritePlanShape,
+        crate::planning::dml::DmlFinalWritePlanContext,
+    ) -> Result<
+        crate::planning::dml::DmlFinalChangeStreamPlan,
+        crate::compiler::SqlCompileError,
+    >;
 
     fn parse_query(sql: &str) -> ast::Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");
@@ -2946,6 +2946,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>
         {
             panic!("plain canonical request construction must not resolve functions")
@@ -2959,6 +2960,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             panic!("plain canonical request construction must not resolve functions")
@@ -2968,6 +2970,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             panic!("plain canonical request construction must not resolve functions")
@@ -2997,7 +3000,8 @@ mod tests {
         assert!(request.imv_rewrite.is_none());
         let _: fn(
             SqlMvJoinFirstRefreshAnalyzeContext<'_>,
-        ) -> Result<SqlMvJoinFirstRefreshAnalyzed, String> =
+        )
+            -> Result<SqlMvJoinFirstRefreshAnalyzed, crate::compiler::SqlCompileError> =
             analyze_join_first_refresh_connector_write;
         let _: FinalJoinFirstRefreshCompile = compile_final_join_first_refresh_connector_write_plan;
     }
@@ -3021,7 +3025,8 @@ mod tests {
         assert!(request.imv_rewrite.is_none());
         let _: fn(
             SqlMvJoinIncrementalRefreshAnalyzeContext<'_>,
-        ) -> Result<SqlMvJoinIncrementalRefreshAnalyzed, String> =
+        )
+            -> Result<SqlMvJoinIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> =
             analyze_join_incremental_refresh_change_stream;
         let _: FinalJoinIncrementalCompile = compile_final_join_incremental_refresh_change_stream;
     }
@@ -3056,7 +3061,8 @@ mod tests {
         );
         let _: fn(
             SqlMvIncrementalRefreshAnalyzeContext<'_>,
-        ) -> Result<SqlMvIncrementalRefreshAnalyzed, String> =
+        )
+            -> Result<SqlMvIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> =
             analyze_mv_incremental_refresh_change_stream;
         let _: FinalMvIncrementalCompile = compile_final_mv_incremental_refresh_change_stream;
     }

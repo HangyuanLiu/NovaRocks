@@ -21,6 +21,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -290,13 +293,24 @@ impl FunctionArgument {
         }
     }
 
-    fn matches_type(&self, expected: &FunctionArgumentType) -> bool {
+    fn matches_type_observed(
+        &self,
+        expected: &FunctionArgumentType,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, FunctionBindingError> {
         match (self, expected) {
-            // A parameter that accepts null accepts a value that never writes
-            // one, inside a nested type as much as at the top: a map's keys are
-            // never null and the signature that takes a map says they may be.
             (Self::Value { value_type, .. }, FunctionArgumentType::Value(expected)) => {
-                value_type.fits_value_type(expected)
+                work.step()?;
+                if value_type.logical_type != expected.logical_type
+                    || (value_type.nullable && !expected.nullable)
+                {
+                    return Ok(false);
+                }
+                novarocks_type_contract::fits_nested_nullability_observed(
+                    &value_type.data_type,
+                    &expected.data_type,
+                    || work.step().map_err(FunctionBindingError::from),
+                )
             }
             (
                 Self::Lambda {
@@ -307,8 +321,22 @@ impl FunctionArgument {
                     parameter_types: expected_parameters,
                     result_type: expected_result,
                 },
-            ) => parameter_types == expected_parameters && result_type == expected_result,
-            _ => false,
+            ) => {
+                if parameter_types.len() != expected_parameters.len() {
+                    return Ok(false);
+                }
+                for (actual, expected) in parameter_types.iter().zip(expected_parameters) {
+                    if !actual.exactly_equals_observed(expected, || {
+                        work.step().map_err(FunctionBindingError::from)
+                    })? {
+                        return Ok(false);
+                    }
+                }
+                result_type.exactly_equals_observed(expected_result, || {
+                    work.step().map_err(FunctionBindingError::from)
+                })
+            }
+            _ => Ok(false),
         }
     }
 }
@@ -358,12 +386,14 @@ pub trait FunctionBindingResolver: Send + Sync {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError>;
 
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError>;
 }
 
@@ -458,18 +488,25 @@ impl ParametricAggregateBindingResolver {
     fn argument_types(
         &self,
         request: FunctionBindingRequest<'_>,
+        work: &mut CompileCheckpoints<'_>,
     ) -> Result<Vec<arrow_schema::DataType>, FunctionBindingError> {
         let values = request
             .arguments
             .iter()
-            .map(|argument| match argument {
-                FunctionArgument::Value { value_type, .. } => Ok(value_type.clone()),
-                FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
+            .map(|argument| {
+                work.step()?;
+                match argument {
+                    FunctionArgument::Value { value_type, .. } => Ok(value_type.clone()),
+                    FunctionArgument::Lambda { .. } => {
+                        Err(FunctionBindingError::NoMatchingOverload)
+                    }
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        work.flush()?;
         self.aggregate_resolver
             .validate_value_arguments(&values)
-            .map_err(|error| invalid(&error.to_string()))?;
+            .map_err(FunctionBindingError::from)?;
         Ok(values.into_iter().map(|value| value.data_type).collect())
     }
 
@@ -506,44 +543,62 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        let argument_types = self.argument_types(request)?;
-        let logical = self
-            .aggregate_resolver
-            .resolve_aggregate(&argument_types[..request.logical_argument_count])
-            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-        let resolved = if request.logical_argument_count == argument_types.len() {
-            logical
-        } else {
-            self.aggregate_resolver
-                .resolve_update_signature(&logical.overload, &argument_types)
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?
-        };
-        self.selection(request, &resolved)
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let argument_types = self.argument_types(request, &mut work)?;
+            work.flush()?;
+            let logical = self
+                .aggregate_resolver
+                .resolve_aggregate(&argument_types[..request.logical_argument_count])
+                .map_err(FunctionBindingError::from)?;
+            let resolved = if request.logical_argument_count == argument_types.len() {
+                logical
+            } else {
+                work.step()?;
+                work.flush()?;
+                self.aggregate_resolver
+                    .resolve_update_signature(&logical.overload, &argument_types)
+                    .map_err(FunctionBindingError::from)?
+            };
+            for _ in request.arguments {
+                work.step()?;
+            }
+            self.selection(request, &resolved)
+        })();
+        finish_binding_work(result, work)
     }
 
-    /// Validate the overload that was selected, rather than resolving a fresh
-    /// one and accepting whatever comes back.
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        let argument_types = self.argument_types(request)?;
-        let selected_overload =
-            crate::AggregateOverloadIdentity::try_new(selected.overload.as_str())
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-        let resolved = self
-            .aggregate_resolver
-            .resolve_update_signature(&selected_overload, &argument_types)
-            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-        if &self.selection(request, &resolved)? == selected {
-            Ok(())
-        } else {
-            Err(FunctionBindingError::InvalidBinding(
-                "selected aggregate overload differs from its typed contract".into(),
-            ))
-        }
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let argument_types = self.argument_types(request, &mut work)?;
+            let selected_overload =
+                crate::AggregateOverloadIdentity::try_new(selected.overload.as_str())
+                    .map_err(|error| invalid(&error.to_string()))?;
+            work.flush()?;
+            let resolved = self
+                .aggregate_resolver
+                .resolve_update_signature(&selected_overload, &argument_types)
+                .map_err(FunctionBindingError::from)?;
+            for _ in request.arguments {
+                work.step()?;
+            }
+            if &self.selection(request, &resolved)? == selected {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "selected aggregate overload differs from its typed contract",
+                ))
+            }
+        })();
+        finish_binding_work(result, work)
     }
 }
 
@@ -682,14 +737,20 @@ impl EngineFunctionCatalog {
         name: &str,
         kind: FunctionKind,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        let definition = self
-            .definition(name, kind)
-            .ok_or(FunctionBindingError::UnknownFunction)?;
-        if definition.visibility == FunctionVisibility::Hidden {
-            return Err(FunctionBindingError::HiddenFunction);
-        }
-        resolve_definition(definition, request)
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            work.step()?;
+            let definition = self
+                .definition(name, kind)
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            if definition.visibility == FunctionVisibility::Hidden {
+                return Err(FunctionBindingError::HiddenFunction);
+            }
+            resolve_definition(definition, request, &mut work)
+        })();
+        finish_binding_work(result, work)
     }
 
     pub fn resolve_bound_trusted(
@@ -697,11 +758,17 @@ impl EngineFunctionCatalog {
         name: &str,
         kind: FunctionKind,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        let definition = self
-            .definition(name, kind)
-            .ok_or(FunctionBindingError::UnknownFunction)?;
-        resolve_definition(definition, request)
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            work.step()?;
+            let definition = self
+                .definition(name, kind)
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            resolve_definition(definition, request, &mut work)
+        })();
+        finish_binding_work(result, work)
     }
 
     /// Check one frozen binding and its already-coerced argument expressions.
@@ -710,34 +777,42 @@ impl EngineFunctionCatalog {
         &self,
         bound: &ResolvedFunctionBinding,
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        let definition = self
-            .definition_by_id(&bound.function_id)
-            .ok_or(FunctionBindingError::UnknownFunction)?;
-        let binding = exact_definition(definition)?;
-        let overload = binding.declaration.overload(&bound.selected.overload)?;
-        if bound.kind != binding.declaration.kind || bound.semantics != overload.semantics {
-            return Err(invalid(
-                "frozen function kind or semantics differ from the declaration",
-            ));
-        }
-        if bound.logical_argument_count != request.logical_argument_count {
-            return Err(invalid(
-                "frozen logical argument count differs from the expression",
-            ));
-        }
-        validate_selection(&binding.declaration, &bound.selected, request)?;
-        if !request
-            .arguments
-            .iter()
-            .zip(bound.selected.argument_types.iter())
-            .all(|(argument, expected)| argument.matches_type(expected))
-        {
-            return Err(invalid(
-                "frozen argument types differ from the already-coerced expressions",
-            ));
-        }
-        binding.resolver.validate_selected(&bound.selected, request)
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            work.step()?;
+            let definition = self
+                .definition_by_id(&bound.function_id)
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            let binding = exact_definition(definition)?;
+            let overload = binding.declaration.overload(&bound.selected.overload)?;
+            if bound.kind != binding.declaration.kind || bound.semantics != overload.semantics {
+                return Err(invalid(
+                    "frozen function kind or semantics differ from the declaration",
+                ));
+            }
+            if bound.logical_argument_count != request.logical_argument_count {
+                return Err(invalid(
+                    "frozen logical argument count differs from the expression",
+                ));
+            }
+            validate_selection(&binding.declaration, &bound.selected, request, &mut work)?;
+            for (argument, expected) in request.arguments.iter().zip(&bound.selected.argument_types)
+            {
+                work.step()?;
+                if !argument.matches_type_observed(expected, &mut work)? {
+                    return Err(invalid(
+                        "frozen argument types differ from the already-coerced expressions",
+                    ));
+                }
+            }
+            work.flush()?;
+            binding
+                .resolver
+                .validate_selected(&bound.selected, request, control)
+        })();
+        finish_binding_work(result, work)
     }
 }
 
@@ -753,11 +828,13 @@ fn exact_definition(
 fn resolve_definition(
     definition: &FunctionDefinition,
     request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     let binding = exact_definition(definition)?;
-    validate_request(binding.declaration.kind, request)?;
-    let selected = binding.resolver.resolve(request)?;
-    validate_selection(&binding.declaration, &selected, request)?;
+    validate_request(binding.declaration.kind, request, work)?;
+    work.flush()?;
+    let selected = binding.resolver.resolve(request, work.control())?;
+    validate_selection(&binding.declaration, &selected, request, work)?;
     Ok(ResolvedFunctionBinding {
         function_id: binding.declaration.function_id.clone(),
         kind: binding.declaration.kind,
@@ -770,18 +847,30 @@ fn resolve_definition(
 fn validate_request(
     kind: FunctionKind,
     request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
+    if request.arguments.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    if let Some(expected) = request.expected_result_type {
+        validate_value_type(expected, work)?;
+    }
     for argument in request.arguments {
+        work.step()?;
         match argument {
-            FunctionArgument::Value { value_type, .. } => validate_value_type(value_type)?,
+            FunctionArgument::Value { value_type, .. } => validate_value_type(value_type, work)?,
             FunctionArgument::Lambda {
                 parameter_types,
                 result_type,
             } => {
-                for ty in parameter_types {
-                    validate_value_type(ty)?;
+                if parameter_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                    return Err(CompileControlError::ResourceExhausted.into());
                 }
-                validate_value_type(result_type)?;
+                for ty in parameter_types {
+                    work.step()?;
+                    validate_value_type(ty, work)?;
+                }
+                validate_value_type(result_type, work)?;
             }
         }
     }
@@ -793,13 +882,13 @@ fn validate_request(
             "logical argument count differs from the function kind or update channels",
         ));
     }
-    if request.arguments[request.logical_argument_count..]
-        .iter()
-        .any(|argument| matches!(argument, FunctionArgument::Lambda { .. }))
-    {
-        return Err(invalid(
-            "aggregate ORDER BY update channels must be values, not lambdas",
-        ));
+    for argument in &request.arguments[request.logical_argument_count..] {
+        work.step()?;
+        if matches!(argument, FunctionArgument::Lambda { .. }) {
+            return Err(invalid(
+                "aggregate ORDER BY update channels must be values, not lambdas",
+            ));
+        }
     }
     Ok(())
 }
@@ -808,21 +897,30 @@ fn validate_selection(
     declaration: &FunctionBindingDeclaration,
     selected: &FunctionBindingSelection,
     request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
-    validate_request(declaration.kind, request)?;
+    validate_request(declaration.kind, request, work)?;
+    if selected.argument_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
     for argument in &selected.argument_types {
-        validate_argument_type(argument)?;
+        work.step()?;
+        validate_argument_type(argument, work)?;
     }
     match &selected.result_type {
-        FunctionResultType::Scalar(ty) => validate_value_type(ty)?,
+        FunctionResultType::Scalar(ty) => validate_value_type(ty, work)?,
         FunctionResultType::Relation(types) => {
+            if types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                return Err(CompileControlError::ResourceExhausted.into());
+            }
             for ty in types {
-                validate_value_type(ty)?;
+                work.step()?;
+                validate_value_type(ty, work)?;
             }
         }
     }
     if let Some(aggregate) = &selected.aggregate {
-        validate_value_type(&aggregate.intermediate_type)?;
+        validate_value_type(&aggregate.intermediate_type, work)?;
     }
     let overload = declaration.overload(&selected.overload)?;
     if selected.argument_types.len() != request.arguments.len() {
@@ -831,6 +929,7 @@ fn validate_selection(
         ));
     }
     for (argument, selected_type) in request.arguments.iter().zip(&selected.argument_types) {
+        work.step()?;
         match (argument, selected_type) {
             (FunctionArgument::Value { .. }, FunctionArgumentType::Value(_)) => {}
             (
@@ -874,25 +973,53 @@ fn validate_selection(
     Ok(())
 }
 
-fn validate_value_type(value: &FunctionValueType) -> Result<(), FunctionBindingError> {
-    value
-        .validate()
-        .map_err(|error| invalid(&error.to_string()))
+fn binding_kernel_failure(error: crate::KernelFailure) -> FunctionBindingError {
+    match error {
+        crate::KernelFailure::Cancelled => CompileControlError::Cancelled.into(),
+        crate::KernelFailure::DeadlineExceeded => CompileControlError::DeadlineExceeded.into(),
+        crate::KernelFailure::ResourceExhausted => CompileControlError::ResourceExhausted.into(),
+        other => invalid(&other.to_string()),
+    }
 }
 
-fn validate_argument_type(argument: &FunctionArgumentType) -> Result<(), FunctionBindingError> {
+fn validate_value_type(
+    value: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
+    crate::kernel_input::validate_type_observed(value, work).map_err(binding_kernel_failure)
+}
+
+fn validate_argument_type(
+    argument: &FunctionArgumentType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
     match argument {
-        FunctionArgumentType::Value(value) => validate_value_type(value),
+        FunctionArgumentType::Value(value) => validate_value_type(value, work),
         FunctionArgumentType::Lambda {
             parameter_types,
             result_type,
         } => {
-            for ty in parameter_types {
-                validate_value_type(ty)?;
+            if parameter_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                return Err(CompileControlError::ResourceExhausted.into());
             }
-            validate_value_type(result_type)
+            for ty in parameter_types {
+                work.step()?;
+                validate_value_type(ty, work)?;
+            }
+            validate_value_type(result_type, work)
         }
     }
+}
+
+fn finish_binding_work<T>(
+    result: Result<T, FunctionBindingError>,
+    work: CompileCheckpoints<'_>,
+) -> Result<T, FunctionBindingError> {
+    if matches!(result, Err(FunctionBindingError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 pub(crate) fn digest_binding_definition(
@@ -952,6 +1079,7 @@ pub(crate) fn digest_binding_definition(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionBindingError {
+    Control(CompileControlError),
     MissingEffectDeclaration(FunctionOverloadId),
     UnknownFunction,
     HiddenFunction,
@@ -970,6 +1098,7 @@ fn invalid(message: &str) -> FunctionBindingError {
 impl fmt::Display for FunctionBindingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Control(error) => error.fmt(formatter),
             Self::MissingEffectDeclaration(identity) => write!(
                 formatter,
                 "selected overload `{}` has no complete effect declaration",
@@ -1003,8 +1132,38 @@ impl fmt::Display for FunctionBindingError {
 
 impl std::error::Error for FunctionBindingError {}
 
+impl From<CompileControlError> for FunctionBindingError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl FunctionBindingError {
+    pub fn control_error(&self) -> Option<CompileControlError> {
+        match self {
+            Self::Control(error) => Some(*error),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod effect_metadata_tests;
+
+impl From<novarocks_type_contract::ValueTypeError> for FunctionBindingError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        invalid(&error.to_string())
+    }
+}
+
+impl From<crate::FunctionResolutionError> for FunctionBindingError {
+    fn from(error: crate::FunctionResolutionError) -> Self {
+        match error {
+            crate::FunctionResolutionError::Control(error) => error.into(),
+            other => invalid(&other.to_string()),
+        }
+    }
+}
