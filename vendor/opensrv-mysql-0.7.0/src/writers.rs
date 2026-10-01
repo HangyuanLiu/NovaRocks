@@ -36,6 +36,17 @@ pub(crate) async fn write_ok_packet<W: AsyncWrite + Unpin>(
     client_capabilities: CapabilityFlags,
     ok_packet: OkResponse,
 ) -> io::Result<()> {
+    if ok_packet
+        .info
+        .len()
+        .checked_add(ok_packet.session_state_info.len())
+        .is_none_or(|n| n > w.limits().diagnostic_bytes)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "MySQL OK diagnostic exceeds limit",
+        ));
+    }
     w.write_u8(ok_packet.header)?; // OK packet type
     w.write_lenenc_int(ok_packet.affected_rows)?;
     w.write_lenenc_int(ok_packet.last_insert_id)?;
@@ -65,6 +76,12 @@ pub async fn write_err<W: AsyncWrite + Unpin>(
     msg: &[u8],
     w: &mut PacketWriter<W>,
 ) -> io::Result<()> {
+    if msg.len() > w.limits().diagnostic_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "MySQL diagnostic exceeds limit",
+        ));
+    }
     w.write_u8(0xFF)?;
     w.write_u16::<LittleEndian>(err as u16)?;
     w.write_u8(b'#')?;
@@ -122,7 +139,27 @@ where
     I: IntoIterator<Item = &'a Column>,
     W: AsyncWrite + Unpin,
 {
+    let mut metadata_bytes = 0usize;
+    let mut columns = 0usize;
     for c in i {
+        columns += 1;
+        metadata_bytes = metadata_bytes
+            .checked_add(c.table.len())
+            .and_then(|n| n.checked_add(c.column.len()))
+            .and_then(|n| n.checked_add(64))
+            .filter(|n| *n <= w.limits().metadata_bytes)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "MySQL metadata exceeds limit",
+                )
+            })?;
+        if columns > w.limits().columns {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MySQL column count exceeds limit",
+            ));
+        }
         use crate::myc::constants::UTF8_GENERAL_CI;
         w.write_lenenc_str(b"def")?;
         w.write_lenenc_str(b"")?;

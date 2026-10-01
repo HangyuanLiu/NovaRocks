@@ -22,16 +22,30 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// The writer of mysql packet.
 /// - behaves as a sync writer, while build the packet
-///    so that trivial async writes could be avoided
+///   so that trivial async writes could be avoided
 /// - behaves like a async writer, while writing data to the output stream
 pub struct PacketWriter<W> {
     packet_builder: PacketBuilder,
-    output_stream: W,
+    output_stream: Option<W>,
+    limits: crate::ProtocolLimits,
+    pending_io: bool,
 }
 
 // exports the internal builder as sync Write
 impl<W> Write for PacketWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.is_poisoned() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy MySQL IO is poisoned",
+            ));
+        }
+        if self.is_detached() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "MySQL writer is detached",
+            ));
+        }
         self.packet_builder.write(buf)
     }
 
@@ -41,11 +55,47 @@ impl<W> Write for PacketWriter<W> {
 }
 
 impl<W> PacketWriter<W> {
-    pub fn new(output_stream: W) -> Self {
+    pub fn with_limits(output_stream: W, limits: crate::ProtocolLimits) -> Self {
         Self {
-            packet_builder: PacketBuilder::new(),
-            output_stream,
+            packet_builder: PacketBuilder::new(limits.row_bytes),
+            output_stream: Some(output_stream),
+            limits,
+            pending_io: false,
         }
+    }
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.pending_io
+    }
+    pub(crate) fn is_detached(&self) -> bool {
+        self.output_stream.is_none()
+    }
+    pub(crate) fn detach(&mut self) -> io::Result<W> {
+        if self.is_poisoned() || !self.packet_builder.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy packet has unpublished bytes",
+            ));
+        }
+        self.output_stream
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "MySQL writer is detached"))
+    }
+    pub(crate) fn restore(&mut self, io: W, sequence: u8) -> io::Result<()> {
+        if self.is_poisoned() || !self.is_detached() || !self.packet_builder.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid MySQL writer restore boundary",
+            ));
+        }
+        self.output_stream = Some(io);
+        self.set_seq(sequence);
+        Ok(())
+    }
+    pub fn limits(&self) -> crate::ProtocolLimits {
+        self.limits
+    }
+    pub fn next_sequence(&self) -> u8 {
+        self.packet_builder.seq()
     }
     pub fn set_seq(&mut self, seq: u8) {
         self.packet_builder.set_seq(seq)
@@ -56,8 +106,19 @@ const PACKET_HEADER_SIZE: usize = 4;
 impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     /// Build packet(s) and write them to the output stream
     pub async fn end_packet(&mut self) -> io::Result<()> {
+        if self.is_poisoned() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy MySQL IO is poisoned",
+            ));
+        }
+        let output_stream = self.output_stream.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "MySQL writer is detached")
+        })?;
         let builder = &mut self.packet_builder;
         if !builder.is_empty() {
+            // Cancellation/error leaves this latch set; legacy IO cannot resume.
+            self.pending_io = true;
             let raw_packet = builder.take_buffer();
 
             // split the rww buffer at the boundary of size U24_MAX
@@ -73,22 +134,37 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                 //
                 // depends on the AsyncWrite provided, this may trigger
                 // real system call or not (for example, if AsyncWrite is buffered stream)
-                let written = self
-                    .output_stream
+                let written = output_stream
                     .write_vectored(&[IoSlice::new(&header), IoSlice::new(chunk)])
                     .await?;
 
                 // if write buffer is not drained, fall back to write_all
+                if written > PACKET_HEADER_SIZE + chunk.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "socket reported invalid write length",
+                    ));
+                }
                 if written != PACKET_HEADER_SIZE + chunk.len() {
-                    let remaining: Vec<u8> = header
-                        .iter()
-                        .chain(chunk.iter())
-                        .skip(written)
-                        .cloned()
-                        .collect();
-                    self.output_stream.write_all(&remaining).await?
+                    if written == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "MySQL socket accepted zero bytes",
+                        ));
+                    }
+                    if written < PACKET_HEADER_SIZE {
+                        output_stream.write_all(&header[written..]).await?;
+                    }
+                    let payload_written = written.saturating_sub(PACKET_HEADER_SIZE);
+                    output_stream.write_all(&chunk[payload_written..]).await?
                 }
             }
+            if raw_packet.len().is_multiple_of(U24_MAX) {
+                let header = [0, 0, 0, builder.seq()];
+                builder.increase_seq();
+                output_stream.write_all(&header).await?;
+            }
+            self.pending_io = false;
             Ok(())
         } else {
             Ok(())
@@ -96,7 +172,19 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     }
 
     pub async fn flush_all(&mut self) -> io::Result<()> {
-        self.output_stream.flush().await
+        if self.is_poisoned() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy MySQL IO is poisoned",
+            ));
+        }
+        let io = self.output_stream.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "MySQL writer is detached")
+        })?;
+        self.pending_io = true;
+        io.flush().await?;
+        self.pending_io = false;
+        Ok(())
     }
 }
 
@@ -105,13 +193,30 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
 struct PacketBuilder {
     buffer: Vec<u8>,
     seq: u8,
+    limit: usize,
 }
 
 impl Write for PacketBuilder {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Here we take them all, and split them into raw packets later in `end_packet` if the size
         // of buffer is larger than max payload size (16MB)
-        self.buffer.extend(buf);
+        let total = self
+            .buffer
+            .len()
+            .checked_add(buf.len())
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy MySQL packet exceeds limit",
+                )
+            })?;
+        self.buffer
+            .try_reserve_exact(total.saturating_sub(self.buffer.len()))
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "MySQL output allocation failed")
+            })?;
+        self.buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -121,10 +226,11 @@ impl Write for PacketBuilder {
 }
 
 impl PacketBuilder {
-    pub fn new() -> Self {
+    pub fn new(limit: usize) -> Self {
         PacketBuilder {
             buffer: vec![],
             seq: 0,
+            limit,
         }
     }
 
@@ -146,5 +252,38 @@ impl PacketBuilder {
 
     fn seq(&self) -> u8 {
         self.seq
+    }
+}
+
+/// A bounded adapter for the legacy binary-row staging API.
+pub(crate) struct BoundedVecWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+impl<'a> BoundedVecWriter<'a> {
+    pub fn new(bytes: &'a mut Vec<u8>, limit: usize) -> Self {
+        Self { bytes, limit }
+    }
+}
+impl Write for BoundedVecWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let total = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "binary MySQL row exceeds limit")
+            })?;
+        self.bytes
+            .try_reserve_exact(total - self.bytes.len())
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "MySQL output allocation failed")
+            })?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

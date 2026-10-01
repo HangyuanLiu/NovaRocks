@@ -39,9 +39,33 @@ where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
+    plain_run_with_limits(
+        shim,
+        writer,
+        opts,
+        init_params,
+        crate::ProtocolLimits::default(),
+    )
+    .await
+}
+
+pub async fn plain_run_with_limits<B, R, W>(
+    shim: B,
+    writer: W,
+    opts: IntermediaryOptions,
+    init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+    limits: crate::ProtocolLimits,
+) -> Result<(), B::Error>
+where
+    B: AsyncMysqlShim<W> + Send + Sync,
+    R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+{
+    let limits = limits.validate()?;
     let (handshake, seq, client_capabilities, reader) = init_params;
-    let reader = PacketReader::new(reader);
-    let writer = PacketWriter::new(writer);
+    let mut reader = reader;
+    reader.set_limit(limits.auth_bytes);
+    let writer = PacketWriter::with_limits(writer, limits);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
@@ -69,10 +93,38 @@ where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
-    let (handshake, seq, client_capabilities, reader) = init_params;
+    secure_run_with_limits(
+        shim,
+        writer,
+        opts,
+        tls_config,
+        init_params,
+        crate::ProtocolLimits::default(),
+    )
+    .await
+}
+
+pub async fn secure_run_with_limits<B, R, W>(
+    shim: B,
+    writer: W,
+    opts: IntermediaryOptions,
+    tls_config: Arc<ServerConfig>,
+    init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+    limits: crate::ProtocolLimits,
+) -> Result<(), B::Error>
+where
+    B: AsyncMysqlShim<WriteHalf<TlsStream<Duplex<PacketReader<R>, W>>>> + Send + Sync,
+    R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+{
+    let limits = limits.validate()?;
+    let (handshake, seq, client_capabilities, mut reader) = init_params;
+    // The initial SSL-request buffer has no unread bytes; release it before
+    // installing the fixed post-TLS authentication/command backing.
+    reader.release_packet_buffer();
     let (reader, writer) = switch_to_tls(tls_config, reader, writer).await?;
-    let reader = PacketReader::new(reader);
-    let writer = PacketWriter::new(writer);
+    let reader = PacketReader::with_limit(reader, limits.auth_bytes);
+    let writer = PacketWriter::with_limits(writer, limits);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;

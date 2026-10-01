@@ -1,0 +1,40 @@
+{
+  "stage": "P03",
+  "status": "VENDOR_MODULE_VERIFIED_NOT_PRODUCTION_WIRING",
+  "source_base_commit": "ecb38bca1d35e64ed97e17896200d12258be75b3",
+  "source_scope_fingerprint_sha256": "3db08283da105e1adbd844be3e4e09a28e40a2caa07f3c6a2c9cd05cb8ddb953",
+  "tests": {
+    "default": 141,
+    "no_tls": 141
+  },
+  "logs": [
+    {
+      "name": "default-tests",
+      "file": "default-tests.log.gz",
+      "raw_sha256": "94edb59850d6ff21f613f0f263bacbb98c354da57383b7d2f722150934cde22f",
+      "stored_sha256": "814550e4e511b4bc66999e9cdfdc16681ea6a700cde05782c1a68f3ad79a9ab5"
+    },
+    {
+      "name": "no-tls-tests",
+      "file": "no-tls-tests.log.gz",
+      "raw_sha256": "f0d56b63f22a1cd03b21c14499857fdca5cd3a32de39b1a33906ec6daae7dfdc",
+      "stored_sha256": "e560286fb8b2636b0396c3c049f1eb3ecdc272a29a50ceeca5d9f22f3b4d3c7a"
+    },
+    {
+      "name": "focused-clippy",
+      "file": "focused-clippy.log.gz",
+      "raw_sha256": "43b600573c8a0bfcee194bb787f72ead4c6dd15b698ab7669fa50abc174c93d6",
+      "stored_sha256": "541e19da858ab7276e0ddbbcb01ef72e7dd48b13d84183d155876ac78b9273ec"
+    }
+  ],
+  "limits": {
+    "connection_input_owner_bytes": 2097152,
+    "prepared_parameters_total": 4096,
+    "long_data_entries_total": 4096,
+    "coalescer_bytes": 65536,
+    "metadata_total_bytes": 524288,
+    "resident_tail_backing_bytes": 4194304
+  },
+  "remaining": "P07 absolute deadlines, complete connection/closing guards and actual alias exit; default vendor input owner cap is not a complete FE connection envelope",
+  "linux": "not run; user will test manually"
+}

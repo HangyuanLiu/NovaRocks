@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::io::{self, Write};
 
 use byteorder::WriteBytesExt;
@@ -23,7 +22,7 @@ use tokio::io::AsyncWrite;
 use crate::packet_writer::PacketWriter;
 use crate::value::ToMysqlValue;
 use crate::{writers, OkResponse};
-use crate::{Column, ErrorKind, StatementData};
+use crate::{Column, ErrorKind};
 
 /// Convenience type for responding to a client `USE <db>` command.
 pub struct InitWriter<'a, W> {
@@ -57,7 +56,7 @@ impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
 #[must_use]
 pub struct StatementMetaWriter<'a, W> {
     pub(crate) writer: &'a mut PacketWriter<W>,
-    pub(crate) stmts: &'a mut HashMap<u32, StatementData>,
+    pub(crate) stmts: &'a mut crate::input::PreparedStatements,
     pub(crate) client_capabilities: CapabilityFlags,
 }
 
@@ -77,13 +76,15 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
         <CI as IntoIterator>::IntoIter: ExactSizeIterator,
     {
         let params = params.into_iter();
-        self.stmts.insert(
-            id,
-            StatementData {
-                params: params.len() as u16,
-                ..Default::default()
-            },
-        );
+        let columns = columns.into_iter();
+        let limits = self.writer.limits();
+        if columns.len() > limits.columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prepared column count exceeds limit",
+            ));
+        }
+        self.stmts.prepare(id, params.len())?;
         writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities).await
     }
 
@@ -136,6 +137,39 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
             writer,
             last_end: None,
         }
+    }
+
+    /// Transfer the exclusive IO owner at an empty legacy packet boundary.
+    /// A detached response must either explicitly finish and restore, or move
+    /// into independent closing. Dropping it leaves this connection detached.
+    #[allow(clippy::result_large_err)]
+    pub fn into_streaming(self) -> Result<crate::StreamingResponseLease<'a, W>, (Self, io::Error)> {
+        if self.last_end.is_some() {
+            return Err((
+                self,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy result finalizer is pending",
+                ),
+            ));
+        }
+        let sequence = self.writer.next_sequence();
+        let limits = self.writer.limits();
+        let io = match self.writer.detach() {
+            Ok(io) => io,
+            Err(error) => return Err((self, error)),
+        };
+        // The intermediary validated the profile before accepting the socket.
+        let owned = match crate::OwnedStreamingMysqlWriter::new(io, limits, sequence) {
+            Ok(owned) => owned,
+            Err(error) => return Err((self, error)),
+        };
+        Ok(crate::StreamingResponseLease::new(
+            self.writer,
+            owned,
+            self.is_bin,
+            self.client_capabilities,
+        ))
     }
 
     /// Returns the capabilities negotiated for this exact connection.
@@ -278,6 +312,10 @@ where
         Ok(())
     }
 
+    pub fn max_allowed_packet(&self) -> u32 {
+        self.result.as_ref().unwrap().writer.limits().row_bytes as u32
+    }
+
     /// Write a value to the next column of the current row as a part of this resultset.
     ///
     /// If you do not call [`end_row`](struct.RowWriter.html#method.end_row) after the last row,
@@ -324,7 +362,13 @@ where
                     self.data[(self.col + 2) / 8] |= 1u8 << ((self.col + 2) % 8);
                 }
             } else {
-                v.to_mysql_bin(&mut self.data, c)?;
+                v.to_mysql_bin(
+                    &mut crate::packet_writer::BoundedVecWriter::new(
+                        &mut self.data,
+                        self.result.as_ref().unwrap().writer.limits().row_bytes,
+                    ),
+                    c,
+                )?;
             }
         } else {
             v.to_mysql_text(self.result.as_mut().unwrap().writer)?;
