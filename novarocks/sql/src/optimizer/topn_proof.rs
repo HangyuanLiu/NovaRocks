@@ -423,8 +423,18 @@ mod tests {
         let mut eq = EquivalenceClasses::default();
         eq.merge_pair(ColumnId(1), ColumnId(2));
         let mut arena = ScalarArena::new();
-        let left_items = intern_sort_items(&mut arena, &[sort_item(1, true, false)]);
-        let right_items = intern_sort_items(&mut arena, &[sort_item(2, true, false)]);
+        let left_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(2, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let left = sort_keys_to_keys(&arena, &left_items).unwrap();
         let right = sort_keys_to_keys(&arena, &right_items).unwrap();
         assert!(sort_keys_equivalent(&left, &right, Some(&eq)));
@@ -433,9 +443,24 @@ mod tests {
     #[test]
     fn sort_keys_reject_direction_or_null_order_mismatch() {
         let mut arena = ScalarArena::new();
-        let asc_items = intern_sort_items(&mut arena, &[sort_item(1, true, false)]);
-        let desc_items = intern_sort_items(&mut arena, &[sort_item(1, false, false)]);
-        let nulls_first_items = intern_sort_items(&mut arena, &[sort_item(1, true, true)]);
+        let asc_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let desc_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, false, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let nulls_first_items = intern_sort_items(
+            &mut arena,
+            &[sort_item(1, true, true)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let asc = sort_keys_to_keys(&arena, &asc_items).unwrap();
         let desc = sort_keys_to_keys(&arena, &desc_items).unwrap();
         let nulls_first = sort_keys_to_keys(&arena, &nulls_first_items).unwrap();
@@ -504,9 +529,24 @@ mod tests {
             },
         ];
         let mut arena = ScalarArena::new();
-        let project_items = intern_project_items(&mut arena, &project_items);
-        let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, true, false)]);
-        let sort_11 = intern_sort_items(&mut arena, &[sort_item(11, true, false)]);
+        let project_items = intern_project_items(
+            &mut arena,
+            &project_items,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let sort_10 = intern_sort_items(
+            &mut arena,
+            &[sort_item(10, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let sort_11 = intern_sort_items(
+            &mut arena,
+            &[sort_item(11, true, false)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
         assert_eq!(
@@ -626,8 +666,18 @@ mod tests {
             output_column_id: ColumnId(10),
         }];
         let mut arena = ScalarArena::new();
-        let project_items = intern_project_items(&mut arena, &project_items);
-        let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, false, true)]);
+        let project_items = intern_project_items(
+            &mut arena,
+            &project_items,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let sort_10 = intern_sort_items(
+            &mut arena,
+            &[sort_item(10, false, true)],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
         let remapped =

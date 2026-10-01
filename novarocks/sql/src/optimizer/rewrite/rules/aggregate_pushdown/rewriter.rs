@@ -88,9 +88,10 @@ fn column_ref_scalar(
     column_id: ColumnId,
     name: String,
     value_type: novarocks_type_contract::FunctionValueType,
-) -> ScalarId {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     arena.remember_source_column_display(column_id, None, name);
-    arena.intern(ScalarNode::ColumnRef(column_id), value_type)
+    arena.intern_observed(ScalarNode::ColumnRef(column_id), value_type, control)
 }
 
 fn aggregate_result_type(spec: &ScalarAggregateSpec) -> novarocks_type_contract::FunctionValueType {
@@ -274,8 +275,13 @@ pub(crate) fn rewrite(
         .zip(partial_agg_output_cols.iter())
         .map(
             |(orig_spec, pc)| -> Result<_, crate::compiler::SqlCompileError> {
-                let arg_id =
-                    column_ref_scalar(arena, pc.column_id, pc.name.clone(), pc.value_type.clone());
+                let arg_id = column_ref_scalar(
+                    arena,
+                    pc.column_id,
+                    pc.name.clone(),
+                    pc.value_type.clone(),
+                    control,
+                )?;
                 let name = final_fn_name(&orig_spec.name);
                 let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
                     function_catalog,
@@ -286,8 +292,13 @@ pub(crate) fn rewrite(
                     true,
                     control,
                 )
-                .map_err(|error| {
-                    format!("failed to resolve aggregate pushdown `{name}`: {error}")
+                .map_err(|error| match error {
+                    crate::compiler::SqlCompileError::Compilation(message) => {
+                        crate::compiler::SqlCompileError::Compilation(format!(
+                            "failed to resolve aggregate pushdown `{name}`: {message}"
+                        ))
+                    }
+                    control => control,
                 })?;
                 Ok(ScalarAggregateSpec {
                     output_column_id: orig_spec.output_column_id,
@@ -352,7 +363,8 @@ pub(crate) fn rewrite(
         &final_output_cols,
         group_by_len,
         arena,
-    );
+        control,
+    )?;
     Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
             items: project_items,
@@ -379,7 +391,8 @@ fn exposure_project_items(
     final_output_cols: &[OutputColumn],
     group_by_len: usize,
     arena: &mut ScalarArena,
-) -> Vec<ScalarProjectItem> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarProjectItem>, crate::compiler::SqlCompileError> {
     let mut items: Vec<ScalarProjectItem> = original
         .group_by
         .iter()
@@ -395,19 +408,20 @@ fn exposure_project_items(
                 .unwrap_or(final_col.column_id);
             // The exposure project emits a ColumnRef to the final aggregate's
             // group-by output column under the original layout ColumnId.
-            ScalarProjectItem {
+            Ok(ScalarProjectItem {
                 expr: column_ref_scalar(
                     arena,
                     final_col.column_id,
                     final_col.name.clone(),
                     final_col.value_type.clone(),
-                ),
+                    control,
+                )?,
                 output_name,
                 output_column_id,
                 expr_display: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
 
     // Aggregate outputs: each final_spec exposes the already-computed result
     // as a ColumnRef so downstream operators see the original output ColumnId.
@@ -429,21 +443,23 @@ fn exposure_project_items(
                     .get(idx)
                     .map(|c| c.column_id)
                     .unwrap_or(orig_spec.output_column_id);
-                ScalarProjectItem {
+                Ok(ScalarProjectItem {
                     expr: column_ref_scalar(
                         arena,
                         final_col.column_id,
                         final_display,
                         final_col.value_type.clone(),
-                    ),
+                        control,
+                    )?,
                     output_name: orig_display,
                     output_column_id: orig_output_col_id,
                     expr_display: None,
-                }
-            }),
+                })
+            })
+            .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
     );
 
-    items
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -544,7 +560,14 @@ mod tests {
         cond: Option<crate::analysis::TypedExpr>,
         arena: &mut ScalarArena,
     ) -> OptExpr {
-        let cond_id = cond.as_ref().map(|c| intern_typed(arena, c));
+        let cond_id = cond.as_ref().map(|c| {
+            intern_typed(
+                arena,
+                c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -638,7 +661,14 @@ mod tests {
         };
         let group_by: Vec<ScalarId> = group_by_typed
             .iter()
-            .map(|e| intern_typed(arena, e))
+            .map(|e| {
+                intern_typed(
+                    arena,
+                    e,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap()
+            })
             .collect();
         let is_merge = vec![false; agg_specs.len()];
         let output_layout = AggregateOutputLayout::new(group_key_columns, aggregate_columns);
@@ -658,7 +688,14 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: test_col_id(&format!("count({col})")),
             name: "count".into(),
-            args: vec![intern_typed(arena, &arg)],
+            args: vec![
+                intern_typed(
+                    arena,
+                    &arg,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap(),
+            ],
             distinct: false,
             order_by: vec![],
             resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
@@ -670,7 +707,14 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: test_col_id(&format!("sum({col})")),
             name: "sum".into(),
-            args: vec![intern_typed(arena, &arg)],
+            args: vec![
+                intern_typed(
+                    arena,
+                    &arg,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap(),
+            ],
             distinct: false,
             order_by: vec![],
             resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
@@ -821,7 +865,14 @@ mod tests {
                 vec![],
             );
             let join = join_opt(a.clone(), b, None, &mut arena);
-            let arg = column_ref_scalar(&mut arena, input.column_id, input.name, source);
+            let arg = column_ref_scalar(
+                &mut arena,
+                input.column_id,
+                input.name,
+                source,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap();
             let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
                 crate::functions::builtin_sql_function_catalog(),
                 &arena,
@@ -1081,7 +1132,9 @@ mod tests {
         let sum_arg = intern_typed(
             &mut arena,
             &qualified_col("t1", "c_key", c_key, DataType::Int32),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sum = ScalarAggregateSpec {
             output_column_id: c_key,
             name: "sum".into(),
@@ -1093,7 +1146,9 @@ mod tests {
         let gb_id = intern_typed(
             &mut arena,
             &qualified_col("t1", "c_bigint", c_bigint, DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let original_group_by = vec![gb_id];
         let original_output_columns = vec![
             OutputColumn {
@@ -1247,7 +1302,9 @@ mod tests {
         let sum_arg = intern_typed(
             &mut arena,
             &qualified_col("cs", "cs_sales_price", sales_price, DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sum = ScalarAggregateSpec {
             output_column_id: sales_price,
             name: "sum".into(),
@@ -1259,7 +1316,9 @@ mod tests {
         let gb_id = intern_typed(
             &mut arena,
             &qualified_col("cs", "cs_call_center_sk", call_center, DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let original_group_by = vec![gb_id];
         let original_output_columns = vec![
             OutputColumn {
@@ -1301,7 +1360,9 @@ mod tests {
         let sold_date_id = intern_typed(
             &mut arena,
             &qualified_col("cs", "cs_sold_date_sk", sold_date, DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let push = PushPlan {
             side: super::super::context::Side::Left,
             target_subtree: left,
@@ -1393,7 +1454,9 @@ mod tests {
         let count_arg = intern_typed(
             &mut arena,
             &qualified_col("t1", "c_key", c_key, DataType::Int32),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let count_spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9003),
             name: "count".into(),
@@ -1407,7 +1470,9 @@ mod tests {
         let gb_id = intern_typed(
             &mut arena,
             &qualified_col("t1", "c_bigint", c_bigint, DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let original_group_by = vec![gb_id];
         let original_output_layout = AggregateOutputLayout::new(
             vec![OutputColumn {

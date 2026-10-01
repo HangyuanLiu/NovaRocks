@@ -86,7 +86,8 @@ impl Rule for PushDownTopNToPreAgg {
                 &local,
                 local_group_id,
                 memo,
-            ));
+                control,
+            )?);
         }
         Ok(results)
     }
@@ -123,13 +124,7 @@ impl Rule for PushDownTopNToPreAgg {
             return Ok(Vec::new());
         };
         let local_group_id = binding.children(1)[0];
-        Ok(rewrite_topn_preagg(
-            &topn,
-            &global,
-            &local,
-            local_group_id,
-            memo,
-        ))
+        rewrite_topn_preagg(&topn, &global, &local, local_group_id, memo, control)
     }
 }
 
@@ -139,34 +134,40 @@ fn rewrite_topn_preagg(
     local: &LogicalAggregateOp,
     local_group_id: GroupId,
     memo: &mut Memo,
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     if topn.phase != TopNPhase::Final || topn.is_split {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(limit) = topn.limit else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if limit < 0 || topn.offset.unwrap_or(0) != 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if global.stage != AggStage::Global || local.stage != AggStage::Local {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if !global.is_split || !local.is_split {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if global.aggregates.iter().any(|agg| agg.distinct)
         || local.aggregates.iter().any(|agg| agg.distinct)
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if !order_by_covers_group_by(&topn.items, global, &memo.scalars) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Some(partial_items) =
-        partial_order_by_for_local_group_by(&topn.items, global, local, &mut memo.scalars)
+    let Some(partial_items) = partial_order_by_for_local_group_by(
+        &topn.items,
+        global,
+        local,
+        &mut memo.scalars,
+        control,
+    )?
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let partial_op = Operator::LogicalTopN(TopNOp {
@@ -205,10 +206,10 @@ fn rewrite_topn_preagg(
             },
         );
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::LogicalTopN(topn.clone()),
         children: vec![new_global_group_id],
-    }]
+    }])
 }
 
 fn order_by_covers_group_by(
@@ -251,34 +252,43 @@ fn partial_order_by_for_local_group_by(
     global: &LogicalAggregateOp,
     local: &LogicalAggregateOp,
     arena: &mut ScalarArena,
-) -> Option<Vec<SortKey>> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<SortKey>>, crate::compiler::SqlCompileError> {
     if items.is_empty() {
-        return None;
+        return Ok(None);
     }
     if global.group_by.len() != local.group_by.len() {
-        return None;
+        return Ok(None);
     }
-    let global_group_outputs = group_key_outputs(global)?;
-    let local_group_outputs = group_key_outputs(local)?;
+    let Some(global_group_outputs) = group_key_outputs(global) else {
+        return Ok(None);
+    };
+    let Some(local_group_outputs) = group_key_outputs(local) else {
+        return Ok(None);
+    };
 
     let mut local_outputs_for_items = Vec::with_capacity(items.len());
     for item in items {
         let global_column_id = match arena.node(item.expr) {
             ScalarNode::ColumnRef(column_id) => *column_id,
-            _ => return None,
+            _ => return Ok(None),
         };
         let position = global_group_outputs
             .iter()
-            .position(|column| column.column_id == global_column_id)?;
+            .position(|column| column.column_id == global_column_id);
+        let Some(position) = position else {
+            return Ok(None);
+        };
         local_outputs_for_items.push(&local_group_outputs[position]);
     }
 
     let mut remapped = Vec::with_capacity(items.len());
     for (item, local_output) in items.iter().zip(local_outputs_for_items) {
-        let local_expr = arena.intern(
+        let local_expr = arena.intern_observed(
             ScalarNode::ColumnRef(local_output.column_id),
             local_output.value_type.clone(),
-        );
+            control,
+        )?;
         remapped.push(SortKey {
             expr: local_expr,
             asc: item.asc,
@@ -286,7 +296,7 @@ fn partial_order_by_for_local_group_by(
             display: Some(ColumnDisplay::new(None, local_output.name.clone())),
         });
     }
-    Some(remapped)
+    Ok(Some(remapped))
 }
 
 fn group_key_outputs(agg: &LogicalAggregateOp) -> Option<&[OutputColumn]> {

@@ -1399,8 +1399,8 @@ impl SqlCompiler {
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical_plan,
             &mut scalar_arena,
-        )
-        .map_err(SqlCompileError::Compilation)?;
+            &control,
+        )?;
         let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr)?;
         control.check()?;
         let (mv_rewrite, factory) = mv_rewrite::attach_candidate_statistics(

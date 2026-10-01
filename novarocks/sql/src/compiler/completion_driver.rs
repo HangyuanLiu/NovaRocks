@@ -743,8 +743,8 @@ fn optimize_to_physical(
     let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
-    )
-    .map_err(SqlCompileError::Compilation)?;
+        control,
+    )?;
     let mut statistics = super::collect_statistics(statistics_snapshot, &mut optimizer_expr)?;
     control.check()?;
     let (mv_rewrite, factory) = super::mv_rewrite::attach_candidate_statistics(

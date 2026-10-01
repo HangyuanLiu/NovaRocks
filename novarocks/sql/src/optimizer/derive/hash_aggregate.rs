@@ -115,7 +115,9 @@ mod tests {
     fn intern_group_by(scalars: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
         exprs
             .iter()
-            .map(|expr| intern_typed(scalars, expr))
+            .map(|expr| {
+                intern_typed(scalars, expr, crate::optimizer::test_optimizer_control()).unwrap()
+            })
             .collect()
     }
 

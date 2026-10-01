@@ -99,8 +99,7 @@ pub(crate) fn run_imv_rewrite(
     // pipeline operates on OptExpr. This is not a production rewrite
     // round-trip inside the optimizer.
     let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
-    let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut())
-        .map_err(SqlCompileError::Compilation)?;
+    let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut(), control)?;
     work.step()
         .map_err(crate::compiler::SqlCompileError::from)?;
     ctx_rw.set_scalar_arena(std::rc::Rc::clone(&scalars));
@@ -829,8 +828,12 @@ pub(crate) mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        try_to_optimizer_expr(&normalized, &mut arena)
-            .expect("normalized aggregate must satisfy optimizer bridge contract");
+        try_to_optimizer_expr(
+            &normalized,
+            &mut arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("normalized aggregate must satisfy optimizer bridge contract");
     }
 
     #[test]

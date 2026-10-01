@@ -638,6 +638,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &change_stream,
         analyzed.write_mode,
+        &control,
     )?;
     let effect_output_ordinal = producer
         .output_columns
@@ -689,6 +690,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &change_stream,
         analyzed.write_mode,
+        &control,
     )?;
     let effect_output_ordinal = producer
         .output_columns
@@ -794,6 +796,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &compiled.change_stream,
         analyzed.write_mode,
+        &control,
     )?;
     let effect_output_ordinal = producer
         .output_columns
@@ -840,6 +843,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &compiled.change_stream,
         analyzed.write_mode,
+        &control,
     )?;
     let effect_output_ordinal = producer
         .output_columns
@@ -1229,7 +1233,9 @@ fn add_join_incremental_change_stream_effect(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     write_mode: SqlMvIncrementalWriteMode,
-) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     use crate::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
     use crate::optimizer::operator::{ChangeEventOutputExpr, ChangeEventSpec};
     use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
@@ -1244,12 +1250,18 @@ fn add_join_incremental_change_stream_effect(
     });
     let action_output = action_columns.next().cloned();
     if action_columns.next().is_some() {
-        return Err("IMV change-stream has ambiguous action output".to_string());
+        return Err("IMV change-stream has ambiguous action output"
+            .to_string()
+            .into());
     }
     if has_delete_branch {
         let required = join_incremental_change_op_output(change_stream, output_columns)?;
         if action_output.as_ref().map(|column| column.column_id) != Some(required.column_id) {
-            return Err("IMV change-stream action output differs from its descriptor".to_string());
+            return Err(
+                "IMV change-stream action output differs from its descriptor"
+                    .to_string()
+                    .into(),
+            );
         }
     }
     let row_lineage_output = match write_mode {
@@ -1304,32 +1316,35 @@ fn add_join_incremental_change_stream_effect(
         .iter()
         .map(|column| {
             arena.remember_source_column_display(column.column_id, None, column.name.clone());
-            ChangeEventOutputExpr {
+            Ok(ChangeEventOutputExpr {
                 output_column_id: column.column_id,
-                expr: Some(arena.intern(
+                expr: Some(arena.intern_observed(
                     ScalarNode::ColumnRef(column.column_id),
                     column.value_type.clone(),
-                )),
-            }
+                    control,
+                )?),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
 
     let not_deleted = action_output
         .as_ref()
         .filter(|_| has_delete_branch)
         .map(|action| {
-            let action_ref = arena.intern(
+            let action_ref = arena.intern_observed(
                 ScalarNode::ColumnRef(action.column_id),
                 action.value_type.clone(),
-            );
-            let delete = arena.intern(
+                control,
+            )?;
+            let delete = arena.intern_observed(
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
                 novarocks_type_contract::FunctionValueType {
                     nullable: false,
                     ..action.value_type.clone()
                 },
-            );
-            let is_delete = arena.intern(
+                control,
+            )?;
+            let is_delete = arena.intern_observed(
                 ScalarNode::BinaryOp {
                     op: BinOp::Eq,
                     left: action_ref,
@@ -1341,8 +1356,9 @@ fn add_join_incremental_change_stream_effect(
                     arrow::datatypes::DataType::Boolean,
                     action.value_type.nullable,
                 ),
-            );
-            let is_not_delete = arena.intern(
+                control,
+            )?;
+            let is_not_delete = arena.intern_observed(
                 ScalarNode::UnaryOp {
                     op: crate::common::UnOp::Not,
                     child: is_delete,
@@ -1351,9 +1367,11 @@ fn add_join_incremental_change_stream_effect(
                     arrow::datatypes::DataType::Boolean,
                     action.value_type.nullable,
                 ),
-            );
-            (is_delete, is_not_delete)
-        });
+                control,
+            )?;
+            Ok::<_, crate::compiler::SqlCompileError>((is_delete, is_not_delete))
+        })
+        .transpose()?;
 
     let mut events = Vec::with_capacity(3);
     if let Some((is_delete, _)) = not_deleted {
@@ -1375,11 +1393,12 @@ fn add_join_incremental_change_stream_effect(
         // A surviving row either lands where no published row stands, or
         // replaces the one its lineage names.
         Some(lineage) => {
-            let lineage_ref = arena.intern(
+            let lineage_ref = arena.intern_observed(
                 ScalarNode::ColumnRef(lineage.column_id),
                 lineage.value_type.clone(),
-            );
-            let is_fresh = arena.intern(
+                control,
+            )?;
+            let is_fresh = arena.intern_observed(
                 ScalarNode::IsNull {
                     child: lineage_ref,
                     negated: false,
@@ -1388,8 +1407,9 @@ fn add_join_incremental_change_stream_effect(
                     arrow::datatypes::DataType::Boolean,
                     false,
                 ),
-            );
-            let is_existing = arena.intern(
+                control,
+            )?;
+            let is_existing = arena.intern_observed(
                 ScalarNode::IsNull {
                     child: lineage_ref,
                     negated: true,
@@ -1398,14 +1418,15 @@ fn add_join_incremental_change_stream_effect(
                     arrow::datatypes::DataType::Boolean,
                     false,
                 ),
-            );
+                control,
+            )?;
             events.push(ChangeEventSpec {
-                predicate: Some(conjoin(&mut arena, surviving, is_fresh)),
+                predicate: Some(conjoin(&mut arena, surviving, is_fresh, control)?),
                 effect: ConnectorRowMutationEffect::Insert,
                 assignments: assignments.clone(),
             });
             events.push(ChangeEventSpec {
-                predicate: Some(conjoin(&mut arena, surviving, is_existing)),
+                predicate: Some(conjoin(&mut arena, surviving, is_existing, control)?),
                 effect: ConnectorRowMutationEffect::Replace,
                 assignments,
             });
@@ -1432,6 +1453,7 @@ fn add_join_incremental_change_stream_effect(
         effect_output.column_id,
         events,
     )
+    .map_err(crate::compiler::SqlCompileError::Compilation)
 }
 
 /// `left AND right`, or `right` alone when there is no left side.
@@ -1439,10 +1461,11 @@ fn conjoin(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     left: Option<crate::optimizer::scalar::ScalarId>,
     right: crate::optimizer::scalar::ScalarId,
-) -> crate::optimizer::scalar::ScalarId {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
     match left {
-        None => right,
-        Some(left) => arena.intern(
+        None => Ok(right),
+        Some(left) => arena.intern_observed(
             crate::optimizer::scalar::ScalarNode::BinaryOp {
                 op: crate::common::BinOp::And,
                 left,
@@ -1453,6 +1476,7 @@ fn conjoin(
                 arrow::datatypes::DataType::Boolean,
                 false,
             ),
+            control,
         ),
     }
 }
@@ -3134,6 +3158,7 @@ mod tests {
             incremental_producer(vec![incremental_column(1, "k")]),
             &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
             SqlMvIncrementalWriteMode::FastAppend,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("an append-only producer expands");
 
@@ -3173,6 +3198,7 @@ mod tests {
             ]),
             &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
             SqlMvIncrementalWriteMode::RowDelta,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("a row-delta producer expands");
 
@@ -3751,5 +3777,74 @@ mod tests {
                 .validate_observed(drifted_schema.as_ref(), &[1, 2], 7)
                 .is_err()
         );
+    }
+    #[test]
+    fn actual_incremental_expansion_preserves_interner_control_categories() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Refuse {
+            cause: CompileControlError,
+            at_entry: bool,
+            seen: std::sync::atomic::AtomicBool,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                if (self.at_entry && units == 0) || (!self.at_entry && units == 256) {
+                    self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(self.cause);
+                }
+                Ok(())
+            }
+        }
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at_entry in [true, false] {
+                let control = Refuse {
+                    cause,
+                    at_entry,
+                    seen: std::sync::atomic::AtomicBool::new(false),
+                };
+                let data_type = arrow::datatypes::DataType::Struct(
+                    (0..300)
+                        .map(|i| {
+                            arrow::datatypes::Field::new(
+                                format!("f{i}"),
+                                arrow::datatypes::DataType::Int64,
+                                false,
+                            )
+                        })
+                        .collect(),
+                );
+                let mut column = incremental_column(1, "payload");
+                column.value_type =
+                    novarocks_type_contract::FunctionValueType::new(data_type, false);
+                let result = add_join_incremental_change_stream_effect(
+                    incremental_producer(vec![column]),
+                    &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(
+                    ),
+                    SqlMvIncrementalWriteMode::FastAppend,
+                    &control,
+                );
+                assert!(
+                    control.seen.load(std::sync::atomic::Ordering::SeqCst),
+                    "the original control must observe the refused work"
+                );
+                assert!(matches!(
+                    (cause, result),
+                    (
+                        CompileControlError::Cancelled,
+                        Err(crate::compiler::SqlCompileError::Cancelled)
+                    ) | (
+                        CompileControlError::DeadlineExceeded,
+                        Err(crate::compiler::SqlCompileError::DeadlineExceeded)
+                    ) | (
+                        CompileControlError::ResourceExhausted,
+                        Err(crate::compiler::SqlCompileError::ResourceExhausted)
+                    )
+                ));
+            }
+        }
     }
 }

@@ -702,7 +702,12 @@ mod tests {
         }];
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
-                items: intern_project_items(&mut scalars, &items),
+                items: intern_project_items(
+                    &mut scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_qualifier: None,
             }),
             children: vec![child],
@@ -739,7 +744,12 @@ mod tests {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
-                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                aggregates: intern_aggregate_calls(
+                    &mut scalars,
+                    &aggregate_calls,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_layout: AggregateOutputLayout::new(
                     vec![],
                     vec![int_col(aggregate_output_id, "sum(a)")],
@@ -870,8 +880,18 @@ mod tests {
         let mut aggregate = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: intern_exprs(&mut scalars, &[column_ref(input_id, "a")]),
-                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                group_by: intern_exprs(
+                    &mut scalars,
+                    &[column_ref(input_id, "a")],
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                aggregates: intern_aggregate_calls(
+                    &mut scalars,
+                    &aggregate_calls,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_layout: AggregateOutputLayout::new(
                     vec![int_col(group_output_id, "a")],
                     vec![int_col(aggregate_output_id, "sum(a)")],
@@ -947,7 +967,9 @@ mod tests {
                         column_ref(input_id, "a"),
                         column_ref(grouping_output_id, "__grouping_fn_0"),
                     ],
-                ),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 aggregates: vec![],
                 output_layout: AggregateOutputLayout::new(aggregate_output_columns.clone(), vec![]),
                 output_columns: aggregate_output_columns,

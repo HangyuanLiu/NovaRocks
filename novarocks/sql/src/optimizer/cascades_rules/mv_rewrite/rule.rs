@@ -93,7 +93,7 @@ impl Rule for MvRewriteRule {
         memo: &mut Memo,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
-        let Some((query, shape)) = SpjgDescriptor::from_memo(expr, memo) else {
+        let Some((query, shape)) = SpjgDescriptor::from_memo(expr, memo, control)? else {
             return Ok(vec![]);
         };
         let mut out = Vec::new();
@@ -160,6 +160,15 @@ fn remap_visible_outputs_to_layout(
         .collect()
 }
 
+macro_rules! candidate {
+    ($value:expr) => {
+        match $value {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
+
 fn try_rewrite(
     query: &SpjgDescriptor,
     shape: &MatchedShape,
@@ -167,14 +176,6 @@ fn try_rewrite(
     memo: &mut Memo,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<NewExpr>, crate::compiler::SqlCompileError> {
-    macro_rules! candidate {
-        ($value:expr) => {
-            match $value {
-                Some(value) => value,
-                None => return Ok(None),
-            }
-        };
-    }
     macro_rules! binding_candidate {
         ($value:expr) => {
             match $value {
@@ -254,8 +255,10 @@ fn try_rewrite(
         containment
             .compensation
             .iter()
-            .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names))
-            .collect::<Option<Vec<_>>>()
+            .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names, control))
+            .map(Result::transpose)
+            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+            .transpose()?
     );
     let mut compensation_required_columns = HashSet::new();
     for predicate in &compensation {
@@ -293,8 +296,9 @@ fn try_rewrite(
     if !compensation.is_empty() {
         let predicate = candidate!(scalar_expr::combine_conjuncts(
             &mut memo.scalars,
-            compensation
-        ));
+            compensation,
+            control
+        )?);
         child_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -312,17 +316,24 @@ fn try_rewrite(
                     .iter()
                     .map(|o| {
                         let SpjgOutputExpr::Dimension(e) = &o.expr else {
-                            return None;
+                            return Ok(None);
                         };
-                        let expr = col_map.rewrite(&mut memo.scalars, *e, &q_names)?;
-                        Some(project_item(
+                        let expr = candidate!(col_map.rewrite(
+                            &mut memo.scalars,
+                            *e,
+                            &q_names,
+                            control
+                        )?);
+                        Ok(Some(project_item(
                             &mut memo.scalars,
                             expr,
                             o.name.clone(),
                             o.column_id,
-                        ))
+                        )))
                     })
-                    .collect::<Option<Vec<_>>>()
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
             );
             let mut required_columns = compensation_required_columns.clone();
             collect_project_required_columns(&memo.scalars, &items, &mut required_columns);
@@ -343,15 +354,25 @@ fn try_rewrite(
                 original_agg
                     .group_by
                     .iter()
-                    .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
-                    .collect::<Option<Vec<_>>>()
+                    .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names, control))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
             );
             let aggregates = candidate!(
                 original_agg
                     .aggregates
                     .iter()
-                    .map(|c| rewrite_aggregate_to_mv(&mut memo.scalars, c, &col_map, &q_names))
-                    .collect::<Option<Vec<_>>>()
+                    .map(|c| rewrite_aggregate_to_mv(
+                        &mut memo.scalars,
+                        c,
+                        &col_map,
+                        &q_names,
+                        control
+                    ))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
             );
             let mut required_columns = compensation_required_columns.clone();
             for expr in &group_by {
@@ -399,11 +420,12 @@ fn try_rewrite(
                                 &mut memo.scalars,
                                 original_agg.group_by[idx],
                                 &q_names,
-                            )),
+                                control
+                            )?),
                             AggregateOutputPosition::Aggregate(idx) => {
                                 let item = &plan.items[idx];
                                 let mv_col = candidate!(agg_cols[item.mv_output_index].clone());
-                                column_ref(&mut memo.scalars, &mv_col)
+                                column_ref(&mut memo.scalars, &mv_col, control)?
                             }
                         };
                         items.push(project_item(
@@ -434,8 +456,15 @@ fn try_rewrite(
                         original_agg
                             .group_by
                             .iter()
-                            .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
-                            .collect::<Option<Vec<_>>>()
+                            .map(|expr| col_map.rewrite(
+                                &mut memo.scalars,
+                                *expr,
+                                &q_names,
+                                control
+                            ))
+                            .map(Result::transpose)
+                            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                            .transpose()?
                     );
                     let needs_coalesce = plan.items.iter().any(|i| i.needs_coalesce);
                     // Aggregate outputs: reuse original ids directly unless a
@@ -460,7 +489,7 @@ fn try_rewrite(
                             .enumerate()
                             .map(|(idx, item)| {
                                 let mv_col = candidate!(agg_cols[item.mv_output_index].clone());
-                                let arg = column_ref(&mut memo.scalars, &mv_col);
+                                let arg = column_ref(&mut memo.scalars, &mv_col, control)?;
                                 let resolved = binding_candidate!(
                                     crate::optimizer::scalar::resolve_aggregate_binding(
                                         memo.function_catalog(),
@@ -526,7 +555,8 @@ fn try_rewrite(
                         children: vec![child_group],
                     });
                     let function_catalog = memo.function_catalog().snapshot();
-                    let items: Vec<ScalarProjectItem> = candidate!(
+                    let items: Vec<ScalarProjectItem> =
+                        candidate!(
                         original_agg
                             .output_columns
                             .iter()
@@ -538,12 +568,12 @@ fn try_rewrite(
                                     AggregateOutputPosition::GroupKey(idx) => column_ref(
                                         &mut memo.scalars,
                                         &output_layout.group_key_columns[idx],
-                                    ),
+                                     control)?,
                                     AggregateOutputPosition::Aggregate(idx) => {
                                         let inner = column_ref(
                                             &mut memo.scalars,
                                             &output_layout.aggregate_columns[idx],
-                                        );
+                                         control)?;
                                         if plan.items[idx].needs_coalesce {
                                             binding_candidate!(coalesce_zero(
                                                 function_catalog.as_ref(),
@@ -615,9 +645,17 @@ fn selected_candidate_marker(
     ))
 }
 
-fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
+fn column_ref(
+    arena: &mut ScalarArena,
+    c: &OutputColumn,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     arena.remember_project_output_display(c.column_id, None, c.name.clone());
-    arena.intern(ScalarNode::ColumnRef(c.column_id), c.value_type.clone())
+    arena.intern_observed(
+        ScalarNode::ColumnRef(c.column_id),
+        c.value_type.clone(),
+        control,
+    )
 }
 
 fn project_item(
@@ -695,23 +733,30 @@ fn rewrite_aggregate_to_mv(
     call: &ScalarAggregateSpec,
     col_map: &MvColumnMap,
     query_base_names: &std::collections::HashMap<crate::column_id::ColumnId, String>,
-) -> Option<ScalarAggregateSpec> {
-    Some(ScalarAggregateSpec {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarAggregateSpec>, crate::compiler::SqlCompileError> {
+    Ok(Some(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: call
-            .args
-            .iter()
-            .map(|arg| col_map.rewrite(arena, *arg, query_base_names))
-            .collect::<Option<Vec<_>>>()?,
+        args: candidate!(
+            call.args
+                .iter()
+                .map(|arg| col_map.rewrite(arena, *arg, query_base_names, control))
+                .map(Result::transpose)
+                .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                .transpose()?
+        ),
         distinct: call.distinct,
-        order_by: call
-            .order_by
-            .iter()
-            .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names))
-            .collect::<Option<Vec<_>>>()?,
+        order_by: candidate!(
+            call.order_by
+                .iter()
+                .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names, control))
+                .map(Result::transpose)
+                .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                .transpose()?
+        ),
         resolved: call.resolved.clone(),
-    })
+    }))
 }
 
 fn rewrite_sort_key(
@@ -719,13 +764,14 @@ fn rewrite_sort_key(
     key: &SortKey,
     col_map: &MvColumnMap,
     query_base_names: &std::collections::HashMap<crate::column_id::ColumnId, String>,
-) -> Option<SortKey> {
-    Some(SortKey {
-        expr: col_map.rewrite(arena, key.expr, query_base_names)?,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<SortKey>, crate::compiler::SqlCompileError> {
+    Ok(Some(SortKey {
+        expr: candidate!(col_map.rewrite(arena, key.expr, query_base_names, control)?),
         asc: key.asc,
         nulls_first: key.nulls_first,
         display: key.display.clone(),
-    })
+    }))
 }
 
 fn coalesce_zero(
@@ -735,13 +781,14 @@ fn coalesce_zero(
     output: &OutputColumn,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    let zero = arena.intern(
+    let zero = arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
         novarocks_type_contract::FunctionValueType {
             nullable: false,
             ..output.value_type.clone()
         },
-    );
+        control,
+    )?;
     let args = vec![value, zero];
     let binding = crate::optimizer::scalar::resolve_function_binding(
         function_catalog,
@@ -750,7 +797,7 @@ fn coalesce_zero(
         &args,
         control,
     )?;
-    Ok(arena.intern(
+    arena.intern_observed(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "coalesce".to_string(),
@@ -762,7 +809,8 @@ fn coalesce_zero(
             nullable: false,
             ..output.value_type.clone()
         },
-    ))
+        control,
+    )
 }
 
 /// Identity match on `(catalog, namespace, table)` only. `table_uuid` and the
@@ -817,6 +865,7 @@ mod tests {
         let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan,
             &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical plan to opt expr");
         crate::optimizer::memo_copy::opt_expr_to_memo(
@@ -829,10 +878,18 @@ mod tests {
 
     fn spjg_descriptor_for_test(plan: &LogicalPlanNode) -> (SpjgDescriptor, ScalarArena) {
         let mut arena = ScalarArena::new();
-        let opt_expr =
-            crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(plan, &mut arena)
-                .expect("logical plan to opt expr");
-        let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena).expect("mv spjg");
+        let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+            plan,
+            &mut arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("logical plan to opt expr");
+        let descriptor = SpjgDescriptor::from_opt_expr(
+            &opt_expr,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("mv spjg");
         (descriptor, arena)
     }
 
@@ -1655,8 +1712,13 @@ mod tests {
             rule.matches(&root_expr.op),
             "test must exercise a production rule entry op"
         );
-        let (query, _) =
-            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("query descriptor");
+        let (query, _) = SpjgDescriptor::from_memo(
+            &root_expr,
+            &mut memo,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("query descriptor");
         assert!(
             query.joins.is_some(),
             "test must exercise the query-side join descriptor path"

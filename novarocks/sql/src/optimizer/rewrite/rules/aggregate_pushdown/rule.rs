@@ -266,8 +266,18 @@ mod tests {
             unreachable!("col_typed must build a ColumnRef");
         };
         let gb_output_id = *gb_output_id;
-        let gb_id = intern_typed(&mut arena, &gb_typed);
-        let sum_arg = intern_typed(&mut arena, &col_typed("v"));
+        let gb_id = intern_typed(
+            &mut arena,
+            &gb_typed,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let sum_arg = intern_typed(
+            &mut arena,
+            &col_typed("v"),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sum_spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
             name: "sum".into(),
@@ -302,7 +312,12 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        let cond_id = intern_typed(&mut arena, &cond_typed);
+        let cond_id = intern_typed(
+            &mut arena,
+            &cond_typed,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {

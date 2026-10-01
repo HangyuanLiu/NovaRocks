@@ -150,7 +150,8 @@ impl LogicalRewriteRule for PruneUkFkJoin {
                     left_scan,
                     &left_cols,
                     &mut arena_rc.borrow_mut(),
-                ))
+                    &ctx.control_view(),
+                )?)
             }
             (JoinKind::Inner, Side::Right)
                 if settings.enable_ukfk_opt
@@ -161,7 +162,8 @@ impl LogicalRewriteRule for PruneUkFkJoin {
                     right_scan,
                     &right_cols,
                     &mut arena_rc.borrow_mut(),
-                ))
+                    &ctx.control_view(),
+                )?)
             }
             _ => None,
         };
@@ -263,20 +265,19 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
             .map(|aggregate| aggregate.output_column_id)
             .filter(|id| *id != ColumnId::UNSET)
             .collect();
-        let items = project
-            .items
-            .into_iter()
-            .map(|item| {
-                rewrite_eliminated_aggregate_project_item(
-                    item,
-                    &eliminated_count_outputs,
-                    &mut arena_rc.borrow_mut(),
-                )
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(items) = items else {
-            return Ok(RewriteResult::Unchanged);
-        };
+        let mut items = Vec::with_capacity(project.items.len());
+        for item in project.items {
+            let Some(item) = rewrite_eliminated_aggregate_project_item(
+                item,
+                &eliminated_count_outputs,
+                &mut arena_rc.borrow_mut(),
+                &ctx.control_view(),
+            )?
+            else {
+                return Ok(RewriteResult::Unchanged);
+            };
+            items.push(item);
+        }
 
         Ok(RewriteResult::Changed(OptExpr {
             op: Operator::LogicalProject(ProjectOp {
@@ -588,7 +589,8 @@ fn add_not_null_filter(
     scan: &ScanOp,
     columns: &[String],
     arena: &mut ScalarArena,
-) -> OptExpr {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, SqlCompileError> {
     let qualifier = scan
         .alias
         .clone()
@@ -608,27 +610,31 @@ fn add_not_null_filter(
             Some(qualifier.clone()),
             output.name.clone(),
         );
-        let child = arena.intern(
+        let child = arena.intern_observed(
             ScalarNode::ColumnRef(output.column_id),
             output.value_type.clone(),
-        );
-        predicates.push(arena.intern(
+            control,
+        )?;
+        predicates.push(arena.intern_observed(
             ScalarNode::IsNull {
                 child,
                 negated: true,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        ));
+            control,
+        )?);
     }
     if predicates.is_empty() {
-        return plan;
+        return Ok(plan);
     }
-    match scalar_expr::combine_conjuncts(arena, predicates) {
-        Some(predicate) => {
-            OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
-        }
-        None => plan,
-    }
+    Ok(
+        match scalar_expr::combine_conjuncts(arena, predicates, control)? {
+            Some(predicate) => {
+                OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+            }
+            None => plan,
+        },
+    )
 }
 
 fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> bool {
@@ -651,25 +657,30 @@ fn rewrite_eliminated_aggregate_project_item(
     item: ScalarProjectItem,
     eliminated_count_outputs: &HashSet<ColumnId>,
     arena: &mut ScalarArena,
-) -> Option<ScalarProjectItem> {
-    let new_expr_id =
-        rewrite_eliminated_aggregate_expr(arena, item.expr, eliminated_count_outputs)?;
-    Some(ScalarProjectItem {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarProjectItem>, SqlCompileError> {
+    let Some(new_expr_id) =
+        rewrite_eliminated_aggregate_expr(arena, item.expr, eliminated_count_outputs, control)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ScalarProjectItem {
         expr: new_expr_id,
         output_name: item.output_name,
         output_column_id: item.output_column_id,
         expr_display: item.expr_display,
-    })
+    }))
 }
 
 fn rewrite_eliminated_aggregate_expr(
     arena: &mut ScalarArena,
     expr: ScalarId,
     eliminated_count_outputs: &HashSet<ColumnId>,
-) -> Option<ScalarId> {
-    match arena.node(expr).clone() {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    Ok(match arena.node(expr).clone() {
         ScalarNode::ColumnRef(column_id) if eliminated_count_outputs.contains(&column_id) => {
-            Some(scalar_expr::int_literal(arena, 1))
+            Some(scalar_expr::int_literal(arena, 1, control)?)
         }
         ScalarNode::AggregateCall {
             name,
@@ -677,11 +688,11 @@ fn rewrite_eliminated_aggregate_expr(
             order_by,
             ..
         } if name.eq_ignore_ascii_case("count") && !distinct && order_by.is_empty() => {
-            Some(scalar_expr::int_literal(arena, 1))
+            Some(scalar_expr::int_literal(arena, 1, control)?)
         }
         _ if !scalar_expr::contains_aggregate(arena, expr) => Some(expr),
         _ => None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -965,9 +976,14 @@ mod tests {
         };
         let eliminated_outputs = HashSet::from([count_output]);
 
-        let rewritten =
-            rewrite_eliminated_aggregate_project_item(item, &eliminated_outputs, &mut arena)
-                .expect("count output reference should be rewritten");
+        let rewritten = rewrite_eliminated_aggregate_project_item(
+            item,
+            &eliminated_outputs,
+            &mut arena,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+        .expect("count output reference should be rewritten");
 
         assert!(matches!(
             arena.node(rewritten.expr),

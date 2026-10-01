@@ -1204,6 +1204,7 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -1232,6 +1233,7 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -1273,6 +1275,7 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -1304,6 +1307,7 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(

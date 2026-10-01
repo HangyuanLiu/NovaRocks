@@ -354,8 +354,18 @@ mod tests {
         map: &HashMap<ColumnId, (TableIdentity, String)>,
     ) -> bool {
         let mut arena = ScalarArena::new();
-        let a = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, a);
-        let b = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, b);
+        let a = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            a,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let b = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            b,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         super::expr_phys_eq(&arena, a, b, map)
     }
 

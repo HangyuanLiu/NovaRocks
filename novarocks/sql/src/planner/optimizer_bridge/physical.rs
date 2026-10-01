@@ -1153,7 +1153,12 @@ mod tests {
     #[test]
     fn bridge_materializes_values_rows() {
         let mut arena = ScalarArena::new();
-        let one = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &int_expr(1));
+        let one = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &int_expr(1),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let node = attach_arena(
             base_node(Operator::PhysicalValues(ValuesOp {
                 rows: vec![vec![one]],
@@ -1279,7 +1284,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let group_column = output_column(7, "k");
         let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Local,
@@ -1325,9 +1332,15 @@ mod tests {
         let group_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
             &mut arena,
             &col_expr(7, "map2"),
-        );
-        let distinct_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &col_expr(2, "s2"));
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let distinct_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(2, "s2"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let map2_column = output_column(7, "map2");
         let s2_column = output_column(2, "s2");
         let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -1381,7 +1394,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let group_column = output_column(8, "k_group");
         let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
@@ -1417,9 +1432,15 @@ mod tests {
         let predicate = crate::planner::optimizer_bridge::scalar::intern_typed(
             &mut arena,
             &col_expr(1, "matched"),
-        );
-        let assignment =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &int_expr(42));
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let assignment = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &int_expr(42),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut node = base_node(Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
             events: vec![ChangeEventSpec {
                 predicate: Some(predicate),
@@ -1779,7 +1800,9 @@ mod tests {
                 output_name: "p".to_string(),
                 output_column_id: output_id,
             }],
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let input = OutputColumn {
             column_id: input_id,
             name: "v".to_string(),

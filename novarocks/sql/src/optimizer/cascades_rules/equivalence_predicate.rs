@@ -69,7 +69,7 @@ impl Rule for InnerJoinEquivalencePredicateRule {
 
         let left_group = expr.children[0];
         let right_group = expr.children[1];
-        Ok(apply_inner(join, left_group, right_group, memo))
+        apply_inner(join, left_group, right_group, memo, control)
     }
 
     fn pattern(&self) -> Pattern {
@@ -100,7 +100,7 @@ impl Rule for InnerJoinEquivalencePredicateRule {
         let left_group = children[0];
         let right_group = children[1];
         let join = join.clone();
-        Ok(apply_inner(&join, left_group, right_group, memo))
+        apply_inner(&join, left_group, right_group, memo, control)
     }
 }
 
@@ -257,8 +257,13 @@ fn has_literal_equality_in_side(
         })
 }
 
-fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<ScalarId>) -> GroupId {
-    let predicate = combine_with_and(&mut memo.scalars, predicates)
+fn add_filter_group(
+    memo: &mut Memo,
+    child_group: GroupId,
+    predicates: Vec<ScalarId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<GroupId, crate::compiler::SqlCompileError> {
+    let predicate = combine_with_and(&mut memo.scalars, predicates, control)?
         .expect("filter group needs at least one predicate");
     let filter_expr = MExpr {
         id: memo.next_expr_id(),
@@ -280,7 +285,7 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Scala
         );
         memo.groups[new_group].logical_props = Some(props);
     }
-    new_group
+    Ok(new_group)
 }
 
 /// Shared body of `apply` and `apply_bound`: given the join op and the two
@@ -290,12 +295,13 @@ fn apply_inner(
     left_group: GroupId,
     right_group: GroupId,
     memo: &mut Memo,
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     let Some(left_props) = memo.groups[left_group].logical_props.clone() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(right_props) = memo.groups[right_group].logical_props.clone() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let left_columns = columns_by_id(&left_props.output_columns);
@@ -326,7 +332,8 @@ fn apply_inner(
                 &mut memo.scalars,
                 column,
                 literal,
-            ));
+                control,
+            )?);
         }
         if let Some(literal) = literal_by_column.get(&right_id).cloned()
             && !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal)
@@ -336,29 +343,30 @@ fn apply_inner(
                 &mut memo.scalars,
                 column,
                 literal,
-            ));
+                control,
+            )?);
         }
     }
 
     if left_new.is_empty() && right_new.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let new_left = if left_new.is_empty() {
         left_group
     } else {
-        add_filter_group(memo, left_group, left_new)
+        add_filter_group(memo, left_group, left_new, control)?
     };
     let new_right = if right_new.is_empty() {
         right_group
     } else {
-        add_filter_group(memo, right_group, right_new)
+        add_filter_group(memo, right_group, right_new, control)?
     };
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::LogicalJoin(join.clone()),
         children: vec![new_left, new_right],
-    }]
+    }])
 }
 
 #[cfg(test)]
@@ -690,7 +698,13 @@ mod tests {
 
         // Call add_filter_group to synthesize a filter group above the scan.
         let predicate = eq_col_lit(&mut memo, 1, 42);
-        let filter_group = add_filter_group(&mut memo, child, vec![predicate]);
+        let filter_group = add_filter_group(
+            &mut memo,
+            child,
+            vec![predicate],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
 
         // The filter group's logical_props must carry the child's column stats.
         let filter_props = memo.groups[filter_group]

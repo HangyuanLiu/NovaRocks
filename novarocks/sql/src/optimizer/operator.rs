@@ -817,7 +817,12 @@ mod aggregate_stage_tests {
     }
 
     fn scalar_col_ref(arena: &mut ScalarArena, id: u32, name: &str) -> ScalarId {
-        intern_typed(arena, &col_ref(id, name))
+        intern_typed(
+            arena,
+            &col_ref(id, name),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn count_call(arena: &mut ScalarArena) -> ScalarAggregateSpec {

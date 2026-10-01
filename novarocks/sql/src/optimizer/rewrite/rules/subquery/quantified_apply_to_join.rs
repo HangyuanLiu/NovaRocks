@@ -121,7 +121,8 @@ fn apply_expr(
     }
 
     let lhs = a.subquery_expr;
-    let inner_cols = scalar_utils::opt_output_columns(&apply_right, arena)?;
+    let inner_cols = scalar_utils::opt_output_columns(&apply_right, arena)
+        .map_err(SqlCompileError::Compilation)?;
     let available_output_ids = inner_cols
         .iter()
         .map(|c| c.column_id.to_string())
@@ -136,7 +137,7 @@ fn apply_expr(
                 a.inner_output_column_id, available_output_ids
             )
         })?;
-    let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc);
+    let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc, control)?;
 
     let either_nullable = arena.nullable(lhs) || inner_col_oc.value_type.nullable;
     let join_type = if negated {
@@ -149,12 +150,13 @@ fn apply_expr(
         JoinKind::LeftSemi
     };
 
-    let in_key = scalar_utils::eq(arena, lhs, inner_col_ref);
+    let in_key = scalar_utils::eq(arena, lhs, inner_col_ref, control)?;
 
     let (right, condition) = if a.correlation_column_ids.is_empty() {
         (apply_right, in_key)
     } else {
-        let Some(lifted) = lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena)
+        let Some(lifted) =
+            lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena, control)?
         else {
             return Ok(None);
         };
@@ -166,7 +168,8 @@ fn apply_expr(
         } else {
             lifted_pred
         };
-        let Some(condition) = scalar_utils::combine_and(arena, vec![in_key, extra]) else {
+        let Some(condition) = scalar_utils::combine_and(arena, vec![in_key, extra], control)?
+        else {
             return Ok(None);
         };
         (lifted.right, condition)

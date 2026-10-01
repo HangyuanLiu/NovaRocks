@@ -111,7 +111,8 @@ impl Rule for SplitDistinctAgg {
                 distinct_col,
                 &non_distinct,
                 &non_distinct_indices,
-            )
+                control,
+            )?
         } else {
             apply_three_phase(
                 expr,
@@ -121,7 +122,8 @@ impl Rule for SplitDistinctAgg {
                 distinct_col,
                 &non_distinct,
                 &non_distinct_indices,
-            )
+                control,
+            )?
         })
     }
 }
@@ -304,6 +306,10 @@ fn scalar_key_matches(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> b
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The original request control accompanies existing distinct aggregate stage inputs."
+)]
 fn apply_three_phase(
     expr: &MExpr,
     memo: &mut Memo,
@@ -312,7 +318,8 @@ fn apply_three_phase(
     distinct_col: ScalarId,
     non_distinct: &[ScalarAggregateSpec],
     non_distinct_indices: &[usize],
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by plus the
     // DISTINCT column when it is not already a group key.
     let mut gb_with_distinct = group_by.to_vec();
@@ -407,7 +414,8 @@ fn apply_three_phase(
         &mut memo.scalars,
         &gb_with_distinct_outputs,
         gb_with_distinct_outputs.len(),
-    );
+        control,
+    )?;
     let distinct_phase_arg = dg_group_by
         .get(distinct_phase_arg_idx)
         .copied()
@@ -442,7 +450,7 @@ fn apply_three_phase(
         .map(|call| rebind_distinct_arg_to_phase_output(call, distinct_phase_arg))
         .collect();
     if distinct_aggs.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     let mut global_aggs = Vec::with_capacity(distinct_aggs.len() + non_distinct.len());
     global_aggs.push(distinct_aggs[0].clone());
@@ -478,11 +486,12 @@ fn apply_three_phase(
         &mut memo.scalars,
         &gb_with_distinct_outputs,
         group_by.len(),
-    );
+        control,
+    )?;
     let global_output_layout =
         AggregateOutputLayout::new(global_group_columns, global_aggregate_columns);
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             // Reference DISTINCT_GLOBAL's original group outputs (drop the
@@ -495,7 +504,7 @@ fn apply_three_phase(
             is_merge: global_merge,
         }),
         children: vec![dg_group],
-    }]
+    }])
 }
 
 fn apply_four_phase(
@@ -505,13 +514,15 @@ fn apply_four_phase(
     distinct_col: ScalarId,
     non_distinct: &[ScalarAggregateSpec],
     non_distinct_indices: &[usize],
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     let distinct_group_outputs = phase_group_output_columns(&memo.scalars, &[distinct_col]);
     let distinct_group_by = aggregate_group_key_output_ref(
         &mut memo.scalars,
         &distinct_group_outputs,
         distinct_group_outputs.len(),
-    );
+        control,
+    )?;
     let distinct_phase_arg = distinct_group_by.first().copied().unwrap_or(distinct_col);
     let partial_output_columns = aggregate_phase_output_columns(
         &memo.scalars,
@@ -579,7 +590,7 @@ fn apply_four_phase(
         .map(|call| rebind_distinct_arg_to_phase_output(call, distinct_phase_arg))
         .collect();
     if distinct_aggs.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     let mut phase_aggs = Vec::with_capacity(distinct_aggs.len() + non_distinct.len());
     phase_aggs.push(distinct_aggs[0].clone());
@@ -639,7 +650,7 @@ fn apply_four_phase(
     );
     let global_output_layout = AggregateOutputLayout::new(vec![], global_aggregate_columns);
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             group_by: vec![],
@@ -649,7 +660,7 @@ fn apply_four_phase(
             is_merge: global_merge,
         }),
         children: vec![dl_group],
-    }]
+    }])
 }
 
 #[cfg(test)]
@@ -770,8 +781,18 @@ mod tests {
             output.column_id = output_id;
             call.output_column_id = output_id;
         }
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_layout = AggregateOutputLayout::new(
             output_columns
                 .iter()
@@ -891,8 +912,18 @@ mod tests {
         full_output_columns: Vec<OutputColumn>,
         public_output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_layout = AggregateOutputLayout::new(
             full_output_columns
                 .iter()
@@ -1187,8 +1218,12 @@ mod tests {
             resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], true),
         };
         let mut memo = Memo::new();
-        let calls =
-            intern_aggregate_calls(&mut memo.scalars, &[count_distinct("x"), sum_distinct_x]);
+        let calls = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[count_distinct("x"), sum_distinct_x],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let col_out = extract_single_distinct_col(&memo.scalars, &calls);
         assert!(
             col_out.is_some(),

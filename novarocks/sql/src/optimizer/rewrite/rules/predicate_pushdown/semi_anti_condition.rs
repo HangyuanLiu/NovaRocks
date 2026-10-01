@@ -127,9 +127,11 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let new_condition = if keep_in_condition.is_empty() {
             None
         } else {
-            scalar_expr::combine_conjuncts(&mut arena, keep_in_condition)
+            scalar_expr::combine_conjuncts(&mut arena, keep_in_condition, &ctx.control_view())?
         };
-        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, push_to_right) else {
+        let Some(pushed_id) =
+            scalar_expr::combine_conjuncts(&mut arena, push_to_right, &ctx.control_view())?
+        else {
             return Ok(RewriteResult::Unchanged);
         };
         let new_right = OptExpr::new(
@@ -349,7 +351,14 @@ mod tests {
         right: OptExpr,
         condition: Option<TypedExpr>,
     ) -> OptExpr {
-        let cond_id = condition.map(|c| intern_typed(arena, &c));
+        let cond_id = condition.map(|c| {
+            intern_typed(
+                arena,
+                &c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftSemi,
@@ -365,7 +374,14 @@ mod tests {
         right: OptExpr,
         condition: Option<TypedExpr>,
     ) -> OptExpr {
-        let cond_id = condition.map(|c| intern_typed(arena, &c));
+        let cond_id = condition.map(|c| {
+            intern_typed(
+                arena,
+                &c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -399,7 +415,9 @@ mod tests {
                                 column: "right_source".to_string(),
                             },
                         },
-                    ),
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
                     output_name: "k".to_string(),
                     output_column_id: ColumnId::new_for_test(202),
                     expr_display: None,

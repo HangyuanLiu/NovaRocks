@@ -1044,7 +1044,12 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
-        crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
+        crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
     }
 
     fn int_literal_scalar(arena: &mut ScalarArena, v: i64) -> crate::optimizer::scalar::ScalarId {
@@ -1052,7 +1057,12 @@ mod tests {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
-        crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
+        crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
     }
 
     fn binop_scalar(
@@ -1072,7 +1082,12 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
+        crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
     }
 
     fn make_scan_with_ids(

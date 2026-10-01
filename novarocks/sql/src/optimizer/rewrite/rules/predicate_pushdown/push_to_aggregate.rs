@@ -156,7 +156,9 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, pushable) else {
+        let Some(pushed_id) =
+            scalar_expr::combine_conjuncts(&mut arena, pushable, &ctx.control_view())?
+        else {
             return Ok(RewriteResult::Unchanged);
         };
         let new_child = OptExpr::new(
@@ -168,7 +170,12 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         let mut new_agg_expr = OptExpr::new(Operator::LogicalAggregate(agg), vec![new_child]);
         new_agg_expr.required_output_columns = aggregate_required_output_columns;
 
-        let result = wrap_remaining_filter_opt_scalar(new_agg_expr, remaining, &mut arena);
+        let result = wrap_remaining_filter_opt_scalar(
+            new_agg_expr,
+            remaining,
+            &mut arena,
+            &ctx.control_view(),
+        )?;
         Ok(RewriteResult::Changed(result))
     }
 }
@@ -319,11 +326,25 @@ mod tests {
     }
 
     fn make_agg(arena: &mut ScalarArena, input: OptExpr) -> OptExpr {
-        let group_by = vec![intern_typed(arena, &col_typed_expr("a"))];
+        let group_by = vec![
+            intern_typed(
+                arena,
+                &col_typed_expr("a"),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
+        ];
         let count_spec = ScalarAggregateSpec {
             output_column_id: test_col_id("sum_b"),
             name: "sum".into(),
-            args: vec![intern_typed(arena, &col_typed_expr("b"))],
+            args: vec![
+                intern_typed(
+                    arena,
+                    &col_typed_expr("b"),
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap(),
+            ],
             distinct: false,
             order_by: vec![],
             resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
@@ -360,7 +381,12 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = make_scan(&mut arena);
         let agg = make_agg(&mut arena, scan);
-        let filter_pred = intern_typed(&mut arena, &eq_expr(col_typed_expr("a"), int_lit_expr(1)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(col_typed_expr("a"), int_lit_expr(1)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -409,7 +435,9 @@ mod tests {
         let filter_pred = intern_typed(
             &mut arena,
             &eq_expr(col_typed_expr("sum_b"), int_lit_expr(100)),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -443,7 +471,12 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = make_scan(&mut arena);
         let agg = make_agg(&mut arena, scan);
-        let filter_pred = intern_typed(&mut arena, &eq_expr(int_lit_expr(1), int_lit_expr(1)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(int_lit_expr(1), int_lit_expr(1)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -476,7 +509,12 @@ mod tests {
         let scan = make_scan(&mut arena);
         let repeat = make_repeat(scan);
         let agg = make_agg(&mut arena, repeat);
-        let filter_pred = intern_typed(&mut arena, &eq_expr(col_typed_expr("a"), int_lit_expr(1)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(col_typed_expr("a"), int_lit_expr(1)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,

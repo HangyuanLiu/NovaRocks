@@ -51,7 +51,7 @@ impl<'a> CteWork<'a> {
     fn finish(self) -> Result<(), SqlCompileError> {
         self.checkpoints.finish().map_err(SqlCompileError::from)
     }
-    // Scalar interning and nested Arrow comparisons/operator payload clones remain opaque
+    // Nested Arrow comparisons/operator payload clones remain opaque
     // owner operations. These observations do not prove internal cooperation.
     fn opaque<T>(&mut self, operation: impl FnOnce() -> T) -> Result<T, SqlCompileError> {
         self.control.checkpoint(CompilePhase::Validate, 0)?;
@@ -399,15 +399,19 @@ fn adapt_opt_expr_output_with_qualifier(
                 target.name, source.value_type.nullable, target.value_type.nullable
             )));
         }
+        work.opaque(|| {
+            scalars.remember_source_column_display(source.column_id, None, source.name.clone())
+        })?;
+        work.checkpoints.flush()?;
+        let expr = scalars.intern_observed(
+            ScalarNode::ColumnRef(source.column_id),
+            novarocks_type_contract::FunctionValueType {
+                nullable: target.value_type.nullable,
+                ..source.value_type.clone()
+            },
+            work.control,
+        )?;
         items.push(work.opaque(|| {
-            scalars.remember_source_column_display(source.column_id, None, source.name.clone());
-            let expr = scalars.intern(
-                ScalarNode::ColumnRef(source.column_id),
-                novarocks_type_contract::FunctionValueType {
-                    nullable: target.value_type.nullable,
-                    ..source.value_type.clone()
-                },
-            );
             let expr_display = Some(ColumnDisplay {
                 qualifier: None,
                 column: source.name.clone(),
@@ -479,15 +483,19 @@ fn adapt_cte_replacement_output_with_qualifier(
                 target.name, source.value_type.nullable, target.value_type.nullable
             )));
         }
+        work.opaque(|| {
+            scalars.remember_source_column_display(source.column_id, None, source.name.clone())
+        })?;
+        work.checkpoints.flush()?;
+        let expr = scalars.intern_observed(
+            ScalarNode::ColumnRef(source.column_id),
+            novarocks_type_contract::FunctionValueType {
+                nullable: target.value_type.nullable,
+                ..source.value_type.clone()
+            },
+            work.control,
+        )?;
         items.push(work.opaque(|| {
-            scalars.remember_source_column_display(source.column_id, None, source.name.clone());
-            let expr = scalars.intern(
-                ScalarNode::ColumnRef(source.column_id),
-                novarocks_type_contract::FunctionValueType {
-                    nullable: target.value_type.nullable,
-                    ..source.value_type.clone()
-                },
-            );
             let expr_display = Some(ColumnDisplay {
                 qualifier: None,
                 column: source.name.clone(),
@@ -1149,5 +1157,66 @@ mod tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(ctx.consume_count.get(&1), Some(&1));
         assert!(matches!(output.op, Operator::LogicalProject(_)));
+    }
+
+    #[test]
+    fn cte_actual_replacement_insertion_propagates_original_control_without_publishing_id() {
+        use novarocks_type_contract::CompileControlError;
+        struct RefuseSecondPositive {
+            error: CompileControlError,
+            observations: std::sync::Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for RefuseSecondPositive {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                let mut observations = self.observations.lock().unwrap();
+                observations.push(units);
+                if units > 0 && observations.iter().filter(|units| **units > 0).count() == 2 {
+                    Err(self.error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let columns = output_columns();
+            let input = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: columns.clone(),
+            }));
+            let control = RefuseSecondPositive {
+                error,
+                observations: Default::default(),
+            };
+            let mut work = CteWork::try_new(&control).unwrap();
+            let mut arena = scalar_arena();
+            let failure = adapt_cte_replacement_output_with_qualifier(
+                input,
+                &columns,
+                &[columns[0].column_id],
+                Some("c"),
+                &mut arena,
+                &mut work,
+            )
+            .unwrap_err();
+            assert_eq!(failure, SqlCompileError::from(error));
+            // Mapping work is flushed before the actual interner starts;
+            // its positive tail is the next observation that refuses.
+            let observations = control.observations.lock().unwrap();
+            assert!(observations.last().is_some_and(|units| *units > 0));
+            assert_eq!(observations.iter().filter(|units| **units > 0).count(), 2);
+            let first = arena.intern(
+                ScalarNode::ColumnRef(columns[0].column_id),
+                columns[0].value_type.clone(),
+            );
+            let expected = scalar_arena().intern(
+                ScalarNode::ColumnRef(columns[0].column_id),
+                columns[0].value_type.clone(),
+            );
+            assert_eq!(first, expected);
+        }
     }
 }

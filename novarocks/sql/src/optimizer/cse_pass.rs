@@ -28,6 +28,7 @@ use arrow::datatypes::DataType;
 
 use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::common::OutputColumn;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::cost::{CostInput, CostOptions, broadcast_decision, compute_cost_estimate};
 use crate::optimizer::operator::{Operator, ScalarProjectItem};
 use crate::optimizer::optimized_tree::{OptimizedOperatorNode, OptimizerExplainStats};
@@ -36,6 +37,7 @@ use crate::optimizer::property::PhysicalPropertySet;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::scalar_expr;
 use crate::optimizer::statistics::Statistics;
+use novarocks_type_contract::{CompilePhase, PureCompileControl};
 
 /// Stable rule name for `SET disable_optimizer_rules`.
 pub(crate) const CSE_RULE: &str = "CommonSubexpressionReuse";
@@ -46,13 +48,31 @@ pub(crate) fn rewrite(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     options: &OptimizerOptions,
-) {
-    if !options.is_enabled(CSE_RULE) {
-        return;
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    // Candidate discovery/tree cloning remains legacy opaque work; every
+    // actual scalar insertion delegates to its observed owner below.
+    let result = (|| -> Result<(), SqlCompileError> {
+        if !options.is_enabled(CSE_RULE) {
+            return Ok(());
+        }
+        let max_existing = max_existing_column_id(root);
+        factory.reserve_until(max_existing.saturating_add(1));
+        rewrite_node(root, scalars, factory, &options.cost_options, control)?;
+
+        Ok(())
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
-    let max_existing = max_existing_column_id(root);
-    factory.reserve_until(max_existing.saturating_add(1));
-    rewrite_node(root, scalars, factory, &options.cost_options);
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    result
 }
 
 fn max_existing_column_id(node: &OptimizedOperatorNode) -> u32 {
@@ -86,27 +106,37 @@ fn rewrite_node(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     for child in &mut node.children {
-        rewrite_node(child, scalars, factory, cost_options);
+        rewrite_node(child, scalars, factory, cost_options, control)?;
     }
     match &node.op {
-        Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory, cost_options),
-        Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory, cost_options),
+        Operator::PhysicalProject(_) => {
+            rewrite_project(node, scalars, factory, cost_options, control)?
+        }
+        Operator::PhysicalFilter(_) => {
+            rewrite_filter(node, scalars, factory, cost_options, control)?
+        }
         Operator::PhysicalHashAggregate(_) => {
-            rewrite_aggregate(node, scalars, factory, cost_options)
+            rewrite_aggregate(node, scalars, factory, cost_options, control)?
         }
         Operator::PhysicalHashJoin(_) | Operator::PhysicalNestLoopJoin(_) => {
-            rewrite_join(node, scalars, factory, cost_options)
+            rewrite_join(node, scalars, factory, cost_options, control)?
         }
-        Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory, cost_options),
-        Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory, cost_options),
-        Operator::PhysicalWindow(_) => rewrite_window(node, scalars, factory, cost_options),
+        Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory, cost_options, control)?,
+        Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory, cost_options, control)?,
+        Operator::PhysicalWindow(_) => {
+            rewrite_window(node, scalars, factory, cost_options, control)?
+        }
         Operator::PhysicalChangeEventExpand(_) => {
-            rewrite_change_event_expand(node, scalars, factory, cost_options)
+            rewrite_change_event_expand(node, scalars, factory, cost_options, control)?
         }
         _ => {}
     }
+
+    Ok(())
 }
 
 fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
@@ -326,7 +356,7 @@ fn record_first_seen(
 fn collect_column_refs(
     scalars: &ScalarArena,
     roots: &[ScalarId],
-) -> Vec<(ColumnId, DataType, bool)> {
+) -> Vec<(ColumnId, novarocks_type_contract::FunctionValueType)> {
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
     for &root in roots {
@@ -339,16 +369,12 @@ fn collect_column_refs_inner(
     scalars: &ScalarArena,
     id: ScalarId,
     seen: &mut HashSet<ColumnId>,
-    refs: &mut Vec<(ColumnId, DataType, bool)>,
+    refs: &mut Vec<(ColumnId, novarocks_type_contract::FunctionValueType)>,
 ) {
     match scalars.node(id) {
         ScalarNode::ColumnRef(column_id) => {
             if seen.insert(*column_id) {
-                refs.push((
-                    *column_id,
-                    scalars.data_type(id).clone(),
-                    scalars.nullable(id),
-                ));
+                refs.push((*column_id, scalars.value_type(id).clone()));
             }
         }
         ScalarNode::BinaryOp { left, right, .. } => {
@@ -433,14 +459,15 @@ fn substitute(
     scalars: &mut ScalarArena,
     id: ScalarId,
     subst: &HashMap<ScalarId, ScalarId>,
-) -> ScalarId {
+    control: &dyn PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     if let Some(&replacement) = subst.get(&id) {
-        return replacement;
+        return Ok(replacement);
     }
 
     let node = scalars.node(id).clone();
-    let data_type = scalars.data_type(id).clone();
-    let nullable = scalars.nullable(id);
+    let value_type = scalars.value_type(id).clone();
     let rewritten = match node {
         ScalarNode::BinaryOp {
             op,
@@ -449,13 +476,13 @@ fn substitute(
             decimal_overflow_policy,
         } => ScalarNode::BinaryOp {
             op,
-            left: substitute(scalars, left, subst),
-            right: substitute(scalars, right, subst),
+            left: substitute(scalars, left, subst, control)?,
+            right: substitute(scalars, right, subst, control)?,
             decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
-            child: substitute(scalars, child, subst),
+            child: substitute(scalars, child, subst, control)?,
         },
         ScalarNode::FunctionCall {
             name,
@@ -467,8 +494,8 @@ fn substitute(
             name,
             args: args
                 .into_iter()
-                .map(|arg| substitute(scalars, arg, subst))
-                .collect(),
+                .map(|arg| substitute(scalars, arg, subst, control))
+                .collect::<Result<Vec<_>, SqlCompileError>>()?,
             distinct,
             binding,
             volatility,
@@ -483,16 +510,16 @@ fn substitute(
             name,
             args: args
                 .into_iter()
-                .map(|arg| substitute(scalars, arg, subst))
-                .collect(),
+                .map(|arg| substitute(scalars, arg, subst, control))
+                .collect::<Result<Vec<_>, SqlCompileError>>()?,
             distinct,
             order_by: order_by
                 .into_iter()
                 .map(|mut key| {
-                    key.expr = substitute(scalars, key.expr, subst);
-                    key
+                    key.expr = substitute(scalars, key.expr, subst, control)?;
+                    Ok(key)
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, SqlCompileError>>()?,
             resolved,
         },
         ScalarNode::Cast {
@@ -500,12 +527,12 @@ fn substitute(
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            child: substitute(scalars, child, subst),
+            child: substitute(scalars, child, subst, control)?,
             target,
             decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
-            child: substitute(scalars, child, subst),
+            child: substitute(scalars, child, subst, control)?,
             negated,
         },
         ScalarNode::InList {
@@ -513,11 +540,11 @@ fn substitute(
             list,
             negated,
         } => ScalarNode::InList {
-            child: substitute(scalars, child, subst),
+            child: substitute(scalars, child, subst, control)?,
             list: list
                 .into_iter()
-                .map(|item| substitute(scalars, item, subst))
-                .collect(),
+                .map(|item| substitute(scalars, item, subst, control))
+                .collect::<Result<Vec<_>, SqlCompileError>>()?,
             negated,
         },
         ScalarNode::Between {
@@ -526,9 +553,9 @@ fn substitute(
             high,
             negated,
         } => ScalarNode::Between {
-            child: substitute(scalars, child, subst),
-            low: substitute(scalars, low, subst),
-            high: substitute(scalars, high, subst),
+            child: substitute(scalars, child, subst, control)?,
+            low: substitute(scalars, low, subst, control)?,
+            high: substitute(scalars, high, subst, control)?,
             negated,
         },
         ScalarNode::Like {
@@ -536,8 +563,8 @@ fn substitute(
             pattern,
             negated,
         } => ScalarNode::Like {
-            child: substitute(scalars, child, subst),
-            pattern: substitute(scalars, pattern, subst),
+            child: substitute(scalars, child, subst, control)?,
+            pattern: substitute(scalars, pattern, subst, control)?,
             negated,
         },
         ScalarNode::Case {
@@ -545,60 +572,60 @@ fn substitute(
             when_then,
             else_expr,
         } => ScalarNode::Case {
-            operand: operand.map(|operand| substitute(scalars, operand, subst)),
+            operand: operand
+                .map(|operand| substitute(scalars, operand, subst, control))
+                .transpose()?,
             when_then: when_then
                 .into_iter()
                 .map(|(when, then)| {
-                    (
-                        substitute(scalars, when, subst),
-                        substitute(scalars, then, subst),
-                    )
+                    Ok((
+                        substitute(scalars, when, subst, control)?,
+                        substitute(scalars, then, subst, control)?,
+                    ))
                 })
-                .collect(),
-            else_expr: else_expr.map(|else_expr| substitute(scalars, else_expr, subst)),
+                .collect::<Result<Vec<_>, SqlCompileError>>()?,
+            else_expr: else_expr
+                .map(|else_expr| substitute(scalars, else_expr, subst, control))
+                .transpose()?,
         },
         ScalarNode::IsTruthValue {
             child,
             value,
             negated,
         } => ScalarNode::IsTruthValue {
-            child: substitute(scalars, child, subst),
+            child: substitute(scalars, child, subst, control)?,
             value,
             negated,
         },
-        ScalarNode::Nested(child) => ScalarNode::Nested(substitute(scalars, child, subst)),
+        ScalarNode::Nested(child) => {
+            ScalarNode::Nested(substitute(scalars, child, subst, control)?)
+        }
         ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
-        | ScalarNode::LambdaFunction { .. } => return id,
+        | ScalarNode::LambdaFunction { .. } => return Ok(id),
     };
 
-    scalars.intern(
-        rewritten,
-        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-    )
+    scalars.intern_observed(rewritten, value_type, control)
 }
 
 fn build_commons(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     commons: &[ScalarId],
-) -> (Vec<ScalarProjectItem>, HashMap<ScalarId, ScalarId>) {
+    control: &dyn PureCompileControl,
+) -> Result<(Vec<ScalarProjectItem>, HashMap<ScalarId, ScalarId>), SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     let mut items = Vec::with_capacity(commons.len());
     let mut subst = HashMap::new();
 
     for &common in commons {
         let expr = common;
-        let data_type = scalars.data_type(common).clone();
-        let nullable = scalars.nullable(common);
+        let value_type = scalars.value_type(common).clone();
         let output_name = format!("__cse_{}", items.len());
-        let output_column_id = factory.create(
-            None,
-            output_name.clone(),
-            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
-        );
+        let output_column_id = factory.create(None, output_name.clone(), value_type.clone());
         scalars.remember_project_output_display(output_column_id, None, output_name.clone());
         items.push(ScalarProjectItem {
             expr,
@@ -607,14 +634,15 @@ fn build_commons(
             expr_display: None,
         });
 
-        let replacement = scalars.intern(
+        let replacement = scalars.intern_observed(
             ScalarNode::ColumnRef(output_column_id),
-            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-        );
+            value_type,
+            control,
+        )?;
         subst.insert(common, replacement);
     }
 
-    (items, subst)
+    Ok((items, subst))
 }
 
 fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectItem) -> OutputColumn {
@@ -807,7 +835,7 @@ fn prelude_binds_to_outputs(
     let roots = prelude.iter().map(|item| item.expr).collect::<Vec<_>>();
     collect_column_refs(scalars, &roots)
         .into_iter()
-        .all(|(column_id, _, _)| available.contains(&column_id))
+        .all(|(column_id, _)| available.contains(&column_id))
 }
 
 fn synthetic_project_explain_stats(
@@ -878,7 +906,8 @@ fn wrap_project_around_child(
     prelude: Vec<ScalarProjectItem>,
     scalars: &mut ScalarArena,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     let original = child.clone();
     let available = available_output_ids(&original);
     let mut passthrough_columns = original
@@ -898,10 +927,11 @@ fn wrap_project_around_child(
     }
     let mut items = Vec::with_capacity(passthrough_columns.len() + prelude.len());
     for column in &passthrough_columns {
-        let expr = scalars.intern(
+        let expr = scalars.intern_observed(
             ScalarNode::ColumnRef(column.column_id),
             column.value_type.clone(),
-        );
+            control,
+        )?;
         items.push(ScalarProjectItem {
             expr,
             output_name: column.name.clone(),
@@ -940,6 +970,8 @@ fn wrap_project_around_child(
         execution_props,
         children: vec![original],
     };
+
+    Ok(())
 }
 
 fn insert_or_reuse_project_below(
@@ -947,9 +979,10 @@ fn insert_or_reuse_project_below(
     prelude: Vec<ScalarProjectItem>,
     scalars: &mut ScalarArena,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if prelude.is_empty() {
-        return;
+        return Ok(());
     }
 
     let can_reuse_project = match &child.op {
@@ -975,10 +1008,12 @@ fn insert_or_reuse_project_below(
             scalars,
             cost_options,
         );
-        return;
+        return Ok(());
     }
 
-    wrap_project_around_child(child, prelude, scalars, cost_options);
+    wrap_project_around_child(child, prelude, scalars, cost_options, control)?;
+
+    Ok(())
 }
 
 fn output_column_set(node: &OptimizedOperatorNode) -> HashSet<ColumnId> {
@@ -1003,9 +1038,10 @@ fn rewrite_project(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     let Operator::PhysicalProject(project) = &node.op else {
-        return;
+        return Ok(());
     };
     let roots = project
         .items
@@ -1014,46 +1050,47 @@ fn rewrite_project(
         .collect::<Vec<_>>();
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalProject(project) = &mut node.op else {
         unreachable!("checked project operator above");
     };
     for item in &mut project.items {
-        item.expr = substitute(scalars, item.expr, &subst);
+        item.expr = substitute(scalars, item.expr, &subst, control)?;
     }
 
     let input_refs = collect_column_refs(scalars, &roots);
     let child = node.children.remove(0);
     let mut child_project_items = input_refs
         .iter()
-        .map(|&(column_id, ref data_type, nullable)| {
-            let expr = scalars.intern(
+        .map(|&(column_id, ref value_type)| {
+            let expr = scalars.intern_observed(
                 ScalarNode::ColumnRef(column_id),
-                novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
-            );
+                value_type.clone(),
+                control,
+            )?;
             let child_column = child
                 .output_columns
                 .iter()
                 .find(|column| column.column_id == column_id);
-            ScalarProjectItem {
+            Ok(ScalarProjectItem {
                 expr,
                 output_name: child_column
                     .map(|column| column.name.clone())
                     .unwrap_or_else(|| column_id.to_string()),
                 output_column_id: column_id,
                 expr_display: None,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, SqlCompileError>>()?;
     let mut child_project_output_columns = input_refs
         .iter()
-        .map(|&(column_id, ref data_type, nullable)| {
+        .map(|&(column_id, ref value_type)| {
             let child_column = child
                 .output_columns
                 .iter()
@@ -1063,14 +1100,9 @@ fn rewrite_project(
                 name: child_column
                     .map(|column| column.name.clone())
                     .unwrap_or_else(|| column_id.to_string()),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    child_column
-                        .map(|column| column.value_type.data_type.clone())
-                        .unwrap_or_else(|| data_type.clone()),
-                    child_column
-                        .map(|column| column.value_type.nullable)
-                        .unwrap_or(nullable),
-                ),
+                value_type: child_column
+                    .map(|column| column.value_type.clone())
+                    .unwrap_or_else(|| value_type.clone()),
 
                 is_internal: child_column
                     .map(|column| column.is_internal)
@@ -1111,6 +1143,8 @@ fn rewrite_project(
     };
     node.children.push(cse_project);
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_filter(
@@ -1118,26 +1152,35 @@ fn rewrite_filter(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     let Operator::PhysicalFilter(filter) = &node.op else {
-        return;
+        return Ok(());
     };
     let roots = [filter.predicate];
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalFilter(filter) = &mut node.op else {
         unreachable!("checked filter operator above");
     };
-    filter.predicate = substitute(scalars, filter.predicate, &subst);
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    filter.predicate = substitute(scalars, filter.predicate, &subst, control)?;
+    insert_or_reuse_project_below(
+        &mut node.children[0],
+        prelude,
+        scalars,
+        cost_options,
+        control,
+    )?;
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_aggregate(
@@ -1145,12 +1188,13 @@ fn rewrite_aggregate(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
     let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
-        return;
+        return Ok(());
     };
     let mut roots = aggregate.group_by.clone();
     for (index, spec) in aggregate.aggregates.iter().enumerate() {
@@ -1162,15 +1206,15 @@ fn rewrite_aggregate(
     }
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalHashAggregate(aggregate) = &mut node.op else {
         unreachable!("checked aggregate operator above");
     };
     for group_by in &mut aggregate.group_by {
-        *group_by = substitute(scalars, *group_by, &subst);
+        *group_by = substitute(scalars, *group_by, &subst, control)?;
     }
     let is_merge = aggregate.is_merge.clone();
     for (index, spec) in aggregate.aggregates.iter_mut().enumerate() {
@@ -1178,14 +1222,22 @@ fn rewrite_aggregate(
             continue;
         }
         for arg in &mut spec.args {
-            *arg = substitute(scalars, *arg, &subst);
+            *arg = substitute(scalars, *arg, &subst, control)?;
         }
         for key in &mut spec.order_by {
-            key.expr = substitute(scalars, key.expr, &subst);
+            key.expr = substitute(scalars, key.expr, &subst, control)?;
         }
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    insert_or_reuse_project_below(
+        &mut node.children[0],
+        prelude,
+        scalars,
+        cost_options,
+        control,
+    )?;
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_join(
@@ -1193,17 +1245,18 @@ fn rewrite_join(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if node.children.len() != 2 {
-        return;
+        return Ok(());
     }
     let condition = match &node.op {
         Operator::PhysicalHashJoin(join) => join.other_condition,
         Operator::PhysicalNestLoopJoin(join) => join.condition,
-        _ => return,
+        _ => return Ok(()),
     };
     let Some(condition) = condition else {
-        return;
+        return Ok(());
     };
 
     let left_columns = output_column_set(&node.children[0]);
@@ -1222,27 +1275,41 @@ fn rewrite_join(
         }
     }
     if left_commons.is_empty() && right_commons.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut subst = HashMap::new();
     if !left_commons.is_empty() {
-        let (prelude, side_subst) = build_commons(scalars, factory, &left_commons);
+        let (prelude, side_subst) = build_commons(scalars, factory, &left_commons, control)?;
         subst.extend(side_subst);
-        insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+        insert_or_reuse_project_below(
+            &mut node.children[0],
+            prelude,
+            scalars,
+            cost_options,
+            control,
+        )?;
     }
     if !right_commons.is_empty() {
-        let (prelude, side_subst) = build_commons(scalars, factory, &right_commons);
+        let (prelude, side_subst) = build_commons(scalars, factory, &right_commons, control)?;
         subst.extend(side_subst);
-        insert_or_reuse_project_below(&mut node.children[1], prelude, scalars, cost_options);
+        insert_or_reuse_project_below(
+            &mut node.children[1],
+            prelude,
+            scalars,
+            cost_options,
+            control,
+        )?;
     }
-    let new_condition = substitute(scalars, condition, &subst);
+    let new_condition = substitute(scalars, condition, &subst, control)?;
     match &mut node.op {
         Operator::PhysicalHashJoin(join) => join.other_condition = Some(new_condition),
         Operator::PhysicalNestLoopJoin(join) => join.condition = Some(new_condition),
         _ => unreachable!("checked join operator above"),
     }
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_sort(
@@ -1250,32 +1317,41 @@ fn rewrite_sort(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
     let Operator::PhysicalSort(sort) = &node.op else {
-        return;
+        return Ok(());
     };
     let mut roots = sort.items.iter().map(|key| key.expr).collect::<Vec<_>>();
     roots.extend(sort.analytic_partition_exprs.iter().copied());
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalSort(sort) = &mut node.op else {
         unreachable!("checked sort operator above");
     };
     for key in &mut sort.items {
-        key.expr = substitute(scalars, key.expr, &subst);
+        key.expr = substitute(scalars, key.expr, &subst, control)?;
     }
     for expr in &mut sort.analytic_partition_exprs {
-        *expr = substitute(scalars, *expr, &subst);
+        *expr = substitute(scalars, *expr, &subst, control)?;
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    insert_or_reuse_project_below(
+        &mut node.children[0],
+        prelude,
+        scalars,
+        cost_options,
+        control,
+    )?;
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_topn(
@@ -1283,28 +1359,37 @@ fn rewrite_topn(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
     let Operator::PhysicalTopN(topn) = &node.op else {
-        return;
+        return Ok(());
     };
     let roots = topn.items.iter().map(|key| key.expr).collect::<Vec<_>>();
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalTopN(topn) = &mut node.op else {
         unreachable!("checked topn operator above");
     };
     for key in &mut topn.items {
-        key.expr = substitute(scalars, key.expr, &subst);
+        key.expr = substitute(scalars, key.expr, &subst, control)?;
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    insert_or_reuse_project_below(
+        &mut node.children[0],
+        prelude,
+        scalars,
+        cost_options,
+        control,
+    )?;
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_window(
@@ -1312,12 +1397,13 @@ fn rewrite_window(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
     let Operator::PhysicalWindow(window) = &node.op else {
-        return;
+        return Ok(());
     };
     let mut roots = Vec::new();
     for spec in &window.window_exprs {
@@ -1327,26 +1413,34 @@ fn rewrite_window(
     }
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalWindow(window) = &mut node.op else {
         unreachable!("checked window operator above");
     };
     for spec in &mut window.window_exprs {
         for arg in &mut spec.args {
-            *arg = substitute(scalars, *arg, &subst);
+            *arg = substitute(scalars, *arg, &subst, control)?;
         }
         for partition in &mut spec.partition_by {
-            *partition = substitute(scalars, *partition, &subst);
+            *partition = substitute(scalars, *partition, &subst, control)?;
         }
         for key in &mut spec.order_by {
-            key.expr = substitute(scalars, key.expr, &subst);
+            key.expr = substitute(scalars, key.expr, &subst, control)?;
         }
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    insert_or_reuse_project_below(
+        &mut node.children[0],
+        prelude,
+        scalars,
+        cost_options,
+        control,
+    )?;
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
+
+    Ok(())
 }
 
 fn rewrite_change_event_expand(
@@ -1354,12 +1448,13 @@ fn rewrite_change_event_expand(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
     cost_options: &CostOptions,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
     if node.children.len() != 1 {
-        return;
+        return Ok(());
     }
     let Operator::PhysicalChangeEventExpand(expand) = &node.op else {
-        return;
+        return Ok(());
     };
     let mut roots = Vec::new();
     for event in &expand.events {
@@ -1373,24 +1468,32 @@ fn rewrite_change_event_expand(
     }
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
     let Operator::PhysicalChangeEventExpand(expand) = &mut node.op else {
         unreachable!("checked change-event expand operator above");
     };
     for event in &mut expand.events {
         if let Some(predicate) = event.predicate {
-            event.predicate = Some(substitute(scalars, predicate, &subst));
+            event.predicate = Some(substitute(scalars, predicate, &subst, control)?);
         }
         for assignment in &mut event.assignments {
             if let Some(expr) = assignment.expr {
-                assignment.expr = Some(substitute(scalars, expr, &subst));
+                assignment.expr = Some(substitute(scalars, expr, &subst, control)?);
             }
         }
     }
-    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars, cost_options);
+    insert_or_reuse_project_below(
+        &mut node.children[0],
+        prelude,
+        scalars,
+        cost_options,
+        control,
+    )?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1799,7 +1902,13 @@ mod tests {
         subst.insert(a_plus_b, cse_ref);
 
         let root = add(&mut arena, a_plus_b, a);
-        let rewritten = super::substitute(&mut arena, root, &subst);
+        let rewritten = super::substitute(
+            &mut arena,
+            root,
+            &subst,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         match arena.node(rewritten) {
             ScalarNode::BinaryOp { left, right, .. } => {
@@ -1825,7 +1934,13 @@ mod tests {
         let a_plus_b = add(&mut arena, a, b);
         let doubled = add(&mut arena, a_plus_b, a_plus_b);
 
-        let (items, subst) = super::build_commons(&mut arena, &mut factory, &[a_plus_b, doubled]);
+        let (items, subst) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[a_plus_b, doubled],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_eq!(items.len(), 2);
         let first_cse = items[0].output_column_id;
@@ -1865,7 +1980,7 @@ mod tests {
 
         assert_eq!(
             refs.into_iter()
-                .map(|(column_id, _, _)| column_id)
+                .map(|(column_id, _)| column_id)
                 .collect::<Vec<_>>(),
             vec![ColumnId(1)]
         );
@@ -1923,7 +2038,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(project) = &node.op else {
             panic!("expected physical project");
@@ -1998,7 +2115,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_eq!(
             factory.peek_next_id(),
@@ -2035,7 +2154,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_eq!(
             factory.peek_next_id(),
@@ -2092,7 +2213,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project");
@@ -2177,7 +2300,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_eq!(
             node.children[0]
@@ -2196,7 +2321,13 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
-        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let (prelude, _) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[a_plus_b],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let child = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
@@ -2227,7 +2358,9 @@ mod tests {
             prelude,
             &mut arena,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(project) = &parent.children[0].op else {
             panic!("expected inserted physical project");
@@ -2259,7 +2392,13 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
-        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let (prelude, _) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[a_plus_b],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let values = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
@@ -2294,7 +2433,9 @@ mod tests {
             prelude,
             &mut arena,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(project) = &stale_filter.op else {
             panic!("expected inserted physical project");
@@ -2324,7 +2465,13 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
-        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let (prelude, _) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[a_plus_b],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let mut repeat = OptimizedOperatorNode {
             op: Operator::PhysicalRepeat(RepeatOp {
@@ -2353,7 +2500,9 @@ mod tests {
             prelude,
             &mut arena,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(project) = &repeat.op else {
             panic!("expected inserted project above repeat");
@@ -2402,7 +2551,13 @@ mod tests {
         let x = col(&mut arena, 201);
         let y = col(&mut arena, 202);
         let x_plus_y = add(&mut arena, x, y);
-        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[x_plus_y]);
+        let (prelude, _) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[x_plus_y],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let values = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
@@ -2431,7 +2586,9 @@ mod tests {
             prelude,
             &mut arena,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(outer_project) = &child_project.op else {
             panic!("expected outer wrapper project");
@@ -2472,7 +2629,13 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
-        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let (prelude, _) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[a_plus_b],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let values = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
@@ -2501,7 +2664,9 @@ mod tests {
             prelude,
             &mut arena,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(project) = &child_project.op else {
             panic!("expected reused physical project");
@@ -2600,7 +2765,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project");
@@ -2702,7 +2869,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(_) = &node.children[0].op else {
             panic!("expected inserted CSE project");
@@ -2768,7 +2937,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(outer_project) = &node.children[0].op else {
             panic!("expected outer CSE project");
@@ -2888,7 +3059,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below aggregate");
@@ -3003,7 +3176,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below aggregate");
@@ -3086,7 +3261,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
@@ -3163,7 +3340,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below aggregate");
@@ -3214,7 +3393,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below sort");
@@ -3266,7 +3447,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below topn");
@@ -3335,7 +3518,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
             panic!("expected inserted CSE project below window");
@@ -3396,7 +3581,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let Operator::PhysicalProject(left_project) = &node.children[0].op else {
             panic!("expected CSE project on left child");
@@ -3475,7 +3662,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         let Operator::PhysicalProject(right_project) = &node.children[1].op else {
@@ -3538,7 +3727,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
@@ -3579,7 +3770,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
@@ -3652,7 +3845,9 @@ mod tests {
             &mut arena,
             &mut factory,
             &crate::optimizer::cost::CostOptions::default(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
         assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
@@ -3660,6 +3855,107 @@ mod tests {
             panic!("expected nested loop join");
         };
         assert_eq!(join.condition, Some(condition));
+    }
+    #[test]
+    fn cse_real_project_insertion_keeps_original_control_failure_and_no_scalar_publication() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct RefuseInsertion(CompileControlError, std::sync::Mutex<Vec<u32>>);
+        impl PureCompileControl for RefuseInsertion {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                self.1.lock().unwrap().push(units);
+                if units > 0 { Err(self.0) } else { Ok(()) }
+            }
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut arena = ScalarArena::new();
+            let a = col(&mut arena, 101);
+            let b = col(&mut arena, 102);
+            let repeated = add(&mut arena, a, b);
+            let doubled = add(&mut arena, repeated, repeated);
+            let mut node = OptimizedOperatorNode {
+                op: Operator::PhysicalProject(ProjectOp {
+                    items: vec![
+                        project_item(repeated, 110, "x"),
+                        project_item(doubled, 111, "y"),
+                    ],
+                    output_qualifier: None,
+                }),
+                children: vec![values_node(vec![
+                    output_column(101, "a"),
+                    output_column(102, "b"),
+                ])],
+                stats: Statistics::default(),
+                explain_stats: OptimizerExplainStats::default(),
+                output_columns: vec![output_column(110, "x"), output_column(111, "y")],
+                execution_props: PlanExecutionProps::default(),
+            };
+            let mut expected_arena = arena.clone();
+            let control = RefuseInsertion(error, Default::default());
+            let failure = super::rewrite(
+                &mut node,
+                &mut arena,
+                &mut ColumnRefFactory::new(),
+                &crate::optimizer::options::OptimizerOptions::default_settings(),
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(failure, crate::compiler::SqlCompileError::from(error));
+            // The positive observation comes from actual scalar interning,
+            // after discovery selected the repeated arithmetic expression.
+            let observations = control.1.lock().unwrap();
+            assert!(observations.last().is_some_and(|units| *units > 0));
+            assert_eq!(observations.iter().filter(|units| **units > 0).count(), 1);
+            assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
+            let Operator::PhysicalProject(project) = &node.op else {
+                panic!("project must remain")
+            };
+            assert_eq!(project.items[0].expr, repeated);
+            assert_eq!(project.items[1].expr, doubled);
+            let next = col(&mut arena, 999);
+            assert_eq!(next, col(&mut expected_arena, 999));
+        }
+    }
+
+    #[test]
+    fn cse_replacement_and_passthrough_keep_complete_source_value_domain() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let mut arena = ScalarArena::new();
+        let source_type = FunctionValueType {
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: ValueLogicalType::Json,
+        };
+        let source = arena.intern(ScalarNode::ColumnRef(ColumnId(41)), source_type.clone());
+        let nested = arena.intern(ScalarNode::Nested(source), source_type.clone());
+        let mut factory = ColumnRefFactory::new();
+        factory.reserve_until(42);
+        let (items, substitutions) = super::build_commons(
+            &mut arena,
+            &mut factory,
+            &[nested],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let replacement = substitutions[&nested];
+        assert_eq!(arena.value_type(replacement), &source_type);
+        assert_eq!(
+            super::output_column_for_project_item(&arena, &items[0]).value_type,
+            source_type
+        );
+        let refs = super::collect_column_refs(&arena, &[nested]);
+        assert_eq!(refs, vec![(ColumnId(41), source_type.clone())]);
+        let rewritten = super::substitute(
+            &mut arena,
+            nested,
+            &std::collections::HashMap::new(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        assert_eq!(arena.value_type(rewritten), &source_type);
     }
 }
 

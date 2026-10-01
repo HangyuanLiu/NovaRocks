@@ -1428,7 +1428,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let right = intern_typed(
             arena,
             &crate::analysis::TypedExpr {
@@ -1440,7 +1442,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         OptimizerPhysicalHashJoinEqCondition {
             left,
             right,
@@ -2181,7 +2185,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut op = scan_op();
         let Operator::PhysicalScan(scan) = &mut op else {
             panic!("expected scan");
@@ -2238,7 +2244,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut op = two_column_scan_op(Some(vec!["narrow"]));
         let Operator::PhysicalScan(scan) = &mut op else {
             panic!("expected scan");
@@ -2328,7 +2336,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let input_stats = stats(1_000_000.0, 16.0);
         let output_stats = stats(10.0, 16.0);
         let op = Operator::PhysicalFilter(FilterOp { predicate });
@@ -3537,7 +3547,9 @@ mod tests {
                     false,
                 ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],

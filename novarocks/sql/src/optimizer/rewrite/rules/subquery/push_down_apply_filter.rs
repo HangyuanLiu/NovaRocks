@@ -64,7 +64,7 @@ impl LogicalRewriteRule for PushDownApplyFilter {
     ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena).map_err(SqlCompileError::Compilation)? {
+        match apply_expr(expr, &mut arena, &ctx.control_view())? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -85,7 +85,11 @@ fn matches_expr(expr: &OptExpr, arena: &ScalarArena) -> bool {
     inner_has_correlated_nonagg_filter(expr.right(), arena, &corr_ids)
 }
 
-fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+fn apply_expr(
+    expr: OptExpr,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -102,8 +106,9 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
     let corr_ids: HashSet<ColumnId> = apply.correlation_column_ids.iter().copied().collect();
 
     // Peel the optional leading Project and extract the filter node.
-    let peeled = peel_inner(right, arena, &corr_ids)
-        .ok_or_else(|| "PushDownApplyFilter: inner shape mismatch".to_string())?;
+    let peeled = peel_inner(right, arena, &corr_ids).ok_or_else(|| {
+        SqlCompileError::Compilation("PushDownApplyFilter: inner shape mismatch".to_string())
+    })?;
 
     // Split the Filter predicate into (correlated, residual).
     let predicate = peeled.filter.predicate;
@@ -114,9 +119,9 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
         return Ok(None);
     }
     if !all_binary_eq_opt(arena, &correlated) {
-        return Err(
+        return Err(SqlCompileError::Compilation(
             "non-EQ correlated predicate in correlated subquery is not supported".to_string(),
-        );
+        ));
     }
 
     // Require each correlated EQ conjunct's inner side to be a ColumnRef.
@@ -135,7 +140,7 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
     let new_filter_input = if residual.is_empty() {
         peeled.filter_input
     } else {
-        let Some(predicate) = scalar_utils::combine_and(arena, residual) else {
+        let Some(predicate) = scalar_utils::combine_and(arena, residual, control)? else {
             return Ok(None);
         };
         scalar_utils::filter(peeled.filter_input, predicate)

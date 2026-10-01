@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn unset_source_column_id_is_not_rewritten() {
-        // ColumnId::UNSET cannot be interned via intern_typed (it panics), so this
+        // ColumnId::UNSET cannot be interned via intern_typed (it panics, crate::optimizer::rewrite::context::unbounded_rewrite_test_control()).unwrap(), so this
         // test builds the OptExpr tree directly using arena.intern() to bypass that
         // guard, then verifies the rule returns Unchanged for UNSET source columns.
         use crate::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ScanOp};

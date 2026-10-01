@@ -15,6 +15,8 @@
 // limitations under the License.
 
 use arrow_schema::{DataType, Field, Schema};
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::Hasher;
 
 pub const MAX_ARROW_FIELD_NAME_BYTES: usize = 1024;
 pub const MAX_ARROW_FIELD_METADATA_ENTRIES: usize = 256;
@@ -121,16 +123,58 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         }
         Ok(true)
     }
+    fn key_hash(&mut self, key: &[u8]) -> Result<u64, E> {
+        (self.observe)()?;
+        let mut hash = DefaultHasher::new();
+        hash.write_usize(key.len());
+        for chunk in key.chunks(1024) {
+            (self.observe)()?;
+            hash.write(chunk);
+        }
+        Ok(hash.finish())
+    }
     fn metadata(&mut self, left: &Field, right: &Field) -> Result<bool, E> {
+        self.metadata_with_key_hash(left, right, Self::key_hash)
+    }
+    fn metadata_with_key_hash(
+        &mut self,
+        left: &Field,
+        right: &Field,
+        mut key_hash: impl FnMut(&mut Self, &[u8]) -> Result<u64, E>,
+    ) -> Result<bool, E> {
         if left.metadata().len() != right.metadata().len() {
             return Ok(false);
         }
+        if left.metadata().is_empty() {
+            return Ok(true);
+        }
+        // Fixed-size fingerprints only select borrowed candidates. Exact
+        // chunk comparisons retain unordered metadata equality even on a
+        // collision. Scratch bucket allocations still need host admission;
+        // neither key strings nor recursive field/type facts are copied.
+        let mut buckets: HashMap<u64, Vec<(&str, &str)>> = HashMap::new();
+        for (key, value) in right.metadata() {
+            let fingerprint = key_hash(self, key.as_bytes())?;
+            buckets.entry(fingerprint).or_default().push((key, value));
+        }
         for (key, value) in left.metadata() {
+            let fingerprint = key_hash(self, key.as_bytes())?;
             (self.observe)()?;
-            let Some(other) = right.metadata().get(key) else {
+            let Some(candidates) = buckets.get(&fingerprint) else {
                 return Ok(false);
             };
-            if !self.bytes(value.as_bytes(), other.as_bytes())? {
+            let mut matched = false;
+            for (other_key, other_value) in candidates {
+                (self.observe)()?;
+                if self.bytes(key.as_bytes(), other_key.as_bytes())? {
+                    if !self.bytes(value.as_bytes(), other_value.as_bytes())? {
+                        return Ok(false);
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
                 return Ok(false);
             }
         }
@@ -396,6 +440,109 @@ mod tests {
                 Err(Failure::Control(failure))
             );
             assert_eq!(*control.work.lock().unwrap(), [0, 256]);
+        }
+    }
+    #[test]
+    fn actual_long_metadata_key_hashing_preserves_control_at_first_quantum() {
+        let key = "k".repeat(320 * 1024);
+        let left = Field::new("x", DataType::Int64, false)
+            .with_metadata(HashMap::from([(key.clone(), "v".to_owned())]));
+        let right = Field::new("x", DataType::Int64, false)
+            .with_metadata(HashMap::from([(key, "v".to_owned())]));
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                failure: Some(failure),
+                work: Mutex::default(),
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let result = arrow_fields_exact_observed(&left, &right, || {
+                work.step().map_err(Failure::Control)
+            });
+            assert_eq!(result, Err(Failure::Control(failure)));
+            assert_eq!(*control.work.lock().unwrap(), [0, 256]);
+        }
+        assert_eq!(
+            arrow_fields_exact_observed::<std::convert::Infallible>(&left, &right, || Ok(())),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn borrowed_metadata_buckets_preserve_unordered_exact_equality() {
+        let field = |entries: &[(&str, &str)]| {
+            Field::new("x", DataType::Int64, false).with_metadata(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            )
+        };
+        let left = field(&[("a", "first"), ("b", "second"), ("c", "third")]);
+        let reordered = field(&[("c", "third"), ("b", "second"), ("a", "first")]);
+        let missing = field(&[("c", "third"), ("b", "second"), ("d", "first")]);
+        let changed = field(&[("c", "third"), ("b", "different"), ("a", "first")]);
+        for (right, expected) in [(&reordered, true), (&missing, false), (&changed, false)] {
+            assert_eq!(
+                arrow_fields_exact_observed::<std::convert::Infallible>(&left, right, || Ok(())),
+                Ok(expected)
+            );
+        }
+        let empty = field(&[]);
+        let mut observed = 0;
+        let mut observe = || {
+            observed += 1;
+            Ok::<_, std::convert::Infallible>(())
+        };
+        assert_eq!(
+            Walk {
+                observe: &mut observe,
+                validate: &mut |_, _| Ok(()),
+                nodes: 0
+            }
+            .metadata(&empty, &empty),
+            Ok(true)
+        );
+        assert_eq!(observed, 0, "empty metadata needs no bucket or key work");
+    }
+
+    #[test]
+    fn forced_metadata_fingerprint_collision_requires_exact_key_and_value() {
+        let field = |entries: &[(&str, &str)]| {
+            Field::new("x", DataType::Int64, false).with_metadata(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            )
+        };
+        let left = field(&[("same-prefix-a", "first"), ("same-prefix-b", "second")]);
+        let equal = field(&[("same-prefix-b", "second"), ("same-prefix-a", "first")]);
+        let missing = field(&[("same-prefix-c", "first"), ("same-prefix-b", "second")]);
+        let swapped = field(&[("same-prefix-a", "second"), ("same-prefix-b", "first")]);
+        for (right, expected) in [(&equal, true), (&missing, false), (&swapped, false)] {
+            let mut observed = 0;
+            let mut observe = || {
+                observed += 1;
+                Ok::<_, std::convert::Infallible>(())
+            };
+            let result = Walk {
+                observe: &mut observe,
+                validate: &mut |_, _| Ok(()),
+                nodes: 0,
+            }
+            .metadata_with_key_hash(&left, right, |walk, _| {
+                (walk.observe)()?;
+                Ok(0)
+            });
+            assert_eq!(result, Ok(expected));
+            assert!(
+                observed > 4,
+                "collisions still inspect actual key/value bytes"
+            );
         }
     }
 }

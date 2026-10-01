@@ -151,8 +151,12 @@ fn coerce_hash_join_eq_condition(
     None
 }
 
-fn eq_condition_to_expr(arena: &mut ScalarArena, eq: ScalarHashJoinEqCondition) -> ScalarId {
-    arena.intern(
+fn eq_condition_to_expr(
+    arena: &mut ScalarArena,
+    eq: ScalarHashJoinEqCondition,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::BinaryOp {
             left: eq.left,
             op: if eq.null_safe {
@@ -171,6 +175,7 @@ fn eq_condition_to_expr(arena: &mut ScalarArena, eq: ScalarHashJoinEqCondition) 
                 arena.nullable(eq.left) || arena.nullable(eq.right)
             },
         ),
+        control,
     )
 }
 
@@ -178,9 +183,10 @@ fn append_residual_condition(
     arena: &mut ScalarArena,
     other: &mut Option<ScalarId>,
     residual: ScalarId,
-) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), crate::compiler::SqlCompileError> {
     *other = Some(match other.take() {
-        Some(existing) => arena.intern(
+        Some(existing) => arena.intern_observed(
             ScalarNode::BinaryOp {
                 left: existing,
                 op: BinOp::And,
@@ -188,9 +194,12 @@ fn append_residual_condition(
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        ),
+            control,
+        )?,
         None => residual,
     });
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -210,9 +219,10 @@ fn extract_eq_conditions(
     condition: Option<ScalarId>,
     _join_type: &JoinKind,
     arena: &mut ScalarArena,
-) -> (Vec<ScalarHashJoinEqCondition>, Option<ScalarId>) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarHashJoinEqCondition>, Option<ScalarId>), crate::compiler::SqlCompileError> {
     let Some(cond) = condition else {
-        return (vec![], None);
+        return Ok((vec![], None));
     };
     let mut eq_pairs = Vec::new();
     let mut others = Vec::new();
@@ -223,7 +233,7 @@ fn extract_eq_conditions(
     if eq_pairs.is_empty() {
         let mut new_others = Vec::new();
         for part in others {
-            let (common, rewritten) = try_extract_common_eq_from_or(arena, part);
+            let (common, rewritten) = try_extract_common_eq_from_or(arena, part, control)?;
             eq_pairs.extend(common);
             if let Some(r) = rewritten {
                 new_others.push(r);
@@ -232,8 +242,8 @@ fn extract_eq_conditions(
         others = new_others;
     }
 
-    let remaining = scalar_expr::combine_conjuncts(arena, others);
-    (eq_pairs, remaining)
+    let remaining = scalar_expr::combine_conjuncts(arena, others, control)?;
+    Ok((eq_pairs, remaining))
 }
 
 /// Recursively flatten top-level AND nodes and classify each conjunct as
@@ -304,11 +314,12 @@ fn eq_pair_matches(a: &ScalarHashJoinEqCondition, b: &ScalarHashJoinEqCondition)
 fn try_extract_common_eq_from_or(
     arena: &mut ScalarArena,
     expr: ScalarId,
-) -> (Vec<ScalarHashJoinEqCondition>, Option<ScalarId>) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarHashJoinEqCondition>, Option<ScalarId>), crate::compiler::SqlCompileError> {
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
-        return (vec![], Some(expr));
+        return Ok((vec![], Some(expr)));
     }
 
     // For each branch, extract eq pairs and residual.
@@ -335,7 +346,7 @@ fn try_extract_common_eq_from_or(
     }
 
     if common.is_empty() {
-        return (vec![], Some(expr));
+        return Ok((vec![], Some(expr)));
     }
 
     // Rewrite each branch: remove the common eq pairs, recombine.
@@ -345,10 +356,11 @@ fn try_extract_common_eq_from_or(
         for eq in eqs {
             if !common.iter().any(|c| eq_pair_matches(c, eq)) {
                 // Keep non-common eq pairs as regular conjuncts.
-                remaining_parts.push(eq_condition_to_expr(arena, eq.clone()));
+                remaining_parts.push(eq_condition_to_expr(arena, eq.clone(), control)?);
             }
         }
-        if let Some(branch_expr) = scalar_expr::combine_conjuncts(arena, remaining_parts) {
+        if let Some(branch_expr) = scalar_expr::combine_conjuncts(arena, remaining_parts, control)?
+        {
             rewritten_branches.push(branch_expr);
         }
         // If a branch becomes empty (only common eqs), skip it — it
@@ -357,14 +369,14 @@ fn try_extract_common_eq_from_or(
     }
 
     let rewritten = if rewritten_branches.len() == branches.len() {
-        scalar_expr::combine_disjuncts(arena, rewritten_branches)
+        scalar_expr::combine_disjuncts(arena, rewritten_branches, control)?
     } else {
         // Some branches were pure eq-only; the entire OR condition is
         // satisfied whenever the common equalities hold.
         None
     };
 
-    (common, rewritten)
+    Ok((common, rewritten))
 }
 
 // ===========================================================================
@@ -520,7 +532,7 @@ impl Rule for JoinToHashJoin {
             return Ok(vec![]);
         };
         let (raw_eq_conds, mut other) =
-            extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars);
+            extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars, control)?;
 
         // Orient eq_conditions so that pair.0 references the left child's
         // columns and pair.1 references the right child's columns.  Pairs
@@ -541,8 +553,14 @@ impl Rule for JoinToHashJoin {
                         {
                             eq_conds.push(coerced);
                         } else {
-                            let residual = eq_condition_to_expr(&mut memo.scalars, oriented);
-                            append_residual_condition(&mut memo.scalars, &mut other, residual);
+                            let residual =
+                                eq_condition_to_expr(&mut memo.scalars, oriented, control)?;
+                            append_residual_condition(
+                                &mut memo.scalars,
+                                &mut other,
+                                residual,
+                                control,
+                            )?;
                         }
                     }
                     None => {
@@ -553,8 +571,14 @@ impl Rule for JoinToHashJoin {
                                 right: b,
                                 null_safe,
                             },
-                        );
-                        append_residual_condition(&mut memo.scalars, &mut other, residual);
+                            control,
+                        )?;
+                        append_residual_condition(
+                            &mut memo.scalars,
+                            &mut other,
+                            residual,
+                            control,
+                        )?;
                     }
                 }
             }
@@ -628,7 +652,8 @@ impl Rule for JoinToNestLoop {
         // physical alternatives. Without this guard, the memo group has no
         // feasible implementation and the optimizer surfaces "no feasible
         // plan for group N".
-        let (eq_conds, _) = extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars);
+        let (eq_conds, _) =
+            extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars, control)?;
         if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
@@ -1628,8 +1653,18 @@ mod eq_pair_tests {
         right: TypedExpr,
     ) -> ScalarHashJoinEqCondition {
         ScalarHashJoinEqCondition {
-            left: intern_typed(arena, &left),
-            right: intern_typed(arena, &right),
+            left: intern_typed(
+                arena,
+                &left,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+            right: intern_typed(
+                arena,
+                &right,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
             null_safe: false,
         }
     }
@@ -1799,7 +1834,14 @@ mod join_demotion_tests {
         children: Vec<GroupId>,
     ) -> MExpr {
         let id = memo.next_expr_id();
-        let condition = Some(intern_typed(&mut memo.scalars, &condition));
+        let condition = Some(
+            intern_typed(
+                &mut memo.scalars,
+                &condition,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+        );
         MExpr {
             id,
             op: Operator::LogicalJoin(LogicalJoinOp {
@@ -2284,7 +2326,12 @@ mod window_split_tests {
         let child_group = memo.new_group(values_mexpr);
 
         // Single window with no partition and no order => single group, no sort.
-        let window_exprs = intern_window_exprs(&mut memo.scalars, &[mk_window_expr("w1", vec![])]);
+        let window_exprs = intern_window_exprs(
+            &mut memo.scalars,
+            &[mk_window_expr("w1", vec![])],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let logical_window_mexpr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(WindowOp {
@@ -2388,8 +2435,18 @@ mod two_phase_agg_tests {
         aggregates: Vec<AggregateCall>,
         output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_layout = AggregateOutputLayout::new(
             output_columns
                 .iter()
@@ -2414,8 +2471,18 @@ mod two_phase_agg_tests {
         is_merge: Vec<bool>,
         is_split: bool,
     ) -> LogicalAggregateOp {
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_layout = AggregateOutputLayout::new(
             output_columns
                 .iter()

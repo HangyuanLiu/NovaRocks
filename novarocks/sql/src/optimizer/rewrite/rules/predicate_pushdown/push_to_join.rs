@@ -116,7 +116,8 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                     right,
                     join_req,
                     &mut arena,
-                );
+                    &ctx.control_view(),
+                )?;
                 if changed {
                     Ok(RewriteResult::Changed(new_join_expr))
                 } else {
@@ -135,7 +136,8 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                     right,
                     required_output_columns,
                     &mut arena,
-                ) {
+                    &ctx.control_view(),
+                )? {
                     Some(result) => Ok(RewriteResult::Changed(result)),
                     None => Ok(RewriteResult::Unchanged),
                 }
@@ -158,7 +160,8 @@ fn push_filter_predicates_opt(
     right: OptExpr,
     required_output_columns: Option<HashSet<ColumnId>>,
     arena: &mut ScalarArena,
-) -> (OptExpr, bool) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(OptExpr, bool), SqlCompileError> {
     let mut left_ids = collect_output_ids_opt(&left);
     let mut right_ids = collect_output_ids_opt(&right);
     left_ids.remove(&ColumnId::UNSET);
@@ -182,7 +185,8 @@ fn push_filter_predicates_opt(
             &right_ids,
             &join_groups,
             &filter_groups,
-        );
+            control,
+        )?;
         append_new_derived_conjuncts_opt(
             &mut conjuncts,
             derived,
@@ -221,8 +225,9 @@ fn push_filter_predicates_opt(
             },
             (true, true) => {
                 if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
-                    let (implied_left, implied_right) =
-                        extract_implied_or_side_filters(arena, conj, &left_ids, &right_ids);
+                    let (implied_left, implied_right) = extract_implied_or_side_filters(
+                        arena, conj, &left_ids, &right_ids, control,
+                    )?;
                     for pred in implied_left {
                         if !subtree_has_predicate_opt(&left, pred, arena) {
                             left_preds.push(pred);
@@ -246,7 +251,7 @@ fn push_filter_predicates_opt(
                     remaining.push(conj);
                 } else {
                     let (factored, or_remaining) =
-                        factor_common_eq_from_or(arena, conj, &left_ids, &right_ids);
+                        factor_common_eq_from_or(arena, conj, &left_ids, &right_ids, control)?;
                     if !factored.is_empty() {
                         join_preds.extend(factored);
                         if let Some(rem) = or_remaining {
@@ -282,7 +287,8 @@ fn push_filter_predicates_opt(
     let new_left = if left_preds.is_empty() {
         left
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, left_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, left_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -294,7 +300,8 @@ fn push_filter_predicates_opt(
     let new_right = if right_preds.is_empty() {
         right
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, right_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, right_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -304,7 +311,7 @@ fn push_filter_predicates_opt(
     };
 
     // Merge new join predicates with the existing join condition.
-    let new_condition = merge_join_conditions(arena, join.condition, join_preds);
+    let new_condition = merge_join_conditions(arena, join.condition, join_preds, control)?;
 
     // Upgrade CROSS JOIN to INNER when join predicates were extracted.
     let new_join_type = if join.join_type == JoinKind::Cross && new_condition.is_some() {
@@ -322,8 +329,8 @@ fn push_filter_predicates_opt(
     );
     new_join.required_output_columns = required_output_columns;
 
-    let result = wrap_remaining_filter_opt_scalar(new_join, remaining, arena);
-    (result, pushed_any)
+    let result = wrap_remaining_filter_opt_scalar(new_join, remaining, arena, control)?;
+    Ok((result, pushed_any))
 }
 
 fn push_join_condition_predicates_opt(
@@ -332,12 +339,15 @@ fn push_join_condition_predicates_opt(
     right: OptExpr,
     required_output_columns: Option<HashSet<ColumnId>>,
     arena: &mut ScalarArena,
-) -> Option<OptExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     if !matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
-        return None;
+        return Ok(None);
     }
 
-    let cond_id = join.condition?;
+    let Some(cond_id) = join.condition else {
+        return Ok(None);
+    };
 
     let mut left_ids = collect_output_ids_opt(&left);
     let mut right_ids = collect_output_ids_opt(&right);
@@ -355,7 +365,8 @@ fn push_join_condition_predicates_opt(
         &right_ids,
         &condition_groups,
         &condition_groups,
-    );
+        control,
+    )?;
     append_new_derived_conjuncts_opt(
         &mut conjuncts,
         derived,
@@ -390,18 +401,19 @@ fn push_join_condition_predicates_opt(
     let new_condition = if residual_preds.is_empty() {
         None
     } else {
-        scalar_expr::combine_conjuncts(arena, residual_preds)
+        scalar_expr::combine_conjuncts(arena, residual_preds, control)?
     };
     let upgrades_cross = join.join_type == JoinKind::Cross && new_condition.is_some();
 
     if !pushed_any && !upgrades_cross {
-        return None;
+        return Ok(None);
     }
 
     let new_left = if left_preds.is_empty() {
         left
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, left_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, left_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -413,7 +425,8 @@ fn push_join_condition_predicates_opt(
     let new_right = if right_preds.is_empty() {
         right
     } else {
-        let pushed_id = scalar_expr::combine_conjuncts(arena, right_preds).expect("non-empty");
+        let pushed_id =
+            scalar_expr::combine_conjuncts(arena, right_preds, control)?.expect("non-empty");
         OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: pushed_id,
@@ -436,7 +449,7 @@ fn push_join_condition_predicates_opt(
         vec![new_left, new_right],
     );
     result.required_output_columns = required_output_columns;
-    Some(result)
+    Ok(Some(result))
 }
 
 fn classify_sides_by_column_ids(
@@ -558,7 +571,8 @@ fn merge_join_conditions(
     arena: &mut ScalarArena,
     existing: Option<ScalarId>,
     new_preds: Vec<ScalarId>,
-) -> Option<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
     let mut all = Vec::new();
     let mut seen = HashSet::new();
     if let Some(cond) = existing {
@@ -575,7 +589,7 @@ fn merge_join_conditions(
             all.push(pred);
         }
     }
-    scalar_expr::combine_conjuncts(arena, all)
+    scalar_expr::combine_conjuncts(arena, all, control)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,11 +603,12 @@ fn extract_implied_or_side_filters(
     expr: ScalarId,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
-) -> (Vec<ScalarId>, Vec<ScalarId>) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarId>, Vec<ScalarId>), SqlCompileError> {
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let branch_count = branches.len();
 
@@ -613,30 +628,33 @@ fn extract_implied_or_side_filters(
         }
 
         if !left_conjuncts.is_empty() {
-            left_terms
-                .push(scalar_expr::combine_conjuncts(arena, left_conjuncts).expect("non-empty"));
+            left_terms.push(
+                scalar_expr::combine_conjuncts(arena, left_conjuncts, control)?.expect("non-empty"),
+            );
         }
         if !right_conjuncts.is_empty() {
-            right_terms
-                .push(scalar_expr::combine_conjuncts(arena, right_conjuncts).expect("non-empty"));
+            right_terms.push(
+                scalar_expr::combine_conjuncts(arena, right_conjuncts, control)?
+                    .expect("non-empty"),
+            );
         }
     }
 
     let left_filters = if left_terms.len() == branch_count {
-        scalar_expr::combine_disjuncts(arena, left_terms)
+        scalar_expr::combine_disjuncts(arena, left_terms, control)?
             .into_iter()
             .collect()
     } else {
         Vec::new()
     };
     let right_filters = if right_terms.len() == branch_count {
-        scalar_expr::combine_disjuncts(arena, right_terms)
+        scalar_expr::combine_disjuncts(arena, right_terms, control)?
             .into_iter()
             .collect()
     } else {
         Vec::new()
     };
-    (left_filters, right_filters)
+    Ok((left_filters, right_filters))
 }
 
 fn classify_implied_filter_side(
@@ -658,11 +676,12 @@ fn factor_common_eq_from_or(
     expr: ScalarId,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
-) -> (Vec<ScalarId>, Option<ScalarId>) {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarId>, Option<ScalarId>), SqlCompileError> {
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
-        return (vec![], None);
+        return Ok((vec![], None));
     }
 
     let branch_conjuncts: Vec<Vec<ScalarId>> = branches
@@ -690,7 +709,7 @@ fn factor_common_eq_from_or(
     }
 
     if common_eqs.is_empty() {
-        return (vec![], None);
+        return Ok((vec![], None));
     }
 
     let mut new_branches = Vec::new();
@@ -701,9 +720,11 @@ fn factor_common_eq_from_or(
             .copied()
             .collect();
         if remaining.is_empty() {
-            new_branches.push(scalar_expr::bool_literal(arena, true));
+            new_branches.push(scalar_expr::bool_literal(arena, true, control)?);
         } else {
-            new_branches.push(scalar_expr::combine_conjuncts(arena, remaining).expect("non-empty"));
+            new_branches.push(
+                scalar_expr::combine_conjuncts(arena, remaining, control)?.expect("non-empty"),
+            );
         }
     }
 
@@ -713,10 +734,9 @@ fn factor_common_eq_from_or(
     {
         None
     } else {
-        scalar_expr::combine_disjuncts(arena, new_branches)
+        scalar_expr::combine_disjuncts(arena, new_branches, control)?
     };
-
-    (common_eqs, or_remaining)
+    Ok((common_eqs, or_remaining))
 }
 
 fn is_cross_side_eq(
@@ -890,7 +910,12 @@ mod tests {
     #[test]
     fn filter_join_pushes_filter_and_derived_opposite_side_predicate() {
         let mut arena = ScalarArena::new();
-        let join_condition = intern_typed(&mut arena, &eq(col("l", "a", 1), col("r", "b", 2)));
+        let join_condition = intern_typed(
+            &mut arena,
+            &eq(col("l", "a", 1), col("r", "b", 2)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -898,7 +923,12 @@ mod tests {
             }),
             vec![scan("l", &[("a", 1)]), scan("r", &[("b", 2)])],
         );
-        let filter_id = intern_typed(&mut arena, &eq(col("l", "a", 1), int_lit(7)));
+        let filter_id = intern_typed(
+            &mut arena,
+            &eq(col("l", "a", 1), int_lit(7)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let input = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_id,
@@ -933,7 +963,9 @@ mod tests {
                 eq(col("l", "a", 1), col("r", "b", 2)),
                 eq(col("l", "a", 1), int_lit(7)),
             ),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let input = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,

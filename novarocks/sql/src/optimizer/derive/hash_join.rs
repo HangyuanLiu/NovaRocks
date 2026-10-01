@@ -581,8 +581,18 @@ mod tests {
         let eq_conditions = eq_conditions
             .into_iter()
             .map(|(left, right, null_safe)| PhysicalHashJoinEqCondition {
-                left: intern_typed(&mut scalars, &left),
-                right: intern_typed(&mut scalars, &right),
+                left: intern_typed(
+                    &mut scalars,
+                    &left,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                right: intern_typed(
+                    &mut scalars,
+                    &right,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 null_safe,
             })
             .collect();

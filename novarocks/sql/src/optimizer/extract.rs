@@ -30,8 +30,10 @@ use super::optimized_tree::{
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
 use crate::common::OutputColumn;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
 use crate::optimizer::statistics::Statistics;
+use novarocks_type_contract::{CompilePhase, PureCompileControl};
 
 /// Extract the best optimizer physical operator tree from the Memo.
 ///
@@ -45,7 +47,9 @@ pub(crate) fn extract_best(
     root_group: GroupId,
     required: &PhysicalPropertySet,
     winners: &HashMap<(GroupId, PhysicalPropertySet), Winner>,
-) -> Result<OptimizedOperatorNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<OptimizedOperatorNode, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     let cache_key = (root_group, required.clone());
     let winner = winners.get(&cache_key).ok_or_else(|| {
         format!(
@@ -58,7 +62,8 @@ pub(crate) fn extract_best(
         return Err(format!(
             "no feasible plan for group {} with props {:?}",
             root_group, required
-        ));
+        )
+        .into());
     }
 
     let (group_stats, output_columns, expr) = {
@@ -103,14 +108,15 @@ pub(crate) fn extract_best(
             winner.expr_index,
             expr.children.len(),
             child_reqs.len()
-        ));
+        )
+        .into());
     }
 
     // Recursively extract children.
     let mut children = Vec::with_capacity(expr.children.len());
     for (i, &child_group_id) in expr.children.iter().enumerate() {
         let child_req = child_reqs[i].clone();
-        let child_node = extract_best(memo, child_group_id, &child_req, winners)?;
+        let child_node = extract_best(memo, child_group_id, &child_req, winners, control)?;
         children.push(child_node);
     }
 
@@ -169,6 +175,7 @@ pub(crate) fn extract_best(
                     &mut memo.scalars,
                     ordering,
                     &inner_node.output_columns,
+                    control,
                 )?;
                 // Sort enforcers inserted by the property-derivation pass are
                 // pure ORDER BY enforcers, not analytic precursor sorts —
@@ -390,13 +397,15 @@ fn ordering_spec_to_sort_keys(
     arena: &mut ScalarArena,
     ordering: &OrderingSpec,
     child_outputs: &[OutputColumn],
-) -> Result<Vec<SortKey>, String> {
+    control: &dyn PureCompileControl,
+) -> Result<Vec<SortKey>, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     match ordering {
         OrderingSpec::Any => Ok(Vec::new()),
         OrderingSpec::Required(sort_keys) => sort_keys
             .iter()
             .enumerate()
-            .map(|(ordinal, sk)| {
+            .map(|(ordinal, sk)| -> Result<SortKey, SqlCompileError> {
                 let mut matches = child_outputs
                     .iter()
                     .filter(|column| column.column_id == sk.column);
@@ -410,13 +419,14 @@ fn ordering_spec_to_sort_keys(
                     return Err(format!(
                         "sort enforcer key occurrence {ordinal} ColumnId({}) is ambiguous in the exact child output map",
                         sk.column.0
-                    ));
+                    ).into());
                 }
                 Ok(SortKey {
-                    expr: arena.intern(
+                    expr: arena.intern_observed(
                         ScalarNode::ColumnRef(sk.column),
                         column.value_type.clone(),
-                    ),
+                        control,
+                    )?,
                     asc: sk.asc,
                     nulls_first: sk.nulls_first,
                     display: None,
@@ -683,7 +693,14 @@ mod tests {
             ),
         );
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         assert_eq!(plan.output_columns.len(), 1);
         assert_eq!(plan.output_columns[0].column_id, output_id);
@@ -744,8 +761,18 @@ mod tests {
             0.0,
         ));
 
-        let left_key = intern_typed(&mut memo.scalars, &test_col(1));
-        let right_key = intern_typed(&mut memo.scalars, &test_col(2));
+        let left_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(1),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(2),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
@@ -821,7 +848,14 @@ mod tests {
             ),
         );
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let ids: Vec<_> = plan
             .output_columns
             .iter()
@@ -892,7 +926,7 @@ mod tests {
 
         let error = scan_output_columns(&scan)
             .expect_err("missing scan pruning metadata must fail closed during extraction");
-        assert!(error.contains("has no exact source occurrence"));
+        assert!(error.to_string().contains("has no exact source occurrence"));
     }
 
     fn output_column_for_test(id: u32, name: &str, nullable: bool) -> OutputColumn {
@@ -933,8 +967,18 @@ mod tests {
         PhysicalPropertySet,
     ) {
         let mut memo = Memo::new();
-        let left_key = intern_typed(&mut memo.scalars, &test_col(10));
-        let right_key = intern_typed(&mut memo.scalars, &test_col(20));
+        let left_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(10),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(20),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let eq_condition = PhysicalHashJoinEqCondition {
             left: left_key,
             right: right_key,
@@ -1102,8 +1146,18 @@ mod tests {
         PhysicalPropertySet,
     ) {
         let mut memo = Memo::new();
-        let left_key = intern_typed(&mut memo.scalars, &test_col(10));
-        let right_key = intern_typed(&mut memo.scalars, &test_col(20));
+        let left_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(10),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(20),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let eq_condition = PhysicalHashJoinEqCondition {
             left: left_key,
             right: right_key,
@@ -1177,7 +1231,14 @@ mod tests {
         let (mut memo, root, winners, required) =
             make_hash_join_winner_with_shuffle_child_props_for_test();
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let winner = winners
             .get(&(root, required.clone()))
             .expect("fixture should record root winner");
@@ -1230,7 +1291,14 @@ mod tests {
             ),
         );
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let Operator::PhysicalHashJoin(join) = &plan.op else {
             panic!("expected hash join")
         };
@@ -1357,8 +1425,14 @@ mod tests {
                 ),
             );
 
-            let mut extracted =
-                extract_best(&mut memo, root, &required, &winners).expect("extract");
+            let mut extracted = extract_best(
+                &mut memo,
+                root,
+                &required,
+                &winners,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .expect("extract");
             crate::optimizer::optimized_tree::attach_scalar_arena(
                 &mut extracted,
                 Arc::new(memo.scalars.clone()),
@@ -1406,7 +1480,14 @@ mod tests {
         let (mut memo, root, winners, required, pre_enforcer_output) =
             make_enforced_limit_winner_for_test();
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         assert_eq!(plan.execution_props.output_property, required);
         assert_eq!(
@@ -1436,7 +1517,14 @@ mod tests {
             network_cost: 7.0,
         });
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         assert_eq!(
             plan.explain_stats
@@ -1462,7 +1550,14 @@ mod tests {
     fn extract_keeps_colocate_hash_join_distribution_when_default_metadata() {
         let (mut memo, root, winners, required) = make_colocate_hash_join_winner_for_test();
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         let Operator::PhysicalHashJoin(join) = &plan.op else {
             panic!("expected hash join");
@@ -1518,10 +1613,18 @@ mod tests {
             ),
         );
 
-        let err = extract_best(&mut memo, root, &required, &winners)
-            .expect_err("extract should reject missing child properties");
+        let err = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect_err("extract should reject missing child properties");
         assert!(
-            err.contains("child_props") && err.contains("expected 1") && err.contains("got 0"),
+            err.to_string().contains("child_props")
+                && err.to_string().contains("expected 1")
+                && err.to_string().contains("got 0"),
             "unexpected error: {err}"
         );
     }
@@ -1552,10 +1655,18 @@ mod tests {
             ),
         )]);
 
-        let error = extract_best(&mut memo, root, &required, &winners)
-            .expect_err("a selected group without logical properties must fail closed");
+        let error = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect_err("a selected group without logical properties must fail closed");
         assert!(
-            error.contains("group 0 has no logical properties"),
+            error
+                .to_string()
+                .contains("group 0 has no logical properties"),
             "unexpected error: {error}"
         );
     }
@@ -1579,8 +1690,13 @@ mod tests {
             nulls_first: true,
         }]);
 
-        let keys = ordering_spec_to_sort_keys(&mut arena, &ordering, &[column])
-            .expect("exact child output should bind the sort enforcer key");
+        let keys = ordering_spec_to_sort_keys(
+            &mut arena,
+            &ordering,
+            &[column],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("exact child output should bind the sort enforcer key");
 
         assert_eq!(keys.len(), 1);
         assert_eq!(arena.data_type(keys[0].expr), &DataType::Decimal128(18, 4));
@@ -1598,12 +1714,89 @@ mod tests {
             nulls_first: false,
         }]);
 
-        let error = ordering_spec_to_sort_keys(&mut arena, &ordering, &[])
-            .expect_err("an absent sort key must fail closed");
+        let error = ordering_spec_to_sort_keys(
+            &mut arena,
+            &ordering,
+            &[],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect_err("an absent sort key must fail closed");
 
         assert!(
-            error.contains("ColumnId(42)") && error.contains("absent"),
+            error.to_string().contains("ColumnId(42)") && error.to_string().contains("absent"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn sort_enforcer_actual_insertion_retains_full_source_and_typed_control_failure() {
+        use novarocks_type_contract::{CompileControlError, FunctionValueType, ValueLogicalType};
+        struct RefusePositive(CompileControlError, std::sync::Mutex<Vec<u32>>);
+        impl PureCompileControl for RefusePositive {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                self.1.lock().unwrap().push(units);
+                if units > 0 { Err(self.0) } else { Ok(()) }
+            }
+        }
+        let column = OutputColumn {
+            column_id: ColumnId(77),
+            name: "json_source".to_string(),
+            value_type: FunctionValueType {
+                data_type: DataType::Utf8,
+                nullable: true,
+                logical_type: ValueLogicalType::Json,
+            },
+            is_internal: false,
+        };
+        let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {
+            column: column.column_id,
+            asc: true,
+            nulls_first: false,
+        }]);
+        let mut arena = ScalarArena::new();
+        let keys = ordering_spec_to_sort_keys(
+            &mut arena,
+            &ordering,
+            std::slice::from_ref(&column),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        assert_eq!(arena.value_type(keys[0].expr), &column.value_type);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut arena = ScalarArena::new();
+            let control = RefusePositive(error, Default::default());
+            let failure = ordering_spec_to_sort_keys(
+                &mut arena,
+                &ordering,
+                std::slice::from_ref(&column),
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(failure, SqlCompileError::from(error));
+            assert!(
+                control
+                    .1
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|units| *units > 0)
+            );
+            let keys = ordering_spec_to_sort_keys(
+                &mut arena,
+                &ordering,
+                std::slice::from_ref(&column),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            let expected = ScalarArena::new().intern(
+                ScalarNode::ColumnRef(column.column_id),
+                column.value_type.clone(),
+            );
+            assert_eq!(keys[0].expr, expected);
+        }
     }
 }

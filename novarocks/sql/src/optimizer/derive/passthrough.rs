@@ -297,7 +297,12 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         FilterOp {
-            predicate: intern_typed(scalars, &predicate),
+            predicate: intern_typed(
+                scalars,
+                &predicate,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
         }
     }
 

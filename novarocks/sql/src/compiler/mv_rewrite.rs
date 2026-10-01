@@ -3260,10 +3260,9 @@ fn build_candidate(
     let mv_opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &mv_logical,
         &mut mv_scalars,
-    )
-    .map_err(SqlCompileError::Compilation)?;
-    let mv = SpjgDescriptor::from_opt_expr(&mv_opt_expr, &mut mv_scalars)
-        .map_err(SqlCompileError::Compilation)?;
+        control,
+    )?;
+    let mv = SpjgDescriptor::from_opt_expr(&mv_opt_expr, &mut mv_scalars, control)?;
     if mv.joins.is_some() {
         return Ok(None);
     }

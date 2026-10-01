@@ -329,12 +329,24 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        scan_op.predicates.push(intern_typed(arena, &predicate));
+        scan_op.predicates.push(
+            intern_typed(
+                arena,
+                &predicate,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
+        );
         OptExpr::leaf(Operator::LogicalScan(scan_op))
     }
 
     fn make_push_plan(scan: OptExpr, arena: &mut ScalarArena) -> PushPlan {
-        let gb_id = intern_typed(arena, &col_ref_typed("k"));
+        let gb_id = intern_typed(
+            arena,
+            &col_ref_typed("k"),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         PushPlan {
             side: super::super::context::Side::Left,
             target_subtree: scan,

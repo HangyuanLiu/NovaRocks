@@ -165,7 +165,8 @@ fn apply_opt(
 
     // --- Correlated, no-check arm (PushDownApplyAggFilter ran) ---
     if !a.need_check_max_rows {
-        let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
+        let cond =
+            scalar_utils::combine_and(arena, a.correlation_conjuncts.clone(), &ctx.control_view())?;
         let project_items = build_output_project_items(
             ctx.function_catalog(),
             arena,
@@ -201,26 +202,30 @@ fn apply_opt(
     }
 
     // Mint cnt and anyval output column ids.
-    let factory = ctx
-        .column_ref_factory()
-        .ok_or_else(|| "ScalarApplyToJoin requires ColumnRefFactory".to_string())?;
+    let factory = ctx.column_ref_factory().ok_or_else(|| {
+        SqlCompileError::Compilation("ScalarApplyToJoin requires ColumnRefFactory".to_string())
+    })?;
     let mut factory = factory.borrow_mut();
 
-    let inner_scalar_type = scalar_utils::find_column_type(&right, arena, a.inner_output_column_id)
-        .unwrap_or(DataType::Null);
-    let inner_scalar_nullable =
-        scalar_utils::find_column_nullable(&right, arena, a.inner_output_column_id).unwrap_or(true);
+    let inner_scalar_value_type = scalar_utils::opt_output_columns(&right, arena)
+        .map_err(SqlCompileError::Compilation)?
+        .into_iter()
+        .find(|column| column.column_id == a.inner_output_column_id)
+        .map(|column| column.value_type)
+        .ok_or_else(|| {
+            SqlCompileError::Compilation("missing scalar subquery output column".into())
+        })?;
 
     let cnt_id = factory.create(
         None,
         "count(1)".to_string(),
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     );
-    let anyval_id = factory.create(
-        None,
-        "any_value".to_string(),
-        novarocks_type_contract::FunctionValueType::new(inner_scalar_type.clone(), true),
-    );
+    let anyval_id = factory.create(None, "any_value".to_string(), {
+        let mut value_type = inner_scalar_value_type.clone();
+        value_type.nullable = true;
+        value_type
+    });
     // Mint internal assertion column id.
     let assert_id = factory.create(
         None,
@@ -237,7 +242,8 @@ fn apply_opt(
     let agg_input = ensure_exposes_columns(right, &group_by, arena)?;
 
     // Build group-key OutputColumns (reuse existing column ids, do NOT mint).
-    let agg_input_columns = scalar_utils::opt_output_columns(&agg_input, arena)?;
+    let agg_input_columns = scalar_utils::opt_output_columns(&agg_input, arena)
+        .map_err(SqlCompileError::Compilation)?;
     let gk_output_cols: Vec<OutputColumn> = group_by
         .iter()
         .map(|expr| {
@@ -250,14 +256,12 @@ fn apply_opt(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Build the vector aggregate: group by corr-key, count(1), any_value(scalar).
-    let inner_scalar_ref = arena.intern(
+    let inner_scalar_ref = arena.intern_observed(
         ScalarNode::ColumnRef(a.inner_output_column_id),
-        novarocks_type_contract::FunctionValueType::new(
-            inner_scalar_type.clone(),
-            inner_scalar_nullable,
-        ),
-    );
-    let count_argument = scalar_utils::int_literal(arena, 1);
+        inner_scalar_value_type.clone(),
+        &ctx.control_view(),
+    )?;
+    let count_argument = scalar_utils::int_literal(arena, 1, &ctx.control_view())?;
     let count_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
         ctx.function_catalog(),
         arena,
@@ -297,10 +301,11 @@ fn apply_opt(
     let anyval_output = OutputColumn {
         column_id: anyval_id,
         name: "any_value".to_string(),
-        value_type: novarocks_type_contract::FunctionValueType::new(
-            inner_scalar_type.clone(),
-            true,
-        ),
+        value_type: {
+            let mut value_type = inner_scalar_value_type.clone();
+            value_type.nullable = true;
+            value_type
+        },
 
         is_internal: false,
     };
@@ -323,7 +328,7 @@ fn apply_opt(
         Operator::LogicalAggregate(LogicalAggregateOp::single(
             group_by,
             vec![
-                scalar_utils::count_one_spec(arena, cnt_id, count_resolved),
+                scalar_utils::count_one_spec(arena, cnt_id, count_resolved, &ctx.control_view())?,
                 scalar_utils::any_value_spec(inner_scalar_ref, anyval_id, any_value_resolved),
             ],
             output_layout,
@@ -333,15 +338,16 @@ fn apply_opt(
     );
 
     // LEFT OUTER JOIN on the correlation conjuncts.
-    let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
-    let mut items = scalar_utils::left_project_items(&left, arena)?;
+    let cond =
+        scalar_utils::combine_and(arena, a.correlation_conjuncts.clone(), &ctx.control_view())?;
+    let mut items = scalar_utils::left_project_items(&left, arena, &ctx.control_view())?;
     let join = scalar_utils::join(left, vector_agg, JoinKind::LeftOuter, cond);
 
     // Build the output project.
     // Items: all left columns (pass-through) + anyval item (scalar output) +
     // internal assert_true item (row-check).
     // Map output_column to anyval (the scalar subquery result).
-    let anyval_ref = scalar_utils::column_ref(arena, &anyval_output);
+    let anyval_ref = scalar_utils::column_ref(arena, &anyval_output, &ctx.control_view())?;
     items.push(ScalarProjectItem {
         expr: anyval_ref,
         output_name: a.output_column.name.clone(),
@@ -352,17 +358,25 @@ fn apply_opt(
     // Build the assert_true condition: cnt IS NULL OR cnt <= 1
     let mut joined_cnt_output = cnt_output.clone();
     joined_cnt_output.value_type.nullable = true;
-    let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output);
-    let cnt_is_null = arena.intern(
+    let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output, &ctx.control_view())?;
+    let cnt_is_null = arena.intern_observed(
         ScalarNode::IsNull {
             child: cnt_ref,
             negated: false,
         },
         novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-    );
-    let one = scalar_utils::int_literal(arena, 1);
-    let cnt_le_1 =
-        scalar_utils::binary_op(arena, BinOp::Le, cnt_ref, one, DataType::Boolean, false);
+        &ctx.control_view(),
+    )?;
+    let one = scalar_utils::int_literal(arena, 1, &ctx.control_view())?;
+    let cnt_le_1 = scalar_utils::binary_op(
+        arena,
+        BinOp::Le,
+        cnt_ref,
+        one,
+        DataType::Boolean,
+        false,
+        &ctx.control_view(),
+    )?;
     let assert_cond = scalar_utils::binary_op(
         arena,
         BinOp::Or,
@@ -370,7 +384,8 @@ fn apply_opt(
         cnt_le_1,
         DataType::Boolean,
         false,
-    );
+        &ctx.control_view(),
+    )?;
     let assert_expr = scalar_utils::assert_true(
         ctx.function_catalog(),
         arena,
@@ -418,16 +433,22 @@ fn build_output_project_items(
     output_col: &OutputColumn,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<ScalarProjectItem>, SqlCompileError> {
-    let mut items = scalar_utils::left_project_items(left, arena)?;
-    let inner_out_type = scalar_utils::find_column_type(right, arena, inner_output_column_id)
-        .unwrap_or(DataType::Null);
-    let inner_nullable =
-        scalar_utils::find_column_nullable(right, arena, inner_output_column_id).unwrap_or(true);
+    let mut items = scalar_utils::left_project_items(left, arena, control)?;
+    let inner_value_type = scalar_utils::opt_output_columns(right, arena)
+        .map_err(SqlCompileError::Compilation)?
+        .into_iter()
+        .find(|column| column.column_id == inner_output_column_id)
+        .map(|column| column.value_type)
+        .ok_or_else(|| {
+            SqlCompileError::Compilation("missing scalar subquery output column".into())
+        })?;
+    let inner_out_type = inner_value_type.data_type.clone();
 
-    let inner_col_ref = arena.intern(
+    let inner_col_ref = arena.intern_observed(
         ScalarNode::ColumnRef(inner_output_column_id),
-        novarocks_type_contract::FunctionValueType::new(inner_out_type.clone(), inner_nullable),
-    );
+        inner_value_type,
+        control,
+    )?;
 
     let scalar_expr =
         if scalar_utils::is_count_aggregate_result(right, arena, inner_output_column_id) {

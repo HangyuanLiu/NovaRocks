@@ -152,8 +152,12 @@ impl LogicalRewriteRule for PushDownPredicateScan {
             required_output_columns,
         };
 
-        let result =
-            wrap_remaining_filter_opt_scalar(new_scan, remaining, &mut arena_rc.borrow_mut());
+        let result = wrap_remaining_filter_opt_scalar(
+            new_scan,
+            remaining,
+            &mut arena_rc.borrow_mut(),
+            &ctx.control_view(),
+        )?;
         Ok(RewriteResult::Changed(result))
     }
 }
@@ -300,7 +304,12 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
+        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
@@ -462,7 +471,9 @@ mod tests {
             crate::planner::optimizer_bridge::scalar::intern_typed(
                 &mut arena,
                 &is_not_null(col("a")),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             )
+            .unwrap()
         };
         let filter2 = OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),

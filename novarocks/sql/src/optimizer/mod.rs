@@ -377,8 +377,7 @@ fn optimize_with_root_property(
 
     // 11. Extract best plan.
     let mut optimized_tree =
-        extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners)
-            .map_err(SqlCompileError::Compilation)?;
+        extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners, control)?;
 
     // Optimizer output contract: the physical tree produced here carries no
     // runtime-filter annotations. CSE and pure physical/scalar rewrites may
@@ -394,7 +393,8 @@ fn optimize_with_root_property(
         &mut memo.scalars,
         &mut memo.factory,
         &options,
-    );
+        control,
+    )?;
     optimized_tree::attach_scalar_arena(&mut optimized_tree, Arc::new(memo.scalars.clone()));
 
     control.checkpoint(CompilePhase::Validate, 0)?;
@@ -1194,7 +1194,12 @@ mod is_known_rule_name_tests {
         settings: &crate::optimizer::options::SessionOptimizerSettings,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
-        let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
+        let plan_expr = try_to_optimizer_expr(
+            &plan,
+            &mut scalar_arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         optimize_with_test_table_statistics(
             plan_expr,
             scalar_arena,
@@ -1212,7 +1217,12 @@ mod is_known_rule_name_tests {
         root_distribution: DistributionSpec,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
-        let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
+        let plan_expr = try_to_optimizer_expr(
+            &plan,
+            &mut scalar_arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         optimize_with_root_distribution_and_test_table_statistics(
             plan_expr,
             scalar_arena,
@@ -1485,6 +1495,7 @@ mod is_known_rule_name_tests {
         let mv_desc = cascades_rules::mv_rewrite::descriptor::SpjgDescriptor::from_opt_expr(
             &mv_expr,
             &mut mv_scalars,
+            test_optimizer_control(),
         )
         .expect("mv descriptor");
         let candidate = cascades_rules::mv_rewrite::MvRewriteCandidate {
@@ -1845,6 +1856,7 @@ mod is_known_rule_name_tests {
         let opt_plan = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical,
             &mut scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical to opt expr");
         let mut rewrite_ctx =

@@ -154,8 +154,9 @@ pub(crate) fn split_conjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec
 pub(crate) fn combine_conjuncts(
     arena: &mut ScalarArena,
     mut exprs: Vec<ScalarId>,
-) -> Option<ScalarId> {
-    combine_binary_bool(arena, &mut exprs, BinOp::And)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    combine_binary_bool(arena, &mut exprs, BinOp::And, control)
 }
 
 pub(crate) fn split_disjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
@@ -177,19 +178,24 @@ pub(crate) fn split_disjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec
 pub(crate) fn combine_disjuncts(
     arena: &mut ScalarArena,
     mut exprs: Vec<ScalarId>,
-) -> Option<ScalarId> {
-    combine_binary_bool(arena, &mut exprs, BinOp::Or)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    combine_binary_bool(arena, &mut exprs, BinOp::Or, control)
 }
 
 fn combine_binary_bool(
     arena: &mut ScalarArena,
     exprs: &mut Vec<ScalarId>,
     op: BinOp,
-) -> Option<ScalarId> {
-    let mut result = exprs.pop()?;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    let Some(mut result) = exprs.pop() else {
+        return Ok(None);
+    };
     while let Some(next) = exprs.pop() {
         let nullable = arena.nullable(next) || arena.nullable(result);
-        result = arena.intern(
+        result = arena.intern_observed(
             ScalarNode::BinaryOp {
                 op,
                 left: next,
@@ -197,22 +203,34 @@ fn combine_binary_bool(
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-        );
+            control,
+        )?;
     }
-    Some(result)
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    Ok(Some(result))
 }
 
-pub(crate) fn bool_literal(arena: &mut ScalarArena, value: bool) -> ScalarId {
-    arena.intern(
+pub(crate) fn bool_literal(
+    arena: &mut ScalarArena,
+    value: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(value))),
         novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        control,
     )
 }
 
-pub(crate) fn int_literal(arena: &mut ScalarArena, value: i64) -> ScalarId {
-    arena.intern(
+pub(crate) fn int_literal(
+    arena: &mut ScalarArena,
+    value: i64,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        control,
     )
 }
 
@@ -874,7 +892,13 @@ mod tests {
         split_conjuncts(&arena, and, &mut parts);
         assert_eq!(parts, vec![a, b]);
 
-        let rebuilt = combine_conjuncts(&mut arena, parts).unwrap();
+        let rebuilt = combine_conjuncts(
+            &mut arena,
+            parts,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             arena.node(rebuilt),
             ScalarNode::BinaryOp { op: BinOp::And, .. }

@@ -426,14 +426,20 @@ pub(crate) fn wrap_remaining_filter_opt_scalar(
     plan: OptExpr,
     remaining: Vec<ScalarId>,
     arena: &mut ScalarArena,
-) -> OptExpr {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, crate::compiler::SqlCompileError> {
     if remaining.is_empty() {
-        return plan;
+        return Ok(plan);
     }
-    let Some(predicate) = crate::optimizer::scalar_expr::combine_conjuncts(arena, remaining) else {
-        return plan;
+    let Some(predicate) =
+        crate::optimizer::scalar_expr::combine_conjuncts(arena, remaining, control)?
+    else {
+        return Ok(plan);
     };
-    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+    Ok(OptExpr::new(
+        Operator::LogicalFilter(FilterOp { predicate }),
+        vec![plan],
+    ))
 }
 
 /// Extract equi-join key pairs from an `OptExpr` join.

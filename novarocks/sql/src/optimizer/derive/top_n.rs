@@ -147,7 +147,9 @@ mod tests {
                     asc: true,
                     nulls_first: false,
                 }],
-            ),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
             limit: Some(100),
             offset: None,
             phase: TopNPhase::Final,

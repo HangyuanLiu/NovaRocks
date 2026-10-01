@@ -350,7 +350,12 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
-        let expr_id = intern_typed(&mut arena, &col_expr);
+        let expr_id = intern_typed(
+            &mut arena,
+            &col_expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![ScalarProjectItem {

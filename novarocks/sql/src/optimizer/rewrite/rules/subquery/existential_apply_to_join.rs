@@ -67,7 +67,7 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
     ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena).map_err(SqlCompileError::Compilation)? {
+        match apply_expr(expr, &mut arena, &ctx.control_view())? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -85,7 +85,11 @@ fn apply_payload_after_pattern_gate(expr: &OptExpr) -> &ApplyOp {
     apply
 }
 
-fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+fn apply_expr(
+    expr: OptExpr,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -110,9 +114,13 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
     };
 
     let (right, condition) = if a.correlation_column_ids.is_empty() {
-        (apply_right, scalar_utils::bool_literal(arena, true))
+        (
+            apply_right,
+            scalar_utils::bool_literal(arena, true, control)?,
+        )
     } else {
-        let Some(lifted) = lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena)
+        let Some(lifted) =
+            lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena, control)?
         else {
             return Ok(None);
         };

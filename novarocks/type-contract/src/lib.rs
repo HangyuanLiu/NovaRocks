@@ -34,9 +34,12 @@ mod logical;
 mod partition;
 mod schema;
 mod semantics;
+mod type_fingerprint;
 mod value_arithmetic;
 mod value_projection;
 mod window;
+
+pub use type_fingerprint::arrow_data_type_fingerprint_observed;
 
 pub use arithmetic::{
     ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,

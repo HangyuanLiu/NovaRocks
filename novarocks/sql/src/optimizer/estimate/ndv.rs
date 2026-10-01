@@ -160,7 +160,8 @@ mod tests {
 
     fn expr_id(expr: &TypedExpr) -> (ScalarArena, ScalarId) {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, expr);
+        let id =
+            intern_typed(&mut arena, expr, crate::optimizer::test_optimizer_control()).unwrap();
         (arena, id)
     }
 

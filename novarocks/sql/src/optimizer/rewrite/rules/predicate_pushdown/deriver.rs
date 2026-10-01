@@ -34,13 +34,14 @@ pub(crate) fn derive_inner_join_predicates(
     right_ids: &HashSet<ColumnId>,
     join_groups: &[PredicateGroup],
     filter_groups: &[PredicateGroup],
-) -> Vec<PredicateGroup> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<PredicateGroup>, crate::compiler::SqlCompileError> {
     if join_groups
         .iter()
         .chain(filter_groups.iter())
         .any(|group| !group.deterministic || group.can_fail)
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut equality_pairs = Vec::new();
@@ -77,7 +78,8 @@ pub(crate) fn derive_inner_join_predicates(
                     constraint,
                     right,
                     derived_kind_for_constraint(&constraint.kind),
-                ) {
+                    control,
+                )? {
                     derived.push(group);
                 }
             } else if same_column(arena, constraint.column, right)
@@ -86,7 +88,8 @@ pub(crate) fn derive_inner_join_predicates(
                     constraint,
                     left,
                     derived_kind_for_constraint(&constraint.kind),
-                )
+                    control,
+                )?
             {
                 derived.push(group);
             }
@@ -95,11 +98,11 @@ pub(crate) fn derive_inner_join_predicates(
 
     for group in filter_groups {
         derived.extend(derive_or_branch_side_filters(
-            arena, left_ids, right_ids, group,
-        ));
+            arena, left_ids, right_ids, group, control,
+        )?);
     }
 
-    dedupe_groups(derived)
+    Ok(dedupe_groups(derived))
 }
 
 fn extract_column_pair_equality(
@@ -171,34 +174,36 @@ fn substitute_constraint_column(
     constraint: &ColumnConstraint,
     target_column: ScalarId,
     derived: PredicateDerivedKind,
-) -> Option<PredicateGroup> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
     if !is_column_ref(arena, target_column) {
-        return None;
+        return Ok(None);
     }
     if arena.data_type(constraint.column) != arena.data_type(target_column) {
-        return None;
+        return Ok(None);
     }
     let expr = match &constraint.kind {
-        ConstraintKind::Eq(value) => binary_bool(arena, target_column, BinOp::Eq, *value),
+        ConstraintKind::Eq(value) => binary_bool(arena, target_column, BinOp::Eq, *value, control)?,
         ConstraintKind::InList(list) => {
             let nullable =
                 arena.nullable(target_column) || list.iter().any(|expr| arena.nullable(*expr));
-            arena.intern(
+            arena.intern_observed(
                 ScalarNode::InList {
                     child: target_column,
                     list: list.clone(),
                     negated: false,
                 },
                 novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-            )
+                control,
+            )?
         }
         ConstraintKind::Lower { op, value } | ConstraintKind::Upper { op, value } => {
-            binary_bool(arena, target_column, *op, *value)
+            binary_bool(arena, target_column, *op, *value, control)?
         }
         ConstraintKind::Between { low, high } => {
             let nullable =
                 arena.nullable(target_column) || arena.nullable(*low) || arena.nullable(*high);
-            arena.intern(
+            arena.intern_observed(
                 ScalarNode::Between {
                     child: target_column,
                     low: *low,
@@ -206,15 +211,16 @@ fn substitute_constraint_column(
                     negated: false,
                 },
                 novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-            )
+                control,
+            )?
         }
     };
-    Some(PredicateGroup::new(
+    Ok(Some(PredicateGroup::new(
         arena,
         expr,
         PredicateOrigin::Derived,
         derived,
-    ))
+    )))
 }
 
 fn derive_or_branch_side_filters(
@@ -222,15 +228,16 @@ fn derive_or_branch_side_filters(
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
     group: &PredicateGroup,
-) -> Vec<PredicateGroup> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<PredicateGroup>, crate::compiler::SqlCompileError> {
     if !group.deterministic || group.can_fail {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, group.expr, &mut branches);
     if branches.len() < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut per_branch = Vec::with_capacity(branches.len());
@@ -274,7 +281,7 @@ fn derive_or_branch_side_filters(
         }
 
         if candidates.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut by_column: HashMap<ColumnId, Vec<ColumnConstraint>> = HashMap::new();
@@ -292,7 +299,7 @@ fn derive_or_branch_side_filters(
             }
         }
         if by_column.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         per_branch.push(BranchCandidates { by_column, by_side });
     }
@@ -308,12 +315,14 @@ fn derive_or_branch_side_filters(
             continue;
         }
 
-        if let Some(group) = derive_or_in_list(arena, column_id, &per_branch) {
+        if let Some(group) = derive_or_in_list(arena, column_id, &per_branch, control)? {
             if let Some(side) = single_column_side(arena, group.expr, left_ids, right_ids) {
                 specialized_sides.insert(side);
             }
             derived.push(group);
-        } else if let Some(group) = derive_or_range_envelope(arena, column_id, &per_branch) {
+        } else if let Some(group) =
+            derive_or_range_envelope(arena, column_id, &per_branch, control)?
+        {
             if let Some(side) = single_column_side(arena, group.expr, left_ids, right_ids) {
                 specialized_sides.insert(side);
             }
@@ -325,12 +334,12 @@ fn derive_or_branch_side_filters(
         if specialized_sides.contains(&side) {
             continue;
         }
-        if let Some(group) = derive_or_side_fallback(arena, side, &per_branch) {
+        if let Some(group) = derive_or_side_fallback(arena, side, &per_branch, control)? {
             derived.push(group);
         }
     }
 
-    dedupe_groups(derived)
+    Ok(dedupe_groups(derived))
 }
 
 #[derive(Clone, Debug)]
@@ -398,28 +407,35 @@ fn derive_or_in_list(
     arena: &mut ScalarArena,
     column_id: ColumnId,
     per_branch: &[BranchCandidates],
-) -> Option<PredicateGroup> {
-    let first = per_branch[0].by_column.get(&column_id)?.first()?.column;
-    let mut values = Vec::new();
-    for branch in per_branch {
-        let constraints = branch.by_column.get(&column_id)?;
-        let eq = constraints
-            .iter()
-            .find_map(|constraint| match &constraint.kind {
-                ConstraintKind::Eq(value) => Some(*value),
-                _ => None,
-            })?;
-        values.push(eq);
-    }
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
+    let Some(constraint) = (|| {
+        let first = per_branch[0].by_column.get(&column_id)?.first()?.column;
+        let mut values = Vec::new();
+        for branch in per_branch {
+            let constraints = branch.by_column.get(&column_id)?;
+            let eq = constraints
+                .iter()
+                .find_map(|constraint| match &constraint.kind {
+                    ConstraintKind::Eq(value) => Some(*value),
+                    _ => None,
+                })?;
+            values.push(eq);
+        }
 
-    substitute_constraint_column(
-        arena,
-        &ColumnConstraint {
+        Some(ColumnConstraint {
             column: first,
             kind: ConstraintKind::InList(values),
-        },
-        first,
+        })
+    })() else {
+        return Ok(None);
+    };
+    substitute_constraint_column(
+        arena,
+        &constraint,
+        constraint.column,
         PredicateDerivedKind::OrSideFilter,
+        control,
     )
 }
 
@@ -427,39 +443,50 @@ fn derive_or_range_envelope(
     arena: &mut ScalarArena,
     column_id: ColumnId,
     per_branch: &[BranchCandidates],
-) -> Option<PredicateGroup> {
-    let first = per_branch[0].by_column.get(&column_id)?.first()?.column;
-    let mut low: Option<ScalarId> = None;
-    let mut high: Option<ScalarId> = None;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
+    let Some(constraint) = (|| {
+        let first = per_branch[0].by_column.get(&column_id)?.first()?.column;
+        let mut low: Option<ScalarId> = None;
+        let mut high: Option<ScalarId> = None;
 
-    for branch in per_branch {
-        let constraints = branch.by_column.get(&column_id)?;
-        let (branch_low, branch_high) = branch_range(arena, constraints)?;
-        low = Some(match low {
-            Some(current) if compare_literals(arena, current, branch_low)? != Ordering::Greater => {
-                current
-            }
-            _ => branch_low,
-        });
-        high = Some(match high {
-            Some(current) if compare_literals(arena, current, branch_high)? != Ordering::Less => {
-                current
-            }
-            _ => branch_high,
-        });
-    }
+        for branch in per_branch {
+            let constraints = branch.by_column.get(&column_id)?;
+            let (branch_low, branch_high) = branch_range(arena, constraints)?;
+            low = Some(match low {
+                Some(current)
+                    if compare_literals(arena, current, branch_low)? != Ordering::Greater =>
+                {
+                    current
+                }
+                _ => branch_low,
+            });
+            high = Some(match high {
+                Some(current)
+                    if compare_literals(arena, current, branch_high)? != Ordering::Less =>
+                {
+                    current
+                }
+                _ => branch_high,
+            });
+        }
 
-    substitute_constraint_column(
-        arena,
-        &ColumnConstraint {
+        Some(ColumnConstraint {
             column: first,
             kind: ConstraintKind::Between {
                 low: low?,
                 high: high?,
             },
-        },
-        first,
+        })
+    })() else {
+        return Ok(None);
+    };
+    substitute_constraint_column(
+        arena,
+        &constraint,
+        constraint.column,
         PredicateDerivedKind::RangeEnvelope,
+        control,
     )
 }
 
@@ -641,27 +668,37 @@ fn derive_or_side_fallback(
     arena: &mut ScalarArena,
     side: Side,
     per_branch: &[BranchCandidates],
-) -> Option<PredicateGroup> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<PredicateGroup>, crate::compiler::SqlCompileError> {
     let mut branch_exprs = Vec::new();
     for branch in per_branch {
-        let constraints = branch.by_side.get(&side)?;
+        let Some(constraints) = branch.by_side.get(&side) else {
+            return Ok(None);
+        };
         if constraints.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let exprs: Option<Vec<ScalarId>> = constraints
-            .iter()
-            .map(|constraint| constraint_to_expr(arena, constraint))
-            .collect();
-        branch_exprs.push(scalar_expr::combine_conjuncts(arena, exprs?)?);
+        let mut exprs = Vec::with_capacity(constraints.len());
+        for constraint in constraints {
+            let Some(expr) = constraint_to_expr(arena, constraint, control)? else {
+                return Ok(None);
+            };
+            exprs.push(expr);
+        }
+        let Some(expr) = scalar_expr::combine_conjuncts(arena, exprs, control)? else {
+            return Ok(None);
+        };
+        branch_exprs.push(expr);
     }
-
-    let expr = scalar_expr::combine_disjuncts(arena, branch_exprs)?;
-    Some(PredicateGroup::new(
+    let Some(expr) = scalar_expr::combine_disjuncts(arena, branch_exprs, control)? else {
+        return Ok(None);
+    };
+    Ok(Some(PredicateGroup::new(
         arena,
         expr,
         PredicateOrigin::Derived,
         PredicateDerivedKind::OrSideFilter,
-    ))
+    )))
 }
 
 fn column_side(
@@ -723,9 +760,15 @@ fn is_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
     matches!(arena.node(expr), ScalarNode::Literal(_))
 }
 
-fn binary_bool(arena: &mut ScalarArena, left: ScalarId, op: BinOp, right: ScalarId) -> ScalarId {
+fn binary_bool(
+    arena: &mut ScalarArena,
+    left: ScalarId,
+    op: BinOp,
+    right: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let nullable = arena.nullable(left) || arena.nullable(right);
-    arena.intern(
+    arena.intern_observed(
         ScalarNode::BinaryOp {
             op,
             left,
@@ -733,17 +776,23 @@ fn binary_bool(arena: &mut ScalarArena, left: ScalarId, op: BinOp, right: Scalar
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
+        control,
     )
 }
 
-fn constraint_to_expr(arena: &mut ScalarArena, constraint: &ColumnConstraint) -> Option<ScalarId> {
-    substitute_constraint_column(
+fn constraint_to_expr(
+    arena: &mut ScalarArena,
+    constraint: &ColumnConstraint,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    Ok(substitute_constraint_column(
         arena,
         constraint,
         constraint.column,
         PredicateDerivedKind::OrSideFilter,
-    )
-    .map(|group| group.expr)
+        control,
+    )?
+    .map(|group| group.expr))
 }
 
 #[cfg(test)]
@@ -832,7 +881,12 @@ mod tests {
     }
 
     fn group(arena: &mut ScalarArena, expr: TypedExpr) -> PredicateGroup {
-        let expr = intern_typed(arena, &expr);
+        let expr = intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         PredicateGroup::new(
             arena,
             expr,
@@ -896,7 +950,9 @@ mod tests {
             &ids(&[2]),
             &[join_eq],
             &[left_filter],
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("\"b\""));
@@ -921,7 +977,9 @@ mod tests {
             &ids(&[2]),
             &[],
             &[filter_eq, left_filter],
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("\"b\""));
@@ -950,7 +1008,9 @@ mod tests {
             &ids(&[2]),
             &[join_eq],
             &[left_filter],
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         assert!(
             derived.is_empty(),
@@ -985,7 +1045,9 @@ mod tests {
             &ids(&[2]),
             &[join_eq],
             &[left_filter],
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("\"b\""));
@@ -1010,8 +1072,15 @@ mod tests {
         );
 
         let or_group = group(&mut arena, or_pred);
-        let derived =
-            derive_inner_join_predicates(&mut arena, &ids(&[1]), &ids(&[2]), &[], &[or_group]);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &ids(&[1]),
+            &ids(&[2]),
+            &[],
+            &[or_group],
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("\"b\""));
@@ -1044,7 +1113,9 @@ mod tests {
             &ids(&[2, 4]),
             &[],
             &[or_group],
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("\"b\""));
@@ -1072,7 +1143,9 @@ mod tests {
             &ids(&[2]),
             &[join_eq],
             &[left_filter, nondeterministic],
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         assert!(derived.is_empty());
     }
@@ -1091,8 +1164,15 @@ mod tests {
         );
 
         let or_group = group(&mut arena, or_pred);
-        let derived =
-            derive_inner_join_predicates(&mut arena, &ids(&[1]), &ids(&[2]), &[], &[or_group]);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &ids(&[1]),
+            &ids(&[2]),
+            &[],
+            &[or_group],
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         assert!(
             derived.is_empty(),
@@ -1133,8 +1213,15 @@ mod tests {
         );
 
         let or_group = group(&mut arena, or_pred);
-        let derived =
-            derive_inner_join_predicates(&mut arena, &ids(&[1]), &ids(&[3]), &[], &[or_group]);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &ids(&[1]),
+            &ids(&[3]),
+            &[],
+            &[or_group],
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("\"price\""));
@@ -1174,8 +1261,15 @@ mod tests {
         );
 
         let or_group = group(&mut arena, or_pred);
-        let derived =
-            derive_inner_join_predicates(&mut arena, &ids(&[1]), &ids(&[3]), &[], &[or_group]);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &ids(&[1]),
+            &ids(&[3]),
+            &[],
+            &[or_group],
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("LargeInt(9007199254740992)"));
@@ -1214,8 +1308,15 @@ mod tests {
         );
 
         let or_group = group(&mut arena, or_pred);
-        let derived =
-            derive_inner_join_predicates(&mut arena, &ids(&[1]), &ids(&[3]), &[], &[or_group]);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &ids(&[1]),
+            &ids(&[3]),
+            &[],
+            &[or_group],
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let rendered = rendered_exprs(&arena, &derived);
         assert!(rendered.contains("Decimal(\"9.50\")"));
@@ -1253,8 +1354,15 @@ mod tests {
         );
 
         let or_group = group(&mut arena, or_pred);
-        let derived =
-            derive_inner_join_predicates(&mut arena, &ids(&[1]), &ids(&[3]), &[], &[or_group]);
+        let derived = derive_inner_join_predicates(
+            &mut arena,
+            &ids(&[1]),
+            &ids(&[3]),
+            &[],
+            &[or_group],
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         assert!(
             derived

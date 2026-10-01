@@ -26,6 +26,8 @@
 //! still use the `TypedExpr` bridge during the migration.
 #![allow(dead_code)] // wired into operators in M1.
 
+mod interner;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -177,12 +179,6 @@ pub(crate) enum ScalarNode {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct ScalarKey {
-    node: ScalarNode,
-    value_type: FunctionValueType,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ColumnDisplay {
     pub qualifier: Option<String>,
     pub column: String,
@@ -219,7 +215,7 @@ pub(crate) struct ScalarArena {
     /// alongside the compact node representation so optimizer passes never
     /// have to carry their own name-based volatility policy.
     function_volatility: Vec<Option<FunctionVolatility>>,
-    intern: HashMap<ScalarKey, ScalarId>,
+    intern: HashMap<u64, Vec<ScalarId>>,
     column_displays: HashMap<ColumnId, StoredColumnDisplay>,
 }
 
@@ -234,28 +230,21 @@ impl ScalarArena {
         }
     }
 
-    /// Intern a typed node. Returns the existing id for a structurally-identical
-    /// node with the same complete value type. Equality and hashing retain the
-    /// existing algorithm; cooperative constant interning is a separate owner.
+    /// Intern a typed node with the original request control. Bucket keys are
+    /// only lookup accelerators; every hit uses observed exact comparison.
+    pub(crate) fn intern_observed(
+        &mut self,
+        node: ScalarNode,
+        value_type: FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+        interner::intern(self, node, value_type, control)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn intern(&mut self, node: ScalarNode, value_type: FunctionValueType) -> ScalarId {
-        let node = Self::normalize(node);
-        let key = ScalarKey {
-            node: node.clone(),
-            value_type: value_type.clone(),
-        };
-        if let Some(&id) = self.intern.get(&key) {
-            return id;
-        }
-        let id = ScalarId(self.nodes.len() as u32);
-        let function_volatility = match &node {
-            ScalarNode::FunctionCall { volatility, .. } => Some(*volatility),
-            _ => None,
-        };
-        self.nodes.push(node);
-        self.value_types.push(value_type);
-        self.function_volatility.push(function_volatility);
-        self.intern.insert(key, id);
-        id
+        self.intern_observed(node, value_type, crate::optimizer::test_optimizer_control())
+            .expect("explicit test scalar interning control")
     }
 
     /// Canonicalize commutative binary ops by ordering operands by ScalarId, so
@@ -920,22 +909,47 @@ mod bridge_tests {
         let mut a = ScalarArena::new();
         // Independently constructed but structurally identical TypedExpr trees
         // must intern to the same ScalarId.
-        let id1 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(5)));
-        let id2 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(5)));
+        let id1 = intern_typed(
+            &mut a,
+            &eq(col(1, DataType::Int64), lit_int(5)),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let id2 = intern_typed(
+            &mut a,
+            &eq(col(1, DataType::Int64), lit_int(5)),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_eq!(
             id1, id2,
             "structurally-identical TypedExprs must intern to one ScalarId"
         );
 
-        let id3 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(6)));
+        let id3 = intern_typed(
+            &mut a,
+            &eq(col(1, DataType::Int64), lit_int(6)),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_ne!(id1, id3);
     }
 
     #[test]
     fn intern_typed_separates_literals_by_type_metadata() {
         let mut a = ScalarArena::new();
-        let int8 = intern_typed(&mut a, &lit_int_as(1, DataType::Int8));
-        let int64 = intern_typed(&mut a, &lit_int_as(1, DataType::Int64));
+        let int8 = intern_typed(
+            &mut a,
+            &lit_int_as(1, DataType::Int8),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let int64 = intern_typed(
+            &mut a,
+            &lit_int_as(1, DataType::Int64),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_ne!(
             int8, int64,
@@ -958,7 +972,7 @@ mod bridge_tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
 
-        intern_typed(&mut a, &expr);
+        intern_typed(&mut a, &expr, crate::optimizer::test_optimizer_control()).unwrap();
     }
 
     #[test]
@@ -973,7 +987,7 @@ mod bridge_tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
 
-        let id = intern_typed(&mut a, &expr);
+        let id = intern_typed(&mut a, &expr, crate::optimizer::test_optimizer_control()).unwrap();
         let back = materialize(&a, id);
 
         let ExprKind::ColumnRef {
@@ -1005,7 +1019,8 @@ mod bridge_tests {
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
 
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef { column, .. } = general.kind else {
@@ -1037,7 +1052,8 @@ mod bridge_tests {
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef {
             qualifier, column, ..
@@ -1065,7 +1081,8 @@ mod bridge_tests {
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef {
             qualifier, column, ..
@@ -1093,7 +1110,8 @@ mod bridge_tests {
             output_column_id: ColumnId(7),
         };
 
-        let scalar_item = intern_project_item(&mut a, &item);
+        let scalar_item =
+            intern_project_item(&mut a, &item, crate::optimizer::test_optimizer_control()).unwrap();
         let general = materialize(&a, scalar_item.expr);
         let ExprKind::ColumnRef {
             qualifier, column, ..
@@ -1147,10 +1165,23 @@ mod bridge_tests {
             .unwrap();
             let mut source = col(700, value_type.data_type.clone());
             source.value_type = value_type.clone();
-            let id = intern_typed(&mut arena, &source);
+            let id = intern_typed(
+                &mut arena,
+                &source,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
             assert_eq!(arena.value_type(id), &value_type);
             assert_eq!(materialize(&arena, id).value_type, value_type);
-            assert_eq!(intern_typed(&mut arena, &source), id);
+            assert_eq!(
+                intern_typed(
+                    &mut arena,
+                    &source,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap(),
+                id
+            );
             assert!(!ids.contains(&id));
             ids.push(id);
         }
@@ -1194,9 +1225,22 @@ mod bridge_tests {
         ] {
             let mut source = col(701, value_type.data_type.clone());
             source.value_type = value_type.clone();
-            let id = intern_typed(&mut arena, &source);
+            let id = intern_typed(
+                &mut arena,
+                &source,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
             assert_eq!(materialize(&arena, id).value_type, value_type);
-            assert_eq!(intern_typed(&mut arena, &source), id);
+            assert_eq!(
+                intern_typed(
+                    &mut arena,
+                    &source,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap(),
+                id
+            );
             assert!(!ids.contains(&id));
             ids.push(id);
         }
@@ -1259,7 +1303,12 @@ mod bridge_tests {
     fn materialize_round_trips_core_variants() {
         let mut a = ScalarArena::new();
         let original = eq(col(1, DataType::Int64), lit_int(5));
-        let id = intern_typed(&mut a, &original);
+        let id = intern_typed(
+            &mut a,
+            &original,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let back = materialize(&a, id);
         assert_eq!(
             format!("{:?}", back),
@@ -1466,14 +1515,14 @@ mod bridge_tests {
             DataType::Utf8,
             true,
         );
-        let id1 = intern_typed(&mut a, &e);
+        let id1 = intern_typed(&mut a, &e, crate::optimizer::test_optimizer_control()).unwrap();
         let back = materialize(&a, id1);
         assert_eq!(
             format!("{back:?}"),
             format!("{e:?}"),
             "complex expr must round-trip"
         );
-        let id2 = intern_typed(&mut a, &e);
+        let id2 = intern_typed(&mut a, &e, crate::optimizer::test_optimizer_control()).unwrap();
         assert_eq!(id1, id2, "complex expr must dedup to one id");
     }
 }
@@ -1516,7 +1565,15 @@ mod overflow_policy_tests {
         assert_ne!(ids[1], ids[3]);
         for id in ids {
             let typed = materialize(&arena, id);
-            assert_eq!(intern_typed(&mut arena, &typed), id);
+            assert_eq!(
+                intern_typed(
+                    &mut arena,
+                    &typed,
+                    crate::optimizer::test_optimizer_control()
+                )
+                .unwrap(),
+                id
+            );
             let expected = match arena.node(id) {
                 ScalarNode::BinaryOp {
                     decimal_overflow_policy,

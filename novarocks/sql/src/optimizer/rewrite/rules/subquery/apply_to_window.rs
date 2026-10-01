@@ -93,7 +93,7 @@ impl LogicalRewriteRule for ApplyToWindow {
     ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_plan_inner(expr, ctx, &mut arena).map_err(SqlCompileError::Compilation)? {
+        match apply_plan_inner(expr, ctx, &mut arena)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -121,7 +121,7 @@ fn apply_plan_inner(
     plan: OptExpr,
     ctx: &mut RewriteContext,
     arena: &mut ScalarArena,
-) -> Result<Option<OptExpr>, String> {
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let Some(m) = ({
         let Operator::LogicalFilter(f) = &plan.op else {
             return Ok(None);
@@ -153,7 +153,8 @@ fn apply_plan_inner(
     let inner_map = collect_scan_column_map(&apply_right);
     // Collect the set of inner-scan ColumnIds upfront; used by post-condition guards.
     let inner_ids: HashSet<ColumnId> = inner_map.keys().copied().collect();
-    let outer_cols = scalar_utils::opt_output_columns(&outer_subtree, arena)?;
+    let outer_cols = scalar_utils::opt_output_columns(&outer_subtree, arena)
+        .map_err(SqlCompileError::Compilation)?;
     let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
     for oc in &outer_cols {
         if let Some((tab, name)) = outer_map.get(&oc.column_id) {
@@ -162,7 +163,9 @@ fn apply_plan_inner(
     }
     let mut agg_args = m.inner_agg.args.clone();
     for arg in &mut agg_args {
-        let Some(remapped) = remap_inner_to_outer(arena, *arg, &inner_map, &phys_to_outer) else {
+        let Some(remapped) =
+            remap_inner_to_outer(arena, *arg, &inner_map, &phys_to_outer, &ctx.control_view())?
+        else {
             // Required column unavailable on outer side → fall back to join form.
             return Ok(None);
         };
@@ -177,9 +180,9 @@ fn apply_plan_inner(
     }
 
     // --- 2. Mint the window output column; build the WindowExpr. ---
-    let factory = ctx
-        .column_ref_factory()
-        .ok_or_else(|| "ApplyToWindow requires ColumnRefFactory".to_string())?;
+    let factory = ctx.column_ref_factory().ok_or_else(|| {
+        SqlCompileError::Compilation("ApplyToWindow requires ColumnRefFactory".to_string())
+    })?;
     let win_id = factory.borrow_mut().create(
         None,
         format!("{}_window", m.inner_agg.name),
@@ -222,7 +225,7 @@ fn apply_plan_inner(
     let before_filtered = if before.is_empty() {
         outer_subtree
     } else {
-        let Some(predicate) = scalar_utils::combine_and(arena, before) else {
+        let Some(predicate) = scalar_utils::combine_and(arena, before, &ctx.control_view())? else {
             return Ok(None);
         };
         scalar_utils::filter(outer_subtree, predicate)
@@ -246,7 +249,8 @@ fn apply_plan_inner(
     );
 
     // --- 5. Window node: output = base outer columns + the window column. ---
-    let mut window_output = scalar_utils::opt_output_columns(&sorted, arena)?;
+    let mut window_output =
+        scalar_utils::opt_output_columns(&sorted, arena).map_err(SqlCompileError::Compilation)?;
     window_output.push(win_output.clone());
     let window = OptExpr::new(
         Operator::LogicalWindow(WindowOp {
@@ -263,7 +267,8 @@ fn apply_plan_inner(
         m.inner_agg_output.column_id,
         &win_output,
         arena,
-    );
+        &ctx.control_view(),
+    )?;
     // Guard 2: value_expr must not reference the inner agg output or any inner-scan column.
     {
         let vrefs = scalar_utils::collect_column_ids(arena, value_expr);
@@ -276,7 +281,8 @@ fn apply_plan_inner(
         m.subquery_conjunct,
         a.output_column.column_id,
         value_expr,
-    );
+        &ctx.control_view(),
+    )?;
     // Guard 3: APPLY_OUT must be gone from after_pred — it has been fully replaced.
     if scalar_utils::collect_column_ids(arena, after_pred).contains(&a.output_column.column_id) {
         return Ok(None); // APPLY_OUT survived (comparison used an unhandled node)
@@ -302,14 +308,24 @@ fn remap_inner_to_outer(
     expr: ScalarId,
     inner_map: &HashMap<ColumnId, (TableIdentity, String)>,
     phys_to_outer: &HashMap<(TableIdentity, String), OutputColumn>,
-) -> Option<ScalarId> {
-    scalar_utils::remap_column_refs(arena, expr, &mut |arena, column_id| {
-        let Some((tab, name)) = inner_map.get(&column_id) else {
-            return Some(None);
-        };
-        let outer_col = phys_to_outer.get(&(tab.clone(), name.clone()))?;
-        Some(Some(scalar_utils::column_ref(arena, outer_col)))
-    })
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    scalar_utils::remap_column_refs(
+        arena,
+        expr,
+        &mut |arena, column_id| {
+            let Some((tab, name)) = inner_map.get(&column_id) else {
+                return Ok(Some(None));
+            };
+            let Some(outer_col) = phys_to_outer.get(&(tab.clone(), name.clone())) else {
+                return Ok(None);
+            };
+            Ok(Some(Some(scalar_utils::column_ref(
+                arena, outer_col, control,
+            )?)))
+        },
+        control,
+    )
 }
 
 /// Build the "value expression" that replaces `APPLY_OUT` in the after-window
@@ -327,8 +343,9 @@ fn build_value_expr(
     agg_out_col_id: ColumnId,
     win_output: &OutputColumn,
     arena: &mut ScalarArena,
-) -> ScalarId {
-    let win_ref = scalar_utils::column_ref(arena, win_output);
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
+    let win_ref = scalar_utils::column_ref(arena, win_output, control)?;
     // Peel exactly one optional leading Project (single-leading-Project assumption:
     // PushDownApplyAggFilter inserts at most one Project above the Aggregate).
     if let Operator::LogicalProject(proj) = &apply_right.op {
@@ -336,14 +353,20 @@ fn build_value_expr(
         for item in &proj.items {
             if item.output_column_id == inner_output_col_id {
                 // Replace the aggregate output column reference with win_id.
-                return scalar_utils::replace_column_ref(arena, item.expr, agg_out_col_id, win_ref);
+                return scalar_utils::replace_column_ref(
+                    arena,
+                    item.expr,
+                    agg_out_col_id,
+                    win_ref,
+                    control,
+                );
             }
         }
         // No matching item found in the Project (unusual shape) → safe fallback.
     }
     // No leading Project OR no matching item: inner_output_col_id IS the aggregate
     // output column (bare agg case, e.g. q2 min/max with no arithmetic).
-    win_ref
+    Ok(win_ref)
 }
 
 fn check_preconditions_opt(

@@ -75,7 +75,8 @@ impl Rule for SplitAggregateRule {
             &mut memo.scalars,
             &local_output_columns,
             agg.group_by.len(),
-        );
+            control,
+        )?;
         remember_group_key_output_displays(
             &mut memo.scalars,
             &local_group_by,
@@ -237,15 +238,17 @@ pub(crate) fn aggregate_group_key_output_ref(
     arena: &mut ScalarArena,
     local_output_columns: &[OutputColumn],
     group_by_len: usize,
-) -> Vec<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarId>, crate::compiler::SqlCompileError> {
     local_output_columns
         .iter()
         .take(group_by_len)
         .map(|output| {
             arena.remember_project_output_display(output.column_id, None, output.name.clone());
-            arena.intern(
+            arena.intern_observed(
                 ScalarNode::ColumnRef(output.column_id),
                 output.value_type.clone(),
+                control,
             )
         })
         .collect()
@@ -392,8 +395,18 @@ mod tests {
         output_columns: Vec<OutputColumn>,
     ) -> LogicalAggregateOp {
         let output_layout = aggregate_output_layout(&group_by, &aggregates, &output_columns);
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         LogicalAggregateOp::single(group_by, aggregates, output_layout, output_columns)
     }
 
@@ -407,8 +420,18 @@ mod tests {
         is_split: bool,
     ) -> LogicalAggregateOp {
         let output_layout = aggregate_output_layout(&group_by, &aggregates, &output_columns);
-        let group_by = intern_exprs(&mut memo.scalars, &group_by);
-        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &group_by,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &aggregates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         LogicalAggregateOp::staged(
             stage,
             group_by,
@@ -542,8 +565,18 @@ mod tests {
         let mut memo = Memo::new();
         let group_output_id = ColumnId::new_for_test(101);
         let sum_output_id = ColumnId::new_for_test(201);
-        let group = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")])[0];
-        let arg = intern_exprs(&mut memo.scalars, &[col_ref(2, "v")])[0];
+        let group = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(1, "k")],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()[0];
+        let arg = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(2, "v")],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()[0];
         let agg = LogicalAggregateOp::single(
             vec![group],
             vec![ScalarAggregateSpec {

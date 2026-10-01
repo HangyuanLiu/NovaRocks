@@ -447,12 +447,26 @@ mod tests {
         let mut query_arena = ScalarArena::new();
         let query_ids: Vec<ScalarId> = query_conjuncts
             .iter()
-            .map(|expr| intern_typed(&mut query_arena, expr))
+            .map(|expr| {
+                intern_typed(
+                    &mut query_arena,
+                    expr,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            })
             .collect();
         let mut mv_arena = ScalarArena::new();
         let mv_ids: Vec<ScalarId> = mv_conjuncts
             .iter()
-            .map(|expr| intern_typed(&mut mv_arena, expr))
+            .map(|expr| {
+                intern_typed(
+                    &mut mv_arena,
+                    expr,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            })
             .collect();
         super::check_containment(
             &query_ids,

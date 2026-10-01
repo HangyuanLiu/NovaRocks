@@ -479,7 +479,14 @@ mod tests {
         let output_layout = hidden_aggregate_layout(&group_by_typed, &agg_specs);
         let group_by = group_by_typed
             .iter()
-            .map(|e| intern_typed(arena, e))
+            .map(|e| {
+                intern_typed(
+                    arena,
+                    e,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap()
+            })
             .collect();
         LogicalAggregateOp::staged(
             AggStage::Single,
@@ -497,7 +504,14 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: test_col_id(None, &format!("sum({col})")),
             name: "sum".into(),
-            args: vec![intern_typed(arena, &arg)],
+            args: vec![
+                intern_typed(
+                    arena,
+                    &arg,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap(),
+            ],
             distinct: false,
             order_by: vec![],
             resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
@@ -548,7 +562,14 @@ mod tests {
         right: OptExpr,
         arena: &mut ScalarArena,
     ) -> OptExpr {
-        let cond_id = condition.as_ref().map(|c| intern_typed(arena, c));
+        let cond_id = condition.as_ref().map(|c| {
+            intern_typed(
+                arena,
+                c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type,
@@ -567,7 +588,14 @@ mod tests {
         let output_layout = hidden_aggregate_layout(&group_by_typed, &agg_specs);
         let group_by = group_by_typed
             .iter()
-            .map(|e| intern_typed(arena, e))
+            .map(|e| {
+                intern_typed(
+                    arena,
+                    e,
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap()
+            })
             .collect();
         let is_merge = vec![false; agg_specs.len()];
         OptExpr::new(
@@ -633,7 +661,12 @@ mod tests {
         let mut arena = make_arena();
         let mut spec = sum_spec("v", &mut arena);
         spec.order_by.push(crate::optimizer::scalar::SortKey {
-            expr: intern_typed(&mut arena, &col_ref_typed("v", DataType::Int64)),
+            expr: intern_typed(
+                &mut arena,
+                &col_ref_typed("v", DataType::Int64),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
             asc: true,
             nulls_first: false,
             display: None,
@@ -670,7 +703,12 @@ mod tests {
     #[test]
     fn rejects_avg_function() {
         let mut arena = make_arena();
-        let avg_arg = intern_typed(&mut arena, &col_ref_typed("v", DataType::Int64));
+        let avg_arg = intern_typed(
+            &mut arena,
+            &col_ref_typed("v", DataType::Int64),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let avg = ScalarAggregateSpec {
             output_column_id: test_col_id(None, "avg(v)"),
             name: "avg".into(),
@@ -701,7 +739,12 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         };
-        let arg_id = intern_typed(&mut arena, &non_col);
+        let arg_id = intern_typed(
+            &mut arena,
+            &non_col,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9002),
             name: "sum".into(),
@@ -738,7 +781,12 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         };
-        let arg_id = intern_typed(&mut arena, &rand_expr);
+        let arg_id = intern_typed(
+            &mut arena,
+            &rand_expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9003),
             name: "sum".into(),
@@ -810,7 +858,12 @@ mod tests {
             scan_b,
             &mut arena,
         );
-        let filter_pred = intern_typed(&mut arena, &col_ref_typed("k", DataType::Boolean));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &col_ref_typed("k", DataType::Boolean),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -839,7 +892,12 @@ mod tests {
             scan_b,
             &mut arena,
         );
-        let proj_expr = intern_typed(&mut arena, &col_ref_typed("k", DataType::Int64));
+        let proj_expr = intern_typed(
+            &mut arena,
+            &col_ref_typed("k", DataType::Int64),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![ScalarProjectItem {
@@ -917,7 +975,9 @@ mod tests {
         let sum_arg = intern_typed(
             &mut arena,
             &qualified_col_ref_typed("cs", "cs_sales_price", DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let agg = agg_opt(
             join,
             vec![qualified_col_ref_typed(
@@ -1132,7 +1192,9 @@ mod tests {
         let count_arg = intern_typed(
             &mut arena,
             &qualified_col_ref_typed("l", "c0", DataType::Int64),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let count_spec = ScalarAggregateSpec {
             output_column_id: test_col_id(Some("l"), "count(c0)"),
             name: "count".into(),

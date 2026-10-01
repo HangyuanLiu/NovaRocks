@@ -20,7 +20,6 @@
 
 use std::collections::HashSet;
 
-use arrow::datatypes::DataType;
 use novarocks_type_contract::FunctionValueType;
 
 use crate::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
@@ -33,28 +32,43 @@ use crate::optimizer::scalar::{
 };
 use crate::planner::payload::{AggregateCall, WindowExpr};
 
-pub(crate) fn intern_exprs(arena: &mut ScalarArena, exprs: &[TypedExpr]) -> Vec<ScalarId> {
-    exprs.iter().map(|expr| intern_typed(arena, expr)).collect()
+pub(crate) fn intern_exprs(
+    arena: &mut ScalarArena,
+    exprs: &[TypedExpr],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarId>, crate::compiler::SqlCompileError> {
+    exprs
+        .iter()
+        .map(|expr| intern_typed(arena, expr, control))
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
 }
 
 pub(crate) fn materialize_exprs(arena: &ScalarArena, exprs: &[ScalarId]) -> Vec<TypedExpr> {
     exprs.iter().map(|expr| materialize(arena, *expr)).collect()
 }
 
-pub(crate) fn intern_sort_item(arena: &mut ScalarArena, item: &SortItem) -> SortKey {
-    SortKey {
-        expr: intern_typed(arena, &item.expr),
+pub(crate) fn intern_sort_item(
+    arena: &mut ScalarArena,
+    item: &SortItem,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<SortKey, crate::compiler::SqlCompileError> {
+    Ok(SortKey {
+        expr: intern_typed(arena, &item.expr, control)?,
         asc: item.asc,
         nulls_first: item.nulls_first,
         display: column_display_from_expr(&item.expr),
-    }
+    })
 }
 
-pub(crate) fn intern_sort_items(arena: &mut ScalarArena, items: &[SortItem]) -> Vec<SortKey> {
+pub(crate) fn intern_sort_items(
+    arena: &mut ScalarArena,
+    items: &[SortItem],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<SortKey>, crate::compiler::SqlCompileError> {
     items
         .iter()
-        .map(|item| intern_sort_item(arena, item))
-        .collect()
+        .map(|item| intern_sort_item(arena, item, control))
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
 }
 
 pub(crate) fn materialize_sort_key(arena: &ScalarArena, key: &SortKey) -> SortItem {
@@ -76,25 +90,27 @@ pub(crate) fn materialize_sort_keys(arena: &ScalarArena, keys: &[SortKey]) -> Ve
 pub(crate) fn intern_project_item(
     arena: &mut ScalarArena,
     item: &ProjectItem,
-) -> ScalarProjectItem {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarProjectItem, crate::compiler::SqlCompileError> {
     let scalar_item = ScalarProjectItem {
-        expr: intern_typed(arena, &item.expr),
+        expr: intern_typed(arena, &item.expr, control)?,
         output_name: item.output_name.clone(),
         output_column_id: item.output_column_id,
         expr_display: column_display_from_expr(&item.expr),
     };
     arena.remember_project_output_display(item.output_column_id, None, item.output_name.clone());
-    scalar_item
+    Ok(scalar_item)
 }
 
 pub(crate) fn intern_project_items(
     arena: &mut ScalarArena,
     items: &[ProjectItem],
-) -> Vec<ScalarProjectItem> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarProjectItem>, crate::compiler::SqlCompileError> {
     items
         .iter()
-        .map(|item| intern_project_item(arena, item))
-        .collect()
+        .map(|item| intern_project_item(arena, item, control))
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
 }
 
 pub(crate) fn materialize_project_item(
@@ -123,30 +139,32 @@ pub(crate) fn materialize_project_items(
 pub(crate) fn intern_aggregate_call(
     arena: &mut ScalarArena,
     call: &AggregateCall,
-) -> ScalarAggregateSpec {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarAggregateSpec, crate::compiler::SqlCompileError> {
     assert!(
         call.output_column_id != ColumnId::UNSET,
         "AggregateCall {} must carry output_column_id before optimizer bridge",
         call.name
     );
-    ScalarAggregateSpec {
+    Ok(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: intern_exprs(arena, &call.args),
+        args: intern_exprs(arena, &call.args, control)?,
         distinct: call.distinct,
-        order_by: intern_sort_items(arena, &call.order_by),
+        order_by: intern_sort_items(arena, &call.order_by, control)?,
         resolved: call.resolved.clone(),
-    }
+    })
 }
 
 pub(crate) fn intern_aggregate_calls(
     arena: &mut ScalarArena,
     calls: &[AggregateCall],
-) -> Vec<ScalarAggregateSpec> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarAggregateSpec>, crate::compiler::SqlCompileError> {
     calls
         .iter()
-        .map(|call| intern_aggregate_call(arena, call))
-        .collect()
+        .map(|call| intern_aggregate_call(arena, call, control))
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
 }
 
 fn aggregate_output_column<'a>(
@@ -212,35 +230,40 @@ pub(crate) fn materialize_aggregate_calls(
         .collect()
 }
 
-pub(crate) fn intern_window_expr(arena: &mut ScalarArena, expr: &WindowExpr) -> ScalarWindowSpec {
+pub(crate) fn intern_window_expr(
+    arena: &mut ScalarArena,
+    expr: &WindowExpr,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarWindowSpec, crate::compiler::SqlCompileError> {
     assert!(
         expr.output_column_id != ColumnId::UNSET,
         "WindowExpr {} must carry output_column_id before optimizer bridge",
         expr.output_name
     );
-    ScalarWindowSpec {
+    Ok(ScalarWindowSpec {
         output_column_id: expr.output_column_id,
         name: expr.name.clone(),
-        args: intern_exprs(arena, &expr.args),
+        args: intern_exprs(arena, &expr.args, control)?,
         distinct: expr.distinct,
         binding: expr.binding.clone(),
-        function_order_by: intern_sort_items(arena, &expr.function_order_by),
+        function_order_by: intern_sort_items(arena, &expr.function_order_by, control)?,
         aggregate_binding: expr.aggregate_binding.clone(),
-        partition_by: intern_exprs(arena, &expr.partition_by),
-        order_by: intern_sort_items(arena, &expr.order_by),
+        partition_by: intern_exprs(arena, &expr.partition_by, control)?,
+        order_by: intern_sort_items(arena, &expr.order_by, control)?,
         window_frame: expr.window_frame.clone(),
         ignore_nulls: expr.ignore_nulls,
-    }
+    })
 }
 
 pub(crate) fn intern_window_exprs(
     arena: &mut ScalarArena,
     exprs: &[WindowExpr],
-) -> Vec<ScalarWindowSpec> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarWindowSpec>, crate::compiler::SqlCompileError> {
     exprs
         .iter()
-        .map(|expr| intern_window_expr(arena, expr))
-        .collect()
+        .map(|expr| intern_window_expr(arena, expr, control))
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
 }
 
 fn window_output_column<'a>(
@@ -319,7 +342,8 @@ pub(crate) fn intern_column_sort_key(
     arena: &mut ScalarArena,
     key: &crate::optimizer::property::SortKey,
     value_type: FunctionValueType,
-) -> SortKey {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<SortKey, crate::compiler::SqlCompileError> {
     let expr = TypedExpr {
         kind: ExprKind::ColumnRef {
             column_id: key.column,
@@ -328,12 +352,12 @@ pub(crate) fn intern_column_sort_key(
         },
         value_type,
     };
-    SortKey {
-        expr: intern_typed(arena, &expr),
+    Ok(SortKey {
+        expr: intern_typed(arena, &expr, control)?,
         asc: key.asc,
         nulls_first: key.nulls_first,
         display: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -454,7 +478,12 @@ mod tests {
         let output_id = ColumnId::new_for_test(701);
         let mut arena = ScalarArena::new();
 
-        let spec = intern_aggregate_call(&mut arena, &aggregate_call(output_id, "sum"));
+        let spec = intern_aggregate_call(
+            &mut arena,
+            &aggregate_call(output_id, "sum"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_eq!(spec.output_column_id, output_id);
         assert_eq!(spec.name, "sum");
@@ -467,7 +496,12 @@ mod tests {
     fn intern_aggregate_call_rejects_unset_output_column_id() {
         let mut arena = ScalarArena::new();
 
-        let _ = intern_aggregate_call(&mut arena, &aggregate_call(ColumnId::UNSET, "sum"));
+        let _ = intern_aggregate_call(
+            &mut arena,
+            &aggregate_call(ColumnId::UNSET, "sum"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -518,7 +552,12 @@ mod tests {
         let output_id = ColumnId::new_for_test(812);
         let argument = column_id_expr(input_id, argument_type.clone());
         let mut arena = ScalarArena::new();
-        let argument_id = intern_typed(&mut arena, &argument);
+        let argument_id = intern_typed(
+            &mut arena,
+            &argument,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let spec = ScalarAggregateSpec {
             output_column_id: output_id,
             name: "avg".into(),
@@ -621,7 +660,12 @@ mod tests {
         let output_id = ColumnId::new_for_test(701);
         let mut arena = ScalarArena::new();
 
-        let spec = intern_window_expr(&mut arena, &window_expr(output_id, "rn"));
+        let spec = intern_window_expr(
+            &mut arena,
+            &window_expr(output_id, "rn"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert_eq!(spec.output_column_id, output_id);
     }
@@ -662,7 +706,12 @@ mod tests {
         };
         let mut arena = ScalarArena::new();
 
-        let spec = intern_window_expr(&mut arena, &source);
+        let spec = intern_window_expr(
+            &mut arena,
+            &source,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_eq!(spec.aggregate_binding.as_ref(), Some(&aggregate_binding));
         assert_eq!(spec.function_order_by.len(), 1);
         let materialized = materialize_window_expr(
@@ -688,7 +737,12 @@ mod tests {
     fn intern_window_expr_rejects_unset_output_id() {
         let mut arena = ScalarArena::new();
 
-        let _ = intern_window_expr(&mut arena, &window_expr(ColumnId::UNSET, "rn"));
+        let _ = intern_window_expr(
+            &mut arena,
+            &window_expr(ColumnId::UNSET, "rn"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -787,7 +841,12 @@ fn column_display_from_expr(expr: &TypedExpr) -> Option<ColumnDisplay> {
 }
 
 /// Recursively intern an analyzer `TypedExpr` into the arena, returning its id.
-pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarId {
+pub(crate) fn intern_typed(
+    arena: &mut ScalarArena,
+    expr: &TypedExpr,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let node = match &expr.kind {
         ExprKind::ColumnRef {
             column_id,
@@ -817,8 +876,8 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             right,
             decimal_overflow_policy,
         } => {
-            let l = intern_typed(arena, left);
-            let r = intern_typed(arena, right);
+            let l = intern_typed(arena, left, control)?;
+            let r = intern_typed(arena, right, control)?;
             ScalarNode::BinaryOp {
                 op: *op,
                 left: l,
@@ -828,7 +887,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
         }
         ExprKind::UnaryOp { op, expr } => ScalarNode::UnaryOp {
             op: *op,
-            child: intern_typed(arena, expr),
+            child: intern_typed(arena, expr, control)?,
         },
         ExprKind::FunctionCall {
             name,
@@ -837,7 +896,10 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             binding,
             volatility,
         } => {
-            let arg_ids: Vec<ScalarId> = args.iter().map(|a| intern_typed(arena, a)).collect();
+            let arg_ids: Vec<ScalarId> =
+                args.iter()
+                    .map(|a| intern_typed(arena, a, control))
+                    .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
             ScalarNode::FunctionCall {
                 name: name.clone(),
                 args: arg_ids,
@@ -848,7 +910,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
         }
         ExprKind::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
             params: params.clone(),
-            body: intern_typed(arena, body),
+            body: intern_typed(arena, body, control)?,
         },
         ExprKind::AggregateCall {
             name,
@@ -858,12 +920,15 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             resolved,
         } => ScalarNode::AggregateCall {
             name: name.clone(),
-            args: args.iter().map(|a| intern_typed(arena, a)).collect(),
+            args: args
+                .iter()
+                .map(|a| intern_typed(arena, a, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             distinct: *distinct,
             order_by: order_by
                 .iter()
-                .map(|item| intern_sort_item(arena, item))
-                .collect(),
+                .map(|item| intern_sort_item(arena, item, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             resolved: resolved.clone(),
         },
         ExprKind::Cast {
@@ -871,12 +936,12 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            child: intern_typed(arena, expr),
+            child: intern_typed(arena, expr, control)?,
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,
         },
         ExprKind::IsNull { expr, negated } => ScalarNode::IsNull {
-            child: intern_typed(arena, expr),
+            child: intern_typed(arena, expr, control)?,
             negated: *negated,
         },
         ExprKind::InList {
@@ -884,8 +949,11 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             list,
             negated,
         } => ScalarNode::InList {
-            child: intern_typed(arena, expr),
-            list: list.iter().map(|item| intern_typed(arena, item)).collect(),
+            child: intern_typed(arena, expr, control)?,
+            list: list
+                .iter()
+                .map(|item| intern_typed(arena, item, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             negated: *negated,
         },
         ExprKind::Between {
@@ -894,9 +962,9 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             high,
             negated,
         } => ScalarNode::Between {
-            child: intern_typed(arena, expr),
-            low: intern_typed(arena, low),
-            high: intern_typed(arena, high),
+            child: intern_typed(arena, expr, control)?,
+            low: intern_typed(arena, low, control)?,
+            high: intern_typed(arena, high, control)?,
             negated: *negated,
         },
         ExprKind::Like {
@@ -904,8 +972,8 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             pattern,
             negated,
         } => ScalarNode::Like {
-            child: intern_typed(arena, expr),
-            pattern: intern_typed(arena, pattern),
+            child: intern_typed(arena, expr, control)?,
+            pattern: intern_typed(arena, pattern, control)?,
             negated: *negated,
         },
         ExprKind::Case {
@@ -913,23 +981,34 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             when_then,
             else_expr,
         } => ScalarNode::Case {
-            operand: operand.as_ref().map(|item| intern_typed(arena, item)),
+            operand: operand
+                .as_ref()
+                .map(|item| intern_typed(arena, item, control))
+                .transpose()?,
             when_then: when_then
                 .iter()
-                .map(|(when, then)| (intern_typed(arena, when), intern_typed(arena, then)))
-                .collect(),
-            else_expr: else_expr.as_ref().map(|item| intern_typed(arena, item)),
+                .map(|(when, then)| {
+                    Ok((
+                        intern_typed(arena, when, control)?,
+                        intern_typed(arena, then, control)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|item| intern_typed(arena, item, control))
+                .transpose()?,
         },
         ExprKind::IsTruthValue {
             expr,
             value,
             negated,
         } => ScalarNode::IsTruthValue {
-            child: intern_typed(arena, expr),
+            child: intern_typed(arena, expr, control)?,
             value: *value,
             negated: *negated,
         },
-        ExprKind::Nested(expr) => ScalarNode::Nested(intern_typed(arena, expr)),
+        ExprKind::Nested(expr) => ScalarNode::Nested(intern_typed(arena, expr, control)?),
         ExprKind::WindowCall {
             name,
             args,
@@ -943,22 +1022,25 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             ignore_nulls,
         } => ScalarNode::WindowCall {
             name: name.clone(),
-            args: args.iter().map(|a| intern_typed(arena, a)).collect(),
+            args: args
+                .iter()
+                .map(|a| intern_typed(arena, a, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             distinct: *distinct,
             binding: binding.clone(),
             function_order_by: function_order_by
                 .iter()
-                .map(|item| intern_sort_item(arena, item))
-                .collect(),
+                .map(|item| intern_sort_item(arena, item, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             aggregate_binding: aggregate_binding.clone(),
             partition_by: partition_by
                 .iter()
-                .map(|expr| intern_typed(arena, expr))
-                .collect(),
+                .map(|expr| intern_typed(arena, expr, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             order_by: order_by
                 .iter()
-                .map(|item| intern_sort_item(arena, item))
-                .collect(),
+                .map(|item| intern_sort_item(arena, item, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             window_frame: window_frame.clone(),
             ignore_nulls: *ignore_nulls,
         },
@@ -967,10 +1049,10 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
         }
         ExprKind::Lambda { params, body } => ScalarNode::Lambda {
             params: params.clone(),
-            body: intern_typed(arena, body),
+            body: intern_typed(arena, body, control)?,
         },
     };
-    arena.intern(node, expr.value_type.clone())
+    arena.intern_observed(node, expr.value_type.clone(), control)
 }
 
 /// Rebuild an analyzer `TypedExpr` from an interned id.

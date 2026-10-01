@@ -630,7 +630,7 @@ fn fold_scalar_uncached(
     // Re-intern with the rebuilt children, keeping this node's own type
     // metadata. `intern` may canonicalize commutative operand order, so the
     // fold step below reads the children back out of the arena.
-    let rebuilt = arena.intern(node, value_type);
+    let rebuilt = arena.intern_observed(node, value_type, work.control())?;
     Ok(try_fold_node(arena, rebuilt, evaluator, work)?.unwrap_or(rebuilt))
 }
 
@@ -672,7 +672,7 @@ fn fold_sec_to_time_source(
         }
         _ => unreachable!("source path was checked before folding"),
     }
-    Ok(arena.intern(node, arena.value_type(id).clone()))
+    arena.intern_observed(node, arena.value_type(id).clone(), work.control())
 }
 
 /// Try to replace one node (whose children are already folded) with a literal.
@@ -699,10 +699,11 @@ fn try_fold_node(
         if !is_wire_encodable_literal_type(&out_type) {
             return Ok(None);
         }
-        return Ok(Some(arena.intern(
+        return Ok(Some(arena.intern_observed(
             ScalarNode::Literal(literal),
             arena.value_type(id).clone(),
-        )));
+            work.control(),
+        )?));
     }
 
     // Gate 2: a volatile or DISTINCT function is never a constant.
@@ -779,10 +780,11 @@ fn try_fold_node(
     };
     work.step()?;
     Ok(match evaluated {
-        Ok(Some(value)) => Some(arena.intern(
+        Ok(Some(value)) => Some(arena.intern_observed(
             ScalarNode::Literal(HashableLiteral(value)),
             arena.value_type(id).clone(),
-        )),
+            work.control(),
+        )?),
         // The evaluator declined this shape.
         Ok(None) => None,
         // Fail-open: keep the original expression and swallow the error. The

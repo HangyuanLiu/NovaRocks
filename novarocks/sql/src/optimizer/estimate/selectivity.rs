@@ -390,7 +390,8 @@ mod tests {
 
     fn estimate_typed(expr: &TypedExpr, column_stats: &HashMap<ColumnId, ColumnStatistic>) -> f64 {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, expr);
+        let id =
+            intern_typed(&mut arena, expr, crate::optimizer::test_optimizer_control()).unwrap();
         estimate_selectivity(&arena, id, column_stats)
     }
 

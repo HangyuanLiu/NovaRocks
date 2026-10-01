@@ -230,13 +230,26 @@ mod tests {
 
     /// Wrap an aggregate call as a materialized MV output column.
     fn scalar_exprs(arena: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
-        exprs.iter().map(|expr| intern_typed(arena, expr)).collect()
+        exprs
+            .iter()
+            .map(|expr| {
+                intern_typed(
+                    arena,
+                    expr,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            })
+            .collect()
     }
 
     fn scalar_aggs(arena: &mut ScalarArena, calls: Vec<AggregateCall>) -> Vec<ScalarAggregateSpec> {
         calls
             .iter()
-            .map(|call| intern_aggregate_call(arena, call))
+            .map(|call| {
+                intern_aggregate_call(arena, call, crate::optimizer::test_optimizer_control())
+                    .unwrap()
+            })
             .collect()
     }
 
@@ -244,7 +257,10 @@ mod tests {
         SpjgOutput {
             name: out.name.clone(),
             column_id: out.column_id,
-            expr: SpjgOutputExpr::Aggregate(intern_aggregate_call(arena, &call)),
+            expr: SpjgOutputExpr::Aggregate(
+                intern_aggregate_call(arena, &call, crate::optimizer::test_optimizer_control())
+                    .unwrap(),
+            ),
         }
     }
 
@@ -253,7 +269,14 @@ mod tests {
         SpjgOutput {
             name: out.name.clone(),
             column_id: out.column_id,
-            expr: SpjgOutputExpr::Dimension(intern_typed(arena, &expr)),
+            expr: SpjgOutputExpr::Dimension(
+                intern_typed(
+                    arena,
+                    &expr,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
+            ),
         }
     }
 

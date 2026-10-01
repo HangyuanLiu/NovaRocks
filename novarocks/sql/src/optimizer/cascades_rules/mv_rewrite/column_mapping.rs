@@ -214,6 +214,15 @@ pub(crate) struct MvColumnMap {
     by_norm: HashMap<NormExpr, OutputColumn>,
 }
 
+macro_rules! mapped {
+    ($value:expr) => {
+        match $value? {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
+
 impl MvColumnMap {
     /// `dims`: (normalized MV dimension expr, the MV-scan output column that
     /// materializes it). Built by the rule from candidate outputs + the new
@@ -232,23 +241,30 @@ impl MvColumnMap {
         arena: &mut ScalarArena,
         expr: ScalarId,
         query_base_names: &HashMap<ColumnId, String>,
-    ) -> Option<ScalarId> {
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
         if let Some(n) = normalize(arena, expr, query_base_names)
             && let Some(col) = self.by_norm.get(&n)
         {
             arena.remember_project_output_display(col.column_id, None, col.name.clone());
-            return Some(
-                arena.intern(ScalarNode::ColumnRef(col.column_id), col.value_type.clone()),
-            );
+            return Ok(Some(arena.intern_observed(
+                ScalarNode::ColumnRef(col.column_id),
+                col.value_type.clone(),
+                control,
+            )?));
         }
         // Not a whole-tree match: recurse; a remaining bare base ColumnRef
         // means the MV does not materialize this column -> fail.
         match arena.node(expr).clone() {
-            ScalarNode::ColumnRef(_) => None,
-            ScalarNode::Literal(_) => Some(expr),
-            node => rewrite_children(arena, expr, node, |arena, child| {
-                self.rewrite(arena, child, query_base_names)
-            }),
+            ScalarNode::ColumnRef(_) => Ok(None),
+            ScalarNode::Literal(_) => Ok(Some(expr)),
+            node => rewrite_children(
+                arena,
+                expr,
+                node,
+                |arena, child| self.rewrite(arena, child, query_base_names, control),
+                control,
+            ),
         }
     }
 }
@@ -257,8 +273,12 @@ fn rewrite_children(
     arena: &mut ScalarArena,
     original: ScalarId,
     node: ScalarNode,
-    mut rewrite: impl FnMut(&mut ScalarArena, ScalarId) -> Option<ScalarId>,
-) -> Option<ScalarId> {
+    mut rewrite: impl FnMut(
+        &mut ScalarArena,
+        ScalarId,
+    ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
     let rewritten = match node {
         ScalarNode::BinaryOp {
             op,
@@ -267,13 +287,13 @@ fn rewrite_children(
             decimal_overflow_policy,
         } => ScalarNode::BinaryOp {
             op,
-            left: rewrite(arena, left)?,
-            right: rewrite(arena, right)?,
+            left: mapped!(rewrite(arena, left)),
+            right: mapped!(rewrite(arena, right)),
             decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
-            child: rewrite(arena, child)?,
+            child: mapped!(rewrite(arena, child)),
         },
         ScalarNode::FunctionCall {
             name,
@@ -283,10 +303,13 @@ fn rewrite_children(
             volatility,
         } => ScalarNode::FunctionCall {
             name,
-            args: args
-                .into_iter()
-                .map(|arg| rewrite(arena, arg))
-                .collect::<Option<Vec<_>>>()?,
+            args: mapped!(
+                args.into_iter()
+                    .map(|arg| rewrite(arena, arg))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()
+            ),
             distinct,
             binding,
             volatility,
@@ -299,10 +322,13 @@ fn rewrite_children(
             resolved,
         } => ScalarNode::AggregateCall {
             name,
-            args: args
-                .into_iter()
-                .map(|arg| rewrite(arena, arg))
-                .collect::<Option<Vec<_>>>()?,
+            args: mapped!(
+                args.into_iter()
+                    .map(|arg| rewrite(arena, arg))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()
+            ),
             distinct,
             order_by,
             resolved,
@@ -312,12 +338,12 @@ fn rewrite_children(
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            child: rewrite(arena, child)?,
+            child: mapped!(rewrite(arena, child)),
             target,
             decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
-            child: rewrite(arena, child)?,
+            child: mapped!(rewrite(arena, child)),
             negated,
         },
         ScalarNode::InList {
@@ -325,11 +351,14 @@ fn rewrite_children(
             list,
             negated,
         } => ScalarNode::InList {
-            child: rewrite(arena, child)?,
-            list: list
-                .into_iter()
-                .map(|item| rewrite(arena, item))
-                .collect::<Option<Vec<_>>>()?,
+            child: mapped!(rewrite(arena, child)),
+            list: mapped!(
+                list.into_iter()
+                    .map(|item| rewrite(arena, item))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()
+            ),
             negated,
         },
         ScalarNode::Between {
@@ -338,9 +367,9 @@ fn rewrite_children(
             high,
             negated,
         } => ScalarNode::Between {
-            child: rewrite(arena, child)?,
-            low: rewrite(arena, low)?,
-            high: rewrite(arena, high)?,
+            child: mapped!(rewrite(arena, child)),
+            low: mapped!(rewrite(arena, low)),
+            high: mapped!(rewrite(arena, high)),
             negated,
         },
         ScalarNode::Like {
@@ -348,8 +377,8 @@ fn rewrite_children(
             pattern,
             negated,
         } => ScalarNode::Like {
-            child: rewrite(arena, child)?,
-            pattern: rewrite(arena, pattern)?,
+            child: mapped!(rewrite(arena, child)),
+            pattern: mapped!(rewrite(arena, pattern)),
             negated,
         },
         ScalarNode::Case {
@@ -358,15 +387,16 @@ fn rewrite_children(
             else_expr,
         } => {
             let operand = match operand {
-                Some(operand) => Some(rewrite(arena, operand)?),
+                Some(operand) => Some(mapped!(rewrite(arena, operand))),
                 None => None,
             };
             let mut mapped_when_then = Vec::with_capacity(when_then.len());
             for (when, then) in when_then {
-                mapped_when_then.push((rewrite(arena, when)?, rewrite(arena, then)?));
+                mapped_when_then
+                    .push((mapped!(rewrite(arena, when)), mapped!(rewrite(arena, then))));
             }
             let else_expr = match else_expr {
-                Some(else_expr) => Some(rewrite(arena, else_expr)?),
+                Some(else_expr) => Some(mapped!(rewrite(arena, else_expr))),
                 None => None,
             };
             ScalarNode::Case {
@@ -375,16 +405,20 @@ fn rewrite_children(
                 else_expr,
             }
         }
-        ScalarNode::Nested(inner) => ScalarNode::Nested(rewrite(arena, inner)?),
+        ScalarNode::Nested(inner) => ScalarNode::Nested(mapped!(rewrite(arena, inner))),
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::WindowCall { .. }
         | ScalarNode::LambdaFunction { .. }
         | ScalarNode::Lambda { .. }
-        | ScalarNode::IsTruthValue { .. } => return None,
+        | ScalarNode::IsTruthValue { .. } => return Ok(None),
     };
-    Some(arena.intern(rewritten, arena.value_type(original).clone()))
+    Ok(Some(arena.intern_observed(
+        rewritten,
+        arena.value_type(original).clone(),
+        control,
+    )?))
 }
 
 #[cfg(test)]
@@ -453,7 +487,12 @@ mod tests {
 
     fn normalize(e: &TypedExpr, base_names: &HashMap<ColumnId, String>) -> Option<NormExpr> {
         let mut arena = ScalarArena::new();
-        let expr = intern_typed(&mut arena, e);
+        let expr = intern_typed(
+            &mut arena,
+            e,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         super::normalize(&arena, expr, base_names)
     }
 
@@ -463,8 +502,20 @@ mod tests {
         base_names: &HashMap<ColumnId, String>,
     ) -> Option<TypedExpr> {
         let mut arena = ScalarArena::new();
-        let expr = intern_typed(&mut arena, e);
-        let rewritten = map.rewrite(&mut arena, expr, base_names)?;
+        let expr = intern_typed(
+            &mut arena,
+            e,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let rewritten = map
+            .rewrite(
+                &mut arena,
+                expr,
+                base_names,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap()?;
         Some(materialize(&arena, rewritten))
     }
 
@@ -671,5 +722,137 @@ mod tests {
         assert_ne!(lhs, other_else);
         let no_else = normalize(&mk(&a1, &b1, None), &n1).expect("no else");
         assert_ne!(lhs, no_else);
+    }
+
+    #[test]
+    fn actual_mv_mapping_preserves_interner_control_categories() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
+        struct Stop {
+            reason: CompileControlError,
+            positive_only: bool,
+            calls: Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for Stop {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::Validate);
+                self.calls.lock().unwrap().push(units);
+                // Child mappings legitimately flush a short tail before the
+                // wide parent interner starts. Refuse that parent's first
+                // full work quantum, rather than a completed leaf's tail.
+                if !self.positive_only || units == 256 {
+                    Err(self.reason)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for reason in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for positive_only in [false, true] {
+                let mut arena = ScalarArena::new();
+                let input = col(1, "a");
+                let leaf = arena.intern(
+                    ScalarNode::ColumnRef(input.column_id),
+                    input.value_type.clone(),
+                );
+                let source = if positive_only {
+                    arena.intern(
+                        ScalarNode::InList {
+                            child: leaf,
+                            list: vec![leaf; 320],
+                            negated: false,
+                        },
+                        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+                    )
+                } else {
+                    leaf
+                };
+                let map = MvColumnMap::new(vec![(NormExpr::Column("a".into()), col(101, "mv_a"))]);
+                let control = Stop {
+                    reason,
+                    positive_only,
+                    calls: Mutex::new(Vec::new()),
+                };
+                assert_eq!(
+                    map.rewrite(&mut arena, source, &names(&[(1, "a")]), &control),
+                    Err(crate::compiler::SqlCompileError::from(reason))
+                );
+                let calls = control.calls.lock().unwrap();
+                if positive_only {
+                    assert!(calls.iter().any(|&units| units > 0 && units < 256));
+                    assert_eq!(calls.iter().find(|&&units| units == 256), Some(&256));
+                    assert_eq!(
+                        calls.last(),
+                        Some(&256),
+                        "the refusal occurs at the first full quantum with no replacement exit"
+                    );
+                } else {
+                    assert_eq!(calls.as_slice(), &[0]);
+                }
+                // The source definition remains the actual input, rather than
+                // a partially published successful mapping result.
+                assert_eq!(arena.node(leaf), &ScalarNode::ColumnRef(input.column_id));
+            }
+        }
+    }
+
+    #[test]
+    fn actual_mv_mapping_first_missing_child_skips_later_interner_work() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Stop(AtomicUsize);
+        impl PureCompileControl for Stop {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(CompileControlError::Cancelled)
+            }
+        }
+        let mut arena = ScalarArena::new();
+        let missing = col(1, "missing");
+        let present = col(2, "present");
+        let left = arena.intern(
+            ScalarNode::ColumnRef(missing.column_id),
+            missing.value_type.clone(),
+        );
+        let right = arena.intern(
+            ScalarNode::ColumnRef(present.column_id),
+            present.value_type.clone(),
+        );
+        let source = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Sub,
+                left,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let map = MvColumnMap::new(vec![(
+            NormExpr::Column("present".into()),
+            col(101, "mv_present"),
+        )]);
+        let control = Stop(AtomicUsize::new(0));
+        assert_eq!(
+            map.rewrite(
+                &mut arena,
+                source,
+                &names(&[(1, "missing"), (2, "present")]),
+                &control
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            control.0.load(Ordering::Relaxed),
+            0,
+            "a miss must not evaluate the mapped suffix"
+        );
     }
 }

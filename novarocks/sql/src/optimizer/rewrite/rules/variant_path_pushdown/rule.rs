@@ -106,8 +106,8 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                     filter_op.predicate,
                     input,
                     &mut factory,
-                )
-                .map_err(SqlCompileError::Compilation)?;
+                    &ctx.control_view(),
+                )?;
                 let changed = new_predicate.is_some();
                 if let Some(new_pred_id) = new_predicate {
                     expr.op = Operator::LogicalFilter(FilterOp {
@@ -128,10 +128,13 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 let mut changed = false;
                 let mut arena = arena_rc.borrow_mut();
                 for item in &mut items {
-                    if let Some(new_expr) =
-                        rewrite_variant_request_scalar(&mut arena, item.expr, input, &mut factory)
-                            .map_err(SqlCompileError::Compilation)?
-                    {
+                    if let Some(new_expr) = rewrite_variant_request_scalar(
+                        &mut arena,
+                        item.expr,
+                        input,
+                        &mut factory,
+                        &ctx.control_view(),
+                    )? {
                         item.expr = new_expr;
                         changed = true;
                     }
@@ -152,9 +155,12 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 // We need &mut ScanOp to call rewrite_scan_predicates.
                 // Temporarily take it out, mutate, put back.
                 let mut scan = scan_op;
-                let changed =
-                    rewrite_scan_predicates(&mut scan, &mut factory, &mut arena_rc.borrow_mut())
-                        .map_err(SqlCompileError::Compilation)?;
+                let changed = rewrite_scan_predicates(
+                    &mut scan,
+                    &mut factory,
+                    &mut arena_rc.borrow_mut(),
+                    &ctx.control_view(),
+                )?;
                 if changed {
                     expr.op = Operator::LogicalScan(scan);
                 }
@@ -175,13 +181,14 @@ fn rewrite_scan_predicates(
     scan: &mut ScanOp,
     factory: &mut ColumnRefFactory,
     arena: &mut ScalarArena,
-) -> Result<bool, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, SqlCompileError> {
     let pred_ids = std::mem::take(&mut scan.predicates);
     let mut new_pred_ids = Vec::with_capacity(pred_ids.len());
     let mut changed = false;
     for pred_id in pred_ids {
         let new_id = if let Some(new_pred) =
-            rewrite_variant_request_scalar(arena, pred_id, scan, factory)?
+            rewrite_variant_request_scalar(arena, pred_id, scan, factory, control)?
         {
             changed = true;
             new_pred
@@ -200,7 +207,8 @@ trait VariantBindings {
         arena: &mut ScalarArena,
         request: &VariantRequest,
         factory: &mut ColumnRefFactory,
-    ) -> Option<ScalarId>;
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<ScalarId>, SqlCompileError>;
 }
 
 impl VariantBindings for OptExpr {
@@ -209,8 +217,9 @@ impl VariantBindings for OptExpr {
         arena: &mut ScalarArena,
         request: &VariantRequest,
         factory: &mut ColumnRefFactory,
-    ) -> Option<ScalarId> {
-        find_or_create_slot(arena, self, request, factory)
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<ScalarId>, SqlCompileError> {
+        find_or_create_slot(arena, self, request, factory, control)
     }
 }
 
@@ -220,8 +229,9 @@ impl VariantBindings for ScanOp {
         arena: &mut ScalarArena,
         request: &VariantRequest,
         factory: &mut ColumnRefFactory,
-    ) -> Option<ScalarId> {
-        find_or_create_slot_on_scan(arena, self, request, factory)
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<ScalarId>, SqlCompileError> {
+        find_or_create_slot_on_scan(arena, self, request, factory, control)
     }
 }
 
@@ -230,13 +240,13 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
     expr: ScalarId,
     bindings: &mut T,
     factory: &mut ColumnRefFactory,
-) -> Result<Option<ScalarId>, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
     if let Some(request) = variant_request_scalar(arena, expr) {
-        return Ok(bindings.column_ref_for(arena, &request, factory));
+        return bindings.column_ref_for(arena, &request, factory, control);
     }
 
-    let data_type = arena.data_type(expr).clone();
-    let nullable = arena.nullable(expr);
+    let value_type = arena.value_type(expr).clone();
     let node = arena.node(expr).clone();
     match node {
         ScalarNode::BinaryOp {
@@ -245,29 +255,33 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             right,
             decimal_overflow_policy,
         } => {
-            let new_left = rewrite_variant_request_scalar(arena, left, bindings, factory)?;
-            let new_right = rewrite_variant_request_scalar(arena, right, bindings, factory)?;
+            let new_left = rewrite_variant_request_scalar(arena, left, bindings, factory, control)?;
+            let new_right =
+                rewrite_variant_request_scalar(arena, right, bindings, factory, control)?;
             let changed = new_left.is_some() || new_right.is_some();
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::BinaryOp {
-                        op,
-                        left: new_left.unwrap_or(left),
-                        right: new_right.unwrap_or(right),
-                        decimal_overflow_policy,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::BinaryOp {
+                            op,
+                            left: new_left.unwrap_or(left),
+                            right: new_right.unwrap_or(right),
+                            decimal_overflow_policy,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::UnaryOp { op, child } => rewrite_unary_child(
             arena,
             child,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             |child| ScalarNode::UnaryOp { op, child },
+            control,
         ),
         ScalarNode::FunctionCall {
             name,
@@ -276,28 +290,31 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             binding,
             volatility,
         } => {
-            let (args, changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::FunctionCall {
-                        name,
-                        args,
-                        distinct,
-                        binding,
-                        volatility,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            let (args, changed) = rewrite_scalar_vec(arena, &args, bindings, factory, control)?;
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::FunctionCall {
+                            name,
+                            args,
+                            distinct,
+                            binding,
+                            volatility,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::LambdaFunction { params, body } => rewrite_unary_child(
             arena,
             body,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             |body| ScalarNode::LambdaFunction { params, body },
+            control,
         ),
         ScalarNode::AggregateCall {
             name,
@@ -306,21 +323,26 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             order_by,
             resolved,
         } => {
-            let (args, args_changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
-            let (order_by, order_changed) = rewrite_sort_keys(arena, &order_by, bindings, factory)?;
+            let (args, args_changed) =
+                rewrite_scalar_vec(arena, &args, bindings, factory, control)?;
+            let (order_by, order_changed) =
+                rewrite_sort_keys(arena, &order_by, bindings, factory, control)?;
             let changed = args_changed || order_changed;
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::AggregateCall {
-                        name,
-                        args,
-                        distinct,
-                        order_by,
-                        resolved,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::AggregateCall {
+                            name,
+                            args,
+                            distinct,
+                            order_by,
+                            resolved,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::Cast {
             child,
@@ -331,41 +353,46 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             child,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             |child| ScalarNode::Cast {
                 child,
                 target,
                 decimal_overflow_policy,
             },
+            control,
         ),
         ScalarNode::IsNull { child, negated } => rewrite_unary_child(
             arena,
             child,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             |child| ScalarNode::IsNull { child, negated },
+            control,
         ),
         ScalarNode::InList {
             child,
             list,
             negated,
         } => {
-            let new_child = rewrite_variant_request_scalar(arena, child, bindings, factory)?;
-            let (list, list_changed) = rewrite_scalar_vec(arena, &list, bindings, factory)?;
+            let new_child =
+                rewrite_variant_request_scalar(arena, child, bindings, factory, control)?;
+            let (list, list_changed) =
+                rewrite_scalar_vec(arena, &list, bindings, factory, control)?;
             let changed = new_child.is_some() || list_changed;
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::InList {
-                        child: new_child.unwrap_or(child),
-                        list,
-                        negated,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::InList {
+                            child: new_child.unwrap_or(child),
+                            list,
+                            negated,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::Between {
             child,
@@ -373,40 +400,49 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             high,
             negated,
         } => {
-            let new_child = rewrite_variant_request_scalar(arena, child, bindings, factory)?;
-            let new_low = rewrite_variant_request_scalar(arena, low, bindings, factory)?;
-            let new_high = rewrite_variant_request_scalar(arena, high, bindings, factory)?;
+            let new_child =
+                rewrite_variant_request_scalar(arena, child, bindings, factory, control)?;
+            let new_low = rewrite_variant_request_scalar(arena, low, bindings, factory, control)?;
+            let new_high = rewrite_variant_request_scalar(arena, high, bindings, factory, control)?;
             let changed = new_child.is_some() || new_low.is_some() || new_high.is_some();
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::Between {
-                        child: new_child.unwrap_or(child),
-                        low: new_low.unwrap_or(low),
-                        high: new_high.unwrap_or(high),
-                        negated,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::Between {
+                            child: new_child.unwrap_or(child),
+                            low: new_low.unwrap_or(low),
+                            high: new_high.unwrap_or(high),
+                            negated,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::Like {
             child,
             pattern,
             negated,
         } => {
-            let new_child = rewrite_variant_request_scalar(arena, child, bindings, factory)?;
-            let new_pattern = rewrite_variant_request_scalar(arena, pattern, bindings, factory)?;
+            let new_child =
+                rewrite_variant_request_scalar(arena, child, bindings, factory, control)?;
+            let new_pattern =
+                rewrite_variant_request_scalar(arena, pattern, bindings, factory, control)?;
             let changed = new_child.is_some() || new_pattern.is_some();
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::Like {
-                        child: new_child.unwrap_or(child),
-                        pattern: new_pattern.unwrap_or(pattern),
-                        negated,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::Like {
+                            child: new_child.unwrap_or(child),
+                            pattern: new_pattern.unwrap_or(pattern),
+                            negated,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::Case {
             operand,
@@ -414,22 +450,25 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             else_expr,
         } => {
             let (operand, operand_changed) =
-                rewrite_optional_scalar(arena, operand, bindings, factory)?;
+                rewrite_optional_scalar(arena, operand, bindings, factory, control)?;
             let (when_then, pairs_changed) =
-                rewrite_scalar_pairs(arena, &when_then, bindings, factory)?;
+                rewrite_scalar_pairs(arena, &when_then, bindings, factory, control)?;
             let (else_expr, else_changed) =
-                rewrite_optional_scalar(arena, else_expr, bindings, factory)?;
+                rewrite_optional_scalar(arena, else_expr, bindings, factory, control)?;
             let changed = operand_changed || pairs_changed || else_changed;
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::Case {
-                        operand,
-                        when_then,
-                        else_expr,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::Case {
+                            operand,
+                            when_then,
+                            else_expr,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::IsTruthValue {
             child,
@@ -440,22 +479,22 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             child,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             |child| ScalarNode::IsTruthValue {
                 child,
                 value,
                 negated,
             },
+            control,
         ),
         ScalarNode::Nested(child) => rewrite_unary_child(
             arena,
             child,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             ScalarNode::Nested,
+            control,
         ),
         ScalarNode::WindowCall {
             name,
@@ -469,40 +508,45 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             window_frame,
             ignore_nulls,
         } => {
-            let (args, args_changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
+            let (args, args_changed) =
+                rewrite_scalar_vec(arena, &args, bindings, factory, control)?;
             let (function_order_by, function_order_changed) =
-                rewrite_sort_keys(arena, &function_order_by, bindings, factory)?;
+                rewrite_sort_keys(arena, &function_order_by, bindings, factory, control)?;
             let (partition_by, partition_changed) =
-                rewrite_scalar_vec(arena, &partition_by, bindings, factory)?;
-            let (order_by, order_changed) = rewrite_sort_keys(arena, &order_by, bindings, factory)?;
+                rewrite_scalar_vec(arena, &partition_by, bindings, factory, control)?;
+            let (order_by, order_changed) =
+                rewrite_sort_keys(arena, &order_by, bindings, factory, control)?;
             let changed =
                 args_changed || function_order_changed || partition_changed || order_changed;
-            Ok(changed.then(|| {
-                arena.intern(
-                    ScalarNode::WindowCall {
-                        name,
-                        args,
-                        distinct,
-                        binding,
-                        function_order_by,
-                        aggregate_binding,
-                        partition_by,
-                        order_by,
-                        window_frame,
-                        ignore_nulls,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                )
-            }))
+            changed
+                .then(|| {
+                    arena.intern_observed(
+                        ScalarNode::WindowCall {
+                            name,
+                            args,
+                            distinct,
+                            binding,
+                            function_order_by,
+                            aggregate_binding,
+                            partition_by,
+                            order_by,
+                            window_frame,
+                            ignore_nulls,
+                        },
+                        value_type,
+                        control,
+                    )
+                })
+                .transpose()
         }
         ScalarNode::Lambda { params, body } => rewrite_unary_child(
             arena,
             body,
             bindings,
             factory,
-            data_type,
-            nullable,
+            value_type,
             |body| ScalarNode::Lambda { params, body },
+            control,
         ),
         ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
             Ok(None)
@@ -515,21 +559,23 @@ fn rewrite_unary_child<T, F>(
     child: ScalarId,
     bindings: &mut T,
     factory: &mut ColumnRefFactory,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
     build: F,
-) -> Result<Option<ScalarId>, String>
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError>
 where
     T: VariantBindings,
     F: FnOnce(ScalarId) -> ScalarNode,
 {
-    let Some(new_child) = rewrite_variant_request_scalar(arena, child, bindings, factory)? else {
+    let Some(new_child) = rewrite_variant_request_scalar(arena, child, bindings, factory, control)?
+    else {
         return Ok(None);
     };
-    Ok(Some(arena.intern(
+    Ok(Some(arena.intern_observed(
         build(new_child),
-        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-    )))
+        value_type,
+        control,
+    )?))
 }
 
 fn rewrite_scalar_vec<T: VariantBindings>(
@@ -537,11 +583,14 @@ fn rewrite_scalar_vec<T: VariantBindings>(
     exprs: &[ScalarId],
     bindings: &mut T,
     factory: &mut ColumnRefFactory,
-) -> Result<(Vec<ScalarId>, bool), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<ScalarId>, bool), SqlCompileError> {
     let mut changed = false;
     let mut out = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        if let Some(new_expr) = rewrite_variant_request_scalar(arena, *expr, bindings, factory)? {
+        if let Some(new_expr) =
+            rewrite_variant_request_scalar(arena, *expr, bindings, factory, control)?
+        {
             changed = true;
             out.push(new_expr);
         } else {
@@ -556,11 +605,12 @@ fn rewrite_optional_scalar<T: VariantBindings>(
     expr: Option<ScalarId>,
     bindings: &mut T,
     factory: &mut ColumnRefFactory,
-) -> Result<(Option<ScalarId>, bool), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Option<ScalarId>, bool), SqlCompileError> {
     let Some(expr) = expr else {
         return Ok((None, false));
     };
-    match rewrite_variant_request_scalar(arena, expr, bindings, factory)? {
+    match rewrite_variant_request_scalar(arena, expr, bindings, factory, control)? {
         Some(new_expr) => Ok((Some(new_expr), true)),
         None => Ok((Some(expr), false)),
     }
@@ -571,12 +621,13 @@ fn rewrite_scalar_pairs<T: VariantBindings>(
     pairs: &[(ScalarId, ScalarId)],
     bindings: &mut T,
     factory: &mut ColumnRefFactory,
-) -> Result<(Vec<(ScalarId, ScalarId)>, bool), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<(ScalarId, ScalarId)>, bool), SqlCompileError> {
     let mut changed = false;
     let mut out = Vec::with_capacity(pairs.len());
     for (left, right) in pairs {
-        let new_left = rewrite_variant_request_scalar(arena, *left, bindings, factory)?;
-        let new_right = rewrite_variant_request_scalar(arena, *right, bindings, factory)?;
+        let new_left = rewrite_variant_request_scalar(arena, *left, bindings, factory, control)?;
+        let new_right = rewrite_variant_request_scalar(arena, *right, bindings, factory, control)?;
         changed |= new_left.is_some() || new_right.is_some();
         out.push((new_left.unwrap_or(*left), new_right.unwrap_or(*right)));
     }
@@ -588,11 +639,13 @@ fn rewrite_sort_keys<T: VariantBindings>(
     keys: &[SortKey],
     bindings: &mut T,
     factory: &mut ColumnRefFactory,
-) -> Result<(Vec<SortKey>, bool), String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<SortKey>, bool), SqlCompileError> {
     let mut changed = false;
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        if let Some(new_expr) = rewrite_variant_request_scalar(arena, key.expr, bindings, factory)?
+        if let Some(new_expr) =
+            rewrite_variant_request_scalar(arena, key.expr, bindings, factory, control)?
         {
             changed = true;
             let display = match arena.node(new_expr) {
@@ -719,8 +772,9 @@ fn find_or_create_slot(
     expr: &mut OptExpr,
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
-) -> Option<ScalarId> {
-    match &expr.op {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    Ok(match &expr.op {
         Operator::LogicalScan(scan) => {
             // For strict requests, only push when the scan has no predicates of
             // its own (same condition as the pre-OptExpr implementation).
@@ -732,9 +786,9 @@ fn find_or_create_slot(
                     .any(|pred_id| expr_contains_variant_request_scalar(arena, *pred_id, request));
             if can_push {
                 let Operator::LogicalScan(scan_mut) = &mut expr.op else {
-                    return None;
+                    return Ok(None);
                 };
-                find_or_create_slot_on_scan(arena, scan_mut, request, factory)
+                find_or_create_slot_on_scan(arena, scan_mut, request, factory, control)?
             } else {
                 None
             }
@@ -746,14 +800,16 @@ fn find_or_create_slot(
             if !request.strict
                 || expr_contains_variant_request_scalar(arena, filter_op.predicate, request)
             {
-                let input = expr.children.get_mut(0)?;
-                find_or_create_slot(arena, input, request, factory)
+                let Some(input) = expr.children.get_mut(0) else {
+                    return Ok(None);
+                };
+                find_or_create_slot(arena, input, request, factory, control)?
             } else {
                 None
             }
         }
         _ => None,
-    }
+    })
 }
 
 fn expr_contains_variant_request_scalar(
@@ -844,7 +900,8 @@ fn find_or_create_slot_on_scan(
     scan: &mut ScanOp,
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
-) -> Option<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
     if !matches!(
         scan.table.source,
         ScanSource::Sql(crate::planner::table::SqlScanSource {
@@ -853,7 +910,7 @@ fn find_or_create_slot_on_scan(
             ..
         })
     ) {
-        return None;
+        return Ok(None);
     }
 
     if let Some(existing) = scan.variant_columns.iter().find(|column| {
@@ -864,15 +921,18 @@ fn find_or_create_slot_on_scan(
             && column.strict == request.strict
             && column.binding == request.binding
     }) {
-        return Some(column_ref_for_variant_slot(arena, existing));
+        return Ok(Some(column_ref_for_variant_slot(arena, existing, control)?));
     }
 
     let source_column = scan
         .columns
         .iter()
-        .find(|column| column.column_id == request.source_column_id)?;
+        .find(|column| column.column_id == request.source_column_id);
+    let Some(source_column) = source_column else {
+        return Ok(None);
+    };
     if source_column.value_type.data_type != DataType::LargeBinary {
-        return None;
+        return Ok(None);
     }
 
     let source_name = source_column.name.clone();
@@ -907,21 +967,25 @@ fn find_or_create_slot_on_scan(
     });
     scan.variant_columns.push(descriptor);
     let descriptor = scan.variant_columns.last().expect("variant descriptor");
-    Some(column_ref_for_variant_slot(arena, descriptor))
+    Ok(Some(column_ref_for_variant_slot(
+        arena, descriptor, control,
+    )?))
 }
 
 fn column_ref_for_variant_slot(
     arena: &mut ScalarArena,
     descriptor: &ScanVariantColumn,
-) -> ScalarId {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
     arena.remember_source_column_display(
         descriptor.synthetic_column_id,
         None,
         descriptor.synthetic_column.clone(),
     );
-    arena.intern(
+    arena.intern_observed(
         ScalarNode::ColumnRef(descriptor.synthetic_column_id),
         novarocks_type_contract::FunctionValueType::new(descriptor.requested_type.clone(), true),
+        control,
     )
 }
 

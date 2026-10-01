@@ -317,7 +317,12 @@ mod tests {
                 true,
             ),
         };
-        let partition_expr = intern_typed(&mut memo.scalars, &partition_expr);
+        let partition_expr = intern_typed(
+            &mut memo.scalars,
+            &partition_expr,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),

@@ -80,27 +80,28 @@ pub(crate) fn enumerate_orders(
     graph: &MultiJoinGraph,
     caps: ReorderCaps,
     arena: &mut ScalarArena,
-) -> Vec<JoinTree> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<JoinTree>, crate::compiler::SqlCompileError> {
     let n = graph.atom_count();
     if n < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut candidates: Vec<JoinTree> = Vec::new();
-    if let Some(tree) = left_deep(graph, arena) {
+    if let Some(tree) = left_deep(graph, arena, control)? {
         candidates.push(tree);
     }
     if caps.enable_dp
         && n <= caps.max_dp.min(MAX_MASK_ATOMS)
-        && let Some(tree) = dp(graph, arena)
+        && let Some(tree) = dp(graph, arena, control)?
     {
         candidates.push(tree);
     }
     if caps.enable_greedy && n <= caps.max_greedy.min(MAX_MASK_ATOMS) {
-        candidates.extend(greedy_topk(graph, caps.topk, arena));
+        candidates.extend(greedy_topk(graph, caps.topk, arena, control)?);
     }
 
-    dedup_trees(candidates)
+    Ok(dedup_trees(candidates))
 }
 
 /// `u32` relation masks cap the chain at 32 atoms.
@@ -266,10 +267,14 @@ fn atom_cell(graph: &MultiJoinGraph, i: usize) -> Cell {
 /// Left-deep greedy reorder: start from the largest atom, then repeatedly attach
 /// the next atom preferring equi-join > non-equi > cross, and within a class the
 /// smallest atom (build side). Always produces a left-deep tree.
-fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
+fn left_deep(
+    graph: &MultiJoinGraph,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<JoinTree>, crate::compiler::SqlCompileError> {
     let n = graph.atom_count();
     if !(2..=MAX_MASK_ATOMS).contains(&n) {
-        return None;
+        return Ok(None);
     }
 
     let start = (0..n)
@@ -319,30 +324,36 @@ fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree
             }
         }
 
-        let (next, _, _) = best?;
+        let Some((next, _, _)) = best else {
+            return Ok(None);
+        };
         let next_mask = 1u32 << next;
-        let parts = connecting_condition_scalars(graph, current_mask, next_mask, arena);
+        let parts = connecting_condition_scalars(graph, current_mask, next_mask, arena, control)?;
         let condition = if parts.is_empty() {
             None
         } else {
-            Some(combine_and_scalar(arena, parts))
+            Some(combine_and_scalar(arena, parts, control)?)
         };
         current = join_cells(&current, &atom_cell(graph, next), condition, arena);
         current_mask |= next_mask;
         used |= next_mask;
     }
 
-    Some(current.tree)
+    Ok(Some(current.tree))
 }
 
 // ---------------------------------------------------------------------------
 // DP (System-R style, exhaustive over subsets; bushy)
 // ---------------------------------------------------------------------------
 
-fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
+fn dp(
+    graph: &MultiJoinGraph,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<JoinTree>, crate::compiler::SqlCompileError> {
     let n = graph.atom_count();
     if !(2..=MAX_DP_ATOMS).contains(&n) {
-        return None;
+        return Ok(None);
     }
     let mut memo: std::collections::HashMap<u32, Cell> = std::collections::HashMap::new();
     for i in 0..n {
@@ -360,7 +371,7 @@ fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
                     left = (left.wrapping_sub(1)) & subset;
                     continue;
                 }
-                if let Some(cell) = try_partition(&memo, graph, left, right, arena)
+                if let Some(cell) = try_partition(&memo, graph, left, right, arena, control)?
                     && best.as_ref().is_none_or(|b| cell.cost < b.cost)
                 {
                     best = Some(cell);
@@ -373,7 +384,7 @@ fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
         }
     }
 
-    memo.remove(&full_mask).map(|c| c.tree)
+    Ok(memo.remove(&full_mask).map(|c| c.tree))
 }
 
 /// Build the cheaper orientation of joining the `left`/`right` subsets, if they
@@ -385,31 +396,41 @@ fn try_partition(
     left: u32,
     right: u32,
     arena: &mut ScalarArena,
-) -> Option<Cell> {
-    let parts = connecting_condition_scalars(graph, left, right, arena);
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Cell>, crate::compiler::SqlCompileError> {
+    let parts = connecting_condition_scalars(graph, left, right, arena, control)?;
     if parts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let condition = combine_and_scalar(arena, parts);
+    let condition = combine_and_scalar(arena, parts, control)?;
     // Require an equi key to avoid materializing NestLoop joins during reorder.
     if !has_equijoin_predicate(arena, condition) {
-        return None;
+        return Ok(None);
     }
-    let left_cell = memo.get(&left)?;
-    let right_cell = memo.get(&right)?;
+    let Some(left_cell) = memo.get(&left) else {
+        return Ok(None);
+    };
+    let Some(right_cell) = memo.get(&right) else {
+        return Ok(None);
+    };
     let a = join_cells(left_cell, right_cell, Some(condition), arena);
     let b = join_cells(right_cell, left_cell, Some(condition), arena);
-    Some(if a.cost <= b.cost { a } else { b })
+    Ok(Some(if a.cost <= b.cost { a } else { b }))
 }
 
 // ---------------------------------------------------------------------------
 // Greedy (level-by-level; returns a bounded Top-K of full-join orders)
 // ---------------------------------------------------------------------------
 
-fn greedy_topk(graph: &MultiJoinGraph, k: usize, arena: &mut ScalarArena) -> Vec<JoinTree> {
+fn greedy_topk(
+    graph: &MultiJoinGraph,
+    k: usize,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<JoinTree>, crate::compiler::SqlCompileError> {
     let n = graph.atom_count();
     if !(2..=MAX_MASK_ATOMS).contains(&n) || graph.predicates.is_empty() || k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let full_mask = (1u32 << n) - 1;
 
@@ -441,7 +462,7 @@ fn greedy_topk(graph: &MultiJoinGraph, k: usize, arena: &mut ScalarArena) -> Vec
                     if l == r && lm >= rm {
                         continue; // same-size symmetric pair handled once
                     }
-                    let Some(cell) = try_partition(&best, graph, lm, rm, arena) else {
+                    let Some(cell) = try_partition(&best, graph, lm, rm, arena, control)? else {
                         continue;
                     };
                     let combined = lm | rm;
@@ -477,7 +498,7 @@ fn greedy_topk(graph: &MultiJoinGraph, k: usize, arena: &mut ScalarArena) -> Vec
         levels[target] = target_masks;
     }
 
-    full_topk.into_iter().map(|c| c.tree).collect()
+    Ok(full_topk.into_iter().map(|c| c.tree).collect())
 }
 
 /// Insert `cell` into a cost-ascending bounded Top-K buffer.
@@ -539,7 +560,8 @@ fn connecting_condition_scalars(
     left_mask: u32,
     right_mask: u32,
     arena: &mut ScalarArena,
-) -> Vec<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarId>, crate::compiler::SqlCompileError> {
     let mut parts: Vec<ScalarId> = Vec::new();
     let mut class_covered = vec![false; graph.equi_classes.len()];
     for predicate in connecting_predicates(&graph.predicates, left_mask, right_mask) {
@@ -567,7 +589,7 @@ fn connecting_condition_scalars(
             (class.rep_in(left_mask), class.rep_in(right_mask))
         {
             let nullable = arena.nullable(left_col) || arena.nullable(right_col);
-            parts.push(arena.intern(
+            parts.push(arena.intern_observed(
                 ScalarNode::BinaryOp {
                     op: BinOp::Eq,
                     left: left_col,
@@ -576,10 +598,11 @@ fn connecting_condition_scalars(
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-            ));
+                control,
+            )?);
         }
     }
-    parts
+    Ok(parts)
 }
 
 /// Index of the equivalence class containing either column of an equi predicate.
@@ -667,12 +690,16 @@ fn bounded_predicate_complexity(v: f64) -> f64 {
     }
 }
 
-fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> ScalarId {
+fn combine_and_scalar(
+    arena: &mut ScalarArena,
+    mut exprs: Vec<ScalarId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     assert!(!exprs.is_empty());
     let mut result = exprs.pop().unwrap();
     while let Some(left) = exprs.pop() {
         let nullable = arena.nullable(left) || arena.nullable(result);
-        result = arena.intern(
+        result = arena.intern_observed(
             ScalarNode::BinaryOp {
                 op: BinOp::And,
                 left,
@@ -680,9 +707,10 @@ fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> Scal
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-        );
+            control,
+        )?;
     }
-    result
+    Ok(result)
 }
 
 /// Deduplicate candidate trees by structural shape (debug form).
@@ -855,7 +883,12 @@ mod tests {
         let mut arena = ScalarArena::new();
         let single_key = pred(&mut arena, eq(col_ref(0), col_ref(1)));
         let second_key = pred(&mut arena, eq(col_ref(2), col_ref(3)));
-        let complex_predicate = combine_and_scalar(&mut arena, vec![single_key, second_key]);
+        let complex_predicate = combine_and_scalar(
+            &mut arena,
+            vec![single_key, second_key],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
 
         let single_key_complexity = join_predicate_complexity(&arena, Some(single_key));
         let complex_predicate_complexity =
@@ -880,7 +913,12 @@ mod tests {
     }
 
     fn pred(arena: &mut ScalarArena, expr: TypedExpr) -> ScalarId {
-        intern_typed(arena, &expr)
+        intern_typed(
+            arena,
+            &expr,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
     }
 
     /// Left-deep path chain over `n` atoms: c_i = c_{i+1} for i in 0..n-1.
@@ -943,18 +981,36 @@ mod tests {
         let mut arena = ScalarArena::new();
         let graph10 = path_graph(10, &mut arena);
         assert!(
-            dp(&graph10, &mut arena).is_some(),
+            dp(
+                &graph10,
+                &mut arena,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_some(),
             "DP must enumerate a 10-atom chain (was capped at 8)"
         );
         let graph9 = path_graph(9, &mut arena);
         assert!(
-            dp(&graph9, &mut arena).is_some(),
+            dp(
+                &graph9,
+                &mut arena,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_some(),
             "DP must enumerate a 9-atom chain"
         );
         // Beyond the safety ceiling (12) DP bails (greedy/left-deep take over).
         let graph13 = path_graph(13, &mut arena);
         assert!(
-            dp(&graph13, &mut arena).is_none(),
+            dp(
+                &graph13,
+                &mut arena,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_none(),
             "DP bails past the 12-atom ceiling"
         );
     }
@@ -965,7 +1021,13 @@ mod tests {
         // left-deep spines, so it can find (0⋈1)⋈(2⋈3).
         let mut arena = ScalarArena::new();
         let graph = two_pairs_graph(&mut arena);
-        let trees = greedy_topk(&graph, 10, &mut arena);
+        let trees = greedy_topk(
+            &graph,
+            10,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert!(
             trees.iter().any(is_bushy),
             "greedy must produce at least one bushy order; got {} trees",
@@ -996,7 +1058,13 @@ mod tests {
     fn left_deep_starts_from_largest_and_prefers_equi() {
         let mut arena = ScalarArena::new();
         let graph = star_graph(&mut arena);
-        let tree = left_deep(&graph, &mut arena).expect("left-deep over 3 atoms");
+        let tree = left_deep(
+            &graph,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("left-deep over 3 atoms");
         // Left-deep shape: ((fact ⋈ dim) ⋈ dim). The deepest-left leaf is the
         // fact atom (100, the largest), reached by descending left children.
         let mut node = &tree;
@@ -1020,7 +1088,13 @@ mod tests {
     fn enumerate_orders_produces_candidates_and_dedups() {
         let mut arena = ScalarArena::new();
         let graph = star_graph(&mut arena);
-        let trees = enumerate_orders(&graph, ReorderCaps::default(), &mut arena);
+        let trees = enumerate_orders(
+            &graph,
+            ReorderCaps::default(),
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert!(!trees.is_empty(), "should enumerate at least one order");
         // All candidates must be 3-atom join trees (2 joins).
         for t in &trees {
@@ -1067,7 +1141,17 @@ mod tests {
             .map(|i| ColumnId::new_for_test(i as u32 + 1))
             .collect();
         let reps: Vec<(usize, ScalarId)> = (0..n)
-            .map(|i| (i, intern_typed(arena, &col_ref(i as u32))))
+            .map(|i| {
+                (
+                    i,
+                    intern_typed(
+                        arena,
+                        &col_ref(i as u32),
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap(),
+                )
+            })
             .collect();
         graph.equi_classes = vec![EquiClass::new(columns, reps)];
         graph
@@ -1079,7 +1163,14 @@ mod tests {
         // literal edge, so exactly one transitive equi is synthesized.
         let mut arena = ScalarArena::new();
         let graph = transitive_path_graph(3, &mut arena);
-        let parts = connecting_condition_scalars(&graph, 0b001, 0b100, &mut arena);
+        let parts = connecting_condition_scalars(
+            &graph,
+            0b001,
+            0b100,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(parts.len(), 1, "one synthesized transitive A-C edge");
         assert!(
             has_equijoin_predicate(&arena, parts[0]),
@@ -1094,7 +1185,14 @@ mod tests {
         // double-count). This cut only becomes reachable via the transitive edge.
         let mut arena = ScalarArena::new();
         let graph = transitive_path_graph(3, &mut arena);
-        let parts = connecting_condition_scalars(&graph, 0b101, 0b010, &mut arena);
+        let parts = connecting_condition_scalars(
+            &graph,
+            0b101,
+            0b010,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(parts.len(), 1, "redundant same-class equi dropped");
     }
 
@@ -1105,7 +1203,14 @@ mod tests {
         let mut arena = ScalarArena::new();
         let graph = transitive_path_graph(2, &mut arena);
         let literal = graph.predicates[0].0;
-        let parts = connecting_condition_scalars(&graph, 0b01, 0b10, &mut arena);
+        let parts = connecting_condition_scalars(
+            &graph,
+            0b01,
+            0b10,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(parts, vec![literal], "literal kept verbatim, no synthesis");
     }
 
@@ -1124,9 +1229,33 @@ mod tests {
                     ColumnId::new_for_test(3),
                 ],
                 vec![
-                    (0, intern_typed(arena, &col_ref(0))),
-                    (1, intern_typed(arena, &col_ref(1))),
-                    (2, intern_typed(arena, &col_ref(2))),
+                    (
+                        0,
+                        intern_typed(
+                            arena,
+                            &col_ref(0),
+                            &crate::compiler::SqlCompileControl::unbounded(),
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        1,
+                        intern_typed(
+                            arena,
+                            &col_ref(1),
+                            &crate::compiler::SqlCompileControl::unbounded(),
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        2,
+                        intern_typed(
+                            arena,
+                            &col_ref(2),
+                            &crate::compiler::SqlCompileControl::unbounded(),
+                        )
+                        .unwrap(),
+                    ),
                 ],
             )]
         } else {
@@ -1169,14 +1298,26 @@ mod tests {
         // cross join, which the enumeration rejects).
         let mut arena = ScalarArena::new();
         let with_class = three_atom_transitive(&mut arena, true);
-        let trees = greedy_topk(&with_class, 10, &mut arena);
+        let trees = greedy_topk(
+            &with_class,
+            10,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert!(
             trees.iter().any(joins_a_and_c_directly),
             "transitive edge makes the (A⋈C)⋈B order a reachable candidate"
         );
 
         let plain = three_atom_transitive(&mut arena, false);
-        let plain_trees = greedy_topk(&plain, 10, &mut arena);
+        let plain_trees = greedy_topk(
+            &plain,
+            10,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert!(
             !plain_trees.iter().any(joins_a_and_c_directly),
             "without the class, A and C are never joined directly (no edge)"
@@ -1190,7 +1331,14 @@ mod tests {
         let mut arena = ScalarArena::new();
         let mut graph = transitive_path_graph(3, &mut arena);
         graph.equi_classes.clear();
-        let parts = connecting_condition_scalars(&graph, 0b001, 0b100, &mut arena);
+        let parts = connecting_condition_scalars(
+            &graph,
+            0b001,
+            0b100,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert!(parts.is_empty(), "no class, no A-C edge — the original gap");
     }
 
@@ -1209,7 +1357,14 @@ mod tests {
                 if i == j {
                     continue;
                 }
-                let parts = connecting_condition_scalars(&graph, 1u32 << i, 1u32 << j, &mut arena);
+                let parts = connecting_condition_scalars(
+                    &graph,
+                    1u32 << i,
+                    1u32 << j,
+                    &mut arena,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
                 assert_eq!(parts.len(), 1, "one equi per atom pair, never the closure");
                 distinct.insert(format!("{:?}", parts[0]));
             }
@@ -1220,7 +1375,13 @@ mod tests {
             distinct.len()
         );
         assert!(
-            dp(&graph, &mut arena).is_some(),
+            dp(
+                &graph,
+                &mut arena,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_some(),
             "DP completes for k=12 class"
         );
     }

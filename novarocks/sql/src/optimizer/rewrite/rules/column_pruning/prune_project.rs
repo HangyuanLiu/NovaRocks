@@ -50,11 +50,15 @@ fn is_assert_true_item(arena: &ScalarArena, item: &ScalarProjectItem) -> bool {
 }
 
 /// Intern `const 1` (Int64) into the arena and return its `ScalarId`.
-fn intern_const_one(arena: &mut ScalarArena) -> ScalarId {
+fn intern_const_one(
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
     use crate::common::LiteralValue;
-    arena.intern(
+    arena.intern_observed(
         ScalarNode::Literal(scalar::HashableLiteral(LiteralValue::Int(1))),
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        control,
     )
 }
 
@@ -130,7 +134,7 @@ impl LogicalRewriteRule for PruneProjectColumns {
             let fill_id = auto_fill_column_id(ctx).unwrap_or(ColumnId::UNSET);
             let fill_name = format!("auto_fill_{}", fill_id.0);
             let arena_rc = ctx.scalar_arena();
-            let const_id = intern_const_one(&mut arena_rc.borrow_mut());
+            let const_id = intern_const_one(&mut arena_rc.borrow_mut(), &ctx.control_view())?;
             new_items.push(ScalarProjectItem {
                 expr: const_id,
                 output_name: fill_name,

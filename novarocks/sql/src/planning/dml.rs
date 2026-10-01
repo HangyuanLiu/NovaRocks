@@ -1300,6 +1300,7 @@ pub fn begin_final_dml_change_stream(
             compiled.optimized_tree,
             &target_columns,
             new_sequence_number,
+            &control,
         )?,
         DmlChangeStreamKind::Merge {
             target_columns,
@@ -1314,6 +1315,7 @@ pub fn begin_final_dml_change_stream(
             matched_update,
             matched_delete,
             not_matched_insert,
+            &control,
         )?,
     };
     let effect_output_ordinal = producer
@@ -1350,6 +1352,7 @@ pub fn compile_final_dml_change_stream(
             compiled.optimized_tree,
             &target_columns,
             new_sequence_number,
+            &control,
         )?,
         DmlChangeStreamKind::Merge {
             target_columns,
@@ -1364,6 +1367,7 @@ pub fn compile_final_dml_change_stream(
             matched_update,
             matched_delete,
             not_matched_insert,
+            &control,
         )?,
     };
     seal_final_change_stream_producer(
@@ -1651,7 +1655,9 @@ fn build_update_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],
     new_sequence_number: i64,
-) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
     let child_outputs = optimized_tree.output_columns.clone();
     let row_id = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
@@ -1665,6 +1671,7 @@ fn build_update_change_event_expand(
             "__nr_file",
             "UPDATE old file",
             file.column_id,
+            control,
         )?,
         output_expr(
             &mut arena,
@@ -1672,19 +1679,21 @@ fn build_update_change_event_expand(
             "__nr_pos",
             "UPDATE old row position",
             pos.column_id,
+            control,
         )?,
     ];
     for (name, output) in &targets {
         let new_name = format!("__nr_new_{name}");
-        let expr = maybe_output_column_by_name(&child_outputs, &new_name)?
-            .map(|column| intern_column(&mut arena, &column))
-            .transpose()?
-            .unwrap_or(child_expr(
+        let expr = match maybe_output_column_by_name(&child_outputs, &new_name)? {
+            Some(column) => intern_column(&mut arena, &column, control)?,
+            None => child_expr(
                 &mut arena,
                 &child_outputs,
                 name,
                 "UPDATE unchanged target column",
-            )?);
+                control,
+            )?,
+        };
         assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
             output_column_id: output.column_id,
             expr: Some(expr),
@@ -1696,13 +1705,15 @@ fn build_update_change_event_expand(
         "__nr_row_id",
         "UPDATE old row id",
         row_id.column_id,
+        control,
     )?);
-    let sequence = arena.intern(
+    let sequence = arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
             crate::analysis::LiteralValue::Int(new_sequence_number),
         )),
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
-    );
+        control,
+    )?;
     assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
         output_column_id: last_sequence.column_id,
         expr: Some(sequence),
@@ -1718,6 +1729,7 @@ fn build_update_change_event_expand(
             assignments,
         }],
     )
+    .map_err(crate::compiler::SqlCompileError::Compilation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1728,7 +1740,9 @@ fn build_merge_change_event_expand(
     matched_update: bool,
     matched_delete: bool,
     not_matched_insert: bool,
-) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR MERGE")?;
     let child_outputs = optimized_tree.output_columns.clone();
     let assert_key =
@@ -1743,6 +1757,7 @@ fn build_merge_change_event_expand(
             "__nr_file",
             "MERGE old file",
             file.column_id,
+            control,
         )?,
         output_expr(
             &mut arena,
@@ -1750,6 +1765,7 @@ fn build_merge_change_event_expand(
             "__nr_pos",
             "MERGE old row position",
             pos.column_id,
+            control,
         )?,
     ];
     let mut reuse_assignments = vec![
@@ -1759,6 +1775,7 @@ fn build_merge_change_event_expand(
             "__nr_file",
             "MERGE old file",
             file.column_id,
+            control,
         )?,
         output_expr(
             &mut arena,
@@ -1766,6 +1783,7 @@ fn build_merge_change_event_expand(
             "__nr_pos",
             "MERGE old row position",
             pos.column_id,
+            control,
         )?,
     ];
     let mut fresh_assignments = Vec::with_capacity(targets.len());
@@ -1776,17 +1794,19 @@ fn build_merge_change_event_expand(
             name,
             "MERGE old target column",
             output.column_id,
+            control,
         )?);
         let new_name = format!("__nr_new_{name}");
-        let reuse = maybe_output_column_by_name(&child_outputs, &new_name)?
-            .map(|column| intern_column(&mut arena, &column))
-            .transpose()?
-            .unwrap_or(child_expr(
+        let reuse = match maybe_output_column_by_name(&child_outputs, &new_name)? {
+            Some(column) => intern_column(&mut arena, &column, control)?,
+            None => child_expr(
                 &mut arena,
                 &child_outputs,
                 name,
                 "MERGE unchanged target column",
-            )?);
+                control,
+            )?,
+        };
         reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
             output_column_id: output.column_id,
             expr: Some(reuse),
@@ -1795,7 +1815,7 @@ fn build_merge_change_event_expand(
         if let Some(column) = maybe_output_column_by_name(&child_outputs, &insert_name)? {
             fresh_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
                 output_column_id: output.column_id,
-                expr: Some(intern_column(&mut arena, &column)?),
+                expr: Some(intern_column(&mut arena, &column, control)?),
             });
         }
     }
@@ -1805,13 +1825,15 @@ fn build_merge_change_event_expand(
         "__nr_row_id",
         "MERGE old row id",
         row_id.column_id,
+        control,
     )?);
-    let sequence = arena.intern(
+    let sequence = arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
             crate::analysis::LiteralValue::Int(new_sequence_number),
         )),
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
-    );
+        control,
+    )?;
     reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
         output_column_id: last_sequence.column_id,
         expr: Some(sequence),
@@ -1819,27 +1841,44 @@ fn build_merge_change_event_expand(
     let mut events = Vec::new();
     if matched_update {
         events.push(crate::optimizer::operator::ChangeEventSpec {
-            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 1)?),
+            predicate: Some(merge_action_predicate(
+                &mut arena,
+                &child_outputs,
+                1,
+                control,
+            )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: reuse_assignments,
         });
     }
     if matched_delete {
         events.push(crate::optimizer::operator::ChangeEventSpec {
-            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 2)?),
+            predicate: Some(merge_action_predicate(
+                &mut arena,
+                &child_outputs,
+                2,
+                control,
+            )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
             assignments: delete_assignments,
         });
     }
     if not_matched_insert {
         events.push(crate::optimizer::operator::ChangeEventSpec {
-            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 3)?),
+            predicate: Some(merge_action_predicate(
+                &mut arena,
+                &child_outputs,
+                3,
+                control,
+            )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             assignments: fresh_assignments,
         });
     }
     if events.is_empty() {
-        return Err("MOR MERGE change-stream expand requires at least one event".to_string());
+        return Err("MOR MERGE change-stream expand requires at least one event"
+            .to_string()
+            .into());
     }
     build_change_expand(
         distributed,
@@ -1848,6 +1887,7 @@ fn build_merge_change_event_expand(
         effect.column_id,
         events,
     )
+    .map_err(crate::compiler::SqlCompileError::Compilation)
 }
 
 fn clone_scalar_arena(
@@ -1989,21 +2029,24 @@ fn output_expr(
     name: &str,
     label: &str,
     output_column_id: crate::column_id::ColumnId,
-) -> Result<crate::optimizer::operator::ChangeEventOutputExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::operator::ChangeEventOutputExpr, crate::compiler::SqlCompileError> {
     Ok(crate::optimizer::operator::ChangeEventOutputExpr {
         output_column_id,
-        expr: Some(child_expr(arena, columns, name, label)?),
+        expr: Some(child_expr(arena, columns, name, label, control)?),
     })
 }
 
 fn intern_column(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     column: &crate::analysis::OutputColumn,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
-    Ok(arena.intern(
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::ColumnRef(column.column_id),
         column.value_type.clone(),
-    ))
+        control,
+    )
 }
 
 fn child_expr(
@@ -2011,24 +2054,27 @@ fn child_expr(
     columns: &[crate::analysis::OutputColumn],
     name: &str,
     label: &str,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
     let column = output_column_by_name(columns, name, label)?;
-    intern_column(arena, &column)
+    intern_column(arena, &column, control)
 }
 
 fn merge_action_predicate(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     columns: &[crate::analysis::OutputColumn],
     action: i32,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
-    let action_expr = child_expr(arena, columns, "__nr_merge_action", "MERGE action")?;
-    let literal = arena.intern(
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
+    let action_expr = child_expr(arena, columns, "__nr_merge_action", "MERGE action", control)?;
+    let literal = arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
             crate::analysis::LiteralValue::Int(i64::from(action)),
         )),
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
-    );
-    Ok(arena.intern(
+        control,
+    )?;
+    arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::BinaryOp {
             op: crate::common::BinOp::Eq,
             left: action_expr,
@@ -2036,7 +2082,8 @@ fn merge_action_predicate(
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Boolean, false),
-    ))
+        control,
+    )
 }
 
 pub(crate) fn build_change_expand(
@@ -3446,5 +3493,178 @@ mod tests {
                 .len(),
             2
         );
+    }
+    #[test]
+    fn actual_dml_output_interning_preserves_control_categories() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Refuse {
+            cause: CompileControlError,
+            at_entry: bool,
+            seen: std::sync::atomic::AtomicBool,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                if (self.at_entry && units == 0) || (!self.at_entry && units == 256) {
+                    self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(self.cause);
+                }
+                Ok(())
+            }
+        }
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at_entry in [true, false] {
+                let control = Refuse {
+                    cause,
+                    at_entry,
+                    seen: std::sync::atomic::AtomicBool::new(false),
+                };
+                let data_type = arrow::datatypes::DataType::Struct(
+                    (0..300)
+                        .map(|i| {
+                            arrow::datatypes::Field::new(
+                                format!("f{i}"),
+                                arrow::datatypes::DataType::Int64,
+                                false,
+                            )
+                        })
+                        .collect(),
+                );
+                let column = crate::analysis::OutputColumn {
+                    column_id: crate::column_id::ColumnId(1),
+                    name: "payload".into(),
+                    value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+                    is_internal: false,
+                };
+                let mut arena = crate::optimizer::scalar::ScalarArena::new();
+                let result = super::output_expr(
+                    &mut arena,
+                    &[column],
+                    "payload",
+                    "DML payload",
+                    crate::column_id::ColumnId(2),
+                    &control,
+                );
+                let node =
+                    crate::optimizer::scalar::ScalarNode::ColumnRef(crate::column_id::ColumnId(99));
+                let ty = novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                );
+                let first = arena.intern(node.clone(), ty.clone());
+                let expected = crate::optimizer::scalar::ScalarArena::new().intern(node, ty);
+                assert_eq!(first, expected, "refused insertion cannot publish a scalar");
+                assert!(
+                    control.seen.load(std::sync::atomic::Ordering::SeqCst),
+                    "the original control must observe the refused work"
+                );
+                assert!(matches!(
+                    (cause, result),
+                    (
+                        CompileControlError::Cancelled,
+                        Err(crate::compiler::SqlCompileError::Cancelled)
+                    ) | (
+                        CompileControlError::DeadlineExceeded,
+                        Err(crate::compiler::SqlCompileError::DeadlineExceeded)
+                    ) | (
+                        CompileControlError::ResourceExhausted,
+                        Err(crate::compiler::SqlCompileError::ResourceExhausted)
+                    )
+                ));
+            }
+        }
+    }
+    #[test]
+    fn actual_update_selected_new_column_skips_unused_fallback_interning() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct RefuseUnusedWide;
+        impl PureCompileControl for RefuseUnusedWide {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                if units == 256 {
+                    return Err(CompileControlError::ResourceExhausted);
+                }
+                Ok(())
+            }
+        }
+        for include_unused_old in [false, true] {
+            let source = |id, name: &str, ty| crate::analysis::OutputColumn {
+                column_id: crate::column_id::ColumnId(id),
+                name: name.into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
+                is_internal: false,
+            };
+            let mut columns = vec![
+                source(1, "__nr_file", arrow::datatypes::DataType::Utf8),
+                source(2, "__nr_pos", arrow::datatypes::DataType::Int64),
+                source(3, "__nr_row_id", arrow::datatypes::DataType::Int64),
+                source(4, "__nr_new_k", arrow::datatypes::DataType::Int64),
+            ];
+            if include_unused_old {
+                columns.push(source(
+                    5,
+                    "k",
+                    arrow::datatypes::DataType::Struct(
+                        (0..300)
+                            .map(|i| {
+                                arrow::datatypes::Field::new(
+                                    format!("f{i}"),
+                                    arrow::datatypes::DataType::Int64,
+                                    false,
+                                )
+                            })
+                            .collect(),
+                    ),
+                ));
+            }
+            let mut node = crate::optimizer::OptimizedOperatorNode {
+                op: crate::optimizer::operator::Operator::PhysicalValues(
+                    crate::optimizer::operator::ValuesOp {
+                        rows: vec![],
+                        columns: columns.clone(),
+                    },
+                ),
+                children: vec![],
+                output_columns: columns,
+                stats: Default::default(),
+                explain_stats: Default::default(),
+                execution_props: Default::default(),
+            };
+            crate::optimizer::optimized_tree::attach_scalar_arena(
+                &mut node,
+                std::sync::Arc::new(crate::optimizer::scalar::ScalarArena::new()),
+            );
+            let expanded =
+                super::build_update_change_event_expand(node, &[column("k")], 9, &RefuseUnusedWide)
+                    .expect("selected new value skips missing or refused old value");
+            let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) =
+                &expanded.op
+            else {
+                panic!("expected change-event expansion");
+            };
+            let target = expanded
+                .output_columns
+                .iter()
+                .find(|column| column.name == "k")
+                .unwrap();
+            let expression = expand.events[0]
+                .assignments
+                .iter()
+                .find(|assignment| assignment.output_column_id == target.column_id)
+                .unwrap()
+                .expr
+                .unwrap();
+            assert!(matches!(
+                expanded
+                    .execution_props
+                    .scalar_arena
+                    .as_ref()
+                    .unwrap()
+                    .node(expression),
+                crate::optimizer::scalar::ScalarNode::ColumnRef(crate::column_id::ColumnId(4))
+            ));
+        }
     }
 }

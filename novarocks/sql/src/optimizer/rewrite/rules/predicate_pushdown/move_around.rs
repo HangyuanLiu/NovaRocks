@@ -104,7 +104,8 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
             &right_ids,
             &join_groups,
             &child_groups,
-        );
+            &ctx.control_view(),
+        )?;
 
         let left_existing = existing_child_predicate_keys(&left, &arena);
         let right_existing = existing_child_predicate_keys(&right, &arena);
@@ -132,14 +133,16 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
             left
         } else {
             let predicate =
-                scalar_expr::combine_conjuncts(&mut arena, left_fresh).expect("non-empty");
+                scalar_expr::combine_conjuncts(&mut arena, left_fresh, &ctx.control_view())?
+                    .expect("non-empty");
             OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![left])
         };
         let new_right = if right_fresh.is_empty() {
             right
         } else {
             let predicate =
-                scalar_expr::combine_conjuncts(&mut arena, right_fresh).expect("non-empty");
+                scalar_expr::combine_conjuncts(&mut arena, right_fresh, &ctx.control_view())?
+                    .expect("non-empty");
             OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![right])
         };
 
@@ -404,7 +407,12 @@ mod tests {
     }
 
     fn make_filter(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = intern_typed(arena, &predicate);
+        let pred_id = intern_typed(
+            arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
@@ -417,7 +425,12 @@ mod tests {
         left: OptExpr,
         right: OptExpr,
     ) -> OptExpr {
-        let cond_id = intern_typed(arena, &condition);
+        let cond_id = intern_typed(
+            arena,
+            &condition,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -479,7 +492,9 @@ mod tests {
         let cond_id = intern_typed(
             &mut arena,
             &eq(col_expr("l", "a", 1), col_expr("r", "b", 2)),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
@@ -581,7 +596,9 @@ mod tests {
                 eq(col_expr("a", "k", 1), col_expr("b", "k", 2)),
                 eq(col_expr("b", "k", 2), int_lit(7)),
             ),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let left_child = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,

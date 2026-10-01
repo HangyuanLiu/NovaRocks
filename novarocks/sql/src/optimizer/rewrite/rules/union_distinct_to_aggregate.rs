@@ -74,8 +74,8 @@ impl LogicalRewriteRule for UnionDistinctToAggregate {
             let mut arena = arena.borrow_mut();
             output_columns
                 .iter()
-                .map(|column| make_column_ref_expr(&mut arena, column))
-                .collect()
+                .map(|column| make_column_ref_expr(&mut arena, column, &ctx.control_view()))
+                .collect::<Result<Vec<_>, _>>()?
         };
         let aggregate = LogicalAggregateOp::single(
             group_by,

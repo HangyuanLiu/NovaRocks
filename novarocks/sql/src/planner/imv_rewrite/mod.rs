@@ -91,10 +91,11 @@ where
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {
-            let opt_out = crate::planner::optimizer_bridge::logical::to_optimizer_expr(
+            let opt_out = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
                 &plan_out,
                 &mut arena.borrow_mut(),
-            );
+                &ctx.control_view(),
+            )?;
             crate::optimizer::rewrite::result::RewriteResult::Changed(opt_out)
         }
         PlanRewriteResult::Unchanged => crate::optimizer::rewrite::result::RewriteResult::Unchanged,
@@ -124,10 +125,11 @@ where
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {
-            let opt_out = crate::planner::optimizer_bridge::logical::to_optimizer_expr(
+            let opt_out = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
                 &plan_out,
                 &mut arena.borrow_mut(),
-            );
+                &ctx.control_view(),
+            )?;
             crate::optimizer::rewrite::result::RewriteResult::Changed(opt_out)
         }
         PlanRewriteResult::Unchanged => crate::optimizer::rewrite::result::RewriteResult::Unchanged,

@@ -305,21 +305,28 @@ fn collect_literal_equalities_inner(
     }
 }
 
-pub(crate) fn make_column_ref_expr(arena: &mut ScalarArena, column: &OutputColumn) -> ScalarId {
-    arena.remember_source_column_display(column.column_id, None, column.name.clone());
-    arena.intern(
+pub(crate) fn make_column_ref_expr(
+    arena: &mut ScalarArena,
+    column: &OutputColumn,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    let result = arena.intern_observed(
         ScalarNode::ColumnRef(column.column_id),
         column.value_type.clone(),
-    )
+        control,
+    )?;
+    arena.remember_source_column_display(column.column_id, None, column.name.clone());
+    Ok(result)
 }
 
 pub(crate) fn make_eq_literal_predicate(
     arena: &mut ScalarArena,
     column: &OutputColumn,
     literal: ScalarId,
-) -> ScalarId {
-    let left = make_column_ref_expr(arena, column);
-    arena.intern(
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    let left = make_column_ref_expr(arena, column, control)?;
+    arena.intern_observed(
         ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
@@ -330,16 +337,22 @@ pub(crate) fn make_eq_literal_predicate(
             DataType::Boolean,
             column.value_type.nullable || arena.nullable(literal),
         ),
+        control,
     )
 }
 
 pub(crate) fn combine_with_and(
     arena: &mut ScalarArena,
-    mut predicates: Vec<ScalarId>,
-) -> Option<ScalarId> {
-    let first = predicates.drain(..1).next()?;
-    Some(predicates.into_iter().fold(first, |left, right| {
-        arena.intern(
+    predicates: Vec<ScalarId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    let mut predicates = predicates.into_iter();
+    let Some(mut left) = predicates.next() else {
+        return Ok(None);
+    };
+    for right in predicates {
+        left = arena.intern_observed(
             ScalarNode::BinaryOp {
                 left,
                 op: BinOp::And,
@@ -350,8 +363,11 @@ pub(crate) fn combine_with_and(
                 DataType::Boolean,
                 arena.nullable(left) || arena.nullable(right),
             ),
-        )
-    }))
+            control,
+        )?;
+    }
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    Ok(Some(left))
 }
 
 pub(crate) fn literal_signature(arena: &ScalarArena, literal: ScalarId) -> String {

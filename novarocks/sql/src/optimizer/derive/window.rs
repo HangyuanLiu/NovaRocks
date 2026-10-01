@@ -175,7 +175,9 @@ mod tests {
                 is_internal: false,
             })
             .collect::<Vec<_>>();
-        let window_exprs = intern_window_exprs(scalars, &exprs);
+        let window_exprs =
+            intern_window_exprs(scalars, &exprs, crate::optimizer::test_optimizer_control())
+                .unwrap();
         WindowOp {
             window_exprs,
             output_columns,

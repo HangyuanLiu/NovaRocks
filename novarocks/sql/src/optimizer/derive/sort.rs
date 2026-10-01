@@ -98,7 +98,9 @@ mod tests {
                     asc: true,
                     nulls_first: false,
                 }],
-            ),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
             analytic_partition_exprs: Vec::new(),
             partition_limit: None,
             topn_type: None,
@@ -122,7 +124,12 @@ mod tests {
             ),
         };
         let mut scalars = ScalarArena::new();
-        let partition = intern_typed(&mut scalars, &partition);
+        let partition = intern_typed(
+            &mut scalars,
+            &partition,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let op = SortOp {
             items: vec![],
             analytic_partition_exprs: vec![partition],

@@ -2715,6 +2715,7 @@ mod tests {
         let mut opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan,
             &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical plan to opt expr");
         bind_test_scan_refs(&mut opt_expr);
@@ -2752,7 +2753,8 @@ mod tests {
         column_stats: &HashMap<ColumnId, ColumnStatistic>,
     ) -> f64 {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, expr);
+        let id =
+            intern_typed(&mut arena, expr, crate::optimizer::test_optimizer_control()).unwrap();
         estimate_selectivity(&arena, id, column_stats)
     }
 
@@ -3180,7 +3182,12 @@ mod tests {
             unreachable!("scan_plan_with_predicates always returns a Scan");
         };
         let mut memo = Memo::new();
-        let predicates = intern_exprs(&mut memo.scalars, &scan.predicates);
+        let predicates = intern_exprs(
+            &mut memo.scalars,
+            &scan.predicates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let expr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalScan(ScanOp {
@@ -3382,8 +3389,18 @@ mod tests {
             is_merge: Vec<bool>,
             is_split: bool,
         ) -> MExpr {
-            let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
-            let aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
+            let group_by = intern_exprs(
+                &mut memo.scalars,
+                &[col_ref(1, "k")],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            let aggregates = intern_aggregate_calls(
+                &mut memo.scalars,
+                &[count_call()],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
             let output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
             let output_layout = full_aggregate_output_layout(group_by.len(), &output_columns);
             MExpr {
@@ -3401,8 +3418,18 @@ mod tests {
             }
         }
 
-        let single_group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
-        let single_aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
+        let single_group_by = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(1, "k")],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let single_aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[count_call()],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let single_output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
         let single_output_layout =
             full_aggregate_output_layout(single_group_by.len(), &single_output_columns);
@@ -3781,7 +3808,12 @@ mod tests {
     }
 
     fn aggregate_group_key_ids(memo: &mut Memo) -> Vec<ScalarId> {
-        intern_exprs(&mut memo.scalars, &aggregate_group_keys())
+        intern_exprs(
+            &mut memo.scalars,
+            &aggregate_group_keys(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn aggregate_output_columns() -> Vec<OutputColumn> {
@@ -4055,7 +4087,12 @@ mod tests {
             g
         }
         fn agg_over(child: usize, memo: &mut Memo) -> MExpr {
-            let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
+            let group_by = intern_exprs(
+                &mut memo.scalars,
+                &[col_ref(1, "k")],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
             let output_columns = vec![output_column(1, "k")];
             MExpr {
                 id: memo.next_expr_id(), // id is irrelevant to derive_statistics
@@ -4207,7 +4244,9 @@ mod tests {
                 predicate: intern_typed(
                     &mut memo.scalars,
                     &eq_expr(col_ref("filter_col"), int_lit(1)),
-                ),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
             }),
             children: vec![child],
         };
@@ -4227,7 +4266,9 @@ mod tests {
                 predicate: intern_typed(
                     &mut memo.scalars,
                     &eq_expr(col_ref("filter_col"), int_lit(1)),
-                ),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
             }),
             children: vec![child],
         };
@@ -4338,13 +4379,33 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![
                     PhysicalHashJoinEqCondition {
-                        left: intern_typed(&mut memo.scalars, &col_ref("l_k1")),
-                        right: intern_typed(&mut memo.scalars, &col_ref("r_k1")),
+                        left: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("l_k1"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        right: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("r_k1"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
                         null_safe: false,
                     },
                     PhysicalHashJoinEqCondition {
-                        left: intern_typed(&mut memo.scalars, &col_ref("l_k2")),
-                        right: intern_typed(&mut memo.scalars, &col_ref("r_k2")),
+                        left: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("l_k2"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        right: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("r_k2"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
                         null_safe: false,
                     },
                 ],
@@ -4416,8 +4477,18 @@ mod tests {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: intern_typed(&mut memo.scalars, &col_ref("l_key")),
-                    right: intern_typed(&mut memo.scalars, &col_ref("r_key")),
+                    left: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref("l_key"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                    right: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref("r_key"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -4495,10 +4566,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4565,10 +4640,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4648,7 +4727,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(&mut memo.scalars, &condition)),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &condition,
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4700,10 +4786,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("r_key"), col_ref("l_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("r_key"), col_ref("l_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4768,7 +4858,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(&mut memo.scalars, &condition)),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &condition,
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4834,10 +4931,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4920,10 +5021,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id)),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id)),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4984,10 +5089,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::LeftSemi,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_filter"), int_lit(7)),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_filter"), int_lit(7)),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -5047,10 +5156,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::RightAnti,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("r_filter"), int_lit(7)),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("r_filter"), int_lit(7)),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -5134,7 +5247,12 @@ mod tests {
 
         let mut memo = Memo::new();
         let child = child_group(&mut memo);
-        let logical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
+        let logical_window_exprs = intern_window_exprs(
+            &mut memo.scalars,
+            &[window_expr("rn")],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let logical_window = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(WindowOp {
@@ -5149,7 +5267,12 @@ mod tests {
             &empty_stats_input(),
         ));
 
-        let physical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
+        let physical_window_exprs = intern_window_exprs(
+            &mut memo.scalars,
+            &[window_expr("rn")],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let physical_window = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalWindow(WindowOp {
@@ -5503,8 +5626,18 @@ mod tests {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: intern_typed(&mut memo.scalars, &col_ref_id(701, "customer_id")),
-                    right: intern_typed(&mut memo.scalars, &col_ref_id(801, "customer_id")),
+                    left: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref_id(701, "customer_id"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                    right: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref_id(801, "customer_id"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -5694,9 +5827,24 @@ mod tests {
         let col = ColumnId::new_for_test(7);
         let mut memo = Memo::new();
         let rows = vec![
-            intern_exprs(&mut memo.scalars, &[int_lit(1)]),
-            intern_exprs(&mut memo.scalars, &[int_lit(2)]),
-            intern_exprs(&mut memo.scalars, &[int_lit(3)]),
+            intern_exprs(
+                &mut memo.scalars,
+                &[int_lit(1)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
+            intern_exprs(
+                &mut memo.scalars,
+                &[int_lit(2)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
+            intern_exprs(
+                &mut memo.scalars,
+                &[int_lit(3)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
         ];
         let expr = MExpr {
             id: memo.next_expr_id(),
@@ -6249,7 +6397,12 @@ mod tests {
 
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         };
-        let one_conjunct = intern_typed(&mut memo.scalars, &lit(1));
+        let one_conjunct = intern_typed(
+            &mut memo.scalars,
+            &lit(1),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let two_conjuncts = {
             let and = TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -6265,7 +6418,12 @@ mod tests {
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
-            intern_typed(&mut memo.scalars, &and)
+            intern_typed(
+                &mut memo.scalars,
+                &and,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap()
         };
 
         // Member 0 (first): TWO conjuncts. Member 1: ONE conjunct. Both inner
@@ -6523,7 +6681,7 @@ mod sort_partition_limit_tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
-        intern_typed(scalars, &expr)
+        intern_typed(scalars, &expr, crate::optimizer::test_optimizer_control()).unwrap()
     }
 
     fn col_stat_with_ndv(ndv: f64) -> ColumnStatistic {

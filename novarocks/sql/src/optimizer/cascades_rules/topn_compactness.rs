@@ -288,7 +288,7 @@ impl Rule for PushTopNThroughSetOp {
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
         let _ = control;
 
-        Ok(push_topn_through_setop(expr, memo))
+        push_topn_through_setop(expr, memo, control)
     }
 
     fn pattern(&self) -> Pattern {
@@ -318,7 +318,7 @@ impl Rule for PushTopNThroughSetOp {
             return Ok(vec![]);
         };
         let union_children = binding.children(1).to_vec();
-        Ok(push_one_setop(&topn, &union, &union_children, memo))
+        push_one_setop(&topn, &union, &union_children, memo, control)
     }
 }
 
@@ -600,25 +600,29 @@ fn push_one_scan(topn: &TopNOp, topn_children: &[GroupId]) -> Vec<NewExpr> {
     }
 }
 
-fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+fn push_topn_through_setop(
+    expr: &MExpr,
+    memo: &mut Memo,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     let Operator::LogicalTopN(topn) = &expr.op else {
-        return vec![];
+        return Ok(vec![]);
     };
     // Rule entry fast-fail guards (mirrored inside `push_one_setop` so
     // `apply_bound` is correct standalone). Phase/window/end_exclusive all
     // depend only on the outer TopN.
     if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
-        return vec![];
+        return Ok(vec![]);
     }
     match TopNWindow::from_limit_offset(topn.limit, topn.offset) {
         Some(window) if window.end_exclusive().is_some() => {}
-        _ => return vec![],
+        _ => return Ok(vec![]),
     }
     if expr.children.len() != 1 {
-        return vec![];
+        return Ok(vec![]);
     }
     let Some(union_group) = memo.groups.get(expr.children[0]).cloned() else {
-        return vec![];
+        return Ok(vec![]);
     };
 
     let mut results = Vec::new();
@@ -629,9 +633,15 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         // Clone the Union op + its branch groups out before borrowing `&mut memo`.
         let union = union.clone();
         let union_children = union_expr.children.clone();
-        results.extend(push_one_setop(topn, &union, &union_children, memo));
+        results.extend(push_one_setop(
+            topn,
+            &union,
+            &union_children,
+            memo,
+            control,
+        )?);
     }
-    results
+    Ok(results)
 }
 
 /// Per-child core for `PushTopNThroughSetOp`: push one `LogicalTopN` below a
@@ -645,23 +655,24 @@ fn push_one_setop(
     union: &UnionOp,
     union_children: &[GroupId],
     memo: &mut Memo,
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
-        return vec![];
+        return Ok(vec![]);
     }
     let Some(window) = TopNWindow::from_limit_offset(topn.limit, topn.offset) else {
-        return vec![];
+        return Ok(vec![]);
     };
     let Some(branch_limit) = window.end_exclusive() else {
-        return vec![];
+        return Ok(vec![]);
     };
     if !union.all || union_children.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     let Some(branch_topn_ops) =
-        build_union_branch_topn_ops(topn, branch_limit, union, union_children, memo)
+        build_union_branch_topn_ops(topn, branch_limit, union, union_children, memo, control)?
     else {
-        return vec![];
+        return Ok(vec![]);
     };
     if union_children
         .iter()
@@ -670,7 +681,7 @@ fn push_one_setop(
             group_starts_with_logical_op(memo, *group, &Operator::LogicalTopN(op.clone()))
         })
     {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let mut pushed_branch_groups = Vec::with_capacity(union_children.len());
@@ -701,10 +712,10 @@ fn push_one_setop(
                 })
             },
         );
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::LogicalTopN(topn.clone()),
         children: vec![pushed_union_group],
-    }]
+    }])
 }
 
 fn build_union_branch_topn_ops(
@@ -713,22 +724,28 @@ fn build_union_branch_topn_ops(
     union: &crate::optimizer::operator::UnionOp,
     branch_groups: &[usize],
     memo: &mut Memo,
-) -> Option<Vec<TopNOp>> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<TopNOp>>, crate::compiler::SqlCompileError> {
     let mut branch_topn_ops = Vec::with_capacity(branch_groups.len());
     for branch_group in branch_groups {
-        let branch_outputs = memo
+        let Some(props) = memo
             .groups
-            .get(*branch_group)?
-            .logical_props
-            .as_ref()?
-            .output_columns
-            .clone();
-        let items = remap_sort_keys_through_union(
+            .get(*branch_group)
+            .and_then(|group| group.logical_props.as_ref())
+        else {
+            return Ok(None);
+        };
+        let branch_outputs = props.output_columns.clone();
+        let Some(items) = remap_sort_keys_through_union(
             &mut memo.scalars,
             &topn.items,
             &union.output_columns,
             &branch_outputs,
-        )?;
+            control,
+        )?
+        else {
+            return Ok(None);
+        };
         branch_topn_ops.push(TopNOp {
             items,
             limit: Some(branch_limit),
@@ -737,7 +754,7 @@ fn build_union_branch_topn_ops(
             is_split: topn.is_split,
         });
     }
-    Some(branch_topn_ops)
+    Ok(Some(branch_topn_ops))
 }
 
 fn remap_sort_keys_through_union(
@@ -745,39 +762,48 @@ fn remap_sort_keys_through_union(
     items: &[ScalarSortKey],
     union_outputs: &[OutputColumn],
     branch_outputs: &[OutputColumn],
-) -> Option<Vec<ScalarSortKey>> {
-    items
-        .iter()
-        .map(|item| {
-            let union_column_id = scalar_expr_to_column_id(scalars, item.expr)?;
-            let output_position = union_outputs
-                .iter()
-                .position(|column| column.column_id == union_column_id)?;
-            let union_output = union_outputs.get(output_position)?;
-            let branch_output = branch_outputs.get(output_position)?;
-            if scalars.data_type(item.expr) != &union_output.value_type.data_type
-                || scalars.nullable(item.expr) != union_output.value_type.nullable
-                || branch_output.value_type.data_type != union_output.value_type.data_type
-                || branch_output.value_type.nullable != union_output.value_type.nullable
-            {
-                return None;
-            }
-
-            let expr = scalars.intern(
-                ScalarNode::ColumnRef(branch_output.column_id),
-                branch_output.value_type.clone(),
-            );
-            Some(ScalarSortKey {
-                expr,
-                asc: item.asc,
-                nulls_first: item.nulls_first,
-                display: Some(ColumnDisplay {
-                    qualifier: None,
-                    column: branch_output.name.clone(),
-                }),
-            })
-        })
-        .collect()
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<ScalarSortKey>>, crate::compiler::SqlCompileError> {
+    let mut remapped = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(union_column_id) = scalar_expr_to_column_id(scalars, item.expr) else {
+            return Ok(None);
+        };
+        let Some(output_position) = union_outputs
+            .iter()
+            .position(|column| column.column_id == union_column_id)
+        else {
+            return Ok(None);
+        };
+        let Some(union_output) = union_outputs.get(output_position) else {
+            return Ok(None);
+        };
+        let Some(branch_output) = branch_outputs.get(output_position) else {
+            return Ok(None);
+        };
+        if scalars.data_type(item.expr) != &union_output.value_type.data_type
+            || scalars.nullable(item.expr) != union_output.value_type.nullable
+            || branch_output.value_type.data_type != union_output.value_type.data_type
+            || branch_output.value_type.nullable != union_output.value_type.nullable
+        {
+            return Ok(None);
+        }
+        let expr = scalars.intern_observed(
+            ScalarNode::ColumnRef(branch_output.column_id),
+            branch_output.value_type.clone(),
+            control,
+        )?;
+        remapped.push(ScalarSortKey {
+            expr,
+            asc: item.asc,
+            nulls_first: item.nulls_first,
+            display: Some(ColumnDisplay {
+                qualifier: None,
+                column: branch_output.name.clone(),
+            }),
+        });
+    }
+    Ok(Some(remapped))
 }
 
 fn group_starts_with_logical_op(memo: &Memo, group_id: usize, op: &Operator) -> bool {
@@ -951,7 +977,12 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalTopN(TopNOp {
-                items: intern_sort_items(&mut memo.scalars, &[item]),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &[item],
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 limit: Some(limit),
                 offset: Some(offset),
                 phase,
@@ -1009,7 +1040,12 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(SortOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 analytic_partition_exprs: Vec::new(),
                 partition_limit: None,
                 topn_type: None,
@@ -1027,7 +1063,12 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalProject(ProjectOp {
-                items: intern_project_items(&mut memo.scalars, &items),
+                items: intern_project_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_qualifier: None,
             }),
             children: vec![child_group],
@@ -1116,8 +1157,18 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(SortOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
-                analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                analytic_partition_exprs: intern_exprs(
+                    &mut memo.scalars,
+                    &[col(2)],
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
                 partition_limit: None,
                 topn_type: None,
             }),
@@ -1138,8 +1189,18 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(SortOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
-                analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                analytic_partition_exprs: intern_exprs(
+                    &mut memo.scalars,
+                    &[col(2)],
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
                 partition_limit: Some(2),
                 topn_type: Some(crate::common::SqlTopNType::Rank),
             }),

@@ -681,7 +681,12 @@ mod tests {
 
     fn project_over_scan_memo_for_test() -> (Memo, GroupId, GroupId) {
         let (mut memo, scan_group) = single_scan_memo();
-        let project_expr = intern_typed(&mut memo.scalars, &test_col(1, "c1"));
+        let project_expr = intern_typed(
+            &mut memo.scalars,
+            &test_col(1, "c1"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalProject(ProjectOp {
@@ -777,8 +782,18 @@ mod tests {
 
     fn eq_cond(memo: &mut Memo, left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
         PhysicalHashJoinEqCondition {
-            left: intern_typed(&mut memo.scalars, &left),
-            right: intern_typed(&mut memo.scalars, &right),
+            left: intern_typed(
+                &mut memo.scalars,
+                &left,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
+            right: intern_typed(
+                &mut memo.scalars,
+                &right,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
             null_safe: false,
         }
     }
@@ -1503,9 +1518,14 @@ mod tests {
         let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
-        let plan =
-            crate::optimizer::extract::extract_best(&mut memo, root, &required, &ctx.winners)
-                .expect("extract");
+        let plan = crate::optimizer::extract::extract_best(
+            &mut memo,
+            root,
+            &required,
+            &ctx.winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let join = find_hash_join_for_test(&plan).expect("hash join");
         let winner = ctx
             .winners
@@ -1888,8 +1908,18 @@ mod cascaded_derivation_tests {
 
     fn eq_cond(memo: &mut Memo, left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
         PhysicalHashJoinEqCondition {
-            left: intern_typed(&mut memo.scalars, &left),
-            right: intern_typed(&mut memo.scalars, &right),
+            left: intern_typed(
+                &mut memo.scalars,
+                &left,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
+            right: intern_typed(
+                &mut memo.scalars,
+                &right,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
             null_safe: false,
         }
     }
@@ -2005,7 +2035,12 @@ mod cascaded_derivation_tests {
             result_type: DataType::Int64,
         };
         let window = Operator::PhysicalWindow(WindowOp {
-            window_exprs: intern_window_exprs(&mut memo.scalars, &[window_expr]),
+            window_exprs: intern_window_exprs(
+                &mut memo.scalars,
+                &[window_expr],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
             output_columns: vec![crate::analysis::OutputColumn {
                 column_id: ColumnId(1000),
                 name: "win".into(),

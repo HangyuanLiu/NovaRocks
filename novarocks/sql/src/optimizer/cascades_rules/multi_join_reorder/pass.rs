@@ -124,7 +124,8 @@ fn reorder_chain(
     work: &mut CompileCheckpoints<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<(), SqlCompileError> {
-    let Some(graph) = observe_opaque(work, control, || flatten_join_chain(memo, root))? else {
+    let Some(graph) = observe_opaque(work, control, || flatten_join_chain(memo, root, control))??
+    else {
         return Ok(());
     };
     let n = graph.atom_count();
@@ -151,8 +152,8 @@ fn reorder_chain(
         }
     }
     let candidates = observe_opaque(work, control, || {
-        enumerate_orders(&graph, caps, &mut memo.scalars)
-    })?;
+        enumerate_orders(&graph, caps, &mut memo.scalars, control)
+    })??;
     for tree in candidates {
         work.step()?;
         inject_candidate(memo, root, tree, stats_input, work, control)?;
@@ -346,7 +347,14 @@ mod tests {
     fn inner(memo: &mut Memo, cond: TypedExpr) -> LogicalJoinOp {
         LogicalJoinOp {
             join_type: JoinKind::Inner,
-            condition: Some(intern_typed(&mut memo.scalars, &cond)),
+            condition: Some(
+                intern_typed(
+                    &mut memo.scalars,
+                    &cond,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
+            ),
         }
     }
 

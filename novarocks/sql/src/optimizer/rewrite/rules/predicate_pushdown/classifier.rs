@@ -189,7 +189,12 @@ mod tests {
     }
 
     fn group(arena: &mut ScalarArena, expr: TypedExpr) -> PredicateGroup {
-        let expr = intern_typed(arena, &expr);
+        let expr = intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         PredicateGroup::new(
             arena,
             expr,

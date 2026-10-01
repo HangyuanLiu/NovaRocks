@@ -124,8 +124,18 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let new_left = wrap_not_null(left, left_preds, &mut arena_rc.borrow_mut());
-        let new_right = wrap_not_null(right, right_preds, &mut arena_rc.borrow_mut());
+        let new_left = wrap_not_null(
+            left,
+            left_preds,
+            &mut arena_rc.borrow_mut(),
+            &ctx.control_view(),
+        )?;
+        let new_right = wrap_not_null(
+            right,
+            right_preds,
+            &mut arena_rc.borrow_mut(),
+            &ctx.control_view(),
+        )?;
 
         let result = OptExpr {
             op: Operator::LogicalJoin(join),
@@ -170,22 +180,31 @@ fn eligible_not_null(
     preds
 }
 
-fn is_not_null(arena: &mut ScalarArena, operand: ScalarId) -> ScalarId {
-    arena.intern(
+fn is_not_null(
+    arena: &mut ScalarArena,
+    operand: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::IsNull {
             child: operand,
             negated: true,
         },
         novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        control,
     )
 }
 
-fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> ScalarId {
+fn combine_and_scalar(
+    arena: &mut ScalarArena,
+    mut exprs: Vec<ScalarId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
     assert!(!exprs.is_empty());
     let mut result = exprs.pop().unwrap();
     while let Some(left) = exprs.pop() {
         let nullable = arena.nullable(left) || arena.nullable(result);
-        result = arena.intern(
+        result = arena.intern_observed(
             ScalarNode::BinaryOp {
                 left,
                 op: BinOp::And,
@@ -193,21 +212,30 @@ fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> Scal
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-        );
+            control,
+        )?;
     }
-    result
+    Ok(result)
 }
 
-fn wrap_not_null(child: OptExpr, operands: Vec<ScalarId>, arena: &mut ScalarArena) -> OptExpr {
+fn wrap_not_null(
+    child: OptExpr,
+    operands: Vec<ScalarId>,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, SqlCompileError> {
     if operands.is_empty() {
-        return child;
+        return Ok(child);
     }
     let preds = operands
         .into_iter()
-        .map(|operand| is_not_null(arena, operand))
-        .collect();
-    let predicate = combine_and_scalar(arena, preds);
-    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![child])
+        .map(|operand| is_not_null(arena, operand, control))
+        .collect::<Result<Vec<_>, _>>()?;
+    let predicate = combine_and_scalar(arena, preds, control)?;
+    Ok(OptExpr::new(
+        Operator::LogicalFilter(FilterOp { predicate }),
+        vec![child],
+    ))
 }
 
 /// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
@@ -371,8 +399,14 @@ mod tests {
         right: OptExpr,
         cond: Option<TypedExpr>,
     ) -> OptExpr {
-        let condition =
-            cond.map(|c| crate::planner::optimizer_bridge::scalar::intern_typed(arena, &c));
+        let condition = cond.map(|c| {
+            crate::planner::optimizer_bridge::scalar::intern_typed(
+                arena,
+                &c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: jt,
@@ -560,10 +594,18 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        let pred_l_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &not_null_pred_l);
-        let pred_r_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &not_null_pred_r);
+        let pred_l_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &not_null_pred_l,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let pred_r_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &not_null_pred_r,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let left_scan = ScanOp {
             database: "default".to_string(),
@@ -627,7 +669,12 @@ mod tests {
         };
 
         let cond = eq_expr(col_typed("l", "a", 1, true), col_typed("r", "b", 2, true));
-        let cond_id = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &cond);
+        let cond_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &cond,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let plan = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
