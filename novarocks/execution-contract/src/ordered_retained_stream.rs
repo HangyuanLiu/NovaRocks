@@ -160,6 +160,11 @@ pub struct OrderedRetainedStream {
 }
 
 impl OrderedRetainedStream {
+    /// Actual allocation retained by this pure metadata queue, including
+    /// spare capacity. Payloads and composing owner objects are excluded.
+    pub fn metadata_backing_bytes(&self) -> usize {
+        self.items.capacity() * std::mem::size_of::<RetainedStreamItem>()
+    }
     pub fn try_new(window: RetainedStreamWindow) -> Result<Self, StreamError> {
         let capacity = window
             .data_positions()

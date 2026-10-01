@@ -300,6 +300,9 @@ pub(super) struct ContextEntry {
     pub(super) domains: QueryContextDomains,
     pub(super) source: Arc<TaskStatusSource>,
     pub(super) tasks: BTreeMap<TaskIdentity, TaskEntry>,
+    /// Result visibility belongs to the context, independent of task records
+    /// and their retained tombstone horizon.
+    pub(super) roots: BTreeMap<TaskIdentity, Arc<crate::root_result_channel::RootResultChannel>>,
     pub(super) quiesce: Option<QuiesceQueryContextReceipt>,
     /// Compact, context-lifetime anti-replay fence for every task identity
     /// that reached an installed worker. Detailed terminal records may be
@@ -338,6 +341,7 @@ impl ContextEntry {
             domains: QueryContextDomains::empty(),
             source,
             tasks: BTreeMap::new(),
+            roots: BTreeMap::new(),
             quiesce: None,
             spent_tasks: BTreeSet::new(),
             retired_at: None,

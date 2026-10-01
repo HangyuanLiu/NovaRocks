@@ -4587,6 +4587,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-memory",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-types",
  "sha2",

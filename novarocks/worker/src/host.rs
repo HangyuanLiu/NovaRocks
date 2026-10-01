@@ -33,6 +33,58 @@ use novarocks_execution_contract::task_execution::status::{
 
 use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
+use crate::root_result_channel::RootResultChannel;
+
+/// Pure preparation facts and the exact runtime owner created alongside them.
+/// The context's creation transaction takes the optional root atomically;
+/// transport handles never enter the shared execution-contract vocabulary.
+pub struct PreparedTaskInstallation {
+    facts: PreparedTaskFacts,
+    root: Option<Arc<RootResultChannel>>,
+}
+impl std::fmt::Debug for PreparedTaskInstallation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTaskInstallation")
+            .field("facts", &self.facts)
+            .field("has_root", &self.root.is_some())
+            .finish()
+    }
+}
+impl PreparedTaskInstallation {
+    pub fn new(
+        facts: PreparedTaskFacts,
+        root: Option<Arc<RootResultChannel>>,
+    ) -> Result<Self, HostRejection> {
+        if root.is_some()
+            && facts.sink_kind() != novarocks_execution_contract::FragmentSinkKind::Result
+        {
+            return Err(HostRejection::new(
+                TaskFailureCategory::Protocol,
+                "bounded root channel requires a result sink",
+            ));
+        }
+        Ok(Self { facts, root })
+    }
+    pub fn facts(&self) -> PreparedTaskFacts {
+        self.facts
+    }
+    pub fn validate_task(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| root.spec().task != descriptor.identity())
+        {
+            return Err(HostRejection::new(
+                TaskFailureCategory::Protocol,
+                "prepared root channel names a different task",
+            ));
+        }
+        Ok(())
+    }
+    pub fn into_parts(self) -> (PreparedTaskFacts, Option<Arc<RootResultChannel>>) {
+        (self.facts, self.root)
+    }
+}
 
 /// The shared facts one establish installs, handed over as a single unit.
 ///
@@ -320,7 +372,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-    ) -> Result<PreparedTaskFacts, HostRejection>;
+    ) -> Result<PreparedTaskInstallation, HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
 

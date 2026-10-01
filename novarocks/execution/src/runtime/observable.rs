@@ -1,7 +1,7 @@
 //! Scheduler-neutral observable callbacks used by execution queues and ports.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Callback invoked after an observable state transition.
 pub type Observer = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -9,6 +9,7 @@ pub type Observer = Arc<dyn Fn() + Send + Sync + 'static>;
 /// Thread-safe callback registry for execution readiness transitions.
 pub struct Observable {
     observers: Mutex<Vec<Observer>>,
+    subscriptions: Mutex<Vec<Weak<ObserverRegistration>>>,
     generation: AtomicU64,
 }
 
@@ -16,6 +17,7 @@ impl Observable {
     pub fn new() -> Self {
         Self {
             observers: Mutex::new(Vec::new()),
+            subscriptions: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -32,6 +34,21 @@ impl Observable {
             .push(observer);
     }
 
+    /// A lifetime-scoped registration for a long-lived shared capacity owner.
+    /// Repeated contexts must not leave one permanent callback per old root.
+    pub fn subscribe(&self, observer: Observer) -> ObserverSubscription {
+        let registration = Arc::new(ObserverRegistration { observer });
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("observable subscription lock");
+        subscriptions.retain(|entry| entry.strong_count() != 0);
+        subscriptions.push(Arc::downgrade(&registration));
+        ObserverSubscription {
+            _registration: registration,
+        }
+    }
+
     pub fn defer_notify(self: &Arc<Self>) -> DeferNotify {
         DeferNotify::new(Arc::clone(self))
     }
@@ -45,11 +62,31 @@ impl Observable {
         for observer in observers {
             observer();
         }
+        let subscriptions = {
+            let mut entries = self
+                .subscriptions
+                .lock()
+                .expect("observable subscription lock");
+            entries.retain(|entry| entry.strong_count() != 0);
+            entries.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        for registration in subscriptions {
+            (registration.observer)();
+        }
     }
 
     pub fn num_observers(&self) -> usize {
         self.observers.lock().expect("observable lock").len()
     }
+}
+
+struct ObserverRegistration {
+    observer: Observer,
+}
+/// Retains the registration through its actual owner's lifetime. The shared
+/// observable retains only a Weak entry, reclaimed on notification/subscribe.
+pub struct ObserverSubscription {
+    _registration: Arc<ObserverRegistration>,
 }
 
 impl Default for Observable {
@@ -114,5 +151,24 @@ mod tests {
         observable.notify_observers();
 
         assert_eq!(observable.generation(), 2);
+    }
+
+    #[test]
+    fn scoped_callbacks_do_not_accumulate_across_context_lifetimes() {
+        let observable = Observable::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        for expected in 1..=1024 {
+            let counter = Arc::clone(&calls);
+            let subscription = observable.subscribe(Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }));
+            observable.notify_observers();
+            assert_eq!(calls.load(Ordering::Relaxed), expected);
+            assert_eq!(observable.subscriptions.lock().unwrap().len(), 1);
+            drop(subscription);
+            observable.notify_observers();
+            assert_eq!(calls.load(Ordering::Relaxed), expected);
+            assert_eq!(observable.subscriptions.lock().unwrap().len(), 0);
+        }
     }
 }

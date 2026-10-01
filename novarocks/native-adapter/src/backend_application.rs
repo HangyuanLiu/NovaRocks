@@ -38,9 +38,7 @@ use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
 };
 #[cfg(test)]
-use novarocks_execution_contract::task_execution::creation::{
-    PreparedTaskFacts, TaskCreationInput,
-};
+use novarocks_execution_contract::task_execution::creation::TaskCreationInput;
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 #[cfg(test)]
@@ -268,7 +266,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _input: TaskCreationInput,
-    ) -> Result<PreparedTaskFacts, HostRejection> {
+    ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,
             UNROUTED_DETAIL,

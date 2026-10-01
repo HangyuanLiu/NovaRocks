@@ -27,8 +27,8 @@ use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
 use novarocks_result_contract::{
-    ClientRenderSchema, NativeRenderType as N, RenderField, RenderPresentation as P,
-    RenderTimeUnit, RootProfileV1 as V,
+    ClientRenderSchema, FrozenRootOutput, NativeRenderType as N, RenderField,
+    RenderPresentation as P, RenderTimeUnit, RootOutputContract, RootProfileV1 as V,
 };
 use std::mem::size_of;
 use std::ops::Range;
@@ -1675,8 +1675,26 @@ enum Phase {
 /// The host pre-admits complete schema/input/scratch overlap and retains its
 /// authority through the encoder's actual destruction. This cursor owns no
 /// transport and emits into caller-owned unpublished segments.
+enum SchemaOwner {
+    Standalone(Arc<ClientRenderSchema>),
+    Root(Arc<RootOutputContract>),
+}
+impl std::ops::Deref for SchemaOwner {
+    type Target = ClientRenderSchema;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Standalone(schema) => schema,
+            Self::Root(contract) => {
+                let FrozenRootOutput::ClientRows(schema) = contract.output() else {
+                    unreachable!("root schema owner is validated before construction");
+                };
+                schema
+            }
+        }
+    }
+}
 pub struct ArrowMysqlTextEncoder {
-    schema: Arc<ClientRenderSchema>,
+    schema: SchemaOwner,
     batch: RecordBatch,
     stage: Box<[u8; 65536]>,
     lengths: Box<[u32; 4096]>,
@@ -1702,6 +1720,20 @@ impl ArrowMysqlTextEncoder {
         schema: Arc<ClientRenderSchema>,
         batch: RecordBatch,
     ) -> Result<Self, RenderError> {
+        Self::try_new_with_owner(SchemaOwner::Standalone(schema), batch)
+    }
+    /// Reuse the plan's immutable schema owner without cloning its Vec/String
+    /// backings when a BE root starts a new admitted input cursor.
+    pub fn try_new_root(
+        contract: Arc<RootOutputContract>,
+        batch: RecordBatch,
+    ) -> Result<Self, RenderError> {
+        if !matches!(contract.output(), FrozenRootOutput::ClientRows(_)) {
+            return Err(error(E::SchemaMismatch));
+        }
+        Self::try_new_with_owner(SchemaOwner::Root(contract), batch)
+    }
+    fn try_new_with_owner(schema: SchemaOwner, batch: RecordBatch) -> Result<Self, RenderError> {
         if schema.columns().is_empty() || schema.columns().len() > V::MAX_COLUMNS {
             return Err(error(E::SchemaMismatch));
         }

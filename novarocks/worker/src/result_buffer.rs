@@ -89,6 +89,15 @@ struct ResultRetainedState {
 }
 
 impl ResultRetainedBudget {
+    #[cfg(test)]
+    pub(crate) fn retained_bytes_for_test(&self) -> usize {
+        self.state.lock().unwrap().process_retained_bytes
+    }
+
+    pub(crate) fn writable_observable(&self) -> Arc<Observable> {
+        Arc::clone(&self.writable)
+    }
+
     pub fn new(process_byte_cap: NonZeroUsize) -> Arc<Self> {
         Arc::new(Self {
             process_byte_cap: process_byte_cap.get(),
@@ -97,7 +106,7 @@ impl ResultRetainedBudget {
         })
     }
 
-    fn try_reserve(
+    pub(crate) fn try_reserve(
         self: &Arc<Self>,
         key: ResultBufferKey,
         stream_byte_cap: usize,

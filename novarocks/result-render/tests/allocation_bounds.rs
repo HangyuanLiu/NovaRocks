@@ -28,19 +28,26 @@ use novarocks_result_render::{ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, Re
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 struct Probe;
-thread_local! {static TRACK:Cell<bool>=const{Cell::new(false)};}
-static BYTES: AtomicUsize = AtomicUsize::new(0);
-static CALLS: AtomicUsize = AtomicUsize::new(0);
-static MAX: AtomicUsize = AtomicUsize::new(0);
+// The test harness runs independent probes concurrently. Both admission and
+// counters belong to the calling thread; process counters would contaminate
+// an exact allocation receipt with another encoder's legitimate allocation.
+thread_local! {
+    static TRACK: Cell<bool> = const { Cell::new(false) };
+    static COUNTERS: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+}
 #[global_allocator]
 static ALLOC: Probe = Probe;
 fn record(size: usize) {
     if TRACK.try_with(Cell::get).unwrap_or(false) {
-        BYTES.fetch_add(size, Ordering::Relaxed);
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        MAX.fetch_max(size, Ordering::Relaxed);
+        let _ = COUNTERS.try_with(|counter| {
+            let (bytes, calls, maximum) = counter.get();
+            counter.set((
+                bytes.saturating_add(size),
+                calls.saturating_add(1),
+                maximum.max(size),
+            ));
+        });
     }
 }
 // SAFETY: Every allocator operation is forwarded unchanged to System; the
@@ -72,18 +79,12 @@ unsafe impl GlobalAlloc for Probe {
     }
 }
 fn start() {
-    BYTES.store(0, Ordering::Relaxed);
-    CALLS.store(0, Ordering::Relaxed);
-    MAX.store(0, Ordering::Relaxed);
+    COUNTERS.with(|counter| counter.set((0, 0, 0)));
     TRACK.with(|t| t.set(true));
 }
 fn stop() -> (usize, usize, usize) {
     TRACK.with(|t| t.set(false));
-    (
-        BYTES.load(Ordering::Relaxed),
-        CALLS.load(Ordering::Relaxed),
-        MAX.load(Ordering::Relaxed),
-    )
+    COUNTERS.with(Cell::get)
 }
 fn prepare(array: ArrayRef, render: RenderField) -> (Arc<ClientRenderSchema>, RecordBatch) {
     let batch = RecordBatch::try_new(
@@ -115,6 +116,48 @@ fn f(n: N, p: P) -> RenderField {
         presentation: p,
         nullable: true,
     }
+}
+#[test]
+fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
+    use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
+    let text = "x".repeat(128 * 1024);
+    let (schema, batch) = prepare(
+        Arc::new(StringArray::from(vec![text])),
+        f(N::String, P::ScalarText),
+    );
+    let schema = Arc::try_unwrap(schema).unwrap();
+    let contract = Arc::new(RootOutputContract::new(
+        RootProfileId::V1,
+        FrozenRootOutput::ClientRows(schema),
+    ));
+    let weak = Arc::downgrade(&contract);
+    let mut output = [0u8; V::EMIT_BYTES_PER_TURN];
+    start();
+    let encoded = ArrowMysqlTextEncoder::try_new_root(Arc::clone(&contract), batch);
+    let (allocated, calls, _) = stop();
+    let mut encoder = encoded.unwrap();
+    assert_eq!(
+        calls, 3,
+        "starting a BE cursor must not clone schema Vec/String backings"
+    );
+    assert!(allocated <= encoder.scratch_capacity_bytes());
+    drop(contract);
+    assert!(weak.upgrade().is_some());
+    loop {
+        start();
+        let result = encoder.step(&mut output);
+        let (allocated, calls, _) = stop();
+        assert_eq!((allocated, calls), (0, 0));
+        let turn = result.unwrap();
+        assert!(turn.emitted_bytes + turn.examined_bytes <= V::EMIT_BYTES_PER_TURN);
+        if turn.status == RenderTurnStatus::InputComplete {
+            break;
+        }
+    }
+    encoder.cancel();
+    assert!(weak.upgrade().is_some(), "cancel is not schema-owner exit");
+    drop(encoder);
+    assert!(weak.upgrade().is_none());
 }
 fn probe(schema: Arc<ClientRenderSchema>, batch: RecordBatch) {
     let mut out = vec![0; V::SEGMENT_BYTES];

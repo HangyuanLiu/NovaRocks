@@ -51,6 +51,7 @@ mod receipt;
 mod reliable_transport;
 pub mod result_batch;
 pub mod result_buffer;
+pub mod root_result_channel;
 mod runtime_filter_error;
 pub mod sink_commit;
 mod status;
@@ -110,8 +111,8 @@ pub use domain::{
 };
 pub use drain::WorkerDrainState;
 pub use host::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost,
+    HostRejection, PreparedTaskInstallation, QueryContextHost, ReleasedContextEvidence,
+    RunnableTask, SharedFactsRequest, TaskExecutionHost,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities,

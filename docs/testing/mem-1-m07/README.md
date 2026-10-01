@@ -1,6 +1,6 @@
 # MEM-1 M07 执行证据
 
-本目录记录已批准的 spec / plan 第 5 版的本地实施与验收。P00 本地准备已完成，进入 P01/P03；这里的目标参数或源码审查不代表产品已经实现或通过验收。
+本目录记录已批准的 spec / plan 第 5 版的本地实施与验收。P00/P01/P02/P03 本地检查点已保存，P04 正在执行；这里的目标参数或源码审查不代表产品已经实现或通过验收。
 
 ## 批准与基线
 
@@ -21,7 +21,8 @@
 | macOS 原生 1FE+3BE 旧路径 | 部分 PASS | 短查询/慢读/type smoke 和四个功能场景已留存；扩展 wire 测量准备中 |
 | Linux 正式测试 | 用户后续手动执行 | 用户明确取消本次 agent 的 Linux 测试要求；不阻塞本地实施，保留复现材料 |
 | 共享 REST / MinIO fixture | READY | `DOCKER_CONTEXT=desktop-linux` 的 BOM 离线校验/up 通过；原 OrbStack 空 daemon 判断已纠正，无需下载输入 |
-| P01 / P03 | 进入实施 | 共享合同主agent；vendor独占sub-agent；其他阶段仍待前置 |
+| P01 / P02 / P03 | 已完成对应切片 | 共享合同/纯 renderer/vendor framing 已留收据；完整产品切换仍待 P04–P08 |
+| P04 context-root core | 定向通过，P04 继续 | [收据](evidence/p04-context-root/README.md)：301 Worker、54 Native host、3 Observable、28 Renderer；尚未接入真实 Native producer/fetch/lane |
 
 ## 验证口径
 
@@ -38,3 +39,5 @@ P00 本地收据：release旧server未改变；原始wire smoke 22/22成功，16
 P01环境复核：`--consumer iceberg-rest`再次通过；`--consumer all`发现已有`paimon-writer`派生镜像定义收据不匹配当前源码（prepared `320bd65a…`，current `23dc030b…`），不是镜像缺失。完整CI的Paimon输入尚未通过当前版本核验；独立准备/准确版本验证留在P09/P10入口，不能沿用REST通过冒称全BOM通过。
 
 Paimon定义差异已只读定位：prepared版本对应`3af07efbb`，当前变化来自已合入`375c9e0ea`的host env parser（unset/变量名/shlex quoting）；Dockerfile/versions/JAR lock/SQL/golden未变。全部5个canonical image、6个JAR已验证存在且hash正确，当前派生image仍带旧definition。完整CI无条件all verify+Paimon准备，故需在独立测试准备阶段用已验证本地输入真实重建并经owner发布，不能仅改BOM/label；现有provision无条件重新下载JAR，不直接使用其联网流程。当前REST运行实例固定image ID不受current alias重建影响。
+
+P04 context-root 核心收据已保存：新增 immutable 通道/物理 backing owner、context fence 接管与读取、正常 seal/abort/lease 收敛；allocation failure callback、schema spare 合并容量和默认并行 allocator probe 已修复且反例通过。Native host 仍为 root=None、V1 未 advertise；P04/P05–P10 继续。此前 Paimon definition 不匹配已在 P02 离线修正，当前 all-consumer 校验通过，详见 [fixture-ready](evidence/fixture-ready/README.md)。

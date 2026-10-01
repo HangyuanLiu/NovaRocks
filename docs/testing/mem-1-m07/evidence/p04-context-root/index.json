@@ -1,0 +1,116 @@
+{
+  "scope": "P04 Worker context-root core only; P04 remains executing",
+  "parent_source_sha": "13daab5bf8c9700120b7f5a82ec1d62fe53a6af2",
+  "source_hashes": {
+    "Cargo.lock": "ae6681438e9cc0b6c7abcb6afe6a4c56f083a0c0897cae409e4a6de2375494a0",
+    "novarocks/execution-contract/src/ordered_retained_stream.rs": "d7ba57f7c6fffaa773bf36d42afa47a01a79d23aa837f9fabf27915a3e138ea5",
+    "novarocks/execution/src/runtime/observable.rs": "a83cc36147801d9bc99a78f9651d364096a1ae62ccb91a0b50d8d478929bf9ca",
+    "novarocks/native-adapter/src/backend_application.rs": "5db4da9683a74daf96a6658a474892273250adc197f6a8e472886a994fbf05b0",
+    "novarocks/native-adapter/src/backend_task_execution/execution_host.rs": "c9130b78d9bf6600ce13eb3009ff5daaa544fe5f8a6ea24db5e8d40b757d2834",
+    "novarocks/native-adapter/src/backend_task_execution/tests.rs": "62ba6840dfba9b7df499b85bc17f40b07867dc5fb8b9dee65ab4590375bae6a6",
+    "novarocks/native-adapter/src/task_protocol_ingress.rs": "f26dc4ebb823bd15beb64bb3b2856699afeab5f4d1a0c1d97a5425e15257db42",
+    "novarocks/result-render/src/encoder.rs": "41a113de4dcd12bf246cd1985f5af1abb64b7e5c3a9edf4de1e353c654fa5242",
+    "novarocks/result-render/tests/allocation_bounds.rs": "25bd87ddcc41aa9aea846a7a51a5ae10f45bd480e4782128a2185c81508ec098",
+    "novarocks/worker/Cargo.toml": "bec58de12718f54837b65464f13e7dae2c31d9a3d4e75742c430e05dad74e608",
+    "novarocks/worker/src/host.rs": "71bb862329a5ae859b81403f1ca769d2c11c1f80222ad8b958d6f913f532d5cf",
+    "novarocks/worker/src/lib.rs": "66992659bba875bc6f23e98ba4ae7e10bd39083f1719c17a07b9a63fc743ddbb",
+    "novarocks/worker/src/result_buffer.rs": "d2c714527106c3be8f1f2573d422ced855100a573bb6e0374125d554617fd3eb",
+    "novarocks/worker/src/task_registry.rs": "9a44f6aa3555cca43470ad6a1194b55b4a50879d8652908c994fb4e43865fc7d",
+    "novarocks/worker/src/task_registry_entry.rs": "aaed15bdc4e93300c14c433e0cc330dc0465b1635cfc8390bc3f30baae163f87",
+    "novarocks/worker/src/task_registry_tests.rs": "24a2d1902953cf71c191ae8db497101242270163af0df3eb119b20b254229335",
+    "novarocks/worker/src/root_result_channel.rs": "baf113d396d6f79452f48fe018dcdfd61b7680c7ad0f2c1ff4f0ff131db04e15"
+  },
+  "verification": [
+    {
+      "file": "worker-tests.log.gz",
+      "command": "cargo test -p novarocks-worker -- --test-threads=1",
+      "result": "passed: 301",
+      "raw_bytes": 30274,
+      "raw_sha256": "c0e1ec7489243cc12b48d4f82bc92bb4e77ddd494aad7c48777c4e0ee6fbe1fb",
+      "gzip_sha256": "1c74f592cb1ff6dc2c665431e3ed88fea8c96a24b0b98456432633f6ed68ca8b"
+    },
+    {
+      "file": "native-host-tests.log.gz",
+      "command": "cargo test -p novarocks-native-adapter backend_task_execution::execution_host::tests -- --test-threads=1",
+      "result": "passed: 54",
+      "raw_bytes": 52653,
+      "raw_sha256": "3f2cef2944c004cf453b44f280a196c4710554d236925f443b50bd72d595ec7f",
+      "gzip_sha256": "2e6bc046289f6fb5201d61a168a18a2b5ad4a8a95c4ea89f571b6573724c976f"
+    },
+    {
+      "file": "observable-tests.log.gz",
+      "command": "cargo test -p novarocks-execution runtime::observable::tests -- --test-threads=1",
+      "result": "passed: 3",
+      "raw_bytes": 47300,
+      "raw_sha256": "146aaca81074bf4faa139d88406bbf9a0b7d41d1ff8d757c38440e79f45e61b1",
+      "gzip_sha256": "668be3fc3c0443b42102671993da8c66a856ebf12589443b67892c179d6b3729"
+    },
+    {
+      "file": "renderer-tests.log.gz",
+      "command": "cargo test -p novarocks-result-render",
+      "result": "passed: 28",
+      "raw_bytes": 2319,
+      "raw_sha256": "0422340561a01088519da6d06fa0b711023cd0e5de935197bfbd7775387454b1",
+      "gzip_sha256": "8c17fa7464735e02ab00a84cb43ddbbe6429745c1ce15f7e19f1fdf6f62010dd"
+    },
+    {
+      "file": "renderer-clippy.log.gz",
+      "command": "cargo clippy -p novarocks-result-render --all-targets -- -D warnings",
+      "result": "passed",
+      "raw_bytes": 524,
+      "raw_sha256": "845d8463b872bb5351f0f518f3570ab8f7aedbdab08aac10ff7ece7cc319df85",
+      "gzip_sha256": "d050f148473569ec1a24a894f8651229a8b9ab2e8741927669b74eb24f1f7688"
+    },
+    {
+      "file": "worker-clippy.log.gz",
+      "command": "cargo clippy -p novarocks-worker --all-targets",
+      "result": "passed with existing warnings",
+      "raw_bytes": 35219,
+      "raw_sha256": "e27789b0de72f448cee15dcced3ca49a6e36ebd210291336ca2dd50089ab523f",
+      "gzip_sha256": "060ff3692be2f37a2b635f78ac7eb2ccc5ea7fb791e25b30fda7364e2d63f78a"
+    },
+    {
+      "file": "native-check.log.gz",
+      "command": "cargo check -p novarocks-native-adapter --all-targets",
+      "result": "passed with existing upstream warnings",
+      "raw_bytes": 44947,
+      "raw_sha256": "85ca34d23937fc8752b74c3353762e7f1d5c0c3b886e8626ee3e3db5f87b7b18",
+      "gzip_sha256": "fedcec1624c1753e5b38ab0112d97d7dec78e052ed8b4ee7a20709e9804b1aa3"
+    },
+    {
+      "file": "fmt-check.log.gz",
+      "command": "cargo fmt --all -- --check",
+      "result": "passed",
+      "raw_bytes": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "file": "diff-check.log.gz",
+      "command": "git diff --check",
+      "result": "passed",
+      "raw_bytes": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "file": "native-first-wrapper-failure.log.gz",
+      "command": "cargo check -p novarocks-native-adapter --all-targets",
+      "result": "failed then fixed: installation wrapper test consumers",
+      "raw_bytes": 53240,
+      "raw_sha256": "91e094d7cd1eb9572714c2bf234e0fa2c75ca75bf3e2f99383d8709315cdf1e5",
+      "gzip_sha256": "0593df50420069a685d7b552dbb83c2189ef4ed495fbc817ae41e7b92671fbbe"
+    },
+    {
+      "file": "renderer-parallel-probe-failure.log.gz",
+      "command": "cargo test -p novarocks-result-render",
+      "result": "failed then fixed: thread-local allocation counters",
+      "raw_bytes": 2541,
+      "raw_sha256": "d321483b174e4358a27716e3651500607974a98fc3e00688aa9c6c4c85d8a307",
+      "gzip_sha256": "8d96f123a2bafb05bb1e2a8abfa04d7b54c1cf7b69fd8e7319ebb97c501ab06e"
+    }
+  ],
+  "product_profile_advertised": false,
+  "linux_tests": "User will run manually",
+  "push_or_pr": false
+}

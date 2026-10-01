@@ -365,6 +365,7 @@ struct RegistryState {
     in_flight: BTreeMap<QueryContextRef, InFlight>,
     pending_termination: BTreeSet<QueryContextRef>,
     pending_quiesce: BTreeSet<QueryContextRef>,
+    released_root_owners: Vec<ContextRootOwners>,
     retired_task_order: VecDeque<(QueryContextRef, TaskIdentity)>,
     gone_task_order: VecDeque<(QueryContextRef, TaskIdentity)>,
     retired_context_order: VecDeque<QueryContextRef>,
@@ -379,6 +380,7 @@ struct RegistryState {
     retained_tasks: usize,
     retained_bytes: usize,
 }
+type ContextRootOwners = BTreeMap<TaskIdentity, Arc<crate::root_result_channel::RootResultChannel>>;
 
 struct QueuedPreparation {
     request: CreateTask,
@@ -695,6 +697,55 @@ impl TaskExecutionRegistry {
             .and_then(|context| state.contexts.get(context))
             .and_then(|entry| entry.tasks.get(&identity))
             .is_some_and(|entry| matches!(entry, TaskEntry::Live(_)))
+    }
+
+    /// Resolve an exact root from its original context, independent of the
+    /// task record/tombstone horizon. Read admission is minted under this
+    /// fence, so release cannot race between lookup and handler entry.
+    pub fn context_root_result_route(
+        &self,
+        read: &novarocks_execution_contract::root_result::RootResultRead,
+    ) -> crate::root_result_channel::ContextRootRoute {
+        use crate::root_result_channel::{ContextRootRoute as Route, RootChannelError};
+        let identity = read.root_task();
+        if identity.backend_process_id() != self.config.backend_process_id {
+            return Route::Mismatch;
+        }
+        let state = self.state.lock().expect(REGISTRY_LOCK);
+        let Some(context) = state
+            .context_by_execution
+            .get(&identity.query_execution_id())
+        else {
+            return Route::UnknownRoot;
+        };
+        let Some(entry) = state.contexts.get(context) else {
+            return Route::UnknownRoot;
+        };
+        let Some(root) = entry.roots.get(&identity) else {
+            return if matches!(entry.tasks.get(&identity), Some(TaskEntry::Creating(_))) {
+                Route::Preparing
+            } else {
+                Route::UnknownRoot
+            };
+        };
+        if root.spec().task != identity
+            || root.spec().contract.profile() != read.profile()
+            || root.spec().contract.kind() != read.kind()
+        {
+            return Route::Mismatch;
+        }
+        if !matches!(
+            entry.state,
+            QueryContextState::Active | QueryContextState::Quiescing
+        ) {
+            return Route::AwaitTerminalControl;
+        }
+        match root.begin_read(read) {
+            Ok(admitted) => Route::Read(admitted),
+            Err(RootChannelError::Capacity) => Route::Busy,
+            Err(RootChannelError::Closed) => Route::AwaitTerminalControl,
+            Err(_) => Route::Mismatch,
+        }
     }
 
     // ---------------------------------------------------- admission tickets
@@ -1312,6 +1363,13 @@ impl TaskExecutionRegistry {
             }
         };
         transaction.receiver_installed = true;
+        if let Err(rejection) = prepared.validate_task(&transaction.descriptor) {
+            return transaction.abandon(
+                operation,
+                OperationOutcome::InvalidStateOrRequest,
+                rejection.detail().as_str(),
+            );
+        }
         if let Some(stop) = transaction.cell.stop() {
             transaction.stop = Some(stop);
             return OperationReceipt::rejected(
@@ -1380,17 +1438,21 @@ impl TaskExecutionRegistry {
         };
 
         let receipt = CreateTaskReceipt::new(identity, receipts, status.current());
-        if let Some((runnable, status)) = transaction.commit(LiveTask {
-            descriptor: Arc::clone(&transaction.descriptor),
-            prepared,
-            receipt: receipt.clone(),
-            creation_failure: None,
-            status,
-            runnable,
-            domains: task_domains,
-            receiver_installed: true,
-            capability_installed: true,
-        }) {
+        let (prepared, root) = prepared.into_parts();
+        if let Some((runnable, status)) = transaction.commit(
+            LiveTask {
+                descriptor: Arc::clone(&transaction.descriptor),
+                prepared,
+                receipt: receipt.clone(),
+                creation_failure: None,
+                status,
+                runnable,
+                domains: task_domains,
+                receiver_installed: true,
+                capability_installed: true,
+            },
+            root,
+        ) {
             // The context closed while this task was being built. Stand the
             // committed worker down. The closing context retained the Live
             // entry, so its eventual stop and resource convergence remain
@@ -2693,6 +2755,9 @@ impl TaskExecutionRegistry {
                 if self.release_ready_locked(&state, context) {
                     let entry = state.contexts.get_mut(&context).expect("quiescing context");
                     let lease = entry.lease;
+                    for root in entry.roots.values() {
+                        root.seal_reads(novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextReleased);
+                    }
                     entry.state = QueryContextState::Releasing;
                     if let Some(lease) = lease {
                         let removed = state.lease_expiry.remove(context, lease);
@@ -2901,7 +2966,7 @@ impl TaskExecutionRegistry {
     fn settle(&self) -> DeadlineSweep {
         let mut sweep = DeadlineSweep::default();
         for _ in 0..MAX_SETTLE_PASSES {
-            let (normal_fanouts, fanouts) = {
+            let (normal_fanouts, fanouts, sealed_roots) = {
                 let mut state = self.state.lock().expect(REGISTRY_LOCK);
                 let now = self.clock.now();
                 sweep.leases_expired += self.expire_leases_locked(&mut state, now);
@@ -2909,15 +2974,29 @@ impl TaskExecutionRegistry {
                 (
                     std::mem::take(&mut state.pending_quiesce),
                     std::mem::take(&mut state.pending_termination),
+                    state
+                        .contexts
+                        .values()
+                        .filter(|entry| {
+                            matches!(
+                                entry.state,
+                                QueryContextState::Aborting | QueryContextState::Releasing
+                            )
+                        })
+                        .flat_map(|entry| entry.roots.values().cloned())
+                        .collect::<Vec<_>>(),
                 )
             };
+            for root in sealed_roots {
+                root.finish_seal();
+            }
             for context in &normal_fanouts {
                 self.stand_down_quiescing_tasks(*context);
             }
             for context in &fanouts {
                 self.stand_down_tasks(*context);
             }
-            {
+            let released_root_owners = {
                 let mut state = self.state.lock().expect(REGISTRY_LOCK);
                 let now = self.clock.now();
                 sweep.tasks_retired += self.retire_locked(&mut state, now);
@@ -2927,7 +3006,9 @@ impl TaskExecutionRegistry {
                 sweep.tasks_reaped += tasks;
                 sweep.contexts_reaped += contexts;
                 self.enforce_capacity_locked(&mut state);
-            }
+                std::mem::take(&mut state.released_root_owners)
+            };
+            drop(released_root_owners);
             self.gate.notify_all();
             if fanouts.is_empty() && normal_fanouts.is_empty() {
                 break;
@@ -3071,6 +3152,17 @@ impl TaskExecutionRegistry {
             }
             self.task_host.abort_context_admission(context);
             entry.state = QueryContextState::Aborting;
+            let root_close = if matches!(
+                entry.latch.cause(),
+                Some(TerminationDetail::Aborted(AbortCause::LeaseExpired))
+            ) {
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::LeaseExpired
+            } else {
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted
+            };
+            for root in entry.roots.values() {
+                root.seal_reads(root_close);
+            }
             entry.terminating_since = Some(now);
             let installed_lease = entry.lease.take();
             // Capability revocation belongs to the winner and happens once,
@@ -3350,6 +3442,7 @@ impl TaskExecutionRegistry {
                     continue;
                 };
                 let ready = entry.tasks.values().all(TaskEntry::is_terminal_record)
+                    && entry.roots.values().all(|root| root.physical_idle())
                     && state
                         .prepare_context_counts
                         .get(&context)
@@ -3433,6 +3526,10 @@ impl TaskExecutionRegistry {
             entry.tasks.values().all(TaskEntry::is_terminal_record),
             "query context convergence requires every task to have physically converged"
         );
+        assert!(
+            entry.roots.values().all(|root| root.physical_idle()),
+            "context convergence requires root read/send/producer owners to exit"
+        );
 
         assert_eq!(
             state
@@ -3447,7 +3544,7 @@ impl TaskExecutionRegistry {
         if let Some(lease) = entry.lease {
             state.lease_expiry.remove(context, lease);
         }
-        let (task_identities, source) = {
+        let (task_identities, source, roots) = {
             let entry = state
                 .contexts
                 .get_mut(&context)
@@ -3462,8 +3559,12 @@ impl TaskExecutionRegistry {
             (
                 entry.tasks.keys().copied().collect::<Vec<_>>(),
                 Arc::clone(&entry.source),
+                std::mem::take(&mut entry.roots),
             )
         };
+        if !roots.is_empty() {
+            state.released_root_owners.push(roots);
+        }
         for identity in task_identities {
             self.ports.discard_task(identity);
         }
@@ -3961,10 +4062,12 @@ impl CreationTransaction<'_> {
     fn commit(
         &mut self,
         mut live: LiveTask,
+        root: Option<Arc<crate::root_result_channel::RootResultChannel>>,
     ) -> Option<(Arc<dyn RunnableTask>, Arc<TaskStatusOwner>)> {
         let status = Arc::clone(&live.status);
         let runnable = Arc::clone(&live.runnable);
         let closed;
+        let mut sealed_root = None;
         {
             let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
             closed = state.context_state(self.context) != QueryContextState::Active;
@@ -3980,6 +4083,29 @@ impl CreationTransaction<'_> {
                 .contexts
                 .get_mut(&self.context)
                 .expect("a reserved creation retains its query context");
+            if let Some(root) = root {
+                root.bind_context_progress(&entry.source)
+                    .expect("exact root preparation binds its one context source");
+                if closed {
+                    let reason = if matches!(
+                        entry.latch.cause(),
+                        Some(TerminationDetail::Aborted(AbortCause::LeaseExpired))
+                    ) {
+                        novarocks_execution_contract::root_lifetime::RootRetentionClose::LeaseExpired
+                    } else {
+                        novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted
+                    };
+                    root.seal_reads(reason);
+                    sealed_root = Some(Arc::clone(&root));
+                } else {
+                    root.mark_context_owned()
+                        .expect("active context takes its provisional root");
+                }
+                assert!(
+                    entry.roots.insert(self.identity, root).is_none(),
+                    "one root channel per exact creation"
+                );
+            }
             entry.mark_spent(self.identity);
             entry
                 .tasks
@@ -3997,6 +4123,9 @@ impl CreationTransaction<'_> {
                 // the Live record and before any runnable may start.
                 status.release_to_observers();
             }
+        }
+        if let Some(root) = sealed_root {
+            root.finish_seal();
         }
         // Completion can race ahead of the creation transaction. It may run
         // only after the task is findable as Live, so an immediate terminal

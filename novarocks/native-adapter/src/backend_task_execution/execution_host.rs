@@ -674,7 +674,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-    ) -> Result<PreparedTaskFacts, HostRejection> {
+    ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let identity = descriptor.identity();
         let execution = identity.query_execution_id();
         let kernel_key = descriptor.fragment_instance_id();
@@ -889,7 +889,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         );
         lease.retain();
         stop_guard.transfer_to_task();
-        Ok(PreparedTaskFacts::new(sink_kind))
+        novarocks_worker::PreparedTaskInstallation::new(PreparedTaskFacts::new(sink_kind), None)
     }
 
     /// Drops everything `install_receiver` prepared.
@@ -1838,6 +1838,7 @@ mod tests {
     ) -> Result<PreparedTaskFacts, HostRejection> {
         let dop = u32::try_from(descriptor.pipeline_dop().get()).expect("small dop");
         host.install_receiver(descriptor, Body::values(dop).input(descriptor))
+            .map(|installed| installed.facts())
     }
 
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
@@ -2919,7 +2920,7 @@ mod tests {
             .install_receiver(&descriptor, body.input(&descriptor))
             .expect("a consistent descriptor prepares");
         assert_eq!(
-            prepared.sink_kind(),
+            prepared.facts().sink_kind(),
             FragmentSinkKind::DataStream,
             "the prepared facts report the validated static sink"
         );
@@ -4012,7 +4013,7 @@ mod tests {
             &self,
             descriptor: &TaskDescriptor,
             input: TaskCreationInput,
-        ) -> Result<PreparedTaskFacts, HostRejection> {
+        ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
             self.installs.fetch_add(1, Ordering::SeqCst);
             self.inner.install_receiver(descriptor, input)
         }
