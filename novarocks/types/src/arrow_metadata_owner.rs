@@ -176,6 +176,27 @@ impl MetadataOwnedField {
     pub fn field(&self) -> &FieldRef {
         &self.field
     }
+    /// Derives only a metadata-map receipt from this known immutable source.
+    /// Caller separately covers name/DataType clones and the new Field/Arc.
+    pub fn derive_field(
+        &self,
+        data_type: DataType,
+        nullable: bool,
+        limits: MetadataOwnerLimits,
+    ) -> Result<Self, MetadataOwnerError> {
+        let metadata =
+            clone_known_metadata(self.field.metadata(), self.metadata_backing_bytes, limits)?;
+        let field = self
+            .field
+            .clone_with_metadata(metadata.metadata)
+            .with_data_type(data_type)
+            .with_nullable(nullable);
+        Ok(Self {
+            field: Arc::new(field),
+            metadata_backing_bytes: metadata.backing_bytes,
+        })
+    }
+
     /// Metadata table + key/value heaps for this exact immutable field only.
     pub fn backing_bytes_for(&self, field: &FieldRef) -> Option<usize> {
         Arc::ptr_eq(&self.field, field).then_some(self.metadata_backing_bytes)
@@ -193,10 +214,55 @@ impl MetadataOwnedSchema {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+    /// The source map is known immutable. Field origins are supplied separately
+    /// and are not inferred from the incoming Fields.
+    pub fn derive_schema(
+        &self,
+        fields: Fields,
+        limits: MetadataOwnerLimits,
+    ) -> Result<Self, MetadataOwnerError> {
+        let metadata =
+            clone_known_metadata(self.schema.metadata(), self.metadata_backing_bytes, limits)?;
+        Ok(metadata.into_schema(fields))
+    }
+
     /// Top-level metadata table + key/value heaps for this exact schema only.
     pub fn backing_bytes_for(&self, schema: &SchemaRef) -> Option<usize> {
         Arc::ptr_eq(&self.schema, schema).then_some(self.metadata_backing_bytes)
     }
+}
+
+// Private: only exact immutable source-owner wrappers call this function.
+// An arbitrary caller-owned HashMap can never obtain a receipt through it.
+fn clone_known_metadata(
+    source: &HashMap<String, String>,
+    source_backing_bytes: usize,
+    limits: MetadataOwnerLimits,
+) -> Result<ArrowMetadataOwner, MetadataOwnerError> {
+    let count = source.len();
+    if count > limits.entries {
+        return Err(MetadataOwnerError::CapacityExceeded);
+    }
+    let peak = checked_add(
+        checked_add(source_backing_bytes, source_backing_bytes)?,
+        checked_add(
+            requested_table_bytes(count)?,
+            count
+                .checked_mul(size_of::<Entry>())
+                .ok_or(MetadataOwnerError::CapacityExceeded)?,
+        )?,
+    )?;
+    if peak > limits.construction_bytes {
+        return Err(MetadataOwnerError::CapacityExceeded);
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| MetadataOwnerError::AllocationFailed)?;
+    for (key, value) in source {
+        entries.push((key.clone(), value.clone()));
+    }
+    ArrowMetadataOwner::try_new(entries, limits)
 }
 
 fn checked_add(left: usize, right: usize) -> Result<usize, MetadataOwnerError> {
@@ -236,4 +302,185 @@ fn requested_table_bytes(entries: usize) -> Result<usize, MetadataOwnerError> {
             .ok_or(MetadataOwnerError::CapacityExceeded)?,
     };
     table_bytes(buckets)
+}
+
+/// A finite, immutable, sorted index of genuine attached-field metadata owners.
+/// It proves only those metadata maps, never a DataType or whole schema. Lookup
+/// checks exact Arc identity; no unknown table is iterated or normalized.
+#[derive(Clone, Debug)]
+pub struct FieldMetadataOrigins {
+    owners: Arc<[MetadataOwnedField]>,
+}
+impl FieldMetadataOrigins {
+    pub fn try_new(
+        mut owners: Vec<MetadataOwnedField>,
+        maximum_nodes: usize,
+    ) -> Result<Self, MetadataOwnerError> {
+        if owners.len() > maximum_nodes {
+            return Err(MetadataOwnerError::CapacityExceeded);
+        }
+        owners.sort_unstable_by_key(|owner| Arc::as_ptr(owner.field()) as usize);
+        owners.dedup_by(|a, b| Arc::ptr_eq(a.field(), b.field()));
+        Ok(Self {
+            owners: owners.into(),
+        })
+    }
+
+    pub fn metadata_bytes_for(&self, field: &FieldRef) -> Option<usize> {
+        let pointer = Arc::as_ptr(field) as usize;
+        let index = self
+            .owners
+            .binary_search_by_key(&pointer, |owner| Arc::as_ptr(owner.field()) as usize)
+            .ok()?;
+        self.owners[index].backing_bytes_for(field)
+    }
+
+    pub fn owner_for(&self, field: &FieldRef) -> Option<&MetadataOwnedField> {
+        let pointer = Arc::as_ptr(field) as usize;
+        let index = self
+            .owners
+            .binary_search_by_key(&pointer, |owner| Arc::as_ptr(owner.field()) as usize)
+            .ok()?;
+        Arc::ptr_eq(self.owners[index].field(), field).then_some(&self.owners[index])
+    }
+
+    /// New root-field properties keep existing child metadata origins. Newly
+    /// constructed child fields still require their own genuine receipts.
+    pub fn replacing_root(
+        &self,
+        old: &FieldRef,
+        replacement: MetadataOwnedField,
+        maximum_nodes: usize,
+    ) -> Result<Self, MetadataOwnerError> {
+        let mut owners = Vec::with_capacity(self.owners.len());
+        for owner in self.owners.iter() {
+            if !Arc::ptr_eq(owner.field(), old) {
+                owners.push(owner.clone());
+            }
+        }
+        owners.push(replacement);
+        Self::try_new(owners, maximum_nodes)
+    }
+
+    /// Retain only exact metadata owners reachable through this field's type
+    /// tree. This avoids one whole-layout provenance index per projected slot.
+    pub fn for_field_tree(
+        &self,
+        root: &FieldRef,
+        maximum_nodes: usize,
+        maximum_depth: usize,
+    ) -> Result<Self, MetadataOwnerError> {
+        let mut owners = Vec::new();
+        self.collect_field(root, 0, maximum_nodes, maximum_depth, &mut owners, &mut 0)?;
+        Self::try_new(owners, maximum_nodes)
+    }
+
+    fn collect_field(
+        &self,
+        field: &FieldRef,
+        depth: usize,
+        nodes: usize,
+        max_depth: usize,
+        owners: &mut Vec<MetadataOwnedField>,
+        visited_types: &mut usize,
+    ) -> Result<(), MetadataOwnerError> {
+        if depth > max_depth || owners.len() >= nodes {
+            return Err(MetadataOwnerError::CapacityExceeded);
+        }
+        let owner = self
+            .owner_for(field)
+            .ok_or(MetadataOwnerError::CapacityExceeded)?;
+        owners.push(owner.clone());
+        self.collect_type(
+            field.data_type(),
+            depth,
+            nodes,
+            max_depth,
+            owners,
+            visited_types,
+        )
+    }
+
+    fn collect_type(
+        &self,
+        data_type: &DataType,
+        depth: usize,
+        nodes: usize,
+        max_depth: usize,
+        owners: &mut Vec<MetadataOwnedField>,
+        visited_types: &mut usize,
+    ) -> Result<(), MetadataOwnerError> {
+        *visited_types = visited_types
+            .checked_add(1)
+            .filter(|count| *count <= nodes)
+            .ok_or(MetadataOwnerError::CapacityExceeded)?;
+        // Dictionary key/value scalar leaves are physical storage at their
+        // parent's semantic level. Composite recursion still consumes depth.
+        if depth > max_depth
+            && matches!(
+                data_type,
+                DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Map(_, _)
+                    | DataType::Struct(_)
+                    | DataType::Union(_, _)
+                    | DataType::Dictionary(_, _)
+                    | DataType::RunEndEncoded(_, _)
+            )
+        {
+            return Err(MetadataOwnerError::CapacityExceeded);
+        }
+        match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+            | DataType::FixedSizeList(field, _) => {
+                self.collect_field(field, depth + 1, nodes, max_depth, owners, visited_types)?;
+            }
+            DataType::Map(entries, _) => {
+                // The physical entries Struct is part of this semantic level.
+                self.collect_field(entries, depth, nodes, max_depth, owners, visited_types)?;
+            }
+            DataType::Struct(fields) => {
+                for field in fields {
+                    self.collect_field(field, depth + 1, nodes, max_depth, owners, visited_types)?;
+                }
+            }
+            DataType::Union(fields, _) => {
+                for (_, field) in fields.iter() {
+                    self.collect_field(field, depth + 1, nodes, max_depth, owners, visited_types)?;
+                }
+            }
+            DataType::Dictionary(key, value) => {
+                if depth >= max_depth
+                    && (matches!(key.as_ref(), DataType::Dictionary(_, _))
+                        || matches!(value.as_ref(), DataType::Dictionary(_, _)))
+                {
+                    return Err(MetadataOwnerError::CapacityExceeded);
+                }
+                self.collect_type(key, depth + 1, nodes, max_depth, owners, visited_types)?;
+                self.collect_type(value, depth + 1, nodes, max_depth, owners, visited_types)?;
+            }
+            DataType::RunEndEncoded(runs, values) => {
+                self.collect_field(runs, depth + 1, nodes, max_depth, owners, visited_types)?;
+                self.collect_field(values, depth + 1, nodes, max_depth, owners, visited_types)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn owners(&self) -> &[MetadataOwnedField] {
+        &self.owners
+    }
+
+    /// Only the index's own compact Arc allocation, excluding pointed-to
+    /// fields/maps and this wrapper's inline size.
+    pub fn index_backing_bytes(&self) -> usize {
+        self.owners.len() * size_of::<MetadataOwnedField>() + 4 * size_of::<usize>()
+    }
 }

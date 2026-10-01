@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use arrow_schema::{Schema, SchemaRef};
 use novarocks_types::SlotId;
+use novarocks_types::arrow_metadata_owner::{FieldMetadataOrigins, MetadataOwnedSchema};
 use novarocks_types::logical::LogicalType;
 use sha2::{Digest, Sha256};
 
@@ -50,6 +51,8 @@ pub struct StaticLayout {
     schema: SchemaRef,
     slots: Arc<[SlotId]>,
     slot_metadata: Option<Arc<[StaticSlotMetadata]>>,
+    field_metadata_origins: Option<FieldMetadataOrigins>,
+    schema_metadata_origin: Option<MetadataOwnedSchema>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +63,7 @@ pub enum LayoutError {
     TooDeep,
     TooManyMetadataNodes,
     Encode,
+    MetadataOwnerConflict,
 }
 
 impl fmt::Display for LayoutError {
@@ -71,6 +75,9 @@ impl fmt::Display for LayoutError {
             Self::TooDeep => "static layout slot metadata exceeds the depth limit",
             Self::TooManyMetadataNodes => "static layout slot metadata exceeds the node limit",
             Self::Encode => "static layout schema cannot be encoded canonically",
+            Self::MetadataOwnerConflict => {
+                "static layout metadata origins conflict with exact owners"
+            }
         })
     }
 }
@@ -124,7 +131,37 @@ impl StaticLayout {
             schema,
             slots,
             slot_metadata,
+            field_metadata_origins: None,
+            schema_metadata_origin: None,
         })
+    }
+
+    pub fn with_metadata_origins(
+        mut self,
+        fields: FieldMetadataOrigins,
+        schema: Option<MetadataOwnedSchema>,
+    ) -> Result<Self, LayoutError> {
+        if self
+            .schema
+            .fields()
+            .iter()
+            .any(|field| fields.metadata_bytes_for(field).is_none())
+            || schema
+                .as_ref()
+                .is_some_and(|origin| origin.backing_bytes_for(&self.schema).is_none())
+        {
+            return Err(LayoutError::MetadataOwnerConflict);
+        }
+        self.field_metadata_origins = Some(fields);
+        self.schema_metadata_origin = schema;
+        Ok(self)
+    }
+
+    pub fn field_metadata_origins(&self) -> Option<&FieldMetadataOrigins> {
+        self.field_metadata_origins.as_ref()
+    }
+    pub fn schema_metadata_origin(&self) -> Option<&MetadataOwnedSchema> {
+        self.schema_metadata_origin.as_ref()
     }
 
     pub fn schema(&self) -> &SchemaRef {
@@ -166,13 +203,30 @@ impl StaticLayout {
                     .get(slot)
                     .copied()
                     .ok_or(LayoutError::UnknownSlot)?;
-                Ok(self.schema.field(index).clone())
+                Ok(Arc::clone(&self.schema.fields()[index]))
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
-        let projected_schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            self.schema.metadata().clone(),
-        ));
+        let (projected_schema, projected_schema_origin) =
+            if let Some(origin) = &self.schema_metadata_origin {
+                let origin = origin
+                    .derive_schema(
+                        fields.into(),
+                        novarocks_types::arrow_metadata_owner::MetadataOwnerLimits {
+                            entries: 65536,
+                            construction_bytes: 96 * 1024 * 1024,
+                        },
+                    )
+                    .map_err(|_| LayoutError::MetadataOwnerConflict)?;
+                (Arc::clone(origin.schema()), Some(origin))
+            } else {
+                (
+                    Arc::new(Schema::new_with_metadata(
+                        fields,
+                        self.schema.metadata().clone(),
+                    )),
+                    None,
+                )
+            };
         let projected_slots = Arc::from(output_columns);
         if let Some(metadata) = &self.slot_metadata {
             let projected_metadata = output_columns
@@ -186,6 +240,13 @@ impl StaticLayout {
         } else {
             Self::try_new(projected_schema, projected_slots)
         }
+        .and_then(|layout| {
+            if let Some(origins) = &self.field_metadata_origins {
+                layout.with_metadata_origins(origins.clone(), projected_schema_origin)
+            } else {
+                Ok(layout)
+            }
+        })
     }
 
     /// A deterministic identity over the full Arrow schema and exact slot order.
@@ -277,6 +338,77 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn projection_keeps_exact_field_arcs_and_derives_only_known_schema_metadata() {
+        use novarocks_types::arrow_metadata_owner::{ArrowMetadataOwner, MetadataOwnerLimits};
+        let limits = MetadataOwnerLimits {
+            entries: 1,
+            construction_bytes: 4096,
+        };
+        let first = ArrowMetadataOwner::try_new(vec![], limits)
+            .unwrap()
+            .into_field("a".into(), DataType::Int64, false);
+        let second = ArrowMetadataOwner::try_new(vec![("source".into(), "known".into())], limits)
+            .unwrap()
+            .into_field("b".into(), DataType::Utf8, true);
+        let top = ArrowMetadataOwner::try_new(vec![("schema".into(), "known".into())], limits)
+            .unwrap()
+            .into_schema(vec![Arc::clone(first.field()), Arc::clone(second.field())].into());
+        let bare = StaticLayout::try_new(
+            Arc::clone(top.schema()),
+            Arc::from([SlotId::new(1), SlotId::new(2)]),
+        )
+        .unwrap();
+        let source = bare
+            .clone()
+            .with_metadata_origins(
+                FieldMetadataOrigins::try_new(vec![first, second], 2).unwrap(),
+                Some(top),
+            )
+            .unwrap();
+        assert_eq!(bare.identity(), source.identity());
+        let projected = source.project_by_slots(&[SlotId::new(2)]).unwrap();
+        assert!(Arc::ptr_eq(
+            &source.schema().fields()[1],
+            &projected.schema().fields()[0]
+        ));
+        assert!(!Arc::ptr_eq(source.schema(), projected.schema()));
+        assert_eq!(source.schema().metadata(), projected.schema().metadata());
+        assert!(
+            projected
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(projected.schema())
+                .is_some()
+        );
+        assert!(
+            source
+                .schema_metadata_origin()
+                .unwrap()
+                .backing_bytes_for(projected.schema())
+                .is_none()
+        );
+        let unknown = bare.project_by_slots(&[SlotId::new(2)]).unwrap();
+        assert!(unknown.field_metadata_origins().is_none());
+        assert!(unknown.schema_metadata_origin().is_none());
+        assert_eq!(unknown.identity(), projected.identity());
+        // Equal values in a new allocation cannot borrow the original receipt.
+        let independent = StaticLayout::try_new(
+            Arc::new(source.schema().as_ref().clone()),
+            Arc::from(source.slots()),
+        )
+        .unwrap();
+        assert_eq!(
+            independent
+                .with_metadata_origins(
+                    source.field_metadata_origins().unwrap().clone(),
+                    source.schema_metadata_origin().cloned()
+                )
+                .unwrap_err(),
+            LayoutError::MetadataOwnerConflict
+        );
+    }
 
     #[test]
     fn rejects_layout_that_cannot_bind_columns_exactly() {

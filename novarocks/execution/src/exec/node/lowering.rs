@@ -944,7 +944,7 @@ impl Lowering<'_> {
 }
 
 fn layout(schema: &ChunkSchemaRef) -> Result<lp::StaticLayout> {
-    lp::StaticLayout::try_new_exact(
+    let layout = lp::StaticLayout::try_new_exact(
         schema.arrow_schema_ref(),
         Arc::from(schema.slot_ids()),
         schema
@@ -958,7 +958,14 @@ fn layout(schema: &ChunkSchemaRef) -> Result<lp::StaticLayout> {
             })
             .collect(),
     )
-    .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
+    .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
+    if let Some(origins) = schema.field_metadata_origins() {
+        layout
+            .with_metadata_origins(origins.clone(), schema.schema_metadata_origin().cloned())
+            .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
+    } else {
+        Ok(layout)
+    }
 }
 
 fn expr(id: ExprId) -> lp::ProgramExprId {
