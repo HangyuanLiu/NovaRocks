@@ -122,11 +122,18 @@ impl PhysicalOwners {
     }
 }
 struct PhysicalSegmentPosition(Arc<PhysicalOwners>);
-struct PhysicalReservationPosition(Arc<PhysicalOwners>);
+struct PhysicalReservationPosition(Arc<PhysicalOwners>, bool);
 impl Drop for PhysicalReservationPosition {
     fn drop(&mut self) {
         self.0.retained_reservations.fetch_sub(1, Ordering::AcqRel);
-        self.0.wake();
+        if self.1 {
+            self.0.wake();
+        } else if let Some(source) = self.0.progress.get().and_then(Weak::upgrade) {
+            // An unsuccessful tentative admission returned no usable
+            // resource. It must not invalidate a producer's blocked-credit
+            // generation and cause an endless retry/notification loop.
+            source.note_progress();
+        }
     }
 }
 struct RetainedReservationOwner {
@@ -382,7 +389,7 @@ impl RootResultChannel {
         {
             return Ok(ResultWriteAdmission::Blocked);
         }
-        let position = PhysicalReservationPosition(Arc::clone(&self.physical));
+        let mut position = PhysicalReservationPosition(Arc::clone(&self.physical), false);
         let granted = self
             .budget
             .try_reserve(
@@ -397,6 +404,7 @@ impl RootResultChannel {
         if !self.state.lock().unwrap().lifetime.allows_read() {
             return Err(RootChannelError::Closed);
         }
+        position.1 = true;
         let owner = RetainedReservationOwner {
             credit: Mutex::new(credit),
             _position: position,
@@ -1076,6 +1084,42 @@ mod tests {
             channel
                 .try_reserve_metadata(32)
                 .expect("physical exit returns metadata position"),
+        );
+    }
+    #[test]
+    fn blocked_raw_admission_does_not_emit_a_false_capacity_transition() {
+        let (channel, _) = channel(facts());
+        let ResultWriteAdmission::Granted(credit) = channel
+            .try_reserve(256 * 1024 * 1024 - 1024 * 1024)
+            .unwrap()
+        else {
+            panic!("complete remaining retained capacity");
+        };
+        let observable = channel.writable_observable();
+        let generation = observable.generation();
+        for _ in 0..128 {
+            assert!(matches!(
+                channel.try_reserve(1).unwrap(),
+                ResultWriteAdmission::Blocked
+            ));
+        }
+        assert_eq!(
+            observable.generation(),
+            generation,
+            "failed tentative positions cannot cause a retry spin"
+        );
+        assert_eq!(
+            channel
+                .physical
+                .retained_reservations
+                .load(Ordering::Acquire),
+            1
+        );
+        drop(credit);
+        assert_ne!(
+            observable.generation(),
+            generation,
+            "actual capacity return still wakes waiters"
         );
     }
     #[tokio::test]

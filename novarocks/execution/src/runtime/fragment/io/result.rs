@@ -269,6 +269,12 @@ impl RootInputAuthority {
     pub fn required_bytes(&self) -> usize {
         self.inner.required_bytes
     }
+    /// Readiness hint only: `try_acquire` still performs exact admission.
+    /// Hosts avoid reserving a second overlap while another input is live.
+    pub fn is_available(&self) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        !state.closed && !state.occupied
+    }
     pub fn observable(&self) -> Arc<Observable> {
         Arc::clone(&self.inner.observable)
     }
@@ -397,6 +403,9 @@ pub trait RootResultSession: Send + Sync + 'static {
     /// Task terminal; callers continue observing the producer until then.
     fn finish_input(&self) -> Result<(), FragmentIoError>;
     fn producer_state(&self) -> RootProducerState;
+    /// Failure/cancellation is a logical decision. The driver still waits
+    /// for every admitted input/cursor/job to actually exit under its grant.
+    fn producer_exited(&self) -> bool;
     fn abort(&self, reason: ResultAbort);
 }
 

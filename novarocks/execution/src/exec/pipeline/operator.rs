@@ -217,6 +217,24 @@ impl FinishingWait {
 pub trait ProcessorOperator: Operator {
     fn need_input(&self) -> bool;
 
+    /// Admission before the upstream owner can materialize its next output.
+    /// Ordinary operators use readiness; bounded root sinks retain one exact
+    /// input/hydration overlap position through the final edge and producer.
+    fn prepare_upstream_pull(&self) -> Result<bool, String> {
+        Ok(self.need_input())
+    }
+
+    /// An empty or failed pull must return an unused root position. A
+    /// successful pull keeps it while the chunk is retained on this edge.
+    fn finish_upstream_pull(&self, _produced_chunk: bool) {}
+
+    /// A host-owned asynchronous terminal processor can fail while its source is
+    /// parked. The driver observes that failure before deciding completion;
+    /// the processor also supplies its stable early-finish wake observable.
+    fn execution_error(&self) -> Option<String> {
+        None
+    }
+
     /// Non-blocking admission for the exact chunk currently retained on the
     /// upstream edge.
     ///
@@ -225,6 +243,14 @@ pub trait ProcessorOperator: Operator {
     /// ownership to `push_chunk`.
     fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
         Ok(self.need_input())
+    }
+
+    /// Transfers the exact original Chunk to a precovered host input owner.
+    /// Such a processor owns finite carrier validation, hydration and memory
+    /// accounting itself; the driver must not inspect or copy its schema,
+    /// expand dictionaries, or create another accounting charge on this edge.
+    fn takes_original_input(&self) -> bool {
+        false
     }
 
     fn has_output(&self) -> bool;

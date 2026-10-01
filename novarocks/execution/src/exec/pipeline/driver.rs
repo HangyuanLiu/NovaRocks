@@ -637,6 +637,9 @@ impl PipelineDriver {
     }
 
     fn cancel_operators(&mut self) {
+        // Edge backing is abandoned before a sink can return its pre-pull
+        // grant, even when asynchronous operator shutdown remains pending.
+        self.release_edge_buffers();
         for op in self.operators.iter_mut() {
             op.cancel();
         }
@@ -663,6 +666,7 @@ impl PipelineDriver {
     }
 
     fn fail_operators(&mut self) {
+        self.release_edge_buffers();
         for op in self.operators.iter_mut() {
             op.on_driver_failure();
         }
@@ -693,7 +697,11 @@ impl PipelineDriver {
     }
 
     fn process_inner(&mut self, time_slice: Duration) -> DriverState {
-        if let Some(err) = self.runtime_state.error() {
+        if let Some(err) = self
+            .runtime_state
+            .error()
+            .or_else(|| self.terminal_sink_error_on_worker())
+        {
             return self.finish_with_state(DriverState::Failed(err));
         }
         if let Some(final_state) = self.pending_finish_state.clone() {
@@ -728,7 +736,11 @@ impl PipelineDriver {
         self.state = DriverState::Running;
 
         loop {
-            if let Some(err) = self.runtime_state.error() {
+            if let Some(err) = self
+                .runtime_state
+                .error()
+                .or_else(|| self.terminal_sink_error_on_worker())
+            {
                 return self.finish_with_state(DriverState::Failed(err));
             }
             if start.elapsed() >= time_slice {
@@ -836,6 +848,10 @@ impl PipelineDriver {
             self.state = DriverState::Ready;
             return self.state.clone();
         }
+    }
+
+    fn terminal_sink_error_on_worker(&self) -> Option<String> {
+        self.operators.last()?.as_processor_ref()?.execution_error()
     }
 
     fn find_precondition_dependency(&self) -> Option<DependencyHandle> {
@@ -1416,7 +1432,7 @@ impl PipelineDriver {
                 downstream_name
             };
             let chunk = self.edge_chunks[e].take().expect("checked is_some");
-            let (mut chunk, dict_stats) = {
+            let (mut chunk, dict_stats, original_input) = {
                 let downstream_ref = self
                     .operators
                     .get(downstream_idx)
@@ -1427,18 +1443,24 @@ impl PipelineDriver {
                             downstream_name
                         )
                     })?;
-                let stats = if self.profiler.is_some() {
+                let original_input = downstream_ref.takes_original_input();
+                let stats = if self.profiler.is_some() && !original_input {
                     Some(dictionary_carrier_stats(&chunk, downstream_ref))
                 } else {
                     None
                 };
-                let chunk = hydrate_for_downstream(&chunk, downstream_ref)?;
-                (chunk, stats)
+                let chunk = if original_input {
+                    chunk
+                } else {
+                    hydrate_for_downstream(&chunk, downstream_ref)?
+                };
+                (chunk, stats, original_input)
             };
-            if let Some(tracker) = self
-                .operator_mem_trackers
-                .get(downstream_idx)
-                .and_then(|v| v.as_ref())
+            if !original_input
+                && let Some(tracker) = self
+                    .operator_mem_trackers
+                    .get(downstream_idx)
+                    .and_then(|v| v.as_ref())
             {
                 // Ownership model: memory is charged to the current holder (queue/operator).
                 // We transfer accounting at queue boundaries via release+consume on the same bytes.
@@ -1543,7 +1565,7 @@ impl PipelineDriver {
             })?;
 
             let has_output = upstream.has_output();
-            let need_input = has_output && downstream.need_input();
+            let need_input = has_output && downstream.prepare_upstream_pull()?;
             if e == 0 {
                 self.source_output_refused = has_output && !need_input;
             }
@@ -1580,6 +1602,7 @@ impl PipelineDriver {
             };
             let start = Instant::now();
             let maybe = upstream.pull_chunk(self.runtime_state.as_ref());
+            downstream.finish_upstream_pull(matches!(&maybe, Ok(Some(_))));
             let elapsed = start.elapsed();
             if self.profiler.is_some() {
                 let elapsed_ns = i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
@@ -1638,7 +1661,9 @@ impl PipelineDriver {
                     let counters = &self.operator_counters[upstream_idx];
                     counters.pull_row_num.add(chunk.len() as i64);
                 }
-                if let Some(tracker) = self.edge_mem_trackers.get(e).and_then(|v| v.as_ref()) {
+                if !downstream.takes_original_input()
+                    && let Some(tracker) = self.edge_mem_trackers.get(e).and_then(|v| v.as_ref())
+                {
                     // Ownership model: memory is charged to the current holder (queue/operator).
                     // We transfer accounting at queue boundaries via release+consume on the same bytes.
                     chunk.transfer_to(tracker);

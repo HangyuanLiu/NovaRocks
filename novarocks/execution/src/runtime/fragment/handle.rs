@@ -58,6 +58,7 @@ pub struct FragmentPrepareContext {
     runtime_filter: Option<RuntimeFilterSessionRef>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     result_writer: Arc<dyn FragmentResultWriter>,
+    root_result_session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
     event_sink: Arc<dyn FragmentEventSink>,
     result_spec: Option<ResultWriteSpec>,
     result_identity: Option<novarocks_execution_contract::TaskIdentity>,
@@ -127,6 +128,14 @@ mod owner_tests {
         chunk: Chunk,
         sink: FragmentSinkProgram,
     ) -> FragmentSubmission {
+        static_submission(finst_id, chunk, sink.into_static().expect("static sink"))
+    }
+
+    fn static_submission(
+        finst_id: UniqueId,
+        chunk: Chunk,
+        sink: novarocks_local_program::StaticSinkProgram,
+    ) -> FragmentSubmission {
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root: ExecNode {
@@ -136,18 +145,17 @@ mod owner_tests {
         let profile = plan
             .local_compile_profile(NonZeroUsize::new(1).expect("one driver"), None)
             .expect("local profile");
-        let sink_requirements = if matches!(&sink, FragmentSinkProgram::Result) {
+        let sink_requirements = if matches!(
+            &sink,
+            novarocks_local_program::StaticSinkProgram::Result
+                | novarocks_local_program::StaticSinkProgram::RootResult(_)
+        ) {
             vec![ExternalSinkRequirement::Result]
         } else {
             Vec::new()
         };
         let (local, bindings) = plan
-            .into_local_program_and_bindings(
-                profile,
-                BTreeMap::new(),
-                sink_requirements,
-                sink.into_static().expect("static sink"),
-            )
+            .into_local_program_and_bindings(profile, BTreeMap::new(), sink_requirements, sink)
             .expect("local program");
         let program = Arc::new(
             FragmentProgram::try_new(
@@ -188,6 +196,226 @@ mod owner_tests {
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .expect("one row chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    struct RejectLegacyRootWriter;
+    impl FragmentResultWriter for RejectLegacyRootWriter {
+        fn open(
+            &self,
+            _: ResultWriteSpec,
+        ) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
+            panic!("a frozen bounded root must not open the legacy result buffer");
+        }
+    }
+    struct BoundedRootSession {
+        spec: crate::runtime::fragment::io::RootResultWriteSpec,
+        authority: crate::runtime::fragment::io::RootInputAuthority,
+        input: Mutex<Option<(Chunk, crate::runtime::fragment::io::RootInputPermit)>>,
+        finishing: AtomicBool,
+        exited: AtomicBool,
+        aborts: Mutex<Vec<ResultAbort>>,
+    }
+    impl BoundedRootSession {
+        fn new() -> Arc<Self> {
+            use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId};
+            let task = novarocks_execution_contract::TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(390, 391), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            );
+            let spec = crate::runtime::fragment::io::RootResultWriteSpec {
+                task,
+                contract: Arc::new(novarocks_result_contract::RootOutputContract::new(
+                    novarocks_result_contract::RootProfileId::V1,
+                    novarocks_result_contract::FrozenRootOutput::CountOnly,
+                )),
+            };
+            Arc::new(Self {
+                authority: crate::runtime::fragment::io::RootInputAuthority::new(&spec),
+                spec,
+                input: Mutex::new(None),
+                finishing: AtomicBool::new(false),
+                exited: AtomicBool::new(false),
+                aborts: Mutex::new(Vec::new()),
+            })
+        }
+        fn actual_exit(&self) {
+            let input = self.input.lock().unwrap().take();
+            drop(input);
+            self.exited.store(true, Ordering::Release);
+            self.authority.observable().notify_observers();
+        }
+        fn context(self: &Arc<Self>) -> FragmentPrepareContext {
+            FragmentPrepareContext {
+                result_writer: Arc::new(RejectLegacyRootWriter),
+                ..Default::default()
+            }
+            .with_result_identity(self.spec.task)
+            .with_root_result_session(
+                Arc::clone(self) as Arc<dyn crate::runtime::fragment::io::RootResultSession>
+            )
+        }
+        fn submission(&self) -> FragmentSubmission {
+            static_submission(
+                UniqueId::new(399, 400),
+                one_row_chunk(),
+                novarocks_local_program::StaticSinkProgram::RootResult(Arc::clone(
+                    &self.spec.contract,
+                )),
+            )
+        }
+    }
+    impl crate::runtime::fragment::io::RootResultSession for BoundedRootSession {
+        fn spec(&self) -> &crate::runtime::fragment::io::RootResultWriteSpec {
+            &self.spec
+        }
+        fn try_acquire_input(
+            &self,
+        ) -> Result<crate::runtime::fragment::io::RootInputAdmission, FragmentIoError> {
+            self.authority
+                .try_acquire(crate::runtime::fragment::io::ResultWriteCredit::new(
+                    self.authority.required_bytes(),
+                    |_| {},
+                ))
+        }
+        fn writable_observable(&self) -> Arc<crate::runtime::observable::Observable> {
+            self.authority.observable()
+        }
+        fn submit_input(
+            &self,
+            chunk: Chunk,
+            permit: crate::runtime::fragment::io::RootInputPermit,
+        ) -> Result<(), FragmentIoError> {
+            assert!(self.authority.owns(&permit));
+            assert!(
+                self.input
+                    .lock()
+                    .unwrap()
+                    .replace((chunk, permit))
+                    .is_none()
+            );
+            Ok(())
+        }
+        fn finish_input(&self) -> Result<(), FragmentIoError> {
+            self.finishing.store(true, Ordering::Release);
+            Ok(())
+        }
+        fn producer_state(&self) -> crate::runtime::fragment::io::RootProducerState {
+            use crate::runtime::fragment::io::RootProducerState;
+            if self.exited.load(Ordering::Acquire) {
+                RootProducerState::ContextHeld
+            } else if self.finishing.load(Ordering::Acquire) {
+                RootProducerState::Finishing
+            } else {
+                RootProducerState::Accepting
+            }
+        }
+        fn producer_exited(&self) -> bool {
+            self.exited.load(Ordering::Acquire)
+        }
+        fn abort(&self, reason: ResultAbort) {
+            let mut aborts = self.aborts.lock().unwrap();
+            if aborts.is_empty() {
+                aborts.push(reason);
+            }
+            drop(aborts);
+            self.authority.close();
+        }
+    }
+    #[test]
+    fn bounded_root_requires_exact_session_without_opening_legacy_result() {
+        let root = BoundedRootSession::new();
+        let mut missing = root.context();
+        missing.root_result_session = None;
+        assert!(prepare_fragment(root.submission(), missing).is_err());
+        assert!(root.aborts.lock().unwrap().is_empty());
+        let wrong = BoundedRootSession::new();
+        assert!(
+            prepare_fragment(
+                root.submission(),
+                wrong.context().with_result_identity(root.spec.task)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            wrong.aborts.lock().unwrap().as_slice(),
+            &[ResultAbort::PrepareRollback]
+        );
+    }
+    #[test]
+    fn bounded_root_prepare_rollback_aborts_the_exact_provisional_owner() {
+        let root = BoundedRootSession::new();
+        assert!(
+            prepare_fragment(
+                root.submission(),
+                root.context()
+                    .with_prepare_failure(super::PrepareFailurePoint::AfterResult)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            root.aborts.lock().unwrap().as_slice(),
+            &[ResultAbort::PrepareRollback]
+        );
+        let root = BoundedRootSession::new();
+        let dormant = prepare_fragment(root.submission(), root.context()).unwrap();
+        drop(dormant);
+        assert_eq!(
+            root.aborts.lock().unwrap().as_slice(),
+            &[ResultAbort::NeverStarted]
+        );
+    }
+    #[test]
+    fn bounded_root_success_waits_actual_producer_exit_then_preserves_context_ownership() {
+        let root = BoundedRootSession::new();
+        let running = prepare_fragment(root.submission(), root.context())
+            .unwrap()
+            .start();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !root.finishing.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(root.finishing.load(Ordering::Acquire));
+        assert!(running.stopped_fact().is_none());
+        assert!(root.input.lock().unwrap().is_some());
+        root.actual_exit();
+        let fact = running.join();
+        assert!(matches!(fact.outcome(), FragmentOutcome::Succeeded));
+        drop(running);
+        assert!(
+            root.aborts.lock().unwrap().is_empty(),
+            "success and task-handle drop must not close the context-held root"
+        );
+    }
+
+    #[test]
+    fn bounded_root_cancellation_retains_host_input_until_actual_exit() {
+        let root = BoundedRootSession::new();
+        let running = prepare_fragment(root.submission(), root.context())
+            .unwrap()
+            .start();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !root.finishing.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(root.finishing.load(Ordering::Acquire));
+        running.cancel(FragmentCancelReason::new("root cancellation probe"));
+        assert!(running.stopped_fact().is_none());
+        assert!(
+            root.input.lock().unwrap().is_some(),
+            "the admitted host input remains physically held during cancellation"
+        );
+        root.actual_exit();
+        assert!(matches!(
+            running.join().outcome(),
+            FragmentOutcome::Cancelled { .. }
+        ));
+        assert_eq!(
+            root.aborts.lock().unwrap().len(),
+            1,
+            "abort is a single logical decision"
+        );
     }
 
     struct BlockingResultSession {
@@ -588,6 +816,7 @@ impl Default for FragmentPrepareContext {
             edge_gates: None,
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
+            root_result_session: None,
             result_spec: None,
             result_identity: None,
             root_sink_dop: None,
@@ -628,6 +857,7 @@ impl FragmentPrepareContext {
             result_writer,
             event_sink,
             edge_gates: None,
+            root_result_session: None,
             result_spec: None,
             result_identity: None,
             root_sink_dop: None,
@@ -665,6 +895,17 @@ impl FragmentPrepareContext {
         gates: Arc<crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates>,
     ) -> Self {
         self.edge_gates = Some(gates);
+        self
+    }
+
+    /// An exact task-owned provisional bounded root session. Opening and
+    /// credit admission are host responsibilities; execution never falls
+    /// back to the legacy result writer for a frozen RootResult program.
+    pub fn with_root_result_session(
+        mut self,
+        session: Arc<dyn crate::runtime::fragment::io::RootResultSession>,
+    ) -> Self {
+        self.root_result_session = Some(session);
         self
     }
 
@@ -727,6 +968,7 @@ impl FragmentPrepareContext {
             result_writer,
             event_sink,
             edge_gates: None,
+            root_result_session: None,
             result_spec,
             result_identity: None,
             root_sink_dop,
@@ -1175,6 +1417,11 @@ pub fn prepare_fragment(
         if let Some(identity) = context.result_identity {
             result_spec = result_spec.with_task_identity(identity);
         }
+        resources.acquire_root_result(
+            program,
+            context.root_result_session.clone(),
+            context.result_identity,
+        )?;
         resources.acquire_result(program, &context.result_writer, result_spec)?;
         context.fail_if_injected(PrepareFailurePoint::AfterResult)?;
         resources.acquire_exchange(program, instance)?;
@@ -1204,6 +1451,7 @@ pub fn prepare_fragment(
             instance,
             Arc::clone(&context.exchange_transmitter),
             resources.result_session(),
+            resources.root_result_session(),
             context.edge_gates.clone(),
             runtime_state.error_state(),
         )?;

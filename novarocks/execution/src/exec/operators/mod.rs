@@ -46,6 +46,7 @@ mod project_processor;
 mod repeat_processor;
 mod result_buffer_sink;
 mod result_sink;
+mod root_result_sink;
 pub(crate) mod runtime_filter;
 pub mod scan;
 mod setop;
@@ -86,6 +87,7 @@ pub(crate) use repeat_processor::repeat_output_chunk_schema;
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(test)]
 pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};
+pub use root_result_sink::RootResultSinkFactory;
 pub(crate) use setop::{
     ExceptSharedState, IntersectSharedState, SetOpStageController, UnionAllSharedState,
 };

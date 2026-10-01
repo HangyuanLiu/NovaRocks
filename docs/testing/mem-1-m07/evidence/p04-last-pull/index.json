@@ -1,0 +1,114 @@
+{
+  "scope": "P04 last-pull and explicit execution root lifecycle only; P04 remains executing",
+  "parent_source_sha": "c57bf79f5e1db64cbfe3c0d677ed0e9078dda5ec",
+  "source_hashes": {
+    "novarocks/execution/src/exec/operators/mod.rs": "ddc6758d10ef35cb76f1b3f373109e471bf74d73f6714c2623de87b0d756280c",
+    "novarocks/execution/src/exec/pipeline/driver.rs": "52d15bd553c1339cc08e892dcec1460437ac35c0bb7d2a5d93003cbd5e1487f0",
+    "novarocks/execution/src/exec/pipeline/operator.rs": "d8c5d0e909c53c0d60c0c6dd10d394b9fd1454db6b86e77f19ae05397e009a62",
+    "novarocks/execution/src/exec/pipeline/operator_factory.rs": "a9667aefa3c0ee33e6a24cf6ebccf8f693f27645076f6b9550695376311f33d4",
+    "novarocks/execution/src/exec/pipeline/pipeline.rs": "017d20876d084faadba8c7a6a5edd6732b83ca0b80e90c20806b79901653e76d",
+    "novarocks/execution/src/runtime/fragment/handle.rs": "f4fb75dcfc697a319596bab06bb83770d83d44b7736e85a8c7d0f578cdb28350",
+    "novarocks/execution/src/runtime/fragment/io/result.rs": "48b375f8ff106a439f9b85e607826c6771f36b53395838fcf70bf6677330565d",
+    "novarocks/execution/src/runtime/fragment/resources.rs": "8a5167fde536b494e7f2b1fc7e1e5b301beb3f33bb025931c95251123093b0b4",
+    "novarocks/execution/src/runtime/fragment/sink.rs": "999de2145284f0790cbd17515435c1aad0ea99f0681254e5d2104068330ffb41",
+    "novarocks/worker/src/root_result_channel.rs": "829a7fed637dcd8b8fe80a6eac33ac0c1ed1b6d912756631ed48ad06749ac454",
+    "novarocks/execution/src/exec/operators/root_result_sink.rs": "d68e120421c257bfd0be0b1a1fbda64ea711748314bffd9b850d7fd6c165f250",
+    "novarocks/execution/tests/root_original_carrier.rs": "6fb0480f00af68de7570f8be5fed44abbbf59d7fb04d8ee0bb1b2ad1ef117051"
+  },
+  "verification": [
+    {
+      "file": "pipeline.log.gz",
+      "command": "cargo test --offline --locked -p novarocks-execution --lib exec::pipeline",
+      "result": "122 passed",
+      "raw_bytes": 58823,
+      "raw_sha256": "ddb81a9d8bfad5bfd64ac78ed68e8d4191c1a0bdb22554fabee41f30b12f6c5e",
+      "gzip_sha256": "3d74aea45a09aa60f8ef2480a53224de9430e84af67d1dfe171465081579c751"
+    },
+    {
+      "file": "fragment.log.gz",
+      "command": "cargo test --offline --locked -p novarocks-execution --lib runtime::fragment",
+      "result": "97 passed",
+      "raw_bytes": 55692,
+      "raw_sha256": "454f0042119b6f67fcbba74de260619e705f62db54dea594758faa0f52f53208",
+      "gzip_sha256": "bd3d45147a01437512b88557c53fd9de5ddb0f4c2a1e2a594c860ed97db72ed3"
+    },
+    {
+      "file": "root-sink.log.gz",
+      "command": "cargo test --offline --locked -p novarocks-execution --lib exec::operators::root_result_sink",
+      "result": "10 passed",
+      "raw_bytes": 46718,
+      "raw_sha256": "411fdc9d4f7382906c9c763bc550aca8c0e59e924584b6fd0099d1d903f06819",
+      "gzip_sha256": "aaedea006846fb1a8892d66cb27be47694b43d60f20268cdf5aa7ff758d88128"
+    },
+    {
+      "file": "root-channel.log.gz",
+      "command": "cargo test --offline --locked -p novarocks-worker --lib root_result_channel",
+      "result": "19 passed",
+      "raw_bytes": 2392,
+      "raw_sha256": "f50e6c43f406a37aaffb5e64148c53a395395b130f2ba037cc787ad46e597922",
+      "gzip_sha256": "9e11457b9f6fdc15add9e8b314c9a3bd43a7bf19b4de0102ca3ddf6ac4c36614"
+    },
+    {
+      "file": "original-carrier.log.gz",
+      "command": "cargo test --offline --locked -p novarocks-execution --test root_original_carrier",
+      "result": "2 passed",
+      "raw_bytes": 43962,
+      "raw_sha256": "1c34172e80fac322d26d9f0d1b2869b313381b17ff4808513199a1c69409e7ee",
+      "gzip_sha256": "46b9bb3823eed124b10a6d4640bba256cc48c9c917226a3b938ed1e142da9f28"
+    },
+    {
+      "file": "native-check.log.gz",
+      "command": "cargo check --offline --locked -p novarocks-native-adapter --all-targets",
+      "result": "passed, existing warnings",
+      "raw_bytes": 44373,
+      "raw_sha256": "8b0eb3f1c92b4b6cef3fe50b6c0296ca5e977b787c080a7e9af8c5fa3afacf3a",
+      "gzip_sha256": "0bfa81e93b13d041ac269099f20d79a20d3b075e2c6f2b9a5fb47ba95a86c205"
+    },
+    {
+      "file": "execution-clippy.log.gz",
+      "command": "cargo clippy --offline --locked -p novarocks-execution --all-targets",
+      "result": "passed, existing warnings",
+      "raw_bytes": 88653,
+      "raw_sha256": "386c502b809663b40dc42990f4d2a22aef9d33f4dc5a080ae17fa31286a47bc5",
+      "gzip_sha256": "7196274fc4111113f80252593067ddfffe0c8d0d39a00d4ebc73e2ea48a1d677"
+    },
+    {
+      "file": "fmt-check.log.gz",
+      "command": "cargo fmt --all -- --check",
+      "result": "passed",
+      "raw_bytes": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "file": "diff-check.log.gz",
+      "command": "git diff --check",
+      "result": "passed",
+      "raw_bytes": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "file": "edge-credit-regression-before.log.gz",
+      "command": "cargo test -p novarocks-execution failed_last_pull_drops_real_edge_backing_before_returning_credit",
+      "result": "expected failure before fix",
+      "raw_bytes": 46348,
+      "raw_sha256": "541bf43fc6e0e082585325aa0847b01aed7e795f3a69dc86ee79d7b7c7a4ff78",
+      "gzip_sha256": "39ba3a9864f3186f034e6e8281c1426d4cf778cb54fa78503e7680cf77127359"
+    },
+    {
+      "file": "root-runtime-first-fixture-errors.log.gz",
+      "command": "cargo test -p novarocks-execution --lib runtime::fragment::handle::owner_tests::bounded_root",
+      "result": "test fixture errors retained; corrected exact identity and first-wins abort oracle",
+      "raw_bytes": 47137,
+      "raw_sha256": "6d2fc5ac07a62016dc8ea60bcdc264b4d9ea446679ddce9cb956fb6f489dbd47",
+      "gzip_sha256": "65e15c5734e0cc71f4b6cd4e20d927df7a61b3efc5a7967d74a0950218269d22"
+    }
+  ],
+  "unverified": [
+    "Native finite producer and original input backing authority",
+    "domain/count source profiles and materializers",
+    "fetch response H2 alias ownership and physical lane listeners",
+    "candidate native product/performance/final CI"
+  ]
+}

@@ -41,3 +41,5 @@ P01环境复核：`--consumer iceberg-rest`再次通过；`--consumer all`发现
 Paimon定义差异已只读定位：prepared版本对应`3af07efbb`，当前变化来自已合入`375c9e0ea`的host env parser（unset/变量名/shlex quoting）；Dockerfile/versions/JAR lock/SQL/golden未变。全部5个canonical image、6个JAR已验证存在且hash正确，当前派生image仍带旧definition。完整CI无条件all verify+Paimon准备，故需在独立测试准备阶段用已验证本地输入真实重建并经owner发布，不能仅改BOM/label；现有provision无条件重新下载JAR，不直接使用其联网流程。当前REST运行实例固定image ID不受current alias重建影响。
 
 P04 context-root 核心收据已保存：新增 immutable 通道/物理 backing owner、context fence 接管与读取、正常 seal/abort/lease 收敛；allocation failure callback、schema spare 合并容量和默认并行 allocator probe 已修复且反例通过。Native host 仍为 root=None、V1 未 advertise；P04/P05–P10 继续。此前 Paimon definition 不匹配已在 P02 离线修正，当前 all-consumer 校验通过，详见 [fixture-ready](evidence/fixture-ready/README.md)。
+
+P04最后pull/Execution生命周期检查点：唯一事前input grant、original-carrier直移、built DOP绑定、explicit RootRegistration与actual-exit成功门已定向通过；[收据](evidence/p04-last-pull/README.md)。P04仍执行，原始Arrow/schema metadata实际backing证明与Native producer/fetch/lane产品接线继续。
