@@ -248,10 +248,11 @@ pub trait ScalarKernelInstance: Send {
 /// resolved by the expression controller. Strict NULL demand is also decided
 /// there; a strict kernel never receives rows skipped for SQL NULL inputs.
 pub struct ScalarEvaluationInstance {
+    // Drop mutable state while its exact immutable preparation is still alive.
+    instance: Box<dyn ScalarKernelInstance>,
     _prepared: Arc<dyn PreparedScalarKernel>,
     contract: Arc<ScalarCallContract>,
     retained_upper_bound: usize,
-    instance: Box<dyn ScalarKernelInstance>,
     failed: bool,
 }
 impl ScalarEvaluationInstance {
@@ -343,6 +344,16 @@ impl ScalarEvaluationInstance {
             },
             control,
         );
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            // A private owner can refuse without latching this wrapper's
+            // control. Its originating control cause wins over reconciliation.
+            return result;
+        }
         if self.instance.retained_bytes() > self.retained_upper_bound {
             return Err(internal(
                 "scalar instance exceeded its lifetime retained bound",

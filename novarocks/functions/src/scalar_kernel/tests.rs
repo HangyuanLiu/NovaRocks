@@ -171,6 +171,9 @@ enum Mode {
     OuterFailure,
     Grow,
     GrowAndFail,
+    GrowAndCancel,
+    GrowAndDeadline,
+    GrowAndResource,
 }
 #[derive(Debug)]
 struct Prepared {
@@ -210,13 +213,26 @@ impl ScalarKernelInstance for Instance {
         if input.contract().effects().argument_control != ArgumentControl::TypeOnly {
             self.next += 1;
         }
-        if matches!(self.mode, Mode::Grow | Mode::GrowAndFail) {
+        if matches!(
+            self.mode,
+            Mode::Grow
+                | Mode::GrowAndFail
+                | Mode::GrowAndCancel
+                | Mode::GrowAndDeadline
+                | Mode::GrowAndResource
+        ) {
             self.extra_bytes = 1;
         }
         if matches!(self.mode, Mode::OuterFailure | Mode::GrowAndFail) {
             return Err(KernelFailure::Operational(KernelDiagnostic::new(
                 "fixture exit",
             )));
+        }
+        match self.mode {
+            Mode::GrowAndCancel => return Err(KernelFailure::Cancelled),
+            Mode::GrowAndDeadline => return Err(KernelFailure::DeadlineExceeded),
+            Mode::GrowAndResource => return Err(KernelFailure::ResourceExhausted),
+            _ => {}
         }
         let rows = input.selection().len();
         let array: ArrayRef = match self.mode {
@@ -819,4 +835,134 @@ fn prepared_scalar_reads_only_the_explicit_constant_ordinal_for_every_selected_r
         .unwrap();
     assert!(result.values().is_empty());
     assert_eq!(calls.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn scalar_instance_drop_keeps_the_last_prepared_owner_alive() {
+    #[derive(Debug)]
+    struct DropPrepared {
+        contract: Arc<ScalarCallContract>,
+        owner: std::sync::Weak<DropPrepared>,
+        drops: Arc<Mutex<Vec<&'static str>>>,
+    }
+    struct DropInstance {
+        owner: std::sync::Weak<DropPrepared>,
+        drops: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl Drop for DropPrepared {
+        fn drop(&mut self) {
+            self.drops.lock().unwrap().push("prepared");
+        }
+    }
+    impl Drop for DropInstance {
+        fn drop(&mut self) {
+            assert!(
+                self.owner.upgrade().is_some(),
+                "the prepared owner must remain live throughout typed instance teardown"
+            );
+            self.drops.lock().unwrap().push("instance");
+        }
+    }
+    impl PreparedScalarKernel for DropPrepared {
+        fn contract(&self) -> &Arc<ScalarCallContract> {
+            &self.contract
+        }
+        fn instance_retained_upper_bound(&self) -> usize {
+            std::mem::size_of::<DropInstance>()
+        }
+        fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
+            Ok(Box::new(DropInstance {
+                owner: self.owner.clone(),
+                drops: self.drops.clone(),
+            }))
+        }
+    }
+    impl ScalarKernelInstance for DropInstance {
+        fn evaluate<'a>(
+            &mut self,
+            _: ScalarCallInput<'_, 'a>,
+            _: &dyn KernelEvaluationControl,
+        ) -> Result<SelectedValues<'a>, KernelFailure> {
+            Err(internal("drop fixture must never evaluate"))
+        }
+        fn retained_bytes(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
+    }
+
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let prepared = Arc::new_cyclic(|owner| DropPrepared {
+        contract: contract(
+            ArgumentControl::Eager,
+            FunctionIntrinsicRowError::NoRowError,
+            false,
+        ),
+        owner: owner.clone(),
+        drops: drops.clone(),
+    });
+    let weak = Arc::downgrade(&prepared);
+    let instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+    assert_eq!(weak.strong_count(), 1);
+    assert!(drops.lock().unwrap().is_empty());
+    drop(instance);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(*drops.lock().unwrap(), vec!["instance", "prepared"]);
+}
+
+#[test]
+fn primary_scalar_control_survives_retained_growth_and_latches_without_replay() {
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![1; 10]));
+    let arguments = [EvaluatedArgument::Column(&input)];
+    let selected = Selection::try_sparse(10, &[1, 4, 9]).unwrap();
+    for (mode, expected) in [
+        (Mode::GrowAndCancel, KernelFailure::Cancelled),
+        (Mode::GrowAndDeadline, KernelFailure::DeadlineExceeded),
+        (Mode::GrowAndResource, KernelFailure::ResourceExhausted),
+    ] {
+        let (prepared, calls) = preparation(
+            ArgumentControl::Eager,
+            mode,
+            FunctionIntrinsicRowError::NoRowError,
+            false,
+        );
+        let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+        assert_eq!(
+            instance
+                .evaluate(selected, &arguments, &Control::default())
+                .unwrap_err(),
+            expected,
+        );
+        // The real mutable fixture grew beyond its immutable preparation bound.
+        assert!(matches!(
+            instance.retained_bytes(),
+            Err(KernelFailure::Internal(_))
+        ));
+        assert_eq!(
+            instance
+                .evaluate(selected, &arguments, &Control::default())
+                .unwrap_err(),
+            KernelFailure::InstanceFailed,
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+    for mode in [Mode::Grow, Mode::GrowAndFail] {
+        let (prepared, calls) = preparation(
+            ArgumentControl::Eager,
+            mode,
+            FunctionIntrinsicRowError::NoRowError,
+            false,
+        );
+        let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+        assert!(matches!(
+            instance.evaluate(selected, &arguments, &Control::default()),
+            Err(KernelFailure::Internal(_)),
+        ));
+        assert_eq!(
+            instance
+                .evaluate(selected, &arguments, &Control::default())
+                .unwrap_err(),
+            KernelFailure::InstanceFailed,
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 }

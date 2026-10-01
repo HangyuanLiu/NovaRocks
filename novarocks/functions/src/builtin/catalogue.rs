@@ -881,7 +881,7 @@ fn validate_builtin_selected_domain(
     }
 }
 
-struct BuiltinScalarResolver {
+pub(super) struct BuiltinScalarResolver {
     function_id: FunctionId,
     canonical_name: Box<str>,
     overloads: Box<[FunctionOverloadId]>,
@@ -2287,6 +2287,51 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
     }
 }
 
+pub(super) fn scalar_definition_parts(
+    name: &str,
+    signatures: &[String],
+    kind: FunctionKind,
+) -> Result<(FunctionBindingDeclaration, BuiltinScalarResolver), FunctionCatalogError> {
+    let overloads = signatures
+        .iter()
+        .map(|signature| builtin_scalar_overload_id(name, signature, kind))
+        .collect::<Result<Vec<_>, _>>()?;
+    let function_id = builtin_scalar_function_id(name, kind)?;
+    let resolver = BuiltinScalarResolver {
+        function_id: function_id.clone(),
+        canonical_name: name.into(),
+        overloads: overloads.clone().into_boxed_slice(),
+    };
+    let result_domain = builtin_fixed_result_domain(&function_id);
+    let declaration = FunctionBindingDeclaration::try_new(
+        function_id,
+        kind,
+        overloads
+            .into_iter()
+            .zip(signatures)
+            .map(|(identity, signature)| FunctionOverloadDeclaration {
+                effects: (name == "abs").then(super::abs_owner::effects),
+                semantics: builtin_scalar_semantics(name),
+                identity,
+                argument_pattern: signature.clone().into_boxed_str(),
+                result_pattern: match result_domain {
+                    Some(domain) => format!(
+                        "{signature};root={}",
+                        domain.metadata_value().expect("declared semantic root")
+                    )
+                    .into_boxed_str(),
+                    None => signature.clone().into_boxed_str(),
+                },
+                aggregate: None,
+            }),
+    )
+    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+        subject: "builtin scalar binding declaration",
+        value: error.to_string().into(),
+    })?;
+    Ok((declaration, resolver))
+}
+
 pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
@@ -2356,49 +2401,18 @@ pub fn contribute_builtin_functions(
                 });
             }
         };
-        let overloads = signatures
-            .iter()
-            .map(|signature| builtin_scalar_overload_id(&name, signature, kind))
-            .collect::<Result<Vec<_>, _>>()?;
-        let function_id = builtin_scalar_function_id(&name, kind)?;
-        let resolver = Arc::new(BuiltinScalarResolver {
-            function_id: function_id.clone(),
-            canonical_name: name.clone().into_boxed_str(),
-            overloads: overloads.clone().into_boxed_slice(),
-        });
-        let result_domain = builtin_fixed_result_domain(&function_id);
-        let declaration = FunctionBindingDeclaration::try_new(
-            function_id,
-            kind,
-            overloads
-                .into_iter()
-                .zip(&signatures)
-                .map(|(identity, signature)| FunctionOverloadDeclaration {
-                    effects: None,
-                    semantics: builtin_scalar_semantics(&name),
-                    identity,
-                    argument_pattern: signature.clone().into_boxed_str(),
-                    result_pattern: match result_domain {
-                        Some(domain) => format!(
-                            "{signature};root={}",
-                            domain.metadata_value().expect("declared semantic root")
-                        )
-                        .into_boxed_str(),
-                        None => signature.clone().into_boxed_str(),
-                    },
-                    aggregate: None,
-                }),
-        )
-        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin scalar binding declaration",
-            value: error.to_string().into(),
-        })?;
-        builder.register(FunctionDefinition::try_new_bound(
-            &name,
-            FunctionVisibility::Public,
-            declaration,
-            resolver,
-        )?)?;
+        let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
+        let definition = if name == "abs" {
+            super::abs_owner::definition(declaration, resolver)?
+        } else {
+            FunctionDefinition::try_new_bound(
+                &name,
+                FunctionVisibility::Public,
+                declaration,
+                Arc::new(resolver),
+            )?
+        };
+        builder.register(definition)?;
     }
     for declaration in builtin_aggregate_declarations() {
         let function_id = FunctionId::try_new(format!("builtin.aggregate/{}/v1", declaration.name))

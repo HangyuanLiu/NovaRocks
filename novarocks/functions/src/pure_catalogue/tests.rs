@@ -614,6 +614,45 @@ pub(super) fn checked_into_parts(
 }
 
 #[test]
+fn actual_builtin_abs_installs_eight_cpu_records_without_sealing_unmigrated_catalogue() {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
+    let definition = builder.definition("abs", FunctionKind::Scalar).unwrap();
+    let binding = definition.binding.as_ref().unwrap();
+    let attachment = binding.pure.as_ref().expect("actual ABS CPU owner");
+    assert_eq!(
+        binding.declaration.function_id().as_str(),
+        "builtin.scalar/abs/v1"
+    );
+    assert_eq!(binding.declaration.overloads().len(), 8);
+    assert_eq!(attachment.implementations.len(), 8);
+    for (overload, installed) in binding
+        .declaration
+        .overloads()
+        .iter()
+        .zip(attachment.implementations.iter())
+    {
+        assert_eq!(installed.overload, overload.identity);
+        assert_eq!(
+            installed.implementation.as_str(),
+            "builtin.scalar/abs/selected-v1"
+        );
+        assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
+        let effects = overload.effects.as_ref().unwrap();
+        assert_eq!(effects.instance_state, FunctionInstanceState::None);
+        assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
+        assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+    }
+    // A real migrated family is not coverage of the remaining whole catalogue.
+    // Incomplete owners/effects must still fail before manifest reconciliation.
+    assert!(matches!(
+        builder.seal_pure(std::iter::empty()),
+        Err(PureCatalogError::MissingOwner(_)
+            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
+    ));
+}
+
+#[test]
 fn metadata_without_actual_owner_and_legacy_effects_cannot_be_pure_sealed() {
     let owner = Arc::new(Owner::new(false));
     let metadata = FunctionDefinition::try_new_bound(
