@@ -61,3 +61,5 @@ pure Close控制投影保留原 UpdateTask envelope/id、exact TaskIdentity、do
 ## 尚待产品接线的事实
 
 SQL pre-optimizer的准确 presentation freeze、BE input/hydrate/encoder/context移交、FE原队列整窗准入、四lane实际隔离、heartbeat控制端点、原 MySQL入口、local/domain/count所有源头、Host完整防护与旧LRA/IPC退役属于后续P04–P08。P01接口验证不把这些项目计为完成。
+
+P02 呈现复核的明确旧算术纠正：`TimestampContainerText` 的有效负 millisecond/nanosecond 值使用 checked Euclidean 秒/余数，分别如 -1ms→1969-12-31 23:59:59.999、-1ns→1969-12-31 23:59:59.999999999；旧 field_render::format_timestamp 对这些值截断余数再转u32，chrono失败后猜成epoch，该fallback不属于准确 native Timestamp合同。新实现不猜epoch，也不将有效signed时间降为unsupported。顶层TimestampUtcMicros的纳秒向零截断策略、正常既有container字节与其他unit规则保持。Date32零日期按既有准确helper的year=-1/month=11/day=30判定（days=-719560）；-719223为正常0000-11-01。Variant Date从其Gregorian日期合同转换，不套用Date32的零日期sentinel。各项以独立literal bytes和P09类型SQL复核，无golden修订。

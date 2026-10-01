@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1 M07 P02",
+  "parent_checkpoint_sha": "555b294cc",
+  "scope": "Pure bounded renderer C2; not production integration or P09 performance acceptance",
+  "tests": {
+    "total": 27,
+    "passed": 27,
+    "failed": 0,
+    "ignored": 0,
+    "unit": 3,
+    "allocation_and_lifetime": 4,
+    "independent_bytes_and_limits": 20,
+    "main_independent_rerun": {
+      "passed": 27,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "scratch": {
+    "actual_capacity_bytes": 187696,
+    "heap_capacity_bytes": 186976,
+    "control_bytes": 720,
+    "staging_bytes": 65536,
+    "cell_length_table_bytes": 16384,
+    "task_slots": 196,
+    "task_size_bytes": 536,
+    "task_stack_capacity_bytes": 105056,
+    "constructor_heap_allocations": 3,
+    "step_heap_allocations": 0,
+    "layout_scope": "Observed 64-bit Rust layout; runtime oracle uses size_of and Vec.capacity, not a cross-platform ABI"
+  },
+  "verification": [
+    {
+      "command": "cargo check -p novarocks-result-render",
+      "result": "passed",
+      "log": "first-check.log.gz"
+    },
+    {
+      "command": "cargo test -p novarocks-result-render -- --test-threads=1",
+      "result": "27 passed; 0 failed; 0 ignored",
+      "log": "c2-tests.log.gz"
+    },
+    {
+      "owner": "main",
+      "command": "cargo test -p novarocks-result-render -- --test-threads=1",
+      "result": "27 passed; 0 failed; 0 ignored",
+      "log": "main-c2-tests.log.gz"
+    },
+    {
+      "command": "cargo clippy -p novarocks-result-render --all-targets -- -D warnings",
+      "result": "passed",
+      "log": "clippy.log.gz"
+    },
+    {
+      "owner": "main",
+      "command": "cargo clippy -p novarocks-result-render --all-targets -- -D warnings",
+      "result": "passed",
+      "log": "main-clippy.log.gz"
+    },
+    {
+      "command": "rustfmt --edition 2024 --check novarocks/result-render/src/encoder.rs novarocks/result-render/src/variant_cursor.rs novarocks/result-render/src/json_cursor.rs novarocks/result-render/src/encoder_tests.rs novarocks/result-render/tests/encoder.rs novarocks/result-render/tests/allocation_bounds.rs",
+      "result": "passed; empty output",
+      "log": "fmt.log.gz"
+    },
+    {
+      "command": "cargo test -p novarocks-result-render --lib actual_scratch_capacity_layout -- --nocapture --test-threads=1",
+      "result": "passed; actual scratch capacity 187696 bytes",
+      "log": "scratch-capacity.log.gz"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed; empty output",
+      "log": "diff-check.log.gz"
+    }
+  ],
+  "sources": [
+    {
+      "path": "novarocks/result-render/Cargo.toml",
+      "bytes": 347,
+      "sha256": "8430ecb9b06d7d75decbcf42a423bcdcc30e086a71f3b9875e835f5451feaaf8"
+    },
+    {
+      "path": "novarocks/result-render/src/encoder.rs",
+      "bytes": 80353,
+      "sha256": "9f84885b0d5a2a2380b9b226d21ff65f3fb9bf731b8740423f1cfed99cdabcea"
+    },
+    {
+      "path": "novarocks/result-render/src/encoder_tests.rs",
+      "bytes": 4256,
+      "sha256": "8452517d21e44c36a50f6bf987ebb795a43052782d43b21d288e682c8ef3dbdf"
+    },
+    {
+      "path": "novarocks/result-render/src/json_cursor.rs",
+      "bytes": 12109,
+      "sha256": "e8d4204fdd34290b5a7d1773f70071db6c62f420981e610af55bea244e17c198"
+    },
+    {
+      "path": "novarocks/result-render/src/lib.rs",
+      "bytes": 3238,
+      "sha256": "4bc32c018c14db3baa5333debabf1c6f382ee44f4ce0ed1dda3b48c07f2f8ab5"
+    },
+    {
+      "path": "novarocks/result-render/src/variant_cursor.rs",
+      "bytes": 6393,
+      "sha256": "030e338feb7861bddb07122bd3a06541324e781f91c8511f4beaba7b964a2360"
+    },
+    {
+      "path": "novarocks/result-render/tests/allocation_bounds.rs",
+      "bytes": 9003,
+      "sha256": "bf913b409bd5ab0c12eed8720f5e1cff43073cfa406e720d290af50ce024cb21"
+    },
+    {
+      "path": "novarocks/result-render/tests/encoder.rs",
+      "bytes": 29330,
+      "sha256": "a7bb0f7748d99608e10eb0087b43b4e52381386dcd3b2a9711535c87488a46a0"
+    }
+  ],
+  "logs": [
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/c2-tests.log.gz",
+      "bytes": 953,
+      "sha256": "44368dab4c929522d67044765484b91ba52a29259e98361bf16a7c021f6bbeaf",
+      "uncompressed_sha256": "c5475d92cc18a8f94aff682cdd9c21d6b2651271e6eeec21e81433f3becbfd91",
+      "uncompressed_bytes": 2246
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/clippy.log.gz",
+      "bytes": 168,
+      "sha256": "8046b70773614b98e022b3b5110bf354b4855da26fe826007275df9012de443c",
+      "uncompressed_sha256": "c38c8f09819bb60efbb9eb0f7204f5b20eb481e36acfee18e6a9936a89ec53b8",
+      "uncompressed_bytes": 188
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/diff-check.log.gz",
+      "bytes": 20,
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "uncompressed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "uncompressed_bytes": 0
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/first-check.log.gz",
+      "bytes": 344,
+      "sha256": "d1179c476f4797ce84e010808c54fee0992baff71c56307e8370f0fafae501ce",
+      "uncompressed_sha256": "71dc1bec1f6e9e1684131c6724335340bae20e9f7c06383037b5dbb41368f381",
+      "uncompressed_bytes": 1106
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/fmt.log.gz",
+      "bytes": 20,
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "uncompressed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "uncompressed_bytes": 0
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/main-c2-tests.log.gz",
+      "bytes": 888,
+      "sha256": "5157aa06b091bbd8ae92a54805eca5e63dfbe211a8f869557f5bb4ed03f2b0f1",
+      "uncompressed_sha256": "8c44eb6d6c888b25032b5f77a190ff296987b88c43b0b26eb20f5d94eac2f838",
+      "uncompressed_bytes": 2130
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/main-clippy.log.gz",
+      "bytes": 91,
+      "sha256": "72bc8566e5fdc7b8318809c9c796151263cb655e1ff7527484b2d47086e0097f",
+      "uncompressed_sha256": "c92508a29848820f033cd2ea015c85dde0953c88b07cc967ce34b7c08f610549",
+      "uncompressed_bytes": 72
+    },
+    {
+      "path": "docs/testing/mem-1-m07/evidence/p02-renderer/scratch-capacity.log.gz",
+      "bytes": 336,
+      "sha256": "b8b3096b86234d6984d56dcdda8116b6422a01e738549ef6bfdbd0922a2128a6",
+      "uncompressed_sha256": "589300fa894194b0b8d039bc73d04e7fa690966e2d044b7f932397763991d0ef",
+      "uncompressed_bytes": 489
+    }
+  ],
+  "readme": {
+    "path": "docs/testing/mem-1-m07/evidence/p02-renderer/README.md",
+    "bytes": 9640,
+    "sha256": "b32cce4d64fcca42e3498b7cff3e84cd3a4f999e2ec8e434b849152ed3c07c0e"
+  },
+  "limitations": [
+    "Host pregrant, hydration overlap, input/schema ownership and actual encoder exit remain caller obligations.",
+    "Cancel is not physical backing release.",
+    "No SQL golden changes, native 1FE+3BE or P09 product performance acceptance claimed.",
+    "Linux tests are deferred to the user."
+  ]
+}

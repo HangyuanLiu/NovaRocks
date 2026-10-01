@@ -20,6 +20,9 @@
 //! Hosts pre-admit input/hydration/scratch and hold their capability through
 //! actual cursor exit. This interface alone advertises no runtime support.
 
+mod encoder;
+pub use encoder::ArrowMysqlTextEncoder;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderErrorKind {
     SchemaMismatch,

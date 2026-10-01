@@ -1,0 +1,16 @@
+{
+  "command": [
+    "docker/fixture-inputs/verify.sh",
+    "--consumer",
+    "all",
+    "--json"
+  ],
+  "environment": {
+    "DOCKER_CONTEXT": "desktop-linux"
+  },
+  "exit_code": 0,
+  "result": "PASS",
+  "json": "verify-all.json",
+  "container_preservation": "PASS",
+  "preexisting_container_count": 7
+}
