@@ -180,8 +180,11 @@ fn child_output_columns_from_expr(child: &OptExpr, existing: &[OutputColumn]) ->
                 .unwrap_or_else(|| OutputColumn {
                     column_id: id,
                     name: format!("col_{}", idx + 1),
-                    data_type: DataType::Null,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Null,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
         })
@@ -217,8 +220,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }

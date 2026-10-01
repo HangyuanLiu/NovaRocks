@@ -259,8 +259,8 @@ fn opt_expr_output_columns(
                 columns.push(work.opaque(|| OutputColumn {
                     column_id: item.output_column_id,
                     name: item.output_name.clone(),
-                    data_type: scalars.data_type(item.expr).clone(),
-                    nullable: scalars.nullable(item.expr),
+                    value_type: scalars.value_type(item.expr).clone(),
+
                     is_internal: false,
                 })?);
             }
@@ -280,8 +280,11 @@ fn opt_expr_output_columns(
             vec![OutputColumn {
                 column_id: node.output_column_id,
                 name: node.column_name.clone(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }]
         }),
@@ -341,7 +344,7 @@ fn make_nullable(
 ) -> Result<(), SqlCompileError> {
     for column in columns {
         work.step()?;
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     Ok(())
 }
@@ -384,24 +387,26 @@ fn adapt_opt_expr_output_with_qualifier(
         .zip(target_output_columns.iter())
     {
         work.step()?;
-        if work.opaque(|| source.data_type != target.data_type)? {
+        if work.opaque(|| source.value_type.data_type != target.value_type.data_type)? {
             return Err(SqlCompileError::Compilation(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
-                target.name, source.data_type, target.data_type
+                target.name, source.value_type.data_type, target.value_type.data_type
             )));
         }
-        if source.nullable && !target.nullable {
+        if source.value_type.nullable && !target.value_type.nullable {
             return Err(SqlCompileError::Compilation(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
-                target.name, source.nullable, target.nullable
+                target.name, source.value_type.nullable, target.value_type.nullable
             )));
         }
         items.push(work.opaque(|| {
             scalars.remember_source_column_display(source.column_id, None, source.name.clone());
             let expr = scalars.intern(
                 ScalarNode::ColumnRef(source.column_id),
-                source.data_type.clone(),
-                target.nullable,
+                novarocks_type_contract::FunctionValueType {
+                    nullable: target.value_type.nullable,
+                    ..source.value_type.clone()
+                },
             );
             let expr_display = Some(ColumnDisplay {
                 qualifier: None,
@@ -462,24 +467,26 @@ fn adapt_cte_replacement_output_with_qualifier(
                 )
             })
             .map_err(SqlCompileError::Compilation)?;
-        if work.opaque(|| source.data_type != target.data_type)? {
+        if work.opaque(|| source.value_type.data_type != target.value_type.data_type)? {
             return Err(SqlCompileError::Compilation(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
-                target.name, source.data_type, target.data_type
+                target.name, source.value_type.data_type, target.value_type.data_type
             )));
         }
-        if source.nullable && !target.nullable {
+        if source.value_type.nullable && !target.value_type.nullable {
             return Err(SqlCompileError::Compilation(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
-                target.name, source.nullable, target.nullable
+                target.name, source.value_type.nullable, target.value_type.nullable
             )));
         }
         items.push(work.opaque(|| {
             scalars.remember_source_column_display(source.column_id, None, source.name.clone());
             let expr = scalars.intern(
                 ScalarNode::ColumnRef(source.column_id),
-                source.data_type.clone(),
-                target.nullable,
+                novarocks_type_contract::FunctionValueType {
+                    nullable: target.value_type.nullable,
+                    ..source.value_type.clone()
+                },
             );
             let expr_display = Some(ColumnDisplay {
                 qualifier: None,
@@ -511,8 +518,8 @@ fn adapt_cte_replacement_output_with_qualifier(
 fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
         && left.name == right.name
-        && left.data_type == right.data_type
-        && left.nullable == right.nullable
+        && left.value_type.data_type == right.value_type.data_type
+        && left.value_type.nullable == right.value_type.nullable
         && left.is_internal == right.is_internal
 }
 
@@ -556,8 +563,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(1),
                 name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             }],
             predicates: vec![],
@@ -571,8 +578,8 @@ mod tests {
         vec![OutputColumn {
             column_id: ColumnId::new_for_test(1),
             name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }]
     }
@@ -581,8 +588,8 @@ mod tests {
         vec![OutputColumn {
             column_id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }]
     }
@@ -673,8 +680,7 @@ mod tests {
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         }
     }
 
@@ -726,8 +732,14 @@ mod tests {
         assert_eq!(output.len(), consume_output_columns.len());
         assert_eq!(output[0].column_id, consume_output_columns[0].column_id);
         assert_eq!(output[0].name, consume_output_columns[0].name);
-        assert_eq!(output[0].data_type, consume_output_columns[0].data_type);
-        assert_eq!(output[0].nullable, consume_output_columns[0].nullable);
+        assert_eq!(
+            output[0].value_type.data_type,
+            consume_output_columns[0].value_type.data_type
+        );
+        assert_eq!(
+            output[0].value_type.nullable,
+            consume_output_columns[0].value_type.nullable
+        );
         let Operator::LogicalProject(project) = &rewritten.op else {
             panic!("expected Project adapter");
         };
@@ -736,8 +748,14 @@ mod tests {
         let materialized =
             crate::planner::optimizer_bridge::scalar::materialize(&arena, project.items[0].expr);
         let expected = column_ref(&output_columns()[0]);
-        assert_eq!(materialized.data_type, expected.data_type);
-        assert_eq!(materialized.nullable, expected.nullable);
+        assert_eq!(
+            materialized.value_type.data_type,
+            expected.value_type.data_type
+        );
+        assert_eq!(
+            materialized.value_type.nullable,
+            expected.value_type.nullable
+        );
         let ExprKind::ColumnRef {
             column_id,
             qualifier,
@@ -756,22 +774,22 @@ mod tests {
         let producer_sort_column = OutputColumn {
             column_id: ColumnId::new_for_test(10),
             name: "sort_key".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         };
         let producer_join_column = OutputColumn {
             column_id: ColumnId::new_for_test(11),
             name: "join_key".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         };
         let consumer_join_column = OutputColumn {
             column_id: ColumnId::new_for_test(42),
             name: "join_key".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         };
         let produce_input = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
@@ -819,8 +837,14 @@ mod tests {
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].column_id, consumer_join_column.column_id);
         assert_eq!(output[0].name, consumer_join_column.name);
-        assert_eq!(output[0].data_type, consumer_join_column.data_type);
-        assert_eq!(output[0].nullable, consumer_join_column.nullable);
+        assert_eq!(
+            output[0].value_type.data_type,
+            consumer_join_column.value_type.data_type
+        );
+        assert_eq!(
+            output[0].value_type.nullable,
+            consumer_join_column.value_type.nullable
+        );
         assert_eq!(output[0].is_internal, consumer_join_column.is_internal);
     }
 
@@ -1064,8 +1088,8 @@ mod tests {
             .map(|ordinal| OutputColumn {
                 column_id: ColumnId::new_for_test(ordinal + 1),
                 name: format!("v{ordinal}"),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             })
             .collect::<Vec<_>>();

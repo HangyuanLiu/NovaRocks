@@ -549,6 +549,7 @@ fn token(
         kind: FunctionKind::Scalar,
         selected: &selected,
         request: FunctionBindingRequest {
+            expected_result_type: None,
             arguments: &arguments,
             logical_argument_count: arguments.len(),
         },

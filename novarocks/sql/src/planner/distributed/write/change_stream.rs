@@ -391,15 +391,15 @@ mod tests {
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(1),
                 name: "before_value".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: true,
             },
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(2),
                 name: "effect".to_string(),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
                 is_internal: true,
             },
         ]
@@ -462,15 +462,15 @@ mod tests {
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(1),
                 name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: true,
             },
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(2),
                 name: "effect".to_string(),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
                 is_internal: true,
             },
         ];
@@ -502,15 +502,15 @@ mod tests {
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(1),
                 name: "sum_over_window".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(2),
                 name: "effect".to_string(),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
                 is_internal: true,
             },
         ];
@@ -600,29 +600,29 @@ mod tests {
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(1),
                 name: "OrderKey".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(2),
                 name: "orderkey".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(3),
                 name: "OrderKey".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: crate::column_id::ColumnId::new_for_test(4),
                 name: "effect".to_string(),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
                 is_internal: true,
             },
         ];

@@ -793,8 +793,11 @@ mod aggregate_stage_tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         }
     }
@@ -806,8 +809,10 @@ mod aggregate_stage_tests {
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 

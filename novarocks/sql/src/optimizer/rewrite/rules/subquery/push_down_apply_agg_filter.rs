@@ -386,8 +386,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, false),
         }
     }
 
@@ -398,8 +397,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, true),
         }
     }
 
@@ -411,8 +409,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -433,15 +430,21 @@ mod tests {
                     OutputColumn {
                         column_id: T2_K,
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: T2_V2,
                         name: "v2".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -488,8 +491,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,
                     name: "max(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -506,8 +512,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: OUTER_K,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -522,8 +531,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -651,13 +663,14 @@ mod tests {
                 op: BinOp::Gt,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(5)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let combined_pred = TypedExpr {
             kind: ExprKind::BinaryOp {
@@ -666,8 +679,7 @@ mod tests {
                 right: Box::new(residual_pred),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
         let inner = LogicalPlanNode::new(
@@ -689,8 +701,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,
                     name: "max(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -712,8 +727,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -786,8 +804,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: APPLY_OUT,
@@ -839,8 +860,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -909,8 +933,7 @@ mod tests {
                 right: Box::new(corr_pred_b),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
         // Extend make_t2_scan() with the two extra columns.
@@ -930,22 +953,31 @@ mod tests {
                     OutputColumn {
                         column_id: T2_A,
                         name: "a".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: T2_B,
                         name: "b".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: T2_V2,
                         name: "v2".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -985,8 +1017,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: SUM_RESULT,
                     name: "sum(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -1002,15 +1037,21 @@ mod tests {
                     OutputColumn {
                         column_id: OUTER1,
                         name: "a".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: OUTER2,
                         name: "b".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1026,8 +1067,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: SUM_RESULT,

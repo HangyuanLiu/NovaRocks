@@ -176,8 +176,7 @@ fn is_not_null(arena: &mut ScalarArena, operand: ScalarId) -> ScalarId {
             child: operand,
             negated: true,
         },
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     )
 }
 
@@ -193,8 +192,7 @@ fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> Scal
                 right: result,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            nullable,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
         );
     }
     result
@@ -315,8 +313,11 @@ mod tests {
                 .map(|(name, id, nullable)| OutputColumn {
                     column_id: ColumnId::new_for_test(*id),
                     name: name.to_string(),
-                    data_type: DataType::Int32,
-                    nullable: *nullable,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        *nullable,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -335,8 +336,7 @@ mod tests {
                 qualifier: Some(qualifier.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable),
         }
     }
 
@@ -348,8 +348,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -361,8 +360,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -553,16 +551,14 @@ mod tests {
                 expr: Box::new(col_typed("l", "a", 1, true)),
                 negated: true,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let not_null_pred_r = TypedExpr {
             kind: ExprKind::IsNull {
                 expr: Box::new(col_typed("r", "b", 2, true)),
                 negated: true,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let pred_l_id =
             crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &not_null_pred_l);
@@ -590,8 +586,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(1),
                 name: "a".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
                 is_internal: false,
             }],
             predicates: vec![pred_l_id],
@@ -620,8 +616,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(2),
                 name: "b".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
                 is_internal: false,
             }],
             predicates: vec![pred_r_id],
@@ -674,8 +670,10 @@ mod tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             };
             let plan = join_opt(
                 &mut arena,

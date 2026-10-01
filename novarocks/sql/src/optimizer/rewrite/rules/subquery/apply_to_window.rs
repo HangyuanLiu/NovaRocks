@@ -183,8 +183,10 @@ fn apply_plan_inner(
     let win_id = factory.borrow_mut().create(
         None,
         format!("{}_window", m.inner_agg.name),
-        m.inner_agg_output.data_type.clone(),
-        true,
+        novarocks_type_contract::FunctionValueType {
+            nullable: true,
+            ..m.inner_agg_output.value_type.clone()
+        },
     );
     let win_expr = crate::optimizer::operator::ScalarWindowSpec {
         output_column_id: win_id,
@@ -202,8 +204,11 @@ fn apply_plan_inner(
     let win_output = OutputColumn {
         column_id: win_id,
         name: format!("{}_window", m.inner_agg.name),
-        data_type: m.inner_agg_output.data_type.clone(),
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType {
+            nullable: true,
+            ..m.inner_agg_output.value_type.clone()
+        },
+
         is_internal: true,
     };
 
@@ -632,8 +637,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, false),
         }
     }
 
@@ -644,8 +648,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, true),
         }
     }
 
@@ -657,8 +660,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -670,8 +672,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -683,8 +684,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -696,24 +696,21 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Float64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         }
     }
 
     fn str_lit(s: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(s.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }
     }
 
     fn float_lit(v: f64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Float(v)),
-            data_type: DataType::Float64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         }
     }
 
@@ -738,22 +735,31 @@ mod tests {
                     OutputColumn {
                         column_id: L_ORDERKEY,
                         name: "l_orderkey".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: L_PARTKEY,
                         name: "l_partkey".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: L_QUANTITY,
                         name: "l_quantity".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Float64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -788,15 +794,21 @@ mod tests {
                     OutputColumn {
                         column_id: P_PARTKEY,
                         name: "p_partkey".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: P_BRAND,
                         name: "p_brand".to_string(),
-                        data_type: DataType::Utf8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -831,15 +843,21 @@ mod tests {
                     OutputColumn {
                         column_id: INNER_L_PARTKEY,
                         name: "l_partkey".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: INNER_L_QUANTITY,
                         name: "l_quantity".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Float64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -888,15 +906,21 @@ mod tests {
                     OutputColumn {
                         column_id: INNER_L_PARTKEY,
                         name: "l_partkey".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: AVG_RESULT,
                         name: "avg(l_quantity)".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Float64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -931,8 +955,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "avg_subq".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: AVG_RESULT,
@@ -1014,8 +1041,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "val_subq".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: VAL_ID,
@@ -1111,8 +1141,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: AVG_RESULT,
@@ -1148,8 +1181,11 @@ mod tests {
         let filter_over_join = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                 },
             }),
@@ -1652,15 +1688,21 @@ mod tests {
                     OutputColumn {
                         column_id: INNER_L_PARTKEY,
                         name: "l_partkey".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: INNER_L_QUANTITY,
                         name: "l_quantity".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Float64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1719,13 +1761,14 @@ mod tests {
                 op: BinOp::Gt,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(0)),
-                    data_type: DataType::Float64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let inner_with_filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
@@ -1785,13 +1828,14 @@ mod tests {
                 op: BinOp::Lt,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Float(999.0)),
-                    data_type: DataType::Float64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let inner_with_filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
@@ -1819,15 +1863,21 @@ mod tests {
                 OutputColumn {
                     column_id: INNER_L_PARTKEY,
                     name: "l_partkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 },
                 OutputColumn {
                     column_id: AVG_RESULT,
                     name: "avg(l_quantity)".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: false,
                 },
             ],
@@ -1844,8 +1894,11 @@ mod tests {
             output_column: OutputColumn {
                 column_id: APPLY_OUT,
                 name: "avg_subq".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Float64,
+                    true,
+                ),
+
                 is_internal: true,
             },
             inner_output_column_id: AVG_RESULT,
@@ -1867,13 +1920,14 @@ mod tests {
                 op: BinOp::Gt,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(100)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let pred = and_expr(
             and_expr(
@@ -1914,8 +1968,7 @@ mod tests {
                 right: Box::new(float_lit(1.0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Float64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         };
         // high = APPLY_OUT + 1.0
         let high_expr = TypedExpr {
@@ -1925,8 +1978,7 @@ mod tests {
                 right: Box::new(float_lit(1.0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Float64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         };
         let between_conjunct = TypedExpr {
             kind: ExprKind::Between {
@@ -1935,8 +1987,7 @@ mod tests {
                 high: Box::new(high_expr),
                 negated: false,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
         // Build the corr conjunct and Apply/Filter plan mirroring winmagic_filter_apply().
@@ -1951,8 +2002,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "avg_subq".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: AVG_RESULT,
@@ -2062,8 +2116,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: AVG_RESULT,
                     name: "avg(l_quantity)".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -2079,8 +2136,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "avg_subq".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 // inner_output_column_id == AVG_RESULT (no leading Project)

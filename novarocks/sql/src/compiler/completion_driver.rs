@@ -830,6 +830,7 @@ fn provider_or_ready_step(
         &physical,
         common.version,
         common.dop_domain,
+        common.functions.as_ref(),
         control,
     )
     .map_err(SqlCompileError::from)?;
@@ -1029,11 +1030,11 @@ fn provider_columns(
             ))
         })?;
         if logical.name != source.name
-            || logical.data_type != source.data_type
-            || logical.nullable != source.nullable
+            || logical.value_type.data_type != source.data_type
+            || logical.value_type.nullable != source.nullable
             || output.name != source.name
-            || output.data_type != source.data_type
-            || output.nullable != source.nullable
+            || output.value_type.data_type != source.data_type
+            || output.value_type.nullable != source.nullable
         {
             return Err(SqlCompileError::Compilation(format!(
                 "scan output '{}' differs from its exact provider schema column",
@@ -1109,6 +1110,7 @@ pub(super) fn resume_provider_read(
             state.common.version,
             state.common.dop_domain,
             reads,
+            state.common.functions.as_ref(),
             control,
         )
         .map_err(SqlCompileError::from)?;

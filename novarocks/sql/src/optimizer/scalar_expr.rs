@@ -196,8 +196,7 @@ fn combine_binary_bool(
                 right: result,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            nullable,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
         );
     }
     Some(result)
@@ -206,16 +205,14 @@ fn combine_binary_bool(
 pub(crate) fn bool_literal(arena: &mut ScalarArena, value: bool) -> ScalarId {
     arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(value))),
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     )
 }
 
 pub(crate) fn int_literal(arena: &mut ScalarArena, value: i64) -> ScalarId {
     arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     )
 }
 
@@ -843,8 +840,7 @@ mod tests {
     fn col(arena: &mut ScalarArena, id: u32, nullable: bool) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId(id)),
-            DataType::Int64,
-            nullable,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         )
     }
 
@@ -853,8 +849,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let expr = arena.intern(
             ScalarNode::ColumnRef(ColumnId::UNSET),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         assert_eq!(collect_column_ids_strict(&arena, expr), None);
@@ -872,8 +867,7 @@ mod tests {
                 right: b,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
 
         let mut parts = Vec::new();
@@ -894,18 +888,19 @@ mod tests {
         let mut arena = ScalarArena::new();
         let child = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
-            DataType::Decimal128(38, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
         );
-        let integer = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let integer = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let nullable = arena.intern(
             ScalarNode::Cast {
                 child: integer,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: OutputNull,
             },
-            DataType::Decimal128(9, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
         let throwing = arena.intern(
             ScalarNode::Cast {
@@ -913,8 +908,7 @@ mod tests {
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,
             },
-            DataType::Decimal128(9, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
         assert!(!can_fail(&arena, nullable));
         assert!(can_fail(&arena, throwing));
@@ -926,8 +920,7 @@ mod tests {
                 right: nullable,
                 decimal_overflow_policy: OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         assert!(can_fail(&arena, predicate));
         assert!(!contains_non_deterministic_function(&arena, predicate));
@@ -961,6 +954,7 @@ mod intrinsic_error_consumer_tests {
                 name,
                 FunctionKind::Scalar,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: args.len(),
                 },
@@ -970,6 +964,7 @@ mod intrinsic_error_consumer_tests {
             .validate_bound(
                 &binding,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: args.len(),
                 },
@@ -987,16 +982,21 @@ mod intrinsic_error_consumer_tests {
                 binding: binding.into(),
                 volatility,
             },
-            output.data_type,
-            output.nullable,
+            novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
         )
     }
 
     #[test]
     fn selected_intrinsic_fact_controls_effect_without_display_name_dispatch() {
         let mut arena = ScalarArena::new();
-        let text = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Utf8, true);
-        let boolean = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Boolean, true);
+        let text = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let boolean = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         let total = actual_call(&mut arena, "parse_json", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         assert!(!can_fail(&arena, total));
@@ -1007,18 +1007,17 @@ mod intrinsic_error_consumer_tests {
             unreachable!()
         };
         *name = "parse_json".into();
-        let renamed = arena.intern(
-            renamed,
-            arena.data_type(raises).clone(),
-            arena.nullable(raises),
-        );
+        let renamed = arena.intern(renamed, arena.value_type(raises).clone());
         assert!(can_fail(&arena, renamed));
     }
 
     #[test]
     fn independent_catching_fact_and_short_circuit_children_are_preserved() {
         let mut arena = ScalarArena::new();
-        let boolean = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Boolean, true);
+        let boolean = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         // A structurally valid custom ReturnsNull declaration may still expose its own
         // Result error. Catalog kind/fact validation is covered in binding tests.
@@ -1030,12 +1029,14 @@ mod intrinsic_error_consumer_tests {
         exact.semantics.failure_behavior =
             novarocks_functions::FunctionFailureBehavior::ReturnsNull;
         *binding = exact.into();
-        let catching = arena.intern(catching, DataType::Boolean, true);
+        let catching = arena.intern(
+            catching,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         assert!(can_fail(&arena, catching));
         let condition = arena.intern(
             ScalarNode::Literal(HashableLiteral(crate::analysis::LiteralValue::Bool(false))),
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let branch = arena.intern(
             ScalarNode::Case {
@@ -1043,8 +1044,7 @@ mod intrinsic_error_consumer_tests {
                 when_then: vec![(condition, catching)],
                 else_expr: Some(boolean),
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         assert!(can_fail(&arena, branch));
         let wrapper = arena.intern(
@@ -1052,8 +1052,7 @@ mod intrinsic_error_consumer_tests {
                 child: branch,
                 negated: false,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         assert!(can_fail(&arena, wrapper));
     }
@@ -1061,8 +1060,14 @@ mod intrinsic_error_consumer_tests {
     #[test]
     fn non_row_boundaries_retain_aggregate_and_window_ordering_child_effects() {
         let mut arena = ScalarArena::new();
-        let text = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Utf8, true);
-        let boolean = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Boolean, true);
+        let text = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let boolean = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        );
         let total = actual_call(&mut arena, "parse_json", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
         let order = |expr| SortKey {
@@ -1085,12 +1090,14 @@ mod intrinsic_error_consumer_tests {
                 order_by: vec![order(raises)],
                 resolved: aggregate.clone(),
             },
-            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                "item",
-                DataType::Boolean,
+            novarocks_type_contract::FunctionValueType::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Boolean,
+                    true,
+                ))),
                 true,
-            ))),
-            true,
+            ),
         );
         assert!(can_fail(&arena, agg));
         let binding = aggregate;
@@ -1113,12 +1120,14 @@ mod intrinsic_error_consumer_tests {
                     window_frame: None,
                     ignore_nulls: false,
                 },
-                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Boolean,
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        DataType::Boolean,
+                        true,
+                    ))),
                     true,
-                ))),
-                true,
+                ),
             );
             assert_eq!(can_fail(&arena, window), expected);
         }
@@ -1153,7 +1162,10 @@ mod intrinsic_cast_effect_tests {
             (DataType::Date32, DataType::Date32, false),
         ] {
             let mut arena = ScalarArena::new();
-            let child = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), source, true);
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(1)),
+                novarocks_type_contract::FunctionValueType::new(source, true),
+            );
             for policy in [
                 DecimalOverflowPolicy::OutputNull,
                 DecimalOverflowPolicy::ReportError,
@@ -1164,8 +1176,7 @@ mod intrinsic_cast_effect_tests {
                         target: target.clone(),
                         decimal_overflow_policy: policy,
                     },
-                    target.clone(),
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(target.clone(), true),
                 );
                 assert_eq!(can_fail(&arena, cast), expected);
             }
@@ -1223,8 +1234,14 @@ mod intrinsic_cast_effect_tests {
             DataType::Decimal256(76, 0),
             DataType::Float64,
         ] {
-            let left = arena.intern(ScalarNode::ColumnRef(ColumnId(51)), dtype.clone(), true);
-            let right = arena.intern(ScalarNode::ColumnRef(ColumnId(52)), dtype.clone(), true);
+            let left = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(51)),
+                novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
+            );
+            let right = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(52)),
+                novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
+            );
             for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
                 for policy in [OutputNull, ReportError] {
                     let expr = arena.intern(
@@ -1234,8 +1251,7 @@ mod intrinsic_cast_effect_tests {
                             right,
                             decimal_overflow_policy: policy,
                         },
-                        dtype.clone(),
-                        true,
+                        novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
                     );
                     let is_decimal =
                         matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
@@ -1288,15 +1304,17 @@ mod intrinsic_cast_effect_tests {
             ),
             (DataType::Int64, DataType::Decimal128(9, 0), false),
         ] {
-            let child = arena.intern(ScalarNode::ColumnRef(ColumnId(61)), source.clone(), true);
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(61)),
+                novarocks_type_contract::FunctionValueType::new(source.clone(), true),
+            );
             let cast = arena.intern(
                 ScalarNode::Cast {
                     child,
                     target: target.clone(),
                     decimal_overflow_policy: OutputNull,
                 },
-                target.clone(),
-                true,
+                novarocks_type_contract::FunctionValueType::new(target.clone(), true),
             );
             assert_eq!(can_fail(&arena, cast), expected, "{source:?} -> {target:?}");
         }

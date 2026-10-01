@@ -424,13 +424,13 @@ impl PlanUnpivotNode {
                         mapping.input_value_column_id
                     )
                 })?;
-            if input.data_type != value_output.data_type {
+            if input.value_type.data_type != value_output.value_type.data_type {
                 return Err(format!(
                     "Unpivot value mapping {index} type mismatch: input {:?}, output {:?}",
-                    input.data_type, value_output.data_type
+                    input.value_type.data_type, value_output.value_type.data_type
                 ));
             }
-            value_nullable |= input.nullable;
+            value_nullable |= input.value_type.nullable;
             if mapping.constants.len() != self.literal_output_column_ids.len() {
                 return Err(format!(
                     "Unpivot value mapping {index} literal count mismatch: expected {}, got {}",
@@ -439,10 +439,10 @@ impl PlanUnpivotNode {
                 ));
             }
         }
-        if value_output.nullable != value_nullable {
+        if value_output.value_type.nullable != value_nullable {
             return Err(format!(
                 "Unpivot value output column id {} nullability mismatch: expected {}, got {}",
-                self.value_output_column_id, value_nullable, value_output.nullable
+                self.value_output_column_id, value_nullable, value_output.value_type.nullable
             ));
         }
 
@@ -466,19 +466,19 @@ impl PlanUnpivotNode {
             let mut nullable = false;
             for (mapping_index, mapping) in self.value_mappings.iter().enumerate() {
                 let constant = &mapping.constants[literal_index];
-                if constant.data_type() != output.data_type {
+                if constant.data_type() != output.value_type.data_type {
                     return Err(format!(
                         "Unpivot value mapping {mapping_index} constant {literal_index} type mismatch: constant {:?}, output {:?}",
                         constant.data_type(),
-                        output.data_type
+                        output.value_type.data_type
                     ));
                 }
                 nullable |= constant.nullable();
             }
-            if output.nullable != nullable {
+            if output.value_type.nullable != nullable {
                 return Err(format!(
                     "Unpivot literal output column id {output_id} nullability mismatch: expected {nullable}, got {}",
-                    output.nullable
+                    output.value_type.nullable
                 ));
             }
         }
@@ -517,15 +517,17 @@ fn require_exact_column_shape(
     input: &OutputColumn,
     output: &OutputColumn,
 ) -> Result<(), String> {
-    if input.data_type != output.data_type || input.nullable != output.nullable {
+    if input.value_type.data_type != output.value_type.data_type
+        || input.value_type.nullable != output.value_type.nullable
+    {
         Err(format!(
             "Unpivot {role} column shape mismatch: input id {} is {:?} nullable={}, output id {} is {:?} nullable={}",
             input.column_id,
-            input.data_type,
-            input.nullable,
+            input.value_type.data_type,
+            input.value_type.nullable,
             output.column_id,
-            output.data_type,
-            output.nullable
+            output.value_type.data_type,
+            output.value_type.nullable
         ))
     } else {
         Ok(())
@@ -541,8 +543,8 @@ mod unpivot_tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -550,8 +552,7 @@ mod unpivot_tests {
     fn string_literal(value: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }
     }
 

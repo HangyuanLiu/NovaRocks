@@ -37,11 +37,14 @@
 //! 4. **Polymorphic widening.** Signatures that opt in to widening can
 //!    merge repeated `Any(name)` bindings through `wider_type`.
 
-use crate::{FunctionResolutionError, ResolvedFunctionSignature};
+use crate::{FunctionResolutionError, FunctionValueType, ResolvedFunctionSignature};
 use arrow_schema::DataType;
 
 use super::registry;
-use super::signature::{BindMode, Bindings, Signature, TypeSpec, anchor_matches, realize, unify};
+use super::signature::{
+    BindMode, Bindings, Signature, TypeSpec, anchor_matches, realize, realize_value, unify,
+    unify_value,
+};
 
 pub type ResolvedScalarFunction = ResolvedFunctionSignature;
 
@@ -168,6 +171,134 @@ pub fn resolve_scalar_function_signature_at_overload(
         candidates: 1,
         binding_enforced: signature.argument_binding.is_enforced(),
     })
+}
+
+/// Exact value-domain signature instantiated by the builtin declaration owner.
+/// The legacy DataType resolver is only a carrier projection; executable
+/// binding uses this path for both selection and selected-overload validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedScalarValueSignature {
+    pub argument_types: Vec<FunctionValueType>,
+    pub return_type: FunctionValueType,
+    pub enforce_argument_binding: bool,
+}
+
+pub fn resolve_scalar_value_signature_with_overload(
+    name: &str,
+    arguments: &[FunctionValueType],
+) -> Result<(usize, ResolvedScalarValueSignature), ResolveError> {
+    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
+    let carriers = arguments
+        .iter()
+        .map(|ty| ty.data_type.clone())
+        .collect::<Vec<_>>();
+    for pass in 0..5 {
+        for (index, signature) in candidates.iter().enumerate() {
+            if let Some(resolved) = value_signature_in_pass(signature, arguments, &carriers, pass)?
+            {
+                return Ok((index, resolved));
+            }
+        }
+    }
+    Err(ResolveError::NoMatchingSignature {
+        candidates: candidates.len(),
+        binding_enforced: binding_enforced_for_arity(candidates, arguments.len()),
+    })
+}
+
+pub fn resolve_scalar_value_signature_at_overload(
+    name: &str,
+    overload_index: usize,
+    arguments: &[FunctionValueType],
+) -> Result<ResolvedScalarValueSignature, ResolveError> {
+    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
+    let signature = candidates
+        .get(overload_index)
+        .ok_or_else(|| ResolveError::BadSignature("selected overload index is unknown".into()))?;
+    let carriers = arguments
+        .iter()
+        .map(|ty| ty.data_type.clone())
+        .collect::<Vec<_>>();
+    for pass in 0..5 {
+        if let Some(resolved) = value_signature_in_pass(signature, arguments, &carriers, pass)? {
+            return Ok(resolved);
+        }
+    }
+    Err(ResolveError::NoMatchingSignature {
+        candidates: 1,
+        binding_enforced: signature.argument_binding.is_enforced(),
+    })
+}
+
+fn value_signature_in_pass(
+    signature: &Signature,
+    arguments: &[FunctionValueType],
+    carriers: &[DataType],
+    pass: u8,
+) -> Result<Option<ResolvedScalarValueSignature>, ResolveError> {
+    let mut carrier_bindings = Bindings::default();
+    let carrier_match = match pass {
+        0 => strict_matches(signature, carriers),
+        1 => polymorphic_matches(signature, carriers, &mut carrier_bindings, BindMode::Strict),
+        2 => integer_widening_matches(signature, carriers),
+        3 => concrete_cast_matches(signature, carriers),
+        4 => {
+            signature.widening
+                && polymorphic_matches(
+                    signature,
+                    carriers,
+                    &mut carrier_bindings,
+                    BindMode::Widening,
+                )
+        }
+        _ => unreachable!("closed resolver pass"),
+    };
+    if !carrier_match {
+        return Ok(None);
+    }
+    let mode = if pass == 4 {
+        BindMode::Widening
+    } else {
+        BindMode::Strict
+    };
+    let mut bindings = Bindings::default();
+    for (index, actual) in arguments.iter().enumerate() {
+        if !unify_value(
+            signature_spec_at(signature, index),
+            actual,
+            &mut bindings,
+            mode,
+        ) {
+            return Ok(None);
+        }
+    }
+    let argument_types = arguments
+        .iter()
+        .enumerate()
+        .map(
+            |(index, actual)| match signature_spec_at(signature, index) {
+                TypeSpec::AnyType | TypeSpec::AnyDecimal128 => Ok(actual.clone()),
+                spec => realize_value(spec, &bindings, actual.nullable)
+                    .map_err(ResolveError::BadSignature),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    if arguments
+        .iter()
+        .zip(&argument_types)
+        .any(|(source, target)| {
+            !super::value_conversion::assignment_domains_authorized(source, target)
+        })
+    {
+        return Ok(None);
+    }
+    let return_type =
+        realize_value(&signature.ret, &bindings, true).map_err(ResolveError::BadSignature)?;
+    Ok(Some(ResolvedScalarValueSignature {
+        argument_types,
+        return_type,
+        enforce_argument_binding: signature.argument_binding.is_enforced(),
+    }))
 }
 
 fn binding_enforced_for_arity(candidates: &[Signature], n_args: usize) -> bool {
@@ -304,6 +435,7 @@ fn integer_widens_losslessly(spec: &TypeSpec, actual: &DataType) -> bool {
         TypeSpec::Int16 => 2,
         TypeSpec::Int32 => 4,
         TypeSpec::Int64 => 8,
+        TypeSpec::LargeInt => 16,
         _ => return false,
     };
     width(actual).is_some_and(|actual_width| actual_width < spec_width)

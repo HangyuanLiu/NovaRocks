@@ -374,8 +374,7 @@ mod aggregate_wire_tests {
                 .into_iter()
                 .map(|data_type| TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
                 })
                 .collect(),
             distinct,

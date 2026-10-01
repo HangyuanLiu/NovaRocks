@@ -25,7 +25,9 @@
 
 use std::sync::Arc;
 
+use crate::FunctionValueType;
 use arrow_schema::{DataType, Field};
+use novarocks_type_contract::ValueLogicalType;
 
 /// Structural type used in registered function signatures.
 ///
@@ -398,15 +400,42 @@ pub(crate) enum BindMode {
 /// Type-variable bindings produced by polymorphic matching.
 #[derive(Default, Debug)]
 pub(crate) struct Bindings {
-    entries: Vec<(&'static str, DataType)>,
+    entries: Vec<(&'static str, FunctionValueType)>,
 }
 
 impl Bindings {
+    pub(crate) fn lookup_value(&self, name: &str) -> Option<FunctionValueType> {
+        self.entries
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ty)| ty.clone())
+    }
+
+    pub(crate) fn bind_value(
+        &mut self,
+        name: &'static str,
+        ty: &FunctionValueType,
+        mode: BindMode,
+    ) -> bool {
+        if let Some(existing) = self.lookup_value(name) {
+            let Some(merged) = merge_value_types(&existing, ty, matches!(mode, BindMode::Widening))
+            else {
+                return false;
+            };
+            if let Some(entry) = self.entries.iter_mut().find(|(n, _)| *n == name) {
+                entry.1 = merged;
+            }
+        } else {
+            self.entries.push((name, ty.clone()));
+        }
+        true
+    }
+
     pub(crate) fn lookup(&self, name: &str) -> Option<DataType> {
         self.entries
             .iter()
             .find(|(n, _)| *n == name)
-            .map(|(_, dt)| dt.clone())
+            .map(|(_, ty)| ty.data_type.clone())
     }
 
     /// Try to bind `name` to `dt`. If `name` was already bound, the two
@@ -423,7 +452,8 @@ impl Bindings {
             }
             return true;
         }
-        self.entries.push((name, dt.clone()));
+        self.entries
+            .push((name, FunctionValueType::new(dt.clone(), true)));
         true
     }
 
@@ -435,14 +465,15 @@ impl Bindings {
     /// has to realize a return type, and NULL is the honest answer there.
     pub(crate) fn bind_null(&mut self, name: &'static str) {
         if self.lookup(name).is_none() {
-            self.entries.push((name, DataType::Null));
+            self.entries
+                .push((name, FunctionValueType::new(DataType::Null, true)));
         }
     }
 
     fn replace(&mut self, name: &str, dt: &DataType) {
         for entry in self.entries.iter_mut() {
             if entry.0 == name {
-                entry.1 = dt.clone();
+                entry.1 = FunctionValueType::new(dt.clone(), entry.1.nullable);
             }
         }
     }
@@ -463,12 +494,13 @@ impl Bindings {
             let widened = novarocks_type_contract::wider_type(&existing, dt);
             for entry in self.entries.iter_mut() {
                 if entry.0 == name {
-                    entry.1 = widened.clone();
+                    entry.1 = FunctionValueType::new(widened.clone(), entry.1.nullable);
                 }
             }
             return true;
         }
-        self.entries.push((name, dt.clone()));
+        self.entries
+            .push((name, FunctionValueType::new(dt.clone(), true)));
         true
     }
 }
@@ -621,6 +653,334 @@ pub(crate) fn unify(
         // For anchor specs, fall back to the no-bindings matcher.
         _ => anchor_matches(spec, dt),
     }
+}
+
+/// Merge the actual value identities; NULL remains undecided. Carrier widening
+/// is used only after every already-decided logical domain agrees, or the
+/// exact value conversion owner admits the selected common-domain targets. This API
+/// does not provide a preparation allocation or cooperative-work receipt.
+pub(crate) fn merge_value_types(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    widening: bool,
+) -> Option<FunctionValueType> {
+    left.validate().ok()?;
+    right.validate().ok()?;
+    if left.data_type == DataType::Null {
+        let mut result = right.clone();
+        result.nullable |= left.nullable;
+        return Some(result);
+    }
+    if right.data_type == DataType::Null {
+        let mut result = left.clone();
+        result.nullable |= right.nullable;
+        return Some(result);
+    }
+    let (logical_type, domain_carrier) = if left.logical_type == right.logical_type {
+        (left.logical_type, None)
+    } else if widening {
+        match (left.logical_type, right.logical_type) {
+            (ValueLogicalType::Json, ValueLogicalType::Physical)
+            | (ValueLogicalType::Physical, ValueLogicalType::Json)
+                if left.data_type == DataType::Utf8 && right.data_type == DataType::Utf8 =>
+            {
+                (ValueLogicalType::Physical, Some(DataType::Utf8))
+            }
+            (ValueLogicalType::LargeInt, ValueLogicalType::Physical)
+                if matches!(
+                    right.data_type,
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                ) =>
+            {
+                (ValueLogicalType::LargeInt, Some(left.data_type.clone()))
+            }
+            (ValueLogicalType::Physical, ValueLogicalType::LargeInt)
+                if matches!(
+                    left.data_type,
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                ) =>
+            {
+                (ValueLogicalType::LargeInt, Some(right.data_type.clone()))
+            }
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    let data_type = if let Some(carrier) = domain_carrier {
+        carrier
+    } else if let Some(merged) = merge_undecided_types(&left.data_type, &right.data_type) {
+        restore_domains(merged, &left.data_type, &right.data_type, widening)?
+    } else if widening {
+        restore_domains(
+            novarocks_type_contract::wider_type(&left.data_type, &right.data_type),
+            &left.data_type,
+            &right.data_type,
+            widening,
+        )?
+    } else {
+        return None;
+    };
+    let result = FunctionValueType::try_with_logical_type(
+        data_type,
+        left.nullable || right.nullable,
+        logical_type,
+    )
+    .ok()?;
+    (super::value_conversion::assignment_domains_authorized(left, &result)
+        && super::value_conversion::assignment_domains_authorized(right, &result))
+    .then_some(result)
+}
+
+fn restore_domains(
+    target: DataType,
+    left: &DataType,
+    right: &DataType,
+    widening: bool,
+) -> Option<DataType> {
+    if left == &DataType::Null {
+        return Some(right.clone());
+    }
+    if right == &DataType::Null {
+        return Some(left.clone());
+    }
+    fn field(target: &Field, left: &Field, right: &Field, widening: bool) -> Option<Arc<Field>> {
+        let left_domain = novarocks_type_contract::field_logical_type(left).ok()?;
+        let right_domain = novarocks_type_contract::field_logical_type(right).ok()?;
+        let decided = if left.data_type() == &DataType::Null {
+            right
+        } else {
+            left
+        };
+        if left.data_type() != &DataType::Null
+            && right.data_type() != &DataType::Null
+            && left_domain != right_domain
+        {
+            let value = merge_value_types(
+                &field_value_type(left)?,
+                &field_value_type(right)?,
+                widening,
+            )?;
+            let mut metadata = left.metadata().clone();
+            if value.logical_type != left_domain {
+                if left_domain != ValueLogicalType::Json
+                    || value.logical_type != ValueLogicalType::Physical
+                {
+                    return None;
+                }
+                metadata.remove(novarocks_type_contract::NR_LOGICAL_TYPE_KEY);
+            }
+            return Some(Arc::new(
+                left.clone()
+                    .with_data_type(value.data_type)
+                    .with_nullable(target.is_nullable())
+                    .with_metadata(metadata),
+            ));
+        }
+        let data_type = restore_domains(
+            target.data_type().clone(),
+            left.data_type(),
+            right.data_type(),
+            widening,
+        )?;
+        let result = decided
+            .clone()
+            .with_name(target.name())
+            .with_data_type(data_type)
+            .with_nullable(target.is_nullable());
+        novarocks_type_contract::field_logical_type(&result).ok()?;
+        Some(Arc::new(result))
+    }
+    match (&target, left, right) {
+        (DataType::List(t), DataType::List(l), DataType::List(r)) => {
+            Some(DataType::List(field(t, l, r, widening)?))
+        }
+        (DataType::LargeList(t), DataType::LargeList(l), DataType::LargeList(r)) => {
+            Some(DataType::LargeList(field(t, l, r, widening)?))
+        }
+        (DataType::Map(t, sorted), DataType::Map(l, _), DataType::Map(r, _)) => {
+            Some(DataType::Map(field(t, l, r, widening)?, *sorted))
+        }
+        (DataType::Struct(t), DataType::Struct(l), DataType::Struct(r))
+            if t.len() == l.len() && l.len() == r.len() =>
+        {
+            let by_name = l
+                .iter()
+                .all(|f| r.iter().any(|other| other.name() == f.name()));
+            let fields = t
+                .iter()
+                .zip(l.iter())
+                .enumerate()
+                .map(|(index, (t, l))| {
+                    let r = if by_name {
+                        r.iter().find(|f| f.name() == l.name())?
+                    } else {
+                        &r[index]
+                    };
+                    field(t, l, r, widening)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(DataType::Struct(fields.into()))
+        }
+        _ => {
+            if !novarocks_type_contract::preserves_nested_logical_identity(left, &target)
+                || !novarocks_type_contract::preserves_nested_logical_identity(right, &target)
+            {
+                return None;
+            }
+            Some(target)
+        }
+    }
+}
+
+pub(crate) fn field_value_type(field: &Field) -> Option<FunctionValueType> {
+    FunctionValueType::try_with_logical_type(
+        field.data_type().clone(),
+        field.is_nullable(),
+        novarocks_type_contract::field_logical_type(field).ok()?,
+    )
+    .ok()
+}
+
+pub(crate) fn value_field(name: &str, ty: &FunctionValueType, nullable: bool) -> Field {
+    let field = Field::new(name, ty.data_type.clone(), nullable);
+    match ty.logical_type.metadata_value() {
+        Some(logical) => field.with_metadata(
+            [(
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
+                logical.to_string(),
+            )]
+            .into(),
+        ),
+        None => field,
+    }
+}
+
+/// Bind one actual argument against the existing declaration vocabulary.
+/// Coercion targets were admitted by the carrier resolver; logical identities
+/// are checked independently and never inferred from those target carriers.
+pub(crate) fn unify_value(
+    spec: &TypeSpec,
+    ty: &FunctionValueType,
+    bindings: &mut Bindings,
+    mode: BindMode,
+) -> bool {
+    if ty.validate().is_err() {
+        return false;
+    }
+    match spec {
+        TypeSpec::Any(name) => bindings.bind_value(name, ty, mode),
+        TypeSpec::AnyType => true,
+        TypeSpec::Decimal128Of(name) => {
+            ty.logical_type == ValueLogicalType::Physical
+                && matches!(ty.data_type, DataType::Decimal128(..))
+                && bindings.bind_value(name, ty, mode)
+        }
+        TypeSpec::List(inner) if ty.data_type == DataType::Null => {
+            bind_nothing_but_open(inner, bindings);
+            true
+        }
+        TypeSpec::Map(key, value) if ty.data_type == DataType::Null => {
+            bind_nothing_but_open(key, bindings);
+            bind_nothing_but_open(value, bindings);
+            true
+        }
+        TypeSpec::List(inner) => {
+            if ty.logical_type != ValueLogicalType::Physical {
+                return false;
+            }
+            match &ty.data_type {
+                DataType::List(item) | DataType::LargeList(item) => field_value_type(item)
+                    .is_some_and(|item| unify_value(inner, &item, bindings, mode)),
+                _ => false,
+            }
+        }
+        TypeSpec::Map(key, value) => {
+            if ty.logical_type != ValueLogicalType::Physical {
+                return false;
+            }
+            let DataType::Map(entries, _) = &ty.data_type else {
+                return false;
+            };
+            let DataType::Struct(fields) = entries.data_type() else {
+                return false;
+            };
+            fields.len() == 2
+                && field_value_type(&fields[0])
+                    .is_some_and(|key_ty| unify_value(key, &key_ty, bindings, mode))
+                && field_value_type(&fields[1])
+                    .is_some_and(|value_ty| unify_value(value, &value_ty, bindings, mode))
+        }
+        TypeSpec::LargeInt => {
+            ty.data_type == DataType::Null
+                || (ty.logical_type == ValueLogicalType::LargeInt
+                    && anchor_matches(spec, &ty.data_type))
+                || realize_value(spec, bindings, ty.nullable).is_ok_and(|target| {
+                    super::value_conversion::resolve_value_conversion(ty, &target).is_ok()
+                })
+        }
+        TypeSpec::Utf8 if ty.logical_type == ValueLogicalType::Json => {
+            super::value_conversion::resolve_value_conversion(
+                ty,
+                &FunctionValueType::new(DataType::Utf8, ty.nullable),
+            )
+            .is_ok()
+        }
+        _ => ty.logical_type == ValueLogicalType::Physical,
+    }
+}
+
+pub(crate) fn realize_value(
+    spec: &TypeSpec,
+    bindings: &Bindings,
+    nullable: bool,
+) -> Result<FunctionValueType, String> {
+    let mut result = match spec {
+        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => bindings
+            .lookup_value(name)
+            .ok_or_else(|| format!("value type variable {name} is unbound"))?,
+        TypeSpec::AnyType | TypeSpec::AnyDecimal128 => {
+            return Err("wildcard has no intrinsic result type".into());
+        }
+        TypeSpec::LargeInt => FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH),
+            nullable,
+            ValueLogicalType::LargeInt,
+        )
+        .map_err(|error| error.to_string())?,
+        TypeSpec::List(inner) => {
+            let item = realize_value(inner, bindings, true)?;
+            FunctionValueType::new(
+                DataType::List(Arc::new(value_field("item", &item, true))),
+                nullable,
+            )
+        }
+        TypeSpec::Map(key, value) => {
+            let key = realize_value(key, bindings, true)?;
+            let value = realize_value(value, bindings, true)?;
+            FunctionValueType::new(
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(value_field("key", &key, true)),
+                                Arc::new(value_field("value", &value, true)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                nullable,
+            )
+        }
+        _ => FunctionValueType::new(realize(spec, bindings)?, nullable),
+    };
+    result.nullable = nullable;
+    result.validate().map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 #[cfg(test)]

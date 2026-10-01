@@ -602,16 +602,14 @@ pub(crate) enum SqlImvAggregateStateRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvAggregateVisibleColumn {
     pub(crate) name: String,
-    pub(crate) data_type: arrow::datatypes::DataType,
-    pub(crate) nullable: bool,
+    pub(crate) value_type: novarocks_type_contract::FunctionValueType,
 }
 
 /// One physical state column in an aggregate refresh layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvAggregateStateColumn {
     pub(crate) name: String,
-    pub(crate) data_type: arrow::datatypes::DataType,
-    pub(crate) nullable: bool,
+    pub(crate) value_type: novarocks_type_contract::FunctionValueType,
     pub(crate) visible_source_index: usize,
     pub(crate) aggregate_index: usize,
     pub(crate) function: crate::mv_refresh::AggregateFunctionKind,
@@ -1403,18 +1401,13 @@ pub struct SqlImvAggregateVisibleColumnFacts {
 impl SqlImvAggregateVisibleColumnFacts {
     pub fn try_new(
         name: String,
-        data_type: arrow::datatypes::DataType,
-        nullable: bool,
+        value_type: novarocks_type_contract::FunctionValueType,
     ) -> Result<Self, String> {
         if name.trim().is_empty() {
             return Err("IMV aggregate visible-column facts are invalid".to_string());
         }
         Ok(Self {
-            inner: SqlImvAggregateVisibleColumn {
-                name,
-                data_type,
-                nullable,
-            },
+            inner: SqlImvAggregateVisibleColumn { name, value_type },
         })
     }
 }
@@ -1428,8 +1421,7 @@ impl SqlImvAggregateExecutionStateColumnFacts {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         name: String,
-        data_type: arrow::datatypes::DataType,
-        nullable: bool,
+        value_type: novarocks_type_contract::FunctionValueType,
         visible_source_index: usize,
         aggregate_index: usize,
         function: crate::mv_refresh::AggregateFunctionKind,
@@ -1442,8 +1434,7 @@ impl SqlImvAggregateExecutionStateColumnFacts {
         Ok(Self {
             inner: SqlImvAggregateStateColumn {
                 name,
-                data_type,
-                nullable,
+                value_type,
                 visible_source_index,
                 aggregate_index,
                 function,
@@ -1883,13 +1874,17 @@ pub(crate) fn test_aggregate_snapshot(
             visible_columns: vec![
                 SqlImvAggregateVisibleColumn {
                     name: "k".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 },
                 SqlImvAggregateVisibleColumn {
                     name: "s".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
                 },
             ],
             state_columns: state_columns
@@ -1897,12 +1892,15 @@ pub(crate) fn test_aggregate_snapshot(
                 .enumerate()
                 .map(|(index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
-                    data_type: if column.type_signature == "long" {
-                        arrow::datatypes::DataType::Int64
-                    } else {
-                        arrow::datatypes::DataType::Binary
-                    },
-                    nullable: column.role == SqlImvAggregateStateRoleContract::Single,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        if column.type_signature == "long" {
+                            arrow::datatypes::DataType::Int64
+                        } else {
+                            arrow::datatypes::DataType::Binary
+                        },
+                        column.role == SqlImvAggregateStateRoleContract::Single,
+                    ),
+
                     visible_source_index: 1,
                     aggregate_index: index,
                     function: crate::mv_refresh::AggregateFunctionKind::Sum,
@@ -2096,13 +2094,17 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             visible_columns: vec![
                 SqlImvAggregateVisibleColumn {
                     name: "k".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 },
                 SqlImvAggregateVisibleColumn {
                     name: "s".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
                 },
             ],
             state_columns: state_columns
@@ -2110,12 +2112,15 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 .enumerate()
                 .map(|(aggregate_index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
-                    data_type: if column.type_signature == "long" {
-                        arrow::datatypes::DataType::Int64
-                    } else {
-                        arrow::datatypes::DataType::Binary
-                    },
-                    nullable: column.role == SqlImvAggregateStateRoleContract::Single,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        if column.type_signature == "long" {
+                            arrow::datatypes::DataType::Int64
+                        } else {
+                            arrow::datatypes::DataType::Binary
+                        },
+                        column.role == SqlImvAggregateStateRoleContract::Single,
+                    ),
+
                     visible_source_index: 1,
                     aggregate_index,
                     function: crate::mv_refresh::AggregateFunctionKind::Sum,

@@ -147,8 +147,7 @@ fn normalize_correlated_on_predicate_inner_opt(
                     right,
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             )
         }
         ScalarNode::BinaryOp {
@@ -187,8 +186,10 @@ fn normalize_correlated_on_predicate_inner_opt(
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
-                            inner_type,
-                            arena.nullable(right),
+                            novarocks_type_contract::FunctionValueType::new(
+                                inner_type,
+                                arena.nullable(right),
+                            ),
                         );
                     }
                     arena.intern(
@@ -198,8 +199,7 @@ fn normalize_correlated_on_predicate_inner_opt(
                             right: left,
                             decimal_overflow_policy,
                         },
-                        data_type,
-                        nullable,
+                        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                     )
                 }
                 _ => predicate,
@@ -392,11 +392,7 @@ mod legacy {
         predicate: TypedExpr,
         outer_ids: &HashSet<ColumnId>,
     ) -> TypedExpr {
-        let TypedExpr {
-            kind,
-            data_type,
-            nullable,
-        } = predicate;
+        let TypedExpr { kind, value_type } = predicate;
         match kind {
             ExprKind::BinaryOp {
                 left,
@@ -410,8 +406,7 @@ mod legacy {
                     right: Box::new(normalize_correlated_on_predicate_inner(*right, outer_ids)),
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
+                value_type: value_type,
             },
             ExprKind::BinaryOp {
                 left,
@@ -444,17 +439,19 @@ mod legacy {
                             right,
                             decimal_overflow_policy,
                         },
-                        data_type,
-                        nullable,
+                        value_type: value_type,
                     },
                     (false, true) => {
-                        let inner_type = left.data_type.clone();
+                        let inner_type = left.value_type.data_type.clone();
                         let inner_expr = *left;
                         let mut outer_expr = *right;
-                        if outer_expr.data_type != inner_type {
+                        if outer_expr.value_type.data_type != inner_type {
                             outer_expr = TypedExpr {
-                                data_type: inner_type.clone(),
-                                nullable: outer_expr.nullable,
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    inner_type.clone(),
+                                    outer_expr.value_type.nullable,
+                                ),
+
                                 kind: ExprKind::Cast {
                                     expr: Box::new(outer_expr),
                                     target: inner_type,
@@ -470,8 +467,7 @@ mod legacy {
                                 right: Box::new(inner_expr),
                                 decimal_overflow_policy,
                             },
-                            data_type,
-                            nullable,
+                            value_type: value_type,
                         }
                     }
                     _ => TypedExpr {
@@ -481,15 +477,13 @@ mod legacy {
                             right,
                             decimal_overflow_policy,
                         },
-                        data_type,
-                        nullable,
+                        value_type: value_type,
                     },
                 }
             }
             kind => TypedExpr {
                 kind,
-                data_type,
-                nullable,
+                value_type: value_type,
             },
         }
     }
@@ -546,8 +540,7 @@ mod legacy {
                             qualifier: None,
                             column: output.name.clone(),
                         },
-                        data_type: output.data_type.clone(),
-                        nullable: output.nullable,
+                        value_type: output.value_type.clone(),
                     },
                     output_name: output.name,
                     output_column_id: output.column_id,
@@ -593,8 +586,7 @@ mod legacy {
     pub(super) fn literal_true() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -608,8 +600,7 @@ mod legacy {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 }
@@ -651,8 +642,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: INNER_K,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 predicates: vec![],
@@ -672,8 +666,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -684,8 +677,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
@@ -697,8 +689,7 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -710,8 +701,7 @@ mod tests {
                 right: Box::new(typed_col_ref(OUTER_K, "k", outer_type)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -723,8 +713,7 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -749,8 +738,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "1".to_string(),
                     output_column_id: CONST_ONE,

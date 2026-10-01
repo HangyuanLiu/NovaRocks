@@ -120,8 +120,10 @@ impl<'a> super::AnalyzerContext<'a> {
                                         qualifier: None,
                                         column: col_name.clone(),
                                     },
-                                    data_type: left_dt,
-                                    nullable: left_nullable,
+                                    value_type: novarocks_type_contract::FunctionValueType::new(
+                                        left_dt,
+                                        left_nullable,
+                                    ),
                                 }
                             };
                         let right_ref = TypedExpr {
@@ -130,12 +132,17 @@ impl<'a> super::AnalyzerContext<'a> {
                                 qualifier: None,
                                 column: col_name,
                             },
-                            data_type: right_dt,
-                            nullable: right_nullable,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                right_dt,
+                                right_nullable,
+                            ),
                         };
                         conds.push(TypedExpr {
-                            data_type: DataType::Boolean,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Boolean,
+                                false,
+                            ),
+
                             kind: ExprKind::BinaryOp {
                                 left: Box::new(left_ref),
                                 op: BinOp::Eq,
@@ -152,8 +159,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         while let Some(prev) = conds.pop() {
                             self.check_control()?;
                             result = TypedExpr {
-                                data_type: DataType::Boolean,
-                                nullable: false,
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Boolean,
+                                    false,
+                                ),
+
                                 kind: ExprKind::BinaryOp {
                                     left: Box::new(prev),
                                     op: BinOp::And,
@@ -228,12 +238,12 @@ impl<'a> super::AnalyzerContext<'a> {
                                 let name_lower = name.to_lowercase();
                                 let left_q = current_scope
                                     .iter_columns()
-                                    .find(|(_, n, _, _, _)| n.to_lowercase() == name_lower)
-                                    .and_then(|(q, _, _, _, _)| q.clone());
+                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
+                                    .and_then(|(q, _, _, _)| q.clone());
                                 let right_q = right_scope
                                     .iter_columns()
-                                    .find(|(_, n, _, _, _)| n.to_lowercase() == name_lower)
-                                    .and_then(|(q, _, _, _, _)| q.clone());
+                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
+                                    .and_then(|(q, _, _, _)| q.clone());
                                 match (left_q, right_q) {
                                     (Some(l), Some(r)) => out.push((name, l, r)),
                                     _ => {
@@ -422,8 +432,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     // as `Relation::Scan`).
                     let column_ids: Vec<crate::column_id::ColumnId> = cols
                         .iter()
-                        .map(|col| scope.add_table_column(Some(qualifier), col))
-                        .collect();
+                        .map(|col| scope.add_table_column(Some(qualifier), col, self.control))
+                        .collect::<Result<Vec<_>, AnalyzeError>>()?;
 
                     let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
                         database: db_lower,
@@ -489,29 +499,16 @@ impl<'a> super::AnalyzerContext<'a> {
                             .into_iter()
                             .map(|col| {
                                 self.check_control()?;
-                                let logical_type =
-                                    self.factory.borrow().logical_type(col.column_id);
-                                let json_list = self
-                                    .factory
-                                    .borrow()
-                                    .has_json_list_provenance(col.column_id);
                                 let new_id = self.alloc_column_id(
                                     Some(alias_name.clone()),
                                     col.name.clone(),
-                                    col.data_type.clone(),
-                                    col.nullable,
+                                    col.value_type.clone(),
                                 );
-                                self.factory
-                                    .borrow_mut()
-                                    .set_logical_type(new_id, logical_type);
-                                self.factory
-                                    .borrow_mut()
-                                    .set_json_list_provenance(new_id, json_list);
                                 Ok(OutputColumn {
                                     column_id: new_id,
                                     name: col.name,
-                                    data_type: col.data_type,
-                                    nullable: col.nullable,
+                                    value_type: col.value_type.clone(),
+
                                     is_internal: false,
                                 })
                             })
@@ -523,8 +520,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                 Some(&alias_name),
                                 &col.name,
                                 col.column_id,
-                                col.data_type.clone(),
-                                col.nullable,
+                                col.value_type.clone(),
                             );
                         }
                         return Ok((
@@ -549,14 +545,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 // Build scope
                 let mut scope = self.new_scope();
                 let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-                let mut column_ids =
-                    scope.add_table(Some(qualifier), &resolved_table.catalog.columns);
+                let mut column_ids = scope.add_table(
+                    Some(qualifier),
+                    &resolved_table.catalog.columns,
+                    self.control,
+                )?;
                 // If alias differs from table name, also register with table name
                 if let Some(ref a) = alias_name
                     && !a.eq_ignore_ascii_case(&table_def.name)
                 {
-                    scope
-                        .add_table_qualified_only(&table_def.name, &resolved_table.catalog.columns);
+                    scope.add_table_qualified_only(
+                        &table_def.name,
+                        &resolved_table.catalog.columns,
+                        self.control,
+                    )?;
                 }
                 // Register Iceberg V3 row-lineage pseudo-columns (_row_id,
                 // _last_updated_sequence_number) when the table carries them.
@@ -565,7 +567,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     let meta_ids = scope.add_iceberg_metadata_columns(
                         qualifier,
                         &resolved_table.catalog.hidden_columns,
-                    );
+                        self.control,
+                    )?;
                     column_ids.extend(meta_ids);
                 }
 
@@ -608,8 +611,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         Some(&alias_name),
                         &col.name,
                         col.column_id,
-                        col.data_type.clone(),
-                        col.nullable,
+                        col.value_type.clone(),
                     );
                 }
 
@@ -703,43 +705,30 @@ impl<'a> super::AnalyzerContext<'a> {
         let alias_name = alias.map(|a| a.name.value.clone());
         let qualifier = alias_name.as_deref().unwrap_or("unnest");
         let mut args = Vec::with_capacity(array_exprs.len());
-        let mut output_columns = Vec::with_capacity(array_exprs.len());
+        let mut names = Vec::with_capacity(array_exprs.len());
         let mut scope = self.new_scope();
-
         for (idx, expr) in array_exprs.iter().enumerate() {
             self.check_control()?;
             let typed = self.analyze_expr(expr, outer_scope)?;
-            let DataType::List(item_field) = &typed.data_type else {
+            if !matches!(&typed.value_type.data_type, DataType::List(_)) {
                 return Err(AnalyzeError::invalid_argument(
                     format!(
                         "UNNEST argument {} must be ARRAY, got {:?}",
                         idx + 1,
-                        typed.data_type
+                        typed.value_type.data_type
                     ),
                     expr.span(),
                 ));
-            };
-            let col_name = alias_columns.get(idx).cloned().unwrap_or_else(|| {
+            }
+            names.push(alias_columns.get(idx).cloned().unwrap_or_else(|| {
                 if array_exprs.len() == 1 {
                     "unnest".to_string()
                 } else {
                     format!("unnest_{}", idx + 1)
                 }
-            });
-            let data_type = item_field.data_type().clone();
-            let nullable = true;
-            let column_id =
-                scope.add_column(Some(qualifier), &col_name, data_type.clone(), nullable);
-            output_columns.push(OutputColumn {
-                column_id,
-                name: col_name,
-                data_type,
-                nullable,
-                is_internal: false,
-            });
+            }));
             args.push(typed);
         }
-
         let function_arguments = args
             .iter()
             .map(crate::analysis::function_argument)
@@ -758,20 +747,24 @@ impl<'a> super::AnalyzerContext<'a> {
                 span,
             ));
         };
-        if result_columns.len() != output_columns.len()
-            || result_columns
-                .iter()
-                .zip(&output_columns)
-                .any(|(bound, output)| {
-                    bound.data_type != output.data_type || bound.nullable != output.nullable
-                })
-        {
+        if result_columns.len() != names.len() {
             return Err(AnalyzeError::invalid_argument(
-                "UNNEST binding result differs from analyzed output columns",
+                "UNNEST binding result count differs from analyzed arguments",
                 span,
             ));
         }
-
+        let mut output_columns = Vec::with_capacity(names.len());
+        for (name, value_type) in names.into_iter().zip(result_columns.iter()) {
+            self.check_control()?;
+            super::helpers::validate_value_type(value_type, self.control)?;
+            let column_id = scope.add_column(Some(qualifier), &name, value_type.clone());
+            output_columns.push(OutputColumn {
+                column_id,
+                name,
+                value_type: value_type.clone(),
+                is_internal: false,
+            });
+        }
         Ok((
             Relation::Unnest(UnnestRelation {
                 args,
@@ -950,8 +943,11 @@ impl<'a> super::AnalyzerContext<'a> {
         let qualifier = alias_name.as_deref().unwrap_or("generate_series");
 
         let mut scope = self.new_scope();
-        let output_column_id =
-            scope.add_column(Some(qualifier), &column_name, DataType::Int64, false);
+        let output_column_id = scope.add_column(
+            Some(qualifier),
+            &column_name,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
 
         let relation = Relation::GenerateSeries(GenerateSeriesRelation {
             start,
@@ -1068,9 +1064,16 @@ impl<'a> super::AnalyzerContext<'a> {
         // Collect analyzer-allocated ColumnIds so the planner can reuse them on
         // the scan's output_columns, keeping ColumnRef ids consistent throughout
         // the plan (same pattern as `Relation::Scan`).
-        let mut column_ids = scope.add_table(Some(qualifier), &resolved_table.catalog.columns);
-        let meta_ids =
-            scope.add_iceberg_metadata_columns(qualifier, &resolved_table.catalog.hidden_columns);
+        let mut column_ids = scope.add_table(
+            Some(qualifier),
+            &resolved_table.catalog.columns,
+            self.control,
+        )?;
+        let meta_ids = scope.add_iceberg_metadata_columns(
+            qualifier,
+            &resolved_table.catalog.hidden_columns,
+            self.control,
+        )?;
         column_ids.extend(meta_ids);
 
         let relation = Relation::IcebergDeltaScan(IcebergDeltaScanRelation {
@@ -1201,8 +1204,8 @@ fn derived_table_output_columns(
         .map(|(col, alias_col)| OutputColumn {
             column_id: col.column_id,
             name: alias_col.value.clone(),
-            data_type: col.data_type.clone(),
-            nullable: col.nullable,
+            value_type: col.value_type.clone(),
+
             is_internal: false,
         })
         .collect())

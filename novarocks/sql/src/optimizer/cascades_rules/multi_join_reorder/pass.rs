@@ -284,8 +284,10 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -297,8 +299,10 @@ mod tests {
                 right: Box::new(r),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: arrow::datatypes::DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Boolean,
+                false,
+            ),
         }
     }
 
@@ -315,8 +319,11 @@ mod tests {
             vec![OutputColumn {
                 column_id: ColumnId::new_for_test(col_id),
                 name: format!("c{col_id}"),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
             rows,

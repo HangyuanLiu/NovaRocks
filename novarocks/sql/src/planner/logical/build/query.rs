@@ -308,8 +308,8 @@ fn apply_query_modifiers(
                         .map(|it| {
                             (
                                 it.output_name.clone(),
-                                it.expr.data_type.clone(),
-                                it.expr.nullable,
+                                it.expr.value_type.data_type.clone(),
+                                it.expr.value_type.nullable,
                                 it.output_column_id,
                             )
                         })
@@ -387,8 +387,9 @@ fn apply_query_modifiers(
                                     qualifier: None,
                                     column: syn_name,
                                 },
-                                data_type: dt,
-                                nullable,
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    dt, nullable,
+                                ),
                             },
                             output_name: name,
                             output_column_id: cid,
@@ -405,8 +406,7 @@ fn apply_query_modifiers(
                                 qualifier: None,
                                 column: col.name.clone(),
                             },
-                            data_type: col.data_type.clone(),
-                            nullable: col.nullable,
+                            value_type: col.value_type.clone(),
                         },
                         output_name: col.name.clone(),
                         output_column_id: col.column_id,
@@ -478,12 +478,7 @@ fn collect_extra_sort_items(
             let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
                 *column_id
             } else {
-                factory.create(
-                    None,
-                    output_name.clone(),
-                    item.expr.data_type.clone(),
-                    item.expr.nullable,
-                )
+                factory.create(None, output_name.clone(), item.expr.value_type.clone())
             };
             extra.push(ProjectItem {
                 expr: item.expr.clone(),
@@ -536,8 +531,8 @@ fn remap_select_alias_refs(
             .or_else(|| name_to_output.get(&column.to_lowercase()));
             if let Some((idx, output_id)) = target {
                 TypedExpr {
-                    data_type: expr.data_type,
-                    nullable: expr.nullable,
+                    value_type: expr.value_type,
+
                     kind: ExprKind::ColumnRef {
                         column_id: *output_id,
                         qualifier: None,
@@ -637,8 +632,7 @@ fn rewrite_sort_items_to_projection_refs(
                             qualifier: None,
                             column: extra.output_name.clone(),
                         },
-                        data_type: item.expr.data_type.clone(),
-                        nullable: item.expr.nullable,
+                        value_type: item.expr.value_type.clone(),
                     },
                     asc: item.asc,
                     nulls_first: item.nulls_first,
@@ -657,8 +651,7 @@ fn rewrite_sort_items_to_projection_refs(
                             qualifier: None,
                             column: col.name.clone(),
                         },
-                        data_type: item.expr.data_type.clone(),
-                        nullable: item.expr.nullable,
+                        value_type: item.expr.value_type.clone(),
                     },
                     asc: item.asc,
                     nulls_first: item.nulls_first,
@@ -675,8 +668,7 @@ fn rewrite_sort_items_to_projection_refs(
                             qualifier: None,
                             column: col.name.clone(),
                         },
-                        data_type: item.expr.data_type.clone(),
-                        nullable: item.expr.nullable,
+                        value_type: item.expr.value_type.clone(),
                     },
                     asc: item.asc,
                     nulls_first: item.nulls_first,

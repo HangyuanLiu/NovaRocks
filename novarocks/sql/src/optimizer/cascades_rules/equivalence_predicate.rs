@@ -361,22 +361,23 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
 
     fn col(memo: &mut Memo, id: u32) -> ScalarId {
-        memo.scalars
-            .intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)
+        memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        )
     }
 
     fn lit(memo: &mut Memo, value: i64) -> ScalarId {
         memo.scalars.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -388,8 +389,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         )
     }
 

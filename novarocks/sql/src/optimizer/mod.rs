@@ -451,8 +451,8 @@ fn optimizer_rejects_unbound_scan_stats() {
         columns: vec![OutputColumn {
             column_id: crate::column_id::ColumnId::new_for_test(1),
             name: "k".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }],
         predicates: vec![],
@@ -923,14 +923,19 @@ mod is_known_rule_name_tests {
         let key_id = crate::column_id::ColumnId::new_for_test(9001);
         let key = memo.scalars.intern(
             crate::optimizer::scalar::ScalarNode::ColumnRef(key_id),
-            arrow::datatypes::DataType::Int32,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         );
         let output = crate::analysis::OutputColumn {
             column_id: key_id,
             name: "k".to_string(),
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
+
             is_internal: false,
         };
         MExpr {
@@ -1256,8 +1261,8 @@ mod is_known_rule_name_tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1269,16 +1274,14 @@ mod is_known_rule_name_tests {
         arena.remember_source_column_display(column.column_id, None, column.name.clone());
         arena.intern(
             ScalarNode::ColumnRef(column.column_id),
-            column.data_type.clone(),
-            column.nullable,
+            column.value_type.clone(),
         )
     }
 
     fn scalar_int(arena: &mut ScalarArena, value: i64) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(crate::common::LiteralValue::Int(value))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -1296,8 +1299,7 @@ mod is_known_rule_name_tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1311,8 +1313,7 @@ mod is_known_rule_name_tests {
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
     }
 
@@ -1328,8 +1329,7 @@ mod is_known_rule_name_tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1579,14 +1579,19 @@ mod is_known_rule_name_tests {
                         qualifier: None,
                         column: "sq".to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 },
                 output_column: OutputColumn {
                     column_id: ColumnId(5),
                     name: "sq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: ColumnId(5),

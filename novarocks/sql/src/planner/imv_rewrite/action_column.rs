@@ -67,8 +67,8 @@ impl ImvActionColumn {
         OutputColumn {
             column_id,
             name: Self::NAME.to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: true,
         }
     }
@@ -339,10 +339,10 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
         Some(SqlScanKind::Delta { .. }) => match action_columns.as_slice() {
             [] => Err(format!("Delta-bound scan {fqn} missing action column")),
             [col] => {
-                if col.data_type != DataType::Int8 {
+                if col.value_type.data_type != DataType::Int8 {
                     return Err(format!("Delta-bound scan {fqn} has non-Int8 action column"));
                 }
-                if col.nullable {
+                if col.value_type.nullable {
                     return Err(format!("Delta-bound scan {fqn} has nullable action column"));
                 }
                 // V7: _row_id must be present so the apply-key projection can reference it.
@@ -478,8 +478,8 @@ mod tests {
         let col = ImvActionColumn::output_column(ColumnId(7));
         assert_eq!(col.column_id, ColumnId(7));
         assert_eq!(col.name, "__change_op");
-        assert_eq!(col.data_type, DataType::Int8);
-        assert!(!col.nullable);
+        assert_eq!(col.value_type.data_type, DataType::Int8);
+        assert!(!col.value_type.nullable);
         assert!(col.is_internal);
     }
 
@@ -501,8 +501,8 @@ mod tests {
         let col = OutputColumn {
             column_id: ColumnId(1),
             name: "other".to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: true,
         };
         assert!(!ImvActionColumn::matches(&col));
@@ -554,8 +554,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             }],
             predicates: Vec::new(),
@@ -590,8 +590,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: ColumnId(1),
@@ -603,8 +605,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvActionColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int8,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: ColumnId(100),
@@ -616,8 +620,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvRowIdColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: ImvRowIdColumn::NAME.to_string(),
                         output_column_id: ColumnId(101),
@@ -629,8 +635,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvRowIdColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                         output_column_id: ColumnId(102),
@@ -655,7 +663,7 @@ mod tests {
     #[test]
     fn validation_rejects_non_int8_action_column() {
         let mut bad = ImvActionColumn::output_column(ColumnId(100));
-        bad.data_type = DataType::Int64;
+        bad.value_type.data_type = DataType::Int64;
         let plan = scan_plan(delta_scan_with(Some(bad)));
         let err = validate(&plan).expect_err("non-Int8 must fail");
         assert!(err.contains("non-Int8"), "got: {err}");
@@ -664,7 +672,7 @@ mod tests {
     #[test]
     fn validation_rejects_nullable_action_column() {
         let mut bad = ImvActionColumn::output_column(ColumnId(100));
-        bad.nullable = true;
+        bad.value_type.nullable = true;
         let plan = scan_plan(delta_scan_with(Some(bad)));
         let err = validate(&plan).expect_err("nullable must fail");
         assert!(err.contains("nullable"), "got: {err}");
@@ -695,8 +703,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: ColumnId(1),
@@ -809,8 +819,7 @@ mod tests {
                     qualifier: None,
                     column: column.to_string(),
                 },
-                data_type,
-                nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             },
             output_name: output_name.to_string(),
             output_column_id,
@@ -888,8 +897,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -971,8 +983,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: ColumnId(1),
@@ -984,8 +998,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvActionColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int8,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: ColumnId(100),
@@ -997,8 +1013,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvRowIdColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: ImvRowIdColumn::NAME.to_string(),
                         output_column_id: ColumnId(101),

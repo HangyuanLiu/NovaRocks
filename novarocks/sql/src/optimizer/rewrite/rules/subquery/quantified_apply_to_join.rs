@@ -134,7 +134,7 @@ fn apply_expr(
         })?;
     let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc);
 
-    let either_nullable = arena.nullable(lhs) || inner_col_oc.nullable;
+    let either_nullable = arena.nullable(lhs) || inner_col_oc.value_type.nullable;
     let join_type = if negated {
         if either_nullable {
             JoinKind::NullAwareLeftAnti
@@ -223,8 +223,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
+
             is_internal: false,
         }
     }
@@ -284,8 +284,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         }
     }
 
@@ -293,8 +292,8 @@ mod tests {
         OutputColumn {
             column_id: IN_OUT,
             name: "in_result".to_string(),
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+
             is_internal: true,
         }
     }
@@ -307,8 +306,10 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k", false)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
         }
     }
 
@@ -504,7 +505,7 @@ mod tests {
             args[1].kind,
             ExprKind::Literal(LiteralValue::Bool(false))
         ));
-        assert!(!condition.nullable);
+        assert!(!condition.value_type.nullable);
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {

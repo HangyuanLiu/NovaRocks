@@ -330,8 +330,10 @@ pub fn plan_writer_statistics(
                     qualifier: None,
                     column: requirement.input().name().to_string(),
                 },
-                data_type: requirement.input().data_type().clone(),
-                nullable: requirement.input().nullable(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    requirement.input().data_type().clone(),
+                    requirement.input().nullable(),
+                ),
             };
             let resolved = crate::functions::resolve_sql_aggregate_binding(
                 functions,
@@ -402,8 +404,10 @@ pub fn plan_writer_statistics(
                         kind: ExprKind::Literal(LiteralValue::String(
                             requirement.artifact().blob_type().to_string(),
                         )),
-                        data_type: DataType::Utf8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            false,
+                        ),
                     }),
                     UnpivotConstant::Utf8Map(Vec::new()),
                 ],

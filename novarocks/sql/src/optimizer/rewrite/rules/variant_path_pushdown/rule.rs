@@ -256,8 +256,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         right: new_right.unwrap_or(right),
                         decimal_overflow_policy,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -287,8 +286,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         binding,
                         volatility,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -320,8 +318,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         order_by,
                         resolved,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -366,8 +363,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         list,
                         negated,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -389,8 +385,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         high: new_high.unwrap_or(high),
                         negated,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -409,8 +404,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         pattern: new_pattern.unwrap_or(pattern),
                         negated,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -433,8 +427,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         when_then,
                         else_expr,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -498,8 +491,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         window_frame,
                         ignore_nulls,
                     },
-                    data_type,
-                    nullable,
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                 )
             }))
         }
@@ -534,7 +526,10 @@ where
     let Some(new_child) = rewrite_variant_request_scalar(arena, child, bindings, factory)? else {
         return Ok(None);
     };
-    Ok(Some(arena.intern(build(new_child), data_type, nullable)))
+    Ok(Some(arena.intern(
+        build(new_child),
+        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+    )))
 }
 
 fn rewrite_scalar_vec<T: VariantBindings>(
@@ -876,7 +871,7 @@ fn find_or_create_slot_on_scan(
         .columns
         .iter()
         .find(|column| column.column_id == request.source_column_id)?;
-    if source_column.data_type != DataType::LargeBinary {
+    if source_column.value_type.data_type != DataType::LargeBinary {
         return None;
     }
 
@@ -885,8 +880,7 @@ fn find_or_create_slot_on_scan(
     let synthetic_column_id = factory.create(
         None,
         synthetic_name.clone(),
-        request.requested_type.clone(),
-        true,
+        novarocks_type_contract::FunctionValueType::new(request.requested_type.clone(), true),
     );
     let descriptor = ScanVariantColumn {
         source_column_id: request.source_column_id,
@@ -902,8 +896,11 @@ fn find_or_create_slot_on_scan(
     scan.columns.push(OutputColumn {
         column_id: synthetic_column_id,
         name: synthetic_name,
-        data_type: request.requested_type.clone(),
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            request.requested_type.clone(),
+            true,
+        ),
+
         // Optimizer-managed scan output must survive pruning until the
         // lowering/codegen path consumes `variant_columns`.
         is_internal: true,
@@ -924,8 +921,7 @@ fn column_ref_for_variant_slot(
     );
     arena.intern(
         ScalarNode::ColumnRef(descriptor.synthetic_column_id),
-        descriptor.requested_type.clone(),
-        true,
+        novarocks_type_contract::FunctionValueType::new(descriptor.requested_type.clone(), true),
     )
 }
 

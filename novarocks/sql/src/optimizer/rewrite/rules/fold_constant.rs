@@ -496,8 +496,7 @@ fn fold_scalar_uncached(
     evaluator: &'static dyn SqlConstantEvaluator,
     memo: &mut HashMap<ScalarId, ScalarId>,
 ) -> ScalarId {
-    let data_type = arena.data_type(id).clone();
-    let nullable = arena.nullable(id);
+    let value_type = arena.value_type(id).clone();
     let mut node = arena.node(id).clone();
 
     // Post-order: children first, so a node only ever sees already-folded
@@ -593,7 +592,7 @@ fn fold_scalar_uncached(
     // Re-intern with the rebuilt children, keeping this node's own type
     // metadata. `intern` may canonicalize commutative operand order, so the
     // fold step below reads the children back out of the arena.
-    let rebuilt = arena.intern(node, data_type, nullable);
+    let rebuilt = arena.intern(node, value_type);
     try_fold_node(arena, rebuilt, evaluator).unwrap_or(rebuilt)
 }
 
@@ -628,7 +627,7 @@ fn fold_sec_to_time_source(
         }
         _ => unreachable!("source path was checked before folding"),
     }
-    arena.intern(node, arena.data_type(id).clone(), arena.nullable(id))
+    arena.intern(node, arena.value_type(id).clone())
 }
 
 /// Try to replace one node (whose children are already folded) with a literal.
@@ -653,7 +652,7 @@ fn try_fold_node(
         if !is_wire_encodable_literal_type(&out_type) {
             return None;
         }
-        return Some(arena.intern(ScalarNode::Literal(literal), out_type, out_nullable));
+        return Some(arena.intern(ScalarNode::Literal(literal), arena.value_type(id).clone()));
     }
 
     // Gate 2: a volatile or DISTINCT function is never a constant.
@@ -723,8 +722,7 @@ fn try_fold_node(
     match evaluator.eval_scalar(&request) {
         Ok(Some(value)) => Some(arena.intern(
             ScalarNode::Literal(HashableLiteral(value)),
-            out_type,
-            out_nullable,
+            arena.value_type(id).clone(),
         )),
         // The evaluator declined this shape.
         Ok(None) => None,
@@ -851,23 +849,25 @@ mod tests {
             }
         }
 
-        fn intern(&self, node: ScalarNode, data_type: DataType, nullable: bool) -> ScalarId {
-            self.arena.borrow_mut().intern(node, data_type, nullable)
+        fn intern(
+            &self,
+            node: ScalarNode,
+            value_type: novarocks_type_contract::FunctionValueType,
+        ) -> ScalarId {
+            self.arena.borrow_mut().intern(node, value_type)
         }
 
         fn int_literal(&self, value: i64) -> ScalarId {
             self.intern(
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-                DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             )
         }
 
         fn column(&self, id: u32) -> ScalarId {
             self.intern(
                 ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-                DataType::Int64,
-                true,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             )
         }
 
@@ -896,8 +896,7 @@ mod tests {
                     distinct,
                     volatility,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             )
         }
 
@@ -921,8 +920,7 @@ mod tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             )
         }
 
@@ -1043,10 +1041,12 @@ mod tests {
                 target: DataType::Utf8,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Utf8,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         );
-        let wrapped = fixture.intern(ScalarNode::Nested(cast_source), DataType::Utf8, true);
+        let wrapped = fixture.intern(
+            ScalarNode::Nested(cast_source),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
         let consumer = fixture.function_call(
             "time_to_sec",
             vec![wrapped],
@@ -1484,11 +1484,33 @@ mod tests {
     }
 
     #[test]
+    fn collapsing_nested_literal_preserves_the_authored_value_domain() {
+        let mut fixture = Fixture::with_mode(FakeMode::Fold);
+        let value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            false,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let literal = fixture.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::String("{\"k\":1}".into()))),
+            value_type.clone(),
+        );
+        let nested = fixture.intern(ScalarNode::Nested(literal), value_type.clone());
+        let folded = project_expr(&changed(fixture.apply(project(nested))));
+        assert_eq!(fixture.arena.borrow().value_type(folded), &value_type);
+        assert_eq!(fixture.calls(), 0);
+    }
+
+    #[test]
     fn folds_through_nested_wrapper() {
         let mut fixture = Fixture::with_mode(FakeMode::Fold);
         let one = fixture.int_literal(1);
         let sum = fixture.binary(BinOp::Add, one, one);
-        let nested = fixture.intern(ScalarNode::Nested(sum), DataType::Int64, false);
+        let nested = fixture.intern(
+            ScalarNode::Nested(sum),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let plan = project(nested);
 
         let rewritten = changed(fixture.apply(plan));
@@ -1509,8 +1531,7 @@ mod tests {
                 when_then: vec![(when, then)],
                 else_expr: None,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let plan = project(case);
 
@@ -1563,8 +1584,7 @@ mod overflow_policy_tests {
             ScalarNode::Literal(HashableLiteral(LiteralValue::Decimal(
                 "99999999999999999999999999999999999999".to_string(),
             ))),
-            DataType::Decimal128(38, 0),
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), false),
         );
         for cast in [false, true] {
             let node = |policy| {
@@ -1588,8 +1608,14 @@ mod overflow_policy_tests {
             } else {
                 DataType::Decimal128(38, 0)
             };
-            let nullable = arena.intern(node(OutputNull), data_type.clone(), true);
-            let throwing = arena.intern(node(ReportError), data_type, true);
+            let nullable = arena.intern(
+                node(OutputNull),
+                novarocks_type_contract::FunctionValueType::new(data_type.clone(), true),
+            );
+            let throwing = arena.intern(
+                node(ReportError),
+                novarocks_type_contract::FunctionValueType::new(data_type, true),
+            );
             let original = arena.node(throwing).clone();
             assert!(try_fold_node(&mut arena, throwing, &EVALUATOR).is_none());
             assert_eq!(arena.node(throwing), &original);
@@ -1621,8 +1647,7 @@ mod overflow_policy_tests {
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Decimal(
                     "99999999999999999999999999999999999999".to_string(),
                 ))),
-                DataType::Decimal128(38, 0),
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), false),
             );
             let original = if cast {
                 ScalarNode::Cast {
@@ -1640,12 +1665,14 @@ mod overflow_policy_tests {
             };
             let id = arena.intern(
                 original.clone(),
-                if cast {
-                    DataType::Decimal128(9, 0)
-                } else {
-                    DataType::Decimal128(38, 0)
-                },
-                true,
+                novarocks_type_contract::FunctionValueType::new(
+                    if cast {
+                        DataType::Decimal128(9, 0)
+                    } else {
+                        DataType::Decimal128(38, 0)
+                    },
+                    true,
+                ),
             );
             let guarded =
                 crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), true).unwrap();
@@ -1661,8 +1688,7 @@ mod overflow_policy_tests {
             ));
             let nested = arena.intern(
                 ScalarNode::Nested(literal),
-                DataType::Decimal128(38, 0),
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), false),
             );
             let pure = try_fold_node(&mut arena, nested, guarded).unwrap();
             assert!(matches!(arena.node(pure), ScalarNode::Literal(_)));

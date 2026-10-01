@@ -243,41 +243,42 @@ fn branch_union_aggregate_change_stream_output_columns(
     columns.push(allocate_imv_output_column(
         ctx,
         &layout.row_id_column_name,
-        DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         true,
     )?);
     for column in &layout.visible_columns {
         columns.push(allocate_imv_output_column(
             ctx,
             &column.name,
-            column.data_type.clone(),
-            column.nullable,
+            column.value_type.clone(),
             false,
         )?);
     }
     for column in &layout.state_columns {
-        let data_type = match column.state_role {
+        let value_type = match column.state_role {
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
             | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
-            | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => DataType::Binary,
+            | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Binary,
+                    column.value_type.nullable,
+                )
+            }
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
-                column.data_type.clone()
+                column.value_type.clone()
             }
         };
         columns.push(allocate_imv_output_column(
             ctx,
             &column.name,
-            data_type,
-            column.nullable,
+            value_type,
             true,
         )?);
     }
     columns.push(allocate_imv_output_column(
         ctx,
         BRANCH_ID_COLUMN_NAME,
-        DataType::Int32,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         true,
     )?);
     // A row-delta publication's writer input is the provider's signed shape:
@@ -289,36 +290,31 @@ fn branch_union_aggregate_change_stream_output_columns(
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_ROW_ID_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_FILE_PATH_COL,
-        DataType::Utf8,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_ROW_POS_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         ImvActionColumn::NAME,
-        DataType::Int8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         true,
     )?);
     Ok(columns)
@@ -969,14 +965,18 @@ mod tests {
                         op: BinOp::Ge,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            data_type: DataType::Int32,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int32,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![input],
@@ -998,8 +998,11 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: name.eq_ignore_ascii_case("s"),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Int64,
+                name.eq_ignore_ascii_case("s"),
+            ),
+
             is_internal: false,
         }
     }
@@ -1011,8 +1014,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -1034,8 +1036,7 @@ mod tests {
                 right: Box::new(col_expr(right_region_id, "region")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {

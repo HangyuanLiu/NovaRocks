@@ -288,7 +288,7 @@ fn join_output_columns(
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     columns
 }
@@ -341,8 +341,8 @@ fn project_output_columns(
             Ok(OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: scalars.data_type(item.expr).clone(),
-                nullable: scalars.nullable(item.expr),
+                value_type: scalars.value_type(item.expr).clone(),
+
                 is_internal: inherited
                     .map(|column| column.is_internal)
                     .or(source_internal)
@@ -353,8 +353,8 @@ fn project_output_columns(
 }
 
 fn same_value_metadata(left: &OutputColumn, right: &OutputColumn) -> bool {
-    left.data_type == right.data_type
-        && left.nullable == right.nullable
+    left.value_type.data_type == right.value_type.data_type
+        && left.value_type.nullable == right.value_type.nullable
         && left.is_internal == right.is_internal
 }
 
@@ -415,8 +415,7 @@ fn ordering_spec_to_sort_keys(
                 Ok(SortKey {
                     expr: arena.intern(
                         ScalarNode::ColumnRef(sk.column),
-                        column.data_type.clone(),
-                        column.nullable,
+                        column.value_type.clone(),
                     ),
                     asc: sk.asc,
                     nulls_first: sk.nulls_first,
@@ -453,8 +452,10 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -534,14 +535,17 @@ mod tests {
     fn project_output_metadata_preserves_repeated_value_aliases() {
         let mut scalars = ScalarArena::new();
         let source_id = ColumnId(2);
-        let expr = scalars.intern(ScalarNode::ColumnRef(source_id), DataType::Utf8, true);
+        let expr = scalars.intern(
+            ScalarNode::ColumnRef(source_id),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
         let columns: Vec<_> = ["name", "path"]
             .into_iter()
             .map(|name| OutputColumn {
                 column_id: source_id,
                 name: name.to_string(),
-                data_type: DataType::Utf8,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+
                 is_internal: true,
             })
             .collect();
@@ -577,8 +581,8 @@ mod tests {
             for (output, expected) in outputs.iter().zip(&columns) {
                 assert_eq!(output.column_id, expected.column_id);
                 assert_eq!(output.name, expected.name);
-                assert_eq!(output.data_type, expected.data_type);
-                assert_eq!(output.nullable, expected.nullable);
+                assert_eq!(output.value_type.data_type, expected.value_type.data_type);
+                assert_eq!(output.value_type.nullable, expected.value_type.nullable);
                 assert_eq!(output.is_internal, expected.is_internal);
             }
         }
@@ -587,8 +591,8 @@ mod tests {
             let mut conflicting = columns.clone();
             match mutation {
                 0 => conflicting[1].is_internal = false,
-                1 => conflicting[1].nullable = false,
-                _ => conflicting[1].data_type = DataType::Int64,
+                1 => conflicting[1].value_type.nullable = false,
+                _ => conflicting[1].value_type.data_type = DataType::Int64,
             }
             assert!(project_output_columns(&project, &scalars, &conflicting, &[]).is_err());
             let mut conflicting_child = child.clone();
@@ -603,8 +607,8 @@ mod tests {
         let source_col = OutputColumn {
             column_id: ColumnId(1),
             name: "__change_op_source".to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: true,
         };
         let child = memo.new_group(MExpr {
@@ -624,8 +628,7 @@ mod tests {
         let stale_id = ColumnId(13);
         let project_expr = memo.scalars.intern(
             ScalarNode::ColumnRef(source_col.column_id),
-            DataType::Int8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         );
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
@@ -644,8 +647,8 @@ mod tests {
             vec![OutputColumn {
                 column_id: stale_id,
                 name: "__change_op".to_string(),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
                 is_internal: true,
             }],
             0.0,
@@ -685,8 +688,8 @@ mod tests {
         assert_eq!(plan.output_columns.len(), 1);
         assert_eq!(plan.output_columns[0].column_id, output_id);
         assert_eq!(plan.output_columns[0].name, "__change_op");
-        assert_eq!(plan.output_columns[0].data_type, DataType::Int8);
-        assert!(!plan.output_columns[0].nullable);
+        assert_eq!(plan.output_columns[0].value_type.data_type, DataType::Int8);
+        assert!(!plan.output_columns[0].value_type.nullable);
         assert!(plan.output_columns[0].is_internal);
     }
 
@@ -696,22 +699,22 @@ mod tests {
         let left_key_col = OutputColumn {
             column_id: ColumnId(1),
             name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let action_col = OutputColumn {
             column_id: ColumnId(14),
             name: "__change_op".to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: true,
         };
         let right_key_col = OutputColumn {
             column_id: ColumnId(2),
             name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let left_columns = vec![left_key_col.clone(), action_col.clone()];
@@ -765,8 +768,11 @@ mod tests {
                 OutputColumn {
                     column_id: ColumnId(15),
                     name: "__change_op".to_string(),
-                    data_type: DataType::Int8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ),
+
                     is_internal: true,
                 },
             ],
@@ -844,20 +850,20 @@ mod tests {
         let left_outer =
             join_output_columns(JoinKind::LeftOuter, &children).expect("left outer outputs");
         assert_eq!(left_outer.len(), 2);
-        assert!(!left_outer[0].nullable);
-        assert!(left_outer[1].nullable);
+        assert!(!left_outer[0].value_type.nullable);
+        assert!(left_outer[1].value_type.nullable);
 
         let right_outer =
             join_output_columns(JoinKind::RightOuter, &children).expect("right outer outputs");
         assert_eq!(right_outer.len(), 2);
-        assert!(right_outer[0].nullable);
-        assert!(!right_outer[1].nullable);
+        assert!(right_outer[0].value_type.nullable);
+        assert!(!right_outer[1].value_type.nullable);
 
         let full_outer =
             join_output_columns(JoinKind::FullOuter, &children).expect("full outer outputs");
         assert_eq!(full_outer.len(), 2);
-        assert!(full_outer[0].nullable);
-        assert!(full_outer[1].nullable);
+        assert!(full_outer[0].value_type.nullable);
+        assert!(full_outer[1].value_type.nullable);
     }
 
     #[test]
@@ -893,8 +899,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
+
             is_internal: false,
         }
     }
@@ -1242,26 +1248,24 @@ mod tests {
             let left_column = OutputColumn {
                 column_id: ColumnId(10),
                 name: "left_key".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             };
             let right_column = OutputColumn {
                 column_id: ColumnId(20),
                 name: "right_key".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             };
             let left_key = memo.scalars.intern(
                 ScalarNode::ColumnRef(left_column.column_id),
-                DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             );
             let right_input = memo.scalars.intern(
                 ScalarNode::ColumnRef(right_column.column_id),
-                DataType::Int32,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             );
             let right_key = memo.scalars.intern(
                 ScalarNode::Cast {
@@ -1270,8 +1274,7 @@ mod tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             );
             let left = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
@@ -1312,10 +1315,10 @@ mod tests {
                 crate::optimizer::memo::LogicalProperties::new(vec![right_column.clone()], 0.0),
             );
             let mut output_left = left_column;
-            output_left.nullable = true;
+            output_left.value_type.nullable = true;
             let mut output_right = right_column;
             if join_type == JoinKind::FullOuter {
-                output_right.nullable = true;
+                output_right.value_type.nullable = true;
             }
             memo.groups[root].logical_props = Some(crate::optimizer::memo::LogicalProperties::new(
                 vec![output_left, output_right],
@@ -1377,6 +1380,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("lower final physical plan")
@@ -1562,8 +1566,11 @@ mod tests {
         let column = OutputColumn {
             column_id: ColumnId(42),
             name: "nullable_decimal".to_string(),
-            data_type: DataType::Decimal128(18, 4),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Decimal128(18, 4),
+                true,
+            ),
+
             is_internal: false,
         };
         let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {

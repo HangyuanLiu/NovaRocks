@@ -313,8 +313,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -373,13 +373,13 @@ mod tests {
     }
 
     fn eq_condition(memo: &mut Memo, left: u32, right: u32) -> crate::optimizer::scalar::ScalarId {
-        let left =
-            memo.scalars
-                .intern(ScalarNode::ColumnRef(ColumnId(left)), DataType::Int64, true);
+        let left = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(left)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let right = memo.scalars.intern(
             ScalarNode::ColumnRef(ColumnId(right)),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         memo.scalars.intern(
             ScalarNode::BinaryOp {
@@ -388,15 +388,15 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
     fn sort_key(memo: &mut Memo, id: u32) -> ScalarSortKey {
-        let expr = memo
-            .scalars
-            .intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, true);
+        let expr = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         ScalarSortKey {
             expr,
             asc: true,
@@ -406,13 +406,13 @@ mod tests {
     }
 
     fn binary_sort_key(memo: &mut Memo, left: u32, right: u32) -> ScalarSortKey {
-        let left =
-            memo.scalars
-                .intern(ScalarNode::ColumnRef(ColumnId(left)), DataType::Int64, true);
+        let left = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(left)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let right = memo.scalars.intern(
             ScalarNode::ColumnRef(ColumnId(right)),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let expr = memo.scalars.intern(
             ScalarNode::BinaryOp {
@@ -421,8 +421,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         ScalarSortKey {
             expr,
@@ -442,8 +441,7 @@ mod tests {
             .map(|(input_id, output_id, name)| {
                 let expr = memo.scalars.intern(
                     ScalarNode::ColumnRef(ColumnId(*input_id)),
-                    DataType::Int64,
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
                 );
                 ScalarProjectItem {
                     expr,
@@ -994,25 +992,24 @@ mod tests {
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> crate::optimizer::scalar::ScalarId {
         let equality = eq_condition(memo, 1, 2);
-        let source = memo
-            .scalars
-            .intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let source = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cast = memo.scalars.intern(
             ScalarNode::Cast {
                 child: source,
                 target: DataType::Decimal128(2, 0),
                 decimal_overflow_policy: policy,
             },
-            DataType::Decimal128(2, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(2, 0), true),
         );
         let checked = memo.scalars.intern(
             ScalarNode::IsNull {
                 child: cast,
                 negated: true,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         memo.scalars.intern(
             ScalarNode::BinaryOp {
@@ -1021,8 +1018,7 @@ mod tests {
                 right: checked,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 

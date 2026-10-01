@@ -142,7 +142,9 @@ fn lower_column(
         .columns
         .iter()
         .find(|output| output.column_id == *column_id)?;
-    if output.data_type != expression.data_type || output.nullable != expression.nullable {
+    if output.value_type.data_type != expression.value_type.data_type
+        || output.value_type.nullable != expression.value_type.nullable
+    {
         return None;
     }
     // Composite assignments can name a scan column, but the provider domain
@@ -201,7 +203,9 @@ fn single_range(value_type: ConnectorValueType, low: Bound, high: Bound) -> Opti
 
 fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option<ConnectorValue> {
     let expression = unnest(expression);
-    if expression.nullable || exact_predicate_value_type(&expression.data_type)? != expected {
+    if expression.value_type.nullable
+        || exact_predicate_value_type(&expression.value_type.data_type)? != expected
+    {
         return None;
     }
     let ExprKind::Literal(literal) = &expression.kind else {
@@ -318,8 +322,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(1),
             name: "k".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }
@@ -331,16 +335,14 @@ mod tests {
                 qualifier: None,
                 column: "k".to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
     fn integer(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -352,8 +354,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -409,8 +410,7 @@ mod tests {
     fn exact_occurrences_keep_original_predicate_ordinals() {
         let unsupported = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let scan = scan(vec![
             comparison(BinOp::Ge, column_ref(), integer(7)),
@@ -435,8 +435,7 @@ mod tests {
                 qualifier: None,
                 column: "k".to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
         let scan = scan(vec![comparison(BinOp::Eq, expression, integer(1))]);
 
@@ -468,19 +467,21 @@ mod tests {
         for data_type in composite_types {
             for negated in [false, true] {
                 let mut expression = column_ref();
-                expression.data_type = data_type.clone();
-                expression.nullable = true;
+                expression.value_type.data_type = data_type.clone();
+                expression.value_type.nullable = true;
                 let predicate = TypedExpr {
                     kind: ExprKind::IsNull {
                         expr: Box::new(expression),
                         negated,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 };
                 let mut scan = scan(vec![predicate]);
-                scan.columns[0].data_type = data_type.clone();
-                scan.columns[0].nullable = true;
+                scan.columns[0].value_type.data_type = data_type.clone();
+                scan.columns[0].value_type.nullable = true;
                 let columns = BTreeMap::from([(
                     ColumnId(1),
                     ProviderPredicateColumn {
@@ -502,8 +503,7 @@ mod tests {
                 list: vec![integer(1), integer(2)],
                 negated: true,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
 
         assert!(lower_provider_predicates(&scan(vec![predicate]), &columns()).is_empty());

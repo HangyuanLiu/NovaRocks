@@ -198,13 +198,15 @@ fn remap_scalar(
                     right,
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::UnaryOp { op, child } => {
             let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::UnaryOp { op, child }, data_type, nullable))
+            Some(arena.intern(
+                ScalarNode::UnaryOp { op, child },
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            ))
         }
         ScalarNode::FunctionCall {
             name,
@@ -222,16 +224,14 @@ fn remap_scalar(
                     binding,
                     volatility,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::LambdaFunction { params, body } => {
             let body = remap_scalar(arena, body, bindings)?;
             Some(arena.intern(
                 ScalarNode::LambdaFunction { params, body },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::AggregateCall {
@@ -251,8 +251,7 @@ fn remap_scalar(
                     order_by,
                     resolved,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::Cast {
@@ -267,13 +266,15 @@ fn remap_scalar(
                     target,
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::IsNull { child, negated } => {
             let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::IsNull { child, negated }, data_type, nullable))
+            Some(arena.intern(
+                ScalarNode::IsNull { child, negated },
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            ))
         }
         ScalarNode::InList {
             child,
@@ -288,8 +289,7 @@ fn remap_scalar(
                     list,
                     negated,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::Between {
@@ -308,8 +308,7 @@ fn remap_scalar(
                     high,
                     negated,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::Like {
@@ -325,8 +324,7 @@ fn remap_scalar(
                     pattern,
                     negated,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::Case {
@@ -351,8 +349,7 @@ fn remap_scalar(
                     when_then,
                     else_expr,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::IsTruthValue {
@@ -367,13 +364,15 @@ fn remap_scalar(
                     value,
                     negated,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::Nested(child) => {
             let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::Nested(child), data_type, nullable))
+            Some(arena.intern(
+                ScalarNode::Nested(child),
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            ))
         }
         ScalarNode::WindowCall {
             name,
@@ -404,13 +403,15 @@ fn remap_scalar(
                     window_frame,
                     ignore_nulls,
                 },
-                data_type,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             ))
         }
         ScalarNode::Lambda { params, body } => {
             let body = remap_scalar(arena, body, bindings)?;
-            Some(arena.intern(ScalarNode::Lambda { params, body }, data_type, nullable))
+            Some(arena.intern(
+                ScalarNode::Lambda { params, body },
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            ))
         }
     }
 }
@@ -483,8 +484,8 @@ mod tests {
 
     fn col_ref(name: &str, id: ColumnId) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: id,
                 qualifier: None,
@@ -495,8 +496,8 @@ mod tests {
 
     fn qualified_col_ref(qualifier: &str, name: &str, id: ColumnId) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: id,
                 qualifier: Some(qualifier.into()),
@@ -507,16 +508,16 @@ mod tests {
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn is_not_null(expr: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(expr),
                 negated: true,
@@ -526,8 +527,8 @@ mod tests {
 
     fn eq(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
@@ -539,8 +540,8 @@ mod tests {
 
     fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::And,
@@ -581,8 +582,11 @@ mod tests {
                 .map(|(n, id)| OutputColumn {
                     column_id: *id,
                     name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -744,8 +748,8 @@ mod tests {
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
         // Build: Project(Scan) with computed item x = a + 1.
         let computed_expr = TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(col_ref("a", a_id)),
                 op: BinOp::Add,
@@ -818,8 +822,8 @@ mod tests {
         let x_id = col_id(2);
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
         let computed_expr = TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(col_ref("a", a_id)),
                 op: BinOp::Add,
@@ -901,8 +905,7 @@ mod tests {
             };
             let input = arena.intern(
                 ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(literal)),
-                input_type.clone(),
-                false,
+                novarocks_type_contract::FunctionValueType::new(input_type.clone(), false),
             );
             let args = [FunctionArgument::Value {
                 value_type: FunctionValueType::new(input_type, false),
@@ -914,6 +917,7 @@ mod tests {
                     name,
                     FunctionKind::Scalar,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &args,
                         logical_argument_count: 1,
                     },
@@ -923,6 +927,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &args,
                         logical_argument_count: 1,
                     },
@@ -940,8 +945,7 @@ mod tests {
                     binding: bound.into(),
                     volatility,
                 },
-                output.data_type,
-                output.nullable,
+                novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
             );
             let Operator::LogicalProject(proj) = &mut project.op else {
                 unreachable!()

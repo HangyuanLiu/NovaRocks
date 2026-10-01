@@ -145,6 +145,7 @@ fn contract_with_argument_nullability(
         kind: FunctionKind::Scalar,
         selected: selected.as_ref(),
         request: FunctionBindingRequest {
+            expected_result_type: None,
             arguments: &args,
             logical_argument_count: 1,
         },
@@ -641,6 +642,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
         kind: FunctionKind::Scalar,
         selected: frozen.selected(),
         request: FunctionBindingRequest {
+            expected_result_type: None,
             arguments: &args,
             logical_argument_count: 1,
         },

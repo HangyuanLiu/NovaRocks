@@ -610,16 +610,14 @@ fn add_not_null_filter(
         );
         let child = arena.intern(
             ScalarNode::ColumnRef(output.column_id),
-            output.data_type.clone(),
-            output.nullable,
+            output.value_type.clone(),
         );
         predicates.push(arena.intern(
             ScalarNode::IsNull {
                 child,
                 negated: true,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         ));
     }
     if predicates.is_empty() {
@@ -711,8 +709,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -759,8 +757,7 @@ mod tests {
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -865,8 +862,7 @@ mod tests {
                 right: right_key,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let items = vec![ScalarProjectItem {
             expr,
@@ -888,15 +884,17 @@ mod tests {
         let right = scan_expr("right_t", &[(2, "right_key")]);
         let left_key = col(&mut arena, 1);
         let right_key = col(&mut arena, 2);
-        let nested_left = arena.intern(ScalarNode::Nested(left_key), DataType::Int64, false);
+        let nested_left = arena.intern(
+            ScalarNode::Nested(left_key),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let cast_right = arena.intern(
             ScalarNode::Cast {
                 child: right_key,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let condition = arena.intern(
             ScalarNode::BinaryOp {
@@ -905,8 +903,7 @@ mod tests {
                 right: cast_right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let join = LogicalJoinOp {
             join_type: JoinKind::Inner,
@@ -924,13 +921,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let one = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let null = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
-            DataType::Null,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
         );
 
         let count_one = ScalarAggregateSpec {
@@ -958,7 +953,10 @@ mod tests {
     fn eliminated_unique_aggregate_rewrites_count_output_ref_to_literal() {
         let mut arena = ScalarArena::new();
         let count_output = ColumnId::new_for_test(9001);
-        let count_ref = arena.intern(ScalarNode::ColumnRef(count_output), DataType::Int64, false);
+        let count_ref = arena.intern(
+            ScalarNode::ColumnRef(count_output),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let item = ScalarProjectItem {
             expr: count_ref,
             output_name: "cnt".to_string(),

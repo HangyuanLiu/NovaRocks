@@ -63,7 +63,7 @@ impl InjectApplyKeyProjectRule {
 /// walking Project items first then descendant scans.
 fn root_row_id_ref(
     plan: &LogicalPlanNode,
-) -> Option<(ColumnId, String, arrow::datatypes::DataType, bool)> {
+) -> Option<(ColumnId, String, novarocks_type_contract::FunctionValueType)> {
     if let LogicalPlanKind::Project(p) = &plan.kind
         && let Some(item) = p
             .items
@@ -73,12 +73,7 @@ fn root_row_id_ref(
             column_id, column, ..
         } = &item.expr.kind
     {
-        return Some((
-            *column_id,
-            column.clone(),
-            item.expr.data_type.clone(),
-            item.expr.nullable,
-        ));
+        return Some((*column_id, column.clone(), item.expr.value_type.clone()));
     }
     if let LogicalPlanKind::Union(u) = &plan.kind
         && is_branch_delta_union(plan)
@@ -90,14 +85,13 @@ fn root_row_id_ref(
         return Some((
             column.column_id,
             column.name.clone(),
-            column.data_type.clone(),
-            column.nullable,
+            column.value_type.clone(),
         ));
     }
     descendant_internal_columns(plan)
         .into_iter()
         .find(ImvRowIdColumn::matches)
-        .map(|c| (c.column_id, c.name, c.data_type, c.nullable))
+        .map(|c| (c.column_id, c.name, c.value_type))
 }
 
 fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
@@ -166,16 +160,13 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
     ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, ctx| {
-            let Some((row_id_col, row_id_name, row_id_type, row_id_nullable)) =
-                root_row_id_ref(&plan)
-            else {
+            let Some((row_id_col, row_id_name, row_id_type)) = root_row_id_ref(&plan) else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             let apply_key_col = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                 ctx,
                 HIDDEN_APPLY_KEY_COLUMN_NAME,
                 row_id_type.clone(),
-                row_id_nullable,
             )?;
             let apply_item = ProjectItem {
                 expr: TypedExpr {
@@ -184,8 +175,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                         qualifier: None,
                         column: row_id_name,
                     },
-                    data_type: row_id_type,
-                    nullable: row_id_nullable,
+                    value_type: row_id_type,
                 },
                 output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                 output_column_id: apply_key_col,
@@ -257,8 +247,7 @@ fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         },
         output_name: column.name.clone(),
         output_column_id: column.column_id,
@@ -325,8 +314,11 @@ mod tests {
                 OutputColumn {
                     column_id: ColumnId(1),
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 },
                 ImvRowIdColumn::output_column(row_id),
@@ -350,8 +342,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: ColumnId(1),
@@ -363,8 +357,10 @@ mod tests {
                                 qualifier: None,
                                 column: "_row_id".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "_row_id".to_string(),
                         output_column_id: row_id,
@@ -418,8 +414,10 @@ mod tests {
                         qualifier: None,
                         column: "_row_id".to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                 output_column_id: ColumnId(200),
@@ -452,8 +450,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![LogicalPlanNode::new(

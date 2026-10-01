@@ -47,8 +47,8 @@ impl ImvRowIdColumn {
         OutputColumn {
             column_id,
             name: Self::NAME.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: true,
         }
     }
@@ -133,8 +133,7 @@ impl LogicalRewriteRule for InjectRowIdRule {
                 None => crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                     ctx,
                     ImvRowIdColumn::NAME,
-                    DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
                 )?,
             };
             scan.columns
@@ -213,8 +212,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             }],
             predicates: Vec::new(),
@@ -255,8 +254,8 @@ mod tests {
     fn row_id_output_column_shape() {
         let col = ImvRowIdColumn::output_column(ColumnId(7));
         assert_eq!(col.name, "_row_id");
-        assert_eq!(col.data_type, DataType::Int64);
-        assert!(!col.nullable);
+        assert_eq!(col.value_type.data_type, DataType::Int64);
+        assert!(!col.value_type.nullable);
         assert!(col.is_internal);
     }
 
@@ -328,21 +327,31 @@ mod tests {
             .expect("build_ctx must install ColumnRefFactory");
         let plan = scan_plan(delta_scan());
         let expr = to_optimizer_expr(&plan, &mut ctx.scalar_arena().borrow_mut());
+        let allocated_id = ColumnId(factory.borrow().peek_next_id());
 
-        let result = rule.apply(expr, &mut ctx).expect("apply");
-        assert!(matches!(result, RewriteResult::Changed(_)));
-
-        let next_id = factory.borrow().peek_next_id();
-        let found = (1..next_id).any(|raw| {
-            let meta = factory.borrow().get(ColumnId(raw)).clone();
-            meta.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
-                && meta.data_type == DataType::Int64
-                && !meta.nullable
-        });
-        assert!(
-            found,
-            "row-id allocation must be recorded in ColumnRefFactory"
+        let RewriteResult::Changed(changed) = rule.apply(expr, &mut ctx).expect("apply") else {
+            panic!("expected Changed(Scan)");
+        };
+        let changed = crate::planner::optimizer_bridge::logical::to_logical_plan(
+            changed,
+            &ctx.scalar_arena().borrow(),
         );
+        let LogicalPlanKind::Scan(scan) = changed.kind else {
+            panic!("expected injected scan");
+        };
+        let row_id = scan
+            .columns
+            .iter()
+            .find(|column| ImvRowIdColumn::matches(column))
+            .unwrap();
+        assert_eq!(row_id.column_id, allocated_id);
+        let factory = factory.borrow();
+        let metadata = factory.get(row_id.column_id);
+        assert_eq!(metadata.name, row_id.name);
+        assert_eq!(metadata.value_type, row_id.value_type);
+        assert_eq!(factory.peek_next_id(), allocated_id.0 + 1);
+        // Reservations carry identity only; they are not authored columns.
+        assert!(factory.value_type(ColumnId(1)).is_none());
     }
 
     #[test]
@@ -353,8 +362,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: ColumnId(9),
             name: ImvRowIdColumn::NAME.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         });
         let plan = scan_plan(scan);

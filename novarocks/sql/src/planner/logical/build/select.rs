@@ -275,14 +275,13 @@ fn build_distinct(
                 qualifier: None,
                 column: item.output_name.clone(),
             },
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
         });
         output_columns.push(OutputColumn {
             column_id: cid,
             name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
+
             is_internal: false,
         });
     }

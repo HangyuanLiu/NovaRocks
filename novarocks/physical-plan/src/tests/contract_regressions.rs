@@ -149,8 +149,20 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
 #[test]
 fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
     let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
-    finish_largeint_literal(ty(largeint.clone(), false)).unwrap();
-    finish_largeint_literal(ty(largeint, true)).unwrap();
+    for nullable in [false, true] {
+        finish_largeint_literal(
+            ValueType::try_with_logical_type(
+                largeint.clone(),
+                nullable,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    // The same physical width does not author the LARGEINT logical domain.
+    let opaque = finish_largeint_literal(ty(largeint, false)).unwrap_err();
+    assert!(opaque.contains("literal largeint differs from its declared type"));
 
     let wrong_type = finish_largeint_literal(ty(DataType::Int64, false)).unwrap_err();
     assert!(wrong_type.contains("literal largeint differs from its declared type Int64"));

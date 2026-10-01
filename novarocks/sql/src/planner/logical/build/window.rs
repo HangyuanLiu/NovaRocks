@@ -121,12 +121,8 @@ fn dedup_project_item_output_ids(
         if item.output_column_id != ColumnId::UNSET && seen.insert(item.output_column_id) {
             continue;
         }
-        item.output_column_id = factory.create(
-            None,
-            item.output_name.clone(),
-            item.expr.data_type.clone(),
-            item.expr.nullable,
-        );
+        item.output_column_id =
+            factory.create(None, item.output_name.clone(), item.expr.value_type.clone());
         seen.insert(item.output_column_id);
     }
     project_items
@@ -292,14 +288,17 @@ impl WindowOutputIdAllocator<'_> {
             self.visible_output_id_used = true;
             self.visible_output_column_id
         } else {
-            self.factory
-                .create(None, output_name.to_string(), data_type.clone(), nullable)
+            self.factory.create(
+                None,
+                output_name.to_string(),
+                novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
+            )
         };
         self.output_columns.push(OutputColumn {
             column_id,
             name: output_name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: !reuse_visible_output_id,
         });
         column_id
@@ -354,8 +353,11 @@ fn rewrite_window_calls(
             // For FIRST_VALUE / LAST_VALUE the reversal also swaps the function
             // because reversing the iteration direction inverts which row is
             // "first" vs "last".
-            let output_column_id =
-                output_ids.allocate(&win_output_name, expr.data_type.clone(), expr.nullable);
+            let output_column_id = output_ids.allocate(
+                &win_output_name,
+                expr.value_type.data_type.clone(),
+                expr.value_type.nullable,
+            );
 
             window_exprs.push(WindowExpr {
                 name: name.clone(),
@@ -367,7 +369,7 @@ fn rewrite_window_calls(
                 partition_by: partition_by.clone(),
                 order_by: order_by.clone(),
                 window_frame: window_frame.clone(),
-                result_type: expr.data_type.clone(),
+                result_type: expr.value_type.data_type.clone(),
                 output_name: win_output_name.clone(),
                 output_column_id,
                 ignore_nulls: *ignore_nulls,
@@ -378,8 +380,7 @@ fn rewrite_window_calls(
                     qualifier: None,
                     column: win_output_name,
                 },
-                data_type: expr.data_type.clone(),
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
             }
         }
         ExprKind::BinaryOp {
@@ -406,8 +407,7 @@ fn rewrite_window_calls(
                 )),
                 decimal_overflow_policy: *decimal_overflow_policy,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
             kind: ExprKind::UnaryOp {
@@ -420,8 +420,7 @@ fn rewrite_window_calls(
                     counter,
                 )),
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::FunctionCall {
             name,
@@ -442,8 +441,7 @@ fn rewrite_window_calls(
                 binding: binding.clone(),
                 volatility: *volatility,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::AggregateCall {
             name,
@@ -477,8 +475,7 @@ fn rewrite_window_calls(
                     .collect(),
                 resolved: resolved.clone(),
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::Cast {
             expr: inner,
@@ -496,8 +493,7 @@ fn rewrite_window_calls(
                 target: target.clone(),
                 decimal_overflow_policy: *decimal_overflow_policy,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::IsNull {
             expr: inner,
@@ -513,8 +509,7 @@ fn rewrite_window_calls(
                 )),
                 negated: *negated,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::InList {
             expr: inner,
@@ -537,8 +532,7 @@ fn rewrite_window_calls(
                     .collect(),
                 negated: *negated,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::Between {
             expr: inner,
@@ -570,8 +564,7 @@ fn rewrite_window_calls(
                 )),
                 negated: *negated,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::Like {
             expr: inner,
@@ -595,8 +588,7 @@ fn rewrite_window_calls(
                 )),
                 negated: *negated,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::Case {
             operand,
@@ -644,8 +636,7 @@ fn rewrite_window_calls(
                     ))
                 }),
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::IsTruthValue {
             expr: inner,
@@ -663,8 +654,7 @@ fn rewrite_window_calls(
                 value: *value,
                 negated: *negated,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         ExprKind::Nested(inner) => TypedExpr {
             kind: ExprKind::Nested(Box::new(rewrite_window_calls(
@@ -674,8 +664,7 @@ fn rewrite_window_calls(
                 window_exprs,
                 counter,
             ))),
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         },
         // For any other node types, return as-is (no window calls inside)
         _ => expr.clone(),

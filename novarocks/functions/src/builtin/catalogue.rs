@@ -33,8 +33,10 @@ use arrow_schema::DataType;
 
 use super::intrinsic::{BuiltinDisposition, builtin_disposition};
 use super::resolver::ResolveError;
+use super::signature::{field_value_type, merge_value_types, value_field};
 use super::{registry, resolver};
 use crate::FunctionVolatility;
+use novarocks_type_contract::ValueLogicalType;
 pub fn resolved_aggregate_signature_from_binding(
     binding: ResolvedFunctionBinding,
 ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
@@ -86,6 +88,7 @@ pub fn resolve_bound_aggregate(
         })
         .collect::<Vec<_>>();
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &arguments,
         logical_argument_count: logical_arg_types.len(),
     };
@@ -222,67 +225,18 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
     }
 }
 
-impl FunctionBindingResolver for BuiltinAggregateResolver {
-    fn resolve(
+impl BuiltinAggregateResolver {
+    fn bind_value_selection(
         &self,
         request: FunctionBindingRequest<'_>,
+        selected: Option<&FunctionOverloadId>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
-        let argument_types = request
-            .arguments
+        validate_request_value_types(request)?;
+        let values = scalar_request_value_types(request)?;
+        let argument_types = values
             .iter()
-            .map(|argument| match argument {
-                FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type.clone()),
-                FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let logical_types = &argument_types[..request.logical_argument_count];
-        let logical = self
-            .resolve_aggregate(logical_types)
-            .map_err(binding_resolution_error)?;
-        let resolved = if request.logical_argument_count == argument_types.len() {
-            logical
-        } else {
-            self.resolve_update_signature(&logical.overload, &argument_types)
-                .map_err(binding_resolution_error)?
-        };
-        let argument_types = request
-            .arguments
-            .iter()
-            .map(FunctionArgument::argument_type)
-            .collect();
-        Ok(FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(resolved.overload.as_str())
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-            argument_types,
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                resolved.output_type,
-                builtin_aggregate_output_nullable(self.declaration.name),
-            )),
-            aggregate: Some(crate::AggregateBindingSelection {
-                intermediate_type: FunctionValueType::new(
-                    resolved.intermediate_type,
-                    builtin_aggregate_intermediate_nullable(self.declaration.name),
-                ),
-                state_format: resolved.state_format,
-            }),
-        })
-    }
-
-    fn validate_selected(
-        &self,
-        selected: &FunctionBindingSelection,
-        request: FunctionBindingRequest<'_>,
-    ) -> Result<(), FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
-        let argument_types = request
-            .arguments
-            .iter()
-            .map(|argument| match argument {
-                FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type.clone()),
-                FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|ty| ty.data_type.clone())
+            .collect::<Vec<_>>();
         let logical_types = &argument_types[..request.logical_argument_count];
         let declaration = self.declaration;
         if !(declaration.min_args..=declaration.max_args).contains(&logical_types.len())
@@ -290,33 +244,130 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
-        let selected_overload = AggregateOverloadIdentity::try_new(selected.overload.as_str())
+        let name = declaration.name;
+        // Numeric readers never reinterpret another semantic value domain as
+        // their carrier. LARGEINT is explicitly admitted only by its owner.
+        if matches!(
+            name,
+            "sum"
+                | "multi_distinct_sum"
+                | "avg"
+                | "multi_distinct_avg"
+                | "corr"
+                | "covar_pop"
+                | "covar_samp"
+                | "var_pop"
+                | "var_samp"
+                | "variance"
+                | "variance_pop"
+                | "variance_samp"
+                | "stddev"
+                | "stddev_pop"
+                | "stddev_samp"
+                | "std"
+        ) {
+            for value in &values[..request.logical_argument_count] {
+                let largeint = matches!(name, "sum" | "multi_distinct_sum")
+                    && value.logical_type == ValueLogicalType::LargeInt;
+                if !largeint
+                    && (value.logical_type != ValueLogicalType::Physical
+                        || matches!(value.data_type, DataType::FixedSizeBinary(_)))
+                {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
+        }
+        let resolved = if let Some(selected) = selected {
+            let overload = AggregateOverloadIdentity::try_new(selected.as_str())
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+            self.resolve_update_signature(&overload, &argument_types)
+                .map_err(binding_resolution_error)?
+        } else {
+            let logical = self
+                .resolve_aggregate(logical_types)
+                .map_err(binding_resolution_error)?;
+            if request.logical_argument_count == argument_types.len() {
+                logical
+            } else {
+                self.resolve_update_signature(&logical.overload, &argument_types)
+                    .map_err(binding_resolution_error)?
+            }
+        };
+        let mut output = FunctionValueType::new(
+            resolved.output_type,
+            builtin_aggregate_output_nullable(name),
+        );
+        let mut intermediate = FunctionValueType::new(
+            resolved.intermediate_type,
+            builtin_aggregate_intermediate_nullable(name),
+        );
+        if let Some(first) = values.first() {
+            match name {
+                "min" | "max" | "any_value" | "array_unique_agg" | "sum_map" => {
+                    output = first.clone();
+                    intermediate = first.clone();
+                }
+                "max_by" | "min_by" | "percentile_cont" | "percentile_disc"
+                | "percentile_disc_lc" => output = first.clone(),
+                "sum" | "multi_distinct_sum"
+                    if first.logical_type == ValueLogicalType::LargeInt =>
+                {
+                    output = first.clone();
+                    if name == "sum" {
+                        intermediate = first.clone();
+                    }
+                }
+                "array_agg" | "array_agg_distinct" => {
+                    output.data_type = DataType::List(Arc::new(value_field("item", first, true)));
+                    // The implementation's state Fields/ORDER BY channels
+                    // remain the separately derived transport representation.
+                }
+                "min_n" | "max_n" => {
+                    output.data_type = DataType::List(Arc::new(value_field("item", first, true)))
+                }
+                _ => {}
+            }
+        }
+        if name == "map_agg" && values.len() >= 2 {
+            output.data_type = full_map_type(&values[0], &values[1]);
+            intermediate.data_type = output.data_type.clone();
+        }
+        output.nullable = builtin_aggregate_output_nullable(name);
+        intermediate.nullable = builtin_aggregate_intermediate_nullable(name);
+        output
+            .validate()
+            .and_then(|()| intermediate.validate())
             .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-        let resolved = AggregateSignatureResolver::resolve_update_signature(
-            self,
-            &selected_overload,
-            &argument_types,
-        )
-        .map_err(binding_resolution_error)?;
-        let expected = FunctionBindingSelection {
-            overload: selected.overload.clone(),
+        Ok(FunctionBindingSelection {
+            overload: FunctionOverloadId::try_new(resolved.overload.as_str())
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
             argument_types: request
                 .arguments
                 .iter()
                 .map(FunctionArgument::argument_type)
                 .collect(),
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                resolved.output_type,
-                builtin_aggregate_output_nullable(self.declaration.name),
-            )),
+            result_type: FunctionResultType::Scalar(output),
             aggregate: Some(crate::AggregateBindingSelection {
-                intermediate_type: FunctionValueType::new(
-                    resolved.intermediate_type,
-                    builtin_aggregate_intermediate_nullable(self.declaration.name),
-                ),
+                intermediate_type: intermediate,
                 state_format: resolved.state_format,
             }),
-        };
+        })
+    }
+}
+
+impl FunctionBindingResolver for BuiltinAggregateResolver {
+    fn resolve(
+        &self,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.bind_value_selection(request, None)
+    }
+    fn validate_selected(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<(), FunctionBindingError> {
+        let expected = self.bind_value_selection(request, Some(&selected.overload))?;
         if &expected == selected {
             Ok(())
         } else {
@@ -802,6 +853,7 @@ fn validate_builtin_selected_domain(
 }
 
 struct BuiltinScalarResolver {
+    function_id: FunctionId,
     canonical_name: Box<str>,
     overloads: Box<[FunctionOverloadId]>,
 }
@@ -860,34 +912,40 @@ fn builtin_scalar_semantics(name: &str) -> FunctionSemantics {
     }
 }
 
-fn validate_legacy_root_domains(
+fn validate_request_value_types(
     request: FunctionBindingRequest<'_>,
 ) -> Result<(), FunctionBindingError> {
-    let physical = |ty: &FunctionValueType| {
-        ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
-    };
-    if request.arguments.iter().any(|argument| match argument {
-        FunctionArgument::Value { value_type, .. } => !physical(value_type),
-        FunctionArgument::Lambda {
-            parameter_types,
-            result_type,
-        } => parameter_types.iter().any(|ty| !physical(ty)) || !physical(result_type),
-    }) {
-        return Err(FunctionBindingError::InvalidBinding(
-            "legacy builtin resolver does not declare root logical identities".into(),
-        ));
+    if request.logical_argument_count > request.arguments.len() {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    for argument in request.arguments {
+        match argument {
+            FunctionArgument::Value { value_type, .. } => value_type.validate(),
+            FunctionArgument::Lambda {
+                parameter_types,
+                result_type,
+            } => {
+                for parameter in parameter_types {
+                    parameter.validate().map_err(|error| {
+                        FunctionBindingError::InvalidBinding(error.to_string().into())
+                    })?;
+                }
+                result_type.validate()
+            }
+        }
+        .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
     }
     Ok(())
 }
 
-fn scalar_request_types(
+fn scalar_request_value_types(
     request: FunctionBindingRequest<'_>,
-) -> Result<Vec<DataType>, FunctionBindingError> {
+) -> Result<Vec<FunctionValueType>, FunctionBindingError> {
     request
         .arguments
         .iter()
         .map(|argument| match argument {
-            FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type.clone()),
+            FunctionArgument::Value { value_type, .. } => Ok(value_type.clone()),
             FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
         })
         .collect()
@@ -984,39 +1042,108 @@ fn binding_resolution_error(error: ResolveError) -> FunctionBindingError {
     }
 }
 
+fn builtin_fixed_result_domain(function_id: &FunctionId) -> Option<ValueLogicalType> {
+    match function_id.as_str() {
+        "builtin.scalar/parse_json/v1"
+        | "builtin.scalar/json_object/v1"
+        | "builtin.scalar/json_array/v1"
+        | "builtin.scalar/to_json/v1"
+        | "builtin.scalar/json_query/v1" => Some(ValueLogicalType::Json),
+        _ => None,
+    }
+}
+
+impl BuiltinScalarResolver {
+    fn selection(
+        &self,
+        index: usize,
+        mut resolved: resolver::ResolvedScalarValueSignature,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let carriers = resolved
+            .argument_types
+            .iter()
+            .map(|ty| ty.data_type.clone())
+            .collect::<Vec<_>>();
+        validate_builtin_selected_domain(&self.canonical_name, &carriers)?;
+        if matches!(
+            self.function_id.as_str(),
+            "builtin.scalar/get_json_bool/v1"
+                | "builtin.scalar/get_variant_bool/v1"
+                | "builtin.scalar/get_json_int/v1"
+                | "builtin.scalar/get_variant_int/v1"
+                | "builtin.scalar/get_json_double/v1"
+                | "builtin.scalar/get_variant_double/v1"
+                | "builtin.scalar/get_json_string/v1"
+                | "builtin.scalar/get_variant_string/v1"
+                | "builtin.scalar/get_json_object/v1"
+                | "builtin.scalar/json_query/v1"
+                | "builtin.scalar/json_extract/v1"
+                | "builtin.scalar/json_exists/v1"
+                | "builtin.scalar/json_length/v1"
+                | "builtin.scalar/json_keys/v1"
+                | "builtin.scalar/variant_typeof/v1"
+        ) {
+            let Some(document) = resolved.argument_types.first() else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            let admitted = document.data_type == DataType::Null
+                || match document.logical_type {
+                    ValueLogicalType::Physical => {
+                        matches!(document.data_type, DataType::Utf8 | DataType::LargeUtf8)
+                    }
+                    ValueLogicalType::Json | ValueLogicalType::Variant => true,
+                    _ => false,
+                };
+            if !admitted {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+        }
+
+        // These result identities belong to these exact registered owners.
+        // No display name or Utf8 carrier establishes a JSON value domain.
+        if let Some(logical_type) = builtin_fixed_result_domain(&self.function_id) {
+            resolved.return_type = FunctionValueType::try_with_logical_type(
+                resolved.return_type.data_type,
+                true,
+                logical_type,
+            )
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+        }
+        if self.function_id.as_str() == "builtin.scalar/array_sortby/v1" {
+            let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first() else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            resolved.argument_types[0] = value_type.clone();
+            resolved.return_type = value_type.clone();
+        }
+        resolved.return_type.nullable = scalar_result_nullable(&self.canonical_name, request);
+        Ok(FunctionBindingSelection {
+            overload: self.overloads[index].clone(),
+            argument_types: resolved
+                .argument_types
+                .into_iter()
+                .map(FunctionArgumentType::Value)
+                .collect(),
+            result_type: FunctionResultType::Scalar(resolved.return_type),
+            aggregate: None,
+        })
+    }
+}
+
 impl FunctionBindingResolver for BuiltinScalarResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
-        let argument_types = scalar_request_types(request)?;
-        let (index, resolved) = resolver::resolve_scalar_function_signature_with_overload(
+        validate_request_value_types(request)?;
+        let argument_types = scalar_request_value_types(request)?;
+        let (index, resolved) = resolver::resolve_scalar_value_signature_with_overload(
             &self.canonical_name,
             &argument_types,
         )
         .map_err(binding_resolution_error)?;
-        validate_builtin_selected_domain(&self.canonical_name, &resolved.argument_types)?;
-        let selected_argument_types = request
-            .arguments
-            .iter()
-            .zip(resolved.argument_types)
-            .map(|(argument, data_type)| match argument {
-                FunctionArgument::Value { value_type, .. } => FunctionArgumentType::Value(
-                    FunctionValueType::new(data_type, value_type.nullable),
-                ),
-                FunctionArgument::Lambda { .. } => unreachable!("scalar registry has no lambdas"),
-            })
-            .collect();
-        Ok(FunctionBindingSelection {
-            overload: self.overloads[index].clone(),
-            argument_types: selected_argument_types,
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                resolved.return_type,
-                scalar_result_nullable(&self.canonical_name, request),
-            )),
-            aggregate: None,
-        })
+        self.selection(index, resolved, request)
     }
 
     fn validate_selected(
@@ -1024,8 +1151,8 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
-        let overload_index = self
+        validate_request_value_types(request)?;
+        let index = self
             .overloads
             .iter()
             .position(|overload| overload == &selected.overload)
@@ -1034,27 +1161,14 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
                     "selected scalar overload is not declared by this function".into(),
                 )
             })?;
-        let argument_types = scalar_request_types(request)?;
-        let resolved = resolver::resolve_scalar_function_signature_at_overload(
+        let argument_types = scalar_request_value_types(request)?;
+        let resolved = resolver::resolve_scalar_value_signature_at_overload(
             &self.canonical_name,
-            overload_index,
+            index,
             &argument_types,
         )
         .map_err(binding_resolution_error)?;
-        validate_builtin_selected_domain(&self.canonical_name, &resolved.argument_types)?;
-        let expected = FunctionBindingSelection {
-            overload: selected.overload.clone(),
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                resolved.return_type,
-                scalar_result_nullable(&self.canonical_name, request),
-            )),
-            aggregate: None,
-        };
+        let expected = self.selection(index, resolved, request)?;
         if &expected == selected {
             return Ok(());
         }
@@ -1135,7 +1249,12 @@ fn bind_builtin_unnest(
         argument_types.push(FunctionArgumentType::Value(value_type.clone()));
         // The current UNNEST operator exposes nullable output slots so a
         // lateral left join can null-extend them without changing its binding.
-        result_columns.push(FunctionValueType::new(item.data_type().clone(), true));
+        if value_type.logical_type != ValueLogicalType::Physical {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        let mut result = field_value_type(item).ok_or(FunctionBindingError::NoMatchingOverload)?;
+        result.nullable = true;
+        result_columns.push(result);
     }
     Ok(FunctionBindingSelection {
         overload: FunctionOverloadId::try_new(BUILTIN_UNNEST_OVERLOAD_ID)
@@ -1151,7 +1270,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
+        validate_request_value_types(request)?;
         bind_builtin_unnest(request)
     }
 
@@ -1160,7 +1279,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
+        validate_request_value_types(request)?;
         if selected.overload.as_str() != BUILTIN_UNNEST_OVERLOAD_ID {
             return Err(FunctionBindingError::UnknownOverload(
                 selected.overload.clone(),
@@ -1221,6 +1340,7 @@ pub fn dynamic_scalar_names() -> &'static [&'static str] {
 }
 
 struct BuiltinDynamicScalarResolver {
+    function_id: FunctionId,
     canonical_name: Box<str>,
     overload: FunctionOverloadId,
 }
@@ -1501,10 +1621,88 @@ pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Opti
     })
 }
 
+fn full_map_type(key: &FunctionValueType, value: &FunctionValueType) -> DataType {
+    DataType::Map(
+        Arc::new(arrow_schema::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(value_field("key", key, true)),
+                    Arc::new(value_field("value", value, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
+}
+
+fn fold_value_types<'a>(
+    values: impl Iterator<Item = &'a FunctionValueType>,
+) -> Result<FunctionValueType, FunctionBindingError> {
+    let mut result = FunctionValueType::new(DataType::Null, true);
+    for value in values {
+        result = merge_value_types(&result, value, true)
+            .ok_or(FunctionBindingError::NoMatchingOverload)?;
+    }
+    Ok(result)
+}
+
+fn full_list_item(ty: &FunctionValueType) -> Result<FunctionValueType, FunctionBindingError> {
+    if ty.logical_type != ValueLogicalType::Physical {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    match &ty.data_type {
+        DataType::List(item) => {
+            field_value_type(item).ok_or(FunctionBindingError::NoMatchingOverload)
+        }
+        DataType::Null => Ok(FunctionValueType::new(DataType::Null, true)),
+        _ => Err(FunctionBindingError::NoMatchingOverload),
+    }
+}
+
+fn full_map_items(
+    ty: &FunctionValueType,
+) -> Result<(FunctionValueType, FunctionValueType), FunctionBindingError> {
+    if ty.logical_type != ValueLogicalType::Physical {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let DataType::Map(entries, _) = &ty.data_type else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    if fields.len() != 2 {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    Ok((
+        field_value_type(&fields[0]).ok_or(FunctionBindingError::NoMatchingOverload)?,
+        field_value_type(&fields[1]).ok_or(FunctionBindingError::NoMatchingOverload)?,
+    ))
+}
+
 fn bind_dynamic_scalar_result(
+    function_id: &FunctionId,
     name: &str,
     request: FunctionBindingRequest<'_>,
 ) -> Result<FunctionValueType, FunctionBindingError> {
+    if function_id.as_str() == "builtin.scalar/__array_literal/v1"
+        && request.arguments.is_empty()
+        && let Some(expected) = request.expected_result_type
+    {
+        if expected.logical_type != ValueLogicalType::Physical
+            || expected.nullable
+            || !matches!(expected.data_type, DataType::List(_))
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        expected
+            .validate()
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+        return Ok(expected.clone());
+    }
     let argument_types = dynamic_argument_data_types(request);
     validate_builtin_selected_domain(name, &argument_types)?;
     let mut result = match name {
@@ -1655,7 +1853,259 @@ fn bind_dynamic_scalar_result(
         "__struct_subfield" | "__array_struct_subfield" => true,
         _ => scalar_result_nullable(name, request),
     };
-    Ok(FunctionValueType::new(result, nullable))
+    let value = |index: usize| match request.arguments.get(index) {
+        Some(FunctionArgument::Value { value_type, .. }) => Ok(value_type),
+        _ => Err(FunctionBindingError::NoMatchingOverload),
+    };
+    let values = || {
+        request
+            .arguments
+            .iter()
+            .map(|argument| match argument {
+                FunctionArgument::Value { value_type, .. } => Ok(value_type),
+                _ => Err(FunctionBindingError::NoMatchingOverload),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let mut full_result = FunctionValueType::new(result, nullable);
+    match name {
+        "__array_literal" => {
+            let arguments = values()?;
+            let item = fold_value_types(arguments.iter().copied())?;
+            full_result.data_type = DataType::List(Arc::new(value_field("item", &item, true)));
+        }
+        "array_repeat" => {
+            if value(1)?.logical_type != ValueLogicalType::Physical {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            full_result.data_type = DataType::List(Arc::new(value_field("item", value(0)?, true)));
+        }
+        "array_intersect" => {
+            let items = values()?
+                .into_iter()
+                .map(full_list_item)
+                .collect::<Result<Vec<_>, _>>()?;
+            let item = fold_value_types(items.iter())?;
+            full_result.data_type = DataType::List(Arc::new(value_field("item", &item, true)));
+        }
+        "array_flatten" => {
+            let outer = full_list_item(value(0)?)?;
+            full_result.data_type = DataType::List(Arc::new(value_field(
+                "item",
+                &full_list_item(&outer)?,
+                true,
+            )));
+        }
+        "array_map" => {
+            let Some(FunctionArgument::Lambda {
+                parameter_types,
+                result_type,
+            }) = request.arguments.first()
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            let items = request.arguments[1..]
+                .iter()
+                .map(|argument| match argument {
+                    FunctionArgument::Value { value_type, .. } => full_list_item(value_type),
+                    _ => Err(FunctionBindingError::NoMatchingOverload),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if items.len() != parameter_types.len()
+                || items
+                    .iter()
+                    .zip(parameter_types.iter())
+                    .any(|(item, parameter)| {
+                        item.data_type != DataType::Null
+                            && (item.logical_type != parameter.logical_type
+                                || item.data_type != parameter.data_type)
+                    })
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            full_result.data_type =
+                DataType::List(Arc::new(value_field("item", result_type, true)));
+        }
+        "array_sort_lambda" => {
+            let _ = full_list_item(value(0)?)?;
+            full_result = value(0)?.clone();
+        }
+        "arrays_zip" => {
+            let items = values()?
+                .into_iter()
+                .map(full_list_item)
+                .collect::<Result<Vec<_>, _>>()?;
+            full_result.data_type = DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Struct(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            Arc::new(value_field(&format!("col{}", index + 1), item, true))
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                true,
+            )));
+        }
+        "greatest" | "least" => {
+            full_result = fold_value_types(values()?.into_iter())?;
+            if full_result.data_type == DataType::Date32 {
+                full_result.data_type =
+                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
+            }
+        }
+        "map" => {
+            let arguments = values()?;
+            let key = fold_value_types(arguments.iter().step_by(2).copied())?;
+            let value = fold_value_types(arguments.iter().skip(1).step_by(2).copied())?;
+            full_result.data_type = full_map_type(&key, &value);
+        }
+        "map_from_arrays" => {
+            full_result.data_type =
+                full_map_type(&full_list_item(value(0)?)?, &full_list_item(value(1)?)?)
+        }
+        "map_concat" => {
+            let pairs = values()?
+                .into_iter()
+                .map(full_map_items)
+                .collect::<Result<Vec<_>, _>>()?;
+            if pairs.is_empty() {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            full_result.data_type = full_map_type(
+                &fold_value_types(pairs.iter().map(|pair| &pair.0))?,
+                &fold_value_types(pairs.iter().map(|pair| &pair.1))?,
+            );
+        }
+        "map_entries" => {
+            let (key, value) = full_map_items(value(0)?)?;
+            let DataType::Map(entries, _) = full_map_type(&key, &value) else {
+                unreachable!("map constructor");
+            };
+            full_result.data_type = DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                entries.data_type().clone(),
+                true,
+            )));
+        }
+        "map_apply" | "transform_keys" | "transform_values" => {
+            let _ = full_map_items(value(1)?)?;
+            let Some(FunctionArgument::Lambda { result_type, .. }) = request.arguments.first()
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            let _ = full_map_items(result_type)?;
+            full_result = result_type.clone();
+        }
+        "named_struct" | "row" | "struct" => {
+            let fields = if name == "named_struct" {
+                request
+                    .arguments
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        let name = utf8_constant(pair.first())
+                            .ok_or(FunctionBindingError::NoMatchingOverload)?;
+                        let FunctionArgument::Value { value_type, .. } = &pair[1] else {
+                            return Err(FunctionBindingError::NoMatchingOverload);
+                        };
+                        Ok(Arc::new(value_field(name, value_type, true)))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                values()?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ty)| {
+                        Arc::new(value_field(&format!("col{}", index + 1), ty, true))
+                    })
+                    .collect()
+            };
+            full_result.data_type = DataType::Struct(fields.into());
+        }
+        "__struct_subfield" | "__array_struct_subfield" => {
+            let name = utf8_constant(request.arguments.get(1))
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            if value(1)?.logical_type != ValueLogicalType::Physical {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            let source = if name.is_empty() {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            } else if self_array_subfield(function_id) {
+                full_list_item(value(0)?)?
+            } else {
+                value(0)?.clone()
+            };
+            if source.logical_type != ValueLogicalType::Physical {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            let DataType::Struct(fields) = &source.data_type else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            let field = fields
+                .iter()
+                .find(|field| field.name().eq_ignore_ascii_case(name))
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let projected =
+                field_value_type(field).ok_or(FunctionBindingError::NoMatchingOverload)?;
+            if self_array_subfield(function_id) {
+                full_result.data_type =
+                    DataType::List(Arc::new(value_field("item", &projected, true)));
+            } else {
+                full_result = projected;
+            }
+        }
+        "array_sum" | "array_avg" | "array_cum_sum" | "array_difference" => {
+            let item = full_list_item(value(0)?)?;
+            let largeint = name == "array_sum" && item.logical_type == ValueLogicalType::LargeInt;
+            if !largeint
+                && (item.logical_type != ValueLogicalType::Physical
+                    || matches!(item.data_type, DataType::FixedSizeBinary(_)))
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            if largeint {
+                full_result.logical_type = ValueLogicalType::LargeInt;
+            }
+        }
+        "variant_get" | "try_variant_get" => {
+            if value(0)?.logical_type != ValueLogicalType::Variant
+                && value(0)?.data_type != DataType::Null
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            if value(1)?.logical_type != ValueLogicalType::Physical
+                || (request.arguments.len() == 3
+                    && value(2)?.logical_type != ValueLogicalType::Physical)
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            if request.arguments.len() == 2 {
+                full_result.logical_type = ValueLogicalType::Variant;
+            }
+        }
+        "md5sum_numeric" | "xx_hash3_128" => full_result.logical_type = ValueLogicalType::LargeInt,
+        "array_generate" | "round" | "truncate" => {
+            if values()?
+                .iter()
+                .any(|ty| ty.logical_type != ValueLogicalType::Physical)
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+        }
+        _ => {}
+    }
+    full_result.nullable = nullable;
+    full_result
+        .validate()
+        .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+    Ok(full_result)
+}
+
+fn self_array_subfield(function_id: &FunctionId) -> bool {
+    function_id.as_str() == "builtin.scalar/__array_struct_subfield/v1"
 }
 
 impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
@@ -1663,21 +2113,42 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
+        validate_request_value_types(request)?;
         if request.logical_argument_count != request.arguments.len() {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
-        Ok(FunctionBindingSelection {
-            overload: self.overload.clone(),
-            argument_types: request
+        let result = bind_dynamic_scalar_result(&self.function_id, &self.canonical_name, request)?;
+        let argument_types = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1" {
+            let item = full_list_item(&result)?;
+            request
+                .arguments
+                .iter()
+                .map(|argument| {
+                    let FunctionArgument::Value {
+                        value_type: source, ..
+                    } = argument
+                    else {
+                        return Err(FunctionBindingError::NoMatchingOverload);
+                    };
+                    let target = FunctionValueType {
+                        nullable: source.nullable,
+                        ..item.clone()
+                    };
+                    super::value_conversion::conversion_intermediate_type(source, &target)?;
+                    Ok(FunctionArgumentType::Value(target))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingError>>()?
+        } else {
+            request
                 .arguments
                 .iter()
                 .map(FunctionArgument::argument_type)
-                .collect(),
-            result_type: FunctionResultType::Scalar(bind_dynamic_scalar_result(
-                &self.canonical_name,
-                request,
-            )?),
+                .collect()
+        };
+        Ok(FunctionBindingSelection {
+            overload: self.overload.clone(),
+            argument_types: argument_types.into(),
+            result_type: FunctionResultType::Scalar(result),
             aggregate: None,
         })
     }
@@ -1687,25 +2158,36 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
-        validate_legacy_root_domains(request)?;
+        validate_request_value_types(request)?;
+        if request.logical_argument_count != request.arguments.len() {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
         if selected.overload != self.overload {
             return Err(FunctionBindingError::UnknownOverload(
                 selected.overload.clone(),
             ));
         }
-        let expected = FunctionBindingSelection {
-            overload: self.overload.clone(),
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
-            result_type: FunctionResultType::Scalar(bind_dynamic_scalar_result(
-                &self.canonical_name,
-                request,
-            )?),
-            aggregate: None,
+        let request = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1"
+            && request.arguments.is_empty()
+        {
+            let FunctionResultType::Scalar(result) = &selected.result_type else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            if let Some(expected) = request.expected_result_type
+                && expected != result
+            {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "selected empty array differs from its explicit result constraint".into(),
+                ));
+            }
+            FunctionBindingRequest {
+                expected_result_type: Some(result),
+                ..request
+            }
+        } else {
+            request
         };
+        let expected = self.resolve(request)?;
         if selected == &expected {
             Ok(())
         } else {
@@ -1719,6 +2201,7 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
 pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
+    builder.register(super::value_conversion::value_conversion_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         if !matches!(
             builtin_disposition(name),
@@ -1742,7 +2225,7 @@ pub fn contribute_builtin_functions(
                 value: error.to_string().into(),
             })?;
         let declaration = FunctionBindingDeclaration::try_new(
-            function_id,
+            function_id.clone(),
             FunctionKind::Scalar,
             [FunctionOverloadDeclaration {
                 effects: None,
@@ -1762,6 +2245,7 @@ pub fn contribute_builtin_functions(
             FunctionVisibility::Public,
             declaration,
             Arc::new(BuiltinDynamicScalarResolver {
+                function_id: function_id.clone(),
                 canonical_name: (*name).into(),
                 overload,
             }),
@@ -1787,12 +2271,15 @@ pub fn contribute_builtin_functions(
             .iter()
             .map(|signature| builtin_scalar_overload_id(&name, signature, kind))
             .collect::<Result<Vec<_>, _>>()?;
+        let function_id = builtin_scalar_function_id(&name, kind)?;
         let resolver = Arc::new(BuiltinScalarResolver {
+            function_id: function_id.clone(),
             canonical_name: name.clone().into_boxed_str(),
             overloads: overloads.clone().into_boxed_slice(),
         });
+        let result_domain = builtin_fixed_result_domain(&function_id);
         let declaration = FunctionBindingDeclaration::try_new(
-            builtin_scalar_function_id(&name, kind)?,
+            function_id,
             kind,
             overloads
                 .into_iter()
@@ -1802,7 +2289,14 @@ pub fn contribute_builtin_functions(
                     semantics: builtin_scalar_semantics(&name),
                     identity,
                     argument_pattern: signature.clone().into_boxed_str(),
-                    result_pattern: signature.clone().into_boxed_str(),
+                    result_pattern: match result_domain {
+                        Some(domain) => format!(
+                            "{signature};root={}",
+                            domain.metadata_value().expect("declared semantic root")
+                        )
+                        .into_boxed_str(),
+                        None => signature.clone().into_boxed_str(),
+                    },
                     aggregate: None,
                 }),
         )
@@ -1977,6 +2471,7 @@ mod tests {
                 name,
                 FunctionKind::Scalar,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments,
                     logical_argument_count: arguments.len(),
                 },
@@ -2026,6 +2521,7 @@ mod tests {
                 "count",
                 FunctionKind::Aggregate,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &nonnull,
                     logical_argument_count: 1,
                 },
@@ -2036,6 +2532,7 @@ mod tests {
                 "sum",
                 FunctionKind::Aggregate,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &nonnull,
                     logical_argument_count: 1,
                 },
@@ -2092,7 +2589,15 @@ mod tests {
             &catalog,
             "variant_get",
             &[
-                value_argument(DataType::LargeBinary, false, None),
+                FunctionArgument::Value {
+                    value_type: FunctionValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        false,
+                        ValueLogicalType::Variant,
+                    )
+                    .unwrap(),
+                    constant: None,
+                },
                 value_argument(
                     DataType::Utf8,
                     false,
@@ -2122,6 +2627,7 @@ mod tests {
                 "unnest",
                 FunctionKind::Table,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: 1,
                 },
@@ -2137,6 +2643,7 @@ mod tests {
             .validate_bound(
                 &binding,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: 1,
                 },
@@ -2401,21 +2908,32 @@ mod tests {
             (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
         ] {
             for nullable in [false, true] {
-                let arguments = [value_argument(input.clone(), nullable, None)];
+                let source_type = if input == DataType::FixedSizeBinary(16) {
+                    FunctionValueType::try_with_logical_type(
+                        input.clone(),
+                        nullable,
+                        ValueLogicalType::LargeInt,
+                    )
+                    .unwrap()
+                } else {
+                    FunctionValueType::new(input.clone(), nullable)
+                };
+                let arguments = [FunctionArgument::Value {
+                    value_type: source_type.clone(),
+                    constant: None,
+                }];
                 let binding = resolve_exact_scalar(&catalog, "abs", &arguments);
                 assert_eq!(scalar_result(&binding).data_type, output);
                 assert_eq!(scalar_result(&binding).nullable, nullable);
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(FunctionValueType::new(
-                        input.clone(),
-                        nullable
-                    ))]
+                    &[FunctionArgumentType::Value(source_type)]
                 );
                 catalog
                     .validate_bound(
                         &binding,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 1,
                         },
@@ -2454,6 +2972,7 @@ mod tests {
                     .validate_bound(
                         &binding,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 1,
                         }
@@ -2505,6 +3024,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: arguments.len(),
                     },
@@ -2532,6 +3052,7 @@ mod tests {
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 1
                         }
@@ -2622,6 +3143,7 @@ mod tests {
                     .validate_bound(
                         &bound,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len(),
                         },
@@ -2634,6 +3156,7 @@ mod tests {
                         "encode_sort_key",
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len()
                         }
@@ -2671,6 +3194,7 @@ mod tests {
                         "field",
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 2
                         }
@@ -2702,6 +3226,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 2,
                     },
@@ -2751,6 +3276,7 @@ mod tests {
                             name,
                             FunctionKind::Scalar,
                             FunctionBindingRequest {
+                                expected_result_type: None,
                                 arguments: &arguments,
                                 logical_argument_count: arguments.len()
                             }
@@ -2769,6 +3295,7 @@ mod tests {
                         "array_sortby",
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 2
                         }
@@ -2789,6 +3316,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 1,
                     },
@@ -2805,6 +3333,7 @@ mod tests {
             .validate_bound(
                 &bound,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: 2,
                 },
@@ -2841,6 +3370,7 @@ mod tests {
                             name,
                             FunctionKind::Scalar,
                             FunctionBindingRequest {
+                                expected_result_type: None,
                                 arguments: &arguments,
                                 logical_argument_count: arguments.len()
                             }
@@ -2870,6 +3400,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 1,
                     },
@@ -2886,6 +3417,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 2,
                     },
@@ -2899,6 +3431,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &[],
                         logical_argument_count: 0,
                     },
@@ -2925,6 +3458,7 @@ mod tests {
                             name,
                             FunctionKind::Scalar,
                             FunctionBindingRequest {
+                                expected_result_type: None,
                                 arguments: &arguments,
                                 logical_argument_count: 1
                             }
@@ -2949,6 +3483,7 @@ mod tests {
                     .validate_bound(
                         &bound,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 1,
                         },
@@ -2981,6 +3516,7 @@ mod tests {
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len()
                         }
@@ -3002,6 +3538,7 @@ mod tests {
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len()
                         }
@@ -3018,6 +3555,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: arguments.len(),
                     },
@@ -3035,6 +3573,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 2,
                     },
@@ -3058,6 +3597,7 @@ mod tests {
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len()
                         }
@@ -3091,6 +3631,7 @@ mod tests {
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: 2
                         }
@@ -3114,6 +3655,7 @@ mod tests {
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: arguments.len(),
                     },
@@ -3137,6 +3679,7 @@ mod tests {
             .validate_bound(
                 &bound,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: 2,
                 },
@@ -3232,3 +3775,7 @@ mod logical_argument_identity_tests {
         )));
     }
 }
+
+#[cfg(test)]
+#[path = "value_binding_tests.rs"]
+mod value_binding_tests;

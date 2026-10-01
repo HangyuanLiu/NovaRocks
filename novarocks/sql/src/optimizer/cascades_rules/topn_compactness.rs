@@ -679,18 +679,17 @@ fn remap_sort_keys_through_union(
                 .position(|column| column.column_id == union_column_id)?;
             let union_output = union_outputs.get(output_position)?;
             let branch_output = branch_outputs.get(output_position)?;
-            if scalars.data_type(item.expr) != &union_output.data_type
-                || scalars.nullable(item.expr) != union_output.nullable
-                || branch_output.data_type != union_output.data_type
-                || branch_output.nullable != union_output.nullable
+            if scalars.data_type(item.expr) != &union_output.value_type.data_type
+                || scalars.nullable(item.expr) != union_output.value_type.nullable
+                || branch_output.value_type.data_type != union_output.value_type.data_type
+                || branch_output.value_type.nullable != union_output.value_type.nullable
             {
                 return None;
             }
 
             let expr = scalars.intern(
                 ScalarNode::ColumnRef(branch_output.column_id),
-                branch_output.data_type.clone(),
-                branch_output.nullable,
+                branch_output.value_type.clone(),
             );
             Some(ScalarSortKey {
                 expr,
@@ -753,8 +752,7 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -769,8 +767,7 @@ mod tests {
     fn literal_expr(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -818,8 +815,8 @@ mod tests {
         crate::analysis::OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }

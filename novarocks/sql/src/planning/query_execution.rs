@@ -342,12 +342,17 @@ fn build_synthetic_scan_plan(
             column_id: factory.create(
                 None,
                 field.name().to_string(),
+                novarocks_type_contract::FunctionValueType::new(
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ),
+            ),
+            name: field.name().to_string(),
+            value_type: novarocks_type_contract::FunctionValueType::new(
                 field.data_type().clone(),
                 field.is_nullable(),
             ),
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
+
             is_internal: false,
         });
     }

@@ -1014,11 +1014,7 @@ pub(crate) fn substitute_scalar(
             body: substitute_scalar(arena, body, defs),
         },
     };
-    arena.intern(
-        rewritten,
-        arena.data_type(expr).clone(),
-        arena.nullable(expr),
-    )
+    arena.intern(rewritten, arena.value_type(expr).clone())
 }
 
 fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
@@ -1073,11 +1069,7 @@ fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
 
 pub(crate) fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
     arena.remember_project_output_display(c.column_id, None, c.name.clone());
-    arena.intern(
-        ScalarNode::ColumnRef(c.column_id),
-        c.data_type.clone(),
-        c.nullable,
-    )
+    arena.intern(ScalarNode::ColumnRef(c.column_id), c.value_type.clone())
 }
 
 #[cfg(test)]
@@ -1096,8 +1088,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1109,16 +1101,14 @@ mod tests {
                 qualifier: None,
                 column: c.name.clone(),
             },
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
+            value_type: c.value_type.clone(),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -1130,8 +1120,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -1153,8 +1142,8 @@ mod tests {
                     .iter()
                     .map(|c| ColumnDef {
                         name: c.name.clone(),
-                        data_type: c.data_type.clone(),
-                        nullable: c.nullable,
+                        data_type: c.value_type.data_type.clone(),
+                        nullable: c.value_type.nullable,
                         write_default: None,
                         logical_type: None,
                     })
@@ -1224,8 +1213,14 @@ mod tests {
         let mut arena = ScalarArena::new();
         // a(=col 1) = b(=col 2)  AND  a > b   (the `>` conjunct is a residual;
         // two ColumnRefs avoid depending on the ScalarNode::Literal payload type).
-        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let a_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let b_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let eq = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1233,8 +1228,7 @@ mod tests {
                 right: b_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         let gt = arena.intern(
             ScalarNode::BinaryOp {
@@ -1243,8 +1237,7 @@ mod tests {
                 right: b_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         let cond = arena.intern(
             ScalarNode::BinaryOp {
@@ -1253,8 +1246,7 @@ mod tests {
                 right: gt,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         let left_columns = HashSet::from([ColumnId(1)]);
@@ -1283,8 +1275,14 @@ mod tests {
         use crate::analysis::BinOp;
 
         let mut arena = ScalarArena::new();
-        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let c_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(3)), DataType::Int64, true);
+        let a_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let c_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(3)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cond = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1292,8 +1290,7 @@ mod tests {
                 right: a_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
@@ -1311,8 +1308,14 @@ mod tests {
         use crate::analysis::BinOp;
 
         let mut arena = ScalarArena::new();
-        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let a_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let b_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cond = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1320,8 +1323,7 @@ mod tests {
                 right: b_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);

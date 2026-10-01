@@ -88,8 +88,7 @@ mod tests {
                 qualifier: None,
                 column: "v".into(),
             },
-            data_type: ty,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
         }
     }
 
@@ -101,7 +100,7 @@ mod tests {
         };
         let argument_types = args
             .iter()
-            .map(|arg| arg.data_type.clone())
+            .map(|arg| arg.value_type.data_type.clone())
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.into(),

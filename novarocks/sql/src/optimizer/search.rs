@@ -753,8 +753,7 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -765,13 +764,14 @@ mod tests {
                 op: BinOp::Sub,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(value)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -1882,8 +1882,7 @@ mod cascaded_derivation_tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -2010,8 +2009,8 @@ mod cascaded_derivation_tests {
             output_columns: vec![crate::analysis::OutputColumn {
                 column_id: ColumnId(1000),
                 name: "win".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         });

@@ -189,8 +189,7 @@ fn substitute_constraint_column(
                     list: list.clone(),
                     negated: false,
                 },
-                DataType::Boolean,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
             )
         }
         ConstraintKind::Lower { op, value } | ConstraintKind::Upper { op, value } => {
@@ -206,8 +205,7 @@ fn substitute_constraint_column(
                     high: *high,
                     negated: false,
                 },
-                DataType::Boolean,
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
             )
         }
     };
@@ -734,8 +732,7 @@ fn binary_bool(arena: &mut ScalarArena, left: ScalarId, op: BinOp, right: Scalar
             right,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        DataType::Boolean,
-        nullable,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
     )
 }
 
@@ -784,40 +781,41 @@ mod tests {
                 qualifier: Some(alias.to_string()),
                 column: name.to_string(),
             },
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn large_int_lit(v: i128) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
-            data_type: DataType::Decimal128(38, 0),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Decimal128(38, 0),
+                false,
+            ),
         }
     }
 
     fn decimal_lit(v: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Decimal(v.to_string())),
-            data_type: DataType::Decimal128(38, 2),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Decimal128(38, 2),
+                false,
+            ),
         }
     }
 
     fn string_lit(v: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(v.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }
     }
 
@@ -829,8 +827,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -861,8 +858,10 @@ mod tests {
                     args: vec![],
                     distinct: false,
                 },
-                data_type: DataType::Float64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Float64,
+                    false,
+                ),
             },
         )
     }
@@ -1113,8 +1112,10 @@ mod tests {
                     high: Box::new(int_lit(150)),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
             BinOp::Or,
             TypedExpr {
@@ -1124,8 +1125,10 @@ mod tests {
                     high: Box::new(int_lit(200)),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
         );
 
@@ -1150,8 +1153,10 @@ mod tests {
                     high: Box::new(large_int_lit(9_007_199_254_741_500)),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
             BinOp::Or,
             TypedExpr {
@@ -1161,8 +1166,10 @@ mod tests {
                     high: Box::new(large_int_lit(9_007_199_254_741_600)),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
         );
 
@@ -1186,8 +1193,10 @@ mod tests {
                     high: Box::new(decimal_lit("20.00")),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
             BinOp::Or,
             TypedExpr {
@@ -1197,8 +1206,10 @@ mod tests {
                     high: Box::new(decimal_lit("30.00")),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
         );
 
@@ -1221,8 +1232,10 @@ mod tests {
                     high: Box::new(string_lit("z")),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
             BinOp::Or,
             TypedExpr {
@@ -1232,8 +1245,10 @@ mod tests {
                     high: Box::new(string_lit("y")),
                     negated: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             },
         );
 

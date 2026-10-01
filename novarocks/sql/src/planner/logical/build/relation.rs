@@ -47,21 +47,23 @@ pub(super) fn plan_relation_scoped(
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(idx, c)| OutputColumn {
-                    column_id: scan.column_ids.get(idx).copied().unwrap_or_else(|| {
-                        factory.create(
-                            scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
-                            c.name.clone(),
-                            c.data_type.clone(),
-                            c.nullable,
-                        )
-                    }),
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                    is_internal: false,
+                .map(|(idx, c)| {
+                    let value_type = c.declared_value_type().map_err(|error| error.to_string())?;
+                    Ok(OutputColumn {
+                        column_id: scan.column_ids.get(idx).copied().unwrap_or_else(|| {
+                            factory.create(
+                                scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                                c.name.clone(),
+                                value_type.clone(),
+                            )
+                        }),
+                        name: c.name.clone(),
+                        value_type,
+
+                        is_internal: false,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             for (meta_idx, c) in scan
                 .table
                 .iceberg_row_lineage_metadata_columns
@@ -69,19 +71,21 @@ pub(super) fn plan_relation_scoped(
                 .enumerate()
             {
                 let col_id_idx = base_len + meta_idx;
-                columns.push(OutputColumn {
-                    column_id: scan.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
-                        factory.create(
-                            scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
-                            c.name.clone(),
-                            c.data_type.clone(),
-                            c.nullable,
-                        )
-                    }),
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                    is_internal: false,
+                columns.push({
+                    let value_type = c.declared_value_type().map_err(|error| error.to_string())?;
+                    OutputColumn {
+                        column_id: scan.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
+                            factory.create(
+                                scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                                c.name.clone(),
+                                value_type.clone(),
+                            )
+                        }),
+                        name: c.name.clone(),
+                        value_type,
+
+                        is_internal: false,
+                    }
                 });
             }
             Ok(LogicalPlanNode::new(
@@ -225,21 +229,24 @@ fn plan_iceberg_metadata_scan(
     // would desync the `ColumnRef` ids in the rest of the plan (SELECT list,
     // WHERE, etc.) from the scan's output_columns, causing Phase-2 column
     // pruning to incorrectly prune needed columns (same pattern as Relation::Scan).
-    let output_columns: Vec<OutputColumn> = rel
-        .table
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| OutputColumn {
-            column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
-                factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable)
-            }),
-            name: c.name.clone(),
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
-            is_internal: false,
-        })
-        .collect();
+    let output_columns: Vec<OutputColumn> =
+        rel.table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                let value_type = c.declared_value_type().map_err(|error| error.to_string())?;
+                Ok(OutputColumn {
+                    column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
+                        factory.create(None, c.name.clone(), value_type.clone())
+                    }),
+                    name: c.name.clone(),
+                    value_type,
+
+                    is_internal: false,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
     let ScanSource::Sql(source) = rel.table.source;
     if !matches!(
         source.kind,
@@ -295,21 +302,24 @@ fn plan_iceberg_delta_scan(
     // the `ColumnRef` ids in the rest of the plan from the scan's output columns,
     // causing Phase-2 column pruning to incorrectly prune needed scan columns.
     let base_col_count = rel.table.columns.len();
-    let mut output_columns: Vec<OutputColumn> = rel
-        .table
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| OutputColumn {
-            column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
-                factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable)
-            }),
-            name: c.name.clone(),
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
-            is_internal: false,
-        })
-        .collect();
+    let mut output_columns: Vec<OutputColumn> =
+        rel.table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                let value_type = c.declared_value_type().map_err(|error| error.to_string())?;
+                Ok(OutputColumn {
+                    column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
+                        factory.create(None, c.name.clone(), value_type.clone())
+                    }),
+                    name: c.name.clone(),
+                    value_type,
+
+                    is_internal: false,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
     for (meta_idx, col) in rel
         .table
         .iceberg_row_lineage_metadata_columns
@@ -317,14 +327,21 @@ fn plan_iceberg_delta_scan(
         .enumerate()
     {
         let col_id_idx = base_col_count + meta_idx;
-        output_columns.push(OutputColumn {
-            column_id: rel.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
-                factory.create(None, col.name.clone(), col.data_type.clone(), col.nullable)
-            }),
-            name: col.name.clone(),
-            data_type: col.data_type.clone(),
-            nullable: col.nullable,
-            is_internal: false,
+        output_columns.push({
+            let value_type = col
+                .declared_value_type()
+                .map_err(|error| error.to_string())?;
+            OutputColumn {
+                column_id: rel
+                    .column_ids
+                    .get(col_id_idx)
+                    .copied()
+                    .unwrap_or_else(|| factory.create(None, col.name.clone(), value_type.clone())),
+                name: col.name.clone(),
+                value_type,
+
+                is_internal: false,
+            }
         });
     }
     let ScanSource::Sql(source) = rel.table.source;
@@ -406,12 +423,16 @@ pub(super) fn plan_set_operation_scoped(
             .iter()
             .zip(right.output_columns.iter())
             .map(|(lc, rc)| {
-                let dt = novarocks_types::wider_type(&lc.data_type, &rc.data_type);
+                let dt =
+                    novarocks_types::wider_type(&lc.value_type.data_type, &rc.value_type.data_type);
                 OutputColumn {
                     column_id: lc.column_id,
                     name: lc.name.clone(),
-                    data_type: dt,
-                    nullable: lc.nullable || rc.nullable,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        dt,
+                        lc.value_type.nullable || rc.value_type.nullable,
+                    ),
+
                     is_internal: lc.is_internal && rc.is_internal,
                 }
             })

@@ -24,6 +24,7 @@ mod arithmetic;
 mod array_generate;
 mod coercion;
 mod comparison;
+mod comparison_coercion;
 mod compile_control;
 mod control_flow;
 mod effects;
@@ -33,6 +34,7 @@ mod logical;
 mod partition;
 mod schema;
 mod semantics;
+mod value_arithmetic;
 mod value_projection;
 mod window;
 
@@ -45,6 +47,10 @@ pub use arithmetic::{
 pub use array_generate::array_generate_item_type;
 pub use coercion::wider_type;
 pub use comparison::OrderedComparisonAlgorithm;
+pub use comparison_coercion::{
+    comparison_common_type, comparison_common_value_type, decimal_compare_type,
+    wider_comparison_value_type,
+};
 pub use compile_control::{
     CompileCheckpoints, CompileControlError, CompilePhase, MAX_UNOBSERVED_COMPILE_WORK,
     PureCompileControl,
@@ -79,6 +85,9 @@ pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
     SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
     SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+};
+pub use value_arithmetic::{
+    arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,
 };
 pub use value_projection::{arrow_type_equals_ignoring_metadata, variant_get_target_type};
 

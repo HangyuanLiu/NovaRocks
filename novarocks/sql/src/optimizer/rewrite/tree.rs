@@ -348,8 +348,7 @@ mod tests {
                 qualifier: None,
                 column: "c1".to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         let expr_id = intern_typed(&mut arena, &col_expr);
         OptExpr::new(
@@ -400,8 +399,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(1),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }

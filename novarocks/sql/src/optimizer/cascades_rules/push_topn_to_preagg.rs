@@ -257,8 +257,7 @@ fn partial_order_by_for_local_group_by(
     for (item, local_output) in items.iter().zip(local_outputs_for_items) {
         let local_expr = arena.intern(
             ScalarNode::ColumnRef(local_output.column_id),
-            local_output.data_type.clone(),
-            local_output.nullable,
+            local_output.value_type.clone(),
         );
         remapped.push(SortKey {
             expr: local_expr,
@@ -316,8 +315,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -325,8 +324,7 @@ mod tests {
     fn col_ref(arena: &mut ScalarArena, id: u32) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 

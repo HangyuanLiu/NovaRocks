@@ -68,8 +68,26 @@ where
         &crate::optimizer::rewrite::context::RewriteContext,
     ) -> Result<PlanRewriteResult, String>,
 {
+    bridge_apply_result_typed(expr, ctx, |plan, ctx| {
+        f(plan, ctx).map_err(crate::compiler::SqlCompileError::Compilation)
+    })
+}
+
+/// Typed source-control failures pass through without entering the ordinary
+/// legacy helper error facade.
+pub(crate) fn bridge_apply_result_typed<F>(
+    expr: crate::optimizer::opt_expr::OptExpr,
+    ctx: &crate::optimizer::rewrite::context::RewriteContext,
+    f: F,
+) -> Result<crate::optimizer::rewrite::result::RewriteResult, crate::compiler::SqlCompileError>
+where
+    F: FnOnce(
+        crate::planner::logical::LogicalPlanNode,
+        &crate::optimizer::rewrite::context::RewriteContext,
+    ) -> Result<PlanRewriteResult, crate::compiler::SqlCompileError>,
+{
     let plan = opt_expr_to_plan(expr, ctx);
-    let result = f(plan, ctx).map_err(crate::compiler::SqlCompileError::Compilation)?;
+    let result = f(plan, ctx)?;
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {

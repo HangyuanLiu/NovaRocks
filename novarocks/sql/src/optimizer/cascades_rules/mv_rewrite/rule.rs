@@ -193,17 +193,17 @@ fn try_rewrite(
             .columns
             .iter()
             .find(|c| c.name == mv_out.name)?; // visible-by-name mapping (spec §5)
+        let value_type = col_def.declared_value_type().ok()?;
         let id = memo.factory.create(
             Some(cand.target_table.name.clone()),
             col_def.name.clone(),
-            col_def.data_type.clone(),
-            col_def.nullable,
+            value_type.clone(),
         );
         let oc = OutputColumn {
             column_id: id,
             name: col_def.name.clone(),
-            data_type: col_def.data_type.clone(),
-            nullable: col_def.nullable,
+            value_type,
+
             is_internal: false,
         };
         scan_columns.push(oc.clone());
@@ -403,12 +403,9 @@ fn try_rewrite(
                         original_agg.output_layout.aggregate_columns.clone();
                     if needs_coalesce {
                         for oc in &mut aggregate_columns {
-                            oc.column_id = memo.factory.create(
-                                None,
-                                oc.name.clone(),
-                                oc.data_type.clone(),
-                                oc.nullable,
-                            );
+                            oc.column_id =
+                                memo.factory
+                                    .create(None, oc.name.clone(), oc.value_type.clone());
                         }
                     }
                     let output_layout = AggregateOutputLayout::new(
@@ -570,11 +567,7 @@ fn selected_candidate_marker(
 
 fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
     arena.remember_project_output_display(c.column_id, None, c.name.clone());
-    arena.intern(
-        ScalarNode::ColumnRef(c.column_id),
-        c.data_type.clone(),
-        c.nullable,
-    )
+    arena.intern(ScalarNode::ColumnRef(c.column_id), c.value_type.clone())
 }
 
 fn project_item(
@@ -693,8 +686,10 @@ fn coalesce_zero(
 ) -> Result<ScalarId, String> {
     let zero = arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
-        output.data_type.clone(),
-        false,
+        novarocks_type_contract::FunctionValueType {
+            nullable: false,
+            ..output.value_type.clone()
+        },
     );
     let args = vec![value, zero];
     let binding = crate::optimizer::scalar::resolve_function_binding(
@@ -711,8 +706,10 @@ fn coalesce_zero(
             distinct: false,
             binding,
         },
-        output.data_type.clone(),
-        false,
+        novarocks_type_contract::FunctionValueType {
+            nullable: false,
+            ..output.value_type.clone()
+        },
     ))
 }
 
@@ -791,8 +788,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -804,16 +801,14 @@ mod tests {
                 qualifier: None,
                 column: c.name.clone(),
             },
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
+            value_type: c.value_type.clone(),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -825,8 +820,7 @@ mod tests {
                 right: Box::new(int_lit(v)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -838,8 +832,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -851,8 +844,7 @@ mod tests {
                 right: Box::new(int_lit(v)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -864,8 +856,7 @@ mod tests {
                 right: Box::new(int_lit(v)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -877,8 +868,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -987,7 +977,11 @@ mod tests {
     fn advance_factory(memo: &mut Memo, up_to: u32) {
         while memo
             .factory
-            .create(None, "pad".to_string(), DataType::Int64, true)
+            .create(
+                None,
+                "pad".to_string(),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )
             .0
             <= up_to
         {}

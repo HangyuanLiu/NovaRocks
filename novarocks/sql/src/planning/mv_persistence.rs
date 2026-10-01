@@ -1040,8 +1040,8 @@ fn output_columns(query: &ResolvedQuery) -> Vec<(String, DataType, bool)> {
                 .map(|item| {
                     (
                         item.output_name.clone(),
-                        item.expr.data_type.clone(),
-                        item.expr.nullable,
+                        item.expr.value_type.data_type.clone(),
+                        item.expr.value_type.nullable,
                     )
                 })
                 .collect(),
@@ -1054,8 +1054,8 @@ fn output_columns(query: &ResolvedQuery) -> Vec<(String, DataType, bool)> {
             .map(|column| {
                 (
                     column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
+                    column.value_type.data_type.clone(),
+                    column.value_type.nullable,
                 )
             })
             .collect()

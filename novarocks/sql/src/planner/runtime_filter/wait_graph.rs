@@ -947,8 +947,10 @@ mod tests {
                     },
                     expression: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     apply_point: ApplyPoint::NodeOutput,
                     role,
@@ -966,8 +968,10 @@ mod tests {
                 },
                 expression: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 apply_point: ApplyPoint::NodeInput,
                 role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {

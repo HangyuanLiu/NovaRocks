@@ -212,8 +212,8 @@ mod tests {
 
     fn col_typed(name: &str) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: test_col_id(name),
                 qualifier: None,
@@ -224,8 +224,8 @@ mod tests {
 
     fn col_with_id_typed(qualifier: &str, name: &str, id: u32) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
                 qualifier: Some(qualifier.to_string()),
@@ -236,16 +236,16 @@ mod tests {
 
     fn int_lit_typed(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
@@ -257,8 +257,8 @@ mod tests {
 
     fn gt_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Gt,
@@ -270,8 +270,8 @@ mod tests {
 
     fn and_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::And,
@@ -309,8 +309,11 @@ mod tests {
                 .map(|n| OutputColumn {
                     column_id: test_col_id(n),
                     name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -327,8 +330,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         }))
@@ -385,8 +388,11 @@ mod tests {
                     expr: intern_typed(
                         &mut arena,
                         &TypedExpr {
-                            data_type: DataType::Int64,
-                            nullable: true,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                true,
+                            ),
+
                             kind: ExprKind::ColumnRef {
                                 column_id: ColumnId::new_for_test(22),
                                 qualifier: None,

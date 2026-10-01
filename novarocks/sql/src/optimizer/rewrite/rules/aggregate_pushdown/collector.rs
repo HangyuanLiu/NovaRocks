@@ -407,8 +407,8 @@ mod tests {
                 OutputColumn {
                     column_id,
                     name,
-                    data_type: expr.data_type.clone(),
-                    nullable: expr.nullable,
+                    value_type: expr.value_type.clone(),
+
                     is_internal: false,
                 }
             })
@@ -418,8 +418,8 @@ mod tests {
             .map(|spec| OutputColumn {
                 column_id: spec.output_column_id,
                 name: spec.name.clone(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             })
             .collect();
@@ -451,8 +451,7 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: ty,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
         }
     }
 
@@ -467,8 +466,7 @@ mod tests {
                 qualifier: Some(qualifier.into()),
                 column: name.into(),
             },
-            data_type: ty,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
         }
     }
 
@@ -531,8 +529,8 @@ mod tests {
                     // the collector can match group_by ColumnIds to scan columns.
                     column_id: test_col_id(alias, n),
                     name: (*n).into(),
-                    data_type: ty.clone(),
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(ty.clone(), false),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -595,8 +593,7 @@ mod tests {
                 right: Box::new(col_ref_typed(b, DataType::Int64)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -702,8 +699,7 @@ mod tests {
                 right: Box::new(col_ref_typed("b", DataType::Int64)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         };
         let arg_id = intern_typed(&mut arena, &non_col);
         let spec = ScalarAggregateSpec {
@@ -740,8 +736,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
             },
-            data_type: DataType::Float64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         };
         let arg_id = intern_typed(&mut arena, &rand_expr);
         let spec = ScalarAggregateSpec {
@@ -916,8 +911,7 @@ mod tests {
                 right: Box::new(qualified_col_ref_typed("d", "d_date_sk", DataType::Int64)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let join = join_opt(JoinKind::Inner, Some(cond), cs, d, &mut arena);
         let sum_arg = intern_typed(
@@ -1110,8 +1104,10 @@ mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
                 op: BinOp::And,
                 right: Box::new(crate::analysis::TypedExpr {
@@ -1122,13 +1118,14 @@ mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let join = join_opt(JoinKind::Inner, Some(cond), a, b, &mut arena);
 

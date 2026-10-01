@@ -1029,8 +1029,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }
@@ -1042,8 +1042,7 @@ mod tests {
                 qualifier: None,
                 column: format!("c{}", id.0),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
         crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
     }
@@ -1051,8 +1050,7 @@ mod tests {
     fn int_literal_scalar(arena: &mut ScalarArena, v: i64) -> crate::optimizer::scalar::ScalarId {
         let expr = crate::analysis::TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
     }
@@ -1072,8 +1070,7 @@ mod tests {
                 right: Box::new(right_typed),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
     }
@@ -1656,19 +1653,19 @@ mod tests {
         let arena_rc = make_arena();
         let mut action =
             make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
-        action.data_type = DataType::Int8;
+        action.value_type.data_type = DataType::Int8;
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(15),
             crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
-        join_apply_key.data_type = DataType::Utf8;
+        join_apply_key.value_type.data_type = DataType::Utf8;
         join_apply_key.is_internal = true;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        row_id.data_type = DataType::Int64;
+        row_id.value_type.data_type = DataType::Int64;
         row_id.is_internal = true;
         let output_columns = vec![
             make_output_column(ColumnId::new_for_test(1), "id"),
@@ -1715,25 +1712,25 @@ mod tests {
         let arena_rc = make_arena();
         let mut action =
             make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
-        action.data_type = DataType::Int8;
+        action.value_type.data_type = DataType::Int8;
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(20),
             crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
-        join_apply_key.data_type = DataType::Utf8;
+        join_apply_key.value_type.data_type = DataType::Utf8;
         join_apply_key.is_internal = false;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        row_id.data_type = DataType::Int64;
+        row_id.value_type.data_type = DataType::Int64;
         row_id.is_internal = true;
         let mut branch_row_id = make_output_column(
             ColumnId::new_for_test(91),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        branch_row_id.data_type = DataType::Int64;
+        branch_row_id.value_type.data_type = DataType::Int64;
         branch_row_id.is_internal = true;
         let output_columns = vec![
             make_output_column(ColumnId::new_for_test(1), "id"),
@@ -2776,13 +2773,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let arg = arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(11)),
-            DataType::Int32,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         );
         let key = arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(12)),
-            DataType::Decimal128(38, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
         );
         let order = arena.intern(
             ScalarNode::Cast {
@@ -2790,18 +2785,15 @@ mod tests {
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,
             },
-            DataType::Decimal128(9, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
         let partition = arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(13)),
-            DataType::Int32,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         );
         let over_order = arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(14)),
-            DataType::Int32,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         );
         let binding =
             crate::functions::test_resolved_aggregate("array_agg", &[DataType::Int32], false);
@@ -2828,12 +2820,14 @@ mod tests {
                 window_frame: None,
                 ignore_nulls: false,
             },
-            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                "item",
-                DataType::Int32,
+            novarocks_type_contract::FunctionValueType::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                ))),
                 true,
-            ))),
-            true,
+            ),
         );
         assert_eq!(
             collect_scalar_column_id_refs(&arena, window),
@@ -2846,8 +2840,7 @@ mod tests {
         );
         let unset = arena.intern(
             ScalarNode::ColumnRef(ColumnId::UNSET),
-            DataType::Decimal128(9, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
         let mut invalid = arena.node(window).clone();
         let ScalarNode::WindowCall {
@@ -2857,7 +2850,10 @@ mod tests {
             unreachable!()
         };
         *function_order_by = vec![sort(unset)];
-        let invalid = arena.intern(invalid, arena.data_type(window).clone(), true);
+        let invalid = arena.intern(
+            invalid,
+            novarocks_type_contract::FunctionValueType::new(arena.data_type(window).clone(), true),
+        );
         assert_eq!(
             crate::optimizer::scalar_expr::collect_column_ids_strict(&arena, invalid),
             None

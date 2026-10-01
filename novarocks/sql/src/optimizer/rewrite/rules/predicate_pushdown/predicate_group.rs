@@ -353,16 +353,14 @@ mod tests {
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -374,8 +372,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -394,8 +391,7 @@ mod tests {
                 args,
                 distinct: false,
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -455,8 +451,7 @@ mod tests {
                 BinOp::And,
                 bool_expr(col("b", 2), BinOp::Eq, int_lit(2)),
             ))),
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
 
         let mut arena = ScalarArena::new();
@@ -544,8 +539,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
             },
-            data_type: DataType::Float64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         };
 
         let mut arena = ScalarArena::new();

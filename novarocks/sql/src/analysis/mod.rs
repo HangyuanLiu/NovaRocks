@@ -42,7 +42,7 @@ pub enum UnpivotConstant {
 impl UnpivotConstant {
     pub fn data_type(&self) -> arrow::datatypes::DataType {
         match self {
-            Self::Scalar(expression) => expression.data_type.clone(),
+            Self::Scalar(expression) => expression.value_type.data_type.clone(),
             Self::Int32List(_) => arrow::datatypes::DataType::List(std::sync::Arc::new(
                 arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Int32, false),
             )),
@@ -70,7 +70,7 @@ impl UnpivotConstant {
 
     pub fn nullable(&self) -> bool {
         match self {
-            Self::Scalar(expression) => expression.nullable,
+            Self::Scalar(expression) => expression.value_type.nullable,
             Self::Int32List(_) | Self::Utf8Map(_) => false,
         }
     }
@@ -336,20 +336,19 @@ pub(crate) struct ResolvedValues {
 #[derive(Clone, Debug)]
 pub struct TypedExpr {
     pub kind: ExprKind,
-    pub data_type: DataType,
-    pub nullable: bool,
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
 pub(crate) fn function_argument(expr: &TypedExpr) -> novarocks_functions::FunctionArgument {
-    use novarocks_functions::{FunctionArgument, FunctionLiteral, FunctionValueType};
+    use novarocks_functions::{FunctionArgument, FunctionLiteral};
 
     match &expr.kind {
         ExprKind::LambdaFunction { params, body } => FunctionArgument::Lambda {
             parameter_types: params
                 .iter()
-                .map(|param| FunctionValueType::new(param.data_type.clone(), param.nullable))
+                .map(|param| param.value_type.clone())
                 .collect(),
-            result_type: FunctionValueType::new(body.data_type.clone(), body.nullable),
+            result_type: body.value_type.clone(),
         },
         ExprKind::Literal(value) => {
             let constant = match value {
@@ -358,7 +357,7 @@ pub(crate) fn function_argument(expr: &TypedExpr) -> novarocks_functions::Functi
                 LiteralValue::Int(value) => Some(FunctionLiteral::Int64(*value)),
                 LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
                 LiteralValue::Float(value) => Some(FunctionLiteral::Float64Bits(value.to_bits())),
-                LiteralValue::Decimal(value) => match &expr.data_type {
+                LiteralValue::Decimal(value) => match &expr.value_type.data_type {
                     DataType::Decimal128(_, scale) => Some(FunctionLiteral::Decimal128(
                         decimal128_literal_unscaled(value, *scale).unwrap_or_else(|message| {
                             panic!(
@@ -376,12 +375,12 @@ pub(crate) fn function_argument(expr: &TypedExpr) -> novarocks_functions::Functi
                 }
             };
             FunctionArgument::Value {
-                value_type: FunctionValueType::new(expr.data_type.clone(), expr.nullable),
+                value_type: expr.value_type.clone(),
                 constant,
             }
         }
         _ => FunctionArgument::Value {
-            value_type: FunctionValueType::new(expr.data_type.clone(), expr.nullable),
+            value_type: expr.value_type.clone(),
             constant: None,
         },
     }

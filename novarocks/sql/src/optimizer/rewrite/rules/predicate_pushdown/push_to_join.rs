@@ -782,16 +782,14 @@ mod tests {
                 qualifier: Some(alias.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
     fn int_lit(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -803,8 +801,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -816,8 +813,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -825,8 +821,8 @@ mod tests {
         OutputColumn {
             column_id: col_id(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -973,22 +969,23 @@ mod tests {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
         for policy in [OutputNull, ReportError] {
             let mut arena = ScalarArena::new();
-            let source = arena.intern(ScalarNode::ColumnRef(col_id(1)), DataType::Int64, true);
+            let source = arena.intern(
+                ScalarNode::ColumnRef(col_id(1)),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            );
             let cast = arena.intern(
                 ScalarNode::Cast {
                     child: source,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,
                 },
-                DataType::Decimal128(9, 0),
-                true,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
             );
             let literal = arena.intern(
                 ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                     LiteralValue::Decimal("1".to_string()),
                 )),
-                DataType::Decimal128(9, 0),
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), false),
             );
             let predicate = arena.intern(
                 ScalarNode::BinaryOp {
@@ -997,8 +994,7 @@ mod tests {
                     op: BinOp::Eq,
                     decimal_overflow_policy: OutputNull,
                 },
-                DataType::Boolean,
-                true,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
             );
             let join = OptExpr::new(
                 Operator::LogicalJoin(LogicalJoinOp {

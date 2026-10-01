@@ -404,8 +404,10 @@ impl LogicalRewriteRule for InjectActionColumnRule {
             let column_id = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                 ctx,
                 ImvActionColumn::NAME,
-                arrow::datatypes::DataType::Int8,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int8,
+                    false,
+                ),
             )?;
             scan.columns
                 .retain(|column| !is_action_column_name(&column.name));
@@ -517,8 +519,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                                 qualifier: None,
                                 column: col.name.clone(),
                             },
-                            data_type: col.data_type.clone(),
-                            nullable: col.nullable,
+                            value_type: col.value_type.clone(),
                         },
                         output_name: col.name.clone(),
                         output_column_id: col.column_id,
@@ -535,8 +536,10 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                 let row_id_column = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                     ctx,
                     crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
-                    arrow::datatypes::DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 )?;
                 for input in &mut plan.children {
                     normalize_branch_row_id_output(input, row_id_column)?;
@@ -634,8 +637,7 @@ fn promote_project_union_row_id_output(
     let row_id_column = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
         ctx,
         crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
-        arrow::datatypes::DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
     )?;
     let Some(union_plan) = plan.children.get_mut(0) else {
         return Ok(false);
@@ -665,8 +667,8 @@ fn promote_project_union_row_id_output(
             *column_id = row_id_column;
             *column = ImvRowIdColumn::NAME.to_string();
         }
-        item.expr.data_type = arrow::datatypes::DataType::Int64;
-        item.expr.nullable = false;
+        item.expr.value_type.data_type = arrow::datatypes::DataType::Int64;
+        item.expr.value_type.nullable = false;
         item.output_column_id = row_id_column;
         item.output_name = ImvRowIdColumn::NAME.to_string();
     }
@@ -725,8 +727,8 @@ fn branch_output_action_column_id(plan: &LogicalPlanNode) -> Option<crate::colum
                     return None;
                 };
                 (*column_id == item.output_column_id
-                    && item.expr.data_type == arrow::datatypes::DataType::Int8
-                    && !item.expr.nullable)
+                    && item.expr.value_type.data_type == arrow::datatypes::DataType::Int8
+                    && !item.expr.value_type.nullable)
                     .then_some(item.output_column_id)
             }),
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
@@ -875,8 +877,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             }],
             predicates: Vec::new(),
@@ -928,8 +930,8 @@ mod tests {
             .iter()
             .find(|c| ImvActionColumn::matches(c))
             .expect("action column must be present");
-        assert_eq!(action.data_type, DataType::Int8);
-        assert!(!action.nullable);
+        assert_eq!(action.value_type.data_type, DataType::Int8);
+        assert!(!action.value_type.nullable);
         assert!(action.is_internal);
         assert_eq!(action.column_id, ColumnId(100));
         assert!(
@@ -1025,8 +1027,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: projected_user_col_id,
@@ -1057,8 +1061,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: user_col_id,
@@ -1070,8 +1076,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvActionColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int8,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: action_id,
@@ -1106,8 +1114,10 @@ mod tests {
                         qualifier: None,
                         column: ImvRowIdColumn::NAME.to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: ImvRowIdColumn::NAME.to_string(),
                 output_column_id: row_id,
@@ -1128,8 +1138,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: user_col_id,
@@ -1161,8 +1173,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: user_col_id,
@@ -1201,8 +1215,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: user_col_id,
@@ -1214,8 +1230,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvActionColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int8,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: action_id,
@@ -1236,8 +1254,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1277,8 +1298,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: user_col_id,
@@ -1290,8 +1313,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: action_id,
@@ -1322,8 +1347,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(column_id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal,
         }
     }
@@ -1352,8 +1377,8 @@ mod tests {
             ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(100)),
             other => panic!("expected ColumnRef, got {:?}", other),
         }
-        assert_eq!(last.expr.data_type, DataType::Int8);
-        assert!(!last.expr.nullable);
+        assert_eq!(last.expr.value_type.data_type, DataType::Int8);
+        assert!(!last.expr.value_type.nullable);
     }
 
     #[test]
@@ -1370,8 +1395,10 @@ mod tests {
                         qualifier: None,
                         column: "__change_op".to_string(),
                     },
-                    data_type: DataType::Int8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ),
                 },
                 output_name: "__change_op".to_string(),
                 output_column_id: ColumnId(100),
@@ -1482,8 +1509,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![recursive_join_delta_union(action_id)],
@@ -1522,8 +1551,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1623,8 +1655,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1682,8 +1717,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1705,8 +1743,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: ColumnId(1),
@@ -1718,8 +1758,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvRowIdColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: ImvRowIdColumn::NAME.to_string(),
                         output_column_id: ColumnId(101),
@@ -1842,8 +1884,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![scan],

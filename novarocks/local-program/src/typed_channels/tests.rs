@@ -1046,6 +1046,7 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         kind: FunctionKind::Aggregate,
         selected: &owner.selected,
         request: FunctionBindingRequest {
+            expected_result_type: None,
             arguments: &arguments,
             logical_argument_count: 1,
         },

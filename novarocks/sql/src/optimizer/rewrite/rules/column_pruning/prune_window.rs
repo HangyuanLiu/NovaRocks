@@ -224,8 +224,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -253,8 +253,8 @@ mod tests {
                 .iter()
                 .map(|column| ColumnDef {
                     name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
+                    data_type: column.value_type.data_type.clone(),
+                    nullable: column.value_type.nullable,
                     write_default: None,
                     logical_type: None,
                 })

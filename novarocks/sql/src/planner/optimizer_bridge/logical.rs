@@ -505,7 +505,13 @@ fn flatten_homogeneous_union_all(
                 || columns
                     .iter()
                     .zip(&root.output_columns)
-                    .any(|(child, output)| child.data_type != output.data_type)
+                    .any(|(child, output)| {
+                        child.value_type.logical_type != output.value_type.logical_type
+                            || !novarocks_type_contract::arrow_data_types_exact(
+                                &child.value_type.data_type,
+                                &output.value_type.data_type,
+                            )
+                    })
         })
     {
         return None;
@@ -747,8 +753,8 @@ mod tests {
         vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }]
     }
@@ -757,8 +763,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -982,15 +988,21 @@ mod tests {
                     OutputColumn {
                         column_id: source_column_id,
                         name: "payload".to_string(),
-                        data_type: DataType::LargeBinary,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::LargeBinary,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: synthetic_column_id,
                         name: "__nr_var_payload_0".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: true,
                     },
                 ],
@@ -1098,8 +1110,7 @@ mod tests {
 
         let predicate = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
         let filter = LogicalPlanNode::new(

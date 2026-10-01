@@ -18,10 +18,11 @@
 //! Runtime-only layout for aggregate materialized-view state.
 //!
 //! This is an immutable in-process contract between planning and execution.
-//! It deliberately contains Arrow/runtime facts only; physical DDL and
+//! It deliberately contains complete value types and runtime facts only; physical DDL and
 //! durable contracts remain with their respective owners.
 
 use arrow_schema::DataType;
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
 /// Runtime aggregate operation used by aggregate state kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,17 +55,15 @@ pub enum MvAggregateStateRole {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvAggregateVisibleColumn {
     name: String,
-    data_type: DataType,
-    nullable: bool,
+    value_type: FunctionValueType,
     source_index: usize,
 }
 
 impl MvAggregateVisibleColumn {
-    pub fn new(name: String, data_type: DataType, nullable: bool, source_index: usize) -> Self {
+    pub fn new(name: String, value_type: FunctionValueType, source_index: usize) -> Self {
         Self {
             name,
-            data_type,
-            nullable,
+            value_type,
             source_index,
         }
     }
@@ -73,12 +72,16 @@ impl MvAggregateVisibleColumn {
         &self.name
     }
 
+    pub fn value_type(&self) -> &FunctionValueType {
+        &self.value_type
+    }
+
     pub fn data_type(&self) -> &DataType {
-        &self.data_type
+        &self.value_type.data_type
     }
 
     pub fn nullable(&self) -> bool {
-        self.nullable
+        self.value_type.nullable
     }
 
     pub fn source_index(&self) -> usize {
@@ -90,8 +93,7 @@ impl MvAggregateVisibleColumn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvAggregateStateColumn {
     name: String,
-    data_type: DataType,
-    nullable: bool,
+    value_type: FunctionValueType,
     visible_source_index: usize,
     aggregate_index: usize,
     aggregate_kind: MvAggregateRuntimeKind,
@@ -103,8 +105,7 @@ impl MvAggregateStateColumn {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
-        data_type: DataType,
-        nullable: bool,
+        value_type: FunctionValueType,
         visible_source_index: usize,
         aggregate_index: usize,
         aggregate_kind: MvAggregateRuntimeKind,
@@ -113,8 +114,7 @@ impl MvAggregateStateColumn {
     ) -> Self {
         Self {
             name,
-            data_type,
-            nullable,
+            value_type,
             visible_source_index,
             aggregate_index,
             aggregate_kind,
@@ -127,12 +127,16 @@ impl MvAggregateStateColumn {
         &self.name
     }
 
+    pub fn value_type(&self) -> &FunctionValueType {
+        &self.value_type
+    }
+
     pub fn data_type(&self) -> &DataType {
-        &self.data_type
+        &self.value_type.data_type
     }
 
     pub fn nullable(&self) -> bool {
-        self.nullable
+        self.value_type.nullable
     }
 
     pub fn visible_source_index(&self) -> usize {
@@ -163,7 +167,7 @@ pub enum MvAggregateVisibleOutput {
     Aggregate(usize),
 }
 
-/// Immutable Arrow/runtime facts for aggregate materialized-view state.
+/// Immutable value-type/runtime facts for aggregate materialized-view state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvAggregateRuntimeLayout {
     row_id_column_name: String,
@@ -216,6 +220,14 @@ impl MvAggregateRuntimeLayout {
         let mut aggregate_state_roles = vec![(false, false, false); aggregate_count];
         let mut retraction_count_columns = 0usize;
         for state_column in &state_columns {
+            // These persisted state bytes belong to the MV state recipe, not
+            // to an aggregate's visible logical result domain.
+            if state_column.value_type.logical_type != ValueLogicalType::Physical {
+                return Err(format!(
+                    "aggregate MV state column must have a Physical logical domain: column={}",
+                    state_column.name
+                ));
+            }
             match state_column.state_role {
                 MvAggregateStateRole::Single => {
                     if state_column.aggregate_index >= aggregate_count {
@@ -224,13 +236,13 @@ impl MvAggregateRuntimeLayout {
                             state_column.aggregate_index
                         ));
                     }
-                    if !is_varbinary_data_type(&state_column.data_type) {
+                    if !is_varbinary_data_type(&state_column.value_type.data_type) {
                         return Err(format!(
                             "aggregate MV Single state column must be Binary or LargeBinary: column={} data_type={:?}",
-                            state_column.name, state_column.data_type
+                            state_column.name, state_column.value_type.data_type
                         ));
                     }
-                    if state_column.nullable {
+                    if state_column.value_type.nullable {
                         return Err(format!(
                             "aggregate MV state column must be non-nullable: column={}",
                             state_column.name
@@ -277,8 +289,8 @@ impl MvAggregateRuntimeLayout {
                 MvAggregateStateRole::AvgSum | MvAggregateStateRole::AvgCount => {
                     if state_column.aggregate_index >= aggregate_count
                         || state_column.aggregate_kind != MvAggregateRuntimeKind::Avg
-                        || !is_varbinary_data_type(&state_column.data_type)
-                        || state_column.nullable
+                        || !is_varbinary_data_type(&state_column.value_type.data_type)
+                        || state_column.value_type.nullable
                     {
                         return Err(format!(
                             "aggregate MV AVG state has invalid runtime shape: column={}",
@@ -341,8 +353,8 @@ impl MvAggregateRuntimeLayout {
                     if state_column.aggregate_kind != MvAggregateRuntimeKind::Count
                         || !state_column.count_star
                         || state_column.aggregate_index != aggregate_count
-                        || state_column.data_type != DataType::Int64
-                        || state_column.nullable
+                        || state_column.value_type.data_type != DataType::Int64
+                        || state_column.value_type.nullable
                     {
                         return Err(format!(
                             "aggregate MV retraction count state has invalid runtime shape: column={}",
@@ -431,20 +443,114 @@ mod tests {
     use super::*;
 
     fn visible(name: &str, source_index: usize) -> MvAggregateVisibleColumn {
-        MvAggregateVisibleColumn::new(name.to_string(), DataType::Int64, false, source_index)
+        MvAggregateVisibleColumn::new(
+            name.to_string(),
+            FunctionValueType::new(DataType::Int64, false),
+            source_index,
+        )
     }
 
     fn state(aggregate_index: usize, visible_source_index: usize) -> MvAggregateStateColumn {
         MvAggregateStateColumn::new(
             format!("state_{aggregate_index}"),
-            DataType::LargeBinary,
-            false,
+            FunctionValueType::new(DataType::LargeBinary, false),
             visible_source_index,
             aggregate_index,
             MvAggregateRuntimeKind::Sum,
             MvAggregateStateRole::Single,
             false,
         )
+    }
+
+    #[test]
+    fn visible_columns_retain_complete_root_and_nested_domains() {
+        use arrow_schema::Field;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        use std::sync::Arc;
+        let item = Field::new("item", DataType::Utf8, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into());
+        let values = vec![
+            FunctionValueType {
+                data_type: DataType::Utf8,
+                nullable: true,
+                logical_type: ValueLogicalType::Json,
+            },
+            FunctionValueType::new(DataType::List(Arc::new(item)), false),
+            FunctionValueType {
+                data_type: DataType::LargeBinary,
+                nullable: false,
+                logical_type: ValueLogicalType::Variant,
+            },
+            FunctionValueType {
+                data_type: DataType::FixedSizeBinary(16),
+                nullable: false,
+                logical_type: ValueLogicalType::LargeInt,
+            },
+            FunctionValueType::new(DataType::FixedSizeBinary(16), false),
+        ];
+        let layout = MvAggregateRuntimeLayout::try_new(
+            "row_id".to_string(),
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    MvAggregateVisibleColumn::new(format!("v{index}"), value.clone(), index)
+                })
+                .collect(),
+            vec![],
+            vec![],
+            (0..values.len()).collect(),
+        )
+        .expect("group-only source layout");
+        for (column, source) in layout.visible_columns().iter().zip(&values) {
+            assert_eq!(column.value_type(), source);
+            assert_eq!(column.data_type(), &source.data_type);
+            assert_eq!(column.nullable(), source.nullable);
+        }
+    }
+
+    #[test]
+    fn opaque_state_recipe_does_not_adopt_visible_logical_domain() {
+        let value = FunctionValueType {
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: ValueLogicalType::Json,
+        };
+        let layout = MvAggregateRuntimeLayout::try_new(
+            "row_id".to_string(),
+            vec![MvAggregateVisibleColumn::new("v".to_string(), value, 0)],
+            vec![state(0, 0)],
+            vec![Some(DataType::Utf8)],
+            vec![],
+        )
+        .expect("physical serialized state");
+        assert_eq!(
+            layout.state_columns()[0].value_type(),
+            &FunctionValueType::new(DataType::LargeBinary, false)
+        );
+        let logical_state = MvAggregateStateColumn::new(
+            "state".to_string(),
+            FunctionValueType {
+                data_type: DataType::LargeBinary,
+                nullable: false,
+                logical_type: ValueLogicalType::Variant,
+            },
+            0,
+            0,
+            MvAggregateRuntimeKind::Min,
+            MvAggregateStateRole::Single,
+            false,
+        );
+        assert!(
+            MvAggregateRuntimeLayout::try_new(
+                "row_id".to_string(),
+                vec![visible("v", 0)],
+                vec![logical_state],
+                vec![Some(DataType::Int64)],
+                vec![]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -493,8 +599,7 @@ mod tests {
     fn layout_rejects_invalid_retraction_count_shape() {
         let invalid_retraction = MvAggregateStateColumn::new(
             "row_count".to_string(),
-            DataType::Int32,
-            false,
+            FunctionValueType::new(DataType::Int32, false),
             0,
             1,
             MvAggregateRuntimeKind::Count,
@@ -523,8 +628,7 @@ mod tests {
             vec![visible("avg_v", 0)],
             vec![MvAggregateStateColumn::new(
                 "avg_state".to_string(),
-                DataType::LargeBinary,
-                false,
+                FunctionValueType::new(DataType::LargeBinary, false),
                 0,
                 0,
                 MvAggregateRuntimeKind::Avg,
@@ -550,8 +654,7 @@ mod tests {
             vec![
                 MvAggregateStateColumn::new(
                     "avg_sum".to_string(),
-                    DataType::LargeBinary,
-                    false,
+                    FunctionValueType::new(DataType::LargeBinary, false),
                     0,
                     0,
                     MvAggregateRuntimeKind::Avg,
@@ -560,8 +663,7 @@ mod tests {
                 ),
                 MvAggregateStateColumn::new(
                     "avg_count".to_string(),
-                    DataType::LargeBinary,
-                    false,
+                    FunctionValueType::new(DataType::LargeBinary, false),
                     0,
                     0,
                     MvAggregateRuntimeKind::Avg,

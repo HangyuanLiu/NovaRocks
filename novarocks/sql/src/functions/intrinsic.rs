@@ -67,6 +67,7 @@ mod tests {
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &[],
                             logical_argument_count: 0
                         }
@@ -82,6 +83,7 @@ mod tests {
                     "not_an_advertised_builtin",
                     FunctionKind::Scalar,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &[],
                         logical_argument_count: 0
                     }

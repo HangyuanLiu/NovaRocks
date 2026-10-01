@@ -218,6 +218,30 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    /// Explicit result syntax requires a declaring binder capability.
+    fn resolve_scalar_binding_with_expected_result(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+        _expected: &novarocks_functions::FunctionValueType,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    fn resolve_value_conversion_binding(
+        &self,
+        _argument: &novarocks_functions::FunctionArgument,
+        _target: &novarocks_functions::FunctionValueType,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     fn resolve_window_binding(
         &self,
         _name: &str,
@@ -2212,6 +2236,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
@@ -2252,7 +2277,15 @@ mod tests {
                             else {
                                 panic!("expected physical aggregate List");
                             };
-                            assert_eq!(logical_type_of_field(item), None);
+                            let novarocks_functions::FunctionArgumentType::Value(input) =
+                                &call.binding.function.argument_types[0]
+                            else {
+                                panic!("aggregate input must be a value");
+                            };
+                            let expected = (input.logical_type
+                                == novarocks_type_contract::ValueLogicalType::Json)
+                                .then_some(LogicalType::Json);
+                            assert_eq!(logical_type_of_field(item), expected);
                             let DataType::List(item) = &call.binding.intermediate_type.data_type
                             else {
                                 panic!("expected physical state List");
@@ -2594,11 +2627,14 @@ mod tests {
         let ExprKind::FunctionCall { args, binding, .. } = &field.kind else {
             unreachable!()
         };
-        assert!(args.iter().all(|arg| arg.data_type == DataType::Float64));
+        assert!(
+            args.iter()
+                .all(|arg| arg.value_type.data_type == DataType::Float64)
+        );
         assert!(binding.selected.argument_types.iter().all(|arg| matches!(arg,
             novarocks_functions::FunctionArgumentType::Value(value) if value.data_type == DataType::Float64)));
-        assert_eq!(field.data_type, DataType::Int32);
-        assert!(!field.nullable);
+        assert_eq!(field.value_type.data_type, DataType::Int32);
+        assert!(!field.value_type.nullable);
     }
 
     #[test]
@@ -2656,6 +2692,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()

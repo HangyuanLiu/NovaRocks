@@ -104,8 +104,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::new_for_test(1),
                     name: "v".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 alias: None,

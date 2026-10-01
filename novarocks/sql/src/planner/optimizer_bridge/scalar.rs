@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
+use novarocks_type_contract::FunctionValueType;
 
 use crate::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::column_id::ColumnId;
@@ -185,7 +186,7 @@ pub(crate) fn materialize_aggregate_call(
         name: call.name.clone(),
         args: materialize_exprs(arena, &call.args),
         distinct: call.distinct,
-        result_type: output_column.data_type.clone(),
+        result_type: output_column.value_type.data_type.clone(),
         order_by: materialize_sort_keys(arena, &call.order_by),
         output_column_id: call.output_column_id,
         resolved: call.resolved.clone(),
@@ -284,7 +285,7 @@ pub(crate) fn materialize_window_expr(
         partition_by: materialize_exprs(arena, &expr.partition_by),
         order_by: materialize_sort_keys(arena, &expr.order_by),
         window_frame: expr.window_frame.clone(),
-        result_type: output_column.data_type.clone(),
+        result_type: output_column.value_type.data_type.clone(),
         output_name: output_column.name.clone(),
         output_column_id: expr.output_column_id,
         ignore_nulls: expr.ignore_nulls,
@@ -317,6 +318,7 @@ pub(crate) fn materialize_window_exprs(
 pub(crate) fn intern_column_sort_key(
     arena: &mut ScalarArena,
     key: &crate::optimizer::property::SortKey,
+    value_type: FunctionValueType,
 ) -> SortKey {
     let expr = TypedExpr {
         kind: ExprKind::ColumnRef {
@@ -324,8 +326,7 @@ pub(crate) fn intern_column_sort_key(
             qualifier: None,
             column: format!("{}", key.column),
         },
-        data_type: DataType::Null,
-        nullable: true,
+        value_type,
     };
     SortKey {
         expr: intern_typed(arena, &expr),
@@ -410,8 +411,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -420,8 +421,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
+
             is_internal: false,
         }
     }
@@ -494,6 +495,64 @@ mod tests {
         assert_eq!(calls[0].output_column_id, id_sum);
         assert_eq!(calls[0].result_type, DataType::Int64);
         assert_eq!(calls[1].output_column_id, id_count);
+    }
+
+    #[test]
+    fn aggregate_bridge_keeps_selected_binding_and_actual_intermediate_output_carrier() {
+        use novarocks_functions::FunctionArgumentType;
+
+        let binding = crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false);
+        let intermediate = binding
+            .selected
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .intermediate_type
+            .clone();
+        let final_type = crate::functions::aggregate_result_type(&binding);
+        assert_ne!(intermediate.data_type, final_type.data_type);
+        let FunctionArgumentType::Value(argument_type) = &binding.selected.argument_types[0] else {
+            panic!("avg must select a value argument");
+        };
+        let input_id = ColumnId::new_for_test(811);
+        let output_id = ColumnId::new_for_test(812);
+        let argument = column_id_expr(input_id, argument_type.clone());
+        let mut arena = ScalarArena::new();
+        let argument_id = intern_typed(&mut arena, &argument);
+        let spec = ScalarAggregateSpec {
+            output_column_id: output_id,
+            name: "avg".into(),
+            args: vec![argument_id],
+            distinct: false,
+            order_by: vec![],
+            resolved: binding.clone(),
+        };
+        let layout = AggregateOutputLayout::new(
+            vec![OutputColumn {
+                column_id: input_id,
+                name: "group".into(),
+                value_type: argument_type.clone(),
+                is_internal: false,
+            }],
+            vec![OutputColumn {
+                column_id: output_id,
+                name: "avg_state".into(),
+                value_type: intermediate.clone(),
+                is_internal: true,
+            }],
+        );
+        let materialized = materialize_aggregate_call(&arena, &spec, &layout);
+        assert_eq!(materialized.output_column_id, output_id);
+        assert_eq!(materialized.result_type, intermediate.data_type);
+        assert_eq!(materialized.args[0].value_type, *argument_type);
+        assert!(std::ptr::eq(
+            materialized.resolved.as_ref(),
+            binding.as_ref()
+        ));
+        assert_eq!(
+            super::aggregate_output_column(&spec, &layout).value_type,
+            intermediate
+        );
     }
 
     #[test]
@@ -576,8 +635,7 @@ mod tests {
                 qualifier: None,
                 column: "value".to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         };
         let aggregate_binding =
             crate::functions::test_resolved_aggregate("array_agg", &[DataType::Int64], false);
@@ -912,7 +970,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             body: intern_typed(arena, body),
         },
     };
-    arena.intern(node, expr.data_type.clone(), expr.nullable)
+    arena.intern(node, expr.value_type.clone())
 }
 
 /// Rebuild an analyzer `TypedExpr` from an interned id.
@@ -1084,8 +1142,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
     };
     TypedExpr {
         kind,
-        data_type: arena.data_type(id).clone(),
-        nullable: arena.nullable(id),
+        value_type: arena.value_type(id).clone(),
     }
 }
 
@@ -1093,14 +1150,13 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
     dead_code,
     reason = "Column-id expression materialization remains available to optimizer bridge fixture and rewrite paths."
 )]
-pub(crate) fn column_id_expr(id: ColumnId, data_type: DataType, nullable: bool) -> TypedExpr {
+pub(crate) fn column_id_expr(id: ColumnId, value_type: FunctionValueType) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::ColumnRef {
             column_id: id,
             qualifier: None,
             column: format!("col{}", id.0),
         },
-        data_type,
-        nullable,
+        value_type,
     }
 }

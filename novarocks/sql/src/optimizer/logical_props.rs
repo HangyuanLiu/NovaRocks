@@ -309,8 +309,7 @@ pub(crate) fn make_column_ref_expr(arena: &mut ScalarArena, column: &OutputColum
     arena.remember_source_column_display(column.column_id, None, column.name.clone());
     arena.intern(
         ScalarNode::ColumnRef(column.column_id),
-        column.data_type.clone(),
-        column.nullable,
+        column.value_type.clone(),
     )
 }
 
@@ -327,8 +326,10 @@ pub(crate) fn make_eq_literal_predicate(
             right: literal,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        DataType::Boolean,
-        column.nullable || arena.nullable(literal),
+        novarocks_type_contract::FunctionValueType::new(
+            DataType::Boolean,
+            column.value_type.nullable || arena.nullable(literal),
+        ),
     )
 }
 
@@ -345,8 +346,10 @@ pub(crate) fn combine_with_and(
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            arena.nullable(left) || arena.nullable(right),
+            novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                arena.nullable(left) || arena.nullable(right),
+            ),
         )
     }))
 }
@@ -372,14 +375,16 @@ mod tests {
     use crate::planner::table::TableDef;
 
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
-        arena.intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)
+        arena.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        )
     }
 
     fn lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -391,8 +396,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         )
     }
 
@@ -430,8 +434,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }

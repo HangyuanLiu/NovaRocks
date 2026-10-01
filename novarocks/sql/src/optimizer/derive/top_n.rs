@@ -139,8 +139,10 @@ mod tests {
                 &[SortItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
                     },
                     asc: true,
                     nulls_first: false,

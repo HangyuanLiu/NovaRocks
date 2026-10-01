@@ -360,8 +360,8 @@ fn change_stream_project_output_column(project: &PlanProjectNode) -> Option<Outp
         .map(|item| OutputColumn {
             column_id: item.output_column_id,
             name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
+
             is_internal: true,
         })
 }
@@ -545,8 +545,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+
             is_internal,
         }
     }
@@ -619,8 +619,10 @@ mod tests {
                     name: "sum_state_signed".to_string(),
                     args: vec![TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     }],
                     distinct: false,
                     result_type: DataType::Binary,
@@ -700,8 +702,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![union],
@@ -793,8 +797,10 @@ mod tests {
                         args: Vec::new(),
                         distinct: false,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![expanded],
@@ -805,8 +811,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int8,
+                            false,
+                        ),
                     },
                     output_name: ImvActionColumn::NAME.to_string(),
                     output_column_id: action_id,

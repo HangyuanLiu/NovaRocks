@@ -1288,8 +1288,11 @@ mod tests {
         crate::analysis::OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         }
     }
@@ -1363,8 +1366,10 @@ mod tests {
             .map(|id| {
                 scalars.intern(
                     ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-                    arrow::datatypes::DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 )
             })
             .collect();
@@ -1418,8 +1423,10 @@ mod tests {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
                     left_value,
                 )),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             },
         );
         let right = intern_typed(
@@ -1428,8 +1435,10 @@ mod tests {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
                     right_value,
                 )),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             },
         );
         OptimizerPhysicalHashJoinEqCondition {
@@ -1442,8 +1451,10 @@ mod tests {
     fn column_ref(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            arrow::datatypes::DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         )
     }
 
@@ -1451,8 +1462,10 @@ mod tests {
         let child = column_ref(arena, id);
         arena.intern(
             ScalarNode::Nested(child),
-            arrow::datatypes::DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         )
     }
 
@@ -2163,8 +2176,10 @@ mod tests {
             &mut arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
         );
         let mut op = scan_op();
@@ -2218,8 +2233,10 @@ mod tests {
             &mut arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
         );
         let mut op = two_column_scan_op(Some(vec!["narrow"]));
@@ -2306,8 +2323,10 @@ mod tests {
             &mut arena,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
         );
         let input_stats = stats(1_000_000.0, 16.0);
@@ -3513,8 +3532,10 @@ mod tests {
             &mut scalars,
             &crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
-                data_type: arrow::datatypes::DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             },
         );
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {

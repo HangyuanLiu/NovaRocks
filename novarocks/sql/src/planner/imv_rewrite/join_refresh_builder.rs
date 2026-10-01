@@ -303,33 +303,34 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ),
     ];
     validate_generated_column_ids(&input_columns, desc, &explicit_generated_ids)?;
-    let net_column = output_column(ColumnId(net_column_id), "net", DataType::Int64, true, true);
+    let net_column = output_column(
+        ColumnId(net_column_id),
+        "net",
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        true,
+    );
     let key_shape_apply_key = output_column_from_factory(
         column_ref_factory,
         &apply_key_output.name,
-        apply_key_output.data_type.clone(),
-        apply_key_output.nullable,
+        apply_key_output.value_type.clone(),
         apply_key_output.is_internal,
     );
     let pending_insert_count = output_column_from_factory(
         column_ref_factory,
         "__pending_insert_count",
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     );
     let pending_delete_count = output_column_from_factory(
         column_ref_factory,
         "__pending_delete_count",
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     );
     let locator_apply_key = output_column_from_factory(
         column_ref_factory,
         &apply_key_input.name,
-        apply_key_input.data_type.clone(),
-        apply_key_input.nullable,
+        apply_key_input.value_type.clone(),
         false,
     );
     let aggregate = build_payload_coalesce_aggregate(
@@ -498,8 +499,7 @@ fn build_payload_coalesce_assert_filter(
     else {
         return Err("abs must return a scalar value".to_string());
     };
-    let abs_type = abs_result.data_type.clone();
-    let abs_nullable = abs_result.nullable;
+    let value_type = abs_result.clone();
     let abs_net = TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("abs"),
@@ -508,8 +508,7 @@ fn build_payload_coalesce_assert_filter(
             distinct: false,
             binding: abs_binding,
         },
-        data_type: abs_type,
-        nullable: abs_nullable,
+        value_type,
     };
     let abs_net_le_one = binary(abs_net, BinOp::Le, int_literal(1, DataType::Int64));
     let payload_assert = assert_true_call(
@@ -627,8 +626,7 @@ fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
             )],
             else_expr: Some(Box::new(int_literal(0, DataType::Int64))),
         },
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     }
 }
 
@@ -657,7 +655,7 @@ fn build_locator_join_shell(
         locator_pos_column_id,
         locator_row_id_column_id,
         locator_last_updated_seq_column_id,
-    );
+    )?;
     let delete_only = binary(
         column_ref(net_column),
         BinOp::Lt,
@@ -672,8 +670,7 @@ fn build_locator_join_shell(
                 qualifier: None,
                 column: left_apply_key.name.clone(),
             },
-            data_type: left_apply_key.data_type.clone(),
-            nullable: left_apply_key.nullable,
+            value_type: left_apply_key.value_type.clone(),
         },
     );
     Ok(LogicalPlanNode::new(
@@ -699,14 +696,11 @@ fn build_target_locator_scan(
     locator_pos_column_id: ColumnId,
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
-) -> LogicalPlanNode {
-    let columns = vec![ColumnDef {
-        name: apply_key.name.clone(),
-        data_type: apply_key.data_type.clone(),
-        nullable: apply_key.nullable,
-        write_default: None,
-        logical_type: None,
-    }];
+) -> Result<LogicalPlanNode, String> {
+    let columns = vec![
+        ColumnDef::from_value_type(apply_key.name.clone(), apply_key.value_type.clone(), None)
+            .map_err(|error| format!("invalid IMV locator apply-key declaration: {error}"))?,
+    ];
     let metadata_columns = vec![
         ColumnDef {
             name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
@@ -741,40 +735,35 @@ fn build_target_locator_scan(
         output_column(
             right_apply_key_id,
             &apply_key.name,
-            apply_key.data_type.clone(),
-            apply_key.nullable,
+            apply_key.value_type.clone(),
             false,
         ),
         output_column(
             locator_file_column_id,
             crate::common::ICEBERG_FILE_PATH_COL,
-            DataType::Utf8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
             true,
         ),
         output_column(
             locator_pos_column_id,
             crate::common::ICEBERG_ROW_POS_COL,
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             true,
         ),
         output_column(
             locator_row_id_column_id,
             crate::common::ICEBERG_ROW_ID_COL,
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             true,
         ),
         output_column(
             locator_last_updated_seq_column_id,
             crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             true,
         ),
     ];
-    LogicalPlanNode::new(
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
             database: desc.mv_identity.database.clone(),
             table: TableDef {
@@ -807,7 +796,7 @@ fn build_target_locator_scan(
         }),
         Vec::new(),
         None,
-    )
+    ))
 }
 
 fn build_locator_assert_filter(
@@ -950,8 +939,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
                 DataType::Int8,
             ))),
         },
-        data_type: DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     };
     TypedExpr {
         kind: ExprKind::Cast {
@@ -959,8 +947,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
             target: DataType::Int8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     }
 }
 
@@ -1048,15 +1035,14 @@ fn project_item_from_source_to_output(source: &OutputColumn, output: &OutputColu
 fn output_column(
     column_id: ColumnId,
     name: &str,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
     is_internal: bool,
 ) -> OutputColumn {
     OutputColumn {
         column_id,
         name: name.to_string(),
-        data_type,
-        nullable,
+        value_type,
+
         is_internal,
     }
 }
@@ -1064,12 +1050,11 @@ fn output_column(
 fn output_column_from_factory(
     factory: &mut ColumnRefFactory,
     name: &str,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
     is_internal: bool,
 ) -> OutputColumn {
-    let column_id = factory.create(None, name.to_string(), data_type.clone(), nullable);
-    output_column(column_id, name, data_type, nullable, is_internal)
+    let column_id = factory.create(None, name.to_string(), value_type.clone());
+    output_column(column_id, name, value_type, is_internal)
 }
 
 fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
@@ -1080,16 +1065,14 @@ fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
             right: Box::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
 fn int_literal(value: i64, data_type: DataType) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(value)),
-        data_type,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
     }
 }
 
@@ -1109,8 +1092,7 @@ fn assert_true_call(
             distinct: false,
             binding,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     })
 }
 
@@ -1120,8 +1102,7 @@ fn is_not_null(expr: TypedExpr) -> TypedExpr {
             expr: Box::new(expr),
             negated: true,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
@@ -1132,8 +1113,7 @@ fn locator_column_ref(column_id: ColumnId, name: &str, data_type: DataType) -> T
             qualifier: None,
             column: name.to_string(),
         },
-        data_type,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
     }
 }
 
@@ -1220,8 +1200,10 @@ fn project_item_for_mapping(
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Int8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int8,
+                            false,
+                        ),
                     }
                 }
                 JoinApplyActionProjection::ConstantInsert => TypedExpr {
@@ -1234,8 +1216,10 @@ fn project_item_for_mapping(
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Int8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ),
                 },
             }
         }
@@ -1279,8 +1263,7 @@ fn validate_input_column(
         ));
     };
     if !actual.name.eq_ignore_ascii_case(&expected.name)
-        || actual.data_type != expected.data_type
-        || actual.nullable != expected.nullable
+        || actual.value_type != expected.value_type
         || !input_internal_matches(actual, expected)
     {
         return Err(format!(
@@ -1288,11 +1271,11 @@ fn validate_input_column(
             expected.column_id,
             expected.name,
             actual.name,
-            actual.data_type,
-            actual.nullable,
+            actual.value_type.data_type,
+            actual.value_type.nullable,
             actual.is_internal,
-            expected.data_type,
-            expected.nullable,
+            expected.value_type.data_type,
+            expected.value_type.nullable,
             expected.is_internal
         ));
     }
@@ -1328,8 +1311,7 @@ fn join_row_key_expr(
     else {
         return Err("join_row_key must return a scalar value".to_string());
     };
-    let data_type = result.data_type.clone();
-    let nullable = result.nullable;
+    let value_type = result.clone();
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -1338,8 +1320,7 @@ fn join_row_key_expr(
             distinct: false,
             binding,
         },
-        data_type,
-        nullable,
+        value_type,
     })
 }
 
@@ -1350,24 +1331,21 @@ fn column_ref(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
 fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Binary(value.as_bytes().to_vec())),
-        data_type: DataType::Binary,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
     }
 }
 
 fn string_literal(value: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-        data_type: DataType::Utf8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
     }
 }
 
@@ -1546,6 +1524,102 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn locator_schema_preserves_admitted_logical_and_nested_domains() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        let domains = [
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap(),
+            FunctionValueType::new(
+                DataType::Struct(
+                    vec![
+                        Field::new("payload", DataType::Utf8, false).with_metadata(
+                            [
+                                ("nr_logical_type".into(), "json".into()),
+                                ("provider.field-id".into(), "71".into()),
+                            ]
+                            .into(),
+                        ),
+                        Field::new_dict(
+                            "dictionary",
+                            DataType::Dictionary(
+                                Box::new(DataType::Int16),
+                                Box::new(DataType::Utf8),
+                            ),
+                            true,
+                            73,
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ];
+        for value_type in domains {
+            let key = OutputColumn {
+                column_id: ColumnId(1),
+                name: "apply_key".into(),
+                value_type: value_type.clone(),
+                is_internal: false,
+            };
+            let plan = super::build_target_locator_scan(
+                &test_coalesce_descriptor(),
+                &test_locator_binding(),
+                &key,
+                ColumnId(2),
+                ColumnId(3),
+                ColumnId(4),
+                ColumnId(5),
+                ColumnId(6),
+            )
+            .unwrap();
+            let LogicalPlanKind::Scan(scan) = plan.kind else {
+                panic!("expected locator scan");
+            };
+            assert_eq!(
+                scan.table.columns[0].declared_value_type().unwrap(),
+                value_type
+            );
+            assert_eq!(scan.columns[0].value_type, value_type);
+            assert_eq!(scan.columns[0].column_id, ColumnId(2));
+            assert!(sql_mv_target_locator_scan(&scan.table.source).is_some());
+            assert_eq!(scan.table.iceberg_row_lineage_metadata_columns.len(), 4);
+        }
+    }
+
+    #[test]
+    fn locator_schema_rejects_unrepresentable_root_instead_of_plain_fixed16() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        let key = OutputColumn {
+            column_id: ColumnId(1),
+            name: "apply_key".into(),
+            value_type: FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+            is_internal: false,
+        };
+        let error = super::build_target_locator_scan(
+            &test_coalesce_descriptor(),
+            &test_locator_binding(),
+            &key,
+            ColumnId(2),
+            ColumnId(3),
+            ColumnId(4),
+            ColumnId(5),
+            ColumnId(6),
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid IMV locator apply-key declaration"));
+    }
+
+    #[test]
     fn coalesce_plan_contains_aggregate_and_target_locator_join() {
         let desc = test_coalesce_descriptor();
         let branch_union = test_branch_union(&desc);
@@ -1602,8 +1676,8 @@ mod tests {
         for column in generated_columns {
             let metadata = factory.get(column.column_id);
             assert_eq!(metadata.name, column.name);
-            assert_eq!(metadata.data_type, column.data_type);
-            assert_eq!(metadata.nullable, column.nullable);
+            assert_eq!(metadata.value_type, column.value_type);
+            assert_eq!(metadata.value_type.nullable, column.value_type.nullable);
         }
     }
 
@@ -2261,8 +2335,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal,
         }
     }

@@ -322,8 +322,11 @@ mod tests {
                 .map(|(name, id)| OutputColumn {
                     column_id: *id,
                     name: name.to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -414,13 +417,15 @@ mod tests {
 
         // Build a scalar predicate: b > 0 (referencing id_b).
         let mut arena = ScalarArena::new();
-        let col_b = arena.intern(ScalarNode::ColumnRef(id_b), DataType::Int32, false);
+        let col_b = arena.intern(
+            ScalarNode::ColumnRef(id_b),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        );
         let zero = arena.intern(
             ScalarNode::Literal(scalar::HashableLiteral(crate::analysis::LiteralValue::Int(
                 0,
             ))),
-            DataType::Int32,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         );
         let pred = arena.intern(
             ScalarNode::BinaryOp {
@@ -429,8 +434,7 @@ mod tests {
                 right: zero,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         scan.predicates.push(pred);
 
@@ -520,33 +524,33 @@ mod tests {
         let mut scan = make_scan(&[("payload", source_id)]);
         scan.table.columns[0].data_type = DataType::LargeBinary;
         scan.table.columns[0].nullable = true;
-        scan.columns[0].data_type = DataType::LargeBinary;
-        scan.columns[0].nullable = true;
+        scan.columns[0].value_type.data_type = DataType::LargeBinary;
+        scan.columns[0].value_type.nullable = true;
         let source = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: source_id,
                 qualifier: None,
                 column: "payload".to_string(),
             },
-            data_type: DataType::LargeBinary,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::LargeBinary,
+                true,
+            ),
         };
         let path = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String("$.id".to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
         let requested_type = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String("bigint".to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
         let args = vec![source, path, requested_type];
         scan.columns.push(OutputColumn {
             column_id: synthetic_id,
             name: "__nr_var_payload_0".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: true,
         });
         scan.variant_columns.push(ScanVariantColumn {
@@ -595,8 +599,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: synthetic_id,
             name: "__nr_var_payload_0".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: true,
         });
         scan.variant_columns.push(ScanVariantColumn {

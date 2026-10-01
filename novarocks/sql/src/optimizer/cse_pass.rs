@@ -575,7 +575,10 @@ fn substitute(
         | ScalarNode::LambdaFunction { .. } => return id,
     };
 
-    scalars.intern(rewritten, data_type, nullable)
+    scalars.intern(
+        rewritten,
+        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+    )
 }
 
 fn build_commons(
@@ -591,8 +594,11 @@ fn build_commons(
         let data_type = scalars.data_type(common).clone();
         let nullable = scalars.nullable(common);
         let output_name = format!("__cse_{}", items.len());
-        let output_column_id =
-            factory.create(None, output_name.clone(), data_type.clone(), nullable);
+        let output_column_id = factory.create(
+            None,
+            output_name.clone(),
+            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
+        );
         scalars.remember_project_output_display(output_column_id, None, output_name.clone());
         items.push(ScalarProjectItem {
             expr,
@@ -601,8 +607,10 @@ fn build_commons(
             expr_display: None,
         });
 
-        let replacement =
-            scalars.intern(ScalarNode::ColumnRef(output_column_id), data_type, nullable);
+        let replacement = scalars.intern(
+            ScalarNode::ColumnRef(output_column_id),
+            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+        );
         subst.insert(common, replacement);
     }
 
@@ -613,8 +621,8 @@ fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectIte
     OutputColumn {
         column_id: item.output_column_id,
         name: item.output_name.clone(),
-        data_type: scalars.data_type(item.expr).clone(),
-        nullable: scalars.nullable(item.expr),
+        value_type: scalars.value_type(item.expr).clone(),
+
         is_internal: true,
     }
 }
@@ -627,8 +635,8 @@ fn repeat_virtual_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColu
             .map(|(name, column_id)| OutputColumn {
                 column_id: *column_id,
                 name: name.clone(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             })
             .collect(),
@@ -892,8 +900,7 @@ fn wrap_project_around_child(
     for column in &passthrough_columns {
         let expr = scalars.intern(
             ScalarNode::ColumnRef(column.column_id),
-            column.data_type.clone(),
-            column.nullable,
+            column.value_type.clone(),
         );
         items.push(ScalarProjectItem {
             expr,
@@ -1028,8 +1035,7 @@ fn rewrite_project(
         .map(|&(column_id, ref data_type, nullable)| {
             let expr = scalars.intern(
                 ScalarNode::ColumnRef(column_id),
-                data_type.clone(),
-                nullable,
+                novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
             );
             let child_column = child
                 .output_columns
@@ -1057,12 +1063,15 @@ fn rewrite_project(
                 name: child_column
                     .map(|column| column.name.clone())
                     .unwrap_or_else(|| column_id.to_string()),
-                data_type: child_column
-                    .map(|column| column.data_type.clone())
-                    .unwrap_or_else(|| data_type.clone()),
-                nullable: child_column
-                    .map(|column| column.nullable)
-                    .unwrap_or(nullable),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    child_column
+                        .map(|column| column.value_type.data_type.clone())
+                        .unwrap_or_else(|| data_type.clone()),
+                    child_column
+                        .map(|column| column.value_type.nullable)
+                        .unwrap_or(nullable),
+                ),
+
                 is_internal: child_column
                     .map(|column| column.is_internal)
                     .unwrap_or(false),
@@ -1072,8 +1081,8 @@ fn rewrite_project(
     child_project_output_columns.extend(prelude.iter().map(|item| OutputColumn {
         column_id: item.output_column_id,
         name: item.output_name.clone(),
-        data_type: scalars.data_type(item.expr).clone(),
-        nullable: scalars.nullable(item.expr),
+        value_type: scalars.value_type(item.expr).clone(),
+
         is_internal: true,
     }));
     child_project_items.extend(prelude);
@@ -1408,7 +1417,10 @@ mod tests {
     use super::pick_commons;
 
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
-        arena.intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, true)
+        arena.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        )
     }
 
     fn add(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
@@ -1419,8 +1431,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
     }
 
@@ -1432,8 +1443,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
     }
 
@@ -1445,8 +1455,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1458,8 +1467,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1471,16 +1479,14 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
     fn int_lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -1506,8 +1512,7 @@ mod tests {
                 distinct: false,
                 volatility,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
     }
 
@@ -1518,8 +1523,7 @@ mod tests {
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
     }
 
@@ -1536,8 +1540,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(column_id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1560,7 +1564,11 @@ mod tests {
         let next_id = super::max_existing_column_id(root).saturating_add(1);
         while factory.peek_next_id() < next_id {
             let raw = factory.peek_next_id();
-            factory.create(None, format!("__test_seed_{raw}"), DataType::Null, true);
+            factory.create(
+                None,
+                format!("__test_seed_{raw}"),
+                novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
+            );
         }
     }
 
@@ -1613,8 +1621,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
             },
-            DataType::Float64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         );
 
         assert_eq!(pick_commons(&arena, &[rand, rand]), Vec::<ScalarId>::new());
@@ -1664,8 +1671,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let null = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
-            DataType::Null,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
         );
         let null_array_type = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
         let binding = crate::optimizer::scalar::test_function_binding(
@@ -1684,8 +1690,7 @@ mod tests {
                 args: vec![null],
                 distinct: false,
             },
-            null_array_type,
-            false,
+            novarocks_type_contract::FunctionValueType::new(null_array_type, false),
         );
         let map_type = DataType::Map(
             Arc::new(Field::new(
@@ -1705,13 +1710,11 @@ mod tests {
                 target: array_map_type.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            array_map_type.clone(),
-            false,
+            novarocks_type_contract::FunctionValueType::new(array_map_type.clone(), false),
         );
         let candidate = arena.intern(
             ScalarNode::ColumnRef(ColumnId(10)),
-            array_map_type.clone(),
-            true,
+            novarocks_type_contract::FunctionValueType::new(array_map_type.clone(), true),
         );
         let in_list = arena.intern(
             ScalarNode::InList {
@@ -1719,8 +1722,7 @@ mod tests {
                 list: vec![candidate],
                 negated: false,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         let not_in_list = arena.intern(
             ScalarNode::InList {
@@ -1728,8 +1730,7 @@ mod tests {
                 list: vec![candidate],
                 negated: true,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         assert_eq!(
@@ -1790,7 +1791,10 @@ mod tests {
         let a = col(&mut arena, 1);
         let b = col(&mut arena, 2);
         let a_plus_b = add(&mut arena, a, b);
-        let cse_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(99)), DataType::Int64, true);
+        let cse_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(99)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let mut subst = std::collections::HashMap::new();
         subst.insert(a_plus_b, cse_ref);
 
@@ -1846,8 +1850,7 @@ mod tests {
                 name: "x".to_string(),
                 slot_id: 7,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let body = add(&mut arena, lambda_param, captured);
         let lambda = arena.intern(
@@ -1855,8 +1858,7 @@ mod tests {
                 params: vec!["x".to_string()],
                 body,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         let refs = super::collect_column_refs(&arena, &[lambda]);
@@ -2121,8 +2123,7 @@ mod tests {
                 name: "x".to_string(),
                 slot_id: 7,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let lambda_body = add(&mut arena, lambda_param, a);
         let lambda = arena.intern(
@@ -2130,8 +2131,7 @@ mod tests {
                 params: vec!["x".to_string()],
                 body: lambda_body,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let child = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
@@ -2374,8 +2374,8 @@ mod tests {
                     (
                         column.column_id,
                         column.name.as_str(),
-                        column.data_type.clone(),
-                        column.nullable,
+                        column.value_type.data_type.clone(),
+                        column.value_type.nullable,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -3602,8 +3602,7 @@ mod tests {
                 name: "x".to_string(),
                 slot_id: 7,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let lambda_body = add(&mut arena, lambda_param, right_b);
         let lambda = arena.intern(
@@ -3611,8 +3610,7 @@ mod tests {
                 params: vec!["x".to_string()],
                 body: lambda_body,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let binding = crate::optimizer::scalar::test_function_binding(
             &arena,
@@ -3630,8 +3628,7 @@ mod tests {
                 args: vec![left_a, lambda],
                 distinct: false,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let lower = gt(&mut arena, captures_right, ten);
         let upper = lt(&mut arena, captures_right, twenty);
@@ -3682,7 +3679,10 @@ mod intrinsic_eligibility_tests {
             ("assert_true", DataType::Boolean, false),
             ("parse_json", DataType::Utf8, true),
         ] {
-            let child = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), input_type.clone(), true);
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(1)),
+                novarocks_type_contract::FunctionValueType::new(input_type.clone(), true),
+            );
             let arguments = [FunctionArgument::Value {
                 value_type: FunctionValueType::new(input_type, true),
                 constant: None,
@@ -3692,6 +3692,7 @@ mod intrinsic_eligibility_tests {
                     name,
                     FunctionKind::Scalar,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 1,
                     },
@@ -3701,6 +3702,7 @@ mod intrinsic_eligibility_tests {
                 .validate_bound(
                     &binding,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 1,
                     },
@@ -3718,8 +3720,7 @@ mod intrinsic_eligibility_tests {
                     binding: binding.into(),
                     volatility,
                 },
-                output.data_type,
-                output.nullable,
+                novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
             );
             assert_eq!(eligible(&arena, call), expected, "{name}");
             if !expected {
@@ -3727,8 +3728,7 @@ mod intrinsic_eligibility_tests {
                     ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                         crate::analysis::LiteralValue::Bool(false),
                     )),
-                    DataType::Boolean,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
                 );
                 let branch = arena.intern(
                     ScalarNode::Case {
@@ -3736,8 +3736,7 @@ mod intrinsic_eligibility_tests {
                         when_then: vec![(condition, call)],
                         else_expr: Some(child),
                     },
-                    DataType::Boolean,
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
                 );
                 assert!(!eligible(&arena, branch));
             }
@@ -3750,8 +3749,7 @@ mod intrinsic_eligibility_tests {
         let mut arena = ScalarArena::new();
         let child = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
-            DataType::Decimal128(38, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
         );
         for (op, expected) in [(BinOp::Mul, false), (BinOp::Add, true)] {
             let expr = arena.intern(
@@ -3761,8 +3759,7 @@ mod intrinsic_eligibility_tests {
                     right: child,
                     decimal_overflow_policy: OutputNull,
                 },
-                DataType::Decimal128(38, 0),
-                true,
+                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
             );
             assert_eq!(eligible(&arena, expr), expected, "{op:?}");
         }

@@ -50,15 +50,16 @@ mod tests {
         nullable: bool,
         is_internal: bool,
     ) -> OutputColumn {
-        let column_id =
-            factory
-                .borrow_mut()
-                .create(None, name.to_string(), data_type.clone(), nullable);
+        let column_id = factory.borrow_mut().create(
+            None,
+            name.to_string(),
+            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
+        );
         OutputColumn {
             column_id,
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal,
         }
     }
@@ -143,32 +144,28 @@ mod tests {
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         }
     }
 
     fn string_literal(value: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }
     }
 
     fn int_literal(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn bool_literal(value: bool) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(value)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -192,8 +189,7 @@ mod tests {
                 args,
                 distinct: false,
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -213,8 +209,7 @@ mod tests {
                 args,
                 distinct: false,
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -226,8 +221,7 @@ mod tests {
                 right: Box::new(int_literal(10)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -329,8 +323,8 @@ mod tests {
             .find(|column| column.column_id == descriptor.synthetic_column_id)
             .expect("synthetic scan output");
         assert_eq!(synthetic_output.name, descriptor.synthetic_column);
-        assert_eq!(synthetic_output.data_type, DataType::Int64);
-        assert!(synthetic_output.nullable);
+        assert_eq!(synthetic_output.value_type.data_type, DataType::Int64);
+        assert!(synthetic_output.value_type.nullable);
         assert!(synthetic_output.is_internal);
 
         let rewritten_left = binary_column_ref_side(&filter.predicate);
@@ -338,8 +332,8 @@ mod tests {
             column_ref_id(rewritten_left),
             descriptor.synthetic_column_id
         );
-        assert_eq!(rewritten_left.data_type, DataType::Int64);
-        assert!(rewritten_left.nullable);
+        assert_eq!(rewritten_left.value_type.data_type, DataType::Int64);
+        assert!(rewritten_left.value_type.nullable);
     }
 
     #[test]
@@ -612,8 +606,11 @@ mod tests {
         let source_column = OutputColumn {
             column_id: ColumnId::UNSET,
             name: "v".to_string(),
-            data_type: DataType::LargeBinary,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::LargeBinary,
+                true,
+            ),
+
             is_internal: false,
         };
 
@@ -623,22 +620,19 @@ mod tests {
         // arena.intern() has no UNSET guard — only intern_typed does.
         let unset_col_id = scalars.intern(
             ScalarNode::ColumnRef(ColumnId::UNSET),
-            DataType::LargeBinary,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, true),
         );
         let path_id = scalars.intern(
             ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                 crate::analysis::LiteralValue::String("$.a".to_string()),
             )),
-            DataType::Utf8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         );
         let ty_id = scalars.intern(
             ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                 crate::analysis::LiteralValue::String("bigint".to_string()),
             )),
-            DataType::Utf8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         );
         let binding = crate::optimizer::scalar::test_function_binding(
             &scalars,
@@ -656,8 +650,7 @@ mod tests {
                 args: vec![unset_col_id, path_id, ty_id],
                 distinct: false,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         let scan_op = OptExpr::leaf(Operator::LogicalScan(ScanOp {

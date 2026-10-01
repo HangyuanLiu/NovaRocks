@@ -294,8 +294,7 @@ mod tests {
     fn bool_filter(scalars: &mut ScalarArena) -> FilterOp {
         let predicate = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         FilterOp {
             predicate: intern_typed(scalars, &predicate),
@@ -322,7 +321,10 @@ mod tests {
         output: ColumnId,
     ) -> ScalarProjectItem {
         ScalarProjectItem {
-            expr: scalars.intern(ScalarNode::ColumnRef(source), DataType::Int64, false),
+            expr: scalars.intern(
+                ScalarNode::ColumnRef(source),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            ),
             output_name: format!("col{}", output.0),
             output_column_id: output,
             expr_display: None,
@@ -452,7 +454,10 @@ mod tests {
     #[test]
     fn project_output_drops_broadcast_for_replica_nondeterministic_expression() {
         let mut scalars = ScalarArena::new();
-        let argument = scalars.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, false);
+        let argument = scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let volatility = novarocks_functions::FunctionVolatility::Stable;
         let binding = test_function_binding(
             &scalars,
@@ -470,8 +475,7 @@ mod tests {
                 binding,
                 volatility,
             },
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let op = ProjectOp {
             items: vec![ScalarProjectItem {

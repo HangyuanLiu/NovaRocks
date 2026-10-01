@@ -319,6 +319,10 @@ pub struct FunctionBindingRequest<'a> {
     pub arguments: &'a [FunctionArgument],
     /// Equals arguments.len() for every non-aggregate function.
     pub logical_argument_count: usize,
+    /// An explicit syntax result constraint for an owner that declares a
+    /// context-typed result, such as a zero-element typed array. This never
+    /// authorizes a consumer to replace an already selected result type.
+    pub expected_result_type: Option<&'a FunctionValueType>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

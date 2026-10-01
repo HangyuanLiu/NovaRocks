@@ -315,8 +315,8 @@ mod tests {
 
     fn col_expr(alias: &str, name: &str, id: u32) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: col_id(id),
                 qualifier: Some(alias.to_string()),
@@ -327,16 +327,16 @@ mod tests {
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::Eq,
@@ -348,8 +348,8 @@ mod tests {
 
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::And,
@@ -363,8 +363,8 @@ mod tests {
         OutputColumn {
             column_id: col_id(id),
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
             is_internal: false,
         }
     }

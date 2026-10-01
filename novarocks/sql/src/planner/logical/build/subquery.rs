@@ -58,7 +58,7 @@ pub(super) fn wrap_scalar_applies(
         // Copy output-column fields before spec.output_column is moved into the LogicalApplyNode.
         let col_id = spec.output_column.column_id;
         let col_name = spec.output_column.name.clone();
-        let col_type = spec.output_column.data_type.clone();
+        let col_type = spec.output_column.value_type.data_type.clone();
         current = LogicalPlanNode::new(
             LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
@@ -69,8 +69,7 @@ pub(super) fn wrap_scalar_applies(
                         qualifier: None,
                         column: col_name,
                     },
-                    data_type: col_type,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(col_type, true),
                 },
                 output_column: spec.output_column,
                 correlation_column_ids: spec.correlation_column_ids,
@@ -135,8 +134,7 @@ pub(super) fn wrap_predicate_applies(
                     qualifier: None,
                     column: spec.output_column.name.clone(),
                 },
-                data_type: spec.output_column.data_type.clone(),
-                nullable: spec.output_column.nullable,
+                value_type: spec.output_column.value_type.clone(),
             },
         };
 

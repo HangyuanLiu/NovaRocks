@@ -717,7 +717,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
-        compiled.function_catalog.as_ref(),
+        compiled.function_catalog,
         None,
         shape,
     )
@@ -870,7 +870,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
-        compiled.function_catalog.as_ref(),
+        compiled.function_catalog,
         None,
         shape,
     )
@@ -1178,40 +1178,50 @@ fn allocate_join_incremental_locator_column_ids(
             .create(
                 None,
                 "net".to_string(),
-                arrow::datatypes::DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             )
             .0,
         file: factory
             .create(
                 None,
                 "_file".to_string(),
-                arrow::datatypes::DataType::Utf8,
-                true,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Utf8,
+                    true,
+                ),
             )
             .0,
         pos: factory
             .create(
                 None,
                 "_pos".to_string(),
-                arrow::datatypes::DataType::Int64,
-                true,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
             )
             .0,
         row_id: factory
             .create(
                 None,
                 "_row_id".to_string(),
-                arrow::datatypes::DataType::Int64,
-                true,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
             )
             .0,
         last_updated_sequence_number: factory
             .create(
                 None,
                 "_last_updated_sequence_number".to_string(),
-                arrow::datatypes::DataType::Int64,
-                true,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
             )
             .0,
     })
@@ -1278,8 +1288,11 @@ fn add_join_incremental_change_stream_effect(
                 + 1,
         ),
         name: crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_string(),
-        data_type: arrow::datatypes::DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int8,
+            false,
+        ),
+
         is_internal: true,
     };
     let mut arena = optimized_tree
@@ -1310,8 +1323,7 @@ fn add_join_incremental_change_stream_effect(
                 output_column_id: column.column_id,
                 expr: Some(arena.intern(
                     ScalarNode::ColumnRef(column.column_id),
-                    column.data_type.clone(),
-                    column.nullable,
+                    column.value_type.clone(),
                 )),
             }
         })
@@ -1323,13 +1335,14 @@ fn add_join_incremental_change_stream_effect(
         .map(|action| {
             let action_ref = arena.intern(
                 ScalarNode::ColumnRef(action.column_id),
-                action.data_type.clone(),
-                action.nullable,
+                action.value_type.clone(),
             );
             let delete = arena.intern(
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
-                action.data_type.clone(),
-                false,
+                novarocks_type_contract::FunctionValueType {
+                    nullable: false,
+                    ..action.value_type.clone()
+                },
             );
             let is_delete = arena.intern(
                 ScalarNode::BinaryOp {
@@ -1339,16 +1352,20 @@ fn add_join_incremental_change_stream_effect(
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                arrow::datatypes::DataType::Boolean,
-                action.nullable,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    action.value_type.nullable,
+                ),
             );
             let is_not_delete = arena.intern(
                 ScalarNode::UnaryOp {
                     op: crate::common::UnOp::Not,
                     child: is_delete,
                 },
-                arrow::datatypes::DataType::Boolean,
-                action.nullable,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    action.value_type.nullable,
+                ),
             );
             (is_delete, is_not_delete)
         });
@@ -1375,24 +1392,27 @@ fn add_join_incremental_change_stream_effect(
         Some(lineage) => {
             let lineage_ref = arena.intern(
                 ScalarNode::ColumnRef(lineage.column_id),
-                lineage.data_type.clone(),
-                lineage.nullable,
+                lineage.value_type.clone(),
             );
             let is_fresh = arena.intern(
                 ScalarNode::IsNull {
                     child: lineage_ref,
                     negated: false,
                 },
-                arrow::datatypes::DataType::Boolean,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             );
             let is_existing = arena.intern(
                 ScalarNode::IsNull {
                     child: lineage_ref,
                     negated: true,
                 },
-                arrow::datatypes::DataType::Boolean,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
             );
             events.push(ChangeEventSpec {
                 predicate: Some(conjoin(&mut arena, surviving, is_fresh)),
@@ -1417,7 +1437,7 @@ fn add_join_incremental_change_stream_effect(
     // the writer decide whether a particular row can be published.
     let mut expanded_columns = routed_outputs;
     for column in &mut expanded_columns {
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     expanded_columns.push(effect_output.clone());
     crate::planning::dml::build_change_expand(
@@ -1444,8 +1464,10 @@ fn conjoin(
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            arrow::datatypes::DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Boolean,
+                false,
+            ),
         ),
     }
 }
@@ -1590,8 +1612,8 @@ fn build_join_first_refresh_append_logical_plan(
         .map(|item| crate::analysis::OutputColumn {
             column_id: item.output_column_id,
             name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
+
             is_internal: false,
         })
         .collect::<Vec<_>>();
@@ -1618,14 +1640,12 @@ fn build_join_first_refresh_append_logical_plan(
     let join_apply_key_id = factory.create(
         None,
         "__nova_join_row_key".to_string(),
-        arrow::datatypes::DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
     );
     let action_id = factory.create(
         None,
         crate::common::CHANGE_OP_COLUMN.to_string(),
-        arrow::datatypes::DataType::Int8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int8, false),
     );
     let join_apply_key = output_column(
         join_apply_key_id,
@@ -1778,7 +1798,9 @@ fn find_row_id_column(
         crate::common::ICEBERG_ROW_ID_COL,
         &format!("{role} row-id"),
     )?;
-    if column.data_type != arrow::datatypes::DataType::Int64 || column.nullable {
+    if column.value_type.data_type != arrow::datatypes::DataType::Int64
+        || column.value_type.nullable
+    {
         return Err(format!(
             "join first-refresh {role} row-id has invalid shape"
         ));
@@ -1944,8 +1966,7 @@ fn project_item(column: &crate::analysis::OutputColumn) -> crate::analysis::Proj
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         },
         output_name: column.name.clone(),
         output_column_id: column.column_id,
@@ -1962,8 +1983,8 @@ fn output_column(
     crate::analysis::OutputColumn {
         column_id,
         name: name.to_string(),
-        data_type,
-        nullable,
+        value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
         is_internal,
     }
 }
@@ -3057,8 +3078,11 @@ mod tests {
         crate::analysis::OutputColumn {
             column_id: crate::column_id::ColumnId(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+
             is_internal: false,
         }
     }
@@ -3221,15 +3245,15 @@ mod tests {
         let child_output = crate::analysis::OutputColumn {
             column_id: crate::column_id::ColumnId(42),
             name: "child_k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let root_output = crate::analysis::OutputColumn {
             column_id: crate::column_id::ColumnId(6),
             name: "root_k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let child = crate::planner::logical::LogicalPlanNode::new(
@@ -3252,8 +3276,7 @@ mod tests {
                                 qualifier: None,
                                 column: child_output.name.clone(),
                             },
-                            data_type: child_output.data_type.clone(),
-                            nullable: child_output.nullable,
+                            value_type: child_output.value_type.clone(),
                         },
                         output_name: root_output.name.clone(),
                         output_column_id: root_output.column_id,
@@ -3294,8 +3317,11 @@ mod tests {
                     columns: vec![crate::analysis::OutputColumn {
                         column_id: crate::column_id::ColumnId(109),
                         name: "payload".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     }],
                 },
@@ -3321,8 +3347,8 @@ mod tests {
             let metadata = factory.get(crate::column_id::ColumnId(id));
             assert!(!metadata.name.starts_with("__reserved_col_"));
             assert_eq!(metadata.name, name);
-            assert_eq!(metadata.data_type, data_type);
-            assert_eq!(metadata.nullable, nullable);
+            assert_eq!(metadata.value_type.data_type, data_type);
+            assert_eq!(metadata.value_type.nullable, nullable);
         }
     }
 

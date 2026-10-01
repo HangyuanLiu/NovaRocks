@@ -534,6 +534,7 @@ fn build_project(
             kind: FunctionKind::Scalar,
             selected: &selected,
             request: FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &arguments,
                 logical_argument_count: 2,
             },

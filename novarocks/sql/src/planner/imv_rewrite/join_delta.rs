@@ -114,7 +114,11 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
 
             let action_column = match delta.action_column {
                 Some(action_column) => action_column,
-                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
+                None => allocate_imv_column(
+                    ctx,
+                    ImvActionColumn::NAME,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                )?,
             };
 
             let (left, right) = take_binary_children(&mut join_children);
@@ -318,8 +322,12 @@ fn inject_join_apply_key(
         .ok_or_else(|| "InjectJoinApplyKey requires ImvExtension".to_string())?;
     let branch_evidence = collect_join_delta_branch_evidence(&plan, ext.snapshot.as_ref())?;
     validate_join_descriptor_contract(ext, &branch_evidence)?;
-    let join_apply_key_column =
-        allocate_imv_output_column(ctx, JOIN_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false, true)?;
+    let join_apply_key_column = allocate_imv_output_column(
+        ctx,
+        JOIN_APPLY_KEY_COLUMN_NAME,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        true,
+    )?;
 
     let LogicalPlanKind::Union(union) = &mut plan.kind else {
         return Ok(plan);
@@ -463,8 +471,7 @@ fn join_row_key_expr(
     else {
         return Err("join_row_key must return a scalar value".to_string());
     };
-    let data_type = result.data_type.clone();
-    let nullable = result.nullable;
+    let value_type = result.clone();
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -473,16 +480,14 @@ fn join_row_key_expr(
             distinct: false,
             binding,
         },
-        data_type,
-        nullable,
+        value_type,
     })
 }
 
 fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Binary(value.as_bytes().to_vec())),
-        data_type: DataType::Binary,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
     }
 }
 
@@ -493,8 +498,7 @@ fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
@@ -1321,8 +1325,7 @@ fn action_project_item(action_output: &OutputColumn) -> ProjectItem {
                 qualifier: None,
                 column: action_output.name.clone(),
             },
-            data_type: action_output.data_type.clone(),
-            nullable: action_output.nullable,
+            value_type: action_output.value_type.clone(),
         },
         output_name: action_output.name.clone(),
         output_column_id: action_output.column_id,
@@ -1463,8 +1466,8 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::GenerateSeries(generate) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: generate.column_name.clone(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }],
         LogicalPlanKind::TableFunction(table_function) => {
@@ -1519,8 +1522,8 @@ fn project_item_output_column(item: &ProjectItem) -> OutputColumn {
     OutputColumn {
         column_id: item.output_column_id,
         name: item.output_name.clone(),
-        data_type: item.expr.data_type.clone(),
-        nullable: item.expr.nullable,
+        value_type: item.expr.value_type.clone(),
+
         is_internal: item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
             || item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
             || item
@@ -1670,17 +1673,19 @@ mod tests {
             &args[0],
             TypedExpr {
                 kind: ExprKind::Literal(crate::analysis::LiteralValue::Binary(bytes)),
-                data_type: DataType::Binary,
+                value_type,
                 ..
             } if bytes == b"left\x00object"
+                && *value_type == novarocks_type_contract::FunctionValueType::new(DataType::Binary, false)
         ));
         assert!(matches!(
             &args[2],
             TypedExpr {
                 kind: ExprKind::Literal(crate::analysis::LiteralValue::Binary(bytes)),
-                data_type: DataType::Binary,
+                value_type,
                 ..
             } if bytes == b"right\xffobject"
+                && *value_type == novarocks_type_contract::FunctionValueType::new(DataType::Binary, false)
         ));
     }
 
@@ -2253,8 +2258,10 @@ mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -2287,8 +2294,8 @@ mod tests {
         let join_apply_key = OutputColumn {
             column_id: ColumnId(21),
             name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+
             is_internal: true,
         };
         LogicalPlanNode::new(
@@ -2349,29 +2356,29 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId(first_id + 2),
                 name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 3),
                 name: crate::common::ICEBERG_ROW_POS_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 4),
                 name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 5),
                 name: crate::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
         ]);
@@ -2428,8 +2435,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: ColumnId(action_id),
             name: ImvActionColumn::NAME.to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: false,
         });
         plan
@@ -2457,8 +2464,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: ColumnId(row_id),
             name: ImvRowIdColumn::NAME.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         });
         plan
@@ -2478,8 +2485,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -2510,8 +2517,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -2523,8 +2529,7 @@ mod tests {
                 right: Box::new(col_expr(10, "right_k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 

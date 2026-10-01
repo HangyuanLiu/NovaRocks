@@ -99,8 +99,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let pred_id = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true))),
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
 
         let expr = OptExpr::new(

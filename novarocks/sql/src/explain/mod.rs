@@ -697,8 +697,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -813,16 +813,14 @@ mod tests {
                 qualifier: qualifier.map(str::to_string),
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn int_literal(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -870,14 +868,19 @@ mod tests {
                         qualifier: None,
                         column: "sq".to_string(),
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
                 output_column: OutputColumn {
                     column_id: ColumnId(5),
                     name: "sq".to_string(),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: ColumnId(5),
@@ -975,8 +978,7 @@ mod tests {
                 right: Box::new(int_literal(10)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode { predicate }),
@@ -1052,8 +1054,10 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(10)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
@@ -1062,13 +1066,14 @@ mod tests {
                         qualifier: Some("r".to_string()),
                         column: "rk".to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
         assert_eq!(format_expr(&expr), "r.rk = 10");
@@ -1083,8 +1088,7 @@ mod tests {
                     qualifier: Some("a".to_string()),
                     column: "k".to_string(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "k".to_string(),
             output_column_id: ColumnId(1),
@@ -1102,8 +1106,7 @@ mod tests {
                     qualifier: None,
                     column: "id".to_string(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "alias_id".to_string(),
             output_column_id: ColumnId(1),

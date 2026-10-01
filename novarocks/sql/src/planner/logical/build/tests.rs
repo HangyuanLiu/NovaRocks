@@ -367,8 +367,7 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -376,8 +375,8 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -580,8 +579,11 @@ fn adapt_plan_output_passthrough_when_outputs_match() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -591,8 +593,11 @@ fn adapt_plan_output_passthrough_when_outputs_match() {
     let target = vec![OutputColumn {
         column_id: source_id,
         name: "k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -610,8 +615,11 @@ fn adapt_plan_output_renames_and_rebinds_with_project() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -621,8 +629,11 @@ fn adapt_plan_output_renames_and_rebinds_with_project() {
     let target = vec![OutputColumn {
         column_id: target_id,
         name: "alias_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -653,8 +664,11 @@ fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k1".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -664,8 +678,11 @@ fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
     let target = vec![OutputColumn {
         column_id: target_id,
         name: "k1".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -698,8 +715,11 @@ fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "rnk".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -709,8 +729,11 @@ fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
     let target = vec![OutputColumn {
         column_id: source_id,
         name: "rnk".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -744,8 +767,11 @@ fn adapt_plan_output_allows_nullable_widening() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -755,8 +781,11 @@ fn adapt_plan_output_allows_nullable_widening() {
     let target = vec![OutputColumn {
         column_id: target_id,
         name: "nullable_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            true,
+        ),
+
         is_internal: false,
     }];
 
@@ -765,7 +794,7 @@ fn adapt_plan_output_allows_nullable_widening() {
         panic!("expected Project adapter");
     };
     assert_eq!(project.items.len(), 1);
-    assert!(project.items[0].expr.nullable);
+    assert!(project.items[0].expr.value_type.nullable);
     assert_eq!(project.items[0].output_column_id, target_id);
 }
 
@@ -777,8 +806,11 @@ fn adapt_plan_output_rejects_nullable_narrowing() {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(10),
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -788,8 +820,11 @@ fn adapt_plan_output_rejects_nullable_narrowing() {
     let target = vec![OutputColumn {
         column_id: ColumnId::new_for_test(20),
         name: "not_null_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -814,8 +849,11 @@ fn adapt_plan_output_rejects_shape_mismatch() {
     let target = vec![OutputColumn {
         column_id: ColumnId::new_for_test(20),
         name: "alias_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -2644,15 +2682,15 @@ fn apply_output_columns_extend_left_with_output_column() {
     let left_col = OutputColumn {
         column_id: ColumnId(11),
         name: "l1".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
         is_internal: false,
     };
     let out_col = OutputColumn {
         column_id: ColumnId(12),
         name: "__sq_1".to_string(),
-        data_type: DataType::Int64,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
         is_internal: true,
     };
     let plan = LogicalPlanNode::new(
@@ -2664,8 +2702,7 @@ fn apply_output_columns_extend_left_with_output_column() {
                     qualifier: None,
                     column: "__sq_1".to_string(),
                 },
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             },
             output_column: out_col.clone(),
             inner_output_column_id: out_col.column_id,
@@ -2715,8 +2752,8 @@ fn assert_one_row_output_columns_pass_through() {
     let col = OutputColumn {
         column_id: ColumnId(21),
         name: "c1".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
         is_internal: false,
     };
     let plan = LogicalPlanNode::new(
@@ -2928,8 +2965,8 @@ fn direct_where_apply(plan: &LogicalPlanNode) -> &LogicalApplyNode {
 }
 
 fn assert_same_column_ref_expr(actual: &TypedExpr, expected: &TypedExpr) {
-    assert_eq!(actual.data_type, expected.data_type);
-    assert_eq!(actual.nullable, expected.nullable);
+    assert_eq!(actual.value_type.data_type, expected.value_type.data_type);
+    assert_eq!(actual.value_type.nullable, expected.value_type.nullable);
     let ExprKind::ColumnRef {
         column_id: actual_id,
         qualifier: actual_qualifier,
@@ -3013,11 +3050,11 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
     let apply = direct_where_apply(&plan);
 
     assert_eq!(
-        apply.subquery_expr.data_type,
+        apply.subquery_expr.value_type.data_type,
         arrow::datatypes::DataType::Boolean
     );
     assert_eq!(
-        apply.subquery_expr.nullable, spec.output_column.nullable,
+        apply.subquery_expr.value_type.nullable, spec.output_column.value_type.nullable,
         "EXISTS subquery_expr must mirror the Boolean predicate output nullability"
     );
     let ExprKind::ColumnRef { column_id, .. } = apply.subquery_expr.kind else {
@@ -3041,20 +3078,15 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
     ] {
         let plan = plan_test_query(sql);
         let (project, aggregate) = root_project_over_aggregate(&plan);
-        let DataType::List(json_item) = &project.items[0].expr.data_type else {
+        let DataType::List(json_item) = &project.items[0].expr.value_type.data_type else {
             panic!("expected JSON List");
         };
-        let DataType::List(string_item) = &project.items[1].expr.data_type else {
+        let DataType::List(string_item) = &project.items[1].expr.value_type.data_type else {
             panic!("expected STRING List");
         };
         assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
         assert_eq!(logical_type_of_field(string_item), None);
-        let ExprKind::Cast {
-            expr: reference, ..
-        } = &project.items[0].expr.kind
-        else {
-            panic!("expected output adapter");
-        };
+        let reference = &project.items[0].expr;
         let ExprKind::ColumnRef { column_id, .. } = reference.kind else {
             panic!("expected exact aggregate output slot");
         };
@@ -3063,20 +3095,21 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
             .iter()
             .find(|call| call.output_column_id == column_id)
             .unwrap();
-        assert_eq!(reference.data_type, call.result_type);
-        assert_eq!(
-            call.result_type,
-            crate::functions::aggregate_result_type(&call.resolved).data_type
-        );
-        let DataType::List(physical_item) = &call.result_type else {
-            panic!("expected physical List");
+        let selected = crate::functions::aggregate_result_type(&call.resolved);
+        assert_eq!(&reference.value_type, selected);
+        assert_eq!(call.result_type, selected.data_type);
+        let DataType::List(selected_item) = &selected.data_type else {
+            panic!("expected selected JSON List");
         };
-        assert_eq!(logical_type_of_field(physical_item), None);
+        assert_eq!(
+            logical_type_of_field(selected_item),
+            Some(LogicalType::Json)
+        );
         let output = aggregate
             .output_columns
             .iter()
             .find(|output| output.column_id == column_id)
             .unwrap();
-        assert_eq!(output.data_type, call.result_type);
+        assert_eq!(&output.value_type, selected);
     }
 }

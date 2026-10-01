@@ -428,16 +428,14 @@ mod tests {
                 qualifier: None,
                 column: format!("rk_{}", id.0),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn int_typed(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -449,8 +447,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -478,8 +475,7 @@ mod tests {
                 high: Box::new(int_typed(high_v)),
                 negated: false,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -490,8 +486,7 @@ mod tests {
                 list: values.iter().map(|&v| int_typed(v)).collect(),
                 negated: false,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -513,8 +508,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -1258,8 +1253,7 @@ mod tests {
                 target: target.clone(),
                 decimal_overflow_policy: policy,
             },
-            data_type: target,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(target, true),
         }
     }
 
@@ -1288,8 +1282,10 @@ mod tests {
                     expr: Box::new(decimal_cast_typed(col_typed(amount), policy)),
                     negated: true,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
             };
             let predicate = binop_typed(le_typed(col_typed(rank), 1), BinOp::And, checked);
             let plan = filter_opt(&mut arena, window, predicate);

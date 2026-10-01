@@ -127,8 +127,10 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -165,8 +167,11 @@ mod tests {
             .map(|expr| OutputColumn {
                 column_id: expr.output_column_id,
                 name: expr.output_name.clone(),
-                data_type: expr.result_type.clone(),
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    expr.result_type.clone(),
+                    true,
+                ),
+
                 is_internal: false,
             })
             .collect::<Vec<_>>();
@@ -185,8 +190,10 @@ mod tests {
                 qualifier: None,
                 column: "c0".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let window_expr = WindowExpr {
             name: "max".into(),
@@ -335,8 +342,10 @@ mod tests {
                 qualifier: None,
                 column: "k".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let partitioned = WindowExpr {
             name: "cume_dist".into(),
@@ -395,8 +404,10 @@ mod tests {
                 qualifier: None,
                 column: "k".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let partitioned = WindowExpr {
             name: "cume_dist".into(),
@@ -454,8 +465,10 @@ mod tests {
                 qualifier: None,
                 column: "k".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let order = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -463,8 +476,10 @@ mod tests {
                 qualifier: None,
                 column: "ts".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let window_expr = WindowExpr {
             name: "sum".into(),

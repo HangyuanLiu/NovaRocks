@@ -764,8 +764,8 @@ pub fn analyze_view_query(
         .filter(|column| !column.is_internal)
         .map(|column| ViewOutputColumn {
             name: column.name,
-            data_type: column.data_type,
-            nullable: column.nullable,
+            data_type: column.value_type.data_type,
+            nullable: column.value_type.nullable,
         })
         .collect())
 }

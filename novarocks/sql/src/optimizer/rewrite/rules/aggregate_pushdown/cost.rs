@@ -148,8 +148,7 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -176,8 +175,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: test_col_id(col),
                 name: col.into(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             }],
             predicates: vec![],
@@ -321,13 +320,14 @@ mod tests {
                 op: BinOp::Eq,
                 right: Box::new(crate::analysis::TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(7)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         scan_op.predicates.push(intern_typed(arena, &predicate));
         OptExpr::leaf(Operator::LogicalScan(scan_op))

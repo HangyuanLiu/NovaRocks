@@ -101,9 +101,10 @@ pub(crate) fn lower_final_physical_plan(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    lower_final_physical_plan_inner(plan, version, dop_domain, None, control)
+    lower_final_physical_plan_inner(plan, version, dop_domain, None, functions, control)
 }
 
 pub(crate) fn lower_final_physical_plan_with_provider_reads(
@@ -111,9 +112,10 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     reads: FinalizedProviderReadSet,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads), control)
+    lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads), functions, control)
 }
 
 /// Lower one admitted SQL write directly into the final physical-plan
@@ -133,6 +135,7 @@ pub(crate) fn lower_final_physical_write_plan(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     input: FinalWriteLowering<'_>,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let FinalWriteLowering {
@@ -142,7 +145,7 @@ pub(crate) fn lower_final_physical_write_plan(
         auxiliary,
         mut targets,
     } = input;
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, control)?;
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, functions, control)?;
     // A write states the runtime filters it can name, for the same reason a
     // read does: a filter whose probe is not one value of one type is a filter
     // the plan cannot say anything exact about.
@@ -173,6 +176,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     input: FinalChangeStreamWriteLowering<'_>,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
@@ -181,7 +185,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
         auxiliary,
         mut targets,
     } = input;
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, control)?;
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, functions, control)?;
     dag.validate().map_err(invalid_write)?;
     if !matches!(plan.kind, PhysicalPlanKind::ChangeEventExpand(_)) {
         return Err(invalid_write(
@@ -205,9 +209,10 @@ fn lower_final_physical_plan_inner(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, control)?;
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, functions, control)?;
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let root = visitor.lower_node(plan)?;
 
@@ -234,6 +239,7 @@ fn lower_final_physical_plan_inner(
 }
 
 struct ContractLoweringVisitor<'a> {
+    functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     control: &'a dyn PureCompileControl,
     work: CompileCheckpoints<'a>,
     current_fragment: FragmentId,
@@ -1276,10 +1282,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         version: PlanVersionId,
         dop_domain: PipelineDopDomain,
         provider_reads: Option<FinalizedProviderReadSet>,
+        functions: &'a dyn crate::compiler::SqlFunctionCatalog,
         control: &'a dyn PureCompileControl,
     ) -> Result<Self, ContractLoweringError> {
         let work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         Ok(Self {
+            functions,
             control,
             work,
             current_fragment: ROOT_FRAGMENT_ID,
@@ -2301,10 +2309,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             // The provider names its own nested fields; the plan states the
             // type without that decoration, and this is where the two meet.
-            let engine_type = ValueType::new(
-                novarocks_types::undecorated_nested_type(&field.engine_type().data_type),
-                field.engine_type().nullable,
-            );
+            let engine_type = undecorated(field.engine_type());
             if engine_type != value_type(column) {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Scan",
@@ -2354,8 +2359,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 ))?;
             let output_column = &plan.output_columns[output_ordinal];
             if output_column.name != descriptor.synthetic_column
-                || output_column.data_type != descriptor.requested_type
-                || !output_column.nullable
+                || output_column.value_type.data_type != descriptor.requested_type
+                || !output_column.value_type.nullable
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Scan",
@@ -2465,9 +2470,9 @@ impl<'a> ContractLoweringVisitor<'a> {
 
         let mut predicate_expressions = Vec::with_capacity(scan.predicates.len());
         for predicate in &scan.predicates {
-            if predicate.data_type != DataType::Boolean {
+            if predicate.value_type.data_type != DataType::Boolean {
                 return Err(ContractLoweringError::PredicateIsNotBoolean {
-                    actual: predicate.data_type.clone(),
+                    actual: predicate.value_type.data_type.clone(),
                 });
             }
             predicate_expressions.push(self.lower_expression(node, predicate, &columns)?);
@@ -2687,7 +2692,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     // Stated in the plan's own vocabulary, like every other
                     // type it carries: the provider's decoration belongs to
                     // the contract the field was frozen from, not to the plan.
-                    ty: column_value_type(input),
+                    ty: column_value_type(input, self.control)?,
                     hidden: target.is_hidden,
                 })
             })
@@ -2783,7 +2788,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         if source_matches_target {
             for (value, column) in source.output.iter().zip(&write.contract.input_columns) {
                 let ty = self.value_declared_type_in(source.fragment, *value)?;
-                if ty.data_type != column_value_type(column).data_type {
+                let target = column_value_type(column, self.control)?;
+                if ty.logical_type != target.logical_type
+                    || !novarocks_type_contract::arrow_data_types_exact(
+                        &ty.data_type,
+                        &target.data_type,
+                    )
+                {
                     source_matches_target = false;
                     break;
                 }
@@ -2811,7 +2822,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .zip(&write.contract.input_columns)
                 .enumerate()
             {
-                let expected = ValueType::new(column.data_type.clone(), column.nullable);
+                let expected = column_value_type(column, self.control)?;
                 let actual = expression_type(expression);
                 if actual != expected {
                     return Err(ContractLoweringError::ExpressionTypeMismatch {
@@ -2868,7 +2879,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // The plan states its types in one vocabulary, so the target's
                 // column is read the way every other column is -- with the
                 // provider's decoration off its nested fields.
-                let ty = column_value_type(&write.contract.input_columns[field_ordinal]);
+                let ty =
+                    column_value_type(&write.contract.input_columns[field_ordinal], self.control)?;
                 let source_ty = self.value_declared_type_in(source.fragment, value)?;
                 // A conversion is where the two types meet, whichever of them
                 // differs: a column that admits a null the value never holds
@@ -2894,17 +2906,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                     // there: a null converts to a null. So the converted value
                     // admits one wherever the source did, and whether the
                     // target column accepts that is the writer's to enforce.
-                    let converted_ty =
-                        ValueType::new(ty.data_type.clone(), source_ty.nullable || ty.nullable);
-                    let expression = self.fragment_mut().add_expression(
+                    let converted_ty = ValueType {
+                        nullable: source_ty.nullable || ty.nullable,
+                        ..ty.clone()
+                    };
+                    let expression = self.convert_expression_to(
                         node,
-                        converted_ty.clone(),
-                        ContractExprKind::Cast {
-                            expr: read,
-                            target: ty.data_type.clone(),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        },
+                        read,
+                        &converted_ty,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     )?;
                     let converted = self.fragment_mut().add_value(
                         converted_ty,
@@ -3050,7 +3060,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // require a non-null field even when the producer admits
                 // null; the writer checks that requirement for each row.
                 let source_type = self.value_declared_type_in(source_fragment, source_value)?;
-                if source_type.data_type != column_value_type(input_column).data_type {
+                if source_type.data_type != column_value_type(input_column, self.control)?.data_type
+                {
                     return Err(invalid_write(format!(
                         "change-stream route input {route_input_ordinal} source ordinal {source_ordinal} `{}` type {:?} differs from writer field `{}` type {:?}; producer=[{}], writer=[{}]",
                         source
@@ -3060,7 +3071,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                             .unwrap_or("?"),
                         source_type.data_type,
                         input_column.name,
-                        column_value_type(input_column).data_type,
+                        column_value_type(input_column, self.control)?.data_type,
                         source.display_names.join(", "),
                         route
                             .sink
@@ -3936,9 +3947,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             // `key`/`value`. One side coming from a provider and the other
             // from a projection would otherwise differ over decoration
             // neither of them compares by.
-            let left_key_type = novarocks_types::undecorated_nested_type(&condition.left.data_type);
-            let right_key_type =
-                novarocks_types::undecorated_nested_type(&condition.right.data_type);
+            let left_key_type = expression_type(&condition.left);
+            let right_key_type = expression_type(&condition.right);
             // The values the exchange partitioned by are the ones below any
             // conversion: the partition hash already widens every narrow
             // integer to the same eight bytes, so a side converted here still
@@ -3947,33 +3957,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             let right_value = direct_join_key_value(&condition.right, right);
             let left_expr = self.lower_expression(node, &condition.left, &left.columns)?;
             let right_expr = self.lower_expression(node, &condition.right, &right.columns)?;
-            // A join compares one type. Its two keys were reconciled while
-            // the statement was analyzed -- a narrower integer on one side --
-            // and the plan states the comparison it performs rather than two
-            // sides the reader has to reconcile again.
-            let (left_expr, right_expr) = if left_key_type == right_key_type {
-                (left_expr, right_expr)
-            } else {
-                // Two integers of different widths meet above both of them --
-                // an INT against a TINYINT is compared as BIGINT -- so the
-                // type the join states is not required to be one of the two.
-                // What it is required to be is a type both sides reach.
-                let compared = novarocks_types::wider_type(&left_key_type, &right_key_type);
-                if novarocks_types::wider_type(&left_key_type, &compared) != compared
-                    || novarocks_types::wider_type(&right_key_type, &compared) != compared
-                {
-                    return Err(ContractLoweringError::InvalidJoinKeys {
-                        node: "HashJoin",
-                        detail: format!(
-                            "equality key pair compares {left_key_type:?} against {right_key_type:?}, which meet at neither"
-                        ),
-                    });
-                }
-                (
-                    self.cast_expression_to(node, left_expr, &compared)?,
-                    self.cast_expression_to(node, right_expr, &compared)?,
-                )
-            };
+            let compared = self.common_comparison_value_type(&left_key_type, &right_key_type)?;
+            let left_expr = self.cast_expression_to(node, left_expr, &compared)?;
+            let right_expr = self.cast_expression_to(node, right_expr, &compared)?;
             left_key_values.push(left_value);
             right_key_values.push(right_value);
             keys.push(JoinKey {
@@ -3998,10 +3984,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             .other_condition
             .as_ref()
             .map(|predicate| {
-                if predicate.data_type != DataType::Boolean {
+                if predicate.value_type.data_type != DataType::Boolean {
                     return Err(ContractLoweringError::JoinPredicateIsNotBoolean {
                         node: "HashJoin",
-                        actual: predicate.data_type.clone(),
+                        actual: predicate.value_type.data_type.clone(),
                     });
                 }
                 self.lower_expression(node, predicate, &visible)
@@ -4220,10 +4206,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             .condition
             .as_ref()
             .map(|predicate| {
-                if predicate.data_type != DataType::Boolean {
+                if predicate.value_type.data_type != DataType::Boolean {
                     return Err(ContractLoweringError::JoinPredicateIsNotBoolean {
                         node: "NestLoopJoin",
-                        actual: predicate.data_type.clone(),
+                        actual: predicate.value_type.data_type.clone(),
                     });
                 }
                 self.lower_expression(node, predicate, &visible)
@@ -4350,7 +4336,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 null_sides.1
             };
             let value = if nullable_side {
-                if !column.nullable {
+                if !column.value_type.nullable {
                     return Err(ContractLoweringError::OutputColumnMismatch {
                         node: "Join",
                         ordinal,
@@ -4369,7 +4355,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         value
                     }
                 }
-            } else if source_ty.nullable == column.nullable {
+            } else if source_ty.nullable == column.value_type.nullable {
                 *source
             } else {
                 return Err(ContractLoweringError::OutputColumnMismatch {
@@ -5327,9 +5313,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         expect_children(plan, 1)?;
         let child = self.lower_node(&plan.children[0])?;
         require_passthrough_shape("Filter", &plan.output_columns, &plan.children[0])?;
-        if predicate.data_type != DataType::Boolean {
+        if predicate.value_type.data_type != DataType::Boolean {
             return Err(ContractLoweringError::PredicateIsNotBoolean {
-                actual: predicate.data_type.clone(),
+                actual: predicate.value_type.data_type.clone(),
             });
         }
 
@@ -5399,13 +5385,21 @@ impl<'a> ContractLoweringVisitor<'a> {
                 source_type.clone(),
                 ContractExprKind::Value(source),
             )?;
-            let published_type = value_type(published).data_type;
-            let (expression, value) = if source_type.data_type == published_type {
+            let published_type = ValueType {
+                nullable: source_type.nullable,
+                ..value_type(published)
+            };
+            let (expression, value) = if source_type == published_type {
                 (expression, source)
             } else {
-                let expression = self.cast_expression_to(node, expression, &published_type)?;
+                let expression = self.convert_expression_to(
+                    node,
+                    expression,
+                    &published_type,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )?;
                 let value = self.fragment_mut().add_value(
-                    ValueType::new(published_type, source_type.nullable),
+                    published_type,
                     ValueOrigin::Expr {
                         node,
                         expr: expression,
@@ -6371,7 +6365,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         {
             let child_column = &plan.children[0].output_columns[ordinal];
             if child_column.column_id != output_column.column_id
-                || child_column.data_type != output_column.data_type
+                || child_column.value_type.data_type != output_column.value_type.data_type
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Repeat",
@@ -6380,7 +6374,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             let value = if nullable_columns.contains(&output_column.column_id) {
-                if !output_column.nullable {
+                if !output_column.value_type.nullable {
                     return Err(ContractLoweringError::OutputColumnMismatch {
                         node: "Repeat",
                         ordinal,
@@ -6401,7 +6395,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 columns.insert(output_column.column_id, value);
                 value
             } else {
-                if child_column.nullable != output_column.nullable {
+                if child_column.value_type.nullable != output_column.value_type.nullable {
                     return Err(ContractLoweringError::OutputColumnMismatch {
                         node: "Repeat",
                         ordinal,
@@ -6430,8 +6424,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             let ordinal = child.output.len() + index;
             let output_column = &plan.output_columns[ordinal];
             if output_column.column_id != *output_id
-                || output_column.data_type != DataType::Int64
-                || output_column.nullable
+                || output_column.value_type.data_type != DataType::Int64
+                || output_column.value_type.nullable
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Repeat",
@@ -6585,8 +6579,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             .enumerate()
         {
             if column.column_id != plan_column.column_id
-                || column.data_type != plan_column.data_type
-                || column.nullable != plan_column.nullable
+                || column.value_type.data_type != plan_column.value_type.data_type
+                || column.value_type.nullable != plan_column.value_type.nullable
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "TableFunction",
@@ -6822,7 +6816,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         {
             if !same_window_signature(expression, first)
                 || expression.output_column_id != output_column.column_id
-                || expression.result_type != output_column.data_type
+                || expression.result_type != output_column.value_type.data_type
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Window",
@@ -7104,8 +7098,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         let column = &plan.output_columns[0];
         if column.column_id != series.output_column_id
             || column.name != series.column_name
-            || column.data_type != DataType::Int64
-            || column.nullable
+            || column.value_type.data_type != DataType::Int64
+            || column.value_type.nullable
         {
             return Err(ContractLoweringError::OutputColumnMismatch {
                 node: "GenerateSeries",
@@ -7173,21 +7167,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             });
         }
 
-        let mut lowered = self.lower_expression(owner, expression, &BTreeMap::new())?;
-        let mut lowered_type = source;
-        if lowered_type.data_type != target.data_type {
-            lowered_type = ValueType::new(target.data_type.clone(), lowered_type.nullable);
-            lowered = self.fragment_mut().add_expression(
-                owner,
-                lowered_type.clone(),
-                ContractExprKind::Cast {
-                    expr: lowered,
-                    target: target.data_type.clone(),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-            )?;
-        }
+        let lowered = self.lower_expression(owner, expression, &BTreeMap::new())?;
+        let lowered = self.convert_expression_to(
+            owner,
+            lowered,
+            target,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )?;
+        let lowered_type = self.expression_value_type(lowered)?;
         if lowered_type == *target {
             return Ok(lowered);
         }
@@ -7365,10 +7352,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // reader has to reconcile again. Arithmetic keeps its own
                 // operands: its result type is derived from the pair.
                 let (lowered_left, lowered_right) = if is_comparison_operator(*op) {
-                    let compared = novarocks_types::wider_type(
-                        &self.expression_value_type(lowered_left)?.data_type,
-                        &self.expression_value_type(lowered_right)?.data_type,
-                    );
+                    let left_type = self.expression_value_type(lowered_left)?;
+                    let right_type = self.expression_value_type(lowered_right)?;
+                    let compared = self.common_comparison_value_type(&left_type, &right_type)?;
                     (
                         self.cast_expression_to(owner, lowered_left, &compared)?,
                         self.cast_expression_to(owner, lowered_right, &compared)?,
@@ -7389,17 +7375,12 @@ impl<'a> ContractLoweringVisitor<'a> {
             },
             ExprKind::Cast {
                 expr,
-                target,
                 decimal_overflow_policy,
-            } => ContractExprKind::Cast {
-                expr: self.lower_expression(owner, expr, visible)?,
-                // The type a conversion produces is stated in the plan's own
-                // vocabulary -- a list's element is named `item` there -- and
-                // that is the vocabulary the expression's own type is read in.
-                // The two are compared, so they are written the same way.
-                target: novarocks_types::undecorated_nested_type(target),
-                decimal_overflow_policy: *decimal_overflow_policy,
-            },
+                ..
+            } => {
+                let child = self.lower_expression(owner, expr, visible)?;
+                return self.convert_expression_to(owner, child, &ty, *decimal_overflow_policy);
+            }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(owner, expr, visible)?,
                 negated: *negated,
@@ -7419,10 +7400,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .iter()
                     .map(|item| self.lower_expression(owner, item, visible))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut compared = self.expression_value_type(input)?.data_type;
+                let mut compared = self.expression_value_type(input)?;
                 for candidate in &candidates {
-                    let other = self.expression_value_type(*candidate)?.data_type;
-                    compared = novarocks_types::wider_type(&compared, &other);
+                    let other = self.expression_value_type(*candidate)?;
+                    compared = self.common_comparison_value_type(&compared, &other)?;
                 }
                 let list = candidates
                     .into_iter()
@@ -7447,10 +7428,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let input = self.lower_expression(owner, expr, visible)?;
                 let low = self.lower_expression(owner, low, visible)?;
                 let high = self.lower_expression(owner, high, visible)?;
-                let mut compared = self.expression_value_type(input)?.data_type;
+                let mut compared = self.expression_value_type(input)?;
                 for operand in [low, high] {
-                    let other = self.expression_value_type(operand)?.data_type;
-                    compared = novarocks_types::wider_type(&compared, &other);
+                    let other = self.expression_value_type(operand)?;
+                    compared = self.common_comparison_value_type(&compared, &other)?;
                 }
                 ContractExprKind::Between {
                     expr: self.cast_expression_to(owner, input, &compared)?,
@@ -7491,12 +7472,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // way a comparison operator does -- an INT operand against a
                 // BIGINT label is one comparison, not two types.
                 if let Some(subject) = operand {
-                    let mut compared = self.expression_value_type(subject)?.data_type;
+                    let mut compared = self.expression_value_type(subject)?;
                     for when in &whens {
-                        compared = novarocks_types::wider_type(
-                            &compared,
-                            &self.expression_value_type(*when)?.data_type,
-                        );
+                        let when_type = self.expression_value_type(*when)?;
+                        compared = self.common_comparison_value_type(&compared, &when_type)?;
                     }
                     operand = Some(self.cast_expression_to(owner, subject, &compared)?);
                     for when in &mut whens {
@@ -7506,12 +7485,25 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let mut branches = Vec::with_capacity(when_then.len());
                 for ((_, then), when) in when_then.iter().zip(whens) {
                     let then = self.lower_expression(owner, then, visible)?;
-                    branches.push((when, self.cast_expression_to(owner, then, &ty.data_type)?));
+                    branches.push((
+                        when,
+                        self.convert_expression_to(
+                            owner,
+                            then,
+                            &ty,
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        )?,
+                    ));
                 }
                 let else_expr = match else_expr.as_deref() {
                     Some(item) => {
                         let item = self.lower_expression(owner, item, visible)?;
-                        Some(self.cast_expression_to(owner, item, &ty.data_type)?)
+                        Some(self.convert_expression_to(
+                            owner,
+                            item,
+                            &ty,
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        )?)
                     }
                     None => None,
                 };
@@ -7618,9 +7610,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // read as two different types.
                 let parameter_types = params
                     .iter()
-                    .map(|param| {
-                        undecorated(&ValueType::new(param.data_type.clone(), param.nullable))
-                    })
+                    .map(|param| undecorated(&param.value_type))
                     .collect::<Vec<_>>();
                 let enclosing = self.lambda_scope.last().map(|scope| scope.lambda);
                 self.lambda_scope.push(LoweringLambdaScope {
@@ -7765,12 +7755,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         expected: &FunctionArgumentType,
     ) -> Result<ExprId, ContractLoweringError> {
         if let FunctionArgumentType::Value(expected) = expected
-            && argument.data_type == DataType::Null
+            && argument.value_type.data_type == DataType::Null
             && expected.data_type != DataType::Null
         {
             return Ok(self.fragment_mut().add_expression(
                 owner,
-                ValueType::new(expected.data_type.clone(), true),
+                ValueType {
+                    nullable: true,
+                    ..undecorated(expected)
+                },
                 ContractExprKind::Literal(ContractLiteralValue::Null),
             )?);
         }
@@ -7798,24 +7791,132 @@ impl<'a> ContractLoweringVisitor<'a> {
     ///
     /// An expression that already has the type is returned as it is: a
     /// conversion that converts nothing is not written down.
+    fn convert_expression_to(
+        &mut self,
+        owner: NodeId,
+        expression: ExprId,
+        target: &ValueType,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> Result<ExprId, ContractLoweringError> {
+        let source = self.expression_value_type(expression)?;
+        if source == *target {
+            return Ok(expression);
+        }
+        if matches!(
+            self.fragment_mut()
+                .expressions()
+                .get(expression)
+                .map(|expr| &expr.kind),
+            Some(ContractExprKind::Literal(ContractLiteralValue::Null))
+        ) {
+            let mut target = target.clone();
+            target.nullable = true;
+            return self.add_scoped_expression(
+                owner,
+                target,
+                ContractExprKind::Literal(ContractLiteralValue::Null),
+            );
+        }
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
+        let intermediate =
+            novarocks_functions::builtin::value_conversion::conversion_intermediate_type(
+                &source, target,
+            );
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
+        let intermediate =
+            intermediate.map_err(|error| ContractLoweringError::InvalidFunctionBinding {
+                detail: error.to_string(),
+            })?;
+        let expression = if let Some(intermediate) = intermediate {
+            let argument = novarocks_functions::FunctionArgument::Value {
+                value_type: source.clone(),
+                constant: None,
+            };
+            let binding = self
+                .functions
+                .resolve_value_conversion_binding(&argument, &intermediate);
+            self.control.checkpoint(CompilePhase::Validate, 0)?;
+            let binding =
+                binding.map_err(|error| ContractLoweringError::InvalidFunctionBinding {
+                    detail: error.to_string(),
+                })?;
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "value conversion owner selected a relation result".into(),
+                });
+            };
+            if result != &intermediate
+                || binding.selected.argument_types.as_ref() != [FunctionArgumentType::Value(source)]
+            {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "value conversion binding differs from its source and explicit target"
+                        .into(),
+                });
+            }
+            let kind = ContractExprKind::FunctionCall {
+                function: BoundFunction {
+                    semantic_parameters: Box::default(),
+                    function_id: binding.function_id.clone(),
+                    overload: binding.selected.overload.clone(),
+                    kind: binding.kind,
+                    argument_types: binding.selected.argument_types.clone(),
+                    result_type: result.clone(),
+                    volatility: binding.semantics.volatility,
+                    argument_evaluation: binding.semantics.argument_evaluation,
+                    failure_behavior: binding.semantics.failure_behavior,
+                    intrinsic_row_error: binding.semantics.intrinsic_row_error,
+                },
+                args: Box::from([expression]),
+            };
+            self.add_scoped_expression(owner, result.clone(), kind)?
+        } else {
+            expression
+        };
+        if self.expression_value_type(expression)? == *target {
+            return Ok(expression);
+        }
+        self.add_scoped_expression(
+            owner,
+            target.clone(),
+            ContractExprKind::Cast {
+                expr: expression,
+                target: target.data_type.clone(),
+                decimal_overflow_policy: policy,
+            },
+        )
+    }
+
+    fn common_comparison_value_type(
+        &mut self,
+        left: &ValueType,
+        right: &ValueType,
+    ) -> Result<ValueType, ContractLoweringError> {
+        self.work.step()?;
+        let result = novarocks_type_contract::wider_comparison_value_type(left, right);
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
+        result.map_err(|detail| ContractLoweringError::InvalidFunctionBinding { detail })
+    }
+
     fn cast_expression_to(
         &mut self,
         owner: NodeId,
         expr: ExprId,
-        target: &DataType,
+        target: &ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
         let current = self.expression_value_type(expr)?;
-        if current.data_type == *target {
-            return Ok(expr);
-        }
-        self.add_scoped_expression(
+        let target = ValueType {
+            nullable: current.nullable,
+            ..target.clone()
+        };
+        // This port retains the existing late comparison OutputNull policy.
+        // Request-owned policy freezing is a separate pending semantic gate.
+        self.convert_expression_to(
             owner,
-            ValueType::new(target.clone(), current.nullable),
-            ContractExprKind::Cast {
-                expr,
-                target: target.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
+            expr,
+            &target,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
@@ -7834,20 +7935,20 @@ impl<'a> ContractLoweringVisitor<'a> {
         // its value never will, and refuses only the reverse. So the carrier
         // takes the position's type, widened where the literal is a NULL the
         // position was analyzed not to expect.
-        let carrier = ValueType::new(target.data_type.clone(), target.nullable || source.nullable);
+        let carrier = ValueType {
+            nullable: target.nullable || source.nullable,
+            ..target.clone()
+        };
         if source.data_type == target.data_type {
             return self.add_scoped_expression(owner, carrier, ContractExprKind::Literal(literal));
         }
         let literal_id =
             self.add_scoped_expression(owner, source, ContractExprKind::Literal(literal))?;
-        self.add_scoped_expression(
+        self.convert_expression_to(
             owner,
-            carrier,
-            ContractExprKind::Cast {
-                expr: literal_id,
-                target: target.data_type,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
+            literal_id,
+            &carrier,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 }
@@ -9108,11 +9209,16 @@ fn lower_row_count_assertion(
 /// function signature the value is fed to. What a field admits is untouched:
 /// nullability is a fact about the values, not decoration.
 /// The same, for a write target's own column definition.
-fn column_value_type(column: &novarocks_types::schema::ColumnDef) -> ValueType {
-    ValueType::new(
-        novarocks_types::undecorated_nested_type(&column.data_type),
-        column.nullable,
-    )
+fn column_value_type(
+    column: &novarocks_types::schema::ColumnDef,
+    control: &dyn PureCompileControl,
+) -> Result<ValueType, ContractLoweringError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let declared = column.declared_value_type_observed::<ContractLoweringError>(|| {
+        work.step().map_err(ContractLoweringError::from)
+    })?;
+    work.finish()?;
+    Ok(undecorated(&declared))
 }
 
 /// The widest this fragment may run.
@@ -9137,10 +9243,7 @@ fn fragment_dop_domain(
 }
 
 fn value_type(column: &OutputColumn) -> ValueType {
-    ValueType::new(
-        novarocks_types::undecorated_nested_type(&column.data_type),
-        column.nullable,
-    )
+    undecorated(&column.value_type)
 }
 
 /// The same value type with the provider's decoration off its nested fields.
@@ -9173,10 +9276,7 @@ fn undecorated_argument(argument: &FunctionArgumentType) -> FunctionArgumentType
 
 /// The type a plan states for one expression. See [`value_type`].
 fn expression_type(expression: &TypedExpr) -> ValueType {
-    ValueType::new(
-        novarocks_types::undecorated_nested_type(&expression.data_type),
-        expression.nullable,
-    )
+    undecorated(&expression.value_type)
 }
 
 fn expect_children(plan: &PhysicalPlanNode, expected: usize) -> Result<(), ContractLoweringError> {
@@ -9214,13 +9314,18 @@ fn require_outputs_within_layout(
                 detail: format!("{} is not produced by this operator", output.column_id),
             });
         };
-        if produced.data_type != output.data_type || produced.nullable != output.nullable {
+        if produced.value_type.data_type != output.value_type.data_type
+            || produced.value_type.nullable != output.value_type.nullable
+        {
             return Err(ContractLoweringError::OutputColumnMismatch {
                 node,
                 ordinal,
                 detail: format!(
                     "produced {:?} nullable={}, published {:?} nullable={}",
-                    produced.data_type, produced.nullable, output.data_type, output.nullable
+                    produced.value_type.data_type,
+                    produced.value_type.nullable,
+                    output.value_type.data_type,
+                    output.value_type.nullable
                 ),
             });
         }
@@ -9284,7 +9389,9 @@ fn unstatable_runtime_filters(
             match identity_column_ref(&intent.probe_expr) {
                 Some(_) => probes.push((
                     intent.filter_id,
-                    novarocks_types::undecorated_nested_type(&intent.probe_expr.data_type),
+                    novarocks_types::undecorated_nested_type(
+                        &intent.probe_expr.value_type.data_type,
+                    ),
                 )),
                 None => {
                     unstatable.insert(intent.filter_id);
@@ -9305,10 +9412,12 @@ fn unstatable_runtime_filters(
                             && identity_column_ref(&condition.right).is_some()
                     })
                     .and_then(|condition| {
-                        let left =
-                            novarocks_types::undecorated_nested_type(&condition.left.data_type);
-                        let right =
-                            novarocks_types::undecorated_nested_type(&condition.right.data_type);
+                        let left = novarocks_types::undecorated_nested_type(
+                            &condition.left.value_type.data_type,
+                        );
+                        let right = novarocks_types::undecorated_nested_type(
+                            &condition.right.value_type.data_type,
+                        );
                         (left == right).then_some(left)
                     });
                 match stated {
@@ -9326,7 +9435,9 @@ fn unstatable_runtime_filters(
                 work.step()?;
                 built_types.insert(
                     intent.filter_id,
-                    novarocks_types::undecorated_nested_type(&intent.group_key_expr.data_type),
+                    novarocks_types::undecorated_nested_type(
+                        &intent.group_key_expr.value_type.data_type,
+                    ),
                 );
             }
         }
@@ -9439,8 +9550,8 @@ fn require_published_subsequence(
     for (ordinal, column) in published.iter().enumerate() {
         let found = carried.any(|candidate| {
             candidate.column_id == column.column_id
-                && candidate.data_type == column.data_type
-                && candidate.nullable == column.nullable
+                && candidate.value_type.data_type == column.value_type.data_type
+                && candidate.value_type.nullable == column.value_type.nullable
         });
         if !found {
             return Err(ContractLoweringError::OutputColumnMismatch {
@@ -9448,7 +9559,7 @@ fn require_published_subsequence(
                 ordinal,
                 detail: format!(
                     "published column {} {:?} nullable={} is not carried in that order",
-                    column.column_id, column.data_type, column.nullable
+                    column.column_id, column.value_type.data_type, column.value_type.nullable
                 ),
             });
         }
@@ -9470,8 +9581,8 @@ fn require_output_shape(
     }
     for (ordinal, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         if actual.column_id != expected.column_id
-            || actual.data_type != expected.data_type
-            || actual.nullable != expected.nullable
+            || actual.value_type.data_type != expected.value_type.data_type
+            || actual.value_type.nullable != expected.value_type.nullable
         {
             return Err(ContractLoweringError::OutputColumnMismatch {
                 node,
@@ -9479,11 +9590,11 @@ fn require_output_shape(
                 detail: format!(
                     "expected {} {:?} nullable={}, got {} {:?} nullable={}",
                     expected.column_id,
-                    expected.data_type,
-                    expected.nullable,
+                    expected.value_type.data_type,
+                    expected.value_type.nullable,
                     actual.column_id,
-                    actual.data_type,
-                    actual.nullable
+                    actual.value_type.data_type,
+                    actual.value_type.nullable
                 ),
             });
         }
@@ -9547,7 +9658,10 @@ fn lower_literal(
         // expression rather than the annotation.
         LiteralValue::Null => Ok((
             ContractLiteralValue::Null,
-            ValueType::new(target.data_type.clone(), true),
+            ValueType {
+                nullable: true,
+                ..target.clone()
+            },
         )),
         LiteralValue::Bool(value) => Ok((
             ContractLiteralValue::Boolean(*value),
@@ -9582,17 +9696,22 @@ fn lower_literal(
             ValueType::new(DataType::Int64, false),
         )),
         LiteralValue::LargeInt(value)
-            if novarocks_type_contract::is_largeint_data_type(&target.data_type) =>
+            if target.logical_type == novarocks_type_contract::ValueLogicalType::LargeInt
+                && novarocks_type_contract::is_largeint_data_type(&target.data_type) =>
         {
             Ok((
                 ContractLiteralValue::LargeInt(*value),
-                ValueType::new(target.data_type.clone(), false),
+                ValueType {
+                    data_type: target.data_type.clone(),
+                    nullable: false,
+                    logical_type: novarocks_type_contract::ValueLogicalType::LargeInt,
+                },
             ))
         }
         LiteralValue::LargeInt(_) => Err(ContractLoweringError::InvalidLiteral {
             kind: "LargeInt",
             detail: format!(
-                "requires FixedSizeBinary({}), got {:?}",
+                "requires an authored LARGEINT FixedSizeBinary({}), got {:?}",
                 novarocks_type_contract::LARGEINT_BYTE_WIDTH,
                 target.data_type,
             ),
@@ -10254,6 +10373,26 @@ impl From<CompileControlError> for ContractLoweringError {
     }
 }
 
+impl From<novarocks_type_contract::ValueTypeError> for ContractLoweringError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        match error {
+            novarocks_type_contract::ValueTypeError::TooDeep
+            | novarocks_type_contract::ValueTypeError::TooManyNodes => {
+                Self::Control(CompileControlError::ResourceExhausted)
+            }
+            error => invalid_write(error.to_string()),
+        }
+    }
+}
+impl From<novarocks_types::ColumnValueTypeError> for ContractLoweringError {
+    fn from(error: novarocks_types::ColumnValueTypeError) -> Self {
+        match error {
+            novarocks_types::ColumnValueTypeError::Type(error) => Self::from(error),
+            error => invalid_write(error.to_string()),
+        }
+    }
+}
+
 impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
     fn from(error: ContractLoweringError) -> Self {
         match error {
@@ -10382,6 +10521,7 @@ mod tests {
                 &source,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &control,
             ));
             assert_eq!(error, cause);
@@ -10417,6 +10557,7 @@ mod tests {
                     &source,
                     version(),
                     dop(),
+                    crate::functions::builtin_sql_function_catalog(),
                     &control
                 )),
                 cause
@@ -10448,6 +10589,7 @@ mod tests {
                 &source,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &control
             )),
             CompileControlError::Cancelled
@@ -10474,7 +10616,14 @@ mod tests {
             vec![column(1, "k", DataType::Int64, false)],
             vec![vec![literal_int(7)]],
         );
-        let builder = lower_final_physical_plan(&source, version(), dop(), &control).unwrap();
+        let builder = lower_final_physical_plan(
+            &source,
+            version(),
+            dop(),
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap();
         drop(control);
         drop(observation);
         assert!(weak.upgrade().is_none());
@@ -10638,8 +10787,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -10647,40 +10796,40 @@ mod tests {
     fn literal_int(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn literal_int32(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
     fn literal_float(value: f64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Float(value)),
-            data_type: DataType::Float64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         }
     }
 
     fn literal_bool(value: bool) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(value)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
     fn literal_largeint(value: i128) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::LargeInt(value)),
-            data_type: DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH),
+                false,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
         }
     }
 
@@ -10691,8 +10840,7 @@ mod tests {
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         }
     }
 
@@ -10768,8 +10916,7 @@ mod tests {
                 binding,
                 volatility,
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
@@ -10900,6 +11047,7 @@ mod tests {
             plan,
             version(),
             dop(),
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )?
         .finish()?)
@@ -10939,6 +11087,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets,
             },
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -10995,6 +11144,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11072,6 +11222,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11157,6 +11308,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets,
             },
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11248,6 +11400,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11328,8 +11481,7 @@ mod tests {
                 right: Box::new(literal_int(0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let filter = PhysicalPlanNode {
             kind: PhysicalPlanKind::Filter(PlanFilterNode { predicate }),
@@ -11356,8 +11508,10 @@ mod tests {
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "next".to_string(),
                         output_column_id: computed.column_id,
@@ -11476,15 +11630,15 @@ mod tests {
             name: "events".to_string(),
             columns: vec![novarocks_types::schema::ColumnDef {
                 name: payload.name.clone(),
-                data_type: payload.data_type.clone(),
-                nullable: payload.nullable,
+                data_type: payload.value_type.data_type.clone(),
+                nullable: payload.value_type.nullable,
                 write_default: None,
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![novarocks_types::schema::ColumnDef {
                 name: row_id.name.clone(),
-                data_type: row_id.data_type.clone(),
-                nullable: row_id.nullable,
+                data_type: row_id.value_type.data_type.clone(),
+                nullable: row_id.value_type.nullable,
                 write_default: None,
                 logical_type: None,
             }],
@@ -11500,8 +11654,7 @@ mod tests {
         };
         let string_literal = |value: &str| TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
         let binding_args = [
             column_ref(&payload),
@@ -11656,6 +11809,7 @@ mod tests {
             version(),
             dop(),
             reads,
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11715,6 +11869,7 @@ mod tests {
             version(),
             dop(),
             bucket_reads,
+            crate::functions::builtin_sql_function_catalog(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11779,7 +11934,14 @@ mod tests {
 
         let control = crate::compiler::SqlCompileControl::unbounded();
 
-        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
+        let mut visitor = ContractLoweringVisitor::new(
+            version(),
+            dop(),
+            None,
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap();
         let sql_exchange = visitor.allocate_hash_scheme().unwrap();
         let provider = visitor.lower_provider_hash_scheme(&read, &scheme).unwrap();
         assert_ne!(provider.space, sql_exchange.space);
@@ -11838,7 +12000,19 @@ mod tests {
         for expression in rows.iter().map(|row| row[0]) {
             let expression = fragment.expressions().get(expression).unwrap();
             assert_eq!(expression.ty, ValueType::new(DataType::Float64, true));
-            assert!(matches!(expression.kind, ContractExprKind::Case { .. }));
+            let ContractExprKind::Cast {
+                expr: source,
+                target,
+                ..
+            } = &expression.kind
+            else {
+                panic!("common type assignment must retain an explicit cast");
+            };
+            assert_eq!(target, &DataType::Float64);
+            let source = fragment.expressions().get(*source).unwrap();
+            assert!(!source.ty.nullable);
+            assert_eq!(source.ty.logical_type, expression.ty.logical_type);
+            assert!(matches!(source.kind, ContractExprKind::Literal(_)));
         }
     }
 
@@ -11908,8 +12082,10 @@ mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             children: vec![repeated_project],
@@ -11953,8 +12129,10 @@ mod tests {
                 literal_int(7),
                 TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Null),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 },
             ]],
         );
@@ -11970,8 +12148,10 @@ mod tests {
                 input_value_column_id: value_input.column_id,
                 constants: vec![crate::analysis::UnpivotConstant::Scalar(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::String("metric".to_string())),
-                    data_type: DataType::Utf8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Utf8,
+                        false,
+                    ),
                 })],
             }],
             vec![
@@ -12035,7 +12215,7 @@ mod tests {
         let mut output_columns = projected_columns;
         for column in &mut output_columns {
             if keys.iter().any(|key| key.column_id == column.column_id) {
-                column.nullable = true;
+                column.value_type.nullable = true;
             }
         }
         output_columns.push(grouping.clone());
@@ -12392,6 +12572,7 @@ mod tests {
                 &unpivot,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidUnpivot { .. })
@@ -12420,6 +12601,7 @@ mod tests {
                 &repeat,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidRepeat { .. })
@@ -12452,6 +12634,7 @@ mod tests {
                 &table_function,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidTableFunction { .. })
@@ -12487,6 +12670,7 @@ mod tests {
                 &window,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidWindow { .. })
@@ -12512,6 +12696,7 @@ mod tests {
                 &unsupported,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .is_err()
@@ -12536,6 +12721,7 @@ mod tests {
                 &hash_join,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -12565,6 +12751,7 @@ mod tests {
                 &hash_join,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -12671,7 +12858,7 @@ mod tests {
                 crate::common::JoinKind::Inner | crate::common::JoinKind::LeftOuter
             ) {
                 let mut visible_right = right.clone();
-                visible_right.nullable = kind == crate::common::JoinKind::LeftOuter;
+                visible_right.value_type.nullable = kind == crate::common::JoinKind::LeftOuter;
                 output.push(visible_right);
             }
             let plan = hash_join(
@@ -12739,10 +12926,10 @@ mod tests {
             let left = column(1, "left_key", DataType::Int64, false);
             let right = column(2, "right_key", DataType::Int32, false);
             let mut output_left = left.clone();
-            output_left.nullable = true;
+            output_left.value_type.nullable = true;
             let mut output_right = right.clone();
             if kind == crate::common::JoinKind::FullOuter {
-                output_right.nullable = true;
+                output_right.value_type.nullable = true;
             }
             let mut hash_join = hash_join(
                 kind,
@@ -12763,8 +12950,7 @@ mod tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             };
 
             let final_plan = finish_for_test(&hash_join).expect("singleton outer join must finish");
@@ -12794,7 +12980,7 @@ mod tests {
         let left = column(1, "left_key", DataType::Int64, false);
         let right = column(2, "right_key", DataType::Int64, false);
         let mut nullable_left = left.clone();
-        nullable_left.nullable = true;
+        nullable_left.value_type.nullable = true;
         let mut hash_join = hash_join(
             crate::common::JoinKind::RightOuter,
             PhysicalHashJoinBuildSide::Right,
@@ -13193,6 +13379,7 @@ mod tests {
                 &partition_sort,
                 version(),
                 dop(),
+                crate::functions::builtin_sql_function_catalog(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -13333,8 +13520,14 @@ mod tests {
         };
         let root_distribution = |plan: PhysicalPlanNode| {
             let control = crate::compiler::SqlCompileControl::unbounded();
-            let mut visitor =
-                ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
+            let mut visitor = ContractLoweringVisitor::new(
+                version(),
+                dop(),
+                None,
+                crate::functions::builtin_sql_function_catalog(),
+                &control,
+            )
+            .unwrap();
             visitor
                 .lower_node(&plan)
                 .expect("tested operator must lower")
@@ -13389,7 +13582,14 @@ mod tests {
             },
         );
         let control = crate::compiler::SqlCompileControl::unbounded();
-        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
+        let mut visitor = ContractLoweringVisitor::new(
+            version(),
+            dop(),
+            None,
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap();
         let hash_project = visitor.lower_node(&project_first(hash_child)).unwrap();
         assert_eq!(
             hash_project.properties.distribution,
@@ -13417,7 +13617,14 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let control = crate::compiler::SqlCompileControl::unbounded();
-        let mut visitor = ContractLoweringVisitor::new(version(), dop(), None, &control).unwrap();
+        let mut visitor = ContractLoweringVisitor::new(
+            version(),
+            dop(),
+            None,
+            crate::functions::builtin_sql_function_catalog(),
+            &control,
+        )
+        .unwrap();
         let ordered_project = visitor.lower_node(&project_first(sort)).unwrap();
         assert_eq!(ordered_project.properties.ordering.len(), 1);
         assert_eq!(
@@ -13551,8 +13758,10 @@ mod tests {
                     vec![right],
                     vec![vec![TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Null),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
                     }]],
                 ),
             ],
@@ -13605,8 +13814,10 @@ mod tests {
                 vec![input],
                 vec![vec![TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Null),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 }]],
             )],
             output_columns: vec![output],
@@ -13662,8 +13873,10 @@ mod tests {
                 vec![input],
                 vec![vec![TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Null),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 }]],
             )],
             output_columns: vec![state.clone()],
@@ -13827,8 +14040,10 @@ mod tests {
                     literal_int(3),
                     TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::String("payload".into())),
-                        data_type: DataType::Utf8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            false,
+                        ),
                     },
                 ]],
             ),
@@ -14075,12 +14290,13 @@ mod tests {
 
     #[test]
     fn largeint_literals_keep_their_semantic_contract_carrier() {
-        let output = column(
+        let mut output = column(
             1,
             "large_number",
             DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH),
             false,
         );
+        output.value_type.logical_type = novarocks_type_contract::ValueLogicalType::LargeInt;
         let final_plan = finish_for_test(&values(
             vec![output],
             vec![vec![literal_largeint(i128::MIN)]],
@@ -14091,10 +14307,139 @@ mod tests {
         let NodeKind::Values { rows } = &root.kind else {
             panic!("expected Values root");
         };
+        let expression = fragment.expressions().get(rows[0][0]).unwrap();
+        assert_eq!(
+            expression.ty.logical_type,
+            novarocks_type_contract::ValueLogicalType::LargeInt
+        );
         assert!(matches!(
-            fragment.expressions().get(rows[0][0]).unwrap().kind,
+            expression.kind,
             ContractExprKind::Literal(ContractLiteralValue::LargeInt(i128::MIN))
         ));
+    }
+    #[test]
+    fn late_comparison_ports_preserve_largeint_and_materialize_signed_assignment() {
+        let large = literal_largeint(i128::MAX);
+        let signed = literal_int(7);
+        let kinds = [
+            ExprKind::BinaryOp {
+                left: Box::new(large.clone()),
+                op: BinOp::Eq,
+                right: Box::new(signed.clone()),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            ExprKind::InList {
+                expr: Box::new(large.clone()),
+                list: vec![signed.clone()],
+                negated: false,
+            },
+            ExprKind::Between {
+                expr: Box::new(large.clone()),
+                low: Box::new(signed.clone()),
+                high: Box::new(large.clone()),
+                negated: false,
+            },
+            ExprKind::Case {
+                operand: Some(Box::new(large)),
+                when_then: vec![(
+                    signed,
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                        value_type: ValueType::new(DataType::Boolean, false),
+                    },
+                )],
+                else_expr: Some(Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Bool(false)),
+                    value_type: ValueType::new(DataType::Boolean, false),
+                })),
+            },
+        ];
+        for kind in kinds {
+            let expression = TypedExpr {
+                kind,
+                value_type: ValueType::new(DataType::Boolean, false),
+            };
+            let final_plan = finish_for_test(&values(
+                vec![column(1, "answer", DataType::Boolean, false)],
+                vec![vec![expression]],
+            ))
+            .unwrap();
+            let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let mut count = 0;
+            for (_, expression) in fragment.expressions().iter() {
+                if let ContractExprKind::FunctionCall { function, args } = &expression.kind {
+                    assert_eq!(
+                        function.function_id.as_str(),
+                        "builtin.scalar/value_domain_conversion/v1"
+                    );
+                    assert!(
+                        function
+                            .overload
+                            .as_str()
+                            .ends_with("signed_to_largeint/v1")
+                    );
+                    assert_eq!(
+                        expression.ty.logical_type,
+                        novarocks_type_contract::ValueLogicalType::LargeInt
+                    );
+                    assert_eq!(
+                        fragment.expressions().get(args[0]).unwrap().ty,
+                        ValueType::new(DataType::Int64, false)
+                    );
+                    count += 1;
+                }
+            }
+            assert_eq!(
+                count, 1,
+                "each exact signed comparison operand needs its real conversion"
+            );
+        }
+    }
+
+    #[test]
+    fn largeint_literal_identity_cannot_be_authored_as_opaque_fixed_binary() {
+        assert!(
+            lower_literal(
+                &LiteralValue::LargeInt(7),
+                &ValueType::new(DataType::FixedSizeBinary(16), false)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_literal_assignment_to_largeint_retains_exact_conversion_binding() {
+        let mut output = column(1, "large_number", DataType::FixedSizeBinary(16), false);
+        output.value_type.logical_type = novarocks_type_contract::ValueLogicalType::LargeInt;
+        let final_plan =
+            finish_for_test(&values(vec![output], vec![vec![literal_int(7)]])).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::Values { rows } = &root.kind else {
+            panic!("expected Values root")
+        };
+        let expression = fragment.expressions().get(rows[0][0]).unwrap();
+        let ContractExprKind::FunctionCall { function, args } = &expression.kind else {
+            panic!("signed assignment must have a real conversion owner");
+        };
+        assert_eq!(
+            function.function_id.as_str(),
+            "builtin.scalar/value_domain_conversion/v1"
+        );
+        assert!(
+            function
+                .overload
+                .as_str()
+                .ends_with("signed_to_largeint/v1")
+        );
+        assert_eq!(
+            expression.ty.logical_type,
+            novarocks_type_contract::ValueLogicalType::LargeInt
+        );
+        assert_eq!(
+            fragment.expressions().get(args[0]).unwrap().ty,
+            ValueType::new(DataType::Int64, false)
+        );
     }
 }
 

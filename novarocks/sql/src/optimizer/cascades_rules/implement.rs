@@ -163,12 +163,14 @@ fn eq_condition_to_expr(arena: &mut ScalarArena, eq: ScalarHashJoinEqCondition) 
             right: eq.right,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        DataType::Boolean,
-        if eq.null_safe {
-            false
-        } else {
-            arena.nullable(eq.left) || arena.nullable(eq.right)
-        },
+        novarocks_type_contract::FunctionValueType::new(
+            DataType::Boolean,
+            if eq.null_safe {
+                false
+            } else {
+                arena.nullable(eq.left) || arena.nullable(eq.right)
+            },
+        ),
     )
 }
 
@@ -185,8 +187,7 @@ fn append_residual_condition(
                 right: residual,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         ),
         None => residual,
     });
@@ -1362,8 +1363,8 @@ mod set_op_tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -1441,8 +1442,7 @@ mod eq_pair_tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -1559,8 +1559,7 @@ mod join_demotion_tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
@@ -1575,8 +1574,8 @@ mod join_demotion_tests {
             .map(|name| OutputColumn {
                 column_id: test_col_id(name),
                 name: (*name).into(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             })
             .collect();
@@ -1617,8 +1616,7 @@ mod join_demotion_tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -1810,8 +1808,8 @@ mod join_demotion_tests {
         assert_eq!(phys.eq_conditions.len(), 1);
         let left_key = mat(&memo, phys.eq_conditions[0].left);
         let right_key = mat(&memo, phys.eq_conditions[0].right);
-        assert_eq!(left_key.data_type, DataType::Int64);
-        assert_eq!(right_key.data_type, DataType::Int32);
+        assert_eq!(left_key.value_type.data_type, DataType::Int64);
+        assert_eq!(right_key.value_type.data_type, DataType::Int32);
         assert!(
             matches!(left_key.kind, ExprKind::ColumnRef { .. }),
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
@@ -1963,8 +1961,8 @@ mod window_split_tests {
         OutputColumn {
             column_id: window_output_id(name),
             name: name.into(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1976,8 +1974,7 @@ mod window_split_tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -2135,8 +2132,7 @@ mod two_phase_agg_tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -2144,8 +2140,8 @@ mod two_phase_agg_tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.into(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -2337,15 +2333,21 @@ mod two_phase_agg_tests {
                     OutputColumn {
                         column_id: test_col_id("city"),
                         name: "city".into(),
-                        data_type: DataType::Int32,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(6),
                         name: "count(distinct id)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],

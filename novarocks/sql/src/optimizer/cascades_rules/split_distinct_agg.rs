@@ -25,8 +25,6 @@
 //!
 //! Mirrors StarRocks's `SplitAggregateRule` / `AggType.java` convention.
 
-use arrow::datatypes::DataType;
-
 use crate::column_id::ColumnId;
 use crate::common::OutputColumn;
 use crate::optimizer::memo::{MExpr, Memo};
@@ -201,8 +199,8 @@ fn group_output_column_from_expr(
     OutputColumn {
         column_id,
         name,
-        data_type: arena.data_type(expr).clone(),
-        nullable: arena.nullable(expr),
+        value_type: arena.value_type(expr).clone(),
+
         is_internal: false,
     }
 }
@@ -251,16 +249,20 @@ fn aggregate_output_columns(
                 // built, not the result the statement asked for. Reading the
                 // parent's type for it would name the type of a value this
                 // phase never produces.
-                data_type: match publishes {
-                    PhaseOutput::State => crate::functions::aggregate_selection(&call.resolved)
-                        .intermediate_type
-                        .data_type
-                        .clone(),
-                    PhaseOutput::Result => source_output
-                        .map(|output| output.data_type.clone())
-                        .unwrap_or(DataType::Null),
+                value_type: {
+                    let mut value_type = match publishes {
+                        PhaseOutput::State => crate::functions::aggregate_selection(&call.resolved)
+                            .intermediate_type
+                            .clone(),
+                        PhaseOutput::Result => {
+                            crate::functions::aggregate_result_type(&call.resolved).clone()
+                        }
+                    };
+                    // Widen only the phase-output root, preserving its full domain.
+                    value_type.nullable = true;
+                    value_type
                 },
-                nullable: true,
+
                 is_internal: true,
             }
         })
@@ -347,8 +349,8 @@ fn apply_three_phase(
             OutputColumn {
                 column_id,
                 name,
-                data_type: memo.scalars.data_type(*expr).clone(),
-                nullable: memo.scalars.nullable(*expr),
+                value_type: memo.scalars.value_type(*expr).clone(),
+
                 is_internal: layout_column
                     .map(|output| output.is_internal)
                     .unwrap_or(false),
@@ -683,8 +685,7 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -843,8 +844,8 @@ mod tests {
             outputs.push(OutputColumn {
                 column_id,
                 name,
-                data_type: expr.data_type.clone(),
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 is_internal: false,
             });
         }
@@ -856,8 +857,11 @@ mod tests {
                     call.output_column_id
                 },
                 name: format!("agg_{idx}"),
-                data_type: call.result_type.clone(),
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    call.result_type.clone(),
+                    true,
+                ),
+
                 is_internal: false,
             });
         }
@@ -868,8 +872,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1161,22 +1165,31 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "g".into(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1429,22 +1442,31 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::new_for_test(9),
                         name: "g_alias".into(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(7),
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(8),
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1535,6 +1557,146 @@ mod tests {
     }
 
     #[test]
+    fn four_phase_preserves_actual_selected_opaque_and_largeint_states() {
+        use novarocks_functions::FunctionArgument;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        for (name, source) in [
+            (
+                "min",
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
+            ),
+            (
+                "sum",
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    false,
+                    ValueLogicalType::LargeInt,
+                )
+                .unwrap(),
+            ),
+        ] {
+            let arguments = [FunctionArgument::Value {
+                value_type: source.clone(),
+                constant: None,
+            }];
+            let resolved: crate::binding::SqlFunctionBinding =
+                crate::functions::builtin_sql_function_catalog()
+                    .resolve_aggregate_binding(name, 1, &arguments)
+                    .unwrap()
+                    .into();
+            let mut result = crate::functions::aggregate_result_type(&resolved).clone();
+            result.nullable = true;
+            let mut state = crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .clone();
+            state.nullable = true;
+            let input = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: test_col_id("a"),
+                    qualifier: None,
+                    column: "a".into(),
+                },
+                value_type: source.clone(),
+            };
+            let call = AggregateCall {
+                name: name.into(),
+                args: vec![input],
+                distinct: false,
+                result_type: result.data_type.clone(),
+                order_by: vec![],
+                output_column_id: ColumnId(202),
+                resolved: resolved.clone(),
+            };
+            let count = count_distinct("x");
+            let count_result = crate::functions::aggregate_result_type(&count.resolved).clone();
+            let columns = vec![
+                OutputColumn {
+                    column_id: count.output_column_id,
+                    name: "count(distinct x)".into(),
+                    value_type: count_result,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId(202),
+                    name: format!("{name}(a)"),
+                    value_type: result.clone(),
+                    is_internal: false,
+                },
+            ];
+            let mut memo = Memo::new();
+            let id = memo.next_expr_id();
+            let child = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
+                    rows: vec![],
+                    columns: vec![
+                        output_column(1, "x"),
+                        OutputColumn {
+                            column_id: test_col_id("a"),
+                            name: "a".into(),
+                            value_type: source,
+                            is_internal: false,
+                        },
+                    ],
+                }),
+                children: vec![],
+            });
+            let aggregate = single_agg(&mut memo, vec![], vec![count, call], columns);
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalAggregate(aggregate.clone()),
+                children: vec![child],
+            };
+            let alternatives = SplitDistinctAgg.apply(&expr, &mut memo);
+            assert_eq!(alternatives.len(), 1);
+            let Operator::PhysicalHashAggregate(global) = &alternatives[0].op else {
+                panic!("GLOBAL");
+            };
+            assert_eq!(global.output_layout.aggregate_columns[1].value_type, result);
+            assert_eq!(global.output_columns[1].value_type, result);
+            let mut group = alternatives[0].children[0];
+            for (mode, ordinal) in [
+                (AggMode::DistinctLocal, 1),
+                (AggMode::DistinctGlobal, 0),
+                (AggMode::Local, 0),
+            ] {
+                let expression = &memo.groups[group].physical_exprs[0];
+                let Operator::PhysicalHashAggregate(phase) = &expression.op else {
+                    panic!("aggregate phase");
+                };
+                assert_eq!(phase.mode, mode);
+                assert_eq!(
+                    phase.output_layout.aggregate_columns[ordinal].value_type,
+                    state
+                );
+                assert!(std::ptr::eq(
+                    phase.aggregates[ordinal].resolved.resolved(),
+                    resolved.resolved()
+                ));
+                group = expression.children[0];
+            }
+            // Even when the public result is pruned, the selected result has
+            // an exact domain; absence of a layout name never becomes Null.
+            let mut pruned = aggregate.clone();
+            pruned.output_layout.aggregate_columns.clear();
+            let projected = aggregate_output_columns(
+                &memo.scalars,
+                &pruned,
+                &aggregate.aggregates[1..],
+                &[1],
+                PhaseOutput::Result,
+            );
+            assert_eq!(projected[0].value_type, result);
+        }
+    }
+
+    #[test]
     fn four_phase_chain_when_scalar() {
         let mut memo = Memo::new();
         let sg = scan_group(&mut memo);
@@ -1549,15 +1711,21 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1735,22 +1903,31 @@ mod tests {
                     OutputColumn {
                         column_id: sum_output,
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: count_output,
                         name: "count(b)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: distinct_output,
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1845,8 +2022,11 @@ mod tests {
                 vec![OutputColumn {
                     column_id: ColumnId::new_for_test(8),
                     name: "count(distinct x)".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
             )),
@@ -1942,22 +2122,31 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::new_for_test(8),
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(9),
                         name: "sum(a)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(10),
                         name: "count(distinct x)".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],

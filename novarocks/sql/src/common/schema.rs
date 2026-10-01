@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
-
 use crate::column_id::ColumnId;
 
 /// Query-local identifier of one already-sealed common-table-expression.
@@ -29,7 +27,6 @@ pub type CteId = u32;
 pub struct OutputColumn {
     pub column_id: ColumnId,
     pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
+    pub value_type: novarocks_type_contract::FunctionValueType,
     pub is_internal: bool,
 }

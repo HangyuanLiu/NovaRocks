@@ -24,3 +24,5 @@ pub mod resolver;
 pub mod signature;
 
 pub mod catalogue;
+
+pub mod value_conversion;

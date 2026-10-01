@@ -248,8 +248,8 @@ pub(crate) fn normalize_imv_rewrite_root_project(plan: LogicalPlanNode) -> Logic
             Some(OutputColumn {
                 column_id: *column_id,
                 name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+                value_type: item.expr.value_type.clone(),
+
                 is_internal: false,
             })
         })
@@ -669,8 +669,7 @@ pub(crate) mod tests {
                 qualifier: None,
                 column: column.name.clone(),
             },
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
+            value_type: column.value_type.clone(),
         }
     }
 
@@ -699,8 +698,8 @@ pub(crate) mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -925,8 +924,11 @@ pub(crate) mod tests {
                 columns: vec![OutputColumn {
                     column_id: ColumnId(column_id),
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 predicates: Vec::new(),
@@ -950,8 +952,11 @@ pub(crate) mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(1),
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -982,14 +987,18 @@ pub(crate) mod tests {
                             op: BinOp::Ge,
                             right: Box::new(TypedExpr {
                                 kind: ExprKind::Literal(LiteralValue::Int(0)),
-                                data_type: DataType::Int32,
-                                nullable: false,
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Int32,
+                                    false,
+                                ),
                             }),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
                     },
                 }),
                 vec![iceberg_scan_plan_with_column_id(first_id)],
@@ -1010,8 +1019,7 @@ pub(crate) mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
 
@@ -1382,15 +1390,21 @@ pub(crate) mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(2),
                         name: "v".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1422,15 +1436,21 @@ pub(crate) mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(3),
                         name: "s".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1482,15 +1502,21 @@ pub(crate) mod tests {
                     OutputColumn {
                         column_id: ColumnId(first_id),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(first_id + 1),
                         name: "v".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1533,8 +1559,7 @@ pub(crate) mod tests {
                 qualifier: None,
                 column: column.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         }
     }
 
@@ -1565,15 +1590,21 @@ pub(crate) mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(12),
                         name: "s".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -1590,8 +1621,10 @@ pub(crate) mod tests {
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
                     }),
                 }),
                 vec![left, right],
@@ -1615,8 +1648,10 @@ pub(crate) mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -1664,8 +1699,10 @@ pub(crate) mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -1679,14 +1716,18 @@ pub(crate) mod tests {
                         op: BinOp::Gt,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![join],
@@ -1712,14 +1753,18 @@ pub(crate) mod tests {
                         op: BinOp::Gt,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![left_scan],
@@ -1738,8 +1783,10 @@ pub(crate) mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -2300,8 +2347,11 @@ pub(crate) mod tests {
             .iter()
             .find(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op"))
             .expect("action column must be present");
-        assert_eq!(action.data_type, arrow::datatypes::DataType::Int8);
-        assert!(!action.nullable);
+        assert_eq!(
+            action.value_type.data_type,
+            arrow::datatypes::DataType::Int8
+        );
+        assert!(!action.value_type.nullable);
     }
 
     #[test]
@@ -2319,8 +2369,10 @@ pub(crate) mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: ColumnId(1),
@@ -2443,8 +2495,10 @@ pub(crate) mod tests {
                             kind: ExprKind::Literal(LiteralValue::String(
                                 "not-target-file".to_string(),
                             )),
-                            data_type: DataType::Utf8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Utf8,
+                                false,
+                            ),
                         },
                         output_name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
                         output_column_id: ColumnId(2),
@@ -2452,8 +2506,10 @@ pub(crate) mod tests {
                     ProjectItem {
                         expr: TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(7)),
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: crate::common::ICEBERG_ROW_POS_COL.to_string(),
                         output_column_id: ColumnId(3),

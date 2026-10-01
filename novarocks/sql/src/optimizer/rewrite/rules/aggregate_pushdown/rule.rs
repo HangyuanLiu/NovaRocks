@@ -144,8 +144,11 @@ mod tests {
                 .map(|n| OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: (*n).into(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -250,8 +253,7 @@ mod tests {
                     qualifier: None,
                     column: name.into(),
                 },
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             }
         }
 
@@ -280,15 +282,15 @@ mod tests {
             vec![OutputColumn {
                 column_id: gb_output_id,
                 name: "k".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
             vec![OutputColumn {
                 column_id: sum_spec.output_column_id,
                 name: "sum".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         );
@@ -300,8 +302,7 @@ mod tests {
                 right: Box::new(col_typed("k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let cond_id = intern_typed(&mut arena, &cond_typed);
 

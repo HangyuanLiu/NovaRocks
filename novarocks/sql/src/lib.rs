@@ -59,8 +59,8 @@ mod common_tests {
         let output = OutputColumn {
             column_id: ColumnId::new_for_test(1),
             name: "internal_col".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: true,
         };
         assert_eq!(output.column_id, ColumnId::new_for_test(1));
@@ -70,8 +70,7 @@ mod common_tests {
         let lambda = LambdaParam {
             name: "x".to_string(),
             slot_id: 3,
-            data_type: DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         };
         assert_eq!(lambda.slot_id, 3);
 

@@ -20,6 +20,9 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+use novarocks_type_contract::{
+    arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,
+};
 
 use crate::{
     AggregatePhase, ExprId, ExprKind, Fragment, FunctionKind, NodeId, NodeKind, ValueOrigin,
@@ -257,9 +260,15 @@ pub(crate) fn validate_expression(
                 // answer, and a plan's nullability widens on the way out. It
                 // may not admit less.
                 let widens = expression.ty.nullable || !input.ty.nullable;
+                // Strict unary NULL preserves the actual nullable NULL domain
+                // and its child evaluation; it is not a numeric coercion.
+                let strict_null = input.ty.logical_type
+                    == novarocks_type_contract::ValueLogicalType::Physical
+                    && input.ty.data_type == DataType::Null
+                    && input.ty.nullable;
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
-                        is_numeric_value(&input.ty)
+                        (is_numeric_value_type(&input.ty) || strict_null)
                             && input.ty.same_value_domain(&expression.ty)
                             && widens
                     }
@@ -269,7 +278,7 @@ pub(crate) fn validate_expression(
                             && widens
                     }
                     crate::UnaryOperator::BitwiseNot => {
-                        is_integer_value(&input.ty)
+                        (is_integer_value_type(&input.ty) || strict_null)
                             && input.ty.same_value_domain(&expression.ty)
                             && widens
                     }
@@ -563,7 +572,8 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64,
         crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(&ty.data_type) && is_numeric_value(ty)
+            novarocks_type_contract::is_largeint_data_type(&ty.data_type)
+                && is_numeric_value_type(ty)
         }
         crate::LiteralValue::Decimal128(_) => {
             matches!(ty.data_type, DataType::Decimal128(_, _))
@@ -725,15 +735,6 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::Multiply
         | crate::BinaryOperator::Divide
         | crate::BinaryOperator::Modulo => {
-            let expected_root =
-                if novarocks_type_contract::is_largeint_data_type(&output.ty.data_type)
-                    && [left.ty.logical_type, right.ty.logical_type]
-                        .contains(&novarocks_type_contract::ValueLogicalType::LargeInt)
-                {
-                    novarocks_type_contract::ValueLogicalType::LargeInt
-                } else {
-                    novarocks_type_contract::ValueLogicalType::Physical
-                };
             let operation = match op {
                 crate::BinaryOperator::Add => novarocks_type_contract::ArithmeticOperator::Add,
                 crate::BinaryOperator::Subtract => {
@@ -750,18 +751,11 @@ pub(crate) fn validate_binary_types(
                 }
                 _ => unreachable!(),
             };
-            output.ty.logical_type == expected_root
-                && is_numeric_value(&left.ty)
-                && is_numeric_value(&right.ty)
-                && is_numeric_value(&output.ty)
-                && novarocks_type_contract::arithmetic_result_type_with_op(
-                    &left.ty.data_type,
-                    &right.ty.data_type,
-                    operation,
-                )
-                .as_ref()
-                .is_some_and(|expected| expected == &output.ty.data_type)
-                && nullability_widens(output.ty.nullable)
+            arithmetic_result_value_type_with_op(&left.ty, &right.ty, operation).is_some_and(
+                |expected| {
+                    output.ty.same_value_domain(&expected) && nullability_widens(output.ty.nullable)
+                },
+            )
         }
         crate::BinaryOperator::Eq
         | crate::BinaryOperator::NotEq
@@ -780,7 +774,7 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::BitOr
         | crate::BinaryOperator::BitXor => {
             same_inputs
-                && is_integer_value(&left.ty)
+                && is_integer_value_type(&left.ty)
                 && output.ty.same_value_domain(&left.ty)
                 && nullability_widens(output.ty.nullable)
         }
@@ -1026,54 +1020,6 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
         ty,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     )
-}
-
-pub(crate) fn is_integer(ty: &DataType) -> bool {
-    // LARGEINT is an integer that happens to need sixteen bytes; it is stored
-    // as fixed-size binary, and a rule that reads the storage instead of the
-    // type refuses `-x` and `~x` on it.
-    novarocks_type_contract::is_largeint_data_type(ty)
-        || matches!(
-            ty,
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-        )
-}
-
-pub(crate) fn is_numeric(ty: &DataType) -> bool {
-    is_integer(ty)
-        || matches!(
-            ty,
-            DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Decimal32(_, _)
-                | DataType::Decimal64(_, _)
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-        )
-}
-
-fn is_integer_value(ty: &ValueType) -> bool {
-    matches!(
-        ty.logical_type,
-        novarocks_type_contract::ValueLogicalType::Physical
-            | novarocks_type_contract::ValueLogicalType::LargeInt
-    ) && is_integer(&ty.data_type)
-}
-
-fn is_numeric_value(ty: &ValueType) -> bool {
-    matches!(
-        ty.logical_type,
-        novarocks_type_contract::ValueLogicalType::Physical
-            | novarocks_type_contract::ValueLogicalType::LargeInt
-    ) && is_numeric(&ty.data_type)
 }
 
 pub(crate) fn validate_function_call(
@@ -1398,5 +1344,254 @@ pub(crate) fn validate_expression_values_on_port(
             ));
         }
         expression.kind.expression_references(&mut pending);
+    }
+}
+
+#[cfg(test)]
+mod value_arithmetic_tests {
+    use super::*;
+    use crate::{
+        BinaryOperator, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, UnaryOperator,
+    };
+    use novarocks_type_contract::ValueLogicalType;
+
+    fn largeint(nullable: bool) -> ValueType {
+        ValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            nullable,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap()
+    }
+
+    // Exercise the actual local binary gate, independently of literal encoding
+    // and whole-plan topology. No owner refinement or runtime claim is made.
+    fn binary_valid(
+        left: ValueType,
+        op: BinaryOperator,
+        right: ValueType,
+        output: ValueType,
+    ) -> bool {
+        let node = |id, ty| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(0),
+            lambda_scope: None,
+            ty,
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let mut errors = ValidationContext::new();
+        validate_binary_types(
+            &node(0, left),
+            op,
+            &node(1, right),
+            &node(2, output),
+            "binary",
+            &mut errors,
+        );
+        errors.is_empty()
+    }
+
+    #[test]
+    fn arithmetic_gate_preserves_exact_domain_and_only_root_nullable_widening() {
+        assert!(binary_valid(
+            largeint(false),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            largeint(false)
+        ));
+        assert!(binary_valid(
+            largeint(false),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            largeint(true)
+        ));
+        assert!(!binary_valid(
+            largeint(true),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            largeint(false)
+        ));
+        assert!(!binary_valid(
+            largeint(false),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            ValueType::new(DataType::FixedSizeBinary(16), true)
+        ));
+        assert!(binary_valid(
+            largeint(false),
+            BinaryOperator::Divide,
+            largeint(false),
+            ValueType::new(DataType::Float64, true)
+        ));
+        assert!(!binary_valid(
+            largeint(false),
+            BinaryOperator::Divide,
+            largeint(false),
+            largeint(true)
+        ));
+        assert!(binary_valid(
+            ValueType::new(DataType::Decimal128(38, 15), true),
+            BinaryOperator::Subtract,
+            largeint(false),
+            ValueType::new(DataType::Decimal256(55, 15), true)
+        ));
+        assert!(!binary_valid(
+            ValueType::new(DataType::Decimal128(38, 15), true),
+            BinaryOperator::Multiply,
+            largeint(false),
+            ValueType::new(DataType::Decimal256(55, 15), true)
+        ));
+    }
+
+    #[test]
+    fn binary_numeric_gates_reject_opaque_fixed16_and_preserve_unsigned_bitwise() {
+        for opaque in [
+            ValueType::new(DataType::FixedSizeBinary(16), false),
+            ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+        ] {
+            assert!(!binary_valid(
+                opaque.clone(),
+                BinaryOperator::Add,
+                largeint(false),
+                largeint(true)
+            ));
+            assert!(!binary_valid(
+                opaque.clone(),
+                BinaryOperator::BitAnd,
+                opaque.clone(),
+                opaque
+            ));
+        }
+        for dtype in [
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ] {
+            assert!(binary_valid(
+                ValueType::new(dtype.clone(), false),
+                BinaryOperator::BitXor,
+                ValueType::new(dtype.clone(), true),
+                ValueType::new(dtype, true)
+            ));
+        }
+    }
+
+    fn unary_fragment(
+        input: ValueType,
+        output: ValueType,
+        op: UnaryOperator,
+        nonliteral_null_child: bool,
+    ) -> Result<Fragment, ValidationErrors> {
+        let mut builder = FragmentBuilder::new(FragmentId::new(0));
+        let node = builder.reserve_node_id().unwrap();
+        let mut child = builder
+            .add_expression(
+                node,
+                input.clone(),
+                ExprKind::Literal(crate::LiteralValue::Null),
+            )
+            .unwrap();
+        if nonliteral_null_child {
+            child = builder
+                .add_expression(
+                    node,
+                    input,
+                    ExprKind::Unary {
+                        op: UnaryOperator::Plus,
+                        expr: child,
+                    },
+                )
+                .unwrap();
+        }
+        let root = builder
+            .add_expression(node, output.clone(), ExprKind::Unary { op, expr: child })
+            .unwrap();
+        let value = builder
+            .add_value(
+                output,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .add_values(
+                node,
+                vec![vec![root].into_boxed_slice()].into_boxed_slice(),
+                vec![value].into_boxed_slice(),
+            )
+            .unwrap();
+        builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+    }
+
+    #[test]
+    fn checked_unary_fragments_preserve_decimal_uint_largeint_and_strict_null() {
+        for dtype in [
+            DataType::Float16,
+            DataType::Decimal32(7, 2),
+            DataType::Decimal64(10, 2),
+            DataType::Decimal128(38, 2),
+            DataType::Decimal256(76, 2),
+            DataType::UInt64,
+        ] {
+            let ty = ValueType::new(dtype, true);
+            unary_fragment(ty.clone(), ty, UnaryOperator::Minus, false).unwrap();
+        }
+        unary_fragment(
+            largeint(true),
+            largeint(true),
+            UnaryOperator::BitwiseNot,
+            false,
+        )
+        .unwrap();
+        for op in [
+            UnaryOperator::Plus,
+            UnaryOperator::Minus,
+            UnaryOperator::BitwiseNot,
+        ] {
+            let ty = ValueType::new(DataType::Null, true);
+            let fragment = unary_fragment(ty.clone(), ty.clone(), op, true).unwrap();
+            assert_eq!(fragment.expressions().len(), 3);
+            assert!(fragment.expressions().iter().all(|(_, expr)| expr.ty == ty));
+        }
+        for opaque in [
+            ValueType::new(DataType::FixedSizeBinary(16), true),
+            ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+        ] {
+            for op in [UnaryOperator::Minus, UnaryOperator::BitwiseNot] {
+                let errors = unary_fragment(opaque.clone(), opaque.clone(), op, false).unwrap_err();
+                assert!(errors.errors().iter().any(|error| error.message()
+                    == "unary expression types are inconsistent with its operator"));
+            }
+        }
+        assert!(
+            unary_fragment(
+                ValueType::new(DataType::Null, true),
+                ValueType::new(DataType::Int64, true),
+                UnaryOperator::Minus,
+                false
+            )
+            .is_err()
+        );
     }
 }

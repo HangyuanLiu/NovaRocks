@@ -168,6 +168,7 @@ impl Owner {
             kind: FunctionKind::Scalar,
             selected: self.selected.as_ref(),
             request: FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &self.arguments,
                 logical_argument_count: self.arguments.len(),
             },

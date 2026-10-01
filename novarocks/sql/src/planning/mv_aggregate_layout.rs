@@ -20,11 +20,12 @@
 //! This module turns SQL's one-shot analyzed aggregate facts into the target
 //! table's physical columns and the execution-only runtime layout.  It keeps
 //! semantic table columns and aggregate-function vocabulary in SQL;
-//! the embedded [`MvAggregateRuntimeLayout`] contains only Arrow/runtime facts.
+//! the embedded [`MvAggregateRuntimeLayout`] contains complete value types and runtime facts.
 
 use std::collections::HashSet;
 
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
+use novarocks_type_contract::FunctionValueType;
 use novarocks_types::mv_aggregate_layout::{
     MvAggregateRuntimeKind, MvAggregateRuntimeLayout, MvAggregateStateColumn, MvAggregateStateRole,
     MvAggregateVisibleColumn,
@@ -135,18 +136,17 @@ pub fn build_sql_mv_aggregate_physical_layout(
         .iter()
         .enumerate()
         .map(|(source_index, column)| {
-            let sql_type = mv_arrow_data_type_to_sql_type(&column.data_type)?;
+            let sql_type = mv_value_type_to_sql_type(&column.value_type)?;
             physical_columns.push(physical_column(
                 column.name.clone(),
                 sql_type,
-                column.nullable,
+                column.value_type.nullable,
                 true,
                 false,
             ));
             Ok(MvAggregateVisibleColumn::new(
                 column.name.clone(),
-                column.data_type.clone(),
-                column.nullable,
+                column.value_type.clone(),
                 source_index,
             ))
         })
@@ -166,7 +166,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
         })?;
         validate_aggregate_state_visible_type(
             call.function(),
-            &visible.data_type,
+            &visible.value_type.data_type,
             aggregate_input_types
                 .get(aggregate_index)
                 .and_then(Option::as_ref),
@@ -194,8 +194,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
                 ));
                 state_columns.push(MvAggregateStateColumn::new(
                     state_name,
-                    state_data_type.clone(),
-                    false,
+                    FunctionValueType::new(state_data_type.clone(), false),
                     visible_source_index,
                     aggregate_index,
                     runtime_kind(call.function()),
@@ -219,8 +218,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
             ));
             state_columns.push(MvAggregateStateColumn::new(
                 state_name,
-                state_data_type,
-                false,
+                FunctionValueType::new(state_data_type, false),
                 visible_source_index,
                 aggregate_index,
                 runtime_kind(call.function()),
@@ -249,8 +247,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
         ));
         state_columns.push(MvAggregateStateColumn::new(
             MV_AGGREGATE_RETRACTION_COUNT_STATE_COLUMN.to_string(),
-            DataType::Int64,
-            false,
+            FunctionValueType::new(DataType::Int64, false),
             0,
             calls.len(),
             MvAggregateRuntimeKind::Count,
@@ -273,64 +270,16 @@ pub fn build_sql_mv_aggregate_physical_layout(
     })
 }
 
-/// Keep aggregate-MV's schema mapper distinct from the generic CTAS mapper.
-///
-/// Their supported Arrow forms and diagnostic contracts differ deliberately.
-pub fn mv_arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
-    match data_type {
-        DataType::Boolean => Ok(SqlType::Boolean),
-        DataType::Int8 => Ok(SqlType::TinyInt),
-        DataType::Int16 => Ok(SqlType::SmallInt),
-        DataType::Int32 => Ok(SqlType::Int),
-        DataType::Int64 => Ok(SqlType::BigInt),
-        DataType::Float32 => Ok(SqlType::Float),
-        DataType::Float64 => Ok(SqlType::Double),
-        DataType::Utf8 => Ok(SqlType::String),
-        DataType::Binary => Ok(SqlType::Binary),
-        DataType::Date32 => Ok(SqlType::Date),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(SqlType::DateTimeNs),
-        DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
-        DataType::Time64(_) => Ok(SqlType::Time),
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            Ok(SqlType::LargeInt)
+/// Project the complete source domain through the shared schema owner.
+/// The runtime layout retains the original full value type independently of
+/// this SQL DDL declaration.
+pub fn mv_value_type_to_sql_type(value_type: &FunctionValueType) -> Result<SqlType, String> {
+    novarocks_types::sql_type_from_value_type(value_type).map_err(|error| match error {
+        novarocks_types::ColumnValueTypeError::UnrepresentableCarrier(carrier) => {
+            format!("unsupported MV output type: {carrier}")
         }
-        DataType::Decimal128(precision, scale) => Ok(SqlType::Decimal {
-            precision: *precision,
-            scale: *scale,
-        }),
-        DataType::List(field) => Ok(SqlType::Array(Box::new(mv_arrow_data_type_to_sql_type(
-            field.data_type(),
-        )?))),
-        DataType::Struct(fields) => Ok(SqlType::Struct(
-            fields
-                .iter()
-                .map(|field| {
-                    Ok((
-                        field.name().clone(),
-                        mv_arrow_data_type_to_sql_type(field.data_type())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        )),
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err("MAP output type must use struct entries".to_string());
-            };
-            let (_, key) = fields
-                .find("key")
-                .ok_or_else(|| "MAP output type is missing key field".to_string())?;
-            let (_, value) = fields
-                .find("value")
-                .ok_or_else(|| "MAP output type is missing value field".to_string())?;
-            Ok(SqlType::Map(
-                Box::new(mv_arrow_data_type_to_sql_type(key.data_type())?),
-                Box::new(mv_arrow_data_type_to_sql_type(value.data_type())?),
-            ))
-        }
-        other => Err(format!("unsupported MV output type: {other}")),
-    }
+        other => other.to_string(),
+    })
 }
 
 /// Reject duplicate physical names using StarRocks identifier normalization.
@@ -461,27 +410,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mv_arrow_mapper_preserves_nested_shape_and_diagnostic_contract() {
+    fn mv_ddl_uses_authored_domains_instead_of_carrier_guesses() {
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        let cases = [
+            (DataType::Utf8, ValueLogicalType::Json, SqlType::Json),
+            (
+                DataType::LargeBinary,
+                ValueLogicalType::Variant,
+                SqlType::Variant,
+            ),
+            (DataType::Binary, ValueLogicalType::Hll, SqlType::Hll),
+            (DataType::Binary, ValueLogicalType::Bitmap, SqlType::Bitmap),
+            (
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::LargeInt,
+                SqlType::LargeInt,
+            ),
+            (
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::Physical,
+                SqlType::Binary,
+            ),
+        ];
+        for (data_type, logical_type, expected) in cases {
+            assert_eq!(
+                mv_value_type_to_sql_type(&FunctionValueType {
+                    data_type,
+                    logical_type,
+                    nullable: true
+                })
+                .unwrap(),
+                expected
+            );
+        }
+        let item = Field::new("item", DataType::Utf8, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into());
+        assert_eq!(
+            mv_value_type_to_sql_type(&FunctionValueType::new(
+                DataType::List(Arc::new(item)),
+                false
+            ))
+            .unwrap(),
+            SqlType::Array(Box::new(SqlType::Json))
+        );
+    }
+
+    #[test]
+    fn mv_value_mapper_preserves_nested_shape_and_diagnostic_contract() {
         let map_entries = DataType::Struct(Fields::from(vec![
             Arc::new(Field::new("key", DataType::Utf8, false)),
             Arc::new(Field::new("value", DataType::Int64, true)),
         ]));
         assert_eq!(
-            mv_arrow_data_type_to_sql_type(&DataType::Map(
-                Arc::new(Field::new("entries", map_entries, false)),
-                false,
+            mv_value_type_to_sql_type(&FunctionValueType::new(
+                DataType::Map(Arc::new(Field::new("entries", map_entries, false)), false,),
+                false
             ))
             .expect("MV map type"),
             SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::BigInt))
         );
         assert_eq!(
-            mv_arrow_data_type_to_sql_type(&DataType::Null),
+            mv_value_type_to_sql_type(&FunctionValueType::new(DataType::Null, true)),
             Err("unsupported MV output type: Null".to_string())
         );
     }
 
     #[test]
-    fn mv_arrow_mapper_preserves_scalar_contract() {
+    fn mv_value_mapper_preserves_scalar_contract() {
         let cases = [
             (DataType::Boolean, SqlType::Boolean),
             (DataType::Int8, SqlType::TinyInt),
@@ -490,7 +485,7 @@ mod tests {
             (DataType::Int64, SqlType::BigInt),
             (
                 DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
-                SqlType::LargeInt,
+                SqlType::Binary,
             ),
             (
                 DataType::Decimal128(38, -2),
@@ -507,7 +502,8 @@ mod tests {
 
         for (arrow_type, expected) in cases {
             assert_eq!(
-                mv_arrow_data_type_to_sql_type(&arrow_type).expect("supported scalar type"),
+                mv_value_type_to_sql_type(&FunctionValueType::new(arrow_type.clone(), false))
+                    .expect("supported scalar type"),
                 expected,
                 "Arrow type {arrow_type:?}"
             );
@@ -515,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_arrow_mapper_preserves_nested_shape_and_order() {
+    fn mv_value_mapper_preserves_nested_shape_and_order() {
         let map_entries = DataType::Struct(Fields::from(vec![
             Arc::new(Field::new("key", DataType::Utf8, false)),
             Arc::new(Field::new("value", DataType::Decimal128(20, -3), true)),
@@ -538,7 +534,8 @@ mod tests {
         ]));
 
         assert_eq!(
-            mv_arrow_data_type_to_sql_type(&nested).expect("supported nested type"),
+            mv_value_type_to_sql_type(&FunctionValueType::new(nested, false))
+                .expect("supported nested type"),
             SqlType::Struct(vec![
                 ("ts".to_string(), SqlType::DateTimeNs),
                 (

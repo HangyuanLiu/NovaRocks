@@ -26,6 +26,7 @@ use novarocks_parser::{
     ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
     printer,
 };
+use novarocks_type_contract::FunctionValueType;
 
 pub use super::mv_persistence::{
     SqlMvCreatePersistenceFacts, SqlMvPersistenceAggregateFacts, SqlMvPersistenceExpressionFacts,
@@ -302,11 +303,37 @@ mod refresh_property_facade_tests {
         ) -> Result<ResolvedAnalyzerTable, String> {
             let planner = TableDef {
                 name: table.to_string(),
-                columns: vec![
-                    column("id", DataType::Int64, false),
-                    column("region", DataType::Utf8, true),
-                    column("amount", DataType::Int64, true),
-                ],
+                columns: if table == "logical_domains" {
+                    use novarocks_types::schema::SqlType;
+                    [
+                        ("doc", DataType::Utf8, Some(SqlType::Json)),
+                        (
+                            "variant_value",
+                            DataType::LargeBinary,
+                            Some(SqlType::Variant),
+                        ),
+                        ("hll_value", DataType::Binary, Some(SqlType::Hll)),
+                        ("bitmap_value", DataType::Binary, Some(SqlType::Bitmap)),
+                        (
+                            "large_value",
+                            DataType::FixedSizeBinary(16),
+                            Some(SqlType::LargeInt),
+                        ),
+                        ("fixed_value", DataType::FixedSizeBinary(16), None),
+                    ]
+                    .into_iter()
+                    .map(|(name, data_type, logical_type)| ColumnDef {
+                        logical_type,
+                        ..column(name, data_type, true)
+                    })
+                    .collect()
+                } else {
+                    vec![
+                        column("id", DataType::Int64, false),
+                        column("region", DataType::Utf8, true),
+                        column("amount", DataType::Int64, true),
+                    ]
+                },
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: ScanSource::Sql(SqlScanSource::new(
                     crate::compiler::mv_rewrite::test_target_binding(),
@@ -409,16 +436,45 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn mv_output_facade_preserves_actual_catalog_root_domains() {
+        use novarocks_type_contract::ValueLogicalType;
+        let facts = analyzed_refresh_input("SELECT doc, variant_value, hll_value, bitmap_value, large_value, fixed_value FROM logical_domains").analysis_facts();
+        let expected = [
+            ValueLogicalType::Json,
+            ValueLogicalType::Variant,
+            ValueLogicalType::Hll,
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Physical,
+        ];
+        for (column, logical_type) in facts.output_columns.iter().zip(expected) {
+            assert_eq!(column.value_type.logical_type, logical_type);
+            assert!(column.value_type.nullable);
+        }
+        assert_eq!(
+            facts.output_columns[4].value_type.data_type,
+            facts.output_columns[5].value_type.data_type
+        );
+        assert_ne!(
+            facts.output_columns[4].value_type,
+            facts.output_columns[5].value_type
+        );
+    }
+
+    #[test]
     fn opaque_refresh_input_projects_only_output_schema_facts() {
         let facts =
             analyzed_refresh_input("SELECT id AS order_id, region FROM fact_east").analysis_facts();
 
         assert_eq!(facts.output_columns.len(), 2);
         assert_eq!(facts.output_columns[0].name, "order_id");
-        assert_eq!(facts.output_columns[0].data_type, DataType::Int64);
-        assert!(!facts.output_columns[0].nullable);
+        assert_eq!(
+            facts.output_columns[0].value_type.data_type,
+            DataType::Int64
+        );
+        assert!(!facts.output_columns[0].value_type.nullable);
         assert_eq!(facts.output_columns[1].name, "region");
-        assert!(facts.output_columns[1].nullable);
+        assert!(facts.output_columns[1].value_type.nullable);
     }
 
     #[test]
@@ -849,8 +905,7 @@ pub struct SqlMvAnalysisFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlMvOutputColumnFacts {
     pub name: String,
-    pub data_type: arrow::datatypes::DataType,
-    pub nullable: bool,
+    pub value_type: FunctionValueType,
 }
 
 /// Selects the output whose aggregate layout is being derived.
@@ -1451,7 +1506,7 @@ fn aggregate_input_types_from_resolved_query(
         let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
             format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
         })?;
-        *slot = args.first().map(|arg| arg.data_type.clone());
+        *slot = args.first().map(|arg| arg.value_type.data_type.clone());
     }
     Ok(input_types)
 }
@@ -1513,8 +1568,7 @@ fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOu
                 .iter()
                 .map(|item| SqlMvOutputColumnFacts {
                     name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
+                    value_type: item.expr.value_type.clone(),
                 })
                 .collect(),
             _ => Vec::new(),
@@ -1525,8 +1579,7 @@ fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOu
             .iter()
             .map(|column| SqlMvOutputColumnFacts {
                 name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
+                value_type: column.value_type.clone(),
             })
             .collect()
     }
@@ -5980,9 +6033,7 @@ fn is_legacy_unresolved_aggregate_function_name(name: &str) -> bool {
 }
 
 fn typed_expr_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
-    left.data_type == right.data_type
-        && left.nullable == right.nullable
-        && expr_kind_eq(&left.kind, &right.kind)
+    left.value_type == right.value_type && expr_kind_eq(&left.kind, &right.kind)
 }
 
 fn typed_exprs_eq(left: &[TypedExpr], right: &[TypedExpr]) -> bool {

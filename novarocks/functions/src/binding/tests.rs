@@ -45,6 +45,7 @@ fn literal_argument(constant: FunctionLiteral) -> FunctionArgument {
 
 fn request(arguments: &[FunctionArgument]) -> FunctionBindingRequest<'_> {
     FunctionBindingRequest {
+        expected_result_type: None,
         arguments,
         logical_argument_count: arguments.len(),
     }
@@ -556,6 +557,7 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
         argument(DataType::Utf8, true),
     ];
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &args,
         logical_argument_count: 1,
     };
@@ -577,6 +579,7 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
         .nullable = true;
     assert!(catalog.validate_bound(&changed, request).is_err());
     let changed_request = FunctionBindingRequest {
+        expected_result_type: None,
         logical_argument_count: 2,
         ..request
     };
@@ -852,6 +855,7 @@ fn aggregate_order_by_update_channels_cannot_be_lambdas() {
         higher_order_arguments()[0].clone(),
     ];
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &arguments,
         logical_argument_count: 1,
     };

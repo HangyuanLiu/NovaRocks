@@ -165,6 +165,7 @@ impl Fixture {
             kind: FunctionKind::Scalar,
             selected: &self.selected,
             request: FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &self.arguments,
                 logical_argument_count: self.arguments.len(),
             },

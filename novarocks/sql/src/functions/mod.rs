@@ -65,21 +65,16 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
-/// Semantic result domains declared by the closed built-in function identity.
-/// Utf8 itself never establishes JSON provenance; external or shadowing functions
-/// retain their own declared physical domain.
-pub(crate) fn scalar_output_logical_type(
+#[cfg(test)]
+fn scalar_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
-    if binding.kind != FunctionKind::Scalar {
-        return None;
-    }
-    match binding.function_id.as_str() {
-        "builtin.scalar/parse_json/v1"
-        | "builtin.scalar/json_object/v1"
-        | "builtin.scalar/json_array/v1"
-        | "builtin.scalar/to_json/v1"
-        | "builtin.scalar/json_query/v1" => Some(novarocks_types::schema::SqlType::Json),
+    match &binding.selected.result_type {
+        FunctionResultType::Scalar(result)
+            if result.logical_type == novarocks_type_contract::ValueLogicalType::Json =>
+        {
+            Some(novarocks_types::schema::SqlType::Json)
+        }
         _ => None,
     }
 }
@@ -126,6 +121,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 name,
                 FunctionKind::Scalar,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments: &arguments,
                     logical_argument_count: arguments.len(),
                 },
@@ -175,8 +171,42 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             name,
             FunctionKind::Scalar,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments,
                 logical_argument_count: arguments.len(),
+            },
+        )
+    }
+
+    fn resolve_scalar_binding_with_expected_result(
+        &self,
+        name: &str,
+        arguments: &[FunctionArgument],
+        expected: &FunctionValueType,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_user(
+            name,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments,
+                logical_argument_count: arguments.len(),
+                expected_result_type: Some(expected),
+            },
+        )
+    }
+
+    fn resolve_value_conversion_binding(
+        &self,
+        argument: &FunctionArgument,
+        target: &FunctionValueType,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted(
+            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: std::slice::from_ref(argument),
+                logical_argument_count: 1,
+                expected_result_type: Some(target),
             },
         )
     }
@@ -190,6 +220,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             name,
             FunctionKind::Window,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments,
                 logical_argument_count: arguments.len(),
             },
@@ -205,6 +236,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             name,
             FunctionKind::Table,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments,
                 logical_argument_count: arguments.len(),
             },
@@ -225,6 +257,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             name,
             FunctionKind::Aggregate,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments,
                 logical_argument_count,
             },
@@ -241,6 +274,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             name,
             FunctionKind::Aggregate,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments,
                 logical_argument_count,
             },
@@ -330,6 +364,7 @@ pub(crate) fn test_resolved_aggregate(
             &executable_name,
             FunctionKind::Aggregate,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &arguments,
                 logical_argument_count: arguments.len(),
             },
@@ -520,6 +555,7 @@ mod tests {
                 name,
                 FunctionKind::Scalar,
                 FunctionBindingRequest {
+                    expected_result_type: None,
                     arguments,
                     logical_argument_count: arguments.len(),
                 },
@@ -535,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn json_output_domain_uses_bound_identity_not_shadowed_function_spelling() {
+    fn json_output_domain_uses_bound_result_not_shadowed_function_spelling() {
         let builtin = build_builtin_engine_function_catalog().unwrap();
         let args = [value_argument(DataType::Utf8, false, None)];
         let bound = resolve_exact_scalar(&builtin, "json_object", &args);
@@ -547,6 +583,8 @@ mod tests {
         let overload = FunctionOverloadId::try_new("test.shadow.json_object/0/v1").unwrap();
         let mut selection = bound.selected.clone();
         selection.overload = overload.clone();
+        selection.result_type =
+            FunctionResultType::Scalar(FunctionValueType::new(DataType::Utf8, false));
         let declaration = FunctionBindingDeclaration::try_new(
             FunctionId::try_new("test.shadow/json_object/v1").unwrap(),
             FunctionKind::Scalar,

@@ -25,6 +25,7 @@ use novarocks_parser::Span;
 use crate::analysis::LambdaParam;
 use crate::analyze_error::AnalyzeError;
 use crate::column_id::{ColumnId, ColumnRefFactory};
+use novarocks_type_contract::{FunctionValueType, PureCompileControl};
 use novarocks_types::schema::ColumnDef;
 
 /// Tracks column names and types visible at the current query level.
@@ -34,13 +35,13 @@ use novarocks_types::schema::ColumnDef;
 pub(super) struct AnalyzerScope {
     /// Shared factory for allocating globally unique ColumnIds.
     factory: Rc<RefCell<ColumnRefFactory>>,
-    /// (qualifier_lower, col_name_lower) -> (ColumnId, DataType, nullable)
-    qualified: HashMap<(String, String), (ColumnId, DataType, bool)>,
-    /// col_name_lower -> (ColumnId, DataType, nullable)
-    unqualified: HashMap<String, (ColumnId, DataType, bool)>,
+    /// (qualifier_lower, col_name_lower) -> (ColumnId, FunctionValueType)
+    qualified: HashMap<(String, String), (ColumnId, FunctionValueType)>,
+    /// col_name_lower -> (ColumnId, FunctionValueType)
+    unqualified: HashMap<String, (ColumnId, FunctionValueType)>,
     /// Ordered columns for SELECT * expansion:
-    /// (qualifier, col_name, ColumnId, DataType, nullable)
-    ordered: Vec<(Option<String>, String, ColumnId, DataType, bool)>,
+    /// (qualifier, col_name, ColumnId, FunctionValueType)
+    ordered: Vec<(Option<String>, String, ColumnId, FunctionValueType)>,
     /// Lambda parameters visible in the current expression scope.
     lambda_params: HashMap<String, LambdaParam>,
     /// For column names that have a canonical qualifier — e.g. a USING-join
@@ -55,13 +56,6 @@ pub(super) struct AnalyzerScope {
     /// `COALESCE(left.id, right.id)` so that null-padding on either side
     /// still produces the correct merged value.
     computed_columns: HashMap<String, crate::analysis::TypedExpr>,
-    /// Logical type tags for columns whose Arrow `DataType` is ambiguous
-    /// (for example JSON-as-Utf8 or BITMAP/HLL-as-Binary). The analyzer
-    /// consults this side-table to reject or special-case semantics that
-    /// depend on the original StarRocks logical type. Keyed by lower-cased
-    /// (qualifier, column) and the unqualified column name.
-    qualified_logical_types: HashMap<(String, String), novarocks_types::schema::SqlType>,
-    unqualified_logical_types: HashMap<String, novarocks_types::schema::SqlType>,
 }
 
 impl AnalyzerScope {
@@ -74,33 +68,12 @@ impl AnalyzerScope {
             lambda_params: HashMap::new(),
             canonical_qualifier: HashMap::new(),
             computed_columns: HashMap::new(),
-            qualified_logical_types: HashMap::new(),
-            unqualified_logical_types: HashMap::new(),
         }
     }
 
     /// Return a reference to the shared ColumnRefFactory.
     pub(super) fn factory(&self) -> &Rc<RefCell<ColumnRefFactory>> {
         &self.factory
-    }
-
-    /// Look up the logical type tag for a column reference. Returns the
-    /// StarRocks `SqlType` for tagged columns; `None` for columns whose Arrow
-    /// type fully describes them.
-    pub(super) fn logical_type_for(
-        &self,
-        qualifier: Option<&str>,
-        name: &str,
-    ) -> Option<novarocks_types::schema::SqlType> {
-        let name_lower = name.to_lowercase();
-        if let Some(q) = qualifier
-            && let Some(t) = self
-                .qualified_logical_types
-                .get(&(q.to_lowercase(), name_lower.clone()))
-        {
-            return Some(t.clone());
-        }
-        self.unqualified_logical_types.get(&name_lower).cloned()
     }
 
     /// Convenience: if `expr` is a `ColumnRef`, return the column's logical
@@ -111,19 +84,7 @@ impl AnalyzerScope {
         &self,
         expr: &crate::analysis::TypedExpr,
     ) -> Option<novarocks_types::schema::SqlType> {
-        if let crate::analysis::ExprKind::ColumnRef {
-            column_id,
-            qualifier,
-            column,
-        } = &expr.kind
-        {
-            self.factory
-                .borrow()
-                .logical_type(*column_id)
-                .or_else(|| self.logical_type_for(qualifier.as_deref(), column))
-        } else {
-            None
-        }
+        super::helpers::sql_logical_projection(expr.value_type.logical_type)
     }
 
     /// Return the canonical qualifier for an unqualified column name, if any.
@@ -145,7 +106,7 @@ impl AnalyzerScope {
     /// entries that aliases may add for compatibility.
     pub(super) fn qualifier_for_binding(&self, name: &str, column_id: ColumnId) -> Option<String> {
         let name_lower = name.to_lowercase();
-        for (qualifier, col_name, id, _, _) in &self.ordered {
+        for (qualifier, col_name, id, _) in &self.ordered {
             if col_name.to_lowercase() == name_lower && *id == column_id {
                 return qualifier.clone();
             }
@@ -154,7 +115,7 @@ impl AnalyzerScope {
         let mut qualifiers: Vec<String> = self
             .qualified
             .iter()
-            .filter_map(|((qualifier, col_name), (id, _, _))| {
+            .filter_map(|((qualifier, col_name), (id, _))| {
                 if col_name == &name_lower && *id == column_id {
                     Some(qualifier.clone())
                 } else {
@@ -189,19 +150,13 @@ impl AnalyzerScope {
         &mut self,
         qualifier: Option<&str>,
         columns: &[ColumnDef],
-    ) -> Vec<ColumnId> {
+        control: &dyn PureCompileControl,
+    ) -> Result<Vec<ColumnId>, AnalyzeError> {
         let mut ids = Vec::with_capacity(columns.len());
         for col in columns {
-            let id = self.factory.borrow_mut().create(
-                qualifier.map(|s| s.to_string()),
-                col.name.clone(),
-                col.data_type.clone(),
-                col.nullable,
-            );
-            ids.push(id);
-            self.insert_table_column_binding(qualifier, col, id);
+            ids.push(self.add_table_column(qualifier, col, control)?);
         }
-        ids
+        Ok(ids)
     }
 
     /// Register a table's columns using pre-allocated `ColumnId`s.
@@ -220,60 +175,18 @@ impl AnalyzerScope {
         qualifier: Option<&str>,
         columns: &[ColumnDef],
         column_ids: &[ColumnId],
-    ) {
+        control: &dyn PureCompileControl,
+    ) -> Result<(), AnalyzeError> {
         assert_eq!(
             columns.len(),
             column_ids.len(),
             "add_table_with_ids: columns/column_ids length mismatch"
         );
-        for (col, &id) in columns.iter().zip(column_ids.iter()) {
-            self.insert_table_column_binding(qualifier, col, id);
+        for (col, &id) in columns.iter().zip(column_ids) {
+            let ty = super::helpers::column_value_type(col, control)?;
+            self.add_column_with_id(qualifier, &col.name, id, ty);
         }
-    }
-
-    fn insert_table_column_binding(
-        &mut self,
-        qualifier: Option<&str>,
-        col: &ColumnDef,
-        id: ColumnId,
-    ) {
-        self.factory.borrow_mut().set_logical_type(
-            id,
-            col.logical_type
-                .clone()
-                .filter(|logical| matches!(logical, novarocks_types::schema::SqlType::Json)),
-        );
-        let json_list = matches!(&col.data_type, DataType::List(item)
-            if novarocks_types::logical::logical_type_of_field(item) == Some(novarocks_types::logical::LogicalType::Json))
-            || matches!(&col.logical_type, Some(novarocks_types::schema::SqlType::Array(item)) if **item == novarocks_types::schema::SqlType::Json);
-        self.factory
-            .borrow_mut()
-            .set_json_list_provenance(id, json_list);
-        let name_lower = col.name.to_lowercase();
-        if let Some(q) = qualifier {
-            self.qualified.insert(
-                (q.to_lowercase(), name_lower.clone()),
-                (id, col.data_type.clone(), col.nullable),
-            );
-            if let Some(logical) = col.logical_type.clone() {
-                self.qualified_logical_types
-                    .insert((q.to_lowercase(), name_lower.clone()), logical);
-            }
-        }
-        self.unqualified.insert(
-            name_lower.clone(),
-            (id, col.data_type.clone(), col.nullable),
-        );
-        if let Some(logical) = col.logical_type.clone() {
-            self.unqualified_logical_types.insert(name_lower, logical);
-        }
-        self.ordered.push((
-            qualifier.map(|s| s.to_lowercase()),
-            col.name.clone(),
-            id,
-            col.data_type.clone(),
-            col.nullable,
-        ));
+        Ok(())
     }
 
     /// Register one already-resolved table column, allocating its id.
@@ -285,15 +198,10 @@ impl AnalyzerScope {
         &mut self,
         qualifier: Option<&str>,
         col: &ColumnDef,
-    ) -> ColumnId {
-        let id = self.factory.borrow_mut().create(
-            qualifier.map(|s| s.to_string()),
-            col.name.clone(),
-            col.data_type.clone(),
-            col.nullable,
-        );
-        self.insert_table_column_binding(qualifier, col, id);
-        id
+        control: &dyn PureCompileControl,
+    ) -> Result<ColumnId, AnalyzeError> {
+        let ty = super::helpers::column_value_type(col, control)?;
+        Ok(self.add_column(qualifier, &col.name, ty))
     }
 
     /// Register a single column (used for subquery output columns, etc.).
@@ -301,32 +209,14 @@ impl AnalyzerScope {
         &mut self,
         qualifier: Option<&str>,
         name: &str,
-        data_type: DataType,
-        nullable: bool,
+        value_type: FunctionValueType,
     ) -> ColumnId {
-        let name_lower = name.to_lowercase();
         let id = self.factory.borrow_mut().create(
-            qualifier.map(|s| s.to_string()),
+            qualifier.map(str::to_string),
             name.to_string(),
-            data_type.clone(),
-            nullable,
+            value_type.clone(),
         );
-        if let Some(q) = qualifier {
-            self.qualified.insert(
-                (q.to_lowercase(), name_lower.clone()),
-                (id, data_type.clone(), nullable),
-            );
-        }
-        self.unqualified
-            .insert(name_lower, (id, data_type.clone(), nullable));
-        // Store original-case name in ordered for SELECT * display.
-        self.ordered.push((
-            qualifier.map(|s| s.to_lowercase()),
-            name.to_string(),
-            id,
-            data_type,
-            nullable,
-        ));
+        self.add_column_with_id(qualifier, name, id, value_type);
         id
     }
 
@@ -338,67 +228,68 @@ impl AnalyzerScope {
         qualifier: Option<&str>,
         name: &str,
         column_id: ColumnId,
-        data_type: DataType,
-        nullable: bool,
+        value_type: FunctionValueType,
     ) {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
             self.qualified.insert(
                 (q.to_lowercase(), name_lower.clone()),
-                (column_id, data_type.clone(), nullable),
+                (column_id, value_type.clone()),
             );
         }
         self.unqualified
-            .insert(name_lower, (column_id, data_type.clone(), nullable));
+            .insert(name_lower, (column_id, value_type.clone()));
         self.ordered.push((
-            qualifier.map(|s| s.to_lowercase()),
+            qualifier.map(str::to_lowercase),
             name.to_string(),
             column_id,
-            data_type,
-            nullable,
+            value_type,
         ));
     }
 
     pub(super) fn contains_column_id(&self, column_id: ColumnId) -> bool {
-        self.ordered.iter().any(|(_, _, id, _, _)| *id == column_id)
-            || self.qualified.values().any(|(id, _, _)| *id == column_id)
-            || self.unqualified.values().any(|(id, _, _)| *id == column_id)
-    }
-
-    pub(super) fn add_lambda_param(&mut self, param: LambdaParam) {
-        self.lambda_params.insert(param.name.to_lowercase(), param);
+        self.ordered.iter().any(|(_, _, id, _)| *id == column_id)
+            || self.qualified.values().any(|(id, _)| *id == column_id)
+            || self.unqualified.values().any(|(id, _)| *id == column_id)
     }
 
     pub(super) fn resolve_lambda_param(&self, name: &str) -> Option<LambdaParam> {
         self.lambda_params.get(&name.to_lowercase()).cloned()
     }
 
-    /// Resolve a column reference. Returns `(ColumnId, DataType, nullable)`.
-    ///
-    /// Returns a spec-aligned error message when the column name is one of
-    /// the two Iceberg V3 row-lineage reserved names but the table did not
-    /// register them (i.e. it is not a V3 row-lineage table), so the user
-    /// gets a clear diagnostic instead of a generic "cannot be resolved"
-    /// message.
+    pub(super) fn add_lambda_param(&mut self, param: LambdaParam) {
+        self.lambda_params.insert(param.name.to_lowercase(), param);
+    }
+
     pub(super) fn resolve(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<(ColumnId, DataType, bool), String> {
+        let (id, ty) = self.resolve_value_type(qualifier, name)?;
+        Ok((id, ty.data_type, ty.nullable))
+    }
+
+    pub(super) fn resolve_value_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<(ColumnId, FunctionValueType), String> {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
-            let q_lower = q.to_lowercase();
-            if let Some(found) = self.qualified.get(&(q_lower.clone(), name_lower.clone())) {
-                return Ok(found.clone());
-            }
-            return Err(reserved_name_error(name)
-                .unwrap_or_else(|| format!("Column '{}.{}' cannot be resolved.", q, name)));
+            return self
+                .qualified
+                .get(&(q.to_lowercase(), name_lower))
+                .cloned()
+                .ok_or_else(|| {
+                    reserved_name_error(name)
+                        .unwrap_or_else(|| format!("Column '{}.{}' cannot be resolved.", q, name))
+                });
         }
-        if let Some(found) = self.unqualified.get(&name_lower) {
-            return Ok(found.clone());
-        }
-        Err(reserved_name_error(name)
-            .unwrap_or_else(|| format!("Column '{}' cannot be resolved.", name)))
+        self.unqualified.get(&name_lower).cloned().ok_or_else(|| {
+            reserved_name_error(name)
+                .unwrap_or_else(|| format!("Column '{}' cannot be resolved.", name))
+        })
     }
 
     /// Resolve a source-level column reference.  The scope itself owns no AST
@@ -409,8 +300,8 @@ impl AnalyzerScope {
         qualifier: Option<&str>,
         name: &str,
         span: Span,
-    ) -> Result<(ColumnId, DataType, bool), AnalyzeError> {
-        self.resolve(qualifier, name)
+    ) -> Result<(ColumnId, FunctionValueType), AnalyzeError> {
+        self.resolve_value_type(qualifier, name)
             .map_err(|message| AnalyzeError::unknown_column(message, span))
     }
 
@@ -421,27 +312,25 @@ impl AnalyzerScope {
     pub(super) fn add_iceberg_metadata_columns(
         &mut self,
         qualifier: &str,
-        columns: &[novarocks_types::schema::ColumnDef],
-    ) -> Vec<crate::column_id::ColumnId> {
-        let q_lower = qualifier.to_lowercase();
+        columns: &[ColumnDef],
+        control: &dyn PureCompileControl,
+    ) -> Result<Vec<ColumnId>, AnalyzeError> {
         let mut ids = Vec::with_capacity(columns.len());
         for col in columns {
-            let name_lower = col.name.to_lowercase();
+            let ty = super::helpers::column_value_type(col, control)?;
             let id = self.factory.borrow_mut().create(
                 Some(qualifier.to_string()),
                 col.name.clone(),
-                col.data_type.clone(),
-                col.nullable,
+                ty.clone(),
             );
             self.qualified.insert(
-                (q_lower.clone(), name_lower.clone()),
-                (id, col.data_type.clone(), col.nullable),
+                (qualifier.to_lowercase(), col.name.to_lowercase()),
+                (id, ty.clone()),
             );
-            self.unqualified
-                .insert(name_lower, (id, col.data_type.clone(), col.nullable));
+            self.unqualified.insert(col.name.to_lowercase(), (id, ty));
             ids.push(id);
         }
-        ids
+        Ok(ids)
     }
 
     /// Register Iceberg row-lineage pseudo-columns using pre-allocated ids.
@@ -453,24 +342,24 @@ impl AnalyzerScope {
     pub(super) fn add_iceberg_metadata_columns_with_ids(
         &mut self,
         qualifier: &str,
-        columns: &[novarocks_types::schema::ColumnDef],
-        column_ids: &[crate::column_id::ColumnId],
-    ) {
+        columns: &[ColumnDef],
+        column_ids: &[ColumnId],
+        control: &dyn PureCompileControl,
+    ) -> Result<(), AnalyzeError> {
         assert_eq!(
             columns.len(),
             column_ids.len(),
             "add_iceberg_metadata_columns_with_ids: columns/column_ids length mismatch"
         );
-        let q_lower = qualifier.to_lowercase();
-        for (col, &id) in columns.iter().zip(column_ids.iter()) {
-            let name_lower = col.name.to_lowercase();
+        for (col, &id) in columns.iter().zip(column_ids) {
+            let ty = super::helpers::column_value_type(col, control)?;
             self.qualified.insert(
-                (q_lower.clone(), name_lower.clone()),
-                (id, col.data_type.clone(), col.nullable),
+                (qualifier.to_lowercase(), col.name.to_lowercase()),
+                (id, ty.clone()),
             );
-            self.unqualified
-                .insert(name_lower, (id, col.data_type.clone(), col.nullable));
+            self.unqualified.insert(col.name.to_lowercase(), (id, ty));
         }
+        Ok(())
     }
 
     /// Merge another scope into this one (for JOINs).
@@ -482,14 +371,14 @@ impl AnalyzerScope {
     /// scope is widened -- the ON condition sees the values before padding,
     /// where the source's own nullability is still the truth.
     pub(super) fn mark_all_nullable(&mut self) {
-        for (_, _, nullable) in self.qualified.values_mut() {
-            *nullable = true;
+        for (_, ty) in self.qualified.values_mut() {
+            ty.nullable = true;
         }
-        for (_, _, nullable) in self.unqualified.values_mut() {
-            *nullable = true;
+        for (_, ty) in self.unqualified.values_mut() {
+            ty.nullable = true;
         }
-        for entry in &mut self.ordered {
-            entry.4 = true;
+        for (_, _, _, ty) in &mut self.ordered {
+            ty.nullable = true;
         }
     }
 
@@ -502,7 +391,7 @@ impl AnalyzerScope {
                 self.canonical_qualifier.insert(name.clone(), qualifier);
             }
         }
-        for ((qualifier, name), (id, dt, nullable)) in &other.qualified {
+        for ((qualifier, name), (id, dt)) in &other.qualified {
             // Left wins: in `t1 LEFT JOIN t1 AS t2`, the aliased-side scan
             // also registers its columns under the original table name
             // (`t1`) for SQL like `SELECT t1.c FROM t1 AS x` that mixes
@@ -517,12 +406,12 @@ impl AnalyzerScope {
             // (`join_range_direct_mapping` step 20).
             self.qualified
                 .entry((qualifier.clone(), name.clone()))
-                .or_insert_with(|| (*id, dt.clone(), *nullable));
+                .or_insert_with(|| (*id, dt.clone()));
         }
-        for (name, (id, dt, nullable)) in &other.unqualified {
+        for (name, (id, dt)) in &other.unqualified {
             self.unqualified
                 .entry(name.clone())
-                .or_insert_with(|| (*id, dt.clone(), *nullable));
+                .or_insert_with(|| (*id, dt.clone()));
         }
         for entry in &other.ordered {
             self.ordered.push(entry.clone());
@@ -576,7 +465,7 @@ impl AnalyzerScope {
     /// Iterate columns in declaration order (for SELECT * expansion).
     pub(super) fn iter_columns(
         &self,
-    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, DataType, bool)> {
+    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, FunctionValueType)> {
         self.ordered.iter()
     }
 
@@ -584,11 +473,11 @@ impl AnalyzerScope {
     pub(super) fn iter_qualified_columns(
         &self,
         qualifier: &str,
-    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, DataType, bool)> {
+    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, FunctionValueType)> {
         let q_lower = qualifier.to_lowercase();
         self.ordered
             .iter()
-            .filter(move |(q, _, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
+            .filter(move |(q, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
     }
 
     /// Register `COALESCE(left.col, right.col)` for every USING column.
@@ -629,7 +518,7 @@ impl AnalyzerScope {
         use crate::analysis::{ExprKind, TypedExpr};
         for col in using_cols {
             let col_lower = col.to_lowercase();
-            let Some((left_id, dt, _)) = self
+            let Some((left_id, dt)) = self
                 .qualified
                 .get(&(left_qual.to_lowercase(), col_lower.clone()))
             else {
@@ -645,7 +534,7 @@ impl AnalyzerScope {
             let (right_id, right_dt) = self
                 .qualified
                 .get(&(right_qual.to_lowercase(), col_lower.clone()))
-                .map_or((ColumnId::UNSET, dt.clone()), |(id, right_dt, _)| {
+                .map_or((ColumnId::UNSET, dt.clone()), |(id, right_dt)| {
                     (*id, right_dt.clone())
                 });
 
@@ -665,8 +554,7 @@ impl AnalyzerScope {
                         qualifier: Some(left_qual.to_string()),
                         column: col_lower.clone(),
                     },
-                    data_type: dt.clone(),
-                    nullable: true,
+                    value_type: super::helpers::with_nullability(dt.clone(), true),
                 });
             let right_ref = TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -674,8 +562,7 @@ impl AnalyzerScope {
                     qualifier: Some(right_qual.to_string()),
                     column: col_lower.clone(),
                 },
-                data_type: right_dt,
-                nullable: true,
+                value_type: super::helpers::with_nullability(right_dt, true),
             };
             // Bind the merged column the way any other call is bound: the
             // overload is chosen from the two sides' own types, each argument
@@ -688,7 +575,7 @@ impl AnalyzerScope {
                 vec![left_ref, right_ref],
                 decimal_overflow_policy,
             )?;
-            let data_type = bound.return_type().clone();
+            let value_type = super::helpers::with_nullability(bound.value_type().clone(), true);
             let coalesce = TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: crate::functions::builtin_function_volatility("coalesce"),
@@ -697,8 +584,7 @@ impl AnalyzerScope {
                     args: bound.args,
                     distinct: false,
                 },
-                data_type,
-                nullable: true,
+                value_type,
             };
             self.computed_columns.insert(col_lower, coalesce);
         }
@@ -734,14 +620,14 @@ impl AnalyzerScope {
             // Reverse-scan dedup: keep the *last* occurrence of each USING name.
             let mut keep_indices: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            for (idx, (_, name, _, _, _)) in self.ordered.iter().enumerate() {
+            for (idx, (_, name, _, _)) in self.ordered.iter().enumerate() {
                 let n = name.to_lowercase();
                 if names_lower.contains(&n) {
                     keep_indices.insert(n, idx);
                 }
             }
             let mut i = 0;
-            self.ordered.retain(|(_, name, _, _, _)| {
+            self.ordered.retain(|(_, name, _, _)| {
                 let n = name.to_lowercase();
                 let keep = if names_lower.contains(&n) {
                     keep_indices.get(&n) == Some(&i)
@@ -754,7 +640,7 @@ impl AnalyzerScope {
         } else {
             // Forward-scan dedup: keep the first occurrence of each USING name.
             let mut seen = std::collections::HashSet::new();
-            self.ordered.retain(|(_, name, _, _, _)| {
+            self.ordered.retain(|(_, name, _, _)| {
                 let n = name.to_lowercase();
                 if names_lower.contains(&n) {
                     seen.insert(n)
@@ -764,13 +650,13 @@ impl AnalyzerScope {
             });
         }
         // Move USING columns to the front in USING-clause order.
-        let mut front: Vec<(Option<String>, String, ColumnId, DataType, bool)> =
+        let mut front: Vec<(Option<String>, String, ColumnId, FunctionValueType)> =
             Vec::with_capacity(names_lower.len());
         for using_name in &names_lower {
             if let Some(pos) = self
                 .ordered
                 .iter()
-                .position(|(_, n, _, _, _)| n.to_lowercase() == *using_name)
+                .position(|(_, n, _, _)| n.to_lowercase() == *using_name)
             {
                 front.push(self.ordered.remove(pos));
             }
@@ -782,15 +668,14 @@ impl AnalyzerScope {
         // an unqualified `id1` in WHERE / SELECT / ORDER BY resolves to the
         // right-side binding (matching the column that wins in `ordered`).
         if prefer_right {
-            for (_, name, id, dt, nullable) in self
+            for (_, name, id, dt) in self
                 .ordered
                 .iter()
                 .take(names_lower.len())
                 .cloned()
                 .collect::<Vec<_>>()
             {
-                self.unqualified
-                    .insert(name.to_lowercase(), (id, dt, nullable));
+                self.unqualified.insert(name.to_lowercase(), (id, dt));
             }
         }
 
@@ -804,7 +689,7 @@ impl AnalyzerScope {
             .ordered
             .iter()
             .take(names_lower.len())
-            .map(|(q, n, _, _, _)| (n.to_lowercase(), q.clone()))
+            .map(|(q, n, _, _)| (n.to_lowercase(), q.clone()))
             .collect();
         for (name, qual) in collected {
             if let Some(q) = qual {
@@ -817,29 +702,28 @@ impl AnalyzerScope {
     /// Used when an alias is present and differs from the table name, so that
     /// both `alias.col` and `table.col` resolve but the duplicate does not
     /// appear in SELECT * expansion.
-    pub(super) fn add_table_qualified_only(&mut self, qualifier: &str, columns: &[ColumnDef]) {
-        let q_lower = qualifier.to_lowercase();
+    pub(super) fn add_table_qualified_only(
+        &mut self,
+        qualifier: &str,
+        columns: &[ColumnDef],
+        control: &dyn PureCompileControl,
+    ) -> Result<(), AnalyzeError> {
         for col in columns {
-            let name_lower = col.name.to_lowercase();
-            // Reuse existing ColumnId from the unqualified map if available,
-            // since this is just an alias for the same column.
-            let id = self
-                .unqualified
-                .get(&name_lower)
-                .map(|(id, _, _)| *id)
-                .unwrap_or_else(|| {
-                    self.factory.borrow_mut().create(
-                        Some(qualifier.to_string()),
-                        col.name.clone(),
-                        col.data_type.clone(),
-                        col.nullable,
-                    )
-                });
-            self.qualified.insert(
-                (q_lower.clone(), name_lower),
-                (id, col.data_type.clone(), col.nullable),
-            );
+            let ty = super::helpers::column_value_type(col, control)?;
+            let name = col.name.to_lowercase();
+            let id = if let Some((id, _)) = self.unqualified.get(&name) {
+                *id
+            } else {
+                self.factory.borrow_mut().create(
+                    Some(qualifier.to_string()),
+                    col.name.clone(),
+                    ty.clone(),
+                )
+            };
+            self.qualified
+                .insert((qualifier.to_lowercase(), name), (id, ty));
         }
+        Ok(())
     }
 }
 
@@ -863,6 +747,7 @@ fn reserved_name_error(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
+    use novarocks_type_contract::{FunctionValueType, PureCompileControl};
     use novarocks_types::schema::ColumnDef;
 
     fn test_factory() -> Rc<RefCell<ColumnRefFactory>> {
@@ -882,7 +767,13 @@ mod tests {
     #[test]
     fn rejects_row_id_on_non_iceberg_table() {
         let mut scope = AnalyzerScope::new(test_factory());
-        scope.add_table(Some("t"), &[col("id", DataType::Int64, false)]);
+        scope
+            .add_table(
+                Some("t"),
+                &[col("id", DataType::Int64, false)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
         assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
     }
@@ -903,7 +794,13 @@ mod tests {
     #[test]
     fn rejects_row_id_on_v2_iceberg_table_no_metadata_added() {
         let mut scope = AnalyzerScope::new(test_factory());
-        scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
+        scope
+            .add_table(
+                Some("ice"),
+                &[col("id", DataType::Int64, false)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
         // V2 path adds no row-lineage metadata columns.
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
         assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
@@ -912,14 +809,23 @@ mod tests {
     #[test]
     fn accepts_row_id_on_v3_row_lineage_table() {
         let mut scope = AnalyzerScope::new(test_factory());
-        scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
-        scope.add_iceberg_metadata_columns(
-            "ice",
-            &[
-                col("_row_id", DataType::Int64, false),
-                col("_last_updated_sequence_number", DataType::Int64, false),
-            ],
-        );
+        scope
+            .add_table(
+                Some("ice"),
+                &[col("id", DataType::Int64, false)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        scope
+            .add_iceberg_metadata_columns(
+                "ice",
+                &[
+                    col("_row_id", DataType::Int64, false),
+                    col("_last_updated_sequence_number", DataType::Int64, false),
+                ],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
         let (_id, ty, nullable) = scope.resolve(None, "_row_id").expect("ok");
         assert_eq!(ty, DataType::Int64);
         assert!(!nullable);
@@ -928,11 +834,23 @@ mod tests {
     #[test]
     fn select_star_does_not_expose_row_lineage_pseudo_columns() {
         let mut scope = AnalyzerScope::new(test_factory());
-        scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
-        scope.add_iceberg_metadata_columns("ice", &[col("_row_id", DataType::Int64, false)]);
+        scope
+            .add_table(
+                Some("ice"),
+                &[col("id", DataType::Int64, false)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        scope
+            .add_iceberg_metadata_columns(
+                "ice",
+                &[col("_row_id", DataType::Int64, false)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
         let names: Vec<_> = scope
             .iter_columns()
-            .map(|(_, n, _, _, _)| n.as_str())
+            .map(|(_, n, _, _)| n.as_str())
             .collect();
         assert_eq!(names, vec!["id"]);
     }

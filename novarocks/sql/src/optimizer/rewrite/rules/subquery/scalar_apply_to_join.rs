@@ -209,19 +209,21 @@ fn apply_opt(
     let inner_scalar_nullable =
         scalar_utils::find_column_nullable(&right, arena, a.inner_output_column_id).unwrap_or(true);
 
-    let cnt_id = factory.create(None, "count(1)".to_string(), DataType::Int64, false);
+    let cnt_id = factory.create(
+        None,
+        "count(1)".to_string(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+    );
     let anyval_id = factory.create(
         None,
         "any_value".to_string(),
-        inner_scalar_type.clone(),
-        true,
+        novarocks_type_contract::FunctionValueType::new(inner_scalar_type.clone(), true),
     );
     // Mint internal assertion column id.
     let assert_id = factory.create(
         None,
         "__subquery_assertion".to_string(),
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     );
     drop(factory);
 
@@ -248,8 +250,10 @@ fn apply_opt(
     // Build the vector aggregate: group by corr-key, count(1), any_value(scalar).
     let inner_scalar_ref = arena.intern(
         ScalarNode::ColumnRef(a.inner_output_column_id),
-        inner_scalar_type.clone(),
-        inner_scalar_nullable,
+        novarocks_type_contract::FunctionValueType::new(
+            inner_scalar_type.clone(),
+            inner_scalar_nullable,
+        ),
     );
     let count_argument = scalar_utils::int_literal(arena, 1);
     let count_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
@@ -284,15 +288,18 @@ fn apply_opt(
     let cnt_output = OutputColumn {
         column_id: cnt_id,
         name: "count(1)".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
         is_internal: false,
     };
     let anyval_output = OutputColumn {
         column_id: anyval_id,
         name: "any_value".to_string(),
-        data_type: inner_scalar_type.clone(),
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            inner_scalar_type.clone(),
+            true,
+        ),
+
         is_internal: false,
     };
     agg_output_cols.push(cnt_output.clone());
@@ -342,15 +349,14 @@ fn apply_opt(
 
     // Build the assert_true condition: cnt IS NULL OR cnt <= 1
     let mut joined_cnt_output = cnt_output.clone();
-    joined_cnt_output.nullable = true;
+    joined_cnt_output.value_type.nullable = true;
     let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output);
     let cnt_is_null = arena.intern(
         ScalarNode::IsNull {
             child: cnt_ref,
             negated: false,
         },
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     );
     let one = scalar_utils::int_literal(arena, 1);
     let cnt_le_1 =
@@ -416,8 +422,7 @@ fn build_output_project_items(
 
     let inner_col_ref = arena.intern(
         ScalarNode::ColumnRef(inner_output_column_id),
-        inner_out_type.clone(),
-        inner_nullable,
+        novarocks_type_contract::FunctionValueType::new(inner_out_type.clone(), inner_nullable),
     );
 
     let scalar_expr =
@@ -478,8 +483,8 @@ fn ensure_exposes_columns(
             .unwrap_or_else(|| OutputColumn {
                 column_id,
                 name: format!("col_{}", column_id.0),
-                data_type: arena.data_type(*group_key).clone(),
-                nullable: arena.nullable(*group_key),
+                value_type: arena.value_type(*group_key).clone(),
+
                 is_internal: false,
             });
         new_items.push(ScalarProjectItem {
@@ -550,8 +555,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, false),
         }
     }
 
@@ -562,8 +566,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, true),
         }
     }
 
@@ -575,8 +578,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -603,8 +605,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: T1_K,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -630,15 +635,21 @@ mod tests {
                     OutputColumn {
                         column_id: T2_K,
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: T2_V2,
                         name: "v2".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -691,8 +702,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,
                     name: "max(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -719,8 +733,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -815,8 +832,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,
@@ -906,15 +926,21 @@ mod tests {
                     OutputColumn {
                         column_id: T2_K,
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: MAX_RESULT,
                         name: "max(v2)".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -937,8 +963,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -1032,8 +1061,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,
@@ -1200,7 +1232,7 @@ mod tests {
         };
         assert_eq!(*isnull_id, cnt_id, "IS NULL must check cnt column");
         assert!(
-            isnull_expr.nullable,
+            isnull_expr.value_type.nullable,
             "LEFT OUTER JOIN can null-extend count(1), so the row-check reference must be nullable"
         );
 
@@ -1222,7 +1254,7 @@ mod tests {
         };
         assert_eq!(*le_id, cnt_id, "<= must check cnt column");
         assert!(
-            le_left.nullable,
+            le_left.value_type.nullable,
             "LEFT OUTER JOIN can null-extend count(1), so the comparison reference must be nullable"
         );
         let ExprKind::Literal(LiteralValue::Int(1)) = &le_right.kind else {
@@ -1256,8 +1288,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,

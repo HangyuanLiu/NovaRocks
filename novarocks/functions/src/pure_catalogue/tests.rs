@@ -391,6 +391,7 @@ fn call_input<'a>(
         kind: FunctionKind::Scalar,
         selected,
         request: FunctionBindingRequest {
+            expected_result_type: None,
             arguments,
             logical_argument_count: arguments.len(),
         },
@@ -752,6 +753,7 @@ fn same_actual_owner_resolves_refines_and_prepares_fresh_and_frozen_and_scalar_c
     let catalog = catalogue(owner.clone(), false);
     let arguments = scalar_arguments();
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &arguments,
         logical_argument_count: 1,
     };
@@ -851,6 +853,7 @@ fn mixed_scalar_higher_order_owner_chooses_exact_overload_abi_without_cross_life
     let catalog = catalogue(owner.clone(), true);
     let arguments = higher_arguments();
     let request = FunctionBindingRequest {
+        expected_result_type: None,
         arguments: &arguments,
         logical_argument_count: 2,
     };
@@ -935,6 +938,7 @@ fn unknown_ids_overloads_and_inaccurate_frozen_selected_kind_options_fail_before
     let selected = Arc::new(
         owner
             .resolve(FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &arguments,
                 logical_argument_count: 1,
             })
@@ -1050,6 +1054,7 @@ fn registered_metadata_cannot_hide_different_owner_effect_source_and_control_typ
     let selected = Arc::new(
         owner
             .resolve(FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &arguments,
                 logical_argument_count: 1,
             })
@@ -1082,6 +1087,7 @@ fn registered_metadata_cannot_hide_different_owner_effect_source_and_control_typ
             let selected = Arc::new(
                 owner
                     .resolve(FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &arguments,
                         logical_argument_count: 1,
                     })
@@ -1196,6 +1202,7 @@ fn exact_control_intrinsic_coalesce_fresh_frozen_keeps_descriptor_and_skips_ordi
             "catalogue_fixture",
             FunctionKind::Scalar,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &arguments,
                 logical_argument_count: 1,
             },

@@ -38,6 +38,7 @@ mod bitmap_base64_type_tests {
                 constant: None,
             }];
             let request = FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &arguments,
                 logical_argument_count: 1,
             };
@@ -64,6 +65,7 @@ mod bitmap_base64_type_tests {
                 .validate_bound(
                     &binding,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &coerced,
                         logical_argument_count: 1,
                     },
@@ -89,6 +91,7 @@ mod bitmap_base64_type_tests {
                         "bitmap_to_base64",
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
+                            expected_result_type: None,
                             arguments: &arguments,
                             logical_argument_count: arguments.len()
                         }

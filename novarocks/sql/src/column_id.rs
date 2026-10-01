@@ -83,11 +83,7 @@ pub(crate) struct ColumnMeta {
     pub id: ColumnId,
     pub name: String,
     pub qualifier: Option<String>,
-    pub data_type: DataType,
-    pub nullable: bool,
-    /// SQL logical provenance for physically ambiguous scalar carriers.
-    pub logical_type: Option<novarocks_types::schema::SqlType>,
-    pub json_list_provenance: bool,
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +100,7 @@ pub(crate) struct ColumnMeta {
 #[derive(Clone, Debug)]
 pub(crate) struct ColumnRefFactory {
     next_id: u32,
-    columns: Vec<ColumnMeta>,
+    columns: Vec<Option<ColumnMeta>>,
 }
 
 impl ColumnRefFactory {
@@ -120,20 +116,16 @@ impl ColumnRefFactory {
         &mut self,
         qualifier: Option<String>,
         name: String,
-        data_type: DataType,
-        nullable: bool,
+        value_type: novarocks_type_contract::FunctionValueType,
     ) -> ColumnId {
         let id = ColumnId(self.next_id);
         self.next_id += 1;
-        self.columns.push(ColumnMeta {
+        self.columns.push(Some(ColumnMeta {
             id,
             name,
             qualifier,
-            data_type,
-            nullable,
-            logical_type: None,
-            json_list_provenance: false,
-        });
+            value_type,
+        }));
         id
     }
 
@@ -143,17 +135,9 @@ impl ColumnRefFactory {
     pub(crate) fn reserve_until(&mut self, next_id: u32) {
         let next_id = next_id.max(1);
         while self.next_id < next_id {
-            let id = ColumnId(self.next_id);
             self.next_id += 1;
-            self.columns.push(ColumnMeta {
-                id,
-                name: format!("__reserved_col_{}", id.0),
-                qualifier: None,
-                data_type: DataType::Null,
-                nullable: true,
-                logical_type: None,
-                json_list_provenance: false,
-            });
+            // A reserved identity has no authored column or value domain.
+            self.columns.push(None);
         }
     }
 
@@ -168,33 +152,43 @@ impl ColumnRefFactory {
             id.0,
             self.columns.len()
         );
-        &self.columns[(id.0 - 1) as usize]
+        self.columns[(id.0 - 1) as usize]
+            .as_ref()
+            .expect("reserved ColumnId has no source metadata")
     }
 
-    /// Freeze semantic provenance alongside the query-local column identity.
-    pub(crate) fn set_logical_type(
-        &mut self,
+    /// Read the complete admitted schema identity. Scope-specific null padding
+    /// belongs to the scope's borrowed projection, not this source record.
+    pub(crate) fn value_type(
+        &self,
         id: ColumnId,
-        logical_type: Option<novarocks_types::schema::SqlType>,
-    ) {
-        self.get(id);
-        self.columns[(id.0 - 1) as usize].logical_type = logical_type;
-    }
-
-    pub(crate) fn set_json_list_provenance(&mut self, id: ColumnId, proven: bool) {
-        self.get(id);
-        self.columns[(id.0 - 1) as usize].json_list_provenance = proven;
+    ) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.columns
+            .get(id.0.checked_sub(1)? as usize)
+            .and_then(|column| column.as_ref().map(|column| &column.value_type))
     }
 
     pub(crate) fn has_json_list_provenance(&self, id: ColumnId) -> bool {
-        id.0.checked_sub(1)
-            .and_then(|index| self.columns.get(index as usize))
-            .is_some_and(|column| column.json_list_provenance)
+        self.value_type(id).is_some_and(|ty| match &ty.data_type {
+            DataType::List(field) => field
+                .metadata()
+                .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+                .is_some_and(|value| value == "json"),
+            _ => false,
+        })
     }
 
     pub(crate) fn logical_type(&self, id: ColumnId) -> Option<novarocks_types::schema::SqlType> {
-        let index = id.0.checked_sub(1)? as usize;
-        self.columns.get(index)?.logical_type.clone()
+        use novarocks_type_contract::ValueLogicalType;
+        use novarocks_types::schema::SqlType;
+        match self.value_type(id)?.logical_type {
+            ValueLogicalType::Json => Some(SqlType::Json),
+            ValueLogicalType::Hll => Some(SqlType::Hll),
+            ValueLogicalType::Bitmap => Some(SqlType::Bitmap),
+            ValueLogicalType::Variant => Some(SqlType::Variant),
+            ValueLogicalType::LargeInt => Some(SqlType::LargeInt),
+            _ => None,
+        }
     }
 
     /// Return a human-readable display name for the column: `"qualifier.name"`
@@ -255,16 +249,24 @@ mod tests {
     #[test]
     fn reserve_until_advances_future_allocations_without_sparse_metadata() {
         let mut factory = ColumnRefFactory::new();
-        let first = factory.create(None, "a".to_string(), DataType::Int64, false);
+        let first = factory.create(
+            None,
+            "a".to_string(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         assert_eq!(first, ColumnId(1));
 
         factory.reserve_until(5);
 
         assert_eq!(factory.peek_next_id(), 5);
         assert_eq!(factory.len(), 4);
-        assert_eq!(factory.column_name(ColumnId(3)), "__reserved_col_3");
+        assert!(factory.value_type(ColumnId(3)).is_none());
 
-        let next = factory.create(None, "b".to_string(), DataType::Utf8, true);
+        let next = factory.create(
+            None,
+            "b".to_string(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
         assert_eq!(next, ColumnId(5));
         assert_eq!(factory.column_name(next), "b");
     }

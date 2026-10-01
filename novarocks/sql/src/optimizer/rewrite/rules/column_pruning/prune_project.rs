@@ -54,8 +54,7 @@ fn intern_const_one(arena: &mut ScalarArena) -> ScalarId {
     use crate::common::LiteralValue;
     arena.intern(
         ScalarNode::Literal(scalar::HashableLiteral(LiteralValue::Int(1))),
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     )
 }
 
@@ -213,22 +212,31 @@ mod tests {
                 OutputColumn {
                     column_id: id_a,
                     name: "a".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 },
                 OutputColumn {
                     column_id: id_b,
                     name: "b".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 },
                 OutputColumn {
                     column_id: id_c,
                     name: "c".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 },
             ],
@@ -241,7 +249,10 @@ mod tests {
 
     /// Intern a simple column-ref expression into the arena.
     fn col_ref_item(arena: &mut ScalarArena, id: ColumnId, name: &str) -> ScalarProjectItem {
-        let expr = arena.intern(ScalarNode::ColumnRef(id), DataType::Int32, false);
+        let expr = arena.intern(
+            ScalarNode::ColumnRef(id),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        );
         ScalarProjectItem {
             expr,
             output_name: name.to_string(),
@@ -449,7 +460,10 @@ mod tests {
         let items = {
             let mut arena = arena_rc.borrow_mut();
             // x → out_x item
-            let x_expr = arena.intern(ScalarNode::ColumnRef(id_x), DataType::Int32, false);
+            let x_expr = arena.intern(
+                ScalarNode::ColumnRef(id_x),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+            );
             let x_item = ScalarProjectItem {
                 expr: x_expr,
                 output_name: "x".to_string(),
@@ -461,8 +475,7 @@ mod tests {
                 ScalarNode::Literal(scalar::HashableLiteral(
                     crate::analysis::LiteralValue::Bool(true),
                 )),
-                DataType::Boolean,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             );
             let binding = crate::optimizer::scalar::test_function_binding(
                 &arena,
@@ -480,8 +493,7 @@ mod tests {
                     args: vec![true_lit],
                     distinct: false,
                 },
-                DataType::Boolean,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             );
             let assert_item = ScalarProjectItem {
                 expr: assert_expr,
@@ -549,7 +561,7 @@ mod tests {
             let Operator::LogicalScan(scan_op) = &mut scan.op else {
                 unreachable!()
             };
-            scan_op.columns[1].data_type = DataType::Decimal128(38, 0);
+            scan_op.columns[1].value_type.data_type = DataType::Decimal128(38, 0);
             scan_op.table.columns[1].data_type = DataType::Decimal128(38, 0);
             let items = {
                 let mut arena = arena_rc.borrow_mut();
@@ -557,8 +569,10 @@ mod tests {
                 plain.output_column_id = kept;
                 let source = arena.intern(
                     ScalarNode::ColumnRef(unused_input),
-                    DataType::Decimal128(38, 0),
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(
+                        DataType::Decimal128(38, 0),
+                        true,
+                    ),
                 );
                 let expr = arena.intern(
                     ScalarNode::BinaryOp {
@@ -567,8 +581,10 @@ mod tests {
                         right: source,
                         decimal_overflow_policy: policy,
                     },
-                    DataType::Decimal128(38, 0),
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(
+                        DataType::Decimal128(38, 0),
+                        true,
+                    ),
                 );
                 vec![
                     plain,

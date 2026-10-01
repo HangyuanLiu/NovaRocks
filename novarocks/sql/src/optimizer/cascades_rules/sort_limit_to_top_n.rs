@@ -280,8 +280,10 @@ mod tests {
                 qualifier: None,
                 column: "p".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
         };
         let partition_expr = intern_typed(&mut memo.scalars, &partition_expr);
 

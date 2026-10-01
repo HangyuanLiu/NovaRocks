@@ -174,8 +174,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+
             is_internal: false,
         }
     }
@@ -215,16 +215,14 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn bool_expr() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -232,8 +230,8 @@ mod tests {
         OutputColumn {
             column_id: EXISTS_OUT,
             name: "exists".to_string(),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             is_internal: true,
         }
     }
@@ -246,8 +244,7 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -278,8 +275,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "1".to_string(),
                     output_column_id: CONST_ONE,
@@ -407,8 +406,8 @@ mod tests {
             condition.kind,
             ExprKind::Literal(LiteralValue::Bool(true))
         ));
-        assert_eq!(condition.data_type, DataType::Boolean);
-        assert!(!condition.nullable);
+        assert_eq!(condition.value_type.data_type, DataType::Boolean);
+        assert!(!condition.value_type.nullable);
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {

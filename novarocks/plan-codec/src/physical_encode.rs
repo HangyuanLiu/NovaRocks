@@ -1674,6 +1674,7 @@ fn validate_table_binding(
         .validate_bound(
             &bound,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &request_arguments,
                 logical_argument_count: request_arguments.len(),
             },
@@ -1784,6 +1785,7 @@ fn validate_bound_function(
         .validate_bound(
             &bound,
             FunctionBindingRequest {
+                expected_result_type: None,
                 arguments,
                 logical_argument_count,
             },

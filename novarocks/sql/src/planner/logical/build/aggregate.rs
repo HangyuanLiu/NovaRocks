@@ -30,12 +30,7 @@ pub(super) fn expr_column_id(
     if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
         *column_id
     } else {
-        factory.create(
-            None,
-            name.to_string(),
-            expr.data_type.clone(),
-            expr.nullable,
-        )
+        factory.create(None, name.to_string(), expr.value_type.clone())
     }
 }
 
@@ -92,7 +87,7 @@ pub(super) fn prepare_repeat_input(
         let Some(source_expr) = select.group_by.get(idx).cloned() else {
             continue;
         };
-        let data_type = source_expr.data_type.clone();
+        let data_type = source_expr.value_type.data_type.clone();
         // Repeat's whole job is to null this key out on the levels whose
         // grouping set leaves it out, which is why the substitution below
         // points downstream reads at the materialized slot. A key that any
@@ -110,10 +105,13 @@ pub(super) fn prepare_repeat_input(
                     .any(|column| column.to_ascii_lowercase() == name)
             })
         });
-        let nullable = source_expr.nullable || nulled_by_some_level;
+        let nullable = source_expr.value_type.nullable || nulled_by_some_level;
         let original_display = typed_expr_display_name(&source_expr);
-        let materialized_column_id =
-            factory.create(None, alias_name.clone(), data_type.clone(), nullable);
+        let materialized_column_id = factory.create(
+            None,
+            alias_name.clone(),
+            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
+        );
         if let Some((original_name, _)) = grouping_key_aliases.get(idx) {
             repeat_key_ids_by_name
                 .insert(original_name.to_ascii_lowercase(), materialized_column_id);
@@ -130,8 +128,7 @@ pub(super) fn prepare_repeat_input(
                 qualifier: Some(repeat_group_qualifier.to_string()),
                 column: alias_name.clone(),
             },
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         };
         substitutions.push(RepeatSubstitution {
             display_name: original_display,
@@ -363,8 +360,11 @@ pub(super) fn split_projection_for_aggregate(
         OutputColumn {
             column_id: call.output_column_id,
             name,
-            data_type: call.result_type.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                call.result_type.clone(),
+                true,
+            ),
+
             is_internal: false,
         }
     }));
@@ -432,8 +432,11 @@ pub(super) fn ensure_aggregate_output_columns(agg: &mut LogicalAggregateNode) {
                 call.distinct,
                 &call.order_by,
             ),
-            data_type: call.result_type.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                call.result_type.clone(),
+                true,
+            ),
+
             is_internal: true,
         });
     }
@@ -504,8 +507,7 @@ pub(super) fn planner_repeat_original_group_by_targets(
                         qualifier: None,
                         column: original_name.clone(),
                     },
-                    data_type: target.expr.data_type.clone(),
-                    nullable: target.expr.nullable,
+                    value_type: target.expr.value_type.clone(),
                 },
                 column_id: target.column_id,
                 display_name: target.display_name.clone(),
@@ -526,8 +528,8 @@ fn group_by_output_column(
         return OutputColumn {
             column_id: expr_column_id(&item.expr, &item.output_name, factory),
             name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
+
             is_internal: false,
         };
     }
@@ -536,8 +538,8 @@ fn group_by_output_column(
     OutputColumn {
         column_id: expr_column_id(group_by, &name, factory),
         name,
-        data_type: group_by.data_type.clone(),
-        nullable: group_by.nullable,
+        value_type: group_by.value_type.clone(),
+
         is_internal: true,
     }
 }
@@ -571,8 +573,7 @@ pub(super) fn rewrite_agg_calls_to_refs(
                 qualifier: None,
                 column: display,
             },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
         };
     }
     rewrite_expr_children(expr, |child| rewrite_agg_calls_to_refs(child, agg_calls))
@@ -590,8 +591,7 @@ pub(super) fn rewrite_group_by_expr_refs(
                     qualifier: None,
                     column: target.display_name.clone(),
                 },
-                data_type: expr.data_type.clone(),
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
             };
         }
     }
@@ -755,8 +755,7 @@ pub(super) fn rewrite_expr_children(
     };
     TypedExpr {
         kind,
-        data_type: expr.data_type.clone(),
-        nullable: expr.nullable,
+        value_type: expr.value_type.clone(),
     }
 }
 
@@ -1153,13 +1152,12 @@ pub(super) fn collect_aggregates(
             });
             if !already {
                 let display = agg_call_display_name_from_parts(name, args, *distinct, order_by);
-                let output_column_id =
-                    factory.create(None, display, expr.data_type.clone(), expr.nullable);
+                let output_column_id = factory.create(None, display, expr.value_type.clone());
                 out.push(AggregateCall {
                     name: name.clone(),
                     args: args.clone(),
                     distinct: *distinct,
-                    result_type: expr.data_type.clone(),
+                    result_type: expr.value_type.data_type.clone(),
                     order_by: order_by.clone(),
                     output_column_id,
                     resolved: resolved.clone(),

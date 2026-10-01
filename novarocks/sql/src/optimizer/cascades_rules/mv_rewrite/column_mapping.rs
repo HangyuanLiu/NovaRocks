@@ -237,11 +237,9 @@ impl MvColumnMap {
             && let Some(col) = self.by_norm.get(&n)
         {
             arena.remember_project_output_display(col.column_id, None, col.name.clone());
-            return Some(arena.intern(
-                ScalarNode::ColumnRef(col.column_id),
-                col.data_type.clone(),
-                col.nullable,
-            ));
+            return Some(
+                arena.intern(ScalarNode::ColumnRef(col.column_id), col.value_type.clone()),
+            );
         }
         // Not a whole-tree match: recurse; a remaining bare base ColumnRef
         // means the MV does not materialize this column -> fail.
@@ -386,11 +384,7 @@ fn rewrite_children(
         | ScalarNode::Lambda { .. }
         | ScalarNode::IsTruthValue { .. } => return None,
     };
-    Some(arena.intern(
-        rewritten,
-        arena.data_type(original).clone(),
-        arena.nullable(original),
-    ))
+    Some(arena.intern(rewritten, arena.value_type(original).clone()))
 }
 
 #[cfg(test)]
@@ -410,8 +404,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -423,16 +417,14 @@ mod tests {
                 qualifier: None,
                 column: c.name.clone(),
             },
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
+            value_type: c.value_type.clone(),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -448,8 +440,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
         }
     }
 
@@ -552,8 +543,7 @@ mod tests {
                     distinct,
                 ),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         };
         assert_ne!(
             normalize(&agg(false), &nm).expect("count(a)"),
@@ -650,8 +640,7 @@ mod tests {
                 when_then: vec![(when, then)],
                 else_expr: else_expr.map(Box::new),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 

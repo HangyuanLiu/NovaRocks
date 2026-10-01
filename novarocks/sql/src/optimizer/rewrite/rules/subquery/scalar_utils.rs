@@ -42,8 +42,8 @@ pub(super) fn opt_output_columns(
             .map(|item| OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: arena.data_type(item.expr).clone(),
-                nullable: arena.nullable(item.expr),
+                value_type: arena.value_type(item.expr).clone(),
+
                 is_internal: false,
             })
             .collect()),
@@ -61,8 +61,8 @@ pub(super) fn opt_output_columns(
         Operator::LogicalGenerateSeries(series) => Ok(vec![OutputColumn {
             column_id: series.output_column_id,
             name: series.column_name.clone(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }]),
         Operator::LogicalCTEProduce(produce) => Ok(produce.output_columns.clone()),
@@ -131,7 +131,7 @@ fn join_output_columns(
 
 fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     columns
 }
@@ -140,8 +140,7 @@ pub(super) fn column_ref(arena: &mut ScalarArena, column: &OutputColumn) -> Scal
     arena.remember_project_output_display(column.column_id, None, column.name.clone());
     arena.intern(
         ScalarNode::ColumnRef(column.column_id),
-        column.data_type.clone(),
-        column.nullable,
+        column.value_type.clone(),
     )
 }
 
@@ -160,24 +159,21 @@ pub(super) fn project_item_for_column(
 pub(super) fn bool_literal(arena: &mut ScalarArena, value: bool) -> ScalarId {
     arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(value))),
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     )
 }
 
 pub(super) fn int_literal(arena: &mut ScalarArena, value: i64) -> ScalarId {
     arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-        DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     )
 }
 
 pub(super) fn string_literal(arena: &mut ScalarArena, value: impl Into<String>) -> ScalarId {
     arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::String(value.into()))),
-        DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
     )
 }
 
@@ -196,8 +192,7 @@ pub(super) fn binary_op(
             right,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type,
-        nullable,
+        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
     )
 }
 
@@ -280,7 +275,7 @@ pub(super) fn find_column_type(
     column_id: ColumnId,
 ) -> Option<DataType> {
     find_output_column(&opt_output_columns(expr, arena).ok()?, column_id)
-        .map(|column| column.data_type.clone())
+        .map(|column| column.value_type.data_type.clone())
 }
 
 pub(super) fn find_column_nullable(
@@ -289,7 +284,7 @@ pub(super) fn find_column_nullable(
     column_id: ColumnId,
 ) -> Option<bool> {
     find_output_column(&opt_output_columns(expr, arena).ok()?, column_id)
-        .map(|column| column.nullable)
+        .map(|column| column.value_type.nullable)
 }
 
 pub(super) fn is_count_aggregate_result(
@@ -522,7 +517,10 @@ where
             return Some(expr);
         }
     };
-    Some(arena.intern(rebuilt, data_type, nullable))
+    Some(arena.intern(
+        rebuilt,
+        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+    ))
 }
 
 fn rewrite_vec<F>(
@@ -577,8 +575,7 @@ pub(super) fn coalesce_false(
             distinct: false,
             binding,
         },
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     ))
 }
 
@@ -604,8 +601,7 @@ pub(super) fn ifnull_zero(
             distinct: false,
             binding,
         },
-        result_type,
-        false,
+        novarocks_type_contract::FunctionValueType::new(result_type, false),
     ))
 }
 
@@ -631,8 +627,7 @@ pub(super) fn assert_true(
             distinct: false,
             binding,
         },
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     ))
 }
 
@@ -685,8 +680,8 @@ pub(super) fn output_for_scalar(
     OutputColumn {
         column_id,
         name: name.into(),
-        data_type: arena.data_type(scalar).clone(),
-        nullable: arena.nullable(scalar),
+        value_type: arena.value_type(scalar).clone(),
+
         is_internal,
     }
 }
@@ -763,8 +758,8 @@ mod tests {
         OutputColumn {
             column_id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -774,7 +769,10 @@ mod tests {
         let mut arena = ScalarArena::new();
         let group_id = ColumnId::new_for_test(1);
         let count_id = ColumnId::new_for_test(2);
-        let group = arena.intern(ScalarNode::ColumnRef(group_id), DataType::Int64, false);
+        let group = arena.intern(
+            ScalarNode::ColumnRef(group_id),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let aggregate = OptExpr::new(
             Operator::LogicalAggregate(LogicalAggregateOp::single(
                 vec![group],
@@ -823,20 +821,20 @@ mod tests {
             &arena,
         )
         .expect("left outer output columns");
-        assert!(!left_outer[0].nullable);
-        assert!(left_outer[1].nullable);
+        assert!(!left_outer[0].value_type.nullable);
+        assert!(left_outer[1].value_type.nullable);
 
         let right_outer = opt_output_columns(
             &join(left.clone(), right.clone(), JoinKind::RightOuter, None),
             &arena,
         )
         .expect("right outer output columns");
-        assert!(right_outer[0].nullable);
-        assert!(!right_outer[1].nullable);
+        assert!(right_outer[0].value_type.nullable);
+        assert!(!right_outer[1].value_type.nullable);
 
         let full_outer = opt_output_columns(&join(left, right, JoinKind::FullOuter, None), &arena)
             .expect("full outer output columns");
-        assert!(full_outer[0].nullable);
-        assert!(full_outer[1].nullable);
+        assert!(full_outer[0].value_type.nullable);
+        assert!(full_outer[1].value_type.nullable);
     }
 }

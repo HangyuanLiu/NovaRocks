@@ -567,6 +567,7 @@ mod tests {
             kind: FunctionKind::Scalar,
             selected: &selected,
             request: FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &args,
                 logical_argument_count: 1,
             },
@@ -623,6 +624,7 @@ mod tests {
             result.compose_for_use(
                 CallEffectInput {
                     request: FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &other_args,
                         logical_argument_count: 1
                     },
@@ -799,6 +801,7 @@ mod tests {
             kind: FunctionKind::Scalar,
             selected: &selected,
             request: FunctionBindingRequest {
+                expected_result_type: None,
                 arguments: &args,
                 logical_argument_count: 1,
             },

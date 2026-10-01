@@ -62,3 +62,6 @@ pub use slot_id::SlotId;
 /// default stack. All application and execution runtime builders use this
 /// shared process-independent sizing contract.
 pub const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+mod column_value_type;
+pub use column_value_type::{ColumnValueTypeError, sql_type_from_value_type};

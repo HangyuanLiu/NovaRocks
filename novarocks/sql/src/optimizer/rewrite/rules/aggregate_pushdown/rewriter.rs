@@ -87,26 +87,17 @@ fn column_ref_scalar(
     arena: &mut ScalarArena,
     column_id: ColumnId,
     name: String,
-    data_type: arrow::datatypes::DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
 ) -> ScalarId {
     arena.remember_source_column_display(column_id, None, name);
-    arena.intern(ScalarNode::ColumnRef(column_id), data_type, nullable)
+    arena.intern(ScalarNode::ColumnRef(column_id), value_type)
 }
 
-fn aggregate_result_type(
-    original: &LogicalAggregateOp,
-    idx: usize,
-    spec: &ScalarAggregateSpec,
-    arena: &ScalarArena,
-) -> arrow::datatypes::DataType {
-    original
-        .output_layout
-        .aggregate_columns
-        .get(idx)
-        .map(|c| c.data_type.clone())
-        .or_else(|| spec.args.first().map(|id| arena.data_type(*id).clone()))
-        .unwrap_or(arrow::datatypes::DataType::Int64)
+fn aggregate_result_type(spec: &ScalarAggregateSpec) -> novarocks_type_contract::FunctionValueType {
+    let mut value_type = crate::functions::aggregate_result_type(&spec.resolved).clone();
+    // Preserve the existing pushdown-output root nullability widening.
+    value_type.nullable = true;
+    value_type
 }
 
 fn group_key_output_column_from_scalar(
@@ -121,12 +112,7 @@ fn group_key_output_column_from_scalar(
         _ => {
             let name = group_by_display_name(gb_id, arena);
             (
-                column_ref_factory.create(
-                    None,
-                    name.clone(),
-                    arena.data_type(gb_id).clone(),
-                    arena.nullable(gb_id),
-                ),
+                column_ref_factory.create(None, name.clone(), arena.value_type(gb_id).clone()),
                 name,
             )
         }
@@ -134,8 +120,8 @@ fn group_key_output_column_from_scalar(
     OutputColumn {
         column_id,
         name,
-        data_type: arena.data_type(gb_id).clone(),
-        nullable: arena.nullable(gb_id),
+        value_type: arena.value_type(gb_id).clone(),
+
         is_internal: false,
     }
 }
@@ -181,17 +167,14 @@ pub(crate) fn rewrite(
     //    and becomes SUM at final.
     //
     //    Each partial spec gets a fresh synthetic ColumnId so the final aggregate
-    //    can reference the partial output. We derive the output column metadata
-    //    from the args (DataType comes from the original spec's output column).
-    //
-    //    To obtain the result DataType we look up the aggregate output layout.
+    //    can reference the partial output. Both nodes are Single-phase calls:
+    //    each publishes its selected full result domain, not encoded state.
     let group_by_len = original.group_by.len();
 
     let partial_specs_and_output_cols: Vec<(ScalarAggregateSpec, OutputColumn)> =
         partial_aggregates
             .iter()
-            .enumerate()
-            .map(|(idx, spec)| {
+            .map(|spec| {
                 let partial_name = partial_fn_name(&spec.name);
                 let partial_args = spec.args.clone();
                 let display_name = scalar_expr::aggregate_display_name(
@@ -201,14 +184,10 @@ pub(crate) fn rewrite(
                     false,
                     &[],
                 );
-                // Result type comes from the original aggregate's output column.
-                let result_type = aggregate_result_type(original, idx, spec, arena);
-                let partial_col_id = column_ref_factory.create(
-                    None,
-                    display_name.clone(),
-                    result_type.clone(),
-                    true,
-                );
+                // The same selected partial call supplies the complete result domain.
+                let result_type = aggregate_result_type(spec);
+                let partial_col_id =
+                    column_ref_factory.create(None, display_name.clone(), result_type.clone());
                 let partial_spec = ScalarAggregateSpec {
                     output_column_id: partial_col_id,
                     name: partial_name,
@@ -220,8 +199,8 @@ pub(crate) fn rewrite(
                 let output_col = OutputColumn {
                     column_id: partial_col_id,
                     name: display_name,
-                    data_type: result_type,
-                    nullable: true,
+                    value_type: result_type,
+
                     is_internal: false,
                 };
                 Ok((partial_spec, output_col))
@@ -293,13 +272,8 @@ pub(crate) fn rewrite(
         .iter()
         .zip(partial_agg_output_cols.iter())
         .map(|(orig_spec, pc)| -> Result<_, String> {
-            let arg_id = column_ref_scalar(
-                arena,
-                pc.column_id,
-                pc.name.clone(),
-                pc.data_type.clone(),
-                pc.nullable,
-            );
+            let arg_id =
+                column_ref_scalar(arena, pc.column_id, pc.name.clone(), pc.value_type.clone());
             let name = final_fn_name(&orig_spec.name);
             let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
                 function_catalog,
@@ -331,16 +305,15 @@ pub(crate) fn rewrite(
         })
         .collect();
     let mut final_agg_output_cols: Vec<OutputColumn> = Vec::with_capacity(final_specs.len());
-    for (idx, spec) in final_specs.iter().enumerate() {
+    for spec in &final_specs {
         let display_name = agg_spec_display_name(spec, arena);
-        let result_type = aggregate_result_type(original, idx, spec, arena);
-        let col_id =
-            column_ref_factory.create(None, display_name.clone(), result_type.clone(), true);
+        let result_type = aggregate_result_type(spec);
+        let col_id = column_ref_factory.create(None, display_name.clone(), result_type.clone());
         final_agg_output_cols.push(OutputColumn {
             column_id: col_id,
             name: display_name,
-            data_type: result_type,
-            nullable: true,
+            value_type: result_type,
+
             is_internal: false,
         });
     }
@@ -421,8 +394,7 @@ fn exposure_project_items(
                     arena,
                     final_col.column_id,
                     final_col.name.clone(),
-                    final_col.data_type.clone(),
-                    final_col.nullable,
+                    final_col.value_type.clone(),
                 ),
                 output_name,
                 output_column_id,
@@ -456,8 +428,7 @@ fn exposure_project_items(
                         arena,
                         final_col.column_id,
                         final_display,
-                        final_col.data_type.clone(),
-                        true,
+                        final_col.value_type.clone(),
                     ),
                     output_name: orig_display,
                     output_column_id: orig_output_col_id,
@@ -500,8 +471,7 @@ mod tests {
                 qualifier: None,
                 column: name.into(),
             },
-            data_type: ty,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
         }
     }
 
@@ -538,8 +508,8 @@ mod tests {
                 .map(|(n, id, ty)| OutputColumn {
                     column_id: *id,
                     name: (*n).into(),
-                    data_type: ty.clone(),
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(ty.clone(), false),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -558,8 +528,7 @@ mod tests {
                 right: Box::new(col_ref_typed(b, DataType::Int64)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -627,8 +596,8 @@ mod tests {
                     OutputColumn {
                         column_id,
                         name,
-                        data_type: expr.data_type.clone(),
-                        nullable: expr.nullable,
+                        value_type: expr.value_type.clone(),
+
                         is_internal: false,
                     }
                 })
@@ -646,8 +615,11 @@ mod tests {
                 .map(|spec| OutputColumn {
                     column_id: spec.output_column_id,
                     name: agg_spec_display_name(spec, arena),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
                 .collect()
@@ -726,15 +698,21 @@ mod tests {
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "k".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 },
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "count(v)".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 },
             ],
@@ -771,6 +749,156 @@ mod tests {
         };
         assert!(!partial.is_split);
         assert_eq!(partial.aggregates[0].name, "count");
+    }
+
+    #[test]
+    fn pushdown_preserves_selected_domains_in_partial_final_and_exposure() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        use std::sync::Arc;
+
+        for (name, source) in [
+            (
+                "min",
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
+            ),
+            (
+                "min",
+                FunctionValueType::new(
+                    DataType::List(Arc::new(
+                        Field::new("item", DataType::Utf8, false).with_metadata(
+                            [
+                                ("nr_logical_type".into(), "json".into()),
+                                ("provider.field-id".into(), "71".into()),
+                            ]
+                            .into(),
+                        ),
+                    )),
+                    false,
+                ),
+            ),
+            (
+                "sum",
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    false,
+                    ValueLogicalType::LargeInt,
+                )
+                .unwrap(),
+            ),
+        ] {
+            let mut arena = ScalarArena::new();
+            let input = OutputColumn {
+                column_id: ColumnId(1),
+                name: "v".into(),
+                value_type: source.clone(),
+                is_internal: false,
+            };
+            let a = OptExpr::new(
+                Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
+                    rows: vec![],
+                    columns: vec![input.clone()],
+                }),
+                vec![],
+            );
+            let b = OptExpr::new(
+                Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+            );
+            let join = join_opt(a.clone(), b, None, &mut arena);
+            let arg = column_ref_scalar(&mut arena, input.column_id, input.name, source);
+            let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+                crate::functions::builtin_sql_function_catalog(),
+                &arena,
+                name,
+                &[arg],
+                &[],
+                false,
+            )
+            .unwrap();
+            let mut expected = crate::functions::aggregate_result_type(&resolved).clone();
+            expected.nullable = true;
+            let spec = ScalarAggregateSpec {
+                output_column_id: ColumnId(2),
+                name: name.into(),
+                args: vec![arg],
+                distinct: false,
+                order_by: vec![],
+                resolved,
+            };
+            let original = make_agg(
+                vec![],
+                vec![spec.clone()],
+                vec![OutputColumn {
+                    column_id: ColumnId(2),
+                    name: format!("{name}(v)"),
+                    value_type: expected.clone(),
+                    is_internal: false,
+                }],
+                &mut arena,
+            );
+            let push = PushPlan {
+                side: super::super::context::Side::Left,
+                target_subtree: a,
+                partial_groupby: vec![],
+                partial_extra_groupby: vec![],
+                partial_aggregates: vec![spec],
+            };
+            let mut factory = ColumnRefFactory::new();
+            factory.reserve_until(2);
+            let out = rewrite(
+                &original,
+                &join,
+                push,
+                &mut factory,
+                &mut arena,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap();
+            let (exposure, final_plan) = unwrap_exposure_project(out);
+            let Operator::LogicalAggregate(final_aggregate) = &final_plan.op else {
+                panic!("final aggregate");
+            };
+            let partial_plan = &final_plan.children[0].children[0];
+            let Operator::LogicalAggregate(partial) = &partial_plan.op else {
+                panic!("partial aggregate");
+            };
+            assert_eq!(
+                partial.output_layout.aggregate_columns[0].value_type,
+                expected
+            );
+            assert_eq!(
+                final_aggregate.output_layout.aggregate_columns[0].value_type,
+                expected
+            );
+            assert_eq!(
+                arena.value_type(final_aggregate.aggregates[0].args[0]),
+                &expected
+            );
+            assert_eq!(arena.value_type(exposure[0].expr), &expected);
+            assert_eq!(
+                factory.get(partial.output_columns[0].column_id).value_type,
+                expected
+            );
+            assert_eq!(
+                factory
+                    .get(final_aggregate.output_columns[0].column_id)
+                    .value_type,
+                expected
+            );
+            assert_eq!(
+                crate::functions::aggregate_result_type(&partial.aggregates[0].resolved),
+                crate::functions::aggregate_result_type(&final_aggregate.aggregates[0].resolved)
+            );
+        }
     }
 
     #[test]
@@ -834,15 +962,21 @@ mod tests {
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "k".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 },
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "total".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 },
             ],
@@ -886,9 +1020,21 @@ mod tests {
         // group-by key column and the aggregate input column.
         let mut factory = ColumnRefFactory::new();
         let mut arena = ScalarArena::new();
-        let c_key = factory.create(Some("t1".into()), "c_key".into(), DataType::Int32, false);
-        let c_bigint = factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
-        let c_int = factory.create(Some("t2".into()), "c_int".into(), DataType::Int32, true);
+        let c_key = factory.create(
+            Some("t1".into()),
+            "c_key".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        );
+        let c_bigint = factory.create(
+            Some("t1".into()),
+            "c_bigint".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let c_int = factory.create(
+            Some("t2".into()),
+            "c_int".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+        );
 
         let left = scan_opt_with_alias(
             "t1",
@@ -907,8 +1053,7 @@ mod tests {
                     qualifier: Some(qualifier.into()),
                     column: name.into(),
                 },
-                data_type: ty,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
             };
 
         let join_cond = crate::analysis::TypedExpr {
@@ -918,8 +1063,7 @@ mod tests {
                 right: Box::new(qualified_col("t2", "c_int", c_int, DataType::Int32)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
 
@@ -944,15 +1088,15 @@ mod tests {
             OutputColumn {
                 column_id: c_bigint,
                 name: "c_bigint".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: c_key,
                 name: "sum(t1.c_key)".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             },
         ];
@@ -1030,22 +1174,23 @@ mod tests {
         let call_center = factory.create(
             Some("cs".into()),
             "cs_call_center_sk".into(),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let sold_date = factory.create(
             Some("cs".into()),
             "cs_sold_date_sk".into(),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let sales_price = factory.create(
             Some("cs".into()),
             "cs_sales_price".into(),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let date_sk = factory.create(Some("d".into()), "d_date_sk".into(), DataType::Int64, true);
+        let date_sk = factory.create(
+            Some("d".into()),
+            "d_date_sk".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
 
         let qualified_col =
             |qualifier: &str, name: &str, id: ColumnId, ty: DataType| crate::analysis::TypedExpr {
@@ -1054,8 +1199,7 @@ mod tests {
                     qualifier: Some(qualifier.into()),
                     column: name.into(),
                 },
-                data_type: ty,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
             };
 
         let left = scan_opt_with_alias(
@@ -1084,8 +1228,7 @@ mod tests {
                 right: Box::new(qualified_col("d", "d_date_sk", date_sk, DataType::Int64)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
 
@@ -1110,15 +1253,15 @@ mod tests {
             OutputColumn {
                 column_id: call_center,
                 name: "cs_call_center_sk".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: sales_price,
                 name: "sum(cs.cs_sales_price)".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             },
         ];
@@ -1188,9 +1331,21 @@ mod tests {
     fn rewrite_exposes_original_count_display_after_final_sum_merge() {
         let mut factory = ColumnRefFactory::new();
         let mut arena = ScalarArena::new();
-        let c_key = factory.create(Some("t1".into()), "c_key".into(), DataType::Int32, false);
-        let c_bigint = factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
-        let c_int = factory.create(Some("t2".into()), "c_int".into(), DataType::Int32, true);
+        let c_key = factory.create(
+            Some("t1".into()),
+            "c_key".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        );
+        let c_bigint = factory.create(
+            Some("t1".into()),
+            "c_bigint".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let c_int = factory.create(
+            Some("t2".into()),
+            "c_int".into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+        );
 
         let qualified_col =
             |qualifier: &str, name: &str, id: ColumnId, ty: DataType| crate::analysis::TypedExpr {
@@ -1199,8 +1354,7 @@ mod tests {
                     qualifier: Some(qualifier.into()),
                     column: name.into(),
                 },
-                data_type: ty,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
             };
 
         let left = scan_opt_with_alias(
@@ -1219,8 +1373,7 @@ mod tests {
                 right: Box::new(qualified_col("t2", "c_int", c_int, DataType::Int32)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
 
@@ -1247,15 +1400,15 @@ mod tests {
             vec![OutputColumn {
                 column_id: c_bigint,
                 name: "c_bigint".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
             vec![OutputColumn {
                 column_id: count_spec.output_column_id,
                 name: expected_count_display.clone(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         );

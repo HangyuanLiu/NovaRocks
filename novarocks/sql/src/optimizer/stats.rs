@@ -2405,7 +2405,7 @@ fn widen_for_join_kind(
     fn widen(cols: Vec<crate::common::OutputColumn>) -> Vec<crate::common::OutputColumn> {
         cols.into_iter()
             .map(|mut c| {
-                c.nullable = true;
+                c.value_type.nullable = true;
                 c
             })
             .collect()
@@ -2453,8 +2453,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             .map(|item| crate::common::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: memo.scalars.data_type(item.expr).clone(),
-                nullable: memo.scalars.nullable(item.expr),
+                value_type: memo.scalars.value_type(item.expr).clone(),
+
                 is_internal: false,
             })
             .collect(),
@@ -2469,8 +2469,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             vec![crate::common::OutputColumn {
                 column_id: g.output_column_id,
                 name: g.column_name.clone(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }]
         }
@@ -2529,8 +2532,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             .map(|item| crate::common::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: memo.scalars.data_type(item.expr).clone(),
-                nullable: memo.scalars.nullable(item.expr),
+                value_type: memo.scalars.value_type(item.expr).clone(),
+
                 is_internal: false,
             })
             .collect(),
@@ -2545,8 +2548,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             vec![crate::common::OutputColumn {
                 column_id: g.output_column_id,
                 name: g.column_name.clone(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }]
         }
@@ -2645,15 +2651,18 @@ fn repeat_output_columns(
                 .iter()
                 .any(|set| !set.contains(&column.column_id))
         {
-            column.nullable = true;
+            column.value_type.nullable = true;
         }
     }
     columns.extend(repeat.grouping_fn_ids.iter().map(|(name, column_id)| {
         crate::common::OutputColumn {
             column_id: *column_id,
             name: name.clone(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: true,
         }
     }));
@@ -2901,8 +2910,8 @@ mod tests {
             .map(|c| OutputColumn {
                 column_id: test_col_id(c),
                 name: c.to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             })
             .collect();
@@ -2956,8 +2965,8 @@ mod tests {
             .map(|c| OutputColumn {
                 column_id: test_col_id(c),
                 name: c.to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             })
             .collect();
@@ -3232,8 +3241,8 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: name.starts_with('_'),
             }
         }
@@ -3303,8 +3312,10 @@ mod tests {
                     qualifier: Some("t".to_string()),
                     column: name.to_string(),
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             }
         }
 
@@ -3312,8 +3323,11 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }
         }
@@ -3442,8 +3456,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -3997,16 +4011,21 @@ mod tests {
                     qualifier: Some("t".to_string()),
                     column: name.to_string(),
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             }
         }
         fn output_column(id: u32, name: &str) -> OutputColumn {
             OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }
         }
@@ -4084,23 +4103,21 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::Eq,
@@ -4112,8 +4129,8 @@ mod tests {
 
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::And,
@@ -4125,8 +4142,8 @@ mod tests {
 
     fn nested_expr(expr: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Nested(Box::new(expr)),
         }
     }
@@ -4874,8 +4891,7 @@ mod tests {
                     qualifier: None,
                     column: "id".to_string(),
                 },
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             }
         }
 
@@ -5200,8 +5216,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "status".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -5270,8 +5289,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -5285,8 +5307,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 producer_column_ids: vec![ColumnId::UNSET],
@@ -5420,8 +5445,7 @@ mod tests {
                     qualifier: None,
                     column: name.to_string(),
                 },
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             }
         }
 
@@ -5525,8 +5549,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: test_col_id("id"),
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -5540,8 +5567,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: test_col_id("consume_id"),
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 producer_column_ids: vec![test_col_id("id")],
@@ -5592,8 +5622,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "x".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -5857,8 +5890,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "col1".to_string(),
                     output_column_id: out_id,
@@ -5902,8 +5937,8 @@ mod tests {
 
     fn between_expr(expr: TypedExpr, low: TypedExpr, high: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::Between {
                 expr: Box::new(expr),
                 low: Box::new(low),
@@ -5936,8 +5971,8 @@ mod tests {
         // The negated value (~0.89) is clearly distinct from the positive (~0.11),
         // so this test genuinely exercises the negated branch.
         let pred = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::Between {
                 expr: Box::new(col_ref("a")),
                 low: Box::new(int_lit(0)),
@@ -6210,15 +6245,18 @@ mod tests {
         // single conjunct, one with two. The literals are arbitrary — only the
         // conjunct COUNT matters to FFewerConj.
         let lit = |v: i64| TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         };
         let one_conjunct = intern_typed(&mut memo.scalars, &lit(1));
         let two_conjuncts = {
             let and = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     op: BinOp::And,
                     left: Box::new(lit(1)),
@@ -6380,8 +6418,8 @@ mod join_widening_tests {
         OutputColumn {
             column_id: ColumnId::UNSET,
             name: name.into(),
-            data_type: DataType::Int32,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable),
+
             is_internal: false,
         }
     }
@@ -6390,8 +6428,8 @@ mod join_widening_tests {
     fn inner_preserves_nullability() {
         let out = widen_for_join_kind(JoinKind::Inner, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 2);
-        assert!(!out[0].nullable);
-        assert!(!out[1].nullable);
+        assert!(!out[0].value_type.nullable);
+        assert!(!out[1].value_type.nullable);
     }
 
     #[test]
@@ -6401,8 +6439,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(!out[0].nullable, "left side preserved");
-        assert!(out[1].nullable, "right side widened");
+        assert!(!out[0].value_type.nullable, "left side preserved");
+        assert!(out[1].value_type.nullable, "right side widened");
     }
 
     #[test]
@@ -6412,8 +6450,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(out[0].nullable, "left side widened");
-        assert!(!out[1].nullable, "right side preserved");
+        assert!(out[0].value_type.nullable, "left side widened");
+        assert!(!out[1].value_type.nullable, "right side preserved");
     }
 
     #[test]
@@ -6423,8 +6461,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(out[0].nullable);
-        assert!(out[1].nullable);
+        assert!(out[0].value_type.nullable);
+        assert!(out[1].value_type.nullable);
     }
 
     #[test]
@@ -6432,7 +6470,7 @@ mod join_widening_tests {
         let out = widen_for_join_kind(JoinKind::LeftSemi, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "a");
-        assert!(!out[0].nullable);
+        assert!(!out[0].value_type.nullable);
     }
 
     #[test]
@@ -6456,10 +6494,13 @@ mod join_widening_tests {
             vec![c("b", false)],
         );
         assert_eq!(out.len(), 3);
-        assert!(out[0].nullable, "nullable source stays nullable");
-        assert!(!out[1].nullable, "non-nullable source stays non-nullable");
+        assert!(out[0].value_type.nullable, "nullable source stays nullable");
         assert!(
-            !out[2].nullable,
+            !out[1].value_type.nullable,
+            "non-nullable source stays non-nullable"
+        );
+        assert!(
+            !out[2].value_type.nullable,
             "non-nullable source on right stays non-nullable"
         );
     }
@@ -6480,8 +6521,7 @@ mod sort_partition_limit_tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
         intern_typed(scalars, &expr)
     }
@@ -6814,8 +6854,7 @@ mod control_tests {
                         let nullable = matches!(&literal, LiteralValue::Null);
                         memo.scalars.intern(
                             ScalarNode::Literal(HashableLiteral(literal)),
-                            data_type,
-                            nullable,
+                            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
                         )
                     })
                     .collect()
@@ -6829,8 +6868,8 @@ mod control_tests {
                 .map(|(ordinal, ty)| OutputColumn {
                     column_id: ColumnId::new_for_test(ordinal as u32 + 1),
                     name: format!("v{ordinal}"),
-                    data_type: ty.clone(),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(ty.clone(), true),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -7058,20 +7097,20 @@ mod control_tests {
         let mut memo = Memo::new();
         let literal = memo.scalars.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let mut nested = literal;
         for _ in 0..320 {
-            nested = memo
-                .scalars
-                .intern(ScalarNode::Nested(nested), DataType::Int64, false);
+            nested = memo.scalars.intern(
+                ScalarNode::Nested(nested),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            );
         }
         let column = OutputColumn {
             column_id: ColumnId::new_for_test(1),
             name: "nested".into(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let expr = MExpr {
@@ -7100,20 +7139,19 @@ mod control_tests {
         assert_eq!(stat.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
         let null = memo.scalars.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
-            DataType::Null,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
         );
-        let nested_null = memo
-            .scalars
-            .intern(ScalarNode::Nested(null), DataType::Int64, true);
+        let nested_null = memo.scalars.intern(
+            ScalarNode::Nested(null),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cast_null = memo.scalars.intern(
             ScalarNode::Cast {
                 child: null,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         for wrapped_null in [nested_null, cast_null] {
             let expr = MExpr {
@@ -7123,8 +7161,11 @@ mod control_tests {
                     columns: vec![OutputColumn {
                         column_id: ColumnId::new_for_test(1),
                         name: "wrapped_null".into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     }],
                 }),

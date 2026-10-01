@@ -123,21 +123,29 @@ mod validation_error_tests {
 
     #[test]
     fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
-        let expression = |id, data_type| crate::ExprNode {
+        let expression = |id, value_type| crate::ExprNode {
             id: ExprId::new(id),
             owner: NodeId::new(1),
             lambda_scope: None,
-            ty: ValueType::new(data_type, true),
+            ty: value_type,
             kind: ExprKind::Literal(crate::LiteralValue::Null),
         };
-        let decimal = expression(1, DataType::Decimal128(38, 15));
-        let integer = expression(2, DataType::FixedSizeBinary(16));
+        let decimal = expression(1, ValueType::new(DataType::Decimal128(38, 15), true));
+        let integer = expression(
+            2,
+            ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        );
         for op in [crate::BinaryOperator::Add, crate::BinaryOperator::Subtract] {
-            let exact = expression(3, DataType::Decimal256(55, 15));
+            let exact = expression(3, ValueType::new(DataType::Decimal256(55, 15), true));
             let mut errors = ValidationContext::new();
             validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
             assert!(errors.is_empty());
-            let wrong = expression(3, DataType::Decimal128(38, 15));
+            let wrong = expression(3, ValueType::new(DataType::Decimal128(38, 15), true));
             let mut errors = ValidationContext::new();
             validate_binary_types(&decimal, op, &integer, &wrong, "binary", &mut errors);
             assert!(!errors.is_empty());
@@ -147,7 +155,7 @@ mod validation_error_tests {
             crate::BinaryOperator::Divide,
             crate::BinaryOperator::Modulo,
         ] {
-            let exact = expression(3, DataType::Decimal256(55, 15));
+            let exact = expression(3, ValueType::new(DataType::Decimal256(55, 15), true));
             let mut errors = ValidationContext::new();
             validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
             assert!(!errors.is_empty());
@@ -178,17 +186,23 @@ mod validation_error_tests {
 
     #[test]
     fn binary_arithmetic_uses_the_type_contract_largeint_domain() {
-        let expression = |id, data_type| crate::ExprNode {
+        let expression = |id, value_type| crate::ExprNode {
             id: ExprId::new(id),
             owner: NodeId::new(1),
             lambda_scope: None,
-            ty: ValueType::new(data_type, false),
+            ty: value_type,
             kind: ExprKind::Literal(crate::LiteralValue::Null),
         };
         let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
-        let left = expression(1, largeint.clone());
-        let right = expression(2, DataType::Int64);
-        let output = expression(3, largeint);
+        let largeint_type = ValueType::try_with_logical_type(
+            largeint.clone(),
+            false,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        let left = expression(1, largeint_type.clone());
+        let right = expression(2, ValueType::new(DataType::Int64, false));
+        let output = expression(3, largeint_type);
         let mut errors = ValidationContext::new();
         validate_binary_types(
             &left,
@@ -199,6 +213,20 @@ mod validation_error_tests {
             &mut errors,
         );
         assert!(errors.is_empty());
+
+        let opaque = expression(4, ValueType::new(largeint, false));
+        for (input, result) in [(&opaque, &output), (&left, &opaque)] {
+            let mut errors = ValidationContext::new();
+            validate_binary_types(
+                input,
+                crate::BinaryOperator::Add,
+                &right,
+                result,
+                "binary",
+                &mut errors,
+            );
+            assert!(!errors.is_empty());
+        }
     }
 
     #[test]
