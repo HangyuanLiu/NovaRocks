@@ -68,6 +68,10 @@ pub struct ConstantResourceFacts {
     pub metadata_bytes: u64,
     pub library_validation_work_upper_bound: u64,
     pub library_validation_temporary_bytes_upper_bound: u64,
+    /// Inspected bytes, including repeated references, plus temporary bytes.
+    /// This is the exact derived input to the library-validation byte gate,
+    /// distinct from deduplicated retained backing or allocation authorization.
+    pub library_validation_bytes_upper_bound: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -479,6 +483,7 @@ fn preflight(
         metadata_bytes: metadata,
         library_validation_work_upper_bound: library_work,
         library_validation_temporary_bytes_upper_bound: temporary,
+        library_validation_bytes_upper_bound: library_bytes,
     })
 }
 fn scan_data(

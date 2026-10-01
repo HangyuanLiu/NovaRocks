@@ -40,11 +40,15 @@ use novarocks_execution::exec::expr::function::lookup_function;
 use novarocks_execution::exec::expr::{
     ExprArena, ExprId, ExprNode, LiteralValue as ExecLiteralValue,
 };
+use novarocks_functions::validate_function_value_type_observed;
 use novarocks_sql::compiler::{
     BinOp, FoldNodeKind, FoldRequest, LiteralValue as SqlLiteralValue, SqlConstantEvaluationError,
     SqlConstantEvaluator, UnOp,
 };
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
+    ValueTypeVisit, field_logical_type, validate_value_type_structure_observed,
+};
 use novarocks_types::largeint;
 use std::sync::Arc;
 
@@ -74,21 +78,42 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
     ) -> Result<Option<SqlLiteralValue>, SqlConstantEvaluationError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let evaluated = (|| -> Result<Option<SqlLiteralValue>, SqlConstantEvaluationError> {
+            // Validate every authored type before literal conversion or arena
+            // publication. A decline must not hide an invalid later argument.
+            let mut supported = legacy_value_type_supported(&request.result_type, &mut work)?;
+            for arg in &request.args {
+                work.step()?;
+                supported &= legacy_value_type_supported(&arg.value_type, &mut work)?;
+                if matches!(arg.value, SqlLiteralValue::Null) && !arg.value_type.nullable {
+                    supported = false;
+                }
+                if matches!(arg.value, SqlLiteralValue::LargeInt(_))
+                    && arg.value_type.logical_type != ValueLogicalType::LargeInt
+                {
+                    supported = false;
+                }
+            }
+            if !supported {
+                return Ok(None);
+            }
             let mut arena = ExprArena::default();
             let mut arg_ids: Vec<ExprId> = Vec::with_capacity(request.args.len());
             for arg in &request.args {
                 work.step()?;
-                let Some(literal) = sql_literal_to_exec(&arg.value, &arg.data_type) else {
+                let Some(literal) = sql_literal_to_exec(&arg.value, &arg.value_type.data_type)
+                else {
                     return Ok(None);
                 };
-                arg_ids.push(arena.push_typed(ExprNode::Literal(literal), arg.data_type.clone()));
+                arg_ids.push(
+                    arena.push_typed(ExprNode::Literal(literal), arg.value_type.data_type.clone()),
+                );
             }
 
             work.step()?;
             let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
                 return Ok(None);
             };
-            let root = arena.push_typed(root_node, request.out_type.clone());
+            let root = arena.push_typed(root_node, request.result_type.data_type.clone());
 
             let chunk = single_row_chunk()?;
             // The legacy kernel and literal/type cloning remain opaque here.
@@ -97,13 +122,70 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             work.flush()?;
             let output = arena.eval(root, &chunk)?;
             work.step()?;
-            Ok(read_back_row0(&output, &request.out_type)?)
+            let result = read_back_row0(&output, &request.result_type.data_type)?;
+            if matches!(result, Some(SqlLiteralValue::Null)) && !request.result_type.nullable {
+                return Ok(None);
+            }
+            Ok(result)
         })();
         // Success, conversion/shape declines and ordinary kernel/readback
         // errors all observe completion. Control failures remain typed and
         // never become a fail-open legacy evaluation String.
+        if matches!(&evaluated, Err(SqlConstantEvaluationError::Control(_))) {
+            // A delegated owner may return a typed resource/control refusal
+            // without latching this adapter's scope. Keep that primary cause.
+            return evaluated;
+        }
         work.finish()?;
         evaluated
+    }
+}
+
+/// The legacy arena carries Arrow types only. Its one exact non-Physical
+/// scalar representation is the existing LARGEINT literal/kernel protocol;
+/// all other semantic domains need the full-value evaluator migration.
+fn legacy_value_type_supported(
+    value_type: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlConstantEvaluationError> {
+    work.step()?;
+    value_type
+        .logical_type
+        .validate_carrier(&value_type.data_type)?;
+    // The function owner supplies the actual type/metadata resource limits.
+    // Its borrowed walk observes entries, not opaque cloning or kernel work.
+    validate_function_value_type_observed(value_type, work)?;
+    let mut nested_physical = true;
+    validate_value_type_structure_observed::<SqlConstantEvaluationError>(
+        &value_type.data_type,
+        |visit| {
+            work.step()?;
+            if let ValueTypeVisit::Field(field) = visit {
+                nested_physical &= field_logical_type(field)? == ValueLogicalType::Physical;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(nested_physical
+        && match value_type.logical_type {
+            ValueLogicalType::Physical => {
+                !matches!(value_type.data_type, DataType::FixedSizeBinary(_))
+            }
+            ValueLogicalType::LargeInt => true,
+            _ => false,
+        })
+}
+
+#[cfg(test)]
+fn fixture_value_type(value: &SqlLiteralValue, data_type: DataType) -> FunctionValueType {
+    FunctionValueType {
+        data_type,
+        nullable: matches!(value, SqlLiteralValue::Null),
+        logical_type: if matches!(value, SqlLiteralValue::LargeInt(_)) {
+            ValueLogicalType::LargeInt
+        } else {
+            ValueLogicalType::Physical
+        },
     }
 }
 
@@ -426,9 +508,8 @@ mod tests {
 
     fn arg(value: SqlLiteralValue, data_type: DataType) -> FoldArg {
         FoldArg {
+            value_type: fixture_value_type(&value, data_type),
             value,
-            data_type,
-            nullable: false,
         }
     }
 
@@ -441,8 +522,7 @@ mod tests {
             &FoldRequest {
                 kind,
                 args,
-                out_type,
-                out_nullable: true,
+                result_type: FunctionValueType::new(out_type, true),
             },
             &TestControl,
         )
@@ -670,6 +750,166 @@ mod tests {
 }
 
 #[cfg(test)]
+mod full_value_type_tests {
+    use super::*;
+    use arrow::datatypes::Field;
+    use novarocks_sql::compiler::FoldArg;
+    use novarocks_type_contract::{DecimalOverflowPolicy, NR_LOGICAL_TYPE_KEY, ValueTypeError};
+
+    fn cast(
+        source: FunctionValueType,
+        result_type: FunctionValueType,
+        value: SqlLiteralValue,
+    ) -> FoldRequest {
+        FoldRequest {
+            kind: FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
+            args: vec![FoldArg {
+                value,
+                value_type: source,
+            }],
+            result_type,
+        }
+    }
+
+    #[test]
+    fn authored_semantic_roots_decline_instead_of_carrier_retagging() {
+        for (carrier, logical, value) in [
+            (
+                DataType::Utf8,
+                ValueLogicalType::Json,
+                SqlLiteralValue::String("{}".into()),
+            ),
+            (
+                DataType::LargeBinary,
+                ValueLogicalType::Variant,
+                SqlLiteralValue::Binary(vec![1]),
+            ),
+            (
+                DataType::Binary,
+                ValueLogicalType::Hll,
+                SqlLiteralValue::Binary(vec![1]),
+            ),
+            (
+                DataType::Binary,
+                ValueLogicalType::Bitmap,
+                SqlLiteralValue::Binary(vec![1]),
+            ),
+            (
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::Uuid,
+                SqlLiteralValue::Null,
+            ),
+        ] {
+            let semantic = FunctionValueType {
+                data_type: carrier.clone(),
+                nullable: true,
+                logical_type: logical,
+            };
+            let physical = FunctionValueType::new(carrier, true);
+            for request in [
+                cast(semantic.clone(), physical.clone(), value.clone()),
+                cast(physical, semantic, value),
+            ] {
+                assert_eq!(
+                    constant_evaluator().eval_scalar(&request, &TestControl),
+                    Ok(None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_logical_identity_declines_and_invalid_later_types_are_not_hidden() {
+        let child = Field::new("item", DataType::Utf8, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
+        let nested = FunctionValueType::new(DataType::List(Arc::new(child)), true);
+        let mut request = cast(nested.clone(), nested, SqlLiteralValue::Null);
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &TestControl),
+            Ok(None)
+        );
+        request.args.push(FoldArg {
+            value: SqlLiteralValue::Int(1),
+            value_type: FunctionValueType {
+                data_type: DataType::Int64,
+                nullable: false,
+                logical_type: ValueLogicalType::Json,
+            },
+        });
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &TestControl),
+            Err(SqlConstantEvaluationError::InvalidType(
+                ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json)
+            ))
+        );
+        let bad = Field::new("item", DataType::Utf8, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown-domain".into())].into());
+        request.result_type = FunctionValueType::new(DataType::List(Arc::new(bad)), true);
+        assert!(matches!(
+            constant_evaluator().eval_scalar(&request, &TestControl),
+            Err(SqlConstantEvaluationError::Preparation(_))
+        ));
+    }
+
+    #[test]
+    fn nonnullable_input_and_actual_null_output_decline() {
+        let physical = FunctionValueType::new(DataType::Int32, false);
+        let request = cast(
+            physical.clone(),
+            FunctionValueType::new(DataType::Int32, true),
+            SqlLiteralValue::Null,
+        );
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &TestControl),
+            Ok(None)
+        );
+        let request = FoldRequest {
+            kind: FoldNodeKind::BinaryOp(BinOp::Div, DecimalOverflowPolicy::OutputNull),
+            args: vec![
+                FoldArg {
+                    value: SqlLiteralValue::Int(1),
+                    value_type: physical.clone(),
+                },
+                FoldArg {
+                    value: SqlLiteralValue::Int(0),
+                    value_type: physical,
+                },
+            ],
+            result_type: FunctionValueType::new(DataType::Float64, false),
+        };
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &TestControl),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn exact_largeint_intrinsic_round_trips_without_fixed16_inference() {
+        let ty = FunctionValueType {
+            data_type: DataType::FixedSizeBinary(16),
+            nullable: false,
+            logical_type: ValueLogicalType::LargeInt,
+        };
+        let value = i128::from(i64::MAX) + 17;
+        let request = cast(ty.clone(), ty.clone(), SqlLiteralValue::LargeInt(value));
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &TestControl),
+            Ok(Some(SqlLiteralValue::LargeInt(value)))
+        );
+        let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
+        for request in [
+            cast(physical.clone(), ty, SqlLiteralValue::LargeInt(value)),
+            cast(physical.clone(), physical, SqlLiteralValue::LargeInt(value)),
+        ] {
+            assert_eq!(
+                constant_evaluator().eval_scalar(&request, &TestControl),
+                Ok(None)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod overflow_policy_tests {
     use super::*;
     use novarocks_sql::compiler::FoldArg;
@@ -681,21 +921,18 @@ mod overflow_policy_tests {
                 value: SqlLiteralValue::Decimal(
                     "99999999999999999999999999999999999999".to_string(),
                 ),
-                data_type: DataType::Decimal128(38, 0),
-                nullable: false,
+                value_type: FunctionValueType::new(DataType::Decimal128(38, 0), false),
             },
             FoldArg {
                 value: SqlLiteralValue::Int(1),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: FunctionValueType::new(DataType::Int64, false),
             },
         ];
         for policy in [OutputNull, ReportError] {
             let request = FoldRequest {
                 kind: FoldNodeKind::BinaryOp(BinOp::Add, policy),
                 args: args.clone(),
-                out_type: DataType::Decimal128(38, 0),
-                out_nullable: true,
+                result_type: FunctionValueType::new(DataType::Decimal128(38, 0), true),
             };
             let result = constant_evaluator().eval_scalar(&request, &TestControl);
             if policy == OutputNull {
@@ -709,8 +946,7 @@ mod overflow_policy_tests {
             let request = FoldRequest {
                 kind: FoldNodeKind::Cast(policy),
                 args: vec![args[0].clone()],
-                out_type: DataType::Decimal128(9, 0),
-                out_nullable: true,
+                result_type: FunctionValueType::new(DataType::Decimal128(9, 0), true),
             };
             let result = constant_evaluator().eval_scalar(&request, &TestControl);
             if policy == OutputNull {
@@ -768,17 +1004,15 @@ mod request_control_tests {
     }
     fn arg(value: SqlLiteralValue, data_type: DataType) -> FoldArg {
         FoldArg {
+            value_type: fixture_value_type(&value, data_type),
             value,
-            data_type,
-            nullable: false,
         }
     }
     fn request(kind: FoldNodeKind, args: Vec<FoldArg>, out_type: DataType) -> FoldRequest {
         FoldRequest {
             kind,
             args,
-            out_type,
-            out_nullable: true,
+            result_type: FunctionValueType::new(out_type, true),
         }
     }
     fn all_errors() -> [CompileControlError; 3] {
@@ -830,6 +1064,66 @@ mod request_control_tests {
     }
 
     #[test]
+    fn authored_type_metadata_interior_and_decline_tail_keep_original_control() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        let mut metadata = (0..255)
+            .map(|index| (format!("provider.fact.{index}"), "value".into()))
+            .collect::<std::collections::HashMap<_, _>>();
+        metadata.insert(NR_LOGICAL_TYPE_KEY.into(), "json".into());
+        let field = Field::new("item", DataType::Utf8, true).with_metadata(metadata);
+        let mut request = request(
+            FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
+            vec![],
+            DataType::Null,
+        );
+        request.result_type = FunctionValueType::new(DataType::List(Arc::new(field)), true);
+        let control = Control::default();
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &control),
+            Ok(None)
+        );
+        let checks = control.checks();
+        assert_eq!(checks[0], 0);
+        let interior = checks.iter().position(|units| *units == 256).unwrap();
+        let tail = checks.len() - 1;
+        assert!(tail > interior);
+        assert!(checks[tail] > 0);
+        for error in all_errors() {
+            for at in [0, interior, tail] {
+                assert_stopped(&request, &checks, at, error);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_type_resource_refusal_cannot_be_replaced_by_later_control() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES;
+        let field = Field::new("item", DataType::Utf8, true).with_metadata(
+            [(
+                "provider.fact".into(),
+                "x".repeat(MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
+            )]
+            .into(),
+        );
+        let mut request = request(
+            FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
+            vec![],
+            DataType::Null,
+        );
+        request.result_type = FunctionValueType::new(DataType::List(Arc::new(field)), true);
+        let control = Control::failing(1, CompileControlError::Cancelled);
+        assert_eq!(
+            constant_evaluator().eval_scalar(&request, &control),
+            Err(SqlConstantEvaluationError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        );
+        assert_eq!(control.checks(), [0]);
+    }
+
+    #[test]
     fn literal_conversion_decline_still_observes_completion() {
         let request = request(
             FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
@@ -842,7 +1136,9 @@ mod request_control_tests {
             Ok(None)
         );
         let checks = control.checks();
-        assert_eq!(checks, [0, 1]);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0], 0);
+        assert!(checks[1] > 0);
         for error in all_errors() {
             assert_stopped(&request, &checks, 1, error);
         }

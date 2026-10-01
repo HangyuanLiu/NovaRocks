@@ -688,7 +688,6 @@ fn try_fold_node(
     work.step()?;
     let node = arena.node(id).clone();
     let out_type = arena.data_type(id).clone();
-    let out_nullable = arena.nullable(id);
 
     // `Nested` is a pure syntactic wrapper: when its inner expression is a
     // literal the wrapper collapses onto that literal, no evaluation needed.
@@ -759,16 +758,14 @@ fn try_fold_node(
         };
         args.push(FoldArg {
             value: value.clone(),
-            data_type: arena.data_type(child).clone(),
-            nullable: arena.nullable(child),
+            value_type: arena.value_type(child).clone(),
         });
     }
 
     let request = FoldRequest {
         kind,
         args,
-        out_type: out_type.clone(),
-        out_nullable,
+        result_type: arena.value_type(id).clone(),
     };
 
     work.step()?;
@@ -777,6 +774,22 @@ fn try_fold_node(
         Ok(value) => Ok(value),
         Err(SqlConstantEvaluationError::Evaluation(error)) => Err(error),
         Err(SqlConstantEvaluationError::Control(error)) => return Err(error.into()),
+        Err(SqlConstantEvaluationError::InvalidType(error)) => {
+            return Err(SqlCompileError::InvalidRequest(error.to_string()));
+        }
+        Err(SqlConstantEvaluationError::Preparation(error)) => {
+            use novarocks_functions::KernelFailure;
+            use novarocks_type_contract::CompileControlError;
+            return Err(match error {
+                KernelFailure::Cancelled => CompileControlError::Cancelled.into(),
+                KernelFailure::DeadlineExceeded => CompileControlError::DeadlineExceeded.into(),
+                KernelFailure::ResourceExhausted => CompileControlError::ResourceExhausted.into(),
+                error @ KernelFailure::InvalidProgram(_) => {
+                    SqlCompileError::InvalidRequest(error.to_string())
+                }
+                other => SqlCompileError::Compilation(other.to_string()),
+            });
+        }
     };
     work.step()?;
     Ok(match evaluated {
@@ -2092,5 +2105,222 @@ mod overflow_policy_tests {
             assert!(matches!(arena.node(pure), ScalarNode::Literal(_)));
         }
         assert!(crate::compiler::constant_evaluator_for_legacy_mode(None, true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod complete_fold_type_tests {
+    use super::*;
+    use crate::compiler::LiteralValue;
+    use arrow::datatypes::Field;
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeError};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Requests(Mutex<Vec<FoldRequest>>);
+    impl SqlConstantEvaluator for Requests {
+        fn eval_scalar(
+            &self,
+            request: &FoldRequest,
+            _: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            self.0.lock().unwrap().push(request.clone());
+            Ok(None)
+        }
+    }
+
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "Dictionary identity is an explicit frozen field fact."
+    )]
+    fn real_fold_author_preserves_root_domains_and_nested_field_identity() {
+        static EVALUATOR: Requests = Requests(Mutex::new(Vec::new()));
+        EVALUATOR.0.lock().unwrap().clear();
+        let dictionary = Field::new_dict(
+            "encoded",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+            73,
+            true,
+        )
+        .with_metadata([("provider.identity".into(), "source-field-9".into())].into());
+        let nested_type =
+            FunctionValueType::new(DataType::Struct(vec![Arc::new(dictionary)].into()), true);
+        let root_types = [
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Variant,
+            )
+            .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+            FunctionValueType::new(DataType::Decimal256(76, -7), false),
+        ];
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            nested_type.clone(),
+        );
+        for result_type in &root_types {
+            let root = arena.intern(
+                ScalarNode::Cast {
+                    child,
+                    target: result_type.data_type.clone(),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+                result_type.clone(),
+            );
+            assert!(try_fold_test_node(&mut arena, root, &EVALUATOR).is_none());
+        }
+        let requests = EVALUATOR.0.lock().unwrap();
+        assert_eq!(requests.len(), root_types.len());
+        for (request, expected) in requests.iter().zip(&root_types) {
+            assert_eq!(&request.result_type, expected);
+            assert_eq!(request.args.len(), 1);
+            assert_eq!(request.args[0].value, LiteralValue::Null);
+            assert_eq!(request.args[0].value_type, nested_type);
+            let DataType::Struct(fields) = &request.args[0].value_type.data_type else {
+                panic!("the authored structure must survive the real request");
+            };
+            assert_eq!(fields[0].dict_id(), Some(73));
+            assert_eq!(fields[0].dict_is_ordered(), Some(true));
+            assert_eq!(fields[0].metadata()["provider.identity"], "source-field-9");
+        }
+    }
+
+    struct PreparationFailure(Mutex<Option<novarocks_functions::KernelFailure>>);
+    impl SqlConstantEvaluator for PreparationFailure {
+        fn eval_scalar(
+            &self,
+            _: &FoldRequest,
+            _: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            Err(SqlConstantEvaluationError::Preparation(
+                self.0.lock().unwrap().as_ref().unwrap().clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn preparation_failures_never_become_optional_fold_misses() {
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        use novarocks_type_contract::CompileControlError;
+        static EVALUATOR: PreparationFailure = PreparationFailure(Mutex::new(None));
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            FunctionValueType::new(DataType::Int64, false),
+        );
+        let root = arena.intern(
+            ScalarNode::Cast {
+                child,
+                target: DataType::Int32,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            FunctionValueType::new(DataType::Int32, true),
+        );
+        for (failure, expected) in [
+            (KernelFailure::Cancelled, SqlCompileError::Cancelled),
+            (
+                KernelFailure::DeadlineExceeded,
+                SqlCompileError::DeadlineExceeded,
+            ),
+            (
+                KernelFailure::ResourceExhausted,
+                SqlCompileError::ResourceExhausted,
+            ),
+            (
+                KernelFailure::InvalidProgram(KernelDiagnostic::new("frozen binding mismatch")),
+                SqlCompileError::InvalidRequest(
+                    "invalid kernel program: frozen binding mismatch".into(),
+                ),
+            ),
+            (
+                KernelFailure::Internal(KernelDiagnostic::new(
+                    "unexpected pure preparation failure",
+                )),
+                SqlCompileError::Compilation(
+                    "kernel internal failure: unexpected pure preparation failure".into(),
+                ),
+            ),
+        ] {
+            let converted = SqlConstantEvaluationError::from(failure.clone());
+            match failure {
+                KernelFailure::Cancelled => assert_eq!(
+                    converted,
+                    SqlConstantEvaluationError::Control(CompileControlError::Cancelled)
+                ),
+                KernelFailure::DeadlineExceeded => assert_eq!(
+                    converted,
+                    SqlConstantEvaluationError::Control(CompileControlError::DeadlineExceeded)
+                ),
+                KernelFailure::ResourceExhausted => assert_eq!(
+                    converted,
+                    SqlConstantEvaluationError::Control(CompileControlError::ResourceExhausted)
+                ),
+                _ => assert_eq!(
+                    converted,
+                    SqlConstantEvaluationError::Preparation(failure.clone())
+                ),
+            }
+            *EVALUATOR.0.lock().unwrap() = Some(failure);
+            let mut work = CompileCheckpoints::try_new(
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                CompilePhase::Validate,
+            )
+            .unwrap();
+            assert_eq!(
+                try_fold_node(&mut arena, root, &EVALUATOR, &mut work),
+                Err(expected)
+            );
+            assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
+        }
+    }
+
+    struct InvalidFrozenType;
+    impl SqlConstantEvaluator for InvalidFrozenType {
+        fn eval_scalar(
+            &self,
+            _: &FoldRequest,
+            _: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            Err(ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json).into())
+        }
+    }
+
+    #[test]
+    fn invalid_frozen_type_is_fatal_in_the_real_fold_rule() {
+        static EVALUATOR: InvalidFrozenType = InvalidFrozenType;
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            FunctionValueType::new(DataType::Int64, false),
+        );
+        let root = arena.intern(
+            ScalarNode::Cast {
+                child,
+                target: DataType::Int32,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            FunctionValueType::new(DataType::Int32, true),
+        );
+        let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+        assert_eq!(
+            try_fold_node(&mut arena, root, &EVALUATOR, &mut work),
+            Err(SqlCompileError::InvalidRequest(
+                ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json).to_string(),
+            )),
+        );
+        assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
     }
 }

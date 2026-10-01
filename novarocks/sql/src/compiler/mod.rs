@@ -390,8 +390,9 @@ pub enum FoldNodeKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FoldArg {
     pub value: LiteralValue,
-    pub data_type: arrow::datatypes::DataType,
-    pub nullable: bool,
+    /// The authored logical domain and exact Arrow field vocabulary travel
+    /// together; a carrier alone cannot authorize a logical reinterpretation.
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
 /// A single-node constant evaluation request.
@@ -403,8 +404,7 @@ pub struct FoldArg {
 pub struct FoldRequest {
     pub kind: FoldNodeKind,
     pub args: Vec<FoldArg>,
-    pub out_type: arrow::datatypes::DataType,
-    pub out_nullable: bool,
+    pub result_type: novarocks_type_contract::FunctionValueType,
 }
 
 /// Evaluates one constant scalar node on behalf of the optimizer.
@@ -416,11 +416,14 @@ pub struct FoldRequest {
 /// analyze request.
 ///
 /// Fail-open contract:
-/// - `Ok(Some(literal))` — folded; the literal has type `request.out_type`.
+/// - `Ok(Some(literal))` — folded; the literal has the complete type `request.result_type`.
 /// - `Ok(None)` — evaluator declines (unmapped node shape or literal type).
 /// - `Err(Evaluation(_))` — evaluation failed. Callers keep the original expression and
 ///   must never surface this as a planning error, because the runtime is
 ///   still allowed to produce a value or its own error for that expression.
+/// - `Err(InvalidType(_))` — invalid frozen type facts; compilation stops.
+/// - `Err(Preparation(_))` — a pure preparation failure; compilation stops.
+///   Resource, internal and static failures cannot become optional row errors.
 /// - `Err(Control(_))` — request cancellation, deadline or resource exhaustion;
 ///   compilation stops with that exact category, never an optimization decline.
 // Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
@@ -437,12 +440,35 @@ pub trait SqlConstantEvaluator: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlConstantEvaluationError {
     Control(novarocks_type_contract::CompileControlError),
+    InvalidType(novarocks_type_contract::ValueTypeError),
+    Preparation(novarocks_functions::KernelFailure),
     Evaluation(String),
 }
 
 impl From<novarocks_type_contract::CompileControlError> for SqlConstantEvaluationError {
     fn from(error: novarocks_type_contract::CompileControlError) -> Self {
         Self::Control(error)
+    }
+}
+
+impl From<novarocks_type_contract::ValueTypeError> for SqlConstantEvaluationError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::InvalidType(error)
+    }
+}
+
+impl From<novarocks_functions::KernelFailure> for SqlConstantEvaluationError {
+    fn from(error: novarocks_functions::KernelFailure) -> Self {
+        use novarocks_functions::KernelFailure;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            KernelFailure::Cancelled => Self::Control(CompileControlError::Cancelled),
+            KernelFailure::DeadlineExceeded => Self::Control(CompileControlError::DeadlineExceeded),
+            KernelFailure::ResourceExhausted => {
+                Self::Control(CompileControlError::ResourceExhausted)
+            }
+            other => Self::Preparation(other),
+        }
     }
 }
 
@@ -456,6 +482,8 @@ impl fmt::Display for SqlConstantEvaluationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
+            Self::InvalidType(error) => error.fmt(f),
+            Self::Preparation(error) => error.fmt(f),
             Self::Evaluation(error) => f.write_str(error),
         }
     }
@@ -2838,8 +2866,10 @@ mod tests {
                 name: "fixture/no-op".into(),
             },
             args: Vec::new(),
-            out_type: arrow::datatypes::DataType::Int64,
-            out_nullable: true,
+            result_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
         };
         let owner = Owner {
             checks: Default::default(),
@@ -2920,8 +2950,10 @@ mod tests {
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         ),
                         args: Vec::new(),
-                        out_type: arrow::datatypes::DataType::Decimal128(3, 0),
-                        out_nullable: true,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Decimal128(3, 0),
+                            true,
+                        ),
                     },
                     &request_control,
                 )

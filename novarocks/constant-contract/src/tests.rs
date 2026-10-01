@@ -458,6 +458,159 @@ fn repeated_views_are_charged_per_validation_reference() {
 }
 
 #[test]
+fn library_validation_bytes_fact_is_the_exact_policy_boundary() {
+    let array = Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
+    let baseline = pool(array.clone(), false);
+    let facts = baseline.resource_facts();
+    assert_eq!(
+        facts.library_validation_bytes_upper_bound,
+        facts.library_validation_temporary_bytes_upper_bound + 2 * 8,
+        "the primitive input inspects its two Int64 values, not buffer capacity"
+    );
+    let mut bounded = policy();
+    bounded.max_library_validation_bytes = facts.library_validation_bytes_upper_bound;
+    let accepted = ConstantPool::try_new(
+        Arc::new(baseline.field().clone()),
+        baseline.value_type().clone(),
+        array.to_data(),
+        bounded,
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    assert_eq!(accepted.resource_facts(), facts);
+    bounded.max_library_validation_bytes -= 1;
+    assert_eq!(
+        ConstantPool::try_new(
+            Arc::new(baseline.field().clone()),
+            baseline.value_type().clone(),
+            array.to_data(),
+            bounded,
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .unwrap_err(),
+        ConstantError::Limit("opaque Arrow validation byte limit exceeded")
+    );
+}
+
+#[test]
+fn library_validation_bytes_count_shared_children_on_each_actual_visit() {
+    let text = "x".repeat(4096);
+    let shared = Arc::new(StringArray::from(vec![text.as_str()])) as ArrayRef;
+    let separate = Arc::new(StringArray::from(vec![text.as_str()])) as ArrayRef;
+    let structure = |right: ArrayRef| {
+        Arc::new(arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("left", DataType::Utf8, false)),
+                shared.clone(),
+            ),
+            (Arc::new(Field::new("right", DataType::Utf8, false)), right),
+        ])) as ArrayRef
+    };
+    let shared_pool = pool(structure(shared.clone()), false);
+    let separate_pool = pool(structure(separate), false);
+    let shared_facts = shared_pool.resource_facts();
+    let separate_facts = separate_pool.resource_facts();
+    assert!(
+        shared_facts.retained_buffer_capacity_bytes < separate_facts.retained_buffer_capacity_bytes,
+        "one shared allocation is retained once"
+    );
+    assert_eq!(shared_facts.buffer_count, separate_facts.buffer_count);
+    assert_eq!(
+        shared_facts.library_validation_bytes_upper_bound,
+        separate_facts.library_validation_bytes_upper_bound,
+        "validation still visits both child references"
+    );
+    assert_eq!(
+        shared_facts.library_validation_work_upper_bound,
+        separate_facts.library_validation_work_upper_bound
+    );
+    let mut bounded = policy();
+    bounded.max_retained_buffer_bytes = shared_facts.retained_buffer_capacity_bytes;
+    assert!(
+        ConstantPool::try_new(
+            Arc::new(shared_pool.field().clone()),
+            shared_pool.value_type().clone(),
+            shared_pool.array().to_data(),
+            bounded,
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        ConstantPool::try_new(
+            Arc::new(separate_pool.field().clone()),
+            separate_pool.value_type().clone(),
+            separate_pool.array().to_data(),
+            bounded,
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .unwrap_err(),
+        ConstantError::Limit("constant retained buffer limit exceeded")
+    );
+}
+
+#[test]
+fn library_validation_bytes_charge_repeated_view_payloads_with_shared_backing() {
+    let text = "x".repeat(4096);
+    let view = arrow_data::ByteView::new(text.len() as u32, &text.as_bytes()[..4]).as_u128();
+    let array = Arc::new(
+        arrow_array::StringViewArray::try_new(
+            arrow_buffer::ScalarBuffer::from(vec![view; 64]),
+            vec![arrow_buffer::Buffer::from(text.as_bytes())],
+            None,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let all = pool(array.clone(), false);
+    let one = pool(array.slice(0, 1), false);
+    let facts = all.resource_facts();
+    let one_facts = one.resource_facts();
+    assert_eq!(
+        facts.retained_buffer_capacity_bytes, one_facts.retained_buffer_capacity_bytes,
+        "a sliced view keeps the original view table and payload allocations"
+    );
+    assert!(
+        facts.library_validation_bytes_upper_bound > one_facts.library_validation_bytes_upper_bound
+    );
+    assert!(
+        facts.library_validation_bytes_upper_bound
+            - facts.library_validation_temporary_bytes_upper_bound
+            >= 64 * text.len() as u64,
+        "opaque string validation scans each repeated payload reference"
+    );
+    let mut bounded = policy();
+    bounded.max_library_validation_bytes = facts.library_validation_bytes_upper_bound;
+    assert!(
+        ConstantPool::try_new(
+            Arc::new(all.field().clone()),
+            all.value_type().clone(),
+            all.array().to_data(),
+            bounded,
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .is_ok()
+    );
+    bounded.max_library_validation_bytes -= 1;
+    assert_eq!(
+        ConstantPool::try_new(
+            Arc::new(all.field().clone()),
+            all.value_type().clone(),
+            all.array().to_data(),
+            bounded,
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .unwrap_err(),
+        ConstantError::Limit("opaque Arrow validation byte limit exceeded")
+    );
+}
+
+#[test]
 fn empty_variadic_buffers_still_have_header_cost() {
     let array = arrow_array::StringViewArray::try_new(
         arrow_buffer::ScalarBuffer::from(Vec::<u128>::new()),
