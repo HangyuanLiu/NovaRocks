@@ -182,6 +182,7 @@ async fn commit_self_assembled_append(
         label,
         guard.as_deref(),
         ctx.snapshot_properties,
+        ctx.metadata_updates,
     )
     .await
     {
@@ -210,6 +211,7 @@ async fn commit_self_assembled_append(
 /// the snapshot id/sequence used by a following `SetStatistics` action.
 pub(crate) async fn stage_eager_fast_append(
     ctx: CommitCtx<'_>,
+    initial_updates: Vec<crate::iceberg::TableUpdate>,
 ) -> Result<(Transaction, CommitOutcome), String> {
     let written = ctx.collector.take_written_files()?;
     for file in &written {
@@ -243,7 +245,7 @@ pub(crate) async fn stage_eager_fast_append(
     // An ordinary empty append has no data-plane effect. A managed
     // publication carries provider properties and therefore still needs the
     // empty snapshot the custom action builds.
-    if written.is_empty() && ctx.snapshot_properties.is_empty() {
+    if written.is_empty() && ctx.snapshot_properties.is_empty() && initial_updates.is_empty() {
         let snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
         return Ok((
             Transaction::new(ctx.table),
@@ -271,6 +273,8 @@ pub(crate) async fn stage_eager_fast_append(
         fail_before_manifest_list_write: false,
     });
     let tx = Transaction::new(ctx.table)
+        .stage_action_commit(ActionCommit::new(initial_updates, Vec::new()))
+        .map_err(|error| format!("FastAppend publication metadata stage failed: {error}"))?
         .stage_action(action)
         .await
         .map_err(|error| format!("FastAppend eager stage failed: {error}"))?;

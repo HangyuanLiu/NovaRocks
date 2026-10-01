@@ -176,3 +176,11 @@ UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-
 `iceberg-ivm/iceberg_ivm_delete_applicability` 使用官方 Iceberg writer 构造五个端点阶段，检查 same-commit DV/equality、同一不可变 Puffin 的不同 blob、删除 artifact 等价替代与整个数据文件移除；每阶段比较增量 MV、独立 FULL MV 和关闭 MV rewrite 的基表行袋。该 suite 使用隔离 REST fixture，需单独运行。
 
 release 对照入口为 `connector/iceberg-delete-performance` 和 `tests/system-test-runner/scripts/uea4g-performance.py`。驱动在执行前冻结二进制、源码、配置、输入与八次运行顺序；同一 cold/warm 配置在 baseline/candidate 间交替，第二遍反转顺序。全部 raw samples 保留，baseline 错行的非 control case 不计算性能比例，candidate 错行直接失败；control 噪声超过冻结门限时要求按同一参数重做实验。性能场景只能使用 `--launch-profile performance`；行袋、闭包与性能收据各自证明对应契约。
+
+UEA-7B3 新增 `iceberg_ivm_visible_bag_duplicate_retractions`、`iceberg_ivm_visible_bag_union_cancellation`、`iceberg_ivm_visible_bag_typed_contents`、`iceberg_ivm_visible_bag_signed_zero` 属于 `iceberg-ivm`；`iceberg_mv_visible_bag_join_multiplicity` 属于 `iceberg-mv-apply`。用例冻结关闭 MV rewrite，以完整可见行袋对照定义 SELECT；signed-zero 用 `atan2` 的符号独立检查。文件写入仅提交测试输入，不表示已取得原生 `1FE+3BE` 收据或已验证 Parquet 字典编码路径。
+
+`iceberg-compatibility/novarocks_mv_external_target_snapshot_guard` 使用同一 REST fixture 的官方 Equality writer 修改已发布目标快照，并检查所有表属性保持不变，断言普通刷新仍拒绝外部快照变更。该用例仅验证外部修改保护，不能作为 `TargetFormatUnsupported`、资格停止或人工 FULL 恢复收据。
+
+`iceberg-compatibility/spark_rest_minio_v3_mv_visible_bag_cow` 明确配置 Spark UPDATE/MERGE 为 COW，检查 overwrite 与真实文件替换，再跨 MERGE+官方 DV 的源历史窗口及已有 DV 后续 COW 更新，比较两个 MV 的完整可见袋与全量定义查询。第二 MV 按源 identity 分区列分区；仅作为候选冻结的产品输入，不声明已有准确文件范围或扫描字节收据。完整可见袋与实际文件替换已在原生 1FE+3BE 验证。
+
+`iceberg-compatibility/novarocks_mv_target_candidate_freeze` 使用官方 Spark Equality 文件和 debug-only 初始发布 seed，将数据与 no-op Equality 正常提交在同一首次发布事务，保持准确 P/E。用例比较 writer/reader 的真实完整候选文件集合与独立 SDK 的 p1 集合，验证 p2 非候选 Equality 豁免、命中 p2 时格式拒绝及停止、源变化不解除、人工 FULL 恢复。扫描字节缺少准确观测入口时标记 Unavailable；不能从 Equality 结果推断 Parquet position 格式产品验证。

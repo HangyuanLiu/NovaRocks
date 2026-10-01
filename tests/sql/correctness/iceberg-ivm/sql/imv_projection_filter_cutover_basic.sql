@@ -34,14 +34,9 @@
 -- frozen test-catalog snapshots. Query 7 verifies that the live provider
 -- refuses fabricated snapshot bounds before a plan is presented.
 --
--- Row correctness and internal-column hygiene (positive
--- `@result_contains` and negative `@result_not_contains` on query 5):
---   * `__change_op`, `_row_id`, and `__nova_base_row_id` must NOT be
---     visible from `SELECT * FROM proj_mv`. The PF refresh merge sink
---     strips `__change_op` and `_row_id` from the INSERT batch (see
---     commit e230d8b6); `__nova_base_row_id` is derived internally
---     from `_row_id` by `InjectApplyKeyProject`. A regression that
---     re-exposed any of them would surface in the row text output.
+-- Non-aggregate S physically stores only the defining SELECT's visible columns.
+-- Signed source actions and target file/position locators remain temporary.
+-- SELECT * must not expose any retired row/apply-key or action columns.
 
 -- query 1
 -- @skip_result_check=true
@@ -98,11 +93,12 @@ REFRESH MATERIALIZED VIEW proj_mv WITH SYNC MODE;
 -- query 5
 -- Correctness + internal-column hygiene. The PF cutover must yield
 -- exactly the rows the MV SELECT would recompute, and `SELECT *`
--- must NOT expose any of the IMV-internal columns the merge-sink /
--- apply-key path uses.
+-- must NOT expose any temporary apply columns.
 -- @result_not_contains=__change_op
 -- @result_not_contains=_row_id
 -- @result_not_contains=__nova_base_row_id
+-- @result_not_contains=__nova_join_row_key
+-- @result_not_contains=__branch_id__
 -- @result_contains=1	10
 -- @result_contains=1	20
 -- @result_contains=1	70

@@ -1349,11 +1349,7 @@ mod tests {
                             type_signature: "int".to_string(),
                             nullable: false,
                         }],
-                        hidden_apply_key: HiddenApplyKeyContract {
-                            column_name: "__nova_base_row_id".to_string(),
-                            target_field_id: 2,
-                            source: novarocks_sql::planning::mv::ApplyKeySource::BaseRowId,
-                        },
+                        hidden_apply_key: None,
                         partition: None,
                     },
                 },

@@ -25,11 +25,15 @@
 use std::fmt;
 
 use crate::TransportBudget;
-use crate::creation::MAX_INITIAL_SCAN_NODES;
+use crate::creation::{MAX_INITIAL_SCAN_NODES, MAX_QUOTA_DOMAINS};
 use crate::descriptor::{
     MAX_EDGE_DESTINATIONS, MAX_INBOUND_SOURCES, MAX_SPLIT_PLAN_NODES, MAX_TOPOLOGY_ENTRIES,
 };
 use crate::domain::{MAX_DOMAIN_UPDATES, MAX_OPEN_EDGES};
+use novarocks_execution_contract::verification::{
+    VERIFICATION_MAX_CONTEXT_BYTES, VERIFICATION_MAX_INSTANCES_PER_CONTEXT,
+    VERIFICATION_MAX_INSTANCES_PER_TASK, VERIFICATION_MAX_TASKS_PER_CONTEXT,
+};
 
 // Keep in sync with plan-codec's NATIVE_V1_MAX_TREE_DEPTH. Task codec must not
 // depend on the plan encoder crate across the native wire boundary.
@@ -88,6 +92,68 @@ pub fn check_operation_batch(raw: &[u8]) -> Result<(), ResourcePreflightError> {
 /// Checks the closed control method's repeated operation count.
 pub fn check_control_operation_batch(raw: &[u8]) -> Result<(), ResourcePreflightError> {
     finish(scan_batch(raw, true))
+}
+
+/// Bounds release facts before a Native client allocates protobuf records.
+pub fn check_operation_response(raw: &[u8]) -> Result<(), ResourcePreflightError> {
+    let mut receipts = 0;
+    finish(for_fields(raw, |field, value| {
+        if let (1, Value::Bytes(receipt)) = (field, value) {
+            checked_increment(
+                &mut receipts,
+                TransportBudget::DEFAULT.max_batch_items(),
+                "task operation response exceeds 32 receipts",
+            )?;
+            let mut tasks = 0;
+            let mut instances = 0;
+            let mut fact_bytes: usize = 0;
+            // Repeated occurrences of a singular message merge in protobuf.
+            // Keep the counters across every release and verification carrier.
+            for_fields(receipt, |field, value| {
+                if let (8, Value::Bytes(release)) = (field, value) {
+                    for_fields(release, |field, value| {
+                        if let (6, Value::Bytes(facts)) = (field, value) {
+                            fact_bytes = fact_bytes
+                                .checked_add(facts.len())
+                                .ok_or_else(|| limit("release verification exceeds byte budget"))?;
+                            if fact_bytes > VERIFICATION_MAX_CONTEXT_BYTES {
+                                return Err(limit("release verification exceeds byte budget"));
+                            }
+                            for_fields(facts, |field, value| {
+                                if let (2, Value::Bytes(task)) = (field, value) {
+                                    checked_increment(
+                                        &mut tasks,
+                                        VERIFICATION_MAX_TASKS_PER_CONTEXT,
+                                        "release verification exceeds task budget",
+                                    )?;
+                                    let mut local_instances = 0;
+                                    for_fields(task, |field, value| {
+                                        if field == 3 && matches!(value, Value::Bytes(_)) {
+                                            checked_increment(
+                                                &mut local_instances,
+                                                VERIFICATION_MAX_INSTANCES_PER_TASK,
+                                                "task verification exceeds instance budget",
+                                            )?;
+                                            checked_increment(
+                                                &mut instances,
+                                                VERIFICATION_MAX_INSTANCES_PER_CONTEXT,
+                                                "release verification exceeds instance budget",
+                                            )?;
+                                        }
+                                        Ok(())
+                                    })?;
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }))
 }
 
 /// Checks every repeated covered target before prost allocates its objects.
@@ -354,6 +420,7 @@ struct MetadataCounts {
     inbound_nodes: usize,
     initial_scan_nodes: usize,
     sink_edges: usize,
+    quota_domains: usize,
 }
 
 fn scan_creation_metadata(raw: &[u8], frozen_raw_bytes: usize) -> ScanResult {
@@ -456,6 +523,13 @@ fn scan_assignment(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
                 &mut counts.initial_scan_nodes,
                 MAX_INITIAL_SCAN_NODES,
                 "task assignment exceeds 1024 initial scan nodes",
+            )?;
+        }
+        if field == 4 && matches!(value, Value::Bytes(_)) {
+            checked_increment(
+                &mut counts.quota_domains,
+                MAX_QUOTA_DOMAINS,
+                "task assignment exceeds 256 quota domains",
             )?;
         }
         Ok(())
@@ -724,6 +798,7 @@ mod tests {
 
         let sink_edges = |count: usize| {
             let assignment = novarocks::TaskAssignment {
+                quota_domain_bindings: Vec::new(),
                 sink_edge_ids: (1..=count as u32).collect(),
                 ..Default::default()
             }
@@ -738,6 +813,28 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "task assignment exceeds 256 sink edges"
+        );
+    }
+
+    #[test]
+    fn quota_domain_bound_precedes_prost_allocation_and_counts_merged_carriers() {
+        let assignment = |count| {
+            let mut bytes = Vec::new();
+            for _ in 0..count {
+                write_bytes_field(&mut bytes, 4, &[]);
+            }
+            bytes
+        };
+        let mut legal = Vec::new();
+        write_bytes_field(&mut legal, 5, &assignment(MAX_QUOTA_DOMAINS));
+        assert!(check_creation_metadata(&legal, 0).is_ok());
+        let mut overflow = legal;
+        write_bytes_field(&mut overflow, 5, &assignment(1));
+        assert_eq!(
+            check_creation_metadata(&overflow, 0)
+                .unwrap_err()
+                .to_string(),
+            "task assignment exceeds 256 quota domains"
         );
     }
 
@@ -936,6 +1033,75 @@ mod tests {
         assert!(novarocks::ApplyTaskOperationsRequest::decode(raw.as_slice()).is_ok());
         assert!(check_operation_batch(&[0x0a, 0x80]).is_ok());
         assert!(novarocks::ApplyTaskOperationsRequest::decode(&[0x0a, 0x80][..]).is_err());
+    }
+
+    #[test]
+    fn release_fact_preflight_bounds_empty_objects_and_merged_carriers() {
+        fn response(facts: &[Vec<u8>]) -> Vec<u8> {
+            let mut receipt = Vec::new();
+            for fact in facts {
+                let mut release = Vec::new();
+                write_bytes_field(&mut release, 6, fact);
+                write_bytes_field(&mut receipt, 8, &release);
+            }
+            let mut response = Vec::new();
+            write_bytes_field(&mut response, 1, &receipt);
+            response
+        }
+        let mut facts = Vec::new();
+        for _ in 0..VERIFICATION_MAX_TASKS_PER_CONTEXT {
+            write_bytes_field(&mut facts, 2, &[]);
+        }
+        assert!(check_operation_response(&response(&[facts.clone()])).is_ok());
+        let mut extra = Vec::new();
+        write_bytes_field(&mut extra, 2, &[]);
+        assert_eq!(
+            check_operation_response(&response(&[facts, extra]))
+                .unwrap_err()
+                .to_string(),
+            "release verification exceeds task budget"
+        );
+
+        let mut task = Vec::new();
+        for _ in 0..VERIFICATION_MAX_INSTANCES_PER_TASK {
+            write_bytes_field(&mut task, 3, &[]);
+        }
+        let mut facts = Vec::new();
+        write_bytes_field(&mut facts, 2, &task);
+        assert!(check_operation_response(&response(&[facts])).is_ok());
+        write_bytes_field(&mut task, 3, &[]);
+        let mut facts = Vec::new();
+        write_bytes_field(&mut facts, 2, &task);
+        assert_eq!(
+            check_operation_response(&response(&[facts]))
+                .unwrap_err()
+                .to_string(),
+            "task verification exceeds instance budget"
+        );
+
+        let mut task = Vec::new();
+        for _ in 0..VERIFICATION_MAX_INSTANCES_PER_TASK {
+            write_bytes_field(&mut task, 3, &[]);
+        }
+        let mut facts = Vec::new();
+        for _ in 0..(VERIFICATION_MAX_INSTANCES_PER_CONTEXT / VERIFICATION_MAX_INSTANCES_PER_TASK) {
+            write_bytes_field(&mut facts, 2, &task);
+        }
+        assert!(check_operation_response(&response(&[facts.clone()])).is_ok());
+        let mut extra = Vec::new();
+        write_bytes_field(&mut extra, 2, &task);
+        assert_eq!(
+            check_operation_response(&response(&[facts, extra]))
+                .unwrap_err()
+                .to_string(),
+            "release verification exceeds instance budget"
+        );
+        assert_eq!(
+            check_operation_response(&response(&[vec![0; VERIFICATION_MAX_CONTEXT_BYTES + 1]]))
+                .unwrap_err()
+                .to_string(),
+            "release verification exceeds byte budget"
+        );
     }
 
     fn write_bytes_field(destination: &mut Vec<u8>, number: u32, bytes: &[u8]) {

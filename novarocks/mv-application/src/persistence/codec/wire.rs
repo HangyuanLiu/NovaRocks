@@ -40,7 +40,7 @@ const STRUCTURAL_ITEM_WORKING_SET_BYTES: usize = 512;
 const DEPTH_FRAME_WORKING_SET_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Schema {
+pub(crate) enum Schema {
     DefinitionDocument,
     QuerySource,
     ResolutionContext,
@@ -64,6 +64,7 @@ pub(super) enum Schema {
     PublicationOutput,
     PublicationStatistics,
     ConfigurationDocument,
+    EligibilityDocument,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,6 +292,21 @@ const PUBLICATION: &[Field] = &[
 const PUBLICATION_INPUT: &[Field] = &[scalar(1), bytes(2), bytes(3)];
 const PUBLICATION_OUTPUT: &[Field] = &[bytes(1), boolean(2)];
 const PUBLICATION_STATISTICS: &[Field] = &[scalar(1), scalar(2)];
+const ELIGIBILITY: &[Field] = &[
+    scalar(1),
+    bytes(2),
+    bytes(3),
+    bytes(4),
+    bytes(5),
+    bytes(6),
+    scalar(7),
+    scalar(8),
+    bytes(9),
+    bytes(10),
+    scalar(11),
+    scalar(12),
+    repeated_bytes(13),
+];
 const CONFIGURATION: &[Field] = &[scalar(1), scalar(2), boolean(3), scalar(4), scalar(5)];
 
 impl Schema {
@@ -319,18 +335,19 @@ impl Schema {
             Self::PublicationOutput => PUBLICATION_OUTPUT,
             Self::PublicationStatistics => PUBLICATION_STATISTICS,
             Self::ConfigurationDocument => CONFIGURATION,
+            Self::EligibilityDocument => ELIGIBILITY,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct PreflightUsage {
+pub(crate) struct PreflightUsage {
     pub encoded_bytes: usize,
     pub estimated_working_set_bytes: usize,
     pub expanded_items: usize,
 }
 
-pub(super) fn preflight(
+pub(crate) fn preflight(
     bytes: &[u8],
     schema: Schema,
     budget: PersistenceDecodeBudget,

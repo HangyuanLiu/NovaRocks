@@ -336,9 +336,37 @@ impl IcebergMvRewriteContext {
         Ok(values)
     }
 
+    /// Project explicit source capability and the admitted statement budget.
+    pub(crate) fn visible_apply_facts(
+        &self,
+        kind: novarocks_sql::compiler::SqlImvVisibleApplyKind,
+        admitted_budget: Option<f64>,
+    ) -> Result<Option<novarocks_sql::compiler::SqlImvVisibleApplyFacts>, String> {
+        use novarocks_sql::compiler::{SqlImvVisibleApplyFacts, SqlImvVisibleApplyKind};
+        if self.analysis.aggregate.is_some() {
+            return Ok(None);
+        }
+        if kind == SqlImvVisibleApplyKind::AppendOnly {
+            return Ok(Some(SqlImvVisibleApplyFacts::append_only()));
+        }
+        let budget = admitted_budget
+            .ok_or("visible-tuple delete application has no admitted resident-state budget")?;
+        if !budget.is_finite() || budget < 1.0 || budget >= i64::MAX as f64 {
+            return Err(
+                "visible-tuple delete application has an invalid admitted resident-state budget"
+                    .into(),
+            );
+        }
+        Ok(Some(SqlImvVisibleApplyFacts::try_new(
+            kind,
+            budget.floor() as u64,
+        )?))
+    }
+
     pub fn to_sql_rewrite_snapshot(
         &self,
         target_binding: SqlTableBindingId,
+        visible_apply: Option<novarocks_sql::compiler::SqlImvVisibleApplyFacts>,
     ) -> Result<SqlImvRewriteSnapshotHandle, String> {
         let mut builder =
             SqlImvRewriteSnapshotBuilder::try_new(self.target.clone(), target_binding, self.mv_id)?;
@@ -378,6 +406,14 @@ impl IcebergMvRewriteContext {
         builder.set_schema_contract(self.sql_schema.clone())?;
         if let Some(analysis) = &self.analysis.aggregate {
             builder.set_aggregate_execution(aggregate_execution_facts(analysis)?)?;
+            if visible_apply.is_some() {
+                return Err("aggregate rewrite received visible-bag policy".into());
+            }
+        } else {
+            builder.set_visible_apply(
+                visible_apply
+                    .ok_or("visible-tuple rewrite is missing frozen source change policy")?,
+            )?;
         }
         builder.build()
     }
@@ -515,8 +551,21 @@ fn sql_schema_facts(
 ) -> Result<SqlImvSchemaContractFacts, String> {
     let definition = projection.facts.definition();
     let interpretation = projection.facts.interpretation();
-    let [apply_key] = bindings.apply_key.as_slice() else {
-        return Err("SQL IMV rewrite requires one physical apply-key column".into());
+    let apply_key = match (
+        interpretation.apply_key.as_ref(),
+        bindings.apply_key.as_slice(),
+    ) {
+        (None, []) if interpretation.aggregates.is_empty() => None,
+        (Some(key), [field])
+            if key.kind == ApplyKeyKind::GroupRowId && !interpretation.aggregates.is_empty() =>
+        {
+            Some(field)
+        }
+        _ => {
+            return Err(
+                "SQL IMV rewrite state key disagrees with the canonical interpretation".into(),
+            );
+        }
     };
     let bases = definition
         .relation_occurrences
@@ -583,7 +632,10 @@ fn sql_schema_facts(
         // NativeColumnV1 is L's declared encoding, not an old contract version.
         Some(SqlImvAggregateContractFacts::try_new(
             1,
-            apply_key.name.clone(),
+            apply_key
+                .ok_or("aggregate IMV rewrite has no state key")?
+                .name
+                .clone(),
             states,
         )?)
     };
@@ -612,12 +664,7 @@ fn sql_schema_facts(
                 )
             })
             .collect::<Result<_, _>>()?,
-        apply_key.name.clone(),
-        match interpretation.apply_key.kind {
-            ApplyKeyKind::BaseRowId => SqlImvApplyKeySourceFacts::BaseRowId,
-            ApplyKeyKind::JoinRowKey => SqlImvApplyKeySourceFacts::JoinRowKey,
-            ApplyKeyKind::GroupRowId => SqlImvApplyKeySourceFacts::GroupRowId,
-        },
+        apply_key.map(|field| (field.name.clone(), SqlImvApplyKeySourceFacts::GroupRowId)),
         analysis.partition.clone(),
     )?;
     SqlImvSchemaContractFacts::try_new(

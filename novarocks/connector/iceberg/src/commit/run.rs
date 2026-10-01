@@ -66,17 +66,20 @@ pub struct RunInput {
     /// DML (`INSERT INTO t.branch_dev`) supplies the branch name here.
     pub target_ref: String,
     pub snapshot_properties: BTreeMap<String, String>,
-    /// Provider-assigned partition-spec updates that must share the exact
-    /// external commit with one managed overwrite snapshot on `main`.
-    pub atomic_partition_replacement: Option<AtomicPartitionReplacement>,
+    /// Application document properties and optional partition-spec updates,
+    /// published atomically with the exact managed snapshot on `main`.
+    pub atomic_publication_updates: Option<AtomicPublicationUpdates>,
 }
 
-pub(crate) struct AtomicPartitionReplacement {
+pub(crate) struct AtomicPublicationUpdates {
     updates: Vec<TableUpdate>,
 }
 
-impl AtomicPartitionReplacement {
+impl AtomicPublicationUpdates {
     pub(super) fn try_new(updates: Vec<TableUpdate>) -> Result<Self, String> {
+        if matches!(updates.as_slice(), [TableUpdate::SetProperties { .. }]) {
+            return Ok(Self { updates });
+        }
         if !(updates.len() == 2 || updates.len() == 3)
             || !matches!(updates[0], TableUpdate::AddSpec { .. })
             || !matches!(updates[1], TableUpdate::SetDefaultSpec { .. })
@@ -85,7 +88,7 @@ impl AtomicPartitionReplacement {
                 .is_some_and(|update| !matches!(update, TableUpdate::SetProperties { .. }))
         {
             return Err(
-                "atomic Iceberg partition replacement requires AddSpec, SetDefaultSpec, and at most one SetProperties"
+                "atomic publication requires SetProperties or AddSpec, SetDefaultSpec and optional SetProperties"
                     .to_string(),
             );
         }
@@ -110,10 +113,25 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         selected_rewrite,
         target_ref,
         snapshot_properties,
-        atomic_partition_replacement,
+        atomic_publication_updates,
     } = input;
 
-    if let Some(replacement) = atomic_partition_replacement {
+    let publication_updates = atomic_publication_updates
+        .map(|updates| updates.updates)
+        .unwrap_or_default();
+    let repartition = matches!(
+        publication_updates.first(),
+        Some(TableUpdate::AddSpec { .. })
+    );
+    if !publication_updates.is_empty() && target_ref != "main" {
+        return Err(CommitServiceError::invalid_input(
+            "atomic application publication requires main".to_string(),
+        ));
+    }
+    if repartition {
+        let replacement = AtomicPublicationUpdates {
+            updates: publication_updates,
+        };
         if collector.op_kind != CommitOpKind::Overwrite || target_ref != "main" {
             return Err(CommitServiceError::invalid_input(
                 "atomic Iceberg partition replacement requires one managed overwrite on main"
@@ -131,6 +149,8 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
             abort_handle: collector.abort_log.clone(),
             target_ref: &target_ref,
             snapshot_properties: &snapshot_properties,
+
+            metadata_updates: &[],
         };
         let result = run_atomic_partition_replacement(ctx, replacement).await;
         return match result {
@@ -187,6 +207,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         abort_handle: collector.abort_log.clone(),
         target_ref: &target_ref,
         snapshot_properties: &snapshot_properties,
+        metadata_updates: &publication_updates,
     };
 
     match action.commit(ctx).await {
@@ -205,7 +226,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
 
 async fn run_atomic_partition_replacement(
     ctx: CommitCtx<'_>,
-    replacement: AtomicPartitionReplacement,
+    replacement: AtomicPublicationUpdates,
 ) -> Result<CommitOutcome, String> {
     // The atomic repartition path assembles its own `TableCommit` because the
     // partition-spec updates must precede the snapshot updates in one commit.
@@ -841,7 +862,7 @@ mod application_document_publication_trace_tests {
     fn prepare_publication(
         fixture: &Fixture,
         technique: ConnectorManagedPublicationTechnique,
-        shape: ConnectorManagedPublicationShape,
+        _shape: ConnectorManagedPublicationShape,
         repartition: bool,
         content: Bytes,
         document_count: usize,
@@ -951,6 +972,17 @@ mod application_document_publication_trace_tests {
                 .expect("publication document")
             })
             .collect::<Vec<_>>();
+        publication_documents.push(
+            ConnectorDocument::try_new(
+                ConnectorDocumentOwner::parse("novarocks.mv").unwrap(),
+                ConnectorDocumentName::parse("eligibility").unwrap(),
+                ConnectorDocumentFormat::try_new("novarocks.mv", "eligibility", 1).unwrap(),
+                Bytes::from_static(b"eligible-current-publication"),
+                Vec::new(),
+                ConnectorDocumentAttachment::TableMetadata,
+            )
+            .unwrap(),
+        );
         if repartition {
             publication_documents.push(
                 ConnectorDocument::try_new(
@@ -1051,6 +1083,7 @@ mod application_document_publication_trace_tests {
             },
             base: Some(prepared.base.clone()),
             flavor: ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                target_candidates: None,
                 declaration: prepared.declaration.clone(),
                 shape,
             },
@@ -1078,6 +1111,7 @@ mod application_document_publication_trace_tests {
                     ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_string(),
                     "row-mutation-base".to_string(),
                 )]),
+                metadata_updates: &[],
             })
             .await
             .expect("seed row-mutation base snapshot");
@@ -1362,7 +1396,7 @@ mod application_document_publication_trace_tests {
         assert_exact_target_mutation(
             &fixture,
             prepared.base_snapshot_id,
-            &["add-snapshot", "set-snapshot-ref"],
+            &["set-properties", "add-snapshot", "set-snapshot-ref"],
             snapshot_id,
         );
         assert_exact_manifest(&fixture, snapshot_id, &prepared.expected_manifest).await;
@@ -1414,6 +1448,7 @@ mod application_document_publication_trace_tests {
         assert!(
             crate::commit::write_stack::control::session_freezes_old_deletes(
                 &ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                    target_candidates: None,
                     declaration: prepared.declaration.clone(),
                     shape: ConnectorManagedPublicationShape::RowMutation,
                 },
@@ -1454,7 +1489,7 @@ mod application_document_publication_trace_tests {
         assert_exact_target_mutation(
             &fixture,
             prepared.base_snapshot_id,
-            &["add-snapshot", "set-snapshot-ref"],
+            &["set-properties", "add-snapshot", "set-snapshot-ref"],
             snapshot_id,
         );
         assert_exact_manifest(&fixture, snapshot_id, &prepared.expected_manifest).await;
@@ -1537,7 +1572,7 @@ mod application_document_publication_trace_tests {
             novarocks_spi::connector::ConnectorDocumentStorageLimits::spec_default(),
         )
         .expect("project one layout and one publication without duplicate identities");
-        assert_eq!(projected.len(), 2);
+        assert_eq!(projected.len(), 3);
 
         let reconciled = control
             .reconcile_write(ConnectorWriteSessionReconcileRequest {
@@ -1564,6 +1599,236 @@ mod application_document_publication_trace_tests {
     }
 
     #[tokio::test]
+    async fn append_and_metadata_only_publish_eligibility_in_the_snapshot_commit() {
+        for technique in [
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationTechnique::MetadataOnly,
+        ] {
+            let fixture = fixture().await;
+            let shape = if technique == ConnectorManagedPublicationTechnique::Incremental {
+                ConnectorManagedPublicationShape::InsertOnlyChangeStream
+            } else {
+                ConnectorManagedPublicationShape::Data
+            };
+            let prepared = prepare_publication(
+                &fixture,
+                technique,
+                shape,
+                false,
+                Bytes::from_static(b"append-eligibility"),
+                1,
+                0,
+            );
+            let control = write_control(&fixture);
+            let plan = control
+                .begin_write(begin_request(&prepared, shape))
+                .unwrap();
+            let outcome = control
+                .finish_write(ConnectorWriteFinishRequest {
+                    commit: plan.commit_handle(),
+                    prepared: ConnectorPreparedWriteSet::try_new(
+                        0,
+                        Vec::new(),
+                        &plan.expected_targets(),
+                    )
+                    .unwrap(),
+                    statistics: Vec::new(),
+                    publication: ConnectorWriteFinishPublication::ApplicationDocuments(
+                        prepared.intent.clone(),
+                    ),
+                    context: context(),
+                })
+                .unwrap();
+            let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+                panic!("publication must commit atomically");
+            };
+            let snapshot_id = receipt
+                .committed_version()
+                .and_then(|version| version.snapshot_id())
+                .unwrap();
+            assert_exact_target_mutation(
+                &fixture,
+                prepared.base_snapshot_id,
+                &["set-properties", "add-snapshot", "set-snapshot-ref"],
+                snapshot_id,
+            );
+            assert_exact_manifest(&fixture, snapshot_id, &prepared.expected_manifest).await;
+            let table = fixture
+                .catalog
+                .load_table(fixture.table.identifier())
+                .await
+                .unwrap();
+            assert!(
+                table
+                    .metadata()
+                    .properties()
+                    .get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
+                    .unwrap()
+                    .contains("eligibility")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_fence_cas_rejects_a_main_snapshot_that_advanced() {
+        let fixture = row_lineage_fixture().await;
+        let original = fixture.table.metadata().current_snapshot_id();
+        seed_empty_snapshot(&fixture).await;
+        let rejected = fixture
+            .catalog
+            .update_table(
+                TableCommit::builder()
+                    .ident(fixture.table.identifier().clone())
+                    .requirements(vec![
+                        TableRequirement::UuidMatch {
+                            uuid: fixture.table.metadata().uuid(),
+                        },
+                        TableRequirement::RefSnapshotIdMatch {
+                            r#ref: "main".into(),
+                            snapshot_id: original,
+                        },
+                    ])
+                    .updates(vec![TableUpdate::SetProperties {
+                        updates: std::collections::HashMap::from([(
+                            "qualification-fence".into(),
+                            "pending".into(),
+                        )]),
+                    }])
+                    .build(),
+            )
+            .await;
+        assert!(rejected.is_err());
+        let current = fixture
+            .catalog
+            .load_table(fixture.table.identifier())
+            .await
+            .unwrap();
+        assert!(
+            !current
+                .metadata()
+                .properties()
+                .contains_key("qualification-fence")
+        );
+    }
+
+    #[tokio::test]
+    async fn nonempty_dv_publication_commits_eligibility_and_snapshot_together() {
+        let fixture = row_lineage_fixture().await;
+        let data = written_file(&fixture.table, "dv-base");
+        let seed = collector(
+            &fixture.table,
+            CommitOpKind::FastAppend,
+            fixture.table.metadata().default_partition_spec().clone(),
+            vec![data.clone()],
+        );
+        FastAppendCommit
+            .commit(CommitCtx {
+                collector: &seed,
+                table: &fixture.table,
+                catalog: fixture.catalog.as_ref(),
+                file_io: fixture.table.file_io(),
+                commit_uuid: Uuid::now_v7(),
+                abort_handle: Arc::clone(&seed.abort_log),
+                target_ref: "main",
+                snapshot_properties: &BTreeMap::new(),
+                metadata_updates: &[],
+            })
+            .await
+            .expect("seed data snapshot");
+        let table = fixture
+            .catalog
+            .load_table(fixture.table.identifier())
+            .await
+            .unwrap();
+        let base_snapshot = table.metadata().current_snapshot_id();
+        fixture.catalog.clear();
+        let mut dv = crate::commit::DeletionVector::new();
+        dv.insert(1).unwrap();
+        let puffin = crate::commit::write_single_deletion_vector_puffin(
+            table.file_io(),
+            &format!("{}/data/qualification.puffin", table.metadata().location()),
+            &data.path,
+            &dv,
+        )
+        .await
+        .unwrap();
+        let mut file = written_file(&table, "unused");
+        file.path = puffin.path;
+        file.content = DataContentType::PositionDeletes;
+        file.format = DataFileFormat::Puffin;
+        file.record_count = puffin.cardinality;
+        file.cardinality = Some(puffin.cardinality);
+        file.file_size_in_bytes = puffin.file_size_in_bytes;
+        file.referenced_data_file = Some(puffin.referenced_data_file);
+        file.content_offset = Some(puffin.content_offset);
+        file.content_size_in_bytes = Some(puffin.content_size_in_bytes);
+        let deletes = collector(
+            &table,
+            CommitOpKind::RowDeltaDvFromFiles,
+            table.metadata().default_partition_spec().clone(),
+            vec![file],
+        );
+        let updates = vec![TableUpdate::SetProperties {
+            updates: HashMap::from([(
+                "novarocks.mv.eligibility-test".to_string(),
+                "eligible".to_string(),
+            )]),
+        }];
+        let (properties, unresolved) = prepared_snapshot_properties("dv-publication");
+        let outcome = RowDeltaDvFromFilesCommit
+            .commit(CommitCtx {
+                collector: &deletes,
+                table: &table,
+                catalog: fixture.catalog.as_ref(),
+                file_io: table.file_io(),
+                commit_uuid: Uuid::now_v7(),
+                abort_handle: Arc::clone(&deletes.abort_log),
+                target_ref: "main",
+                snapshot_properties: &properties,
+                metadata_updates: &updates,
+            })
+            .await
+            .expect("commit deletion and qualification atomically");
+        assert_one_snapshot_commit(
+            &fixture.catalog,
+            &["set-properties", "add-snapshot", "set-snapshot-ref"],
+            outcome.new_snapshot_id,
+        );
+        assert_eq!(
+            fixture.catalog.commits()[0].ref_requirements,
+            vec![("main".to_string(), base_snapshot)]
+        );
+        let committed = fixture
+            .catalog
+            .load_table(table.identifier())
+            .await
+            .unwrap();
+        assert_eq!(
+            committed
+                .metadata()
+                .properties()
+                .get("novarocks.mv.eligibility-test"),
+            Some(&"eligible".to_string())
+        );
+        crate::document_storage::publication::validate_expected_manifest(
+            committed.metadata(),
+            outcome.new_snapshot_id,
+            &unresolved,
+        )
+        .expect("snapshot and document agree");
+        assert_eq!(
+            committed
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get("total-records"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn normal_document_publication_is_one_exact_main_commit() {
         let fixture = fixture().await;
         let file = written_file(&fixture.table, "normal");
@@ -1584,6 +1849,8 @@ mod application_document_publication_trace_tests {
                 abort_handle: Arc::clone(&collector.abort_log),
                 target_ref: "main",
                 snapshot_properties: &properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("normal document publication");
@@ -1648,8 +1915,8 @@ mod application_document_publication_trace_tests {
             vec![file],
         );
         let (properties, unresolved) = prepared_snapshot_properties("eager");
-        let (transaction, outcome) =
-            crate::commit::fast_append::stage_eager_fast_append(CommitCtx {
+        let (transaction, outcome) = crate::commit::fast_append::stage_eager_fast_append(
+            CommitCtx {
                 collector: &collector,
                 table: &fixture.table,
                 catalog: fixture.catalog.as_ref(),
@@ -1658,9 +1925,18 @@ mod application_document_publication_trace_tests {
                 abort_handle: Arc::clone(&collector.abort_log),
                 target_ref: "main",
                 snapshot_properties: &properties,
-            })
-            .await
-            .expect("stage eager document publication");
+
+                metadata_updates: &[],
+            },
+            vec![TableUpdate::SetProperties {
+                updates: std::collections::HashMap::from([(
+                    "qualification-fence".to_string(),
+                    "eligible".to_string(),
+                )]),
+            }],
+        )
+        .await
+        .expect("stage eager document publication");
         let mut staged = transaction.into_table_commit();
         staged.add_requirement(TableRequirement::UuidMatch {
             uuid: fixture.table.metadata().uuid(),
@@ -1684,7 +1960,7 @@ mod application_document_publication_trace_tests {
 
         assert_one_snapshot_commit(
             &fixture.catalog,
-            &["add-snapshot", "set-snapshot-ref"],
+            &["set-properties", "add-snapshot", "set-snapshot-ref"],
             outcome.new_snapshot_id,
         );
         let table = fixture
@@ -1692,6 +1968,14 @@ mod application_document_publication_trace_tests {
             .load_table(fixture.table.identifier())
             .await
             .expect("reload eager publication");
+        assert_eq!(
+            table
+                .metadata()
+                .properties()
+                .get("qualification-fence")
+                .map(String::as_str),
+            Some("eligible")
+        );
         crate::document_storage::publication::validate_expected_manifest(
             table.metadata(),
             outcome.new_snapshot_id,
@@ -1724,6 +2008,8 @@ mod application_document_publication_trace_tests {
                 abort_handle: Arc::clone(&seed_collector.abort_log),
                 target_ref: "main",
                 snapshot_properties: &seed_properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("seed populated table");
@@ -1757,6 +2043,8 @@ mod application_document_publication_trace_tests {
                 abort_handle: Arc::clone(&collector.abort_log),
                 target_ref: "main",
                 snapshot_properties: &properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("empty document publication");
@@ -1806,7 +2094,7 @@ mod application_document_publication_trace_tests {
             &replacement,
         )
         .expect("prepare repartition");
-        let replacement = AtomicPartitionReplacement::try_new(prepared.metadata_updates().to_vec())
+        let replacement = AtomicPublicationUpdates::try_new(prepared.metadata_updates().to_vec())
             .expect("atomic repartition updates");
         let collector = collector(
             &fixture.table,
@@ -1828,6 +2116,8 @@ mod application_document_publication_trace_tests {
                 abort_handle: Arc::clone(&collector.abort_log),
                 target_ref: "main",
                 snapshot_properties: &properties,
+
+                metadata_updates: &[],
             },
             replacement,
         )

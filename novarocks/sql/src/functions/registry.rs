@@ -1702,6 +1702,17 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // function exists to take; it reads each argument independently and
     // returns a fixed type, which is what `AnyType` says. Same correction as
     // the variadic hash and encode functions beside it.
+    add(m, "mv_entry_id", Signature::new(vec![], TypeSpec::Binary));
+    add(
+        m,
+        "mv_require_non_null",
+        Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+    );
+    add(
+        m,
+        "mv_content_key",
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
+    );
     add(
         m,
         "mv_group_row_id",
@@ -2007,6 +2018,11 @@ fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    add(
+        m,
+        "mv_weight_sum",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
+    );
     // max_by / min_by / any_value preserve first-arg type.
     for name in ["max_by", "min_by", "any_value"] {
         add(

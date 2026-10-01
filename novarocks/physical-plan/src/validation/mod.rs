@@ -379,11 +379,13 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
                 });
         }
     }
+    let sink_expressions = sink_expression_ids(fragment);
     for (_, expression) in fragment.expressions().iter() {
         validate_expression(
             fragment,
             expression,
             &indexes.visible_inputs,
+            &sink_expressions,
             &window_roots,
             &operator_roots,
             expression_parents

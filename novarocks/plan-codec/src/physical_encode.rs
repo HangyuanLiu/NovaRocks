@@ -472,6 +472,23 @@ fn encode_runtime_filter_producer(
     let expression =
         encode_runtime_filter_endpoint(fragment, layout, &producer.endpoint, producer_scope)?;
     let target = match producer.target {
+        RuntimeFilterProducerTarget::QuotaContentField {
+            field_ordinal,
+            content_equivalence,
+        } => {
+            let semantic = match content_equivalence {
+                novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1 => {
+                    plan::ResultContentEquivalence::NativeResultContentV1 as i32
+                }
+            };
+            plan::runtime_filter_producer_role::Target::QuotaContentField(
+                plan::RuntimeFilterQuotaContentField {
+                    field_ordinal,
+                    content_equivalence: semantic,
+                    witness_id: producer.witness.get(),
+                },
+            )
+        }
         RuntimeFilterProducerTarget::JoinBuildKey { equality } => {
             let witness = filter
                 .equality_witnesses
@@ -559,6 +576,42 @@ fn encode_runtime_filter_consumer(
     let expression =
         encode_runtime_filter_endpoint(fragment, layout, &consumer.endpoint, consumer.apply_point)?;
     let target = match &consumer.target {
+        RuntimeFilterConsumerTarget::QuotaContentScanField {
+            producer: witness, ..
+        } => {
+            let producer = filter
+                .producers
+                .iter()
+                .find(|producer| producer.witness == *witness)
+                .ok_or("quota runtime-filter consumer has no exact producer witness")?;
+            let novarocks_physical_plan::RuntimeFilterProducerTarget::QuotaContentField {
+                field_ordinal,
+                content_equivalence,
+            } = producer.target
+            else {
+                return Err("quota runtime-filter consumer references a non-quota producer".into());
+            };
+            if producer.endpoint.fragment != consumer.endpoint.fragment {
+                return Err(
+                    "quota runtime-filter consumer must remain in the exact Preclaim fragment"
+                        .into(),
+                );
+            }
+            let semantic = match content_equivalence {
+                novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1 => {
+                    plan::ResultContentEquivalence::NativeResultContentV1 as i32
+                }
+            };
+            plan::runtime_filter_consumer_role::Target::QuotaContentScanField(
+                plan::RuntimeFilterQuotaContentScanField {
+                    producer_witness_id: witness.get(),
+                    field_ordinal,
+                    content_equivalence: semantic,
+                    preclaim_node_id: i32::try_from(producer.endpoint.node.get())
+                        .map_err(|_| "quota runtime-filter Preclaim node exceeds i32")?,
+                },
+            )
+        }
         RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {
             let novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput { input_ordinal } =
                 consumer.apply_point
@@ -749,7 +802,8 @@ fn encode_runtime_filter_reduction(
                 .iter()
                 .find_map(|producer| match producer.target {
                     RuntimeFilterProducerTarget::AggregateTopNKey { limit, .. } => Some(limit),
-                    RuntimeFilterProducerTarget::JoinBuildKey { .. } => None,
+                    RuntimeFilterProducerTarget::JoinBuildKey { .. }
+                    | RuntimeFilterProducerTarget::QuotaContentField { .. } => None,
                 })
                 .ok_or_else(|| {
                     "ordered-hull reduction has no Aggregate TopN producer".to_string()
@@ -1073,7 +1127,9 @@ fn charge_node_expressions(
                 }
             }
         }
-        NodeKind::Limit { .. }
+        NodeKind::QuotaPreclaim { .. }
+        | NodeKind::QuotaTrim { .. }
+        | NodeKind::Limit { .. }
         | NodeKind::SetOp { .. }
         | NodeKind::Repeat { .. }
         | NodeKind::GenerateSeries { .. }
@@ -1492,8 +1548,10 @@ fn preflight_encoder(
                     })?;
                 }
             }
-            FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
-            }
+            FragmentSink::Result
+            | FragmentSink::Stream { .. }
+            | FragmentSink::Multicast { .. }
+            | FragmentSink::PredicateFanout { .. } => {}
             FragmentSink::SealedArtifact(_) | FragmentSink::Noop => {
                 unreachable!("shared preflight rejects these sinks")
             }
@@ -1558,6 +1616,12 @@ fn preflight_runtime_filters(physical: &PhysicalPlan) -> Result<ScanRuntimeFilte
                             filter.id.get()
                         )
                     })?;
+                }
+                RuntimeFilterProducerTarget::QuotaContentField { .. } => {
+                    if !matches!(filter.domain, RuntimeFilterDomain::Membership { ref ty, null_semantics: novarocks_physical_plan::RuntimeFilterNullSemantics::NullSafeEqual } if novarocks_physical_plan::quota_content_runtime_filter_type_supported(&ty.data_type))
+                    {
+                        return Err("quota runtime filter requires a conservative null-safe membership domain".into());
+                    }
                 }
                 RuntimeFilterProducerTarget::JoinBuildKey { .. } => {}
             }
@@ -2924,6 +2988,72 @@ fn encode_node_payload(
                 .collect::<Result<Vec<_>, String>>()?,
             output_columns: outputs.clone(),
         }),
+        NodeKind::QuotaPreclaim { spec } => Kind::QuotaPreclaim(plan::QuotaPreclaimNode {
+            demand_entry_id_column_id: layout
+                .input_value_slot_at(node.id, 0, spec.demand_entry_id)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            demand_key_column_id: layout
+                .input_value_slot_at(node.id, 0, spec.demand_key)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            demand_need: Some(encode_quota_need(layout, node.id, 0, spec.demand_need)?),
+            demand_value_column_ids: spec
+                .demand_values
+                .iter()
+                .map(|v| {
+                    layout
+                        .input_value_slot_at(node.id, 0, *v)
+                        .map(WireSlotId::get_u32)
+                        .map_err(|e| e.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            target_value_column_ids: spec
+                .target_values
+                .iter()
+                .map(|v| {
+                    layout
+                        .input_value_slot_at(node.id, 1, *v)
+                        .map(WireSlotId::get_u32)
+                        .map_err(|e| e.to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            target_file_column_id: layout
+                .input_value_slot_at(node.id, 1, spec.target_file)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            target_position_column_id: layout
+                .input_value_slot_at(node.id, 1, spec.target_position)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            content_equivalence: plan::ResultContentEquivalence::NativeResultContentV1 as i32,
+            preselection_domain_node_id: i32::try_from(spec.preselection_domain.get())
+                .map_err(|_| "quota domain node exceeds i32".to_string())?,
+            max_state_bytes: spec.max_state_bytes,
+        }),
+        NodeKind::QuotaTrim { spec } => Kind::QuotaTrim(plan::QuotaTrimNode {
+            seed_entry_id_column_id: layout
+                .input_value_slot_at(node.id, 0, spec.seed_entry_id)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            seed_need: Some(encode_quota_need(layout, node.id, 0, spec.seed_need)?),
+            candidate_entry_id_column_id: layout
+                .input_value_slot_at(node.id, 1, spec.candidate_entry_id)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            candidate_file_column_id: layout
+                .input_value_slot_at(node.id, 1, spec.candidate_file)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            candidate_position_column_id: layout
+                .input_value_slot_at(node.id, 1, spec.candidate_position)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            content_equivalence: plan::ResultContentEquivalence::NativeResultContentV1 as i32,
+            preselection_domain_node_id: i32::try_from(spec.preselection_domain.get())
+                .map_err(|_| "quota domain node exceeds i32".to_string())?,
+            max_state_bytes: spec.max_state_bytes,
+        }),
         NodeKind::Unpivot { spec } => Kind::Unpivot(plan::UnpivotNode {
             passthrough_columns: spec
                 .passthrough
@@ -3728,6 +3858,32 @@ fn encode_sink(
                     .collect::<Result<Vec<_>, String>>()?,
             })
         }
+        FragmentSink::PredicateFanout { branches } => {
+            let root = &fragment.nodes()[&fragment.root()];
+            let scope = output_scope_map(layout, root)?;
+            Kind::PredicateFanout(plan::PredicateFanoutSink {
+                branches: branches
+                    .iter()
+                    .map(|branch| {
+                        Ok(plan::PredicateFanoutBranch {
+                            stream: Some(encode_stream_sink(
+                                physical,
+                                fragment,
+                                layout,
+                                branch.edge,
+                            )?),
+                            predicate: Some(encode_physical_expr(
+                                fragment,
+                                layout,
+                                root.id,
+                                branch.predicate,
+                                ValueResolution::Exact(&scope),
+                            )?),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            })
+        }
         FragmentSink::Router { effect, routes } => {
             let root = &fragment.nodes()[&fragment.root()];
             let effect_ordinal = output_ordinal(root, *effect)?;
@@ -3813,6 +3969,7 @@ fn encode_edge(
         .collect::<Vec<_>>();
     let kind = match edge.kind {
         EdgeKind::Stream => plan::fragment_edge_kind::Kind::Stream(true),
+        EdgeKind::PredicateFanout => plan::fragment_edge_kind::Kind::PredicateFanout(true),
         EdgeKind::CteMulticast => {
             plan::fragment_edge_kind::Kind::CteMulticast(plan::CteMulticastEdge {
                 cte_id: edge.source.fragment.get(),
@@ -7269,4 +7426,290 @@ mod tests {
             }
         }
     }
+
+    fn append_quota_wire_values(
+        builder: &mut FragmentBuilder,
+        types: &[DataType],
+        properties_of: impl FnOnce(&[ValueId]) -> PhysicalProperties,
+    ) -> (NodeId, Vec<ValueId>, PhysicalProperties) {
+        let node = builder.reserve_node_id().unwrap();
+        let mut values = Vec::new();
+        let mut expressions = Vec::new();
+        for (ordinal, data_type) in types.iter().enumerate() {
+            let ty = ValueType::new(data_type.clone(), false);
+            let literal = match data_type {
+                DataType::Binary => LiteralValue::Binary(Box::from([1u8])),
+                DataType::Utf8 => LiteralValue::Utf8("target.parquet".into()),
+                _ => LiteralValue::Int64(-2),
+            };
+            expressions.push(
+                builder
+                    .add_expression(node, ty.clone(), ExprKind::Literal(literal))
+                    .unwrap(),
+            );
+            values.push(
+                builder
+                    .add_value(
+                        ty,
+                        ValueOrigin::NodeOutput {
+                            node,
+                            output_ordinal: ordinal as u32,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        let properties = properties_of(&values);
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties.clone(),
+                output: OutputPort {
+                    node,
+                    columns: values.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([expressions.into_boxed_slice()]),
+                },
+            })
+            .unwrap();
+        (node, values, properties)
+    }
+
+    #[test]
+    fn quota_preclaim_encodes_signed_need_and_exact_symbolic_domain() {
+        use novarocks_physical_plan::{
+            EdgeDestination, EdgePartitioning, EdgeSource, QuotaNeed, QuotaPreclaimSpec,
+        };
+        let semantic = novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1;
+        let quota_properties = PhysicalProperties {
+            distribution: Distribution::Unconstrained,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        let dop = PipelineDopDomain {
+            min: 1,
+            max: 1,
+            requires_power_of_two: false,
+        };
+        let mut preclaim = FragmentBuilder::new(FragmentId::new(901));
+        let (demand, values, demand_properties) = append_quota_wire_values(
+            &mut preclaim,
+            &[
+                DataType::Binary,
+                DataType::Binary,
+                DataType::Int64,
+                DataType::Int64,
+            ],
+            |_| PhysicalProperties {
+                distribution: Distribution::Broadcast,
+                row_multiplicity: RowMultiplicity::Replicated,
+                ordering: Box::default(),
+            },
+        );
+        let (target, target_values, _target_properties) = append_quota_wire_values(
+            &mut preclaim,
+            &[DataType::Int64, DataType::Utf8, DataType::Int64],
+            |_| properties(),
+        );
+        let node = preclaim.reserve_node_id().unwrap();
+        let output = [DataType::Binary, DataType::Utf8, DataType::Int64]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, data_type)| {
+                preclaim
+                    .add_value(
+                        ValueType::new(data_type, false),
+                        ValueOrigin::NodeOutput {
+                            node,
+                            output_ordinal: ordinal as u32,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        preclaim
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::from([demand, target]),
+                required_inputs: Box::from([demand_properties, quota_properties.clone()]),
+                output_properties: quota_properties.clone(),
+                output: OutputPort {
+                    node,
+                    columns: output.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::QuotaPreclaim {
+                    spec: QuotaPreclaimSpec {
+                        demand_entry_id: values[0],
+                        demand_key: values[1],
+                        demand_need: QuotaNeed::NegativeWeight { value: values[2] },
+                        demand_values: Box::from([values[3]]),
+                        target_values: Box::from([target_values[0]]),
+                        target_file: target_values[1],
+                        target_position: target_values[2],
+                        content_equivalence: semantic,
+                        preselection_domain: node,
+                        max_state_bytes: 4096,
+                    },
+                },
+            })
+            .unwrap();
+        let preclaim = preclaim
+            .finish_definition(
+                node,
+                FragmentSink::Stream {
+                    edge: EdgeId::new(901),
+                },
+                dop,
+            )
+            .unwrap();
+        let layout = WireLayout::try_new(&preclaim).unwrap();
+        let negative_slot = layout.input_value_slot(node, values[2]).unwrap().get_u32();
+        let mut physical = PlanBuilder::new(PlanVersionId::try_new([91; 16]).unwrap());
+        physical.add_fragment(preclaim).unwrap();
+        let edge = EdgeId::new(901);
+        let result_fragment = FragmentId::new(902);
+        let mut result = FragmentBuilder::new(result_fragment);
+        let result_node = result.reserve_node_id().unwrap();
+        let result_types = [DataType::Binary, DataType::Utf8, DataType::Int64];
+        let result_values = output
+            .iter()
+            .zip(&result_types)
+            .map(|(source, data_type)| {
+                result
+                    .add_value(
+                        ValueType::new(data_type.clone(), false),
+                        ValueOrigin::ExchangeImport {
+                            edge,
+                            source_value: *source,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mapping = output
+            .iter()
+            .copied()
+            .zip(result_values.iter().copied())
+            .collect::<Vec<_>>();
+        result
+            .insert_node_unchecked(PhysicalNode {
+                id: result_node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: result_node,
+                    columns: result_values.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::ExchangeSource {
+                    edge,
+                    imports: mapping.clone().into_boxed_slice(),
+                },
+            })
+            .unwrap();
+        physical
+            .add_fragment(
+                result
+                    .finish_definition(result_node, FragmentSink::Result, dop)
+                    .unwrap(),
+            )
+            .unwrap();
+        physical
+            .add_edge(Edge {
+                id: edge,
+                kind: EdgeKind::Stream,
+                source: EdgeSource {
+                    fragment: FragmentId::new(901),
+                    projection: output.into_boxed_slice(),
+                },
+                destination: EdgeDestination {
+                    fragment: result_fragment,
+                    node: result_node,
+                    receive_mapping: mapping.into_boxed_slice(),
+                },
+                partitioning: EdgePartitioning {
+                    source: Distribution::Singleton,
+                    source_multiplicity: RowMultiplicity::SingleCopy,
+                    destination: Distribution::Singleton,
+                    destination_multiplicity: RowMultiplicity::SingleCopy,
+                },
+            })
+            .unwrap();
+        physical
+            .set_result_port(ResultPort {
+                fragment: result_fragment,
+                output: OutputPort {
+                    node: result_node,
+                    columns: result_values.clone().into_boxed_slice(),
+                },
+                fields: result_values
+                    .into_iter()
+                    .zip(result_types)
+                    .enumerate()
+                    .map(|(ordinal, (value, data_type))| ResultField {
+                        name: format!("field{ordinal}").into(),
+                        alias: None,
+                        value,
+                        ty: ValueType::new(data_type, false),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let physical = physical.finish().unwrap();
+        let (catalog, _) = exact_scalar_catalog();
+        let encoded =
+            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap();
+        let plan::distributed_node::Payload::Physical(preclaim) = encoded.fragments[0]
+            .root
+            .as_ref()
+            .unwrap()
+            .payload
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("physical quota expected")
+        };
+        let Some(plan::plan_node::Kind::QuotaPreclaim(preclaim)) = &preclaim.kind else {
+            panic!("Preclaim expected")
+        };
+        assert_eq!(preclaim.preselection_domain_node_id, node.get() as i32);
+        assert_eq!(
+            preclaim.demand_need.as_ref().unwrap().kind,
+            Some(plan::quota_need::Kind::NegativeWeightColumnId(
+                negative_slot
+            ))
+        );
+        assert_eq!(preclaim.demand_value_column_ids.len(), 1);
+        assert_eq!(
+            preclaim.content_equivalence,
+            plan::ResultContentEquivalence::NativeResultContentV1 as i32
+        );
+        let decoded = plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(encoded, decoded);
+    }
+}
+
+fn encode_quota_need(
+    layout: &WireLayout,
+    node: NodeId,
+    input: u32,
+    need: novarocks_physical_plan::QuotaNeed,
+) -> Result<plan::QuotaNeed, String> {
+    let slot = layout
+        .input_value_slot_at(node, input, need.value())
+        .map_err(|e| e.to_string())?
+        .get_u32();
+    Ok(plan::QuotaNeed {
+        kind: Some(match need {
+            novarocks_physical_plan::QuotaNeed::Count { .. } => {
+                plan::quota_need::Kind::CountColumnId(slot)
+            }
+            novarocks_physical_plan::QuotaNeed::NegativeWeight { .. } => {
+                plan::quota_need::Kind::NegativeWeightColumnId(slot)
+            }
+        }),
+    })
 }

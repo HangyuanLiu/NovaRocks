@@ -25,10 +25,11 @@ use crate::mv::domain::application::{MvRefreshRequest, MvShowStatement};
 use crate::mv::domain::refresh::planning::RefreshPlanContract;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ListMvsRequest {
     pub stmt: MvShowStatement,
     pub current_catalog: Option<String>,
+    pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 #[derive(Clone, Debug)]
@@ -160,12 +161,26 @@ pub struct MvListRow {
     /// not. A target it can only read is still listed: it is being queried,
     /// and leaving it out would report it as gone.
     pub manageability: String,
+    pub eligibility_state: String,
+    pub eligibility_baseline: Option<String>,
+    pub eligibility_generation: Option<String>,
+    pub eligibility_attempt: Option<String>,
+    pub eligibility_requested: Option<String>,
+    pub eligibility_matched: Option<String>,
+    pub eligibility_conclusion: String,
+    pub eligibility_block_reason: Option<String>,
+    pub automatic_refresh_stop_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshErrorKind {
     UserError,
     PreCommitFailed,
+    /// These execution categories require exact verification evidence before
+    /// rollback; their names alone do not establish an uncommitted outcome.
+    ConsistencyFailed,
+    CapacityRefused,
+    TargetRefused,
     CommitFailedKnownUncommitted,
     CommitFailedKnownCommitted,
     CommitUnknown,
@@ -201,6 +216,18 @@ impl RefreshError {
 
     pub fn pre_commit(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::PreCommitFailed, message)
+    }
+
+    pub fn consistency_failed(message: impl Into<String>) -> Self {
+        Self::new(RefreshErrorKind::ConsistencyFailed, message)
+    }
+
+    pub fn capacity_refused(message: impl Into<String>) -> Self {
+        Self::new(RefreshErrorKind::CapacityRefused, message)
+    }
+
+    pub fn target_refused(message: impl Into<String>) -> Self {
+        Self::new(RefreshErrorKind::TargetRefused, message)
     }
 
     pub fn commit_known_uncommitted(message: impl Into<String>) -> Self {
@@ -255,6 +282,18 @@ mod tests {
 
         assert_eq!(error.kind, RefreshErrorKind::CommitUnknown);
         assert_eq!(error.to_string(), "commit state unknown");
+    }
+
+    #[test]
+    fn typed_apply_failures_require_verification_for_rollback() {
+        for error in [
+            RefreshError::consistency_failed("capacity detail"),
+            RefreshError::capacity_refused("consistency detail"),
+            RefreshError::target_refused("availability detail"),
+        ] {
+            assert!(!error.kind.should_rollback_after_commit());
+            assert_eq!(error.to_string(), error.message);
+        }
     }
 
     #[test]

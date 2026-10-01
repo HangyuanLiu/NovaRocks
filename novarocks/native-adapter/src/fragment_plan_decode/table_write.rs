@@ -1450,9 +1450,15 @@ mod tests {
         .expect("table writer factory");
         assert!(!factory.is_sink(), "a table writer is not a terminal sink");
         let runtime_state = writer_runtime_state();
+        let task_tracker =
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root("test writer task");
+        task_tracker
+            .install_limit_once(1024 * 1024)
+            .expect("admit writer task memory");
         let mut operators = Vec::new();
         for driver_id in 0..4 {
             let mut operator = factory.create(4, driver_id);
+            operator.set_mem_tracker(Arc::clone(&task_tracker));
             operator.prepare().expect("prepare writer actor");
             operator
                 .bind_runtime_state(&runtime_state)
@@ -2035,6 +2041,18 @@ mod tests {
                 expected_schema: Arc::new(arrow::datatypes::Schema::empty()),
                 physical: ConnectorWriterPhysicalContext::new([0; 16], 1, [0; 16], 0, 0),
                 context: test_request_context(),
+                resources: {
+                    let ledger =
+                        Arc::new(novarocks_execution::connector::WriterResourceLedger::new());
+                    ledger
+                        .install(
+                            novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                                "test writer task",
+                            ),
+                        )
+                        .expect("install writer tracker");
+                    ledger.resources()
+                },
             })
             .await
             .expect("open writer");

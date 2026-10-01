@@ -865,6 +865,10 @@ fn add_node_usage(
                 usage.add_items(output.arguments.len());
             }
         }
+        NodeKind::QuotaPreclaim { spec } => {
+            usage.add_item_counts([spec.demand_values.len(), spec.target_values.len()])
+        }
+        NodeKind::QuotaTrim { .. } => {}
         NodeKind::Unpivot { spec } => {
             usage.add_item_counts([
                 spec.passthrough.len(),
@@ -1187,6 +1191,7 @@ fn add_sink_usage(
 ) {
     match sink {
         FragmentSink::Multicast { edges } => usage.add_items(edges.len()),
+        FragmentSink::PredicateFanout { branches } => usage.add_items(branches.len()),
         FragmentSink::Router { routes, .. } => {
             usage.add_items(routes.len());
             for route in routes {
@@ -1308,7 +1313,8 @@ fn add_runtime_filter_usage(
         usage.add_item_counts([consumer.endpoint.values.len(), consumer.capabilities.len()]);
         match &consumer.target {
             crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. }
+            | crate::RuntimeFilterConsumerTarget::QuotaContentScanField { lineage, .. } => {
                 usage.add_items(lineage.len());
             }
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {}

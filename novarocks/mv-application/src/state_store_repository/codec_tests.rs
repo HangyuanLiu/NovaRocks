@@ -124,6 +124,20 @@ fn projection_codec_round_trips_complete_source_revision_and_waterline() {
 }
 
 #[test]
+fn accelerator_source_revision_preserves_eligibility_revision() {
+    let mut source = projection().facts.source_revision().clone();
+    source.eligibility_revision = Some(
+        crate::persistence::identity::DocumentRevision::from_canonical_bytes(
+            b"pending generation 2",
+        ),
+    );
+    let encoded = super::MvAcceleratorSourceRevisionAvro::from(&source);
+    let decoded =
+        crate::persistence::definition::MvAcceleratorSourceRevision::try_from(encoded).unwrap();
+    assert_eq!(decoded, source);
+}
+
+#[test]
 fn envelope_rejects_wrong_kind_unknown_schema_and_corruption() {
     let operation_id = Uuid::now_v7();
     let value = encode_record(
@@ -182,7 +196,14 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
     for subject in catalog.subjects() {
         assert!(catalog.entry(subject, 1).is_err());
         assert!(catalog.entry(subject, 2).is_err());
-        assert_eq!(catalog.latest(subject).unwrap().id(), 3);
+        assert_eq!(
+            catalog.latest(subject).unwrap().id(),
+            if subject == "mv.accelerator_projection" {
+                4
+            } else {
+                3
+            }
+        );
     }
     assert!(catalog.entry("mv.definition", 4).is_err());
     assert!(catalog.entry("mv.refresh", 5).is_err());

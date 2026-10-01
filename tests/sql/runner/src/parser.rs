@@ -188,8 +188,9 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         }
         "incomplete-discovery" => PublicationCatalogFault::IncompleteDiscovery,
         "corrupt-package" => PublicationCatalogFault::CorruptPackage,
+        "corrupt-package-until-clear" => PublicationCatalogFault::CorruptPackageUntilClear,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package, corrupt-package-until-clear"
         ),
     };
     let compatible = matches!(
@@ -209,6 +210,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         ) | (
             PublicationCatalogAction::TableLoad,
             PublicationCatalogFault::CorruptPackage
+                | PublicationCatalogFault::CorruptPackageUntilClear
         )
     );
     if !compatible {
@@ -496,6 +498,26 @@ fn parse_meta_with_sql_error_descriptors(
             }
             "publication_catalog_fault" => {
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
+            }
+            "publication_catalog_fault_target" => {
+                let parts = raw_value.split(',').map(str::trim).collect::<Vec<_>>();
+                if parts.len() != 2
+                    || parts.iter().any(|part| {
+                        part.is_empty()
+                            || part.len() > 512
+                            || part.contains('/')
+                            || part.chars().any(char::is_control)
+                    })
+                {
+                    bail!("publication_catalog_fault_target requires exact namespace,table");
+                }
+                meta.publication_catalog_fault_target = Some(PublicationCatalogFaultTarget {
+                    namespace: parts[0].into(),
+                    table: parts[1].into(),
+                });
+            }
+            "publication_catalog_fault_clear" => {
+                meta.publication_catalog_fault_clear = parse_bool(&raw_value)?;
             }
             "publication_service_hold" => {
                 meta.publication_service_hold = Some(parse_publication_service_hold(&raw_value)?);
@@ -843,6 +865,12 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         publication_catalog_fault: override_meta
             .publication_catalog_fault
             .or(base.publication_catalog_fault),
+        publication_catalog_fault_target: override_meta
+            .publication_catalog_fault_target
+            .clone()
+            .or_else(|| base.publication_catalog_fault_target.clone()),
+        publication_catalog_fault_clear: override_meta.publication_catalog_fault_clear
+            || base.publication_catalog_fault_clear,
         publication_service_hold: override_meta
             .publication_service_hold
             .clone()
@@ -1369,6 +1397,52 @@ mod opt5_directive_tests {
         )
         .expect_err("crossed catalog observation fault must be rejected");
         assert!(error.to_string().contains("action/fault combination"));
+    }
+
+    #[test]
+    fn parses_targeted_corruption_window_after_placeholder_substitution() {
+        let raw = "-- @publication_catalog_fault=table-load,corrupt-package-until-clear\n-- @publication_catalog_fault_target=ns_${uuid0},a_mv";
+        let content = substitute_placeholders(
+            raw,
+            &HashMap::from([("uuid0".into(), "fixture".into())]),
+            "fault test",
+        )
+        .unwrap();
+        let lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+        let meta = parse_meta(&lines, &meta_re()).unwrap();
+        assert_eq!(
+            meta.publication_catalog_fault.unwrap().fault,
+            PublicationCatalogFault::CorruptPackageUntilClear
+        );
+        assert_eq!(
+            meta.publication_catalog_fault_target.unwrap(),
+            PublicationCatalogFaultTarget {
+                namespace: "ns_fixture".into(),
+                table: "a_mv".into(),
+            }
+        );
+        assert!(
+            parse_meta(
+                &["-- @publication_catalog_fault_target=ns,table,extra".into()],
+                &meta_re()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_meta(
+                &["-- @publication_catalog_fault_target=ns,table/path".into()],
+                &meta_re()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_meta(
+                &["-- @publication_catalog_fault_clear=true".into()],
+                &meta_re()
+            )
+            .unwrap()
+            .publication_catalog_fault_clear
+        );
     }
 
     #[test]

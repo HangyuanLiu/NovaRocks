@@ -20,9 +20,9 @@
 use crate::analysis::{OutputColumn, SortItem};
 use crate::optimizer::operator::{
     AggregateOutputLayout, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-    ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
-    LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScalarAggregateSpec, ScanOp,
-    SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
+    ExceptOp, FanoutAnchorOp, FanoutBranchOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp,
+    IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp,
+    ScalarAggregateSpec, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::ScalarArena;
@@ -48,7 +48,21 @@ pub(crate) fn try_to_optimizer_expr(
     plan: &LogicalPlanNode,
     scalars: &mut ScalarArena,
 ) -> Result<OptExpr, String> {
+    validate_fanout_mappings(plan)?;
     Ok(to_optimizer_expr_unchecked(plan, scalars))
+}
+
+fn validate_fanout_mappings(plan: &LogicalPlanNode) -> Result<(), String> {
+    // Keep validation independent of plan depth, just like the project/union
+    // spines handled by the conversion below.
+    let mut pending = vec![plan];
+    while let Some(node) = pending.pop() {
+        if let LogicalPlanKind::FanoutConsume(consume) = &node.kind {
+            consume.validate_mapping()?;
+        }
+        pending.extend(node.children.iter());
+    }
+    Ok(())
 }
 
 pub(crate) fn to_optimizer_expr(plan: &LogicalPlanNode, scalars: &mut ScalarArena) -> OptExpr {
@@ -370,6 +384,43 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             OptExpr::new(op, vec![child])
         }
 
+        LogicalPlanKind::QuotaPreclaim(node) => OptExpr::new(
+            Operator::LogicalQuotaPreclaim(node.clone()),
+            plan.children
+                .iter()
+                .map(|child| to_optimizer_expr_unchecked(child, scalars))
+                .collect(),
+        ),
+        LogicalPlanKind::QuotaTrim(node) => OptExpr::new(
+            Operator::LogicalQuotaTrim(node.clone()),
+            plan.children
+                .iter()
+                .map(|child| to_optimizer_expr_unchecked(child, scalars))
+                .collect(),
+        ),
+        LogicalPlanKind::FanoutConsume(node) => {
+            OptExpr::leaf(Operator::LogicalFanoutConsume(node.clone()))
+        }
+        LogicalPlanKind::FanoutAnchor(node) => {
+            let branches = node
+                .branches
+                .iter()
+                .map(|branch| FanoutBranchOp {
+                    predicate: intern_typed(scalars, &branch.predicate),
+                    distribution: branch.distribution.clone(),
+                })
+                .collect();
+            OptExpr::new(
+                Operator::LogicalFanoutAnchor(FanoutAnchorOp {
+                    id: node.id,
+                    branches,
+                }),
+                plan.children
+                    .iter()
+                    .map(|child| to_optimizer_expr_unchecked(child, scalars))
+                    .collect(),
+            )
+        }
         LogicalPlanKind::CTEConsume(node) => {
             let op = Operator::LogicalCTEConsume(CTEConsumeOp {
                 cte_id: node.cte_id,
@@ -541,6 +592,22 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
         .map(|c| to_logical_plan(c, arena))
         .collect();
     let kind = match expr.op {
+        Operator::LogicalQuotaPreclaim(op) => LogicalPlanKind::QuotaPreclaim(op),
+        Operator::LogicalQuotaTrim(op) => LogicalPlanKind::QuotaTrim(op),
+        Operator::LogicalFanoutConsume(op) => LogicalPlanKind::FanoutConsume(op),
+        Operator::LogicalFanoutAnchor(op) => {
+            LogicalPlanKind::FanoutAnchor(crate::planner::quota::PlanFanoutAnchorNode {
+                id: op.id,
+                branches: op
+                    .branches
+                    .into_iter()
+                    .map(|branch| crate::planner::quota::PlanFanoutBranch {
+                        predicate: materialize(arena, branch.predicate),
+                        distribution: branch.distribution,
+                    })
+                    .collect(),
+            })
+        }
         Operator::LogicalScan(op) => LogicalPlanKind::Scan(PlanScanNode {
             database: op.database,
             table: op.table,
@@ -772,6 +839,45 @@ mod tests {
             vec![],
             None,
         )
+    }
+
+    #[test]
+    fn fanout_mapping_is_validated_below_project_before_optimizer_conversion() {
+        use crate::planner::quota::{PlanFanoutConsumeNode, PlanFanoutDistribution};
+
+        for (producers, keys, detail) in [
+            (vec![ColumnId(12)], vec![ColumnId(13)], "not materialized"),
+            (
+                vec![ColumnId(12), ColumnId(12)],
+                vec![ColumnId(12)],
+                "producer identities",
+            ),
+        ] {
+            let consume = PlanFanoutConsumeNode {
+                anchor: ColumnId(1),
+                branch: 2,
+                output_columns: (0..producers.len())
+                    .map(|ordinal| test_output_column(ordinal as u32 + 2, "seed"))
+                    .collect(),
+                producer_column_ids: producers,
+                distribution: PlanFanoutDistribution::Hash(keys),
+            };
+            let plan = LogicalPlanNode::new(
+                LogicalPlanKind::Project(PlanProjectNode {
+                    items: vec![],
+                    output_qualifier: None,
+                }),
+                vec![LogicalPlanNode::new(
+                    LogicalPlanKind::FanoutConsume(consume),
+                    vec![],
+                    None,
+                )],
+                None,
+            );
+            let error = try_to_optimizer_expr(&plan, &mut ScalarArena::new())
+                .expect_err("malformed nested fanout must fail before property derivation");
+            assert!(error.contains(detail), "unexpected error: {error}");
+        }
     }
 
     #[test]

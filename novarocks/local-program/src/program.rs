@@ -31,8 +31,8 @@ use novarocks_types::SlotId;
 
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, ImmutableExpressions, ProgramExprId,
-    ProgramNodeId, ScanSourceKind, StaticConnectorScan, StaticFieldSchema, StaticFilterConsumer,
-    StaticFilterProducer, StaticLayout, StaticSinkProgram, StaticValues,
+    ProgramNodeId, QuotaDomainId, ScanSourceKind, StaticConnectorScan, StaticFieldSchema,
+    StaticFilterConsumer, StaticFilterProducer, StaticLayout, StaticSinkProgram, StaticValues,
 };
 
 /// Matches the native task-codec preflight, which runs before protobuf decode.
@@ -350,10 +350,128 @@ pub enum TableFunctionOutputSlot {
     Result { index: usize },
 }
 
+/// The frozen demand interpretation never guesses whether a count is a weight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaNeed {
+    Count { column: usize },
+    NegativeWeight { column: usize },
+}
+impl QuotaNeed {
+    pub const fn column(self) -> usize {
+        match self {
+            Self::Count { column } | Self::NegativeWeight { column } => column,
+        }
+    }
+}
+
+/// One Task is one preselection domain; all its local drivers share one owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaPreclaimSpec {
+    pub demand_entry_id_column: usize,
+    pub demand_key_column: usize,
+    pub demand_need: QuotaNeed,
+    pub target_value_columns: Vec<usize>,
+    pub target_file_column: usize,
+    pub target_position_column: usize,
+    pub preselection_domain: QuotaDomainId,
+    pub max_state_bytes: usize,
+}
+/// Seeds and candidates are routed to the same Task by opaque entry ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaTrimSpec {
+    pub seed_entry_id_column: usize,
+    pub seed_need: QuotaNeed,
+    pub candidate_entry_id_column: usize,
+    pub candidate_file_column: usize,
+    pub candidate_position_column: usize,
+    pub preselection_domain: QuotaDomainId,
+    pub max_state_bytes: usize,
+}
+fn quota_column(schema: &arrow_schema::Schema, column: usize, ty: &DataType) -> bool {
+    schema
+        .fields()
+        .get(column)
+        .is_some_and(|f| f.data_type() == ty)
+}
+fn quota_need_valid(schema: &arrow_schema::Schema, need: QuotaNeed) -> bool {
+    match need {
+        QuotaNeed::Count { column } => {
+            quota_column(schema, column, &DataType::Int64)
+                || quota_column(schema, column, &DataType::UInt64)
+        }
+        QuotaNeed::NegativeWeight { column } => quota_column(schema, column, &DataType::Int64),
+    }
+}
+impl QuotaPreclaimSpec {
+    pub fn validate(
+        &self,
+        demand: &arrow_schema::Schema,
+        target: &arrow_schema::Schema,
+        output: &arrow_schema::Schema,
+    ) -> bool {
+        self.max_state_bytes > 0
+            && !self.target_value_columns.is_empty()
+            && quota_column(demand, self.demand_entry_id_column, &DataType::Binary)
+            && quota_column(demand, self.demand_key_column, &DataType::Binary)
+            && quota_need_valid(demand, self.demand_need)
+            && quota_column(target, self.target_file_column, &DataType::Utf8)
+            && quota_column(target, self.target_position_column, &DataType::Int64)
+            && self.target_value_columns.iter().all(|&i| {
+                target.fields().get(i).is_some_and(|f| {
+                    novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1
+                        .supports(f.data_type())
+                })
+            })
+            && output.fields().len() == 3
+            && quota_column(output, 0, &DataType::Binary)
+            && quota_column(output, 1, &DataType::Utf8)
+            && quota_column(output, 2, &DataType::Int64)
+    }
+}
+impl QuotaTrimSpec {
+    pub fn validate(
+        &self,
+        seeds: &arrow_schema::Schema,
+        candidates: &arrow_schema::Schema,
+        output: &arrow_schema::Schema,
+    ) -> bool {
+        self.max_state_bytes > 0
+            && quota_column(seeds, self.seed_entry_id_column, &DataType::Binary)
+            && quota_need_valid(seeds, self.seed_need)
+            && quota_column(
+                candidates,
+                self.candidate_entry_id_column,
+                &DataType::Binary,
+            )
+            && quota_column(candidates, self.candidate_file_column, &DataType::Utf8)
+            && quota_column(candidates, self.candidate_position_column, &DataType::Int64)
+            && output.fields().len() == 2
+            && quota_column(output, 0, &DataType::Utf8)
+            && quota_column(output, 1, &DataType::Int64)
+    }
+}
+
 /// Every execution node has a closed static representation. Task-owned inputs,
 /// exchange receivers, writer handles, and filter sessions are requirements.
 #[derive(Clone, Debug)]
+pub struct QuotaContentFilter {
+    pub demand_expr: ProgramExprId,
+    pub producer: StaticFilterProducer,
+}
+
+#[derive(Clone, Debug)]
 pub enum ProgramNodeKind {
+    QuotaPreclaim {
+        demand: ProgramNodeId,
+        target: ProgramNodeId,
+        spec: QuotaPreclaimSpec,
+        runtime_filters: Vec<QuotaContentFilter>,
+    },
+    QuotaTrim {
+        seeds: ProgramNodeId,
+        candidates: ProgramNodeId,
+        spec: QuotaTrimSpec,
+    },
     AssertNumRows {
         input: ProgramNodeId,
         mode: AssertRowsMode,
@@ -523,6 +641,10 @@ impl ProgramNodeKind {
             Self::UnionAll { inputs }
             | Self::SetOp { inputs, .. }
             | Self::TableFinish { inputs, .. } => inputs.clone(),
+            Self::QuotaPreclaim { demand, target, .. } => vec![*demand, *target],
+            Self::QuotaTrim {
+                seeds, candidates, ..
+            } => vec![*seeds, *candidates],
             Self::Join { left, right, .. } | Self::NestedLoopJoin { left, right, .. } => {
                 vec![*left, *right]
             }
@@ -538,7 +660,11 @@ impl ProgramNodeKind {
             | Self::Limit { .. }
             | Self::TableFunction { .. }
             | Self::SetOp { .. }
-            | Self::TableFinish { .. } => Vec::new(),
+            | Self::TableFinish { .. }
+            | Self::QuotaTrim { .. } => Vec::new(),
+            Self::QuotaPreclaim {
+                runtime_filters, ..
+            } => runtime_filters.iter().map(|f| f.demand_expr).collect(),
             Self::Project { exprs, .. } => exprs.clone(),
             Self::Unpivot { value_mappings, .. } => value_mappings
                 .iter()
@@ -743,6 +869,8 @@ impl LocalProgram {
             if matches!(
                 node.kind,
                 ProgramNodeKind::Scan { .. }
+                    | ProgramNodeKind::QuotaPreclaim { .. }
+                    | ProgramNodeKind::QuotaTrim { .. }
                     | ProgramNodeKind::ExchangeSource { .. }
                     | ProgramNodeKind::TableWriter { .. }
                     | ProgramNodeKind::TableFinish { .. }
@@ -804,6 +932,25 @@ impl LocalProgram {
         let mut required_writers = BTreeSet::new();
         let mut required_finishes = BTreeSet::new();
         let mut required_filters = BTreeSet::new();
+        let quota_domains = nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                ProgramNodeKind::QuotaPreclaim { spec, .. } => Some(spec.preselection_domain),
+                ProgramNodeKind::QuotaTrim { spec, .. } => Some(spec.preselection_domain),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let required_domains = requirements
+            .entries()
+            .iter()
+            .filter_map(|req| match req {
+                BindingRequirement::QuotaDomain { domain } => Some(*domain),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if quota_domains != required_domains {
+            return Err(LocalProgramError::InvalidRequirement);
+        }
         for requirement in requirements.entries() {
             match requirement {
                 BindingRequirement::ResultSink { layout }
@@ -834,6 +981,19 @@ impl LocalProgram {
                         return Err(LocalProgramError::InvalidRequirement);
                     }
                     required_scans.insert(node.index());
+                }
+                BindingRequirement::QuotaDomain { domain } => {
+                    if !nodes.iter().any(|node| match &node.kind {
+                        ProgramNodeKind::QuotaPreclaim { spec, .. } => {
+                            spec.preselection_domain == *domain
+                        }
+                        ProgramNodeKind::QuotaTrim { spec, .. } => {
+                            spec.preselection_domain == *domain
+                        }
+                        _ => false,
+                    }) {
+                        return Err(LocalProgramError::InvalidRequirement);
+                    }
                 }
                 BindingRequirement::RuntimeFilter { binding_id } => {
                     required_filters.insert(*binding_id);
@@ -1010,6 +1170,15 @@ fn node_filter_ids(kind: &ProgramNodeKind) -> Result<Vec<i32>, LocalProgramError
             runtime_filters, ..
         } => consumer_ids(runtime_filters),
         ProgramNodeKind::RuntimeFilterConsumer { bindings, .. } => consumer_ids(bindings),
+        ProgramNodeKind::QuotaPreclaim {
+            runtime_filters, ..
+        } => runtime_filters
+            .iter()
+            .map(|filter| {
+                i32::try_from(filter.producer.binding_id())
+                    .map_err(|_| LocalProgramError::InvalidRequirement)
+            })
+            .collect(),
         ProgramNodeKind::Aggregate { topn_filters, .. } => topn_filters
             .iter()
             .map(|filter| {
@@ -1046,6 +1215,36 @@ fn validate_relationships(
         )
     };
     match &node.kind {
+        ProgramNodeKind::QuotaPreclaim { spec, .. }
+            if spec.preselection_domain.get() != node.native_node_id =>
+        {
+            return Err(LocalProgramError::InvalidNodeShape);
+        }
+        ProgramNodeKind::QuotaPreclaim {
+            demand,
+            target,
+            spec,
+            ..
+        } if !spec.validate(
+            nodes[demand.index()].output_layout.schema(),
+            nodes[target.index()].output_layout.schema(),
+            node.output_layout.schema(),
+        ) =>
+        {
+            return Err(LocalProgramError::InvalidNodeShape);
+        }
+        ProgramNodeKind::QuotaTrim {
+            seeds,
+            candidates,
+            spec,
+        } if !spec.validate(
+            nodes[seeds.index()].output_layout.schema(),
+            nodes[candidates.index()].output_layout.schema(),
+            node.output_layout.schema(),
+        ) =>
+        {
+            return Err(LocalProgramError::InvalidNodeShape);
+        }
         ProgramNodeKind::Join {
             left,
             right,
@@ -1283,6 +1482,120 @@ mod tests {
             layout.identity().unwrap(),
             KernelAbiVersion::CURRENT,
         )
+    }
+
+    fn quota_layout(types: &[DataType]) -> StaticLayout {
+        let schema = Arc::new(Schema::new(
+            types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| Field::new(format!("q{i}"), ty.clone(), false))
+                .collect::<Vec<_>>(),
+        ));
+        StaticLayout::try_new(
+            schema,
+            Arc::from(
+                (0..types.len())
+                    .map(|i| SlotId::new(i as u32 + 1))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap()
+    }
+    fn quota_values(id: i32, layout: &StaticLayout) -> ProgramNode {
+        ProgramNode::new(
+            id,
+            ProgramNodeKind::Values {
+                values: StaticValues::try_new(
+                    RecordBatch::new_empty(layout.schema().clone()),
+                    layout.clone(),
+                )
+                .unwrap(),
+            },
+            layout.clone(),
+        )
+    }
+    #[test]
+    fn quota_domain_is_a_required_capability_without_a_placement_count() {
+        let domain = QuotaDomainId::try_new(5).unwrap();
+        assert!(QuotaDomainId::try_new(-1).is_err());
+        let seeds = quota_layout(&[DataType::Binary, DataType::Int64]);
+        let candidates = quota_layout(&[DataType::Binary, DataType::Utf8, DataType::Int64]);
+        let output = quota_layout(&[DataType::Utf8, DataType::Int64]);
+        let spec = QuotaTrimSpec {
+            seed_entry_id_column: 0,
+            seed_need: QuotaNeed::Count { column: 1 },
+            candidate_entry_id_column: 0,
+            candidate_file_column: 1,
+            candidate_position_column: 2,
+            preselection_domain: domain,
+            max_state_bytes: 1024,
+        };
+        let nodes = vec![
+            quota_values(1, &seeds),
+            quota_values(2, &candidates),
+            ProgramNode::new(
+                9,
+                ProgramNodeKind::QuotaTrim {
+                    seeds: ProgramNodeId::new(0),
+                    candidates: ProgramNodeId::new(1),
+                    spec,
+                },
+                output.clone(),
+            ),
+        ];
+        let expressions =
+            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        assert!(matches!(
+            LocalProgram::try_new(
+                nodes.clone(),
+                ProgramNodeId::new(2),
+                expressions.clone(),
+                profile(&output),
+                BindingRequirements::try_new(vec![]).unwrap()
+            ),
+            Err(LocalProgramError::InvalidRequirement)
+        ));
+        LocalProgram::try_new(
+            nodes,
+            ProgramNodeId::new(2),
+            expressions,
+            profile(&output),
+            BindingRequirements::try_new(vec![BindingRequirement::QuotaDomain { domain }]).unwrap(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn quota_preclaim_accepts_extra_visible_demand_fields_and_validates_narrow_output() {
+        let demand = Schema::new(vec![
+            Field::new("entry", DataType::Binary, false),
+            Field::new("key", DataType::Binary, false),
+            Field::new("weight", DataType::Int64, false),
+            Field::new("visible", DataType::Utf8, true),
+        ]);
+        let target = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("file", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ]);
+        let output = Schema::new(vec![
+            Field::new("entry", DataType::Binary, false),
+            Field::new("file", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ]);
+        let mut spec = QuotaPreclaimSpec {
+            demand_entry_id_column: 0,
+            demand_key_column: 1,
+            demand_need: QuotaNeed::NegativeWeight { column: 2 },
+            target_value_columns: vec![0],
+            target_file_column: 1,
+            target_position_column: 2,
+            preselection_domain: QuotaDomainId::try_new(5).unwrap(),
+            max_state_bytes: 1024,
+        };
+        assert!(spec.validate(&demand, &target, &output));
+        spec.target_value_columns = vec![3];
+        assert!(!spec.validate(&demand, &target, &output));
     }
 
     #[test]

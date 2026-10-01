@@ -175,7 +175,7 @@ pub struct InterpretationDocument {
     pub outputs: Vec<OutputBinding>,
     /// Set semantics, canonically sorted by slot identity.
     pub state_slots: Vec<StateSlot>,
-    pub apply_key: ApplyKey,
+    pub apply_key: Option<ApplyKey>,
     /// Set semantics, canonically sorted by aggregate identity.
     pub aggregates: Vec<AggregateInterpretation>,
     /// Ordered UNION branches. Their position is semantic.
@@ -229,8 +229,6 @@ pub struct ApplyKeyComponent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyKeyKind {
-    BaseRowId,
-    JoinRowKey,
     GroupRowId,
 }
 

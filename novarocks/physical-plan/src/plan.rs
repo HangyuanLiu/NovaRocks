@@ -686,6 +686,49 @@ pub struct ChangeStreamRoute {
     pub edge: EdgeId,
 }
 
+/// Exact demand interpretation frozen by the planner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaNeed {
+    Count { value: ValueId },
+    NegativeWeight { value: ValueId },
+}
+impl QuotaNeed {
+    pub const fn value(self) -> ValueId {
+        match self {
+            Self::Count { value } | Self::NegativeWeight { value } => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaPreclaimSpec {
+    pub demand_entry_id: ValueId,
+    pub demand_key: ValueId,
+    pub demand_need: QuotaNeed,
+    /// Materialized visible tuple representatives, in target content-field order.
+    /// Empty means no content-field runtime filter is requested.
+    pub demand_values: Box<[ValueId]>,
+    pub target_values: Box<[ValueId]>,
+    pub target_file: ValueId,
+    pub target_position: ValueId,
+    pub content_equivalence: novarocks_type_contract::ResultContentEquivalence,
+    /// Exact native Preclaim node whose task placement defines this domain.
+    pub preselection_domain: NodeId,
+    pub max_state_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaTrimSpec {
+    pub seed_entry_id: ValueId,
+    pub seed_need: QuotaNeed,
+    pub candidate_entry_id: ValueId,
+    pub candidate_file: ValueId,
+    pub candidate_position: ValueId,
+    pub content_equivalence: novarocks_type_contract::ResultContentEquivalence,
+    pub preselection_domain: NodeId,
+    pub max_state_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     Scan {
@@ -783,6 +826,12 @@ pub enum NodeKind {
     },
     Unpivot {
         spec: UnpivotSpec,
+    },
+    QuotaPreclaim {
+        spec: QuotaPreclaimSpec,
+    },
+    QuotaTrim {
+        spec: QuotaTrimSpec,
     },
     GenerateSeries {
         start: ExprId,
@@ -908,7 +957,9 @@ impl NodeKind {
                     }
                 }
             }
-            Self::Limit { .. }
+            Self::QuotaPreclaim { .. }
+            | Self::QuotaTrim { .. }
+            | Self::Limit { .. }
             | Self::SetOp { .. }
             | Self::Repeat { .. }
             | Self::AssertOneRow(_)
@@ -935,6 +986,12 @@ pub struct PipelineDopDomain {
     pub requires_power_of_two: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PredicateFanoutBranch {
+    pub edge: EdgeId,
+    pub predicate: ExprId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FragmentSink {
     Result,
@@ -943,6 +1000,9 @@ pub enum FragmentSink {
     },
     Multicast {
         edges: Box<[EdgeId]>,
+    },
+    PredicateFanout {
+        branches: Box<[PredicateFanoutBranch]>,
     },
     Router {
         effect: ValueId,
@@ -1002,6 +1062,7 @@ impl Fragment {
 pub enum EdgeKind {
     Stream,
     CteMulticast,
+    PredicateFanout,
     ChangeStreamRouter,
 }
 
@@ -1249,6 +1310,11 @@ pub enum RuntimeFilterApplyPoint {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterProducerTarget {
+    /// One conservative visible-content demand field on QuotaPreclaim input 0.
+    QuotaContentField {
+        field_ordinal: u32,
+        content_equivalence: novarocks_type_contract::ResultContentEquivalence,
+    },
     JoinBuildKey {
         equality: crate::RuntimeFilterEqualityWitnessId,
     },
@@ -1300,6 +1366,11 @@ pub enum RuntimeFilterConsumerActivation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterConsumerTarget {
+    /// Exact target visible field connected to a quota demand producer.
+    QuotaContentScanField {
+        producer: crate::RuntimeFilterWitnessId,
+        lineage: Box<[RuntimeFilterLineageStep]>,
+    },
     JoinProbeKey {
         equality: crate::RuntimeFilterEqualityWitnessId,
     },
@@ -1564,3 +1635,5 @@ impl From<FragmentParts> for Fragment {
         }
     }
 }
+
+pub use novarocks_type_contract::quota_content_runtime_filter_type_supported;

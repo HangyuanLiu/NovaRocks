@@ -288,11 +288,7 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
                 Some(action_column) => action_column,
                 None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
             };
-            let branch_id_column =
-                allocate_imv_column(ctx, BRANCH_ID_COLUMN_NAME, DataType::Int32, false)?;
-
             let action_output = ImvActionColumn::output_column(action_column);
-            let branch_output = branch_id_output_column(branch_id_column);
 
             let mut rewritten_inputs = Vec::with_capacity(inputs.len());
             for (idx, branch) in inputs.into_iter().enumerate() {
@@ -311,14 +307,11 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
                     &union.output_columns,
                     &branch_output_columns,
                     &action_output,
-                    &branch_output,
-                    idx,
                 ));
             }
 
             let mut union_output_columns = union.output_columns;
             union_output_columns.push(action_output);
-            union_output_columns.push(branch_output);
 
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                 LogicalPlanKind::Union(LogicalUnionNode {
@@ -332,23 +325,11 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
     }
 }
 
-fn branch_id_output_column(column_id: crate::column_id::ColumnId) -> crate::analysis::OutputColumn {
-    crate::analysis::OutputColumn {
-        column_id,
-        name: BRANCH_ID_COLUMN_NAME.to_string(),
-        data_type: arrow::datatypes::DataType::Int32,
-        nullable: false,
-        is_internal: true,
-    }
-}
-
 fn normalize_top_level_union_branch_output(
     input: LogicalPlanNode,
     union_visible_output: &[crate::analysis::OutputColumn],
     branch_visible_output: &[crate::analysis::OutputColumn],
     action_output: &crate::analysis::OutputColumn,
-    branch_output: &crate::analysis::OutputColumn,
-    branch_idx: usize,
 ) -> LogicalPlanNode {
     let mut items = union_visible_output
         .iter()
@@ -379,25 +360,6 @@ fn normalize_top_level_union_branch_output(
         },
         output_name: action_output.name.clone(),
         output_column_id: action_output.column_id,
-    });
-    items.push(ProjectItem {
-        expr: crate::analysis::TypedExpr {
-            kind: crate::analysis::ExprKind::Cast {
-                expr: Box::new(crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
-                        branch_idx as i64,
-                    )),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                }),
-                target: arrow::datatypes::DataType::Int32,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            data_type: branch_output.data_type.clone(),
-            nullable: false,
-        },
-        output_name: branch_output.name.clone(),
-        output_column_id: branch_output.column_id,
     });
 
     LogicalPlanNode::new(
@@ -550,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_top_level_union_delta_adds_branch_and_action_columns() {
+    fn rewrite_top_level_union_delta_adds_action_without_persisted_branch_identity() {
         let rule = RewriteTopLevelUnionDeltaRule;
         let mut ctx = build_ctx();
         let plan = delta(project_filter_union(true));
@@ -592,13 +554,12 @@ mod tests {
                 (ColumnId(1), "k", DataType::Int64, false, false),
                 (ColumnId(2), "v", DataType::Int64, false, false),
                 (action_column, "__change_op", DataType::Int8, false, true),
-                (ColumnId(101), "__branch_id__", DataType::Int32, false, true),
             ]
         );
         assert_eq!(rewritten.required_output_columns, required_output_columns());
 
-        assert_top_level_union_branch(&rewritten.children[0], action_column, ColumnId(101), 0);
-        assert_top_level_union_branch(&rewritten.children[1], action_column, ColumnId(101), 1);
+        assert_top_level_union_branch(&rewritten.children[0], action_column, 0);
+        assert_top_level_union_branch(&rewritten.children[1], action_column, 1);
     }
 
     #[test]
@@ -641,12 +602,17 @@ mod tests {
             "rewritten union must expose action output"
         );
         assert!(
-            union
+            !union
                 .output_columns
                 .iter()
                 .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)),
-            "rewritten union must expose branch id output"
+            "nonaggregate union must not introduce a persisted branch id output"
         );
+        assert!(union.all);
+        assert_eq!(union.output_columns.len(), 3);
+        assert_eq!(rewritten.children.len(), 2);
+        assert_top_level_union_branch(&rewritten.children[0], ColumnId(100), 0);
+        assert_top_level_union_branch(&rewritten.children[1], ColumnId(100), 1);
     }
 
     #[test]
@@ -981,7 +947,6 @@ mod tests {
     fn assert_top_level_union_branch(
         plan: &LogicalPlanNode,
         action_column: ColumnId,
-        branch_column: ColumnId,
         expected_branch_id: i64,
     ) {
         let LogicalPlanKind::Project(project) = &plan.kind else {
@@ -993,7 +958,7 @@ mod tests {
                 .iter()
                 .map(|item| item.output_column_id)
                 .collect::<Vec<_>>(),
-            vec![ColumnId(1), ColumnId(2), action_column, branch_column]
+            vec![ColumnId(1), ColumnId(2), action_column]
         );
         assert_visible_branch_expr(&project.items[0], expected_branch_id, 0);
         assert_visible_branch_expr(&project.items[1], expected_branch_id, 1);
@@ -1009,24 +974,12 @@ mod tests {
                 if *column_id == action_column && column == ImvActionColumn::NAME
         ));
 
-        let branch = project
-            .items
-            .iter()
-            .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
-            .expect("branch Project must expose branch id column");
-        assert_eq!(branch.output_column_id, branch_column);
-        assert_eq!(branch.expr.data_type, DataType::Int32);
-        assert!(!branch.expr.nullable);
-        assert!(matches!(
-            &branch.expr.kind,
-            ExprKind::Cast { expr, target , .. }
-                if *target == DataType::Int32
-                    && matches!(
-                        &expr.kind,
-                        ExprKind::Literal(LiteralValue::Int(value))
-                            if *value == expected_branch_id
-                    )
-        ));
+        assert!(
+            project
+                .items
+                .iter()
+                .all(|item| !item.output_name.eq_ignore_ascii_case("__branch_id__"))
+        );
 
         assert!(
             contains_non_root_delta(plan.unary_input(), action_column),

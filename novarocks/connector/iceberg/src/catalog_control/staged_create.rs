@@ -751,6 +751,8 @@ impl IcebergStagedCreateAdapter {
                     abort_handle: action_abort,
                     target_ref: "main",
                     snapshot_properties: &snapshot_properties,
+
+                    metadata_updates: &[],
                 })
                 .await
             })

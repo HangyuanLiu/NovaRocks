@@ -131,6 +131,15 @@ pub(crate) fn derive_statistics(
                 }
             }
         }
+        Operator::LogicalQuotaPreclaim(_) | Operator::LogicalQuotaTrim(_) => {
+            child_statistics(memo, &expr.children, 1)
+        }
+        Operator::LogicalFanoutConsume(_) => Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        },
+        Operator::LogicalFanoutAnchor(_) => child_statistics(memo, &expr.children, 1),
         Operator::LogicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
         // -- Unary operators (single child) --
@@ -577,6 +586,15 @@ pub(crate) fn derive_statistics(
             }
         }
 
+        Operator::PhysicalQuotaPreclaim(_) | Operator::PhysicalQuotaTrim(_) => {
+            child_statistics(memo, &expr.children, 1)
+        }
+        Operator::PhysicalFanoutConsume(_) => Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        },
+        Operator::PhysicalFanoutAnchor(_) => child_statistics(memo, &expr.children, 1),
         Operator::PhysicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
         Operator::PhysicalRepeat(repeat) => {
@@ -2260,6 +2278,10 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
         Operator::LogicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
+        Operator::LogicalQuotaPreclaim(o) => o.output_columns.clone(),
+        Operator::LogicalQuotaTrim(o) => o.output_columns.clone(),
+        Operator::LogicalFanoutConsume(o) => o.output_columns.clone(),
+        Operator::LogicalFanoutAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::LogicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::LogicalCTEProduce(c) => c.output_columns.clone(),
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
@@ -2336,6 +2358,10 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
         Operator::PhysicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
+        Operator::PhysicalQuotaPreclaim(o) => o.output_columns.clone(),
+        Operator::PhysicalQuotaTrim(o) => o.output_columns.clone(),
+        Operator::PhysicalFanoutConsume(o) => o.output_columns.clone(),
+        Operator::PhysicalFanoutAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::PhysicalCTEProduce(c) => c.output_columns.clone(),
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),

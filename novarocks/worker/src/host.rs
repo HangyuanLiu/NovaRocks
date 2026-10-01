@@ -125,7 +125,7 @@ impl HostRejection {
         &self.failure
     }
 
-    pub const fn category(&self) -> TaskFailureCategory {
+    pub fn category(&self) -> TaskFailureCategory {
         self.failure.category()
     }
 
@@ -153,6 +153,7 @@ impl std::error::Error for HostRejection {}
 pub struct ReleasedContextEvidence {
     runtime_filter: Option<Arc<dyn CodecOwnedContent>>,
     runtime_filter_observation: RuntimeFilterReleaseObservation,
+    verification: Option<Arc<novarocks_execution_contract::ContextVerificationFacts>>,
 }
 
 impl Default for ReleasedContextEvidence {
@@ -183,6 +184,7 @@ impl fmt::Debug for ReleasedContextEvidence {
                 "runtime_filter_observation",
                 &self.runtime_filter_observation,
             )
+            .field("verification", &self.verification)
             .finish()
     }
 }
@@ -193,6 +195,7 @@ impl ReleasedContextEvidence {
         Self {
             runtime_filter: None,
             runtime_filter_observation: RuntimeFilterReleaseObservation::Absent,
+            verification: None,
         }
     }
 
@@ -215,7 +218,23 @@ impl ReleasedContextEvidence {
         Self {
             runtime_filter: Some(runtime_filter),
             runtime_filter_observation,
+            verification: None,
         }
+    }
+
+    pub fn with_verification(
+        mut self,
+        facts: novarocks_execution_contract::ContextVerificationFacts,
+    ) -> Self {
+        facts
+            .validate()
+            .expect("Worker seals valid bounded verification facts");
+        self.verification = Some(Arc::new(facts));
+        self
+    }
+
+    pub fn verification(&self) -> Option<&novarocks_execution_contract::ContextVerificationFacts> {
+        self.verification.as_deref()
     }
 
     pub fn runtime_filter(&self) -> Option<&Arc<dyn CodecOwnedContent>> {
@@ -321,6 +340,14 @@ pub trait TaskExecutionHost: Send + Sync {
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
     ) -> Result<PreparedTaskFacts, HostRejection>;
+
+    /// Seals the operator-owned facts before physical runtime resources are discarded.
+    fn verification_facts(
+        &self,
+        identity: novarocks_execution_contract::TaskIdentity,
+    ) -> novarocks_execution_contract::TaskVerificationFacts {
+        novarocks_execution_contract::TaskVerificationFacts::unavailable(identity)
+    }
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
 

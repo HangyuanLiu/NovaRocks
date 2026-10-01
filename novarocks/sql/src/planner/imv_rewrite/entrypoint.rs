@@ -362,6 +362,55 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
             collect_output_columns(&intersect.output_columns, max_id)
         }
         LogicalPlanKind::Except(except) => collect_output_columns(&except.output_columns, max_id),
+        LogicalPlanKind::QuotaPreclaim(node) => {
+            collect_output_columns(&node.output_columns, max_id);
+            for id in [
+                node.domain,
+                node.demand_entry_id,
+                node.demand_key,
+                node.demand_need.column(),
+                node.target_file,
+                node.target_position,
+            ] {
+                collect_column_id(id, max_id);
+            }
+            for id in node.demand_values.iter().chain(&node.target_values) {
+                collect_column_id(*id, max_id);
+            }
+        }
+        LogicalPlanKind::QuotaTrim(node) => {
+            collect_output_columns(&node.output_columns, max_id);
+            for id in [
+                node.domain,
+                node.seed_entry_id,
+                node.seed_need.column(),
+                node.candidate_entry_id,
+                node.candidate_file,
+                node.candidate_position,
+            ] {
+                collect_column_id(id, max_id);
+            }
+        }
+        LogicalPlanKind::FanoutConsume(node) => {
+            collect_output_columns(&node.output_columns, max_id);
+            collect_column_id(node.anchor, max_id);
+            for id in &node.producer_column_ids {
+                collect_column_id(*id, max_id);
+            }
+        }
+        LogicalPlanKind::FanoutAnchor(node) => {
+            collect_column_id(node.id, max_id);
+            for branch in &node.branches {
+                collect_expr_column_ids(&branch.predicate, max_id);
+                if let crate::planner::quota::PlanFanoutDistribution::Hash(ids) =
+                    &branch.distribution
+                {
+                    for id in ids {
+                        collect_column_id(*id, max_id);
+                    }
+                }
+            }
+        }
         LogicalPlanKind::CTEProduce(produce) => {
             collect_output_columns(&produce.output_columns, max_id)
         }
@@ -600,6 +649,99 @@ pub(crate) mod tests {
 
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(test)]
+    fn rewrite_visible_join(plan: LogicalPlanNode) -> ImvRewriteOutcome {
+        run_imv_rewrite(ImvRewriteInput {
+            plan,
+            snapshot: join_projection_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory_reserved_until(30),
+        })
+        .expect("join projection visible bag apply")
+    }
+
+    #[cfg(test)]
+    fn assert_visible_bag_outcome(outcome: &ImvRewriteOutcome) {
+        assert!(!plan_contains_imv_marker(&outcome.plan));
+        assert!(!outcome.annotation.change_stream.has_aggregate());
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .visible_bag
+            .as_ref()
+            .expect("visible bag descriptor");
+        assert_eq!(
+            descriptor.kind,
+            crate::compiler::mv_rewrite::SqlImvVisibleApplyKind::PotentialDeletes
+        );
+        super::super::visible_tuple_apply::validate_descriptor(&outcome.plan, descriptor)
+            .expect("complete visible bag quota graph");
+        let output = crate::planner::plan_output_columns(&outcome.plan).unwrap();
+        assert!(output.iter().any(
+            |column| column.column_id == descriptor.action && ImvActionColumn::matches(column)
+        ));
+    }
+
+    #[cfg(test)]
+    fn assert_source_union_schema(plan: &LogicalPlanNode) {
+        let LogicalPlanKind::Union(union) = &plan.kind else {
+            panic!("expected source delta union")
+        };
+        assert!(union.all);
+        assert!(union.output_columns.iter().any(ImvActionColumn::matches));
+        for branch in &plan.children {
+            let outputs = crate::planner::plan_output_columns(branch).unwrap();
+            assert_eq!(outputs.len(), union.output_columns.len());
+            for (actual, declared) in outputs.iter().zip(&union.output_columns) {
+                assert_eq!(
+                    (&actual.name, &actual.data_type, actual.nullable),
+                    (&declared.name, &declared.data_type, declared.nullable)
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn collect_source_windows(
+        plan: &LogicalPlanNode,
+        delta: &mut Vec<(u32, String, i64, i64)>,
+        versions: &mut Vec<(u32, String, i64)>,
+    ) {
+        if let LogicalPlanKind::Scan(scan) = &plan.kind {
+            let ScanSource::Sql(source) = &scan.table.source;
+            match source.kind {
+                SqlScanKind::Delta {
+                    from_snapshot_id,
+                    to_snapshot_id,
+                } => delta.push((
+                    source.mv_occurrence.expect("source occurrence").get(),
+                    format!(
+                        "{}.{}.{}",
+                        source.table.catalog, source.table.namespace, source.table.table
+                    ),
+                    from_snapshot_id,
+                    to_snapshot_id,
+                )),
+                SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(id),
+                    ..
+                } => versions.push((
+                    source.mv_occurrence.expect("source occurrence").get(),
+                    format!(
+                        "{}.{}.{}",
+                        source.table.catalog, source.table.namespace, source.table.table
+                    ),
+                    id,
+                )),
+                _ => {}
+            }
+        }
+        for child in &plan.children {
+            collect_source_windows(child, delta, versions);
+        }
+    }
+
     fn test_column_ref_factory() -> Rc<RefCell<ColumnRefFactory>> {
         Rc::new(RefCell::new(ColumnRefFactory::new()))
     }
@@ -610,6 +752,7 @@ pub(crate) mod tests {
         factory
     }
 
+    #[cfg(test)]
     fn optimize_logical_for_test(plan: LogicalPlanNode) -> crate::optimizer::OptimizedOperatorNode {
         let mut scalar_arena = ScalarArena::new();
         let optimizer_expr =
@@ -1015,29 +1158,13 @@ pub(crate) mod tests {
         dead_code,
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
     )]
-    fn locator_join_left_input(plan: &LogicalPlanNode) -> &LogicalPlanNode {
-        let LogicalPlanKind::Project(_) = &plan.kind else {
-            panic!("expected root Project over target locator join, got {plan:?}");
-        };
-        let join_plan = plan.unary_input();
-        let LogicalPlanKind::Join(join) = &join_plan.kind else {
-            panic!("expected target locator Join under root Project, got {join_plan:?}");
-        };
-        assert_eq!(join.join_type, JoinKind::LeftOuter);
-        let LogicalPlanKind::Scan(scan) = &join_plan.right().kind else {
-            panic!("expected target locator scan on join right side");
-        };
-        assert!(
-            matches!(
-                scan.table.source,
-                ScanSource::Sql(SqlScanSource {
-                    kind: SqlScanKind::MvTargetLocator { .. },
-                    ..
-                })
-            ),
-            "join right side must be target locator scan"
-        );
-        join_plan.left()
+    #[cfg(test)]
+    fn visible_delta_producer(plan: &LogicalPlanNode) -> &LogicalPlanNode {
+        match &plan.kind {
+            LogicalPlanKind::FanoutAnchor(_) => &plan.children[0],
+            LogicalPlanKind::Project(_) => plan.unary_input(),
+            _ => panic!("expected visible bag apply root, got {plan:?}"),
+        }
     }
 
     #[allow(
@@ -1216,10 +1343,30 @@ pub(crate) mod tests {
             column_ref_factory: test_column_ref_factory(),
         })
         .unwrap();
-        let descriptor = outcome.annotation.change_stream.join_refresh.unwrap();
-        assert_eq!(descriptor.left_base_fqn, descriptor.right_base_fqn);
-        assert_eq!(descriptor.left_occurrence_id.get(), 7);
-        assert_eq!(descriptor.right_occurrence_id.get(), 42);
+        assert_visible_bag_outcome(&outcome);
+        let mut delta = Vec::new();
+        let mut versions = Vec::new();
+        collect_source_windows(
+            visible_delta_producer(&outcome.plan),
+            &mut delta,
+            &mut versions,
+        );
+        delta.sort();
+        versions.sort();
+        assert_eq!(
+            delta,
+            vec![
+                (7, "ice.db.base".into(), 11, 22),
+                (42, "ice.db.base".into(), 33, 44)
+            ]
+        );
+        assert_eq!(
+            versions,
+            vec![
+                (7, "ice.db.base".into(), 22),
+                (42, "ice.db.base".into(), 33)
+            ]
+        );
     }
 
     #[allow(
@@ -1791,7 +1938,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             column_ref_factory: std::rc::Rc::clone(&factory),
         })
@@ -1809,7 +1960,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -1833,7 +1988,10 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -1954,7 +2112,12 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
-            disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "NoSuchRule".to_string(),
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2059,7 +2222,7 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec!["RewriteVisibleBagApply".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2078,7 +2241,7 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec!["RewriteVisibleBagApply".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2097,7 +2260,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2112,7 +2279,11 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2129,8 +2300,7 @@ pub(crate) mod tests {
                 "imv-delta-pushdown",
                 "imv-scan-binding",
                 "imv-action-propagation",
-                "imv-apply-key",
-                "imv-target-locator",
+                "imv-visible-bag-apply",
                 "imv-change-stream-descriptor",
                 "imv-partition-derivation",
                 "imv-marker-cleanup",
@@ -2145,14 +2315,14 @@ pub(crate) mod tests {
         reason = "The test asserts the frozen SQL-source invariant while preserving its explicit failure diagnostic."
     )]
     fn imv_pipeline_binds_root_delta_scan() {
-        // Disable InjectApplyKeyProject and ActionColumnValidation so this
+        // Disable RewriteVisibleBagApply and ActionColumnValidation so this
         // test stays focused on scan binding (snapshot-id promotion) without
         // requiring a Project wrapper above the Scan.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
             disabled_rules: vec![
-                "InjectApplyKeyProject".to_string(),
+                "RewriteVisibleBagApply".to_string(),
                 "ActionColumnValidation".to_string(),
             ],
             deadline: None,
@@ -2194,7 +2364,10 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2230,7 +2403,10 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
-            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            disabled_rules: vec![
+                "WrapRootInImvDelta".to_string(),
+                "RewriteVisibleBagApply".to_string(),
+            ],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2252,14 +2428,14 @@ pub(crate) mod tests {
 
     #[test]
     fn imv_pipeline_injects_action_on_delta_scan() {
-        // Disable InjectApplyKeyProject and ActionColumnValidation so this
+        // Disable RewriteVisibleBagApply and ActionColumnValidation so this
         // test stays focused on __change_op injection into the Scan without
         // requiring a Project wrapper above the Scan.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
             disabled_rules: vec![
-                "InjectApplyKeyProject".to_string(),
+                "RewriteVisibleBagApply".to_string(),
                 "ActionColumnValidation".to_string(),
             ],
             deadline: None,
@@ -2315,36 +2491,26 @@ pub(crate) mod tests {
         })
         .expect("Project over delta scan must rewrite and pass validation");
 
-        // Outcome root is a Project that exposes the propagated action column.
-        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
-            panic!("expected Project outcome, got {:?}", outcome.plan);
-        };
+        assert_visible_bag_outcome(&outcome);
+        let output = crate::planner::plan_output_columns(&outcome.plan).unwrap();
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .visible_bag
+            .as_ref()
+            .unwrap();
+        assert!(output.iter().any(
+            |column| column.column_id == descriptor.action && ImvActionColumn::matches(column)
+        ));
         assert!(
-            project
-                .items
+            output
                 .iter()
-                .any(|item| item.output_name.eq_ignore_ascii_case("__change_op")),
-            "Project must expose propagated action column; items: {:?}",
-            project
-                .items
-                .iter()
-                .map(|i| &i.output_name)
-                .collect::<Vec<_>>()
+                .any(|column| !column.is_internal && column.name == "k")
         );
-        // The user column is still present.
-        assert!(
-            project.items.iter().any(|item| item.output_name == "k"),
-            "user column k must remain"
-        );
-        // The user plan is on the left side of the injected target locator join.
-        let scan = find_delta_scan(locator_join_left_input(&outcome.plan))
-            .expect("expected delta-bound scan under target locator join left side");
-        assert!(
-            scan.columns
-                .iter()
-                .any(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op")),
-            "child scan must carry the internal action column"
-        );
+        let scan =
+            find_delta_scan(visible_delta_producer(&outcome.plan)).expect("source delta scan");
+        assert!(scan.columns.iter().any(ImvActionColumn::matches));
+        assert_project_refs_resolve_to_child_outputs(&outcome.plan);
     }
 
     #[test]
@@ -2372,38 +2538,105 @@ pub(crate) mod tests {
         })
         .expect("projection/filter rewrite must carry target locator metadata");
 
-        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
-            panic!("expected root Project, got {:?}", outcome.plan);
-        };
-        let output_names = project_output_names(project);
+        assert_visible_bag_outcome(&outcome);
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .visible_bag
+            .as_ref()
+            .unwrap();
+        let output = crate::planner::plan_output_columns(&outcome.plan).unwrap();
+        for (id, name, ty) in [
+            (
+                descriptor.file.unwrap(),
+                crate::common::ICEBERG_FILE_PATH_COL,
+                DataType::Utf8,
+            ),
+            (
+                descriptor.position.unwrap(),
+                crate::common::ICEBERG_ROW_POS_COL,
+                DataType::Int64,
+            ),
+        ] {
+            assert!(output.iter().any(|column| column.column_id == id
+                && column.name == name
+                && column.data_type == ty
+                && column.is_internal
+                && column.nullable));
+        }
         assert!(
-            output_names
+            !output
                 .iter()
-                .any(|name| name.eq_ignore_ascii_case(crate::common::ICEBERG_FILE_PATH_COL)),
-            "root output must include target _file locator metadata; items: {output_names:?}"
-        );
-        assert!(
-            output_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(crate::common::ICEBERG_ROW_POS_COL)),
-            "root output must include target _pos locator metadata; items: {output_names:?}"
-        );
-        assert!(
-            output_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)),
-            "root output must include target _row_id lineage metadata; items: {output_names:?}"
-        );
-        assert!(
-            output_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(crate::common::ICEBERG_LAST_UPDATED_SEQ_COL)),
-            "root output must include target _last_updated_sequence_number lineage metadata; items: {output_names:?}"
+                .any(|column| column.name == crate::common::ICEBERG_ROW_ID_COL
+                    || column.name == crate::common::ICEBERG_LAST_UPDATED_SEQ_COL)
         );
     }
 
     #[test]
-    fn imv_pipeline_rejects_preexisting_locator_metadata_name_collision() {
+    fn imv_pipeline_append_only_publishes_visible_columns_without_quota_or_target_read() {
+        let mut snapshot = (*dummy_mv_ctx()).clone();
+        snapshot.visible_apply = Some(
+            crate::compiler::mv_rewrite::SqlImvVisibleApplyFacts::try_new(
+                crate::compiler::mv_rewrite::SqlImvVisibleApplyKind::AppendOnly,
+                1024 * 1024,
+            )
+            .unwrap(),
+        );
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: iceberg_scan_plan(),
+            snapshot: Arc::new(snapshot),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .expect("append-only visible apply");
+        let descriptor = outcome
+            .annotation
+            .change_stream
+            .visible_bag
+            .as_ref()
+            .unwrap();
+        super::super::visible_tuple_apply::validate_descriptor(&outcome.plan, descriptor).unwrap();
+        assert_eq!(
+            descriptor.kind,
+            crate::compiler::mv_rewrite::SqlImvVisibleApplyKind::AppendOnly
+        );
+        assert_eq!((descriptor.file, descriptor.position), (None, None));
+        let mut todo = vec![&outcome.plan];
+        while let Some(plan) = todo.pop() {
+            assert!(!matches!(
+                &plan.kind,
+                LogicalPlanKind::QuotaPreclaim(_)
+                    | LogicalPlanKind::QuotaTrim(_)
+                    | LogicalPlanKind::FanoutAnchor(_)
+                    | LogicalPlanKind::FanoutConsume(_)
+                    | LogicalPlanKind::Aggregate(_)
+                    | LogicalPlanKind::TableFunction(_)
+            ));
+            if let LogicalPlanKind::Scan(scan) = &plan.kind {
+                let ScanSource::Sql(source) = &scan.table.source;
+                assert!(matches!(source.kind, SqlScanKind::Delta { .. }));
+                assert_eq!(source.table.table, "b");
+            }
+            todo.extend(plan.children.iter());
+        }
+
+        let columns = super::super::join_delta::plan_output_columns(&outcome.plan).unwrap();
+        assert_eq!(
+            columns.iter().filter(|column| !column.is_internal).count(),
+            1
+        );
+        assert_eq!(
+            columns.iter().filter(|column| column.is_internal).count(),
+            1
+        );
+        assert!(columns.iter().any(
+            |column| column.column_id == descriptor.action && ImvActionColumn::matches(column)
+        ));
+    }
+
+    #[test]
+    fn imv_pipeline_rejects_extra_visible_locator_columns_outside_target_contract() {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
@@ -2447,10 +2680,10 @@ pub(crate) mod tests {
             deadline: None,
             column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
-        .expect_err("preexisting _file/_pos names must not bypass target locator injection");
+        .expect_err("extra user-visible locator names must not bypass the admitted visible arity");
 
         assert!(
-            err.contains("reserved target locator metadata column"),
+            err.contains("visible apply target arity differs from admitted contract"),
             "{err}"
         );
     }
@@ -2464,71 +2697,23 @@ pub(crate) mod tests {
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
         })
-        .expect("top-level projection/filter UNION ALL must rewrite through the full IMV pipeline");
-
-        assert!(
-            !plan_contains_imv_marker(&outcome.plan),
-            "final plan must not contain unresolved IMV markers: {:?}",
-            outcome.plan
+        .expect("projection/filter UNION ALL visible bag apply");
+        assert_visible_bag_outcome(&outcome);
+        let source_union =
+            find_union_plan(visible_delta_producer(&outcome.plan)).expect("source delta UnionAll");
+        assert_source_union_schema(source_union);
+        let mut delta = Vec::new();
+        let mut versions = Vec::new();
+        collect_source_windows(source_union, &mut delta, &mut versions);
+        delta.sort();
+        assert_eq!(
+            delta,
+            vec![
+                (7, "ice.db.b".into(), 11, 22),
+                (42, "ice.db.b".into(), 12, 22)
+            ]
         );
-        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
-            panic!("expected root apply-key Project, got {:?}", outcome.plan);
-        };
-        assert!(
-            project
-                .items
-                .iter()
-                .any(|item| item.output_name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)),
-            "root output must include branch id; items: {:?}",
-            project_output_names(project)
-        );
-        assert!(
-            project
-                .items
-                .iter()
-                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
-            "root output must include action column; items: {:?}",
-            project_output_names(project)
-        );
-        assert!(
-            project.items.iter().any(|item| item
-                .output_name
-                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)),
-            "root output must include apply key; items: {:?}",
-            project_output_names(project)
-        );
-        let union_plan = find_union_plan(locator_join_left_input(&outcome.plan))
-            .expect("expected union under target locator join left side");
-        let LogicalPlanKind::Union(union) = &union_plan.kind else {
-            panic!(
-                "expected Union under target locator join left side, got {:?}",
-                union_plan
-            );
-        };
-        assert!(
-            union
-                .output_columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)),
-            "Union output must include branch id"
-        );
-        assert!(
-            union
-                .output_columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
-            "Union output must include action column"
-        );
-        for branch in &union_plan.children {
-            let LogicalPlanKind::Project(branch_project) = &branch.kind else {
-                panic!("expected normalized branch Project, got {branch:?}");
-            };
-            assert_eq!(
-                branch_project.items.len(),
-                union.output_columns.len(),
-                "branch Project output count must match Union output count"
-            );
-        }
+        assert!(versions.is_empty());
     }
 
     #[test]
@@ -2737,13 +2922,13 @@ pub(crate) mod tests {
             "join aggregate refresh must use aggregate change-stream semantics"
         );
         assert!(
-            outcome.annotation.change_stream.join_refresh.is_none(),
-            "aggregate-over-join refresh must not record a pure join-refresh descriptor"
+            outcome.annotation.change_stream.visible_bag.is_none(),
+            "aggregate-over-join refresh must not record a visible bag descriptor"
         );
     }
 
     #[test]
-    fn join_aggregate_refresh_does_not_record_join_payload_descriptor() {
+    fn join_aggregate_refresh_does_not_record_visible_bag_descriptor() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
@@ -2754,420 +2939,110 @@ pub(crate) mod tests {
         .expect("join aggregate IMV pipeline must rewrite and validate");
 
         assert!(outcome.annotation.change_stream.has_aggregate());
-        assert!(outcome.annotation.change_stream.join_refresh.is_none());
+        assert!(outcome.annotation.change_stream.visible_bag.is_none());
     }
 
     #[test]
     fn pure_join_refresh_pipeline_keeps_internal_outputs_above_projection() {
-        let outcome = run_imv_rewrite(ImvRewriteInput {
-            plan: join_projection_plan(),
-            snapshot: join_projection_mv_ctx(),
-            disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-            deadline: None,
-            column_ref_factory: test_column_ref_factory_reserved_until(30),
-        })
-        .expect("join projection IMV pipeline must rewrite and validate");
-        let descriptor = outcome
-            .annotation
-            .change_stream
-            .join_refresh
-            .as_ref()
-            .expect("join projection rewrite must record join refresh descriptor");
-        let output_columns =
-            crate::planner::plan_output_columns(&outcome.plan).expect("pipeline output columns");
-
-        assert!(
-            output_columns.iter().any(|column| column.column_id
-                == descriptor.action_column.column_id
-                && column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
-            "coalesce input must expose the recorded action column"
-        );
-        assert!(
-            output_columns.iter().any(|column| {
-                column.column_id == descriptor.join_apply_key_column.column_id
-                    && column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
-            }),
-            "coalesce input must expose the recorded join apply-key column"
-        );
-        assert!(
-            !output_columns.iter().any(ImvRowIdColumn::matches),
-            "raw base _row_id columns are join-key inputs, not change-stream outputs: {output_columns:?}"
-        );
-
-        let union_plan = find_union_plan(&outcome.plan).expect("pure join refresh must keep union");
-        let LogicalPlanKind::Union(union) = &union_plan.kind else {
-            panic!("expected pure join refresh union");
-        };
-        for branch in &union_plan.children {
-            let LogicalPlanKind::Project(project) = &branch.kind else {
-                panic!("expected normalized branch Project");
-            };
-            assert_eq!(
-                project.items.len(),
-                union.output_columns.len(),
-                "branch Project output count must match pruned Union output count"
-            );
-            assert!(
-                project.items.iter().all(|item| {
-                    item.output_column_id != descriptor.left_row_id_column.column_id
-                        && item.output_column_id != descriptor.right_row_id_column.column_id
-                        && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
-                }),
-                "branch Project must not expose raw base row-id outputs after join apply-key injection: {:?}",
-                project.items
-            );
-        }
-
-        let optimized_tree = optimize_logical_for_test(outcome.plan.clone());
-        assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
-        assert!(
-            !optimized_tree
-                .output_columns
+        let outcome = rewrite_visible_join(join_projection_plan());
+        assert_visible_bag_outcome(&outcome);
+        let outputs = crate::planner::plan_output_columns(&outcome.plan).unwrap();
+        assert_eq!(
+            outputs
                 .iter()
-                .any(ImvRowIdColumn::matches),
-            "physical root must not advertise raw base _row_id columns as change-stream outputs: {:?}",
-            optimized_tree.output_columns
+                .filter(|column| !column.is_internal)
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k", "v"]
         );
+        assert!(outputs.iter().any(ImvActionColumn::matches));
+        assert!(!outputs.iter().any(|column| ImvRowIdColumn::matches(column)
+            || column.name == HIDDEN_APPLY_KEY_COLUMN_NAME
+            || column.name == JOIN_APPLY_KEY_COLUMN_NAME
+            || column.name == "__mv_content_key"
+            || column.name == "__mv_entry"));
+        let optimized = optimize_logical_for_test(outcome.plan);
+        assert_physical_project_refs_resolve_to_child_outputs(&optimized);
+        assert!(!optimized.output_columns.iter().any(ImvRowIdColumn::matches));
     }
 
     #[test]
     fn pure_join_refresh_union_branches_match_declared_output_schema() {
-        let outcome = run_imv_rewrite(ImvRewriteInput {
-            plan: join_projection_plan(),
-            snapshot: join_projection_mv_ctx(),
-            disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-            deadline: None,
-            column_ref_factory: test_column_ref_factory_reserved_until(30),
-        })
-        .expect("join projection IMV pipeline must rewrite and validate");
-        let union_plan = find_union_plan(&outcome.plan).expect("join delta union");
-        let LogicalPlanKind::Union(union) = &union_plan.kind else {
-            panic!("expected Union");
-        };
-        let output_names = union
-            .output_columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
-
-        for child in &union_plan.children {
-            let LogicalPlanKind::Project(project) = &child.kind else {
-                panic!("expected normalized Project branch");
-            };
-            let child_names = project
-                .items
-                .iter()
-                .map(|item| item.output_name.as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                child_names, output_names,
-                "join refresh union branch output must match union schema"
-            );
-        }
+        let outcome = rewrite_visible_join(join_projection_plan());
+        assert_visible_bag_outcome(&outcome);
+        let source_union = find_union_plan(visible_delta_producer(&outcome.plan))
+            .expect("join delta source UnionAll");
+        assert_source_union_schema(source_union);
     }
 
     #[test]
-    fn pure_join_refresh_coalesce_plan_keeps_project_refs_in_child_scope() {
-        let factory_cell = test_column_ref_factory_reserved_until(30);
-        let outcome = run_imv_rewrite(ImvRewriteInput {
-            plan: join_projection_plan(),
-            snapshot: join_projection_mv_ctx(),
-            disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-            deadline: None,
-            column_ref_factory: Rc::clone(&factory_cell),
-        })
-        .expect("join projection IMV pipeline must rewrite and validate");
-        let descriptor = outcome
-            .annotation
-            .change_stream
-            .join_refresh
-            .as_ref()
-            .expect("join projection rewrite must record join refresh descriptor");
-        let coalesce = {
-            let mut factory = factory_cell.borrow_mut();
-            crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                outcome.plan,
-                descriptor,
-                &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                    target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                    target_table_uuid: "uuid-tgt".to_string(),
-                    target_snapshot_id: Some(99),
-                },
-                &mut factory,
-                200,
-                201,
-                202,
-                203,
-                204,
-            )
-        }
-        .expect("join projection coalesce plan");
-
-        assert_project_refs_resolve_to_child_outputs(&coalesce);
+    fn pure_join_visible_bag_plan_keeps_project_refs_in_child_scope() {
+        let outcome = rewrite_visible_join(join_projection_plan());
+        assert_visible_bag_outcome(&outcome);
+        assert_project_refs_resolve_to_child_outputs(&outcome.plan);
     }
 
     #[test]
-    fn pure_join_refresh_optimized_tree_keeps_project_refs_in_child_scope() {
+    fn pure_join_visible_bag_optimized_tree_keeps_project_refs_in_child_scope() {
         std::thread::Builder::new()
-            .name("imv-join-physical-scope-test".to_string())
+            .name("imv-visible-bag-scope-test".into())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                let factory_cell = test_column_ref_factory_reserved_until(30);
-                let outcome = run_imv_rewrite(ImvRewriteInput {
-                    plan: join_projection_plan(),
-                    snapshot: join_projection_mv_ctx(),
-                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    deadline: None,
-                    column_ref_factory: Rc::clone(&factory_cell),
-                })
-                .expect("join projection IMV pipeline must rewrite and validate");
-                let descriptor = outcome
-                    .annotation
-                    .change_stream
-                    .join_refresh
-                    .as_ref()
-                    .expect("join projection rewrite must record join refresh descriptor");
-                let coalesce = {
-                    let mut factory = factory_cell.borrow_mut();
-                    crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                        outcome.plan,
-                        descriptor,
-                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                            target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                            target_table_uuid: "uuid-tgt".to_string(),
-                            target_snapshot_id: Some(99),
-                        },
-                        &mut factory,
-                        200,
-                        201,
-                        202,
-                        203,
-                        204,
-                    )
-                }
-                .expect("join projection coalesce plan");
-                let optimized_tree = optimize_logical_for_test(coalesce);
-
-                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
-            })
-            .expect("spawn physical scope test")
-            .join()
-            .expect("physical scope test");
-    }
-
-    #[test]
-    fn pure_join_refresh_filter_optimized_tree_keeps_action_refs_in_child_scope() {
-        std::thread::Builder::new()
-            .name("imv-join-filter-physical-scope-test".to_string())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let factory_cell = test_column_ref_factory_reserved_until(30);
-                let outcome = run_imv_rewrite(ImvRewriteInput {
-                    plan: join_projection_filter_plan(),
-                    snapshot: join_projection_mv_ctx(),
-                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    deadline: None,
-                    column_ref_factory: Rc::clone(&factory_cell),
-                })
-                .expect("join projection/filter IMV pipeline must rewrite and validate");
-                let descriptor = outcome
-                    .annotation
-                    .change_stream
-                    .join_refresh
-                    .as_ref()
-                    .expect("join projection/filter rewrite must record join refresh descriptor");
-                let coalesce = {
-                    let mut factory = factory_cell.borrow_mut();
-                    crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                        outcome.plan,
-                        descriptor,
-                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                            target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                            target_table_uuid: "uuid-tgt".to_string(),
-                            target_snapshot_id: Some(99),
-                        },
-                        &mut factory,
-                        200,
-                        201,
-                        202,
-                        203,
-                        204,
-                    )
-                }
-                .expect("join projection/filter coalesce plan");
-                let optimized_tree = optimize_logical_for_test(coalesce);
-
+                let outcome = rewrite_visible_join(join_projection_plan());
+                assert_visible_bag_outcome(&outcome);
+                assert_project_refs_resolve_to_child_outputs(&outcome.plan);
+                let optimized = optimize_logical_for_test(outcome.plan);
                 crate::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
-                    &optimized_tree,
+                    &optimized,
                 )
-                .expect("join projection/filter physical coalesce plan must bind ids");
-                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
+                .expect("visible bag physical graph binds every expression");
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized);
             })
-            .expect("spawn join filter physical scope test")
+            .unwrap()
             .join()
-            .expect("join filter physical scope test");
+            .unwrap();
     }
 
     #[test]
-    fn pure_join_refresh_side_filter_optimized_tree_keeps_action_refs_in_child_scope() {
+    fn pure_join_visible_bag_filter_optimized_tree_keeps_action_refs_in_child_scope() {
         std::thread::Builder::new()
-            .name("imv-join-side-filter-physical-scope-test".to_string())
+            .name("imv-visible-bag-scope-test".into())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                let factory_cell = test_column_ref_factory_reserved_until(30);
-                let outcome = run_imv_rewrite(ImvRewriteInput {
-                    plan: join_projection_left_filter_plan(),
-                    snapshot: join_projection_mv_ctx(),
-                    disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    deadline: None,
-                    column_ref_factory: Rc::clone(&factory_cell),
-                })
-                .expect("join projection side-filter IMV pipeline must rewrite and validate");
-                let descriptor = outcome
-                    .annotation
-                    .change_stream
-                    .join_refresh
-                    .as_ref()
-                    .expect("join side-filter rewrite must record join refresh descriptor");
-                let coalesce = {
-                    let mut factory = factory_cell.borrow_mut();
-                    crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                        outcome.plan,
-                        descriptor,
-                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                            target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                            target_table_uuid: "uuid-tgt".to_string(),
-                            target_snapshot_id: Some(99),
-                        },
-                        &mut factory,
-                        200,
-                        201,
-                        202,
-                        203,
-                        204,
-                    )
-                }
-                .expect("join side-filter coalesce plan");
-                let optimized_tree = optimize_logical_for_test(coalesce);
-
-                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
+                let outcome = rewrite_visible_join(join_projection_filter_plan());
+                assert_visible_bag_outcome(&outcome);
+                assert_project_refs_resolve_to_child_outputs(&outcome.plan);
+                let optimized = optimize_logical_for_test(outcome.plan);
+                crate::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+                    &optimized,
+                )
+                .expect("visible bag physical graph binds every expression");
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized);
             })
-            .expect("spawn join side-filter physical scope test")
+            .unwrap()
             .join()
-            .expect("join side-filter physical scope test");
+            .unwrap();
     }
 
-    pub(crate) mod tests_support {
-        use super::*;
-
-        /// Request-local token assignment for the join-refresh coalesce
-        /// lowering fixture. The old SQL-only builder intentionally reused
-        /// its placeholder token for every scan. Owner tests that exercise
-        /// preparation must instead retain one exact binding per physical
-        /// base/target identity.
-        #[derive(Clone, Copy, Debug)]
-        pub(crate) struct JoinRefreshCoalesceBindingTokens {
-            pub(crate) left: crate::binding::SqlTableBindingId,
-            pub(crate) right: crate::binding::SqlTableBindingId,
-            pub(crate) target: crate::binding::SqlTableBindingId,
-        }
-
-        impl JoinRefreshCoalesceBindingTokens {
-            pub(crate) fn for_scope(scope: crate::binding::SqlTableBindingScopeId) -> Self {
-                use std::num::NonZeroU32;
-
-                Self {
-                    left: crate::binding::SqlTableBindingId::new(
-                        scope,
-                        NonZeroU32::new(1).expect("nonzero fixture ordinal"),
-                    ),
-                    right: crate::binding::SqlTableBindingId::new(
-                        scope,
-                        NonZeroU32::new(2).expect("nonzero fixture ordinal"),
-                    ),
-                    target: crate::binding::SqlTableBindingId::new(
-                        scope,
-                        NonZeroU32::new(3).expect("nonzero fixture ordinal"),
-                    ),
-                }
-            }
-        }
-
-        pub(crate) fn build_join_refresh_coalesce_plan_for_lowering()
-        -> crate::optimizer::OptimizedOperatorNode {
-            let plan = join_projection_plan();
-            let factory_cell = test_column_ref_factory_reserved_until(30);
-            let snapshot = crate::compiler::mv_rewrite::test_join_snapshot(false);
-            let outcome = run_imv_rewrite(ImvRewriteInput {
-                plan,
-                snapshot: Arc::clone(&snapshot),
-                disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                deadline: None,
-                column_ref_factory: Rc::clone(&factory_cell),
-                #[cfg(not(test))]
-                function_catalog: crate::functions::test_function_catalog_snapshot(),
-            })
-            .expect("join projection IMV pipeline must rewrite and validate");
-            let descriptor = outcome
-                .annotation
-                .change_stream
-                .join_refresh
-                .as_ref()
-                .expect("join projection rewrite must record join refresh descriptor");
-            let coalesce = {
-                let mut factory = factory_cell.borrow_mut();
-                crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                    outcome.plan,
-                    descriptor,
-                    &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&snapshot),
-                    &mut factory,
-                    200,
-                    201,
-                    202,
-                    203,
-                    204,
-                    #[cfg(not(test))]
-                    crate::functions::builtin_sql_function_catalog(),
+    #[test]
+    fn pure_join_visible_bag_side_filter_optimized_tree_keeps_action_refs_in_child_scope() {
+        std::thread::Builder::new()
+            .name("imv-visible-bag-scope-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let outcome = rewrite_visible_join(join_projection_left_filter_plan());
+                assert_visible_bag_outcome(&outcome);
+                assert_project_refs_resolve_to_child_outputs(&outcome.plan);
+                let optimized = optimize_logical_for_test(outcome.plan);
+                crate::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+                    &optimized,
                 )
-            }
-            .expect("join projection coalesce plan");
-            optimize_logical_for_test(coalesce)
-        }
-
-        /// Build the same coalesce plan as the SQL-only rule test, but bind
-        /// every scan to the request-local identity that preparation will
-        /// materialize. Repeated scans of the same base deliberately reuse
-        /// its one exact admitted binding; the target locator has its own
-        /// target binding.
-        pub(crate) fn build_tokenized_join_refresh_coalesce_plan_for_lowering(
-            scope: crate::binding::SqlTableBindingScopeId,
-        ) -> (
-            crate::optimizer::OptimizedOperatorNode,
-            JoinRefreshCoalesceBindingTokens,
-        ) {
-            let tokens = JoinRefreshCoalesceBindingTokens::for_scope(scope);
-            let mut optimized = build_join_refresh_coalesce_plan_for_lowering();
-            retokenize_coalesce_scans(&mut optimized, tokens);
-            (optimized, tokens)
-        }
-
-        fn retokenize_coalesce_scans(
-            node: &mut crate::optimizer::OptimizedOperatorNode,
-            tokens: JoinRefreshCoalesceBindingTokens,
-        ) {
-            if let crate::optimizer::Operator::PhysicalScan(scan) = &mut node.op {
-                let ScanSource::Sql(source) = &mut scan.table.source;
-                source.binding = match source.table.table.as_str() {
-                    "l" => tokens.left,
-                    "r" => tokens.right,
-                    "mv" => tokens.target,
-                    table => panic!("unexpected coalesce fixture scan table {table}"),
-                };
-            }
-            for child in &mut node.children {
-                retokenize_coalesce_scans(child, tokens);
-            }
-        }
+                .expect("visible bag physical graph binds every expression");
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -3190,7 +3065,7 @@ pub(crate) mod tests {
         .expect("aggregate change stream should not require join refresh descriptor");
 
         assert!(outcome.annotation.change_stream.has_aggregate());
-        assert!(outcome.annotation.change_stream.join_refresh.is_none());
+        assert!(outcome.annotation.change_stream.visible_bag.is_none());
     }
 
     #[test]
@@ -3213,7 +3088,7 @@ pub(crate) mod tests {
         })
         .expect("zero-key aggregate join uses aggregate state merge");
         assert!(outcome.annotation.change_stream.has_aggregate());
-        assert!(outcome.annotation.change_stream.join_refresh.is_none());
+        assert!(outcome.annotation.change_stream.visible_bag.is_none());
         let mut delta_windows = Vec::new();
         let mut versions = Vec::new();
         fn collect(
@@ -3274,6 +3149,26 @@ pub(crate) mod tests {
             vec![("l".into(), 11, 22), ("r".into(), 33, 44)]
         );
         assert_eq!(versions, vec![("l".into(), 22), ("r".into(), 33)]);
+        let mut occurrence_delta = Vec::new();
+        let mut occurrence_versions = Vec::new();
+        collect_source_windows(
+            &outcome.plan,
+            &mut occurrence_delta,
+            &mut occurrence_versions,
+        );
+        occurrence_delta.sort();
+        occurrence_versions.sort();
+        assert_eq!(
+            occurrence_delta,
+            vec![
+                (7, "ice.db.l".into(), 11, 22),
+                (42, "ice.db.r".into(), 33, 44)
+            ]
+        );
+        assert_eq!(
+            occurrence_versions,
+            vec![(7, "ice.db.l".into(), 22), (42, "ice.db.r".into(), 33)]
+        );
     }
 
     #[test]

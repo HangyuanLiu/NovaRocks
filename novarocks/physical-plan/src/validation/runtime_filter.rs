@@ -67,6 +67,7 @@ pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut Validat
         if !validate_runtime_filter_shape(filter, &path, errors) {
             continue;
         }
+        validate_quota_runtime_filter_key_homology(plan, filter, &path, errors);
         let witnesses = runtime_filter_witness_index(&filter.equality_witnesses);
         for witness in &filter.equality_witnesses {
             match plan.fragments().get(&witness.fragment) {
@@ -242,6 +243,10 @@ pub(crate) fn validate_runtime_filter_wait_graph(
                 (
                     crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
                     NodeKind::Aggregate { .. },
+                ) => node.inputs.first().copied(),
+                (
+                    crate::RuntimeFilterProducerTarget::QuotaContentField { .. },
+                    NodeKind::QuotaPreclaim { .. },
                 ) => node.inputs.first().copied(),
                 _ => None,
             };
@@ -455,7 +460,8 @@ pub(crate) fn validate_runtime_filter_shape(
         total.saturating_add(match &consumer.target {
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => 0,
             crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. }
+            | crate::RuntimeFilterConsumerTarget::QuotaContentScanField { lineage, .. } => {
                 lineage.len()
             }
         })
@@ -545,7 +551,8 @@ pub(crate) fn validate_runtime_filter_shape(
         .iter()
         .filter_map(|producer| match &producer.target {
             crate::RuntimeFilterProducerTarget::JoinBuildKey { equality } => Some(*equality),
-            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => None,
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. }
+            | crate::RuntimeFilterProducerTarget::QuotaContentField { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     let consumer_equalities = filter
@@ -554,7 +561,8 @@ pub(crate) fn validate_runtime_filter_shape(
         .filter_map(|consumer| match &consumer.target {
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { equality }
             | crate::RuntimeFilterConsumerTarget::ScanField { equality, .. } => Some(*equality),
-            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => None,
+            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+            | crate::RuntimeFilterConsumerTarget::QuotaContentScanField { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     if !consumer_equalities.is_subset(&producer_equalities) {
@@ -1032,6 +1040,10 @@ pub(crate) fn validate_runtime_filter_producer_progress(
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
             NodeKind::Aggregate { .. },
         ) if node.inputs.len() == 1 && non_build_edges.is_empty() => node.inputs[0],
+        (
+            crate::RuntimeFilterProducerTarget::QuotaContentField { .. },
+            NodeKind::QuotaPreclaim { .. },
+        ) if node.inputs.len() == 2 => node.inputs[0],
         _ => {
             errors.push(ValidationError::new(
                 path,
@@ -1075,6 +1087,9 @@ pub(crate) fn validate_runtime_filter_producer_progress(
         let detail = match producer.target {
             crate::RuntimeFilterProducerTarget::JoinBuildKey { .. } => {
                 "runtime filter join-build frontier differs from the exact join input exchange cuts"
+            }
+            crate::RuntimeFilterProducerTarget::QuotaContentField { .. } => {
+                "runtime filter quota frontier differs from the exact demand input exchange cuts"
             }
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => {
                 "runtime filter Aggregate TopN frontier differs from the exact aggregate input exchange cuts"
@@ -1321,6 +1336,19 @@ pub(crate) fn validate_runtime_filter_producer_target(
         return;
     }
     let valid = match producer.target {
+        crate::RuntimeFilterProducerTarget::QuotaContentField { field_ordinal, content_equivalence } => {
+            fragment.nodes().get(&producer.endpoint.node).is_some_and(|node| {
+                let NodeKind::QuotaPreclaim { spec } = &node.kind else { return false };
+                let field = usize::try_from(field_ordinal).ok().and_then(|ordinal| spec.demand_values.get(ordinal));
+                producer.apply_point == (crate::RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 })
+                    && node.inputs.len() == 2 && spec.content_equivalence == content_equivalence
+                    && producer.completion == crate::RuntimeFilterCompletion::ProducerClosed
+                    && producer.contribution_kinds.as_ref() == [crate::RuntimeFilterContributionKind::ValueDomainDelta, crate::RuntimeFilterContributionKind::ProducerClosed]
+                    && reduction == crate::RuntimeFilterReduction::SetUnion
+                    && matches!(domain, crate::RuntimeFilterDomain::Membership { ty, null_semantics: crate::RuntimeFilterNullSemantics::NullSafeEqual } if crate::quota_content_runtime_filter_type_supported(&ty.data_type))
+                    && field.is_some_and(|field| producer.endpoint.values.as_ref() == [*field])
+            })
+        }
         crate::RuntimeFilterProducerTarget::JoinBuildKey { equality }
             if matches!(
                 reduction,
@@ -1419,6 +1447,9 @@ pub(crate) fn validate_runtime_filter_producer_target(
     };
     if !valid {
         let detail = match producer.target {
+            crate::RuntimeFilterProducerTarget::QuotaContentField { .. } => {
+                "runtime filter quota producer does not match its exact demand content field"
+            }
             crate::RuntimeFilterProducerTarget::JoinBuildKey { .. } => {
                 "runtime filter producer target does not match its equality witness and exact build key"
             }
@@ -1461,7 +1492,8 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
                     crate::LateApplyGranularity::Row | crate::LateApplyGranularity::Batch
                 ),
                 crate::RuntimeFilterConsumerTarget::ScanField { .. }
-                | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
+                | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                | crate::RuntimeFilterConsumerTarget::QuotaContentScanField { .. } => matches!(
                     late_apply,
                     crate::LateApplyGranularity::Batch
                         | crate::LateApplyGranularity::RowGroup
@@ -1479,6 +1511,34 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     }
 
     let valid = match &consumer.target {
+        crate::RuntimeFilterConsumerTarget::QuotaContentScanField { producer, .. } => {
+            producers.iter().any(|candidate| {
+                candidate.witness == *producer
+                    && candidate.endpoint.fragment == fragment.id()
+                    && matches!(
+                        candidate.target,
+                        crate::RuntimeFilterProducerTarget::QuotaContentField { .. }
+                    )
+            }) && consumer.apply_point == crate::RuntimeFilterApplyPoint::ScanSource
+                && consumer
+                    .capabilities
+                    .contains(&crate::RuntimeFilterArtifactCapability::Membership)
+                && !matches!(
+                    consumer.activation,
+                    crate::RuntimeFilterConsumerActivation::NonBlockingLive { .. }
+                )
+                && fragment
+                    .nodes()
+                    .get(&consumer.endpoint.node)
+                    .is_some_and(|node| {
+                        consumer.endpoint.values.len() == 1
+                            && indexes.scan_provider_contains(
+                                fragment,
+                                node,
+                                consumer.endpoint.values[0],
+                            )
+                    })
+        }
         crate::RuntimeFilterConsumerTarget::JoinProbeKey { equality } => {
             runtime_filter_equality_witness(witnesses, *equality).is_some_and(|witness| {
                 let probe_side = witness.domain_side.opposite();
@@ -1530,6 +1590,9 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     };
     if !valid {
         let detail = match &consumer.target {
+            crate::RuntimeFilterConsumerTarget::QuotaContentScanField { .. } => {
+                "runtime filter quota consumer has no exact producer witness or target scan field"
+            }
             crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
                 "runtime filter Aggregate TopN consumer has no exact producer witness or scan field"
             }
@@ -1560,9 +1623,23 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
             RuntimeFilterLineageOrigin::AggregateTopN(*producer),
             lineage.as_ref(),
         ),
+        crate::RuntimeFilterConsumerTarget::QuotaContentScanField { producer, lineage } => (
+            RuntimeFilterLineageOrigin::QuotaContent(*producer),
+            lineage.as_ref(),
+        ),
         crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => return,
     };
-    if lineage.len() > errors.limits().runtime_filter_lineage_steps
+    let quota_lineage_safe = !matches!(origin, RuntimeFilterLineageOrigin::QuotaContent(_))
+        || lineage.iter().all(|step| {
+            matches!(
+                step,
+                crate::RuntimeFilterLineageStep::FilterPassThrough { .. }
+                    | crate::RuntimeFilterLineageStep::SortPassThrough { .. }
+                    | crate::RuntimeFilterLineageStep::ProjectIdentity { .. }
+            )
+        });
+    if !quota_lineage_safe
+        || lineage.len() > errors.limits().runtime_filter_lineage_steps
         || runtime_filter_scan_lineage_is_valid(
             plan, witnesses, producers, consumer, origin, lineage, indexes,
         )
@@ -1577,6 +1654,7 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
 
 #[derive(Clone, Copy)]
 pub(crate) enum RuntimeFilterLineageOrigin {
+    QuotaContent(crate::RuntimeFilterWitnessId),
     Join(crate::RuntimeFilterEqualityWitnessId),
     AggregateTopN(crate::RuntimeFilterWitnessId),
 }
@@ -1591,6 +1669,34 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
     indexes: &mut RuntimeFilterLineageIndexes,
 ) -> Option<()> {
     let mut position = match origin {
+        RuntimeFilterLineageOrigin::QuotaContent(witness) => {
+            let producer = producers
+                .iter()
+                .find(|producer| producer.witness == witness)?;
+            let crate::RuntimeFilterProducerTarget::QuotaContentField { field_ordinal, .. } =
+                producer.target
+            else {
+                return None;
+            };
+            let fragment = plan.fragments().get(&producer.endpoint.fragment)?;
+            let node = fragment.nodes().get(&producer.endpoint.node)?;
+            let NodeKind::QuotaPreclaim { spec } = &node.kind else {
+                return None;
+            };
+            let input = *node.inputs.get(1)?;
+            if node.inputs.len() != 2
+                || !node_has_exact_parent(&mut indexes.parents, fragment, input, node.id)
+            {
+                return None;
+            }
+            (
+                fragment.id(),
+                input,
+                *spec
+                    .target_values
+                    .get(usize::try_from(field_ordinal).ok()?)?,
+            )
+        }
         RuntimeFilterLineageOrigin::Join(equality) => {
             let witness = runtime_filter_equality_witness(witnesses, equality)?;
             let fragment = plan.fragments().get(&witness.fragment)?;
@@ -1952,4 +2058,172 @@ pub(crate) fn node_has_exact_parent(
         parents
     });
     parents.get(&child).copied().flatten() == Some(expected_parent)
+}
+
+/// Replay the complete visible tuple used by the final content-key Project,
+/// including exact fanout/exchange aliases. This proof requires the full
+/// referenced static subgraph; a local fragment alone cannot attest an
+/// upstream computation.
+pub(crate) fn validate_quota_runtime_filter_key_homology(
+    plan: &PhysicalPlan,
+    filter: &crate::RuntimeFilter,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    for producer in &filter.producers {
+        if !matches!(
+            producer.target,
+            crate::RuntimeFilterProducerTarget::QuotaContentField { .. }
+        ) {
+            continue;
+        }
+        let valid = plan
+            .fragments()
+            .get(&producer.endpoint.fragment)
+            .and_then(|fragment| {
+                let node = fragment.nodes().get(&producer.endpoint.node)?;
+                let NodeKind::QuotaPreclaim { spec } = &node.kind else {
+                    return None;
+                };
+                let root = *node.inputs.first()?;
+                quota_content_key_has_exact_tuple(
+                    plan,
+                    fragment.id(),
+                    root,
+                    spec.demand_key,
+                    &spec.demand_values,
+                )
+                .then_some(())
+            })
+            .is_some();
+        if !valid {
+            errors.push(ValidationError::new(path, "quota runtime-filter demand key is not computed from its exact complete visible tuple"));
+        }
+    }
+}
+
+fn quota_content_key_has_exact_tuple(
+    plan: &PhysicalPlan,
+    mut fragment_id: FragmentId,
+    mut node_id: NodeId,
+    mut key: ValueId,
+    values: &[ValueId],
+) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+    let mut values = values.to_vec();
+    let mut seen = BTreeSet::new();
+    while seen.insert((fragment_id, node_id)) {
+        let Some(fragment) = plan.fragments().get(&fragment_id) else {
+            return false;
+        };
+        let Some(node) = fragment.nodes().get(&node_id) else {
+            return false;
+        };
+        if !node.output.columns.contains(&key)
+            || values
+                .iter()
+                .any(|value| !node.output.columns.contains(value))
+        {
+            return false;
+        }
+        match &node.kind {
+            NodeKind::Project { expressions } if node.inputs.len() == 1 => {
+                let Some(input) = fragment.nodes().get(&node.inputs[0]) else {
+                    return false;
+                };
+                let identity = |value: ValueId| -> Option<ValueId> {
+                    if let Some((expr, _)) = expressions.iter().find(|(_, output)| *output == value)
+                    {
+                        crate::expression_value(fragment.expressions(), *expr)
+                    } else {
+                        input.output.columns.contains(&value).then_some(value)
+                    }
+                };
+                let Some(mapped_values) = values
+                    .iter()
+                    .map(|value| identity(*value))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                if let Some((expr, _)) = expressions.iter().find(|(_, output)| *output == key) {
+                    let Some(expression) = fragment.expressions().get(*expr) else {
+                        return false;
+                    };
+                    if let crate::ExprKind::FunctionCall { function, args } = &expression.kind {
+                        let argument_values = args
+                            .iter()
+                            .map(|arg| crate::expression_value(fragment.expressions(), *arg))
+                            .collect::<Option<Vec<_>>>();
+                        return function.function_id.as_str() == "builtin.scalar/mv_content_key/v1"
+                            && function.kind == novarocks_type_contract::FunctionKind::Scalar
+                            && function.volatility
+                                == novarocks_type_contract::FunctionVolatility::Immutable
+                            && function.argument_evaluation
+                                == novarocks_type_contract::FunctionArgumentEvaluation::Eager
+                            && function.failure_behavior
+                                == novarocks_type_contract::FunctionFailureBehavior::Propagate
+                            && function.intrinsic_row_error
+                                == novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+                            && !function.result_type.nullable
+                            && expression.ty == function.result_type
+                            && expression.ty.data_type == DataType::Binary
+                            && function.result_type.data_type == DataType::Binary
+                            && argument_values.as_ref() == Some(&mapped_values);
+                    }
+                }
+                let Some(mapped_key) = identity(key) else {
+                    return false;
+                };
+                key = mapped_key;
+                values = mapped_values;
+                node_id = node.inputs[0];
+            }
+            NodeKind::Filter { .. } | NodeKind::Sort { .. } | NodeKind::Limit { .. }
+                if node.inputs.len() == 1 =>
+            {
+                node_id = node.inputs[0];
+            }
+            NodeKind::ExchangeSource { edge, imports } => {
+                let Some(edge) = plan.edges().get(edge) else {
+                    return false;
+                };
+                if !matches!(
+                    edge.kind,
+                    crate::EdgeKind::Stream | crate::EdgeKind::PredicateFanout
+                ) || edge.destination.fragment != fragment_id
+                    || edge.destination.node != node_id
+                    || imports.as_ref() != edge.destination.receive_mapping.as_ref()
+                {
+                    return false;
+                }
+                let source = |value: ValueId| {
+                    imports.iter().find_map(|(source, destination)| {
+                        (*destination == value).then_some(*source)
+                    })
+                };
+                let Some(mapped_key) = source(key) else {
+                    return false;
+                };
+                let Some(mapped_values) = values
+                    .iter()
+                    .map(|value| source(*value))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                let Some(source_fragment) = plan.fragments().get(&edge.source.fragment) else {
+                    return false;
+                };
+                key = mapped_key;
+                values = mapped_values;
+                fragment_id = source_fragment.id();
+                node_id = source_fragment.root();
+            }
+            _ => return false,
+        }
+    }
+    false
 }

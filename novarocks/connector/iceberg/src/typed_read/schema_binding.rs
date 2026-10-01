@@ -1831,6 +1831,33 @@ mod tests {
         .expect("metadata column handle")
     }
 
+    #[test]
+    fn visible_bag_target_scan_projects_visible_fields_and_row_locators() {
+        let schema = table_schema();
+        let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(1)),
+            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, true)
+                .with_metadata(field_id_metadata(ICEBERG_RESERVED_FIELD_ID_ROW_ID)),
+        ]));
+        let columns = vec![
+            handle(&schema, 1),
+            metadata_handle(IcebergMetadataColumn::Path),
+            metadata_handle(IcebergMetadataColumn::RowPosition),
+        ];
+        let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
+            .expect("target visible tuple and physical locators");
+        assert_eq!(binding.physical_base_field_ids(), &[1]);
+        assert!(binding.requires_row_positions());
+        assert!(matches!(
+            binding.columns()[1].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::Path)
+        ));
+        assert!(matches!(
+            binding.columns()[2].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::RowPosition)
+        ));
+    }
+
     /// Whether a row-lineage column is stored is a fact of one file, and each
     /// column answers for itself. This file materializes `_row_id` and leaves
     /// `_last_updated_sequence_number` to inheritance, so only the first joins

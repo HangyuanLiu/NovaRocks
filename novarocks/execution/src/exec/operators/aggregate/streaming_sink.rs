@@ -369,7 +369,7 @@ impl AggregateStreamingSinkOperator {
         session.fail(reason)
     }
 
-    fn process(&mut self, chunk: Chunk) -> Result<(), String> {
+    fn process(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         if self.finished {
             return Ok(());
         }
@@ -444,6 +444,7 @@ impl AggregateStreamingSinkOperator {
                     &self.state_ptrs,
                     batch,
                     merge,
+                    Some(state),
                 )?;
             }
             return Ok(());
@@ -609,6 +610,7 @@ impl AggregateStreamingSinkOperator {
                     &self.state_ptrs,
                     batch,
                     merge,
+                    Some(state),
                 )?;
             }
             Ok(())
@@ -1077,7 +1079,7 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         let result = (|| {
             if self.finished {
                 return Ok(());
@@ -1088,7 +1090,7 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
                 );
             }
             let num_rows = chunk.len();
-            self.process(chunk)?;
+            self.process(state, chunk)?;
             self.topn_rf_rows_since_publish += num_rows;
             self.try_submit_native_topn_bound()?;
             Ok(())
@@ -1275,6 +1277,75 @@ mod retained_memory_tests {
             .set_finishing(&RuntimeState::default())
             .expect("finish streaming aggregate");
         state.poll_chunk().expect("streaming aggregate output")
+    }
+
+    #[test]
+    fn mv_weight_sum_driver_update_and_merge_publish_typed_failure() {
+        for merge in [false, true] {
+            let mut arena = ExprArena::default();
+            let input = arena.push_typed(ExprNode::SlotId(VALUE_SLOT), DataType::Int64);
+            let function = AggFunction {
+                name: "mv_weight_sum".into(),
+                inputs: vec![input],
+                input_is_intermediate: merge,
+                types: Some(AggTypeSignature {
+                    intermediate_type: Some(DataType::Int64),
+                    output_type: Some(DataType::Int64),
+                    input_arg_type: Some(DataType::Int64),
+                }),
+                order: Default::default(),
+            };
+            let function_set = empty_execution_function_set();
+            let selected = function_set
+                .catalog()
+                .resolve_aggregate_trusted("mv_weight_sum", &[DataType::Int64])
+                .unwrap();
+            let field = Field::new("weight", DataType::Int64, true);
+            let schema = Arc::new(
+                ChunkSchema::try_new(vec![
+                    ChunkSlotSchema::from_field(FINAL_SLOT, &field, None).unwrap(),
+                ])
+                .unwrap(),
+            );
+            let streaming = AggregateStreamingState::new(1);
+            let factory = AggregateStreamingSinkFactory::new_native(
+                1,
+                Arc::new(arena),
+                Vec::new(),
+                vec![function],
+                function_set,
+                vec![selected],
+                false,
+                schema,
+                streaming,
+                Vec::new(),
+                None,
+                1,
+            )
+            .unwrap();
+            let mut operator = factory.create(1, 0);
+            operator.prepare().unwrap();
+            let state = RuntimeState::default();
+            operator.bind_runtime_state(&state).unwrap();
+            let result = operator
+                .as_processor_mut()
+                .unwrap()
+                .push_chunk(&state, int64_chunk(VALUE_SLOT, [i64::MAX, 1]));
+            assert!(result.is_err());
+            assert_eq!(
+                state.error_state().task_failure().unwrap().category(),
+                novarocks_execution_contract::TaskFailureCategory::Execution
+            );
+            assert!(
+                state
+                    .error_state()
+                    .task_failure()
+                    .unwrap()
+                    .detail()
+                    .as_str()
+                    .contains("weight arithmetic overflow")
+            );
+        }
     }
 
     #[test]

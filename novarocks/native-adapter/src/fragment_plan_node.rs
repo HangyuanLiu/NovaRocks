@@ -2874,6 +2874,8 @@ pub fn validate_distributed_node_children(
                 plan::plan_node::Kind::Scan(_) => ("ScanNode", 0),
                 plan::plan_node::Kind::HashAggregate(_) => ("HashAggregateNode", 1),
                 plan::plan_node::Kind::HashJoin(_) => ("HashJoinNode", 2),
+                plan::plan_node::Kind::QuotaPreclaim(_) => ("QuotaPreclaimNode", 2),
+                plan::plan_node::Kind::QuotaTrim(_) => ("QuotaTrimNode", 2),
                 plan::plan_node::Kind::NestLoopJoin(_) => ("NestLoopJoinNode", 2),
                 plan::plan_node::Kind::Window(_) => ("WindowNode", 1),
                 plan::plan_node::Kind::Repeat(_) => ("RepeatNode", 1),

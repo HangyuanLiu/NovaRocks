@@ -56,6 +56,7 @@ pub(crate) struct FixtureHandle {
     next_fault: Arc<Mutex<NextFaultState>>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
     traffic: Arc<Mutex<TrafficCounters>>,
+    request_deadline: Arc<Mutex<Option<Instant>>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -67,6 +68,7 @@ pub(crate) struct FixtureControl {
     next_fault: Arc<Mutex<NextFaultState>>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
     traffic: Arc<Mutex<TrafficCounters>>,
+    deadline: Option<Instant>,
 }
 
 pub(crate) struct FixtureFaultGuard {
@@ -94,6 +96,7 @@ struct AppState {
     next_fault_sequence: Arc<AtomicU64>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
     traffic: Arc<Mutex<TrafficCounters>>,
+    request_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Cumulative traffic forwarded to the real REST Catalog. Fixture control
@@ -171,6 +174,7 @@ pub(crate) enum PublicationFault {
     AfterCommitHoldForFrontendKill,
     IncompleteDiscovery,
     CorruptPackage,
+    CorruptPackageUntilClear,
 }
 
 impl PublicationFault {
@@ -187,12 +191,15 @@ impl PublicationFault {
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
             Self::CorruptPackage => "corrupt-package",
+            Self::CorruptPackageUntilClear => "corrupt-package-until-clear",
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct ArmedNextFault {
+    target: Option<ExactTableTarget>,
+    deadline: Option<Instant>,
     arm_id: String,
     action: PublicationAction,
     fault: PublicationFault,
@@ -206,8 +213,16 @@ struct ConsumedNextFault {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ExactTableTarget {
+    namespace: String,
+    table: String,
+}
+
 #[derive(Deserialize, Serialize)]
 struct ArmNextFaultRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<ExactTableTarget>,
     action: PublicationAction,
     fault: PublicationFault,
 }
@@ -231,7 +246,9 @@ impl FixtureHandle {
         let next_fault = Arc::new(Mutex::new(NextFaultState::default()));
         let mutations = Arc::new(Mutex::new(BTreeMap::new()));
         let traffic = Arc::new(Mutex::new(TrafficCounters::default()));
+        let request_deadline = Arc::new(Mutex::new(None));
         let state = AppState {
+            request_deadline: Arc::clone(&request_deadline),
             downstream: downstream.trim_end_matches('/').to_string(),
             client: reqwest::Client::builder().no_proxy().build()?,
             next_fault: Arc::clone(&next_fault),
@@ -270,6 +287,7 @@ impl FixtureHandle {
             next_fault,
             mutations,
             traffic,
+            request_deadline,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -280,7 +298,22 @@ impl FixtureHandle {
     }
 
     pub(crate) fn control(&self) -> Result<FixtureControl> {
+        self.control_with_deadline(None)
+    }
+
+    pub(crate) fn control_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<FixtureControl> {
+        if let Some(deadline) = deadline {
+            let mut bound = self
+                .request_deadline
+                .lock()
+                .expect("publication deadline mutex");
+            *bound = Some(bound.map_or(deadline, |current| current.min(deadline)));
+        }
         Ok(FixtureControl {
+            deadline,
             uri: self.uri.clone(),
             client: reqwest::blocking::Client::builder().no_proxy().build()?,
             next_fault: Arc::clone(&self.next_fault),
@@ -305,18 +338,94 @@ impl FixtureControl {
     }
 
     pub(crate) fn arm_next(&self, action: &str, fault: &str) -> Result<FixtureFaultGuard> {
-        let action = parse_action(action)?;
-        let fault = parse_fault(fault)?;
+        self.arm_next_request(parse_action(action)?, parse_fault(fault)?, None)
+    }
+
+    pub(crate) fn arm_targeted(
+        &self,
+        action: &str,
+        fault: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<FixtureFaultGuard> {
+        self.arm_next_request(
+            parse_action(action)?,
+            parse_fault(fault)?,
+            Some(ExactTableTarget {
+                namespace: namespace.into(),
+                table: table.into(),
+            }),
+        )
+    }
+
+    pub(crate) fn arm_next_for_table(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<FixtureFaultGuard> {
+        self.arm_next_request(
+            PublicationAction::TableCommit,
+            PublicationFault::AfterCommitBeforeResponse,
+            Some(ExactTableTarget {
+                namespace: namespace.into(),
+                table: table.into(),
+            }),
+        )
+    }
+
+    fn bounded_request(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "publication fault control deadline expired"
+            );
+            Ok(request.timeout(remaining))
+        } else {
+            Ok(request)
+        }
+    }
+
+    fn arm_next_request(
+        &self,
+        action: PublicationAction,
+        fault: PublicationFault,
+        target: Option<ExactTableTarget>,
+    ) -> Result<FixtureFaultGuard> {
         let response: ArmNextFaultResponse = self
-            .client
-            .post(format!("{}/_fixture/publication-faults/next", self.uri))
-            .json(&ArmNextFaultRequest { action, fault })
+            .bounded_request(
+                self.client
+                    .post(format!("{}/_fixture/publication-faults/next", self.uri))
+                    .json(&ArmNextFaultRequest {
+                        action,
+                        fault,
+                        target,
+                    }),
+            )?
             .send()
             .context("arm publication catalog next-action fault")?
             .error_for_status()
             .context("publication catalog next-action fault was rejected")?
             .json()
             .context("decode publication catalog next-action fault receipt")?;
+        // The proxy and its control run in this same runner process. Install
+        // the exact monotonic deadline, never reconstruct it from wall time.
+        if let Some(armed) = self
+            .next_fault
+            .lock()
+            .expect("publication fault mutex")
+            .armed
+            .as_mut()
+            .filter(|armed| armed.arm_id == response.arm_id)
+        {
+            armed.deadline = self.deadline.or_else(|| {
+                (fault == PublicationFault::CorruptPackageUntilClear)
+                    .then(|| Instant::now() + Duration::from_secs(30))
+            });
+        }
         Ok(FixtureFaultGuard {
             control: self.clone(),
             arm_id: response.arm_id,
@@ -327,11 +436,10 @@ impl FixtureControl {
 
     fn clear_arm(&self, arm_id: &str) -> Result<bool> {
         let response: ClearNextFaultResponse = self
-            .client
-            .delete(format!(
+            .bounded_request(self.client.delete(format!(
                 "{}/_fixture/publication-faults/next/{arm_id}",
                 self.uri
-            ))
+            )))?
             .send()
             .context("clear publication catalog next-action fault")?
             .error_for_status()
@@ -424,11 +532,40 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
         }
         "incomplete-discovery" => Ok(PublicationFault::IncompleteDiscovery),
         "corrupt-package" => Ok(PublicationFault::CorruptPackage),
+        "corrupt-package-until-clear" => Ok(PublicationFault::CorruptPackageUntilClear),
         other => anyhow::bail!("unknown publication catalog fault `{other}`"),
     }
 }
 
 impl FixtureFaultGuard {
+    pub(crate) fn bound_window(&mut self, deadline: Instant) -> Result<()> {
+        anyhow::ensure!(
+            self.fault == PublicationFault::CorruptPackageUntilClear,
+            "only persistent corruption has a window deadline"
+        );
+        anyhow::ensure!(
+            deadline > Instant::now(),
+            "corruption window deadline expired"
+        );
+        let deadline = self
+            .control
+            .deadline
+            .map_or(deadline, |bound| bound.min(deadline));
+        self.control.deadline = Some(deadline);
+        let mut next = self
+            .control
+            .next_fault
+            .lock()
+            .expect("publication fault mutex");
+        let armed = next
+            .armed
+            .as_mut()
+            .filter(|armed| armed.arm_id == self.arm_id)
+            .context("persistent corruption arm is missing")?;
+        armed.deadline = Some(deadline);
+        Ok(())
+    }
+
     pub(crate) fn wait_until_entered(&self, deadline: Instant) -> Result<()> {
         self.control.wait_until_entered(&self.arm_id, deadline)
     }
@@ -445,12 +582,29 @@ impl FixtureFaultGuard {
         if self.cleared {
             return Ok(true);
         }
-        let entered = self.control.clear_arm(&self.arm_id)?;
+        let entered = if self.fault == PublicationFault::CorruptPackageUntilClear {
+            // Release remains possible after the injection deadline. It only
+            // clears the exact token and cannot extend the corruption window.
+            let mut cleanup = self.control.clone();
+            cleanup.deadline = Some(Instant::now() + Duration::from_secs(5));
+            cleanup.clear_arm(&self.arm_id)?
+        } else {
+            self.control.clear_arm(&self.arm_id)?
+        };
         self.cleared = true;
         Ok(entered)
     }
 
-    pub(crate) fn finish(mut self) -> Result<FixtureFaultEvidence> {
+    pub(crate) fn finish(self) -> Result<FixtureFaultEvidence> {
+        self.finish_before(Instant::now() + Duration::from_secs(5))
+    }
+
+    pub(crate) fn finish_before(mut self, deadline: Instant) -> Result<FixtureFaultEvidence> {
+        self.control.deadline = Some(
+            self.control
+                .deadline
+                .map_or(deadline, |bound| bound.min(deadline)),
+        );
         let entered = self.release()?;
         if !entered {
             anyhow::bail!(
@@ -474,13 +628,12 @@ impl FixtureFaultGuard {
                 "response-held-after-downstream-success"
             }
             PublicationFault::IncompleteDiscovery => "discovery-response-replaced",
-            PublicationFault::CorruptPackage => "package-response-corrupted",
+            PublicationFault::CorruptPackage | PublicationFault::CorruptPackageUntilClear => {
+                "package-response-corrupted"
+            }
         };
-        self.control.wait_for_trace_event(
-            &self.arm_id,
-            terminal_event,
-            Instant::now() + Duration::from_secs(5),
-        )?;
+        self.control
+            .wait_for_trace_event(&self.arm_id, terminal_event, deadline)?;
         Ok(FixtureFaultEvidence {
             events: self.control.trace_events(&self.arm_id),
         })
@@ -511,6 +664,7 @@ pub(crate) async fn serve(config: FixtureConfig) -> Result<()> {
         .await
         .context("bind publication catalog fixture listener")?;
     let state = AppState {
+        request_deadline: Arc::new(Mutex::new(None)),
         downstream: config.downstream.trim_end_matches('/').to_string(),
         client: reqwest::Client::builder().no_proxy().build()?,
         next_fault: Arc::new(Mutex::new(NextFaultState::default())),
@@ -547,6 +701,32 @@ async fn arm_next_fault(
     State(state): State<AppState>,
     Json(request): Json<ArmNextFaultRequest>,
 ) -> Response {
+    if let Some(target) = &request.target {
+        if !matches!(
+            request.action,
+            PublicationAction::TableCommit | PublicationAction::TableLoad
+        ) || [&target.namespace, &target.table].iter().any(|part| {
+            part.is_empty()
+                || part.len() > 512
+                || part.contains('/')
+                || part.chars().any(char::is_control)
+        }) {
+            return wire_error(
+                StatusCode::BAD_REQUEST,
+                "fixture-target",
+                "exact table fault target is invalid",
+            );
+        }
+    }
+    if request.fault == PublicationFault::CorruptPackageUntilClear
+        && (request.action != PublicationAction::TableLoad || request.target.is_none())
+    {
+        return wire_error(
+            StatusCode::BAD_REQUEST,
+            "fixture-target",
+            "persistent corruption requires an exact table-load target",
+        );
+    }
     let arm_id = format!(
         "publication-fault-{}",
         state.next_fault_sequence.fetch_add(1, Ordering::Relaxed)
@@ -560,6 +740,9 @@ async fn arm_next_fault(
         );
     }
     next.armed = Some(ArmedNextFault {
+        target: request.target,
+        deadline: (request.fault == PublicationFault::CorruptPackageUntilClear)
+            .then(|| Instant::now() + Duration::from_secs(30)),
         arm_id: arm_id.clone(),
         action: request.action,
         fault: request.fault,
@@ -574,15 +757,18 @@ async fn clear_next_fault(
     AxumPath(arm_id): AxumPath<String>,
 ) -> Response {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
-    let entered = match next.status.as_ref() {
-        Some(status) if status.arm_id == arm_id => status.entered,
-        None => {
-            return wire_error(
-                StatusCode::NOT_FOUND,
-                "fixture-token",
-                "publication catalog fault token is unknown",
-            );
-        }
+    let (entered, release) = match next.status.as_ref() {
+        Some(status) if status.arm_id == arm_id => (status.entered, Arc::clone(&status.release)),
+        None => match next.armed.as_ref().filter(|armed| armed.arm_id == arm_id) {
+            Some(armed) => (false, Arc::clone(&armed.release)),
+            None => {
+                return wire_error(
+                    StatusCode::NOT_FOUND,
+                    "fixture-token",
+                    "publication catalog fault token is unknown",
+                );
+            }
+        },
         Some(_) => {
             return wire_error(
                 StatusCode::NOT_FOUND,
@@ -591,12 +777,6 @@ async fn clear_next_fault(
             );
         }
     };
-    let release = next
-        .status
-        .as_ref()
-        .expect("checked publication fault status")
-        .release
-        .clone();
     record_fault_event_locked(&mut next, &arm_id, "control-release");
     next.status = None;
     if next
@@ -613,13 +793,51 @@ async fn clear_next_fault(
 
 async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES).await {
+    let body_deadline = *state
+        .request_deadline
+        .lock()
+        .expect("publication deadline mutex");
+    let read_body = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES);
+    let body_result = if let Some(deadline) = body_deadline {
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read_body).await {
+            Ok(result) => result,
+            Err(_) => return temporary_failure("publication proxy request body deadline expired"),
+        }
+    } else {
+        read_body.await
+    };
+    let bytes = match body_result {
         Ok(bytes) => bytes,
         Err(error) => return temporary_failure(error.to_string()),
     };
     let action = standard_catalog_action(&parts.method, parts.uri.path(), &bytes);
     let mutation_target = mutation_target(&parts.method, action, parts.uri.path(), &bytes);
-    let fault = action.and_then(|action| take_matching_fault(&state, action));
+    let read_target = if action == Some(PublicationAction::TableLoad) {
+        exact_table_path(parts.uri.path())
+    } else {
+        None
+    };
+    let fault = action.and_then(|action| {
+        take_matching_fault(
+            &state,
+            action,
+            read_target.or_else(|| {
+                mutation_target
+                    .as_ref()
+                    .map(|(_, namespace, table)| (namespace.as_str(), table.as_str()))
+            }),
+        )
+    });
+    if let Some(armed) = fault.as_ref()
+        && armed.target.is_some()
+    {
+        // The standard path is bounded and contains no credentials or query parameters.
+        record_fault_event(
+            &state,
+            armed,
+            &format!("matched-path={:.2048}", parts.uri.path()),
+        );
+    }
     if let Some(armed) = fault.as_ref()
         && armed.fault == PublicationFault::BeforeDispatch
     {
@@ -650,8 +868,15 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     let method = parts.method.clone();
     let request_body_bytes = bytes.len() as u64;
     let forwarded_at = Instant::now();
-    let (response, response_body_bytes) =
-        proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    let (response, response_body_bytes) = proxy_request(
+        &state,
+        parts.method,
+        parts.uri,
+        parts.headers,
+        bytes,
+        fault.as_ref().and_then(|armed| armed.deadline),
+    )
+    .await;
     let roundtrip_nanos = u64::try_from(forwarded_at.elapsed().as_nanos())
         .expect("catalog request duration exceeds u64 nanoseconds");
     record_traffic(
@@ -699,7 +924,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                 record_fault_event(&state, &armed, "discovery-response-replaced");
                 return temporary_failure("catalog discovery read failed");
             }
-            PublicationFault::CorruptPackage => {
+            PublicationFault::CorruptPackage | PublicationFault::CorruptPackageUntilClear => {
                 record_fault_event(&state, &armed, "package-response-corrupted");
                 return response_with_headers(
                     StatusCode::OK,
@@ -804,22 +1029,53 @@ fn record_mutation(
     }
 }
 
-fn take_matching_fault(state: &AppState, action: PublicationAction) -> Option<ArmedNextFault> {
-    let mut next = state.next_fault.lock().expect("publication fault mutex");
-    let armed = next.armed.as_ref()?;
-    if armed.action != action {
+fn exact_table_path(path: &str) -> Option<(&str, &str)> {
+    let remainder = path.split_once("/v1/namespaces/")?.1;
+    let (namespace, table) = remainder.split_once("/tables/")?;
+    if namespace.is_empty() || table.is_empty() || namespace.contains('/') || table.contains('/') {
         return None;
     }
-    // Consume the arm before the request is dispatched. In particular, a
-    // definite OCC conflict may cause the product to issue one fresh attempt;
-    // that second standard request must not re-enter this one-shot hold.
-    let armed = next.armed.take().expect("matching arm exists");
+    Some((namespace, table))
+}
+
+fn take_matching_fault(
+    state: &AppState,
+    action: PublicationAction,
+    target: Option<(&str, &str)>,
+) -> Option<ArmedNextFault> {
+    let mut next = state.next_fault.lock().expect("publication fault mutex");
+    let armed = next.armed.as_ref()?;
+    if armed
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+        || armed.action != action
+        || armed.target.as_ref().is_some_and(|expected| {
+            target != Some((expected.namespace.as_str(), expected.table.as_str()))
+        })
+    {
+        return None;
+    }
+    // Ordinary faults consume before dispatch, so a fresh OCC attempt cannot
+    // re-enter a one-shot hold. The bounded corruption window alone retains
+    // its exact target until explicit release or its deadline.
+    let armed = if armed.fault == PublicationFault::CorruptPackageUntilClear {
+        armed.clone()
+    } else {
+        next.armed.take().expect("matching arm exists")
+    };
     next.status = Some(ConsumedNextFault {
         arm_id: armed.arm_id.clone(),
         entered: true,
         release: Arc::clone(&armed.release),
     });
     record_fault_event_locked(&mut next, &armed.arm_id, "matched");
+    if let Some(target) = &armed.target {
+        record_fault_event_locked(
+            &mut next,
+            &armed.arm_id,
+            &format!("matched-target={}.{}", target.namespace, target.table),
+        );
+    }
     Some(armed)
 }
 
@@ -870,6 +1126,7 @@ async fn proxy_request(
     uri: axum::http::Uri,
     headers: HeaderMap,
     bytes: Bytes,
+    deadline: Option<Instant>,
 ) -> (Response, u64) {
     let url = format!(
         "{}{}",
@@ -879,6 +1136,24 @@ async fn proxy_request(
             .unwrap_or("/")
     );
     let mut outbound = state.client.request(method, url).body(bytes);
+    let shared_deadline = *state
+        .request_deadline
+        .lock()
+        .expect("publication deadline mutex");
+    let deadline = match (deadline, shared_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (
+                temporary_failure("publication fault downstream deadline expired"),
+                0,
+            );
+        }
+        outbound = outbound.timeout(remaining);
+    }
     for (name, value) in &headers {
         if name != axum::http::header::HOST && name != axum::http::header::CONTENT_LENGTH {
             outbound = outbound.header(name, value);
@@ -1030,10 +1305,13 @@ mod tests {
     #[test]
     fn one_shot_fault_only_consumes_its_matching_standard_action() {
         let state = AppState {
+            request_deadline: Arc::new(Mutex::new(None)),
             downstream: "http://example.invalid".to_string(),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             next_fault: Arc::new(Mutex::new(NextFaultState {
                 armed: Some(ArmedNextFault {
+                    target: None,
+                    deadline: None,
                     arm_id: "one".to_string(),
                     action: PublicationAction::TableCommit,
                     fault: PublicationFault::AfterCommitBeforeResponse,
@@ -1046,12 +1324,12 @@ mod tests {
             mutations: Arc::new(Mutex::new(BTreeMap::new())),
             traffic: Arc::new(Mutex::new(TrafficCounters::default())),
         };
-        assert!(take_matching_fault(&state, PublicationAction::StageCreate).is_none());
-        let consumed = take_matching_fault(&state, PublicationAction::TableCommit)
+        assert!(take_matching_fault(&state, PublicationAction::StageCreate, None).is_none());
+        let consumed = take_matching_fault(&state, PublicationAction::TableCommit, None)
             .expect("matching fault is consumed");
         assert_eq!(consumed.arm_id, "one");
         assert_eq!(consumed.fault, PublicationFault::AfterCommitBeforeResponse);
-        assert!(take_matching_fault(&state, PublicationAction::TableCommit).is_none());
+        assert!(take_matching_fault(&state, PublicationAction::TableCommit, None).is_none());
         let trace = &state.next_fault.lock().unwrap().trace;
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].sequence, 1);
@@ -1125,5 +1403,225 @@ mod tests {
             "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> response-dropped-after-downstream-success -> control-release"
         );
         downstream.join().unwrap();
+    }
+    #[test]
+    fn exact_table_fault_does_not_consume_another_real_rest_commit() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let downstream = std::thread::spawn(move || {
+            for table in ["other", "owned"] {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(stream) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "downstream acceptance deadline expired"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept downstream: {error}"),
+                    }
+                };
+                // Darwin inherits the listener's nonblocking flag on accept.
+                // A bounded blocking socket must wait for the real HTTP bytes.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 1024];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "downstream request closed before its body");
+                    request.extend_from_slice(&buffer[..read]);
+                    assert!(
+                        request.len() <= 4096,
+                        "downstream request exceeds test bound"
+                    );
+                    if let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .expect("test request must declare its body length");
+                        if request.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    String::from_utf8_lossy(&request)
+                        .contains(&format!("POST /v1/namespaces/ns/tables/{table}"))
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+            }
+        });
+        let fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let control = fixture.control_with_deadline(Some(deadline)).unwrap();
+        let guard = control.arm_next_for_table("ns", "owned").unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for (table, expected) in [
+            ("other", StatusCode::OK),
+            ("owned", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = client
+                .post(format!("{}/v1/namespaces/ns/tables/{table}", fixture.uri()))
+                .json(&json!({"requirements":[],"updates":[]}))
+                .send()
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if table == "other" {
+                assert!(control.next_fault.lock().unwrap().armed.is_some());
+            }
+        }
+        let evidence = guard.finish_before(deadline).unwrap().summary();
+        assert!(evidence.contains("matched-target=ns.owned"));
+        assert!(!evidence.contains("ns.other"));
+        assert_eq!(
+            control
+                .mutation_counts("ns", "owned")
+                .table_commit_succeeded,
+            1
+        );
+        assert_eq!(
+            control
+                .mutation_counts("ns", "other")
+                .table_commit_succeeded,
+            1
+        );
+        downstream.join().unwrap();
+    }
+
+    #[test]
+    fn targeted_corruption_window_repeats_and_clear_restores_the_exact_table() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let downstream = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..read])
+                        .contains("GET /v1/namespaces/ns/tables/")
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+            }
+        });
+        let fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let mut guard = control
+            .arm_targeted("table-load", "corrupt-package-until-clear", "ns", "owned")
+            .unwrap();
+        guard
+            .bound_window(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for (table, body) in [
+            ("other", "{}"),
+            ("owned", "{corrupt-package"),
+            ("owned", "{corrupt-package"),
+        ] {
+            let response = client
+                .get(format!("{}/v1/namespaces/ns/tables/{table}", fixture.uri()))
+                .send()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.text().unwrap(), body);
+            assert!(control.next_fault.lock().unwrap().armed.is_some());
+        }
+        let evidence = guard.finish().unwrap().summary();
+        assert_eq!(evidence.matches("package-response-corrupted").count(), 2);
+        assert_eq!(
+            evidence
+                .matches("matched-path=/v1/namespaces/ns/tables/owned")
+                .count(),
+            2
+        );
+        assert!(!evidence.contains("matched-path=/v1/namespaces/ns/tables/other"));
+        assert_eq!(
+            client
+                .get(format!("{}/v1/namespaces/ns/tables/owned", fixture.uri()))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "{}"
+        );
+        downstream.join().unwrap();
+    }
+
+    #[test]
+    fn unconsumed_or_expired_corruption_window_is_released_without_forged_consumption() {
+        let fixture = FixtureHandle::start("http://example.invalid".into()).unwrap();
+        let control = fixture.control().unwrap();
+        let mut guard = control
+            .arm_targeted("table-load", "corrupt-package-until-clear", "ns", "owned")
+            .unwrap();
+        guard.control.deadline = Some(Instant::now());
+        {
+            let mut next = control.next_fault.lock().unwrap();
+            next.armed.as_mut().unwrap().deadline = Some(Instant::now());
+        }
+        assert!(
+            take_matching_fault(
+                &AppState {
+                    downstream: "http://example.invalid".into(),
+                    client: reqwest::Client::new(),
+                    next_fault: Arc::clone(&control.next_fault),
+                    next_fault_sequence: Arc::new(AtomicU64::new(1)),
+                    mutations: Arc::clone(&control.mutations),
+                    traffic: Arc::clone(&control.traffic),
+                    request_deadline: Arc::clone(&fixture.request_deadline),
+                },
+                PublicationAction::TableLoad,
+                Some(("ns", "owned"))
+            )
+            .is_none()
+        );
+        assert!(guard.finish().is_err());
+        assert!(control.next_fault.lock().unwrap().armed.is_none());
+        assert!(control.next_fault.lock().unwrap().status.is_none());
+    }
+
+    #[test]
+    fn expired_control_deadline_cannot_arm_a_fault() {
+        let fixture = FixtureHandle::start("http://example.invalid".into()).unwrap();
+        let control = fixture.control_with_deadline(Some(Instant::now())).unwrap();
+        assert!(control.arm_next_for_table("ns", "owned").is_err());
+        assert!(control.next_fault.lock().unwrap().armed.is_none());
     }
 }

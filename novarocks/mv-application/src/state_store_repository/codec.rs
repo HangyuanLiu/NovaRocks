@@ -166,6 +166,7 @@ struct MvAcceleratorSourceRevisionAvro {
     publication_revision: Option<String>,
     publication_output_version: Option<MvAcceleratorCommittedVersionRevisionAvro>,
     configuration_revision: String,
+    eligibility_revision: Option<String>,
     deployment_owner: String,
     process_incarnation: String,
 }
@@ -206,6 +207,10 @@ impl From<&MvAcceleratorSourceRevision> for MvAcceleratorSourceRevisionAvro {
                 .map(|revision| hex::encode(revision.as_bytes())),
             publication_output_version: value.publication_output_version.as_ref().map(Into::into),
             configuration_revision: hex::encode(value.configuration_revision.as_bytes()),
+            eligibility_revision: value
+                .eligibility_revision
+                .as_ref()
+                .map(|revision| hex::encode(revision.as_bytes())),
             deployment_owner: value.deployment_owner.as_str().to_string(),
             process_incarnation: value.process_incarnation.as_str().to_string(),
         }
@@ -246,6 +251,11 @@ impl TryFrom<MvAcceleratorSourceRevisionAvro> for MvAcceleratorSourceRevision {
                 &value.configuration_revision,
                 "configuration revision",
             )?,
+            eligibility_revision: value
+                .eligibility_revision
+                .as_deref()
+                .map(|revision| decode_document_revision(revision, "eligibility revision"))
+                .transpose()?,
             deployment_owner: DeploymentOwner::parse(&value.deployment_owner)
                 .map_err(|error| format!("decode MV Accelerator deployment owner: {error}"))?,
             process_incarnation: ProcessIncarnation::parse(&value.process_incarnation)
@@ -402,6 +412,72 @@ pub fn decode_projection(
     })
 }
 
+pub(crate) fn decode_drop_projection(
+    key: &Key,
+    value: &Value,
+) -> Result<
+    DecodedMvRecord<(
+        i64,
+        crate::product::MvTarget,
+        MvAcceleratorSourceRevision,
+        crate::persistence::codec::DefinitionDocument,
+    )>,
+    String,
+> {
+    let decoded: DecodedMvRecord<StoredMvProjectionAvro> = decode_record(key, value)?;
+    let raw = decoded.value;
+    if super::key::projection_by_id_key(raw.mv_id)? != *key {
+        return Err("DROP root ID differs from its canonical key".into());
+    }
+    if raw.mv_id <= 0 || raw.publication.is_some() != raw.output_version.is_some() {
+        return Err("invalid DROP Accelerator root identity/publication presence".into());
+    }
+    let (definition, _, _, object) = crate::persistence::documents::decode_drop_document_bodies(
+        &raw.definition,
+        &raw.interpretation,
+        raw.publication.as_ref().map(|p| p.as_ref()),
+        &raw.configuration,
+        PersistenceDecodeBudget::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let source: MvAcceleratorSourceRevision = raw.source_revision.try_into()?;
+    let metadata: ConnectorCommittedVersion = raw.metadata_version.try_into()?;
+    let output = raw
+        .output_version
+        .map(ConnectorCommittedVersion::try_from)
+        .transpose()?;
+    if source.definition_revision != DocumentRevision::from_canonical_bytes(&raw.definition)
+        || source.interpretation_revision
+            != DocumentRevision::from_canonical_bytes(&raw.interpretation)
+        || source.configuration_revision
+            != DocumentRevision::from_canonical_bytes(&raw.configuration)
+        || source.publication_revision
+            != raw
+                .publication
+                .as_ref()
+                .map(|p| DocumentRevision::from_canonical_bytes(p))
+        || source.target_object_id.as_bytes().as_ref() != object.as_bytes()
+        || source.metadata_version
+            != MvAcceleratorCommittedVersionRevision::from_committed(&metadata)
+        || source.publication_output_version
+            != output
+                .as_ref()
+                .map(MvAcceleratorCommittedVersionRevision::from_committed)
+    {
+        return Err("DROP Accelerator exact source revision differs from its document root".into());
+    }
+    let target = crate::product::MvTarget::try_new(
+        Some(source.target.instance_id.as_str().into()),
+        source.target.namespace.to_string(),
+        source.target.table.to_string(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(DecodedMvRecord {
+        operation_id: decoded.operation_id,
+        value: (raw.mv_id, target, source, definition),
+    })
+}
+
 pub fn encode_record<T>(kind: MvRecordKind, operation_id: Uuid, value: &T) -> Result<Value, String>
 where
     T: Serialize,
@@ -538,3 +614,39 @@ where
 #[cfg(test)]
 #[path = "codec_tests.rs"]
 mod codec_tests;
+
+/// A historical root fixture bypasses only encoding; production decoding stays strict.
+#[cfg(test)]
+pub(super) fn encode_retired_projection_for_test(
+    operation: Uuid,
+    projection: &StoredMvProjection,
+) -> Value {
+    use prost::Message;
+    let mut raw = StoredMvProjectionAvro::try_from(projection).unwrap();
+    let mut l =
+        crate::persistence::generated::InterpretationDocument::decode(raw.interpretation.as_ref())
+            .unwrap();
+    l.aggregates.clear();
+    l.state_slots.clear();
+    l.branches.clear();
+    l.target
+        .as_mut()
+        .unwrap()
+        .fields
+        .retain(|field| field.kind != Some(2));
+    l.apply_key = Some(crate::persistence::generated::ApplyKey {
+        kind: Some(1),
+        components: vec![],
+    });
+    raw.interpretation = serde_bytes::ByteBuf::from(l.encode_to_vec());
+    let l_revision = DocumentRevision::from_canonical_bytes(&raw.interpretation);
+    raw.source_revision.interpretation_revision = hex::encode(l_revision.as_bytes());
+    if let Some(bytes) = &raw.publication {
+        let mut p = decode_publication(bytes, PersistenceDecodeBudget::default()).unwrap();
+        p.interpretation_revision = l_revision;
+        let encoded = encode_publication(&p).unwrap();
+        raw.source_revision.publication_revision = Some(hex::encode(encoded.revision().as_bytes()));
+        raw.publication = Some(serde_bytes::ByteBuf::from(encoded.into_bytes()));
+    }
+    encode_record(MvRecordKind::Projection, operation, &raw).unwrap()
+}

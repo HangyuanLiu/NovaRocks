@@ -36,7 +36,7 @@ use crate::exec::pipeline::operator::{
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
-use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::UniqueId;
@@ -59,6 +59,9 @@ pub struct SplitDataStreamSinkFactory {
 }
 
 impl SplitDataStreamSinkFactory {
+    pub fn validate_predicate(arena: &ExprArena, root: ExprId) -> Result<(), String> {
+        bounded_predicate_nodes(arena, root).map(|_| ())
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         sinks: Vec<DataStreamSinkFactoryInput>,
@@ -103,6 +106,11 @@ impl SplitDataStreamSinkFactory {
             }
         }
 
+        if fanout && init_error.is_none() {
+            init_error = split_exprs
+                .iter()
+                .find_map(|expr| Self::validate_predicate(&split_arena, *expr).err());
+        }
         Self {
             name,
             init_error,
@@ -182,6 +190,7 @@ struct SplitDataStreamSinkOperator {
     fanout: bool,
     sinks: Vec<InnerSinkRuntime>,
     finishing: bool,
+    scratch_tracker: Option<Arc<MemTracker>>,
     sink_observable: Arc<Observable>,
 }
 
@@ -212,6 +221,7 @@ impl SplitDataStreamSinkOperator {
             fanout,
             sinks,
             finishing: false,
+            scratch_tracker: None,
             sink_observable,
         }
     }
@@ -223,6 +233,7 @@ impl Operator for SplitDataStreamSinkOperator {
     }
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.scratch_tracker = Some(Arc::clone(&tracker));
         for sink in &mut self.sinks {
             sink.op.set_mem_tracker(Arc::clone(&tracker));
         }
@@ -242,6 +253,9 @@ impl Operator for SplitDataStreamSinkOperator {
     }
 
     fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if let Some(error) = &self.init_error {
+            return Err(error.clone());
+        }
         for sink in &mut self.sinks {
             sink.op.activate(state)?;
         }
@@ -334,6 +348,45 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
             return Ok(());
         }
         if chunk.is_empty() || self.sinks.is_empty() {
+            return Ok(());
+        }
+
+        if self.fanout {
+            if self.split_exprs.len() != self.sinks.len() {
+                return Err("fanout predicates differ from branch count".into());
+            }
+            let tracker = self.scratch_tracker.as_ref().ok_or_else(|| {
+                "predicate fanout requires an exact task memory tracker".to_string()
+            })?;
+            // Allocate only one branch's mask and filtered batch at a time. The
+            // branch retains its output under its own exchange accounting.
+            for (sink, expr) in self.sinks.iter_mut().zip(&self.split_exprs) {
+                let nodes = bounded_predicate_nodes(&self.split_arena, *expr)?;
+                let bytes = chunk
+                    .len()
+                    .checked_mul(nodes)
+                    .and_then(|n| n.checked_mul(40))
+                    .and_then(|n| n.checked_add(chunk.estimated_bytes()))
+                    .ok_or_else(|| {
+                        state.fail_task(
+                            novarocks_execution_contract::TaskFailure::capacity_refused(
+                                novarocks_execution_contract::SafeDetail::truncating(
+                                    "predicate fanout scratch",
+                                ),
+                                u64::MAX,
+                                i64::MAX as u64,
+                            ),
+                        )
+                    })?;
+                let _scratch = TrackedBytes::try_new(bytes, Arc::clone(tracker))?;
+                let mask = eval_split_mask(&self.split_arena, *expr, &chunk)?;
+                if let Some(part) = filter_chunk_by_mask(&chunk, &mask)? {
+                    sink.op
+                        .as_processor_mut()
+                        .ok_or_else(|| "fanout branch is not a processor".to_string())?
+                        .push_chunk(state, part)?;
+                }
+            }
             return Ok(());
         }
 
@@ -813,4 +866,224 @@ mod tests {
         assert!(!op.finishing_wait().is_pending());
         assert!(op.is_finished());
     }
+    struct RecordingFanoutSink {
+        rows: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        ready: Arc<AtomicBool>,
+        finishes: Arc<std::sync::atomic::AtomicUsize>,
+        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+        finished: bool,
+    }
+    impl Operator for RecordingFanoutSink {
+        fn name(&self) -> &str {
+            "recording fanout"
+        }
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+    impl ProcessorOperator for RecordingFanoutSink {
+        fn need_input(&self) -> bool {
+            self.ready.load(Ordering::Acquire) && !self.finished
+        }
+        fn has_output(&self) -> bool {
+            false
+        }
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            assert!(
+                self.tracker.current() > 0,
+                "scratch must stay accounted through branch handoff"
+            );
+            let ids = chunk
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .unwrap();
+            self.rows
+                .lock()
+                .unwrap()
+                .extend(ids.iter().map(|id| id.unwrap().to_vec()));
+            Ok(())
+        }
+        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+            if !self.finished {
+                self.finished = true;
+                self.finishes.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(())
+        }
+    }
+    fn fanout_fixture(
+        limit: i64,
+    ) -> (
+        SplitDataStreamSinkOperator,
+        RuntimeState,
+        Chunk,
+        Vec<Arc<std::sync::Mutex<Vec<Vec<u8>>>>>,
+        Vec<Arc<AtomicBool>>,
+        Vec<Arc<std::sync::atomic::AtomicUsize>>,
+    ) {
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("fanout task");
+        tracker.install_limit_once(limit).unwrap();
+        let state = RuntimeState::new(None, None, None, None, None, Some(tracker.clone()), None);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("positive", DataType::Boolean, false),
+            Field::new("entry_id", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BooleanArray::from(vec![true, false])),
+                Arc::new(arrow::array::BinaryArray::from(vec![
+                    b"positive".as_slice(),
+                    b"negative".as_slice(),
+                ])),
+            ],
+        )
+        .unwrap();
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &schema,
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let mut arena = ExprArena::default();
+        let positive = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Boolean);
+        let negative = arena.push_typed(ExprNode::Not(positive), DataType::Boolean);
+        let rows = (0..3)
+            .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+            .collect::<Vec<_>>();
+        let ready = (0..3)
+            .map(|_| Arc::new(AtomicBool::new(true)))
+            .collect::<Vec<_>>();
+        let finishes = (0..3)
+            .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let sinks = (0..3)
+            .map(|i| InnerSinkRuntime {
+                op: Box::new(RecordingFanoutSink {
+                    rows: rows[i].clone(),
+                    ready: ready[i].clone(),
+                    finishes: finishes[i].clone(),
+                    tracker: tracker.clone(),
+                    finished: false,
+                }),
+            })
+            .collect();
+        let mut op = SplitDataStreamSinkOperator::new(
+            "fanout".into(),
+            None,
+            Arc::new(arena),
+            vec![positive, negative, negative],
+            true,
+            sinks,
+        );
+        op.set_mem_tracker(tracker);
+        (op, state, chunk, rows, ready, finishes)
+    }
+    #[test]
+    fn predicate_fanout_shares_materialized_ids_and_obeys_all_branch_backpressure() {
+        let (mut op, state, chunk, rows, ready, finishes) = fanout_fixture(1 << 20);
+        ready[2].store(false, Ordering::Release);
+        assert!(!op.need_input());
+        ready[2].store(true, Ordering::Release);
+        assert!(op.need_input());
+        op.push_chunk(&state, chunk).unwrap();
+        assert_eq!(*rows[0].lock().unwrap(), vec![b"positive".to_vec()]);
+        assert_eq!(*rows[1].lock().unwrap(), vec![b"negative".to_vec()]);
+        assert_eq!(*rows[1].lock().unwrap(), *rows[2].lock().unwrap());
+        assert_eq!(state.mem_tracker().unwrap().current(), 0);
+        op.set_finishing(&state).unwrap();
+        op.set_finishing(&state).unwrap();
+        assert!(op.is_finished());
+        for count in finishes {
+            assert_eq!(count.load(Ordering::Acquire), 1);
+        }
+    }
+    #[test]
+    fn predicate_fanout_refuses_capacity_before_filter_and_rolls_back() {
+        let (mut op, state, chunk, rows, _, _) = fanout_fixture(1);
+        assert!(op.push_chunk(&state, chunk).is_err());
+        assert!(rows.iter().all(|rows| rows.lock().unwrap().is_empty()));
+        assert_eq!(state.mem_tracker().unwrap().current(), 0);
+        assert!(matches!(
+            state.error_state().task_failure().unwrap().category(),
+            novarocks_execution_contract::TaskFailureCategory::CapacityRefused { .. }
+        ));
+    }
+    #[test]
+    fn predicate_fanout_requires_installed_task_accounting() {
+        let (mut op, state, chunk, rows, _, _) = fanout_fixture(1 << 20);
+        op.scratch_tracker = None;
+        assert!(op.push_chunk(&state, chunk).is_err());
+        assert!(rows.iter().all(|rows| rows.lock().unwrap().is_empty()));
+        assert_eq!(state.mem_tracker().unwrap().current(), 0);
+    }
+    #[test]
+    fn predicate_fanout_empty_branches_still_close_once() {
+        let (mut op, state, _, rows, _, finishes) = fanout_fixture(1 << 20);
+        op.set_finishing(&state).unwrap();
+        assert!(op.is_finished());
+        assert!(rows.iter().all(|rows| rows.lock().unwrap().is_empty()));
+        for count in finishes {
+            assert_eq!(count.load(Ordering::Acquire), 1);
+        }
+    }
+}
+
+/// Predicate fanout accepts bounded scalar comparisons over materialized fields.
+/// Allocation-heavy scalar calls belong in the producer Project, once per row.
+fn bounded_predicate_nodes(arena: &ExprArena, root: ExprId) -> Result<usize, String> {
+    use crate::exec::expr::{ExprNode, LiteralValue};
+    let mut pending = vec![root];
+    let mut nodes = 0usize;
+    while let Some(id) = pending.pop() {
+        nodes = nodes
+            .checked_add(1)
+            .ok_or_else(|| "fanout predicate size overflow".to_string())?;
+        if nodes > 65536 {
+            return Err("fanout predicate exceeds the bounded scalar vocabulary".into());
+        }
+        match arena
+            .node(id)
+            .ok_or_else(|| "invalid fanout predicate expression".to_string())?
+        {
+            ExprNode::SlotId(_) => {}
+            ExprNode::Literal(LiteralValue::Utf8(_) | LiteralValue::Binary(_)) => {
+                return Err(
+                    "fanout variable-width literals must be materialized by the producer".into(),
+                );
+            }
+            ExprNode::Literal(_) => {}
+            ExprNode::Eq(a, b)
+            | ExprNode::EqForNull(a, b)
+            | ExprNode::Ne(a, b)
+            | ExprNode::Lt(a, b)
+            | ExprNode::Le(a, b)
+            | ExprNode::Gt(a, b)
+            | ExprNode::Ge(a, b)
+            | ExprNode::And(a, b)
+            | ExprNode::Or(a, b) => pending.extend([*a, *b]),
+            ExprNode::Not(a) | ExprNode::IsNull(a) | ExprNode::IsNotNull(a) => pending.push(*a),
+            ExprNode::In { child, values, .. } => {
+                pending.push(*child);
+                pending.extend(values.iter().copied());
+            }
+            _ => {
+                return Err(
+                    "fanout scalar computation must be materialized by the producer".into(),
+                );
+            }
+        }
+    }
+    Ok(nodes)
 }

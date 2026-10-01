@@ -307,6 +307,7 @@ pub(crate) struct TaskCreationSeed {
     split_plan_nodes: Vec<PlanNodeId>,
     instance_ordinal: u32,
     initial_scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
+    quota_domains: BTreeMap<i32, u32>,
     sink_edges: Arc<[ExchangeEdgeId]>,
 }
 
@@ -356,8 +357,25 @@ impl TaskCreationSeed {
             split_plan_nodes: facts.split_plan_nodes,
             instance_ordinal: facts.instance_ordinal,
             initial_scan_ranges: facts.initial_scan_ranges,
+            quota_domains: BTreeMap::new(),
             sink_edges,
         }
+    }
+
+    /// Install the exact placement facts before this seed is priced or frozen.
+    pub(crate) fn bind_quota_domains(
+        &mut self,
+        domains: BTreeMap<i32, u32>,
+    ) -> Result<(), TaskExecutionError> {
+        if domains.keys().copied().collect::<Vec<_>>() != self.fragment.facts().quota_domains()
+            || domains.values().any(|&count| count == 0)
+        {
+            return Err(TaskExecutionError::Schedule(
+                "quota domain bindings differ from the frozen fragment requirements".to_string(),
+            ));
+        }
+        self.quota_domains = domains;
+        Ok(())
     }
 
     pub(crate) const fn identity(&self) -> TaskIdentity {
@@ -425,6 +443,7 @@ impl TaskCreationSeed {
                 )
             }),
             &self.sink_edges,
+            &self.quota_domains,
         );
         let assignment_len = assignment.encoded_len();
         let metadata =
@@ -457,6 +476,7 @@ impl TaskCreationSeed {
                 )
             }),
             &self.sink_edges,
+            &self.quota_domains,
         );
         let assignment_len = assignment.encoded_len();
         let metadata = encode_creation_metadata(self.context, &descriptor, assignment, Vec::new())
@@ -487,6 +507,7 @@ fn assignment_message(
     instance_ordinal: u32,
     initial_scan_ranges: impl Iterator<Item = (i32, Vec<proto::ScanRangeParams>)>,
     sink_edges: &[ExchangeEdgeId],
+    quota_domains: &BTreeMap<i32, u32>,
 ) -> proto::TaskAssignment {
     proto::TaskAssignment {
         instance_ordinal,
@@ -499,6 +520,15 @@ fn assignment_message(
             })
             .collect(),
         sink_edge_ids: sink_edges.iter().map(|edge| edge.get()).collect(),
+        quota_domain_bindings: quota_domains
+            .iter()
+            .map(
+                |(&preclaim_node_id, &task_count)| proto::TaskQuotaDomainBinding {
+                    preclaim_node_id,
+                    task_count,
+                },
+            )
+            .collect(),
     }
 }
 

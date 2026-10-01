@@ -196,13 +196,29 @@ pub enum RuntimeFilterLateApplyGranularity {
 
 #[derive(Clone, Copy)]
 pub enum RuntimeFilterProducerTarget {
-    JoinBuildKey { ordinal: u32 },
-    AggregateTopNKey { group_key_ordinal: u32, limit: u32 },
+    QuotaContentField {
+        field_ordinal: u32,
+        content_equivalence: novarocks_type_contract::ResultContentEquivalence,
+    },
+    JoinBuildKey {
+        ordinal: u32,
+    },
+    AggregateTopNKey {
+        group_key_ordinal: u32,
+        limit: u32,
+    },
 }
 
 impl RuntimeFilterProducerTarget {
     fn from_attempt(value: attempt_facts::AttemptRuntimeFilterProducerTarget) -> Self {
         match value {
+            attempt_facts::AttemptRuntimeFilterProducerTarget::QuotaContentField {
+                field_ordinal,
+                content_equivalence,
+            } => Self::QuotaContentField {
+                field_ordinal,
+                content_equivalence,
+            },
             attempt_facts::AttemptRuntimeFilterProducerTarget::JoinBuildKey { ordinal } => {
                 Self::JoinBuildKey { ordinal }
             }

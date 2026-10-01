@@ -27,8 +27,6 @@ use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_sql::planning::mv::{
     ApplyKeySource, MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
     MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-    MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
-    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +178,8 @@ pub struct TargetContract {
     pub table_uuid: String,
     pub schema_id_at_create: i32,
     pub visible_columns: Vec<TargetVisibleColumn>,
-    pub hidden_apply_key: HiddenApplyKeyContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_apply_key: Option<HiddenApplyKeyContract>,
     #[serde(default)]
     pub partition: Option<MvPartitionContract>,
 }
@@ -233,6 +232,8 @@ pub enum MvPartitionTransformContract {
 /// time — they should never surface to end users in practice.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContractSelfCheckError {
+    VisibleBagHasHiddenFields,
+    AggregateRequiresApplyKey,
     OutputTargetLenMismatch {
         output_len: usize,
         target_len: usize,
@@ -298,6 +299,13 @@ pub enum ContractSelfCheckError {
 impl std::fmt::Display for ContractSelfCheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::VisibleBagHasHiddenFields => write!(
+                f,
+                "visible tuple bag must not contain hidden apply-key or branch fields; DROP and recreate the materialized view"
+            ),
+            Self::AggregateRequiresApplyKey => {
+                write!(f, "aggregate state requires its GroupRowId apply key")
+            }
             Self::OutputTargetLenMismatch {
                 output_len,
                 target_len,
@@ -473,51 +481,51 @@ impl MvSchemaContract {
                 target_len: self.target.visible_columns.len(),
             });
         }
-        let expected_hidden_apply_key_column = match self.target.hidden_apply_key.source {
-            ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
-            ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
-            ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-        };
-        if self.target.hidden_apply_key.column_name != expected_hidden_apply_key_column {
-            return Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong {
-                expected: expected_hidden_apply_key_column.to_string(),
-                actual: self.target.hidden_apply_key.column_name.clone(),
-            });
-        }
-        if let Some(branch) = &self.branch
-            && branch.branch_id_column.column_name != BRANCH_ID_COLUMN_NAME
+        if self
+            .join
+            .as_ref()
+            .is_some_and(|join| join.predicates.is_empty())
         {
-            return Err(ContractSelfCheckError::BranchIdColumnNameWrong {
-                expected: BRANCH_ID_COLUMN_NAME.to_string(),
-                actual: branch.branch_id_column.column_name.clone(),
-            });
+            return Err(ContractSelfCheckError::EmptyJoinPredicates);
         }
-        match self.target.hidden_apply_key.source {
-            ApplyKeySource::JoinRowKey => match &self.join {
-                Some(join) if join.predicates.is_empty() => {
-                    return Err(ContractSelfCheckError::EmptyJoinPredicates);
-                }
-                Some(_) => {}
-                None => return Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract),
-            },
-            ApplyKeySource::BaseRowId => {
-                if self.join.is_some() {
-                    return Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract);
+        match (&self.aggregate, &self.target.hidden_apply_key) {
+            (None, None) => {
+                if self.branch.is_some() {
+                    return Err(ContractSelfCheckError::VisibleBagHasHiddenFields);
                 }
             }
-            ApplyKeySource::GroupRowId => {
-                if self.aggregate.is_none() {
+            (None, Some(key)) => {
+                if key.source == ApplyKeySource::GroupRowId {
                     return Err(ContractSelfCheckError::GroupRowIdRequiresAggregateContract);
                 }
+                return Err(ContractSelfCheckError::VisibleBagHasHiddenFields);
             }
-        }
-        if let Some(branch) = &self.branch
-            && branch.inner_apply_key_source != self.target.hidden_apply_key.source
-        {
-            return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
-                branch_source: branch.inner_apply_key_source,
-                hidden_apply_key_source: self.target.hidden_apply_key.source,
-            });
+            (Some(_), None) => return Err(ContractSelfCheckError::AggregateRequiresApplyKey),
+            (Some(_), Some(key)) => {
+                if key.source != ApplyKeySource::GroupRowId {
+                    return Err(ContractSelfCheckError::AggregateRequiresApplyKey);
+                }
+                if key.column_name != GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME {
+                    return Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong {
+                        expected: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+                        actual: key.column_name.clone(),
+                    });
+                }
+                if let Some(branch) = &self.branch {
+                    if branch.branch_id_column.column_name != BRANCH_ID_COLUMN_NAME {
+                        return Err(ContractSelfCheckError::BranchIdColumnNameWrong {
+                            expected: BRANCH_ID_COLUMN_NAME.to_string(),
+                            actual: branch.branch_id_column.column_name.clone(),
+                        });
+                    }
+                    if branch.inner_apply_key_source != ApplyKeySource::GroupRowId {
+                        return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
+                            branch_source: branch.inner_apply_key_source,
+                            hidden_apply_key_source: ApplyKeySource::GroupRowId,
+                        });
+                    }
+                }
+            }
         }
         if let Some(aggregate) = &self.aggregate {
             if aggregate.row_id_column_name != GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME {
@@ -689,8 +697,10 @@ fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage)
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use novarocks_sql::planning::mv::SqlMvApplyKeySourceFacts;
     use novarocks_sql::planning::mv::{
-        SqlMvApplyKeySourceFacts, SqlMvPersistedApplyKeySourceFacts,
+        MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
     };
 
     fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
@@ -774,11 +784,7 @@ mod tests {
                     type_signature: "long".to_string(),
                     nullable: false,
                 }],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: "__nova_base_row_id".to_string(),
-                    target_field_id: 2,
-                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
-                },
+                hidden_apply_key: None,
                 partition: Some(MvPartitionContract {
                     target_spec_id: 0,
                     fields: vec![MvPartitionFieldContract {
@@ -807,11 +813,11 @@ mod tests {
                 role: AggregateStateRoleContract::Single,
             }],
         });
-        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
             column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
             target_field_id: 1,
             source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        };
+        });
         contract
     }
 
@@ -872,19 +878,14 @@ mod tests {
     #[test]
     fn branch_union_contract_self_check_preserves_join_source_error_priority() {
         let mut contract = sample_join_contract();
-        contract.join = None;
-        contract.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
-                target_field_id: 4242,
-            },
-            branch_count: 2,
-            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
+            column_name: JOIN_APPLY_KEY_COLUMN_NAME.into(),
+            target_field_id: 99,
+            source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
         });
-
         assert!(matches!(
             contract.ensure_self_consistent(),
-            Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract)
+            Err(ContractSelfCheckError::VisibleBagHasHiddenFields)
         ));
     }
 
@@ -977,7 +978,10 @@ mod tests {
                 .referenced_base_fields
                 .is_empty()
         );
-        decoded.ensure_self_consistent().expect("self check");
+        assert!(matches!(
+            decoded.ensure_self_consistent(),
+            Err(ContractSelfCheckError::VisibleBagHasHiddenFields)
+        ));
 
         let reencoded = serde_json::to_value(&decoded).expect("re-encode v1 contract");
         assert_eq!(reencoded["bases"], serde_json::json!([]));
@@ -1021,8 +1025,7 @@ mod tests {
     #[test]
     fn self_check_rejects_partition_source_not_in_visible_target_columns() {
         let mut c = sample_contract();
-        c.target.partition.as_mut().expect("partition").fields[0].source_target_field_id =
-            c.target.hidden_apply_key.target_field_id;
+        c.target.partition.as_mut().expect("partition").fields[0].source_target_field_id = 2;
         match c.ensure_self_consistent() {
             Err(ContractSelfCheckError::PartitionReferencesUnknownTargetFieldId {
                 partition_field_name,
@@ -1034,8 +1037,8 @@ mod tests {
 
     #[test]
     fn self_check_rejects_wrong_hidden_column_name() {
-        let mut c = sample_contract();
-        c.target.hidden_apply_key.column_name = "wrong".to_string();
+        let mut c = sample_aggregate_contract();
+        c.target.hidden_apply_key.as_mut().unwrap().column_name = "wrong".to_string();
         assert!(matches!(
             c.ensure_self_consistent(),
             Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong { .. })
@@ -1077,14 +1080,7 @@ mod tests {
         contract.ensure_self_consistent().expect("self check");
         assert_eq!(contract.contract_version, 2);
         assert_eq!(contract.bases.len(), 2);
-        assert_eq!(
-            contract
-                .target
-                .hidden_apply_key
-                .source
-                .sql_mv_apply_key_source_facts(),
-            SqlMvApplyKeySourceFacts::JoinRowKey
-        );
+        assert!(contract.target.hidden_apply_key.is_none());
     }
 
     #[test]
@@ -1122,11 +1118,11 @@ mod tests {
                 role: AggregateStateRoleContract::Single,
             }],
         });
-        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
             source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        };
+        });
 
         contract.ensure_self_consistent().expect("self check");
     }
@@ -1135,11 +1131,11 @@ mod tests {
     fn group_row_id_apply_key_requires_aggregate_contract() {
         let mut contract = sample_contract();
         contract.contract_version = 3;
-        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
             source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        };
+        });
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
         assert!(err.to_string().contains("GroupRowId"), "err={err}");
@@ -1160,11 +1156,11 @@ mod tests {
                 role: AggregateStateRoleContract::Single,
             }],
         });
-        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
             source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        };
+        });
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
         assert!(err.to_string().contains("row-id"), "err={err}");
@@ -1185,11 +1181,11 @@ mod tests {
                 role: AggregateStateRoleContract::Single,
             }],
         });
-        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
             source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        };
+        });
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
         assert!(err.to_string().contains("layout version"), "err={err}");
@@ -1204,11 +1200,11 @@ mod tests {
             row_id_column_name: "__row_id__".to_string(),
             state_columns: vec![],
         });
-        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
             source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        };
+        });
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
         assert!(err.to_string().contains("state columns"), "err={err}");
@@ -1275,10 +1271,14 @@ mod tests {
     #[test]
     fn contract_v2_rejects_join_row_key_with_base_hidden_column() {
         let mut contract = sample_join_contract();
-        contract.target.hidden_apply_key.column_name = HIDDEN_APPLY_KEY_COLUMN_NAME.to_string();
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
+            column_name: JOIN_APPLY_KEY_COLUMN_NAME.into(),
+            target_field_id: 99,
+            source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
+        });
         assert!(matches!(
             contract.ensure_self_consistent(),
-            Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong { .. })
+            Err(ContractSelfCheckError::VisibleBagHasHiddenFields)
         ));
     }
 
@@ -1309,10 +1309,14 @@ mod tests {
     #[test]
     fn contract_v2_rejects_join_row_key_without_join_contract() {
         let mut contract = sample_join_contract();
-        contract.join = None;
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
+            column_name: JOIN_APPLY_KEY_COLUMN_NAME.into(),
+            target_field_id: 99,
+            source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
+        });
         assert!(matches!(
             contract.ensure_self_consistent(),
-            Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract)
+            Err(ContractSelfCheckError::VisibleBagHasHiddenFields)
         ));
     }
 
@@ -1329,11 +1333,14 @@ mod tests {
     #[test]
     fn contract_v2_rejects_base_row_id_with_join_contract() {
         let mut contract = sample_join_contract();
-        contract.target.hidden_apply_key.column_name = HIDDEN_APPLY_KEY_COLUMN_NAME.to_string();
-        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::BaseRowId.into();
+        contract.target.hidden_apply_key = Some(HiddenApplyKeyContract {
+            column_name: JOIN_APPLY_KEY_COLUMN_NAME.into(),
+            target_field_id: 99,
+            source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
+        });
         assert!(matches!(
             contract.ensure_self_consistent(),
-            Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract)
+            Err(ContractSelfCheckError::VisibleBagHasHiddenFields)
         ));
     }
 
@@ -1418,11 +1425,7 @@ mod tests {
                     type_signature: "long".to_string(),
                     nullable: false,
                 }],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-                    target_field_id: 2,
-                    source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
-                },
+                hidden_apply_key: None,
                 partition: None,
             },
         }

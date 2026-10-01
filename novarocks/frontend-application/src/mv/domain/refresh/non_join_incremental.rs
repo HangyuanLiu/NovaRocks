@@ -117,18 +117,14 @@ fn reduce_non_join_incremental_facts(
         table_object_ids,
     };
 
-    let mut has_insert_changes = false;
+    let mut all_content_net_zero = true;
     let mut has_delete_changes = false;
     let mut full_rebuild_reasons = BTreeMap::new();
     for fact in facts {
         match fact.admission {
-            ConnectorChangeWindowAdmission::MetadataOnly => {}
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts,
-                has_deletes,
-                ..
-            } => {
-                has_insert_changes |= has_inserts;
+            ConnectorChangeWindowAdmission::ContentNetZero { .. } => {}
+            ConnectorChangeWindowAdmission::Incremental { has_deletes, .. } => {
+                all_content_net_zero = false;
                 has_delete_changes |= has_deletes;
             }
             ConnectorChangeWindowAdmission::FullRebuild(reason) => {
@@ -158,7 +154,7 @@ fn reduce_non_join_incremental_facts(
         return Ok(NonJoinIncrementalChangePlan::FullRebuild { lineage, reason });
     }
 
-    if !has_insert_changes && !has_delete_changes {
+    if all_content_net_zero {
         Ok(NonJoinIncrementalChangePlan::MetadataOnly(lineage))
     } else {
         Ok(NonJoinIncrementalChangePlan::ChangeStream {
@@ -234,8 +230,20 @@ mod tests {
     #[test]
     fn repeated_table_occurrences_remain_distinct() {
         let plan = reduce_non_join_incremental_facts(vec![
-            fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
-            fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
+            fact(
+                "c.db.t",
+                2,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
+            ),
+            fact(
+                "c.db.t",
+                3,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
+            ),
         ])
         .expect("separate relation occurrences may name the same table");
         let NonJoinIncrementalChangePlan::MetadataOnly(lineage) = plan else {
@@ -248,10 +256,22 @@ mod tests {
 
     #[test]
     fn duplicate_relation_occurrence_is_rejected() {
-        let mut duplicate = fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly);
+        let mut duplicate = fact(
+            "c.db.t",
+            3,
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+            },
+        );
         duplicate.occurrence_id = SqlMvRelationOccurrenceId::new(2);
         let err = reduce_non_join_incremental_facts(vec![
-            fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
+            fact(
+                "c.db.t",
+                2,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
+            ),
             duplicate,
         ])
         .expect_err("duplicate occurrence");
@@ -263,7 +283,9 @@ mod tests {
         let plan = reduce_non_join_incremental_facts(vec![fact(
             "c.db.t",
             2,
-            ConnectorChangeWindowAdmission::MetadataOnly,
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+            },
         )])
         .expect("metadata only");
         assert!(matches!(
@@ -367,10 +389,58 @@ mod tests {
     }
 
     #[test]
+    fn missing_content_proof_executes_source_even_without_physical_flags() {
+        let plan =
+            reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, incremental(false, false))])
+                .expect("unproven source must execute");
+        assert!(matches!(
+            plan,
+            NonJoinIncrementalChangePlan::ChangeStream {
+                has_delete_changes: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn every_occurrence_needs_its_own_content_proof() {
+        let plan = reduce_non_join_incremental_facts(vec![
+            fact(
+                "c.db.t",
+                2,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
+            ),
+            fact("c.db.t", 3, incremental(true, true)),
+        ])
+        .expect("unproven occurrence must execute");
+        assert!(matches!(
+            plan,
+            NonJoinIncrementalChangePlan::ChangeStream {
+                has_delete_changes: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn lineage_maps_are_complete_and_sorted_by_occurrence() {
         let plan = reduce_non_join_incremental_facts(vec![
-            fact("z.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
-            fact("a.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
+            fact(
+                "z.db.t",
+                3,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
+            ),
+            fact(
+                "a.db.t",
+                2,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
+            ),
         ])
         .expect("metadata only");
         let NonJoinIncrementalChangePlan::MetadataOnly(lineage) = plan else {

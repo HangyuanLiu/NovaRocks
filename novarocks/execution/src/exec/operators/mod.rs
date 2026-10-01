@@ -43,7 +43,16 @@ mod multi_cast_data_stream_sink;
 mod nljoin;
 mod noop_sink;
 mod project_processor;
+pub(crate) mod quota;
+pub(crate) mod quota_preclaim;
+mod quota_runtime_filter;
+mod quota_trim;
 mod repeat_processor;
+pub(crate) use quota_preclaim::{
+    QuotaPreclaimBuildFactory, QuotaPreclaimProbeFactory, QuotaPreclaimShared,
+};
+pub(crate) use quota_runtime_filter::NativeQuotaContentFilterObserver;
+pub(crate) use quota_trim::{QuotaTrimInputFactory, QuotaTrimShared, QuotaTrimSourceFactory};
 mod result_buffer_sink;
 mod result_sink;
 pub(crate) mod runtime_filter;

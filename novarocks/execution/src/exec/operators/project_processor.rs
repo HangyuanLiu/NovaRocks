@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, new_empty_array};
+use arrow::array::{ArrayRef, BinaryBuilder, new_empty_array};
 use arrow::datatypes::{DataType, Field};
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -41,8 +41,10 @@ use crate::exec::expr::dict_peel::{
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_array_to_target};
 use novarocks_types::SlotId;
 
+use crate::exec::expr::function::FunctionKind;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::runtime_state::RuntimeState;
 
 fn projected_field_from_existing(
@@ -137,6 +139,7 @@ fn slots_adjusted_for_actual_nullability(
 /// Factory for projection processors that evaluate expression lists into projected chunks.
 pub struct ProjectProcessorFactory {
     name: String,
+    entry_node_id: Option<u32>,
     arena: Arc<ExprArena>,
     exprs: Vec<ExprId>,
     expr_slot_ids: Vec<SlotId>,
@@ -172,6 +175,9 @@ impl ProjectProcessorFactory {
         }
         Self {
             name,
+            entry_node_id: (!is_subordinate)
+                .then(|| u32::try_from(node_id).ok())
+                .flatten(),
             arena,
             exprs,
             expr_slot_ids,
@@ -187,9 +193,12 @@ impl OperatorFactory for ProjectProcessorFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         Box::new(ProjectProcessorOperator {
             name: self.name.clone(),
+            entry_identity: self.entry_node_id.zip(u32::try_from(driver_id).ok()),
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::clone(&self.arena),
             exprs: self.exprs.clone(),
             expr_slot_ids: self.expr_slot_ids.clone(),
@@ -211,6 +220,11 @@ impl OperatorFactory for ProjectProcessorFactory {
 
 struct ProjectProcessorOperator {
     name: String,
+    // Entry ABI: exact Task fragment-instance (16B), primary plan node (4B),
+    // driver ordinal (4B), and this operator's checked sequence (8B), big-endian.
+    entry_identity: Option<(u32, u32)>,
+    entry_counter: u64,
+    entry_task: Option<novarocks_types::UniqueId>,
     arena: Arc<ExprArena>,
     exprs: Vec<ExprId>,
     expr_slot_ids: Vec<SlotId>,
@@ -259,14 +273,14 @@ impl ProcessorOperator for ProjectProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
             return Err("project received input while output buffer is full".to_string());
         }
-        let out = self.process_one(chunk)?;
+        let out = self.process_one_bound(chunk, Some(state))?;
         self.pending_output = out;
         Ok(())
     }
@@ -289,6 +303,16 @@ impl ProcessorOperator for ProjectProcessorOperator {
 }
 
 impl ProjectProcessorOperator {
+    fn is_entry_expr(&self, expr: ExprId) -> bool {
+        matches!(
+            self.arena.node(expr),
+            Some(ExprNode::FunctionCall {
+                kind: FunctionKind::MvState("mv_entry_id"),
+                ..
+            })
+        )
+    }
+
     fn declared_slot_schema(&self, slot_id: SlotId) -> Option<ChunkSlotSchema> {
         self.expr_slot_schemas.get(&slot_id).cloned()
     }
@@ -328,7 +352,51 @@ impl ProjectProcessorOperator {
         })
     }
 
+    #[cfg(test)]
     fn process_one(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+        self.process_one_bound(chunk, None)
+    }
+
+    fn process_one_bound(
+        &mut self,
+        chunk: Chunk,
+        state: Option<&RuntimeState>,
+    ) -> Result<Option<Chunk>, String> {
+        let entry_exprs = self
+            .exprs
+            .iter()
+            .filter(|expr| self.is_entry_expr(**expr))
+            .count();
+        if entry_exprs > 1 {
+            return Err(
+                "Project must materialize mv_entry_id once and reuse its output slot".into(),
+            );
+        }
+        let entry_binding = if entry_exprs == 1 {
+            let state = state.ok_or("mv_entry_id requires an exact task-bound Project")?;
+            let finst = state
+                .fragment_instance_id()
+                .filter(|id| id.high() != 0 || id.low() != 0)
+                .ok_or("mv_entry_id requires a nonzero frozen fragment-instance identity")?;
+            if self.entry_task.is_some_and(|bound| bound != finst) {
+                return Err("mv_entry_id Project cannot rebind to a different Task".into());
+            }
+            self.entry_task = Some(finst);
+            let (node, driver) = self.entry_identity.ok_or("mv_entry_id requires a primary Project with nonnegative node and driver identities")?;
+            let tracker = state
+                .mem_tracker()
+                .ok_or("mv_entry_id requires task memory accounting")?;
+            Some((finst, node, driver, tracker))
+        } else {
+            None
+        };
+        for expr in self.exprs.iter().filter(|expr| self.is_entry_expr(**expr)) {
+            if !matches!(self.arena.node(*expr), Some(ExprNode::FunctionCall { args, .. }) if args.is_empty())
+                || self.arena.data_type(*expr) != Some(&DataType::Binary)
+            {
+                return Err("mv_entry_id requires zero arguments and Binary output".into());
+            }
+        }
         if chunk.is_empty() {
             return Ok(Some(self.empty_output_chunk()?));
         }
@@ -341,23 +409,88 @@ impl ProjectProcessorOperator {
             ));
         }
 
+        let entry_charge = if let Some((_, _, _, tracker)) = entry_binding.as_ref() {
+            let values = chunk
+                .len()
+                .checked_mul(32)
+                .ok_or("mv_entry_id allocation overflow")?;
+            i32::try_from(values).map_err(|_| "mv_entry_id Binary offset overflow")?;
+            let offsets = chunk
+                .len()
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or("mv_entry_id offsets overflow")?;
+            let round = |bytes: usize| bytes.checked_add(63).map(|n| n & !63);
+            let bytes = round(values)
+                .and_then(|n| round(offsets).and_then(|m| n.checked_add(m)))
+                .ok_or("mv_entry_id allocation overflow")?;
+            i64::try_from(bytes).map_err(|_| "mv_entry_id accounting overflow")?;
+            Some(TrackedBytes::try_new(bytes, Arc::clone(tracker))?)
+        } else {
+            None
+        };
+
         // Vectorized implementation: compute all expressions on the chunk
         // Handle CSE by appending intermediate results to a working chunk
         let mut working_chunk = chunk.clone();
         let mut computed_columns: Vec<ArrayRef> = Vec::with_capacity(self.exprs.len());
 
-        for (expr_id, slot_id) in self.exprs.iter().zip(self.expr_slot_ids.iter()) {
+        for index in 0..self.exprs.len() {
+            let expr_id = self.exprs[index];
+            let slot_id = self.expr_slot_ids[index];
             // Evaluate expression on the current working chunk (which includes previously computed columns)
-            let array = self.eval_project_expr(*expr_id, &working_chunk)?;
+            let array = if self.is_entry_expr(expr_id) {
+                let Some(ExprNode::FunctionCall { args, .. }) = self.arena.node(expr_id) else {
+                    unreachable!()
+                };
+                if !args.is_empty() || self.arena.data_type(expr_id) != Some(&DataType::Binary) {
+                    return Err("mv_entry_id requires zero arguments and Binary output".into());
+                }
+                if self
+                    .declared_slot_schema(slot_id)
+                    .or_else(|| self.output_chunk_schema.slot(slot_id).cloned())
+                    .is_some_and(|slot| slot.data_type() != &DataType::Binary)
+                {
+                    return Err("mv_entry_id output slot must be Binary".into());
+                }
+                let (finst, node, driver, _) =
+                    entry_binding.as_ref().expect("validated entry binding");
+                let end = self
+                    .entry_counter
+                    .checked_add(
+                        u64::try_from(chunk.len()).map_err(|_| "mv_entry_id row count overflow")?,
+                    )
+                    .ok_or("mv_entry_id counter overflow")?;
+                let mut builder = BinaryBuilder::with_capacity(
+                    chunk.len(),
+                    chunk
+                        .len()
+                        .checked_mul(32)
+                        .ok_or("mv_entry_id allocation overflow")?,
+                );
+                for counter in self.entry_counter..end {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&finst.high().to_be_bytes());
+                    bytes[8..16].copy_from_slice(&finst.low().to_be_bytes());
+                    bytes[16..20].copy_from_slice(&node.to_be_bytes());
+                    bytes[20..24].copy_from_slice(&driver.to_be_bytes());
+                    bytes[24..].copy_from_slice(&counter.to_be_bytes());
+                    builder.append_value(bytes);
+                }
+                self.entry_counter = end;
+                Arc::new(builder.finish()) as ArrayRef
+            } else {
+                self.eval_project_expr(expr_id, &working_chunk)?
+            };
 
             computed_columns.push(array.clone());
 
             // Append this computed column to working_chunk for CSE support
             // This allows subsequent expressions to reference this result via SlotId.
-            if let Some(existing_idx) = working_chunk.slot_id_to_index().get(slot_id).copied() {
+            if let Some(existing_idx) = working_chunk.slot_id_to_index().get(&slot_id).copied() {
                 let is_identity = matches!(
-                    self.arena.node(*expr_id),
-                    Some(ExprNode::SlotId(existing)) if *existing == *slot_id
+                    self.arena.node(expr_id),
+                    Some(ExprNode::SlotId(existing)) if *existing == slot_id
                 );
                 if is_identity {
                     continue;
@@ -374,8 +507,8 @@ impl ProjectProcessorOperator {
                 let old_field = working_schema.field(existing_idx);
                 let data_type = computed_columns.last().unwrap().data_type();
                 let preferred_slot_schema = self
-                    .declared_slot_schema(*slot_id)
-                    .or_else(|| working_chunk.chunk_schema().slot(*slot_id).cloned());
+                    .declared_slot_schema(slot_id)
+                    .or_else(|| working_chunk.chunk_schema().slot(slot_id).cloned());
                 let replaced = preferred_slot_schema
                     .as_ref()
                     .map(|schema| {
@@ -393,8 +526,8 @@ impl ProjectProcessorOperator {
                     &columns,
                 );
                 slot_schemas[existing_idx] = preferred_slot_schema
-                    .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &replaced))
-                    .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &replaced));
+                    .map(|schema| projected_slot_schema_from_existing(&schema, slot_id, &replaced))
+                    .unwrap_or_else(|| synthetic_slot_schema(slot_id, &replaced));
                 working_chunk =
                     Chunk::try_new_with_columns(Self::build_chunk_schema(slot_schemas)?, columns)
                         .map_err(|e| format!("Failed to replace chunk column: {}", e))?;
@@ -408,7 +541,7 @@ impl ProjectProcessorOperator {
             // Create new schema with appended field
             let mut fields = working_chunk.batch.schema().fields().to_vec();
             let data_type = computed_columns.last().unwrap().data_type();
-            let declared_slot_schema = self.declared_slot_schema(*slot_id);
+            let declared_slot_schema = self.declared_slot_schema(slot_id);
             let field = if let Some(slot_schema) = declared_slot_schema.as_ref() {
                 let f = field_from_slot_schema(slot_schema, data_type);
                 if array_has_nulls && !f.is_nullable() {
@@ -416,7 +549,7 @@ impl ProjectProcessorOperator {
                 } else {
                     f
                 }
-            } else if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
+            } else if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(expr_id) {
                 if let Some(source_idx) = working_chunk.slot_id_to_index().get(source_slot) {
                     projected_field_from_existing(
                         working_chunk.batch.schema().field(*source_idx),
@@ -438,20 +571,20 @@ impl ProjectProcessorOperator {
             };
             fields.push(Arc::new(field.clone()));
             let slot_schema = declared_slot_schema
-                .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &field))
+                .map(|schema| projected_slot_schema_from_existing(&schema, slot_id, &field))
                 .or_else(|| {
-                    if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
+                    if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(expr_id) {
                         working_chunk
                             .chunk_schema()
                             .slot(*source_slot)
                             .map(|schema| {
-                                projected_slot_schema_from_existing(schema, *slot_id, &field)
+                                projected_slot_schema_from_existing(schema, slot_id, &field)
                             })
                     } else {
                         None
                     }
                 })
-                .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &field));
+                .unwrap_or_else(|| synthetic_slot_schema(slot_id, &field));
             let mut slot_schemas = slots_adjusted_for_actual_nullability(
                 working_chunk.chunk_schema().slots(),
                 working_chunk.batch.columns(),
@@ -542,10 +675,16 @@ impl ProjectProcessorOperator {
         }
         let output_chunk_schema = Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?);
 
-        Ok(Some(
-            Chunk::try_new_with_columns(output_chunk_schema, output_columns)
-                .map_err(|e| format!("Failed to create output batch: {}", e))?,
-        ))
+        let mut out = Chunk::try_new_with_columns(output_chunk_schema, output_columns)
+            .map_err(|e| format!("Failed to create output batch: {}", e))?;
+        if let Some((_, _, _, tracker)) = entry_binding {
+            // Synchronous handoff: the output chunk acquires the complete Arrow
+            // lease before it can leave this processor; no await or publication
+            // occurs between releasing the construction charge and the charge.
+            drop(entry_charge);
+            out.try_transfer_to(&tracker)?;
+        }
+        Ok(Some(out))
     }
 
     fn empty_output_chunk(&self) -> Result<Chunk, String> {
@@ -628,6 +767,7 @@ mod tests {
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator::ProcessorOperator;
+    use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
@@ -682,6 +822,9 @@ mod tests {
         );
         let op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![lower],
             expr_slot_ids: vec![output_slot],
@@ -714,6 +857,9 @@ mod tests {
         );
         let mut op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![lower],
             expr_slot_ids: vec![output_slot],
@@ -793,6 +939,9 @@ mod tests {
         );
         let mut op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![lower, coalesce],
             expr_slot_ids: vec![lower_slot, coalesce_slot],
@@ -857,6 +1006,9 @@ mod tests {
         );
         let mut op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![lower, read_overwritten],
             expr_slot_ids: vec![input_slot, output_slot],
@@ -910,6 +1062,9 @@ mod tests {
         let expr_read_slot17 = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int32);
         let mut op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![expr_write_slot17, expr_read_slot17],
             expr_slot_ids: vec![SlotId::new(17), SlotId::new(19)],
@@ -995,6 +1150,9 @@ mod tests {
             Arc::new(ChunkSchema::try_new(vec![output_slot_schema.clone()]).expect("schema"));
         let mut op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![expr],
             expr_slot_ids: vec![output_slot],
@@ -1050,6 +1208,9 @@ mod tests {
         );
         let mut op = ProjectProcessorOperator {
             name: "PROJECT".to_string(),
+            entry_identity: None,
+            entry_counter: 0,
+            entry_task: None,
             arena: Arc::new(arena),
             exprs: vec![expr],
             expr_slot_ids: vec![output_slot],
@@ -1085,5 +1246,245 @@ mod tests {
             .expect("output column");
         assert_eq!(values.value(0), 1);
         assert_eq!(values.value(1), 2);
+    }
+
+    fn entry_operator(node: u32, driver: u32) -> ProjectProcessorOperator {
+        let mut arena = ExprArena::default();
+        let entry = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::MvState("mv_entry_id"),
+                args: vec![],
+            },
+            DataType::Binary,
+        );
+        let slot = SlotId::new(2);
+        ProjectProcessorOperator {
+            name: "entry Project".into(),
+            entry_identity: Some((node, driver)),
+            entry_counter: 0,
+            entry_task: None,
+            arena: Arc::new(arena),
+            exprs: vec![entry],
+            expr_slot_ids: vec![slot],
+            expr_slot_schemas: HashMap::new(),
+            output_indices: None,
+            output_chunk_schema: Arc::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                    slot,
+                    Field::new("entry", DataType::Binary, false),
+                    None,
+                    None,
+                )])
+                .unwrap(),
+            ),
+            pending_output: None,
+            finishing: false,
+            finished: false,
+        }
+    }
+
+    fn entry_state(
+        finst: Option<novarocks_types::UniqueId>,
+        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) -> RuntimeState {
+        RuntimeState::new(None, None, None, finst, None, Some(tracker), None)
+    }
+
+    fn entry_values(chunk: &Chunk) -> Vec<Vec<u8>> {
+        let array = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        (0..array.len())
+            .map(|row| array.value(row).to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn mv_entry_id_is_unique_across_batches_drivers_tasks_and_projects() {
+        use crate::runtime::mem_tracker::MemTracker;
+        use novarocks_types::UniqueId;
+        let tracker = MemTracker::new_root("entry test");
+        let state = entry_state(Some(UniqueId::new(11, 12)), Arc::clone(&tracker));
+        let mut op = entry_operator(10, 0);
+        let input = || dict_string_chunk(SlotId::new(1));
+        let first = op
+            .process_one_bound(input(), Some(&state))
+            .unwrap()
+            .unwrap();
+        let second = op
+            .process_one_bound(input(), Some(&state))
+            .unwrap()
+            .unwrap();
+        let other_driver = entry_operator(10, 1)
+            .process_one_bound(input(), Some(&state))
+            .unwrap()
+            .unwrap();
+        let other_node = entry_operator(11, 0)
+            .process_one_bound(input(), Some(&state))
+            .unwrap()
+            .unwrap();
+        let other_state = entry_state(Some(UniqueId::new(11, 13)), Arc::clone(&tracker));
+        let other_task = entry_operator(10, 0)
+            .process_one_bound(input(), Some(&other_state))
+            .unwrap()
+            .unwrap();
+        let chunks = [first, second, other_driver, other_node, other_task];
+        let ids = chunks.iter().flat_map(entry_values).collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| id.len() == 32));
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            20
+        );
+        assert_eq!(&ids[0][24..], &0u64.to_be_bytes());
+        assert_eq!(&ids[4][24..], &4u64.to_be_bytes());
+        assert_eq!(
+            tracker.current(),
+            chunks
+                .iter()
+                .map(|chunk| chunk.logical_bytes() as i64)
+                .sum::<i64>()
+        );
+        drop(chunks);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn mv_entry_id_refuses_missing_identity_context_rebinding_and_overflow() {
+        use crate::runtime::mem_tracker::MemTracker;
+        use novarocks_types::UniqueId;
+        let tracker = MemTracker::new_root("entry test");
+        let input = || dict_string_chunk(SlotId::new(1));
+        let mut op = entry_operator(1, 0);
+        assert!(op.process_one(input()).unwrap_err().contains("task-bound"));
+        for finst in [None, Some(UniqueId::new(0, 0))] {
+            let state = entry_state(finst, Arc::clone(&tracker));
+            assert!(op.process_one_bound(input(), Some(&state)).is_err());
+        }
+        assert!(
+            op.arena
+                .eval(op.exprs[0], &input())
+                .unwrap_err()
+                .contains("top-level Project")
+        );
+        let untracked = RuntimeState::new(
+            None,
+            None,
+            None,
+            Some(UniqueId::new(1, 2)),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            op.process_one_bound(input(), Some(&untracked))
+                .unwrap_err()
+                .contains("memory accounting")
+        );
+        let mut nested = entry_operator(1, 0);
+        let entry = nested.exprs[0];
+        let clone = Arc::get_mut(&mut nested.arena)
+            .unwrap()
+            .push_typed(ExprNode::Clone(entry), DataType::Binary);
+        nested.exprs[0] = clone;
+        let state = entry_state(Some(UniqueId::new(1, 2)), Arc::clone(&tracker));
+        assert!(
+            nested
+                .process_one_bound(input(), Some(&state))
+                .unwrap_err()
+                .contains("top-level Project")
+        );
+        op.entry_identity = None;
+        assert!(
+            op.process_one_bound(input(), Some(&state))
+                .unwrap_err()
+                .contains("primary Project")
+        );
+        op.entry_identity = Some((1, 0));
+        op.entry_counter = u64::MAX - 2;
+        assert!(
+            op.process_one_bound(input(), Some(&state))
+                .unwrap_err()
+                .contains("counter overflow")
+        );
+        assert_eq!(tracker.current(), 0);
+        let different = entry_state(Some(UniqueId::new(1, 3)), Arc::clone(&tracker));
+        assert!(
+            op.process_one_bound(input(), Some(&different))
+                .unwrap_err()
+                .contains("different Task")
+        );
+    }
+
+    #[test]
+    fn mv_entry_id_is_materialized_once_and_reused_by_slot() {
+        use crate::runtime::mem_tracker::MemTracker;
+        use novarocks_types::UniqueId;
+        let tracker = MemTracker::new_root("entry test");
+        let state = entry_state(Some(UniqueId::new(1, 2)), Arc::clone(&tracker));
+        let mut duplicate = entry_operator(1, 0);
+        duplicate.exprs.push(duplicate.exprs[0]);
+        assert!(
+            duplicate
+                .process_one_bound(dict_string_chunk(SlotId::new(1)), Some(&state))
+                .unwrap_err()
+                .contains("materialize")
+        );
+        let mut op = entry_operator(1, 0);
+        let arena = Arc::get_mut(&mut op.arena).unwrap();
+        let read = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Binary);
+        op.exprs.push(read);
+        op.expr_slot_ids.push(SlotId::new(3));
+        op.output_chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(2),
+                    Field::new("entry", DataType::Binary, false),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(3),
+                    Field::new("copy", DataType::Binary, false),
+                    None,
+                    None,
+                ),
+            ])
+            .unwrap(),
+        );
+        let chunk = op
+            .process_one_bound(dict_string_chunk(SlotId::new(1)), Some(&state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.columns()[0].to_data(), chunk.columns()[1].to_data());
+        for (left, right) in chunk.columns()[0]
+            .to_data()
+            .buffers()
+            .iter()
+            .zip(chunk.columns()[1].to_data().buffers())
+        {
+            assert_eq!(
+                left.as_ptr(),
+                right.as_ptr(),
+                "entry reuse must share Arrow buffers"
+            );
+        }
+        assert_eq!(op.entry_counter, 4);
+    }
+
+    #[test]
+    fn mv_entry_id_reservation_refuses_before_generation() {
+        use crate::runtime::mem_tracker::MemTracker;
+        use novarocks_types::UniqueId;
+        let tracker = MemTracker::new_root("entry limited");
+        tracker.install_limit_once(1).unwrap();
+        let state = entry_state(Some(UniqueId::new(1, 2)), Arc::clone(&tracker));
+        let mut op = entry_operator(1, 0);
+        assert!(
+            op.process_one_bound(dict_string_chunk(SlotId::new(1)), Some(&state))
+                .is_err()
+        );
+        assert_eq!(op.entry_counter, 0);
+        assert_eq!(tracker.current(), 0);
     }
 }

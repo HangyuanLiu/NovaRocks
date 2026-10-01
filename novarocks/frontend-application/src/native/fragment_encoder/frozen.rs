@@ -31,6 +31,7 @@
 //! plan leaves this module as bytes and facts only.
 // Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{FragmentContractVersion, FrozenBytes};
@@ -71,9 +72,22 @@ pub(crate) struct FragmentFacts {
     root_plan_node_id: i32,
     declares_table_writer: bool,
     carries_runtime_filter_bindings: bool,
+    quota_domains: Box<[i32]>,
+    quota_preclaims: Box<[i32]>,
+    quota_trims: Box<[i32]>,
 }
 
 impl FragmentFacts {
+    pub(crate) fn quota_domains(&self) -> &[i32] {
+        &self.quota_domains
+    }
+    pub(crate) fn quota_preclaims(&self) -> &[i32] {
+        &self.quota_preclaims
+    }
+    pub(crate) fn quota_trims(&self) -> &[i32] {
+        &self.quota_trims
+    }
+
     pub(crate) const fn fragment_id(&self) -> FragmentId {
         self.fragment_id
     }
@@ -154,13 +168,22 @@ impl FragmentArtifact {
             .ok_or_else(|| format!("native fragment {fragment_id} carries no root node"))?;
         let root_plan_node_id = root.node_id;
         let declares_table_writer = contains_writer(root);
+        let mut quota_domains = BTreeSet::new();
+        let mut quota_preclaims = BTreeSet::new();
+        let mut quota_trims = BTreeSet::new();
+        collect_quota_facts(
+            root,
+            &mut quota_domains,
+            &mut quota_preclaims,
+            &mut quota_trims,
+        )?;
         let carries_runtime_filter_bindings = plan.runtime_filter_bindings.is_some();
         let kind = plan
             .sink
             .as_ref()
             .and_then(|sink| sink.kind.as_ref())
             .ok_or_else(|| format!("native fragment {fragment_id} carries no sink"))?;
-        let sink_targets = static_sink_targets(kind);
+        let sink_targets = static_sink_targets(kind)?;
         let facts = FragmentFacts {
             fragment_id,
             dop_domain: header.dop_domain,
@@ -168,6 +191,9 @@ impl FragmentArtifact {
             root_plan_node_id,
             declares_table_writer,
             carries_runtime_filter_bindings,
+            quota_domains: quota_domains.into_iter().collect(),
+            quota_preclaims: quota_preclaims.into_iter().collect(),
+            quota_trims: quota_trims.into_iter().collect(),
         };
         let frozen = wire::FrozenFragment {
             plan_version: header.plan_version.as_bytes().to_vec(),
@@ -201,6 +227,47 @@ impl FragmentArtifact {
     }
 }
 
+fn collect_quota_facts(
+    node: &plan::DistributedNode,
+    domains: &mut BTreeSet<i32>,
+    preclaims: &mut BTreeSet<i32>,
+    trims: &mut BTreeSet<i32>,
+) -> Result<(), String> {
+    use plan::plan_node::Kind;
+    let physical_kind = match node.payload.as_ref() {
+        Some(plan::distributed_node::Payload::Physical(physical)) => physical.kind.as_ref(),
+        _ => None,
+    };
+    let domain = match physical_kind {
+        Some(Kind::QuotaPreclaim(spec)) => {
+            if spec.preselection_domain_node_id != node.node_id
+                || node.node_id < 0
+                || !preclaims.insert(node.node_id)
+            {
+                return Err("quota preclaim must declare its own unique domain node".to_string());
+            }
+            Some(spec.preselection_domain_node_id)
+        }
+        Some(Kind::QuotaTrim(spec)) => {
+            if node.node_id < 0 || !trims.insert(node.node_id) {
+                return Err("quota trim must have a unique nonnegative node id".to_string());
+            }
+            Some(spec.preselection_domain_node_id)
+        }
+        _ => None,
+    };
+    if let Some(domain) = domain {
+        if domain < 0 {
+            return Err("quota domain node must be nonnegative".to_string());
+        }
+        domains.insert(domain);
+    }
+    for child in &node.children {
+        collect_quota_facts(child, domains, preclaims, trims)?;
+    }
+    Ok(())
+}
+
 fn contains_writer(node: &plan::DistributedNode) -> bool {
     matches!(
         node.payload.as_ref(),
@@ -210,12 +277,12 @@ fn contains_writer(node: &plan::DistributedNode) -> bool {
 
 /// The static sink branches, in the order the plan declares them. A sink
 /// that delivers nowhere -- the result, or a sink that discards -- has none.
-fn static_sink_targets(kind: &plan::data_sink::Kind) -> Box<[StaticSinkTarget]> {
+fn static_sink_targets(kind: &plan::data_sink::Kind) -> Result<Box<[StaticSinkTarget]>, String> {
     let target = |target_fragment_id, target_exchange_node_id| StaticSinkTarget {
         target_fragment_id,
         target_exchange_node_id,
     };
-    match kind {
+    Ok(match kind {
         plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Box::default(),
         plan::data_sink::Kind::DataStream(stream) => {
             Box::new([target(stream.target_fragment_id, stream.dest_node_id)])
@@ -230,7 +297,18 @@ fn static_sink_targets(kind: &plan::data_sink::Kind) -> Box<[StaticSinkTarget]> 
             .iter()
             .map(|route| target(route.target_fragment_id, route.target_exchange_node_id))
             .collect(),
-    }
+        plan::data_sink::Kind::PredicateFanout(fanout) => fanout
+            .branches
+            .iter()
+            .map(|branch| {
+                let stream = branch
+                    .stream
+                    .as_ref()
+                    .ok_or_else(|| "predicate fanout branch carries no stream".to_string())?;
+                Ok(target(stream.target_fragment_id, stream.dest_node_id))
+            })
+            .collect::<Result<Box<[_]>, String>>()?,
+    })
 }
 
 #[cfg(test)]

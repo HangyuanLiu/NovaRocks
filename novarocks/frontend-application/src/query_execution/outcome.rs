@@ -64,6 +64,9 @@ impl ResultExecutionOutcome {
 
 pub struct WriteExecutionOutcome {
     write_session: Option<ConnectorWriteSessionCompletion>,
+    execution_id: Option<novarocks_types::QueryExecutionId>,
+    verification_receipt:
+        Option<std::sync::Arc<crate::task_execution::execution::ReleasedVerificationFacts>>,
 }
 
 /// A write whose data plane closed and whose execution succeeded, carried to
@@ -122,6 +125,22 @@ impl ConnectorWriteSessionCompletion {
 }
 
 impl WriteExecutionOutcome {
+    pub fn execution_id(&self) -> Option<novarocks_types::QueryExecutionId> {
+        self.execution_id
+    }
+
+    pub fn verification_receipt(
+        &self,
+    ) -> Option<&crate::task_execution::execution::ReleasedVerificationFacts> {
+        self.verification_receipt.as_deref()
+    }
+
+    pub(crate) fn verification_receipt_arc(
+        &self,
+    ) -> Option<std::sync::Arc<crate::task_execution::execution::ReleasedVerificationFacts>> {
+        self.verification_receipt.clone()
+    }
+
     /// The NCP-6 session completion, present exactly when this query used the
     /// write-session data plane.
     pub(crate) fn into_write_session(self) -> Option<ConnectorWriteSessionCompletion> {
@@ -185,6 +204,35 @@ impl ProfileExecutionOutcome {
 }
 
 impl DistributedQueryOutcome {
+    pub(crate) fn with_attempt_verification(
+        mut self,
+        execution_id: novarocks_types::QueryExecutionId,
+        receipt: std::sync::Arc<crate::task_execution::execution::ReleasedVerificationFacts>,
+    ) -> Result<Self, DistributedQueryError> {
+        if receipt.execution_id() != execution_id {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "verification receipt does not belong to the exact execution attempt",
+            )
+            .with_attempt_verification(execution_id, None));
+        }
+        if let Self::Write(outcome) = &mut self {
+            if outcome
+                .execution_id
+                .is_some_and(|known| known != execution_id)
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "write outcome already belongs to another execution attempt",
+                )
+                .with_attempt_verification(execution_id, None));
+            }
+            outcome.execution_id = Some(execution_id);
+            outcome.verification_receipt = Some(receipt);
+        }
+        Ok(self)
+    }
+
     pub fn intent(&self) -> DistributedQueryIntent {
         match self {
             Self::Result(_) => DistributedQueryIntent::Result,
@@ -267,6 +315,8 @@ impl QueryOutcomeFactory {
         self.require_intent(DistributedQueryIntent::Write)?;
         Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
             write_session: Some(ConnectorWriteSessionCompletion { session, prepared }),
+            execution_id: None,
+            verification_receipt: None,
         }))
     }
 
@@ -384,4 +434,62 @@ fn outcome_variant_mismatch(
             "distributed query outcome variant mismatch: expected {expected:?}, received {received:?}"
         ),
     )
+}
+
+#[cfg(test)]
+mod owned_verification_receipt_tests {
+    use super::*;
+    use crate::task_execution::execution::ReleasedVerificationFacts;
+    use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+    use std::sync::Arc;
+
+    fn execution(attempt: u64) -> QueryExecutionId {
+        QueryExecutionId::new(QueryId::new(3, 9), AttemptId::new(attempt).unwrap()).unwrap()
+    }
+
+    fn write() -> DistributedQueryOutcome {
+        DistributedQueryOutcome::Write(WriteExecutionOutcome {
+            write_session: None,
+            execution_id: None,
+            verification_receipt: None,
+        })
+    }
+
+    #[test]
+    fn owned_verification_receipt_write_retains_exact_attempt_and_partial_facts() {
+        let execution = execution(1);
+        let facts = Arc::new(ReleasedVerificationFacts::for_test(
+            execution,
+            Default::default(),
+            vec![],
+            false,
+        ));
+        let outcome = write()
+            .with_attempt_verification(execution, Arc::clone(&facts))
+            .unwrap();
+        let DistributedQueryOutcome::Write(outcome) = outcome else {
+            unreachable!()
+        };
+        assert_eq!(outcome.execution_id(), Some(execution));
+        assert_eq!(outcome.verification_receipt(), Some(facts.as_ref()));
+        assert!(!outcome.verification_receipt().unwrap().permits_rollback());
+        assert_eq!(Arc::strong_count(&facts), 2);
+    }
+
+    #[test]
+    fn owned_verification_receipt_write_refuses_another_attempt() {
+        let facts = Arc::new(ReleasedVerificationFacts::for_test(
+            execution(2),
+            Default::default(),
+            vec![],
+            true,
+        ));
+        let error = write()
+            .with_attempt_verification(execution(1), facts)
+            .err()
+            .expect("a foreign attempt cannot authorize a write");
+        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+        assert_eq!(error.execution_id(), Some(execution(1)));
+        assert!(error.verification_receipt().is_none());
+    }
 }

@@ -242,6 +242,8 @@ pub struct ManagementObservationState {
     authorization: Option<ManagementObservationAuthorization>,
     liveness: ManagementObservationLiveness,
     latest_metadata_version: Option<ConnectorCommittedVersion>,
+    latest_marker_incarnation: Option<ProcessIncarnation>,
+    registration_predecessor: Option<ProcessIncarnation>,
 }
 
 impl ManagementObservationState {
@@ -297,7 +299,22 @@ impl ManagementObservationState {
             authorization,
             liveness: ManagementObservationLiveness::new(),
             latest_metadata_version: None,
+            latest_marker_incarnation: None,
+            registration_predecessor: None,
         })
+    }
+
+    /// Minted only by an entrance that retained a typed Unknown registration.
+    pub(super) fn with_registration_predecessor(
+        mut self,
+        predecessor: Option<ProcessIncarnation>,
+    ) -> Self {
+        self.registration_predecessor = predecessor;
+        self
+    }
+
+    pub(super) fn registration_marker_incarnation(&self) -> Option<&ProcessIncarnation> {
+        self.latest_marker_incarnation.as_ref()
     }
 
     pub const fn phase(&self) -> ManagementObservationPhase {
@@ -397,6 +414,7 @@ impl ManagementObservationState {
             ));
         }
         self.latest_metadata_version = Some(observation.metadata_version().clone());
+        self.latest_marker_incarnation = Some(observation.incarnation().clone());
 
         let result = match self.phase {
             ManagementObservationPhase::AwaitingFreshObservation => {
@@ -496,7 +514,9 @@ impl ManagementObservationState {
                     self.phase = ManagementObservationPhase::Ready;
                     return Ok(self.phase);
                 }
-                if observation.incarnation() != previous_incarnation {
+                if observation.incarnation() != previous_incarnation
+                    && self.registration_predecessor.as_ref() != Some(observation.incarnation())
+                {
                     return Err(ManagementObservationError::IncarnationMismatch);
                 }
                 RegistrationRequirement::Incarnation

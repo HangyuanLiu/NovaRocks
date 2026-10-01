@@ -2723,11 +2723,14 @@ impl TaskExecutionRegistry {
         let entry = state.contexts.get(&context);
         let observed = entry.map_or(QueryContextState::Gone, |entry| entry.state);
         let cause = entry.and_then(ContextEntry::termination_cause);
+        let evidence = entry
+            .map(|entry| entry.released_evidence.clone())
+            .unwrap_or_default();
         drop(state);
         OperationReceipt::acknowledged(
             operation,
             outcome,
-            ReleaseAcknowledgement::new(context, release, observed, cause),
+            ReleaseAcknowledgement::new(context, release, observed, cause).with_evidence(evidence),
         )
     }
 
@@ -3244,6 +3247,8 @@ impl TaskExecutionRegistry {
                         continue;
                     };
                     let mut live = *live;
+                    let verification = self.task_host.verification_facts(identity);
+                    entry.record_verification(context, verification);
                     live.status
                         .retire()
                         .expect("a retirement-ready live task can retire exactly once");
@@ -3458,6 +3463,11 @@ impl TaskExecutionRegistry {
                 entry.released_evidence = self.context_host.release(context);
                 entry.facts_released = true;
             }
+            let verification = entry.seal_verification(context);
+            entry.released_evidence = entry
+                .released_evidence
+                .clone()
+                .with_verification(verification);
             entry.domains = QueryContextDomains::empty();
             (
                 entry.tasks.keys().copied().collect::<Vec<_>>(),
@@ -4123,6 +4133,12 @@ impl Drop for CreationTransaction<'_> {
             if removed {
                 if let Some(entry) = state.contexts.get_mut(&self.context) {
                     if let Some(status) = &accepted {
+                        entry.record_verification(
+                            self.context,
+                            novarocks_execution_contract::TaskVerificationFacts::unavailable(
+                                self.identity,
+                            ),
+                        );
                         let current = status.current();
                         let final_info = status.final_info();
                         let receipt =

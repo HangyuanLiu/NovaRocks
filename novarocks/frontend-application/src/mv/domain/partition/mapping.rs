@@ -299,11 +299,11 @@ mod tests {
         fixture.interpretation.aggregates.clear();
         fixture.interpretation.state_slots.clear();
         fixture.interpretation.branches.clear();
-        fixture.interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        fixture.interpretation.apply_key = None;
         fixture.interpretation.target.fields.retain(|field| {
             matches!(
                 field.logical_identity,
-                PhysicalFieldLogicalIdentity::Output(_) | PhysicalFieldLogicalIdentity::ApplyKey(_)
+                PhysicalFieldLogicalIdentity::Output(_)
             )
         });
         fixture.interpretation.target.fields[0].type_signature = "bigint".into();

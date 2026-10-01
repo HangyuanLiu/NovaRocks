@@ -21,7 +21,7 @@
 -- Test Point: Iceberg IMV UNION shape validation rejects unsupported
 -- neighboring shapes at CREATE time.
 -- Scope: UNION DISTINCT, mixed projection/aggregate branches, incompatible
--- aggregate branches, reserved branch-id output names, and
+-- aggregate branches and
 -- heterogeneous-base composed branch-union aggregates (aggregate-over-join
 -- branches whose two branches join DIFFERENT base sets). Also pins the
 -- join-of-aggregate boundary: joins with aggregate subquery sides remain
@@ -127,7 +127,8 @@ FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 GROUP BY region;
 
 -- query 6
--- @expect_error=reserved for internal branch id
+-- A retired branch-id label is a normal visible output name for a stateless UNION.
+-- @skip_result_check=true
 CREATE MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0}
 DISTRIBUTED BY HASH(__branch_id__) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -173,6 +174,7 @@ GROUP BY d.region;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW union_duplicate_base_mv_${uuid0};
+DROP MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0};
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 FORCE;

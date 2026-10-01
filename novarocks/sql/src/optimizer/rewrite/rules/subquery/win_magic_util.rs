@@ -57,6 +57,12 @@ impl TableIdentity {
                     table: source.table.table.clone(),
                     table_uuid: None,
                 },
+                SqlScanKind::MvTargetBag { facts } => TableIdentity::Iceberg {
+                    catalog: format!("__mv_bag__{}", source.table.catalog),
+                    namespace: source.table.namespace.clone(),
+                    table: source.table.table.clone(),
+                    table_uuid: Some(facts.target_table_uuid.clone()),
+                },
                 SqlScanKind::MvTargetLocator { facts } => TableIdentity::Iceberg {
                     catalog: format!("__mv_locator__{}", source.table.catalog),
                     namespace: source.table.namespace.clone(),

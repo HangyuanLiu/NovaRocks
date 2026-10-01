@@ -2249,6 +2249,10 @@ pub trait ServerHandle: Send {
     ) -> Result<Option<process_resources::ClusterProcessIdentities>> {
         Ok(None)
     }
+    /// The exact runner-owned FE fault directory, available only for enabled fixtures.
+    fn query_lifecycle_fault_directory(&self) -> Option<&Path> {
+        None
+    }
     fn supports_fault_injection(&self) -> bool {
         false
     }
@@ -3982,6 +3986,11 @@ impl ServerHandle for CrossProcessServerHandle {
         &self,
     ) -> Result<Option<process_resources::ClusterProcessIdentities>> {
         CrossProcessServerHandle::process_resource_identities(self).map(Some)
+    }
+
+    fn query_lifecycle_fault_directory(&self) -> Option<&Path> {
+        self.query_lifecycle_faults_enabled
+            .then_some(self.query_lifecycle_fault_files.root())
     }
 
     fn supports_fault_injection(&self) -> bool {

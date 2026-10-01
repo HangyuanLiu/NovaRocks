@@ -19,7 +19,7 @@
 -- @order_sensitive=true
 -- @tags=optimizer,iceberg,imv,projection_filter,logical_cutover
 -- Test Objective:
--- Plan-shape golden for projection/filter IMV incremental refresh. This locks
+-- Directive assertions for projection/filter visible-bag incremental refresh. This locks
 -- the default EXPLAIN REFRESH output and the VERBOSE rendering for the same
 -- refresh rewrite pipeline.
 
@@ -75,20 +75,29 @@ INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES (4, 7);
 -- query 4
 -- Default EXPLAIN REFRESH should print the actual refresh logical plan.
 -- @skip_result_check=true
--- @result_contains=LEFT OUTER JOIN
+-- @result_contains=QUOTA PRECLAIM
+-- @result_contains=QUOTA TRIM
+-- @result_contains=PREDICATE FANOUT
+-- @result_not_contains=LEFT OUTER JOIN
 -- @result_contains=predicate: v2 > 0
--- @result_contains=__nova_base_row_id
+-- @result_not_contains=__nova_base_row_id
+-- @result_not_contains=__nova_join_row_key
 -- @result_not_contains=source:
 EXPLAIN REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 
 -- query 5
 -- VERBOSE should include the same refresh plan shape plus refresh source detail.
 -- @skip_result_check=true
--- @result_contains=LEFT OUTER JOIN
+-- @result_contains=QUOTA PRECLAIM
+-- @result_contains=QUOTA TRIM
+-- @result_contains=PREDICATE FANOUT
+-- @result_not_contains=LEFT OUTER JOIN
 -- @result_contains=predicate: v2 > 0
--- @result_contains=__nova_base_row_id
+-- @result_not_contains=__nova_base_row_id
+-- @result_not_contains=__nova_join_row_key
 -- @result_contains=source: IcebergDeltaTable
--- @result_contains=source: IcebergMvTargetLocator
+-- @result_contains=source: IcebergMvTargetBag
+-- @result_not_contains=source: IcebergMvTargetLocator
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 
 -- query 6

@@ -177,6 +177,11 @@ pub(crate) fn derive_output(
         Operator::PhysicalUnion(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalIntersect(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalExcept(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalQuotaPreclaim(_) | Operator::PhysicalQuotaTrim(_) => {
+            PhysicalPropertySet::any()
+        }
+        Operator::PhysicalFanoutAnchor(_) => children_outputs[1].clone(),
+        Operator::PhysicalFanoutConsume(o) => fanout_output_property(o),
         Operator::PhysicalCTEAnchor(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalDistribution(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalFilter(o) => o.derive_output(scalars, children_outputs),
@@ -236,6 +241,17 @@ pub(crate) fn derive_required(
         Operator::PhysicalUnion(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalIntersect(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalExcept(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalQuotaPreclaim(_) => {
+            vec![PhysicalPropertySet::broadcast(), PhysicalPropertySet::any()]
+        }
+        Operator::PhysicalQuotaTrim(o) => vec![
+            quota_hash_property(o.seed_entry_id),
+            quota_hash_property(o.candidate_entry_id),
+        ],
+        Operator::PhysicalFanoutAnchor(_) => {
+            vec![PhysicalPropertySet::any(), parent_required.clone()]
+        }
+        Operator::PhysicalFanoutConsume(_) => vec![],
         Operator::PhysicalCTEAnchor(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalDistribution(o) => {
             o.derive_required(scalars, parent_required, num_children)
@@ -502,3 +518,32 @@ pub(crate) mod set_op;
 pub(crate) mod sort;
 pub(crate) mod top_n;
 pub(crate) mod window;
+
+fn quota_hash_property(column: ColumnId) -> PhysicalPropertySet {
+    PhysicalPropertySet {
+        distribution: crate::optimizer::property::DistributionSpec::shuffle_join([column]),
+        ordering: crate::optimizer::property::OrderingSpec::Any,
+    }
+}
+fn fanout_output_property(
+    consume: &crate::planner::quota::PlanFanoutConsumeNode,
+) -> PhysicalPropertySet {
+    use crate::planner::quota::PlanFanoutDistribution;
+    match &consume.distribution {
+        PlanFanoutDistribution::RoundRobin => PhysicalPropertySet::any(),
+        PlanFanoutDistribution::Broadcast => PhysicalPropertySet::broadcast(),
+        PlanFanoutDistribution::Hash(columns) => PhysicalPropertySet {
+            distribution: crate::optimizer::property::DistributionSpec::shuffle_join(
+                columns.iter().map(|producer| {
+                    let ordinal = consume
+                        .producer_column_ids
+                        .iter()
+                        .position(|column| column == producer)
+                        .expect("fanout hash key must be materialized in the consumer mapping");
+                    consume.output_columns[ordinal].column_id
+                }),
+            ),
+            ordering: crate::optimizer::property::OrderingSpec::Any,
+        },
+    }
+}

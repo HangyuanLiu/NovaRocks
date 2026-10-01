@@ -155,6 +155,12 @@ pub struct RunningPipelineExecution {
 }
 
 impl RunningPipelineExecution {
+    pub(crate) fn runtime_error_state(
+        &self,
+    ) -> Arc<crate::runtime::runtime_state::RuntimeErrorState> {
+        self.runtime_state.error_state()
+    }
+
     pub const fn submitted_driver_count(&self) -> usize {
         self.submitted_driver_count
     }
@@ -1277,6 +1283,34 @@ mod tests {
             !schedule_state.is_in_blocked(),
             "timeout join must return only after the parked driver drains"
         );
+    }
+
+    #[test]
+    fn typed_operator_failure_survives_driver_and_completion_text_boundaries() {
+        use novarocks_execution_contract::{SafeDetail, TaskFailure};
+        struct RefusingOperator(TaskFailure);
+        impl Operator for RefusingOperator {
+            fn name(&self) -> &str {
+                "RefusingOperator"
+            }
+            fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+                Err(state.fail_task(self.0.clone()))
+            }
+        }
+        let failure = TaskFailure::mv_apply_consistency(11, 7, SafeDetail::new("tuple").unwrap());
+        let state = test_runtime_state();
+        let driver = PipelineDriver::new(
+            0,
+            vec![Box::new(RefusingOperator(failure.clone()))],
+            None,
+            Vec::new(),
+            Arc::clone(&state),
+            None,
+        );
+        let running = manually_prepared_execution(driver, state, None).start();
+        assert!(running.join().is_err());
+        assert!(running.stopped_fact().is_some());
+        assert_eq!(running.runtime_error_state().task_failure(), Some(failure));
     }
 
     #[test]

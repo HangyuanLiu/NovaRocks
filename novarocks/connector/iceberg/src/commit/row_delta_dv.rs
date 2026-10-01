@@ -61,7 +61,8 @@ use super::fast_append::commit_empty_iceberg_mv_snapshot;
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
-    snapshot_total_records, submit_occ_action, target_ref_snapshot_id, write_manifest_list,
+    snapshot_total_records, submit_snapshot_occ_action, target_ref_snapshot_id,
+    write_manifest_list,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_with_dv_merge, dv_summary, dv_total_records,
@@ -114,7 +115,17 @@ impl IcebergCommitAction for RowDeltaDvCommit {
         };
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
-        match submit_occ_action(ctx.catalog, ctx.table, action, "RowDeltaDv", None).await {
+        match submit_snapshot_occ_action(
+            ctx.catalog,
+            ctx.table,
+            action,
+            "RowDeltaDv",
+            None,
+            ctx.snapshot_properties,
+            ctx.metadata_updates,
+        )
+        .await
+        {
             Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = required_target_ref_snapshot_id(
                     table_after.metadata(),

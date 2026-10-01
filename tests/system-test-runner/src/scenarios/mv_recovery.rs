@@ -34,6 +34,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvRewriteBindingBarrier::default()),
         Box::new(MvCurrentDependencyRecheck::default()),
         Box::new(MvLegacyInterpretationRebuild::default()),
+        Box::new(MvCapacityStop::default()),
+        Box::new(MvInvalidRestart::default()),
+        Box::new(MvCommitResponseLoss::default()),
+        Box::new(MvValidationRecovery::new(
+            ValidationRecoveryCase::FrontendCrash,
+        )),
+        Box::new(MvValidationRecovery::new(
+            ValidationRecoveryCase::BackendFailure,
+        )),
         Box::new(MvRefreshConfigurationInterleaving::default()),
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
@@ -948,43 +957,60 @@ impl Scenario for MvLegacyInterpretationRebuild {
         setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         let create = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders";
         execute(context, &mut conn, "create an unpublished MV", create)?;
-        externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
+        externally_persist_legacy_nonaggregate_interpretation(
+            context,
+            &rest_uri,
+            "ns",
+            "orders_mv",
+        )?;
         drop(conn);
 
-        restart_frontend(context, "restart FE over an old nonzero big-endian L")?;
+        restart_frontend(
+            context,
+            "restart FE over a retired nonaggregate identity interpretation",
+        )?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        let closed = wait_for_status_phase(
-            context,
-            &mut conn,
-            catalog,
-            "orders_mv",
-            "AWAITING_EFFECT_SETTLEMENT",
-            "wait for recovered old-format MV management barrier",
-        )?;
-        let challenge = property(&closed, "Challenge")?;
-        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
-        context.action("settle the old FE before testing the old L binding");
-        let resumed: Vec<(String, Option<String>)> = conn.query(format!(
-            "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
-             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
-             'the system scenario replaced the old FE before rebuilding an old-format MV')"
-        ))?;
-        if property(&resumed, "SettledEffects")? != "1" {
-            bail!("old-format MV did not settle the old FE incarnation");
-        }
-        context.action("old L must reject a refresh before any publication");
-        let error = conn
-            .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
-            .expect_err("old nonzero big-endian L must fail closed")
-            .to_string();
-        if !error
-            .contains("MV runtime target schema version is not from the exact document generation")
-        {
-            bail!("old L refresh failed for another reason: {error}");
+        context.action("legacy nonaggregate L must reject incremental and full refresh");
+        for sql in [
+            "REFRESH MATERIALIZED VIEW orders_mv",
+            "REFRESH MATERIALIZED VIEW orders_mv FULL",
+        ] {
+            let error = conn
+                .query_drop(sql)
+                .expect_err("legacy persisted row identities must fail closed")
+                .to_string();
+            if !error.contains("legacy nonaggregate MV interpretation") || !error.contains("DROP") {
+                bail!("legacy L refresh failed for another reason: {error}");
+            }
         }
         assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 0)?;
 
+        let drop_error = conn
+            .query_drop("DROP MATERIALIZED VIEW orders_mv")
+            .expect_err("old incarnation requires an explicit management declaration before DROP")
+            .to_string();
+        if !drop_error.contains("resume") && !drop_error.contains("Resume") {
+            bail!(
+                "legacy DROP preflight failed without a management readmission requirement: {drop_error}"
+            );
+        }
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 0)?;
+        resume_management_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+        // Readmission settles the old incarnation's catalog/object effects.
+        // It permits DROP only; it does not rehabilitate the retired L.
+        for sql in [
+            "REFRESH MATERIALIZED VIEW orders_mv",
+            "REFRESH MATERIALIZED VIEW orders_mv FULL",
+        ] {
+            let error = conn
+                .query_drop(sql)
+                .expect_err("readmission must not rehabilitate legacy L")
+                .to_string();
+            if !error.contains("legacy nonaggregate MV interpretation") {
+                bail!("readmitted legacy L failed for another reason: {error}");
+            }
+        }
         execute(
             context,
             &mut conn,
@@ -1020,6 +1046,860 @@ impl Scenario for MvLegacyInterpretationRebuild {
         };
         fixture.shutdown()
     }
+}
+
+#[derive(Default)]
+struct MvInvalidRestart {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvInvalidRestart {
+    fn name(&self) -> &'static str {
+        "mv/invalid-restart"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_invalid_restart")?;
+        *self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))? = Some(fixture);
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_invalid_restart";
+        let (create_catalog, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot.as_ref().context("managed MV fixture is missing")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create baseline for physical corruption fault",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        let baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        context.action(
+            "replace one visible tuple in the private target Parquet without changing any metadata",
+        );
+        let evidence = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            slot.as_ref()
+                .context("managed MV fixture is missing")?
+                .corrupt_private_visible_tuple(
+                    "ns",
+                    "orders_mv",
+                    context.remaining("apply bounded private target physical corruption")?,
+                )?
+        };
+        context.action(evidence);
+        if lake_validation_baseline(context, &rest_uri, "orders_mv")? != baseline {
+            bail!("physical corruption altered S/P/E metadata");
+        }
+        execute(
+            context,
+            &mut conn,
+            "produce a real negative delta for the physically missing target tuple",
+            "DELETE FROM orders WHERE k1 = 1",
+        )?;
+        conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+            .expect_err("complete matching must refuse the physically missing target occurrence");
+        let invalid = require_invalid_deficit(context, &mut conn)?;
+        let generation = nullable_mv_status_string(&invalid, "EligibilityGeneration")?
+            .context("Invalid generation absent")?;
+        let invalid_baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        if invalid_baseline.snapshot != baseline.snapshot
+            || invalid_baseline.publication != baseline.publication
+            || invalid_baseline.eligibility == baseline.eligibility
+        {
+            bail!(
+                "completed deficit did not preserve data/progress and persist its invalidity conclusion"
+            );
+        }
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 1)?;
+        drop(conn);
+        restart_frontend(
+            context,
+            "restart FE over the durable complete deficit conclusion",
+        )?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        resume_management_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+        let recovered = require_invalid_deficit(context, &mut conn)?;
+        if nullable_mv_status_string(&recovered, "EligibilityGeneration")?.as_deref()
+            != Some(generation.as_str())
+            || lake_validation_baseline(context, &rest_uri, "orders_mv")? != invalid_baseline
+        {
+            bail!("FE readmission changed the exact durable Invalid conclusion");
+        }
+        execute(
+            context,
+            &mut conn,
+            "source progress cannot clear proved invalidity",
+            "INSERT INTO orders VALUES (3, 30)",
+        )?;
+        conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+            .expect_err("ordinary refresh must not rehabilitate Invalid");
+        require_invalid_deficit(context, &mut conn)?;
+        if lake_validation_baseline(context, &rest_uri, "orders_mv")? != invalid_baseline {
+            bail!("source progress or rejected refresh cleared durable Invalid");
+        }
+        execute(
+            context,
+            &mut conn,
+            "explicit full rebuild replaces physically corrupted target",
+            "REFRESH MATERIALIZED VIEW orders_mv FULL WITH SYNC MODE",
+        )?;
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(2, 20), (3, 30)],
+            "read full rebuild after durable Invalid and FE replacement",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        if let Some(mut fixture) = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take()
+        {
+            fixture.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+fn require_invalid_deficit(context: &mut ScenarioContext, conn: &mut Conn) -> Result<Row> {
+    let row = require_eligibility(context, conn, "orders_mv", "INVALID")?;
+    if nullable_mv_status_string(&row, "EligibilityRequested")?.as_deref() != Some("1")
+        || nullable_mv_status_string(&row, "EligibilityMatched")?.as_deref() != Some("0")
+    {
+        bail!("Invalid lacks exact complete requested=1/matched=0 evidence");
+    }
+    Ok(row)
+}
+
+/// Uses a dedicated FE budget rather than a synthetic capacity error.
+#[derive(Default)]
+struct MvCapacityStop {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvCapacityStop {
+    fn name(&self) -> &'static str {
+        "mv/capacity-stop"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_capacity_stop")?;
+        *self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))? = Some(fixture);
+        let overlay = launch.config_overlay.fe.get_or_insert_with(String::new);
+        overlay.push_str(
+            r#"
+[runtime]
+optimizer_query_mem_limit_bytes = 524288
+[standalone_server]
+mv_refresh_scheduler_enabled = true
+mv_refresh_scheduler_interval_ms = 100
+mv_refresh_scheduler_max_concurrent = 1
+mv_refresh_scheduler_failure_backoff_ms = 100
+mv_refresh_scheduler_max_failure_backoff_ms = 1000
+"#,
+        );
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_capacity_stop";
+        let (create_catalog, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot.as_ref().context("managed MV fixture is missing")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog, false)?;
+        execute(
+            context,
+            &mut conn,
+            "seed distinct visible tuples exceeding the exact quota budget",
+            "INSERT INTO orders SELECT CAST(number AS INT), CAST(number * 10 AS BIGINT) FROM TABLE(generate_series(0, 32768)) t(number)",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "create capacity baseline without quota application",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        let baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "create actual large negative demand",
+            "DELETE FROM orders WHERE k1 > 0",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "enable real automatic quota application",
+            "ALTER MATERIALIZED VIEW orders_mv SET REFRESH ASYNC EVERY INTERVAL 1 SECOND",
+        )?;
+        context.action("wait for typed capacity refusal from the real automatic refresh");
+        let stopped = loop {
+            let row = eligibility_row(context, &mut conn, "orders_mv")?;
+            if nullable_mv_status_string(&row, "AutomaticRefreshStopReason")?.as_deref()
+                == Some("CAPACITY_REFUSED")
+            {
+                break row;
+            }
+            context.remaining("wait for automatic capacity stop")?;
+            thread::sleep(POLL_INTERVAL);
+        };
+        let state = nullable_mv_status_string(&stopped, "EligibilityState")?
+            .context("capacity eligibility is missing")?;
+        if !matches!(state.as_str(), "ELIGIBLE" | "VALIDATION_PENDING") {
+            bail!("capacity stop invented a completed-deficit conclusion: {state}");
+        }
+        let stopped_baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        if stopped_baseline.snapshot != baseline.snapshot
+            || stopped_baseline.publication != baseline.publication
+        {
+            bail!("capacity refusal published partial data or progress");
+        }
+        execute(
+            context,
+            &mut conn,
+            "source progress must not clear a capacity stop",
+            "INSERT INTO orders VALUES (40000, 400000)",
+        )?;
+        // Observe across multiple scheduler opportunities, without rewriting
+        // the stop or clearing its retained typed cause in the test owner.
+        let observation_end = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < observation_end {
+            context.remaining("observe capacity stop after source progress")?;
+            let row = eligibility_row(context, &mut conn, "orders_mv")?;
+            if nullable_mv_status_string(&row, "AutomaticRefreshStopReason")?.as_deref()
+                != Some("CAPACITY_REFUSED")
+                || nullable_mv_status_string(&row, "EligibilityState")?.as_deref()
+                    != Some(state.as_str())
+            {
+                bail!("source progress cleared the retained capacity stop or eligibility fence");
+            }
+            if lake_validation_baseline(context, &rest_uri, "orders_mv")? != stopped_baseline {
+                bail!("stopped automatic refresh changed data, progress or eligibility");
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        execute(
+            context,
+            &mut conn,
+            "explicit full rebuild restores the stopped MV",
+            "REFRESH MATERIALIZED VIEW orders_mv FULL WITH SYNC MODE",
+        )?;
+        let recovered = require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        if nullable_mv_status_string(&recovered, "AutomaticRefreshStopReason")?.is_some() {
+            bail!("successful manual full refresh did not clear the capacity stop");
+        }
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(0, 0), (40000, 400000)],
+            "read full rebuild after real quota capacity refusal",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        if let Some(mut fixture) = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take()
+        {
+            fixture.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct MvCommitResponseLoss {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvCommitResponseLoss {
+    fn name(&self) -> &'static str {
+        "mv/commit-response-loss-reconciliation"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fault_dir = scenario_root.join("mv-commit-response-faults");
+        fs::create_dir_all(&fault_dir)?;
+        let (fixture, mut launch) = ManagedMvRestFixture::start_with_catalog_proxy(
+            scenario_root,
+            "system_mv_response_loss",
+        )?;
+        *self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))? = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".into(),
+            fault_dir.to_string_lossy().into_owned(),
+        );
+        // The refresh holds one blocking worker at the runner barrier;
+        // independent SHOW observations need a second ordinary worker.
+        let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
+        fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
+        launch.config_overlay.fe = Some(fe_overlay);
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_response_loss";
+        let (create_catalog, rest_uri, proxy) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot.as_ref().context("managed MV fixture is missing")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+                fixture.catalog_proxy_control(context.deadline())?,
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV for real commit response loss",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        let baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 1)?;
+        execute(
+            context,
+            &mut conn,
+            "produce the negative tuple whose commit reply will be lost",
+            "DELETE FROM orders WHERE k1 = 1",
+        )?;
+        let hold = FileTrigger::create(
+            &context
+                .scenario_root()
+                .join("mv-commit-response-faults/mv-refresh-at-data-prepared.trigger"),
+            "token=before-success-response-loss\n",
+        )?;
+        let pending_refresh = spawn_refresh(
+            context.mysql_user().to_owned(),
+            context.mysql_port(),
+            catalog,
+            "orders_mv",
+            context.remaining("start real response-loss refresh")?,
+        );
+        wait_for_fe_marker(
+            context,
+            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-success-response-loss",
+            "wait for full matching before arming the commit response fault",
+        )?;
+        require_eligibility(context, &mut conn, "orders_mv", "VALIDATION_PENDING")?;
+        if let Ok(result) = pending_refresh.try_recv() {
+            bail!("refresh exited before the runner armed commit response loss: {result:?}");
+        }
+        let before = proxy.successful_table_commits("ns", "orders_mv");
+        let fault = proxy.arm_next_table_commit("ns", "orders_mv")?;
+        hold.remove()?;
+        match pending_refresh
+            .recv_timeout(context.remaining("wait for exact provider reconciliation")?)
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("committed MV response loss did not reconcile: {error}"),
+            Err(error) => bail!("MV response-loss refresh did not finish: {error}"),
+        }
+        let evidence = fault.finish(context.deadline())?;
+        context.action(format!(
+            "actual downstream commit response loss: {evidence}"
+        ));
+        if proxy.successful_table_commits("ns", "orders_mv") != before + 1 {
+            bail!("response loss dispatched more than one successful MV commit");
+        }
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
+        let committed = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        if committed.snapshot == baseline.snapshot
+            || committed.publication == baseline.publication
+            || committed.eligibility == baseline.eligibility
+        {
+            bail!("reconciled commit did not atomically advance data, progress and eligibility");
+        }
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(2, 20)],
+            "read reconciled exact-once tuple deletion",
+        )?;
+        // A subsequent source delta must use the committed baseline rather
+        // than applying the lost-response deletion a second time.
+        execute(
+            context,
+            &mut conn,
+            "advance source after reconciled response loss",
+            "INSERT INTO orders VALUES (3, 30)",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(2, 20), (3, 30)],
+            "subsequent refresh starts from the reconciled publication",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        if let Some(mut fixture) = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take()
+        {
+            fixture.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ValidationRecoveryCase {
+    FrontendCrash,
+    BackendFailure,
+}
+
+struct MvValidationRecovery {
+    case: ValidationRecoveryCase,
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl MvValidationRecovery {
+    fn new(case: ValidationRecoveryCase) -> Self {
+        Self {
+            case,
+            fixture: Mutex::default(),
+        }
+    }
+    fn catalog(&self) -> &'static str {
+        match self.case {
+            ValidationRecoveryCase::FrontendCrash => "system_mv_pending_restart",
+            ValidationRecoveryCase::BackendFailure => "system_mv_before_matching_failure",
+        }
+    }
+}
+
+impl Scenario for MvValidationRecovery {
+    fn name(&self) -> &'static str {
+        match self.case {
+            ValidationRecoveryCase::FrontendCrash => "mv/validation-pending-restart",
+            ValidationRecoveryCase::BackendFailure => "mv/before-matching-backend-failure",
+        }
+    }
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fault_dir = scenario_root.join("mv-validation-faults");
+        fs::create_dir_all(&fault_dir)?;
+        let (fixture, mut launch) = ManagedMvRestFixture::start(scenario_root, self.catalog())?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture initialized twice");
+        }
+        *slot = Some(fixture);
+        if matches!(self.case, ValidationRecoveryCase::FrontendCrash) {
+            launch.child_environment.fe.insert(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
+                fault_dir.to_string_lossy().into_owned(),
+            );
+        }
+        // Backend failure arms must share the harness-owned FE/BE fault root:
+        // FE binds the arm to the exact attempt before a BE can claim it.
+        // The refresh holds one blocking worker at the runner barrier;
+        // independent SHOW observations need a second ordinary worker.
+        let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
+        fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
+        launch.config_overlay.fe = Some(fe_overlay);
+        Ok(launch)
+    }
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = self.catalog();
+        let (create_catalog, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot.as_ref().context("managed MV fixture is missing")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create visible tuple recovery MV",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "establish exact published baseline before recovery fault",
+        )?;
+        let baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "produce an actual negative visible tuple delta",
+            "DELETE FROM orders WHERE k1 = 1",
+        )?;
+        let validation_fault_dir = match self.case {
+            ValidationRecoveryCase::FrontendCrash => {
+                context.scenario_root().join("mv-validation-faults")
+            }
+            ValidationRecoveryCase::BackendFailure => context
+                .handle()
+                .runtime_dir()
+                .join("query-lifecycle-faults"),
+        };
+        let trigger = FileTrigger::create(
+            &validation_fault_dir.join("mv-refresh-at-validation-pending-saved.trigger"),
+            "token=validation-pending-saved\n",
+        )?;
+        let pending_refresh = spawn_refresh(
+            context.mysql_user().to_owned(),
+            context.mysql_port(),
+            catalog,
+            "orders_mv",
+            context.remaining("start pending validation refresh")?,
+        );
+        wait_for_fe_marker(
+            context,
+            "NOVAROCKS_MV_RECOVERY_PHASE phase=validation-pending-saved token=validation-pending-saved",
+            "observe lake-confirmed pending fence before matching dispatch",
+        )?;
+        let pending = require_eligibility(context, &mut conn, "orders_mv", "VALIDATION_PENDING")?;
+        let pending_attempt = pending
+            .get::<String, _>("EligibilityAttempt")
+            .context("pending attempt is missing")?;
+        let pending_baseline = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+        if baseline.snapshot != pending_baseline.snapshot
+            || baseline.publication != pending_baseline.publication
+        {
+            bail!("pending fence changed target data or publication");
+        }
+        if baseline.eligibility == pending_baseline.eligibility {
+            bail!("pending fence did not change lake eligibility");
+        }
+
+        if let Ok(result) = pending_refresh.try_recv() {
+            bail!("refresh exited before the runner injected the recovery fault: {result:?}");
+        }
+        match self.case {
+            ValidationRecoveryCase::FrontendCrash => {
+                drop(conn);
+                context
+                    .handle()
+                    .kill_fe()
+                    .context("kill FE after confirmed pending CAS")?;
+                trigger.remove()?;
+                expect_refresh_failure(
+                    context,
+                    pending_refresh,
+                    "interrupted pending refresh must unwind",
+                )?;
+                restart_frontend(context, "restart FE with lake pending fence intact")?;
+                conn = connect(context)?;
+                select_catalog_and_database(context, &mut conn, catalog)?;
+                resume_management_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+                let recovered =
+                    require_eligibility(context, &mut conn, "orders_mv", "VALIDATION_PENDING")?;
+                if recovered.get::<String, _>("EligibilityAttempt").as_deref()
+                    != Some(pending_attempt.as_str())
+                {
+                    bail!("FE replacement changed the exact pending attempt");
+                }
+                if lake_validation_baseline(context, &rest_uri, "orders_mv")? != pending_baseline {
+                    bail!(
+                        "management readmission changed pending eligibility, data or publication"
+                    );
+                }
+                execute(
+                    context,
+                    &mut conn,
+                    "source progress must not clear pending",
+                    "INSERT INTO orders VALUES (3, 30)",
+                )?;
+                let error = conn
+                    .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+                    .expect_err("pending baseline must reject ordinary refresh");
+                if error.to_string().is_empty() {
+                    bail!("pending rejection lacks diagnostics");
+                }
+                require_eligibility(context, &mut conn, "orders_mv", "VALIDATION_PENDING")?;
+                if lake_validation_baseline(context, &rest_uri, "orders_mv")? != pending_baseline {
+                    bail!("rejected refresh changed the lake pending fence or publication");
+                }
+            }
+            ValidationRecoveryCase::BackendFailure => {
+                let markers = total_be_marker_count(context, TASK_EXECUTION_FAILURE_MARKER)?;
+                let backends = context.handle().be_count();
+                for index in 0..backends {
+                    context
+                        .handle()
+                        .arm_query_lifecycle_fault(index, TASK_EXECUTION_FAILURE)?;
+                }
+                trigger.remove()?;
+                let result = expect_refresh_failure(
+                    context,
+                    pending_refresh,
+                    "BE failure must fail the frozen matching attempt",
+                );
+                context.handle().clear_query_lifecycle_faults()?;
+                result?;
+                if total_be_marker_count(context, TASK_EXECUTION_FAILURE_MARKER)? <= markers {
+                    bail!("refresh failed without the actual BE execution fault firing");
+                }
+                let recovered = eligibility_row(context, &mut conn, "orders_mv")?;
+                let state = recovered
+                    .get::<String, _>("EligibilityState")
+                    .context("eligibility state is missing")?;
+                let unchanged = lake_validation_baseline(context, &rest_uri, "orders_mv")?;
+                if unchanged.snapshot != baseline.snapshot
+                    || unchanged.publication != baseline.publication
+                {
+                    bail!("BE failure published partial target effects");
+                }
+                // Exact NotStarted receipts may recover; missing/unavailable
+                // preparation facts remain Pending. Task failure is no proof.
+                match state.as_str() {
+                    "ELIGIBLE" => {
+                        refresh(context, &mut conn, "orders_mv")?;
+                        assert_rows(
+                            context,
+                            &mut conn,
+                            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+                            &[(2, 20)],
+                            "retry only after exact unstarted verification recovered eligibility",
+                        )?;
+                        return Ok(());
+                    }
+                    "VALIDATION_PENDING" => {
+                        if recovered.get::<String, _>("EligibilityAttempt").as_deref()
+                            != Some(pending_attempt.as_str())
+                        {
+                            bail!("BE failure changed its pending attempt identity");
+                        }
+                    }
+                    other => bail!("BE failure invented a verification conclusion: {other}"),
+                }
+            }
+        }
+        execute(
+            context,
+            &mut conn,
+            "explicit full rebuild may restore pending eligibility",
+            "REFRESH MATERIALIZED VIEW orders_mv FULL WITH SYNC MODE",
+        )?;
+        require_eligibility(context, &mut conn, "orders_mv", "ELIGIBLE")?;
+        let expected: &[(i32, i64)] = match self.case {
+            ValidationRecoveryCase::FrontendCrash => &[(2, 20), (3, 30)],
+            ValidationRecoveryCase::BackendFailure => &[(2, 20)],
+        };
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            expected,
+            "full rebuild atomically restores data, publication and eligibility",
+        )?;
+        Ok(())
+    }
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        if let Some(mut fixture) = fixture {
+            fixture.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+// SQL NULL is an absent observation, not an invented status or counter.
+fn nullable_mv_status_string(row: &Row, column: &str) -> Result<Option<String>> {
+    row.get_opt::<Option<String>, _>(column)
+        .with_context(|| format!("SHOW MV lacks column {column}"))?
+        .with_context(|| format!("SHOW MV column {column} is not nullable text"))
+}
+
+fn eligibility_row(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<Row> {
+    let rows: Vec<Row> = query(
+        context,
+        conn,
+        "SHOW MATERIALIZED VIEWS FROM ns",
+        "observe lake-backed maintenance eligibility",
+    )?;
+    for row in rows {
+        if nullable_mv_status_string(&row, "Name")?.as_deref() == Some(mv) {
+            return Ok(row);
+        }
+    }
+    bail!("SHOW MATERIALIZED VIEWS omitted the recovery target")
+}
+
+fn require_eligibility(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    mv: &str,
+    expected: &str,
+) -> Result<Row> {
+    let row = eligibility_row(context, conn, mv)?;
+    let state = nullable_mv_status_string(&row, "EligibilityState")?
+        .context("SHOW MV lacks eligibility state")?;
+    if state != expected {
+        bail!("MV eligibility is {state}, expected {expected}");
+    }
+    Ok(row)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LakeValidationBaseline {
+    snapshot: i64,
+    publication: Vec<u8>,
+    eligibility: Vec<u8>,
+}
+
+fn lake_validation_baseline(
+    context: &ScenarioContext,
+    rest_uri: &str,
+    mv: &str,
+) -> Result<LakeValidationBaseline> {
+    let url = format!(
+        "{}/v1/namespaces/ns/tables/{mv}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact lake validation baseline")?)
+        .build()?
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    validation_baseline_from_metadata(&loaded["metadata"])
+}
+
+fn validation_baseline_from_metadata(
+    metadata: &serde_json::Value,
+) -> Result<LakeValidationBaseline> {
+    let snapshot = metadata["current-snapshot-id"]
+        .as_i64()
+        .context("target snapshot is missing")?;
+    let current = metadata["snapshots"]
+        .as_array()
+        .context("target snapshots are missing")?
+        .iter()
+        .find(|entry| entry["snapshot-id"].as_i64() == Some(snapshot))
+        .context("exact current target snapshot is missing")?;
+    // P belongs to the exact committed output snapshot. E is independently
+    // attached to current table metadata; they are different carrier domains.
+    let revision =
+        |properties: &serde_json::Value, name: &str, attachment: &str| -> Result<Vec<u8>> {
+            let encoded = properties["novarocks.documents.v1"]
+                .as_str()
+                .with_context(|| format!("{name} document manifest is missing"))?;
+            let manifest: serde_json::Value = serde_json::from_str(encoded)?;
+            if manifest["version"].as_u64() != Some(1) {
+                bail!("{name} document manifest has an unsupported version");
+            }
+            let documents = manifest["documents"]
+                .as_array()
+                .context("lake manifest document list is missing")?;
+            let mut matching = documents
+                .iter()
+                .filter(|doc| doc["owner"] == "novarocks.mv" && doc["name"] == name);
+            let document = matching
+                .next()
+                .with_context(|| format!("lake manifest lacks {name}"))?;
+            if matching.next().is_some()
+                || document["attachment"]["kind"].as_str() != Some(attachment)
+            {
+                bail!("{name} attachment is ambiguous or belongs to another carrier domain");
+            }
+            if attachment == "exact-output"
+                && document["attachment"]["snapshot_id"].as_i64() != Some(snapshot)
+            {
+                bail!("publication does not bind the exact current output");
+            }
+            let revision: Vec<u8> = serde_json::from_value(document["revision"].clone())?;
+            if revision.len() != 32 {
+                bail!("{name} revision is not exact SHA-256");
+            }
+            Ok(revision)
+        };
+    Ok(LakeValidationBaseline {
+        snapshot,
+        publication: revision(&current["summary"], "publication", "exact-output")?,
+        eligibility: revision(&metadata["properties"], "eligibility", "table-metadata")?,
+    })
 }
 
 #[derive(Default)]
@@ -1714,11 +2594,10 @@ fn externally_remove_current_definition_document(
     Ok(snapshot_id)
 }
 
-/// Reproduce the pre-fix CREATE encoding on an unpublished target. The test
-/// writer first advances the physical Iceberg schema ID, then writes that
-/// exact nonzero ID into L in the former big-endian order. No P exists yet,
-/// so no historical publication reference is rewritten by this fixture.
-fn externally_persist_old_endian_interpretation(
+/// Persist the former nonaggregate row-identity layout on an unpublished
+/// target. Its physical schema and L refer to the same exact field generation;
+/// only the retired interpretation prevents refresh admission.
+fn externally_persist_legacy_nonaggregate_interpretation(
     context: &mut ScenarioContext,
     rest_uri: &str,
     namespace: &str,
@@ -1757,6 +2636,10 @@ fn externally_persist_old_endian_interpretation(
     let last_column_id = metadata["last-column-id"]
         .as_i64()
         .context("REST MV metadata has no last column ID")?;
+    let legacy_field_id = last_column_id
+        .checked_add(1)
+        .context("legacy field ID overflow")?;
+    let legacy_field_identity = i32::try_from(legacy_field_id)?.to_le_bytes();
     let mut new_schema = metadata["schemas"]
         .as_array()
         .context("REST MV metadata has no schemas")?
@@ -1771,7 +2654,12 @@ fn externally_persist_old_endian_interpretation(
     if fields.len() < 2 {
         bail!("old-format L fixture requires two target fields to reorder");
     }
-    fields.reverse();
+    fields.push(serde_json::json!({
+        "id": legacy_field_id,
+        "name": "__nova_base_row_id",
+        "required": true,
+        "type": "long"
+    }));
     let encoded = metadata["properties"]["novarocks.documents.v1"]
         .as_str()
         .context("REST MV metadata has no table document manifest")?;
@@ -1800,12 +2688,35 @@ fn externally_persist_old_endian_interpretation(
     if i64::from(original_id) != current_schema_id || next_schema_id > i64::from(i32::MAX) {
         bail!("old-format L fixture schema version does not match the exact physical target");
     }
-    content[schema].copy_from_slice(&(next_schema_id as i32).to_be_bytes());
+    content[schema].copy_from_slice(&(next_schema_id as i32).to_le_bytes());
+    let logical_id = Sha256::digest(b"system-test-legacy-base-row-id");
+    let mut component = protobuf_encode_bytes(1, logical_id.as_slice());
+    component.extend(protobuf_encode_bytes(2, &legacy_field_identity));
+    // Retired BaseRowId = 1. Preserve an actual former apply-key component
+    // and its corresponding hidden physical target field, not malformed bytes.
+    let mut key = vec![0x08, 0x01];
+    key.extend(protobuf_encode_bytes(2, &component));
+    let mut physical = vec![0x08, 0x03];
+    physical.extend(protobuf_encode_bytes(2, logical_id.as_slice()));
+    physical.extend(protobuf_encode_bytes(3, &legacy_field_identity));
+    physical.extend(protobuf_encode_bytes(4, b"bigint"));
+    physical.extend([0x28, 0x00]);
+    let mut target_content = content[target.clone()].to_vec();
+    target_content.extend(protobuf_encode_bytes(4, &physical));
+    let target_field = protobuf_field_span(&content, 9)?;
+    content.splice(
+        target_field.clone(),
+        protobuf_encode_bytes(9, &target_content),
+    );
+    content.splice(
+        target_field.start..target_field.start,
+        protobuf_encode_bytes(6, &key),
+    );
     interpretation["carrier"]["content"] = serde_json::to_value(&content)?;
+    interpretation["encoded_len"] = serde_json::json!(content.len());
     interpretation["revision"] =
         serde_json::to_value(Vec::from(Sha256::digest(&content).as_slice()))?;
-    context
-        .action("persist an exact nonzero physical schema with the former big-endian L encoding");
+    context.action("persist retired BaseRowId L with an exact hidden physical identity field");
     let update = serde_json::json!({
         "requirements": [
             {"type": "assert-table-uuid", "uuid": table_uuid},
@@ -1813,7 +2724,7 @@ fn externally_persist_old_endian_interpretation(
             {"type": "assert-last-assigned-field-id", "last-assigned-field-id": last_column_id}
         ],
         "updates": [
-            {"action": "add-schema", "schema": new_schema, "last-column-id": last_column_id},
+            {"action": "add-schema", "schema": new_schema, "last-column-id": legacy_field_id},
             {"action": "set-current-schema", "schema-id": -1},
             {"action": "set-properties", "updates": {"novarocks.documents.v1": manifest.to_string()}}
         ]
@@ -1844,13 +2755,64 @@ fn externally_persist_old_endian_interpretation(
         .context("old-format L REST mutation lost L")?;
     let persisted_content: Vec<u8> =
         serde_json::from_value(persisted_l["carrier"]["content"].clone())?;
+    if persisted_l["encoded_len"].as_u64() != Some(persisted_content.len() as u64)
+        || persisted_l["revision"]
+            != serde_json::to_value(Vec::from(Sha256::digest(&persisted_content).as_slice()))?
+    {
+        bail!("legacy L REST mutation did not retain its exact content envelope");
+    }
     let target = protobuf_bytes_field(&persisted_content, 9)?;
     let schema = protobuf_bytes_field(&persisted_content[target.clone()], 2)?;
     let persisted_schema = target.start + schema.start..target.start + schema.end;
-    if persisted_content[persisted_schema] != (next_schema_id as i32).to_be_bytes() {
-        bail!("old-format L REST mutation did not retain the big-endian schema version");
+    if persisted_content[persisted_schema] != (next_schema_id as i32).to_le_bytes() {
+        bail!("legacy L REST mutation did not retain the exact schema generation");
+    }
+    if persisted_content[protobuf_bytes_field(&persisted_content, 6)?] != key {
+        bail!("legacy L REST mutation did not retain its retired apply-key facts");
     }
     Ok(())
+}
+
+fn protobuf_encode_bytes(field: u64, bytes: &[u8]) -> Vec<u8> {
+    fn varint(mut value: u64, output: &mut Vec<u8>) {
+        while value >= 128 {
+            output.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
+    }
+    let mut output = Vec::new();
+    varint((field << 3) | 2, &mut output);
+    varint(bytes.len() as u64, &mut output);
+    output.extend_from_slice(bytes);
+    output
+}
+
+fn protobuf_field_span(input: &[u8], expected: u64) -> Result<std::ops::Range<usize>> {
+    let mut offset = 0usize;
+    while offset < input.len() {
+        let start = offset;
+        let key = protobuf_varint(input, &mut offset)?;
+        match key & 7 {
+            0 => {
+                protobuf_varint(input, &mut offset)?;
+            }
+            2 => {
+                let length = usize::try_from(protobuf_varint(input, &mut offset)?)?;
+                offset = offset
+                    .checked_add(length)
+                    .context("protobuf fixture length overflow")?;
+                if offset > input.len() {
+                    bail!("protobuf fixture exceeds its document");
+                }
+            }
+            wire => bail!("unsupported protobuf fixture wire type {wire}"),
+        }
+        if key >> 3 == expected {
+            return Ok(start..offset);
+        }
+    }
+    bail!("protobuf fixture lacks field {expected}")
 }
 
 fn protobuf_bytes_field(input: &[u8], expected_field: u64) -> Result<std::ops::Range<usize>> {
@@ -2360,5 +3322,28 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("remove trigger {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod validation_baseline_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn lake_validation_baseline_reads_p_from_exact_snapshot_and_e_from_metadata() {
+        let p = json!({"owner":"novarocks.mv","name":"publication","revision":vec![1u8;32],"attachment":{"kind":"exact-output","snapshot_id":41}});
+        let e = json!({"owner":"novarocks.mv","name":"eligibility","revision":vec![2u8;32],"attachment":{"kind":"table-metadata"}});
+        let mut metadata = json!({"current-snapshot-id":41,"properties":{"novarocks.documents.v1":json!({"version":1,"documents":[e]}).to_string()},"snapshots":[{"snapshot-id":41,"summary":{"novarocks.documents.v1":json!({"version":1,"documents":[p]}).to_string()}}]});
+        assert_eq!(
+            validation_baseline_from_metadata(&metadata).unwrap(),
+            LakeValidationBaseline {
+                snapshot: 41,
+                publication: vec![1u8; 32],
+                eligibility: vec![2u8; 32]
+            }
+        );
+        metadata["current-snapshot-id"] = json!(42);
+        assert!(validation_baseline_from_metadata(&metadata).is_err());
     }
 }

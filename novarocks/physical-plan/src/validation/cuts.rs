@@ -547,6 +547,10 @@ pub(crate) fn extend_runtime_filter_build_dependencies(
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
             NodeKind::Aggregate { .. },
         ) => node.inputs.first().copied(),
+        (
+            crate::RuntimeFilterProducerTarget::QuotaContentField { .. },
+            NodeKind::QuotaPreclaim { .. },
+        ) => node.inputs.first().copied(),
         _ => None,
     };
     let Some(build_root) = build_root else {
@@ -705,6 +709,10 @@ pub(crate) fn extend_runtime_filter_proof_hull(
                         | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
                             lineage,
                             ..
+                        }
+                        | crate::RuntimeFilterConsumerTarget::QuotaContentScanField {
+                            lineage,
+                            ..
                         } => lineage.len(),
                     })
                 }));
@@ -750,6 +758,9 @@ pub(crate) fn extend_runtime_filter_proof_hull(
                 let lineage = match &consumer.target {
                     crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
                     | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                        lineage, ..
+                    }
+                    | crate::RuntimeFilterConsumerTarget::QuotaContentScanField {
                         lineage, ..
                     } => lineage,
                     crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => continue,
@@ -1143,6 +1154,7 @@ pub(crate) fn validate_fragment_cuts_into(
     let sink_edges = match fragment.sink() {
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
+        FragmentSink::PredicateFanout { branches } => branches.iter().map(|b| b.edge).collect(),
         FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
         FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => Vec::new(),
     };
@@ -1899,6 +1911,7 @@ pub(crate) fn validate_runtime_filter_proof_graph(
     }
     validate_runtime_filter_proof_edge_source_sinks(&proof_plan, path, errors);
     for filter in proof_plan.runtime_filters().values() {
+        validate_quota_runtime_filter_key_homology(&proof_plan, filter, path, errors);
         if !validate_runtime_filter_shape(filter, path, errors) {
             continue;
         }

@@ -540,6 +540,53 @@ pub(crate) fn validate_node_output_properties(
         ordering: Box::default(),
     };
     let expected = match &node.kind {
+        NodeKind::QuotaPreclaim { spec: _ } => {
+            if node.required_inputs.len() != 2
+                || node.required_inputs[0].distribution != Distribution::Broadcast
+                || node.required_inputs[0].row_multiplicity != RowMultiplicity::Replicated
+                || !node.required_inputs[0].ordering.is_empty()
+                || node.required_inputs[1] != empty
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "QuotaPreclaim requires a broadcast demand and single-copy target input",
+                ));
+            }
+            Some(&empty)
+        }
+        NodeKind::QuotaTrim { spec } => {
+            let valid = match node.required_inputs.as_ref() {
+                [left, right] => match (&left.distribution, &right.distribution) {
+                    (
+                        Distribution::Hash {
+                            keys: l,
+                            scheme: ls,
+                        },
+                        Distribution::Hash {
+                            keys: r,
+                            scheme: rs,
+                        },
+                    ) => {
+                        l.as_ref() == [spec.seed_entry_id]
+                            && r.as_ref() == [spec.candidate_entry_id]
+                            && ls == rs
+                            && left.row_multiplicity == RowMultiplicity::SingleCopy
+                            && right.row_multiplicity == RowMultiplicity::SingleCopy
+                            && left.ordering.is_empty()
+                            && right.ordering.is_empty()
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !valid {
+                errors.push(ValidationError::new(
+                    path,
+                    "QuotaTrim inputs require the same exact entry-id hash partition space",
+                ));
+            }
+            Some(&empty)
+        }
         NodeKind::Scan { relation, .. } => {
             if relation.provided_properties().row_multiplicity != RowMultiplicity::SingleCopy
                 || relation.provided_properties().distribution == Distribution::Broadcast

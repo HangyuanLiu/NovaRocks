@@ -297,6 +297,7 @@ pub(crate) struct SubmissionPlanFacts {
     order: Vec<FragmentId>,
     fragments: Vec<SubmissionFragmentFacts>,
     stream_edge_sources: std::collections::BTreeSet<FragmentId>,
+    predicate_fanout_sources: std::collections::BTreeSet<FragmentId>,
     /// Every consumer of every CTE, grouped by the CTE it reads. Which
     /// instances receive is placement's answer and is joined in at
     /// submission; everything here is a property of the plan.
@@ -315,6 +316,7 @@ impl SubmissionPlanFacts {
         order: Vec<FragmentId>,
         fragments: Vec<SubmissionFragmentFacts>,
         stream_edge_sources: std::collections::BTreeSet<FragmentId>,
+        predicate_fanout_sources: std::collections::BTreeSet<FragmentId>,
         cte_consumers: BTreeMap<u32, Vec<CteMulticastConsumer>>,
         router_edges: Vec<RouterSubmissionEdge>,
     ) -> Self {
@@ -324,6 +326,7 @@ impl SubmissionPlanFacts {
             order,
             fragments,
             stream_edge_sources,
+            predicate_fanout_sources,
             cte_consumers,
             router_edges,
         }
@@ -350,6 +353,10 @@ impl SubmissionPlanFacts {
         self.fragments
             .iter()
             .find(|fragment| fragment.fragment_id == fragment_id)
+    }
+
+    pub(crate) fn has_predicate_fanout_from(&self, fragment_id: FragmentId) -> bool {
+        self.predicate_fanout_sources.contains(&fragment_id)
     }
 
     pub(crate) fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {

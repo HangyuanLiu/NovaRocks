@@ -156,6 +156,7 @@ impl AggregateRetainedMemory {
         state_ptrs: &[AggStatePtr],
         batch: AggregateInputBatch<'_>,
         merge: bool,
+        runtime: Option<&crate::runtime::runtime_state::RuntimeState>,
     ) -> Result<(), String> {
         if state_ptrs.len() != batch.row_count() {
             return Err(format!(
@@ -168,17 +169,17 @@ impl AggregateRetainedMemory {
             RetainedMemoryPolicy::AllocationTracked => {
                 self.ensure_available()?;
                 return if merge {
-                    kernel.merge_batch(state_ptrs, batch)
+                    apply_typed_batch(kernel, state_ptrs, batch, true, runtime)
                 } else {
-                    kernel.update_batch(state_ptrs, batch)
+                    apply_typed_batch(kernel, state_ptrs, batch, false, runtime)
                 };
             }
             RetainedMemoryPolicy::FixedZero => {
                 return self.around_mutation(kernel, state_ptrs, || {
                     if merge {
-                        kernel.merge_batch(state_ptrs, batch)
+                        apply_typed_batch(kernel, state_ptrs, batch, true, runtime)
                     } else {
-                        kernel.update_batch(state_ptrs, batch)
+                        apply_typed_batch(kernel, state_ptrs, batch, false, runtime)
                     }
                 });
             }
@@ -193,9 +194,9 @@ impl AggregateRetainedMemory {
             let touched = touched.pointers(state_slice)?;
             self.around_mutation(kernel, touched, || {
                 if merge {
-                    kernel.merge_batch(state_slice, slice)
+                    apply_typed_batch(kernel, state_slice, slice, true, runtime)
                 } else {
-                    kernel.update_batch(state_slice, slice)
+                    apply_typed_batch(kernel, state_slice, slice, false, runtime)
                 }
             })?;
         }
@@ -664,6 +665,26 @@ fn combine_operation_and_accounting<T>(
 
 fn bytes_to_i64(bytes: usize) -> i64 {
     i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
+fn apply_typed_batch(
+    kernel: &AggKernelEntry,
+    pointers: &[AggStatePtr],
+    batch: AggregateInputBatch<'_>,
+    merge: bool,
+    runtime: Option<&crate::runtime::runtime_state::RuntimeState>,
+) -> Result<(), String> {
+    let result = if merge {
+        kernel.merge_batch_typed(pointers, batch)
+    } else {
+        kernel.update_batch_typed(pointers, batch)
+    };
+    result.map_err(|error| match (error, runtime) {
+        (crate::exec::expr::agg::PreparedAggregateError::TaskFailure(failure), Some(runtime)) => {
+            runtime.fail_task(failure)
+        }
+        (error, _) => error.to_string(),
+    })
 }
 
 #[cfg(test)]

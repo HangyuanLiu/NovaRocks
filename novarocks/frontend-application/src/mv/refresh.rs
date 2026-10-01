@@ -52,6 +52,7 @@ pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
+    pub(super) readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
 }
 
 pub(super) fn execute(
@@ -236,6 +237,7 @@ fn execute_data(
             "SQL-prepared MV write does not use its Lake publication identity",
         ));
     }
+    let validation_required = prepared.requires_visible_validation();
     let intent = prepared.publication_intent().clone();
     // The publication identity must not drift mid-attempt. A session-driven
     // write carries no operation id to re-check after the fact, so the
@@ -258,44 +260,88 @@ fn execute_data(
     let assembly = dependencies
         .provider_activation
         .activate_write(prepared, planning, &write_lease, execution, context.clone())
-        .map_err(invalid)?;
-    let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
+        .map_err(write_preparation_error)?;
+    let outcome =
+        dispatch_data_write(
+            dependencies,
+            assembly,
+            execution,
+            &context,
+            planning,
+            admitted,
+            if validation_required {
+                Some(intent.expected_target_snapshot_id().ok_or_else(|| {
+                    invalid("MV delete application has no published target snapshot")
+                })?)
+            } else {
+                None
+            },
+        )?;
+    let verification = outcome.verification_receipt_arc();
     let authority = write_commit_authority(outcome.into_write_session())?;
-    if let Err(error) = wait_for_mv_recovery_phase(MvRecoveryPhase::DataPrepared) {
+    let prepared_publication = (|| {
+        wait_for_mv_recovery_phase(MvRecoveryPhase::DataPrepared)?;
+        admitted
+            .recheck_current_dependencies(planning, &context)
+            .map_err(|error| {
+                MvApplicationError::new(MvApplicationErrorKind::BindingInvalidated, error)
+            })?;
+        bind_publication_documents(
+            planning,
+            &intent,
+            admitted,
+            authority.session(),
+            authority.row_count(),
+            &context,
+        )?;
+        // This responsibility starts immediately before the provider finish call.
+        admitted
+            .mark_dispatched(intent.publication_id())
+            .map_err(invalid)
+    })();
+    if let Err(error) = prepared_publication {
         crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
             authority.session(), &context,
         );
+        if validation_required {
+            if let Some(facts) = verification
+                .as_deref()
+                .filter(|facts| facts.permits_rollback())
+            {
+                finish_verified_uncommitted(dependencies, planning, admitted, facts, &context);
+            }
+        }
         return Err(error);
     }
-    if let Err(error) = admitted.recheck_current_dependencies(planning, &context) {
-        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
-            authority.session(), &context,
-        );
-        return Err(MvApplicationError::new(
-            MvApplicationErrorKind::BindingInvalidated,
-            error,
-        ));
-    }
-    bind_publication_documents(
-        planning,
-        &intent,
-        admitted,
-        authority.session(),
-        authority.row_count(),
-        &context,
-    )?;
-    // Past this point the commit may have happened, so the publication owns an
-    // outcome it must report. Marking it here rather than at admission keeps a
-    // statement that failed before the provider call from leaving the target
-    // unsettled over an effect nobody attempted.
-    admitted
-        .mark_dispatched(intent.publication_id())
-        .map_err(invalid)?;
     // Every publication commits, so there is no second route out of here. A
     // window that materialized nothing commits an empty write, which is what
     // advances the watermark P records; the `NoOp` effect that used to fall
     // back to a catalog-staged waterline can no longer be reported.
-    let (_, receipt) = commit_known(authority, context.clone())?;
+    let (_, receipt) = match commit_known(authority, context.clone()) {
+        Ok(committed) => committed,
+        Err(error) => {
+            if error.kind() == MvApplicationErrorKind::TerminalFailure && validation_required {
+                // Only the provider's explicit KnownUncommitted verdict can
+                // clear this dispatched responsibility before closing Pending.
+                if let Err(closure_error) = admitted.record_known_uncommitted_data_effect() {
+                    tracing::warn!(%closure_error, "MV known-uncommitted data responsibility could not close");
+                } else if let Some(verification) = verification
+                    .as_deref()
+                    .filter(|facts| facts.permits_rollback())
+                {
+                    finish_verified_uncommitted(
+                        dependencies,
+                        planning,
+                        admitted,
+                        verification,
+                        &context,
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+
     let committed = dependencies
         .provider_activation
         .interpret_write_commit(intent, &receipt)
@@ -427,9 +473,20 @@ fn dispatch_data_write(
     assembly: PreparedMvNativeWriteAssembly,
     execution: &QueryExecutionContext,
     context: &ConnectorRequestContext,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
+    validation_snapshot: Option<i64>,
 ) -> Result<crate::query_execution::outcome::WriteExecutionOutcome, MvApplicationError> {
     let write_session = Arc::clone(assembly.write_session());
-    let dispatched = bind_and_execute_data_write(dependencies, assembly, execution);
+    let dispatched = bind_and_execute_data_write(
+        dependencies,
+        assembly,
+        execution,
+        context,
+        planning,
+        admitted,
+        validation_snapshot,
+    );
     if dispatched.is_err() {
         crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
             &write_session, context,
@@ -438,23 +495,204 @@ fn dispatch_data_write(
     dispatched
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_and_execute_data_write(
     dependencies: &FrontendMvRefreshDependencies,
     assembly: PreparedMvNativeWriteAssembly,
     execution: &QueryExecutionContext,
+    context: &ConnectorRequestContext,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
+    validation_snapshot: Option<i64>,
 ) -> Result<crate::query_execution::outcome::WriteExecutionOutcome, MvApplicationError> {
-    let request = assembly
-        .finish()
-        .into_request(execution)
-        .map_err(|error| invalid(error.to_string()))?;
-    dependencies
+    let request = assembly.finish().into_request(execution).map_err(invalid)?;
+    // Reserve the exact native attempt before the lake fence and use this same
+    // reservation for dispatch; no auto-allocating execution may follow it.
+    let reservation = dependencies
         .query_execution
-        .execute(request)
+        .reserve_initial_attempt()
         .map_err(|error| {
             MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
-        })?
-        .into_write()
-        .map_err(|error| MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string()))
+        })?;
+    let execution_id = reservation.execution_id();
+    if let Some(snapshot) = validation_snapshot {
+        admitted
+            .begin_validation(planning, execution_id, snapshot, context)
+            .map_err(validation_update_error)?;
+        admitted
+            .install_eligibility_projection(dependencies.readiness.as_ref(), context)
+            .map_err(|error| {
+                MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
+            })?;
+    }
+    if validation_snapshot.is_some() {
+        wait_for_mv_recovery_phase(MvRecoveryPhase::ValidationPendingSaved)?;
+    }
+    let outcome = dependencies
+        .query_execution
+        .execute_reserved(request, reservation)
+        .and_then(|outcome| outcome.into_write());
+    match outcome {
+        Ok(outcome) => {
+            if validation_snapshot.is_some()
+                && (outcome.execution_id() != Some(execution_id)
+                    || !outcome.verification_receipt().is_some_and(|facts| {
+                        facts.execution_id() == execution_id && facts.permits_rollback()
+                    }))
+            {
+                return Err(MvApplicationError::new(
+                    MvApplicationErrorKind::Engine,
+                    "MV delete application did not return complete exact verification facts",
+                ));
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if validation_snapshot.is_some() && error.execution_id() == Some(execution_id) {
+                let completion = validation_completion(&error, execution_id);
+                if let Some(completion) = completion {
+                    match admitted
+                        .finish_validation(planning, completion, context)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| {
+                            admitted.install_eligibility_projection(
+                                dependencies.readiness.as_ref(),
+                                context,
+                            )
+                        }) {
+                        Ok(()) => {}
+                        Err(persistence_error) => {
+                            tracing::warn!(%persistence_error, "MV validation conclusion could not be installed; the baseline remains fenced")
+                        }
+                    }
+                }
+            }
+            Err(distributed_mv_error(&error))
+        }
+    }
+}
+
+fn validation_completion(
+    error: &crate::query_execution::contract::DistributedQueryError,
+    execution_id: novarocks_types::QueryExecutionId,
+) -> Option<crate::mv::domain::eligibility_document::ValidationCompletion<'_>> {
+    use crate::mv::domain::eligibility_document::ValidationCompletion;
+    if error.execution_id() != Some(execution_id) {
+        return None;
+    }
+    let facts = error
+        .verification_receipt()
+        .filter(|facts| facts.execution_id() == execution_id)?;
+    if let Some(deficit) = facts.completed_deficit_evidence() {
+        let samples = match error.task_failure().map(|failure| failure.category()) {
+            Some(novarocks_execution_contract::TaskFailureCategory::MvApplyConsistency {
+                sample,
+                ..
+            }) => vec![sample.as_str().as_bytes().iter().copied().take(
+                    novarocks_mv_application::persistence::eligibility::MAX_ELIGIBILITY_SAMPLE_BYTES
+                ).collect()],
+            _ => Vec::new(),
+        };
+        Some(ValidationCompletion::Invalid {
+            execution_id,
+            evidence: novarocks_mv_application::persistence::eligibility::EligibilityEvidence {
+                requested: deficit.requested,
+                matched: deficit.matched,
+                samples,
+            },
+        })
+    } else if facts.permits_rollback() {
+        Some(ValidationCompletion::VerifiedUncommitted {
+            verification: facts,
+        })
+    } else {
+        None
+    }
+}
+
+fn finish_verified_uncommitted(
+    dependencies: &FrontendMvRefreshDependencies,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
+    verification: &crate::task_execution::execution::ReleasedVerificationFacts,
+    context: &ConnectorRequestContext,
+) {
+    let completion =
+        crate::mv::domain::eligibility_document::ValidationCompletion::VerifiedUncommitted {
+            verification,
+        };
+    if let Err(error) = admitted
+        .finish_validation(planning, completion, context)
+        .map_err(|error| error.to_string())
+        .and_then(|()| {
+            admitted.install_eligibility_projection(dependencies.readiness.as_ref(), context)
+        })
+    {
+        tracing::warn!(%error,"MV verified-uncommitted qualification could not be installed; the baseline remains fenced");
+    }
+}
+
+fn validation_update_error(
+    error: crate::mv::domain::eligibility_document::ValidationUpdateError,
+) -> MvApplicationError {
+    use crate::mv::domain::eligibility_document::ValidationUpdateError;
+    let kind = match &error {
+        ValidationUpdateError::CommitUnknown(_) => MvApplicationErrorKind::CommitUnknown,
+        ValidationUpdateError::CommittedProjectionFailed(_) => {
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        }
+        ValidationUpdateError::KnownUncommitted(_)
+        | ValidationUpdateError::ValidationConflict(_) => {
+            MvApplicationErrorKind::BindingInvalidated
+        }
+    };
+    MvApplicationError::new(kind, error.to_string())
+}
+
+fn write_preparation_error(
+    error: crate::query_execution::mv_native_write::MvWritePreparationError,
+) -> MvApplicationError {
+    use crate::query_execution::mv_native_write::MvWritePreparationError;
+    use novarocks_spi::connector::ConnectorErrorKind;
+    match error {
+        MvWritePreparationError::Contract(message) => invalid(message),
+        MvWritePreparationError::Connector(error) => {
+            let kind = if error.target_format_failure().is_some() {
+                MvApplicationErrorKind::TargetRefused
+            } else {
+                match error.kind() {
+                    ConnectorErrorKind::ResourceExhausted => {
+                        MvApplicationErrorKind::CapacityRefused
+                    }
+                    ConnectorErrorKind::InvalidRequest | ConnectorErrorKind::Unsupported => {
+                        MvApplicationErrorKind::InvalidRequest
+                    }
+                    ConnectorErrorKind::CorruptData => MvApplicationErrorKind::Corruption,
+                    _ => MvApplicationErrorKind::Unavailable,
+                }
+            };
+            MvApplicationError::new(kind, error.to_string())
+        }
+    }
+}
+
+fn distributed_mv_error(
+    error: &crate::query_execution::contract::DistributedQueryError,
+) -> MvApplicationError {
+    use novarocks_execution_contract::TaskFailureCategory;
+    let kind = match error.task_failure().map(|failure| failure.category()) {
+        Some(TaskFailureCategory::MvApplyConsistency { .. }) => {
+            MvApplicationErrorKind::ConsistencyFailed
+        }
+        Some(TaskFailureCategory::CapacityRefused { .. }) => {
+            MvApplicationErrorKind::CapacityRefused
+        }
+        Some(TaskFailureCategory::TargetFormatUnsupported { .. }) => {
+            MvApplicationErrorKind::TargetRefused
+        }
+        _ => MvApplicationErrorKind::Engine,
+    };
+    MvApplicationError::new(kind, error.to_string())
 }
 
 /// Publish a refresh whose inputs did not move.
@@ -624,6 +862,9 @@ fn product_error(error: MvProductError) -> MvApplicationError {
         MvProductErrorKind::KnownCommittedFinalizeFailed => {
             MvApplicationErrorKind::KnownCommittedFinalizeFailed
         }
+        MvProductErrorKind::ConsistencyFailed => MvApplicationErrorKind::ConsistencyFailed,
+        MvProductErrorKind::CapacityRefused => MvApplicationErrorKind::CapacityRefused,
+        MvProductErrorKind::TargetRefused => MvApplicationErrorKind::TargetRefused,
         MvProductErrorKind::Conflict => MvApplicationErrorKind::AlreadyActive,
         MvProductErrorKind::Unavailable => MvApplicationErrorKind::Unavailable,
         MvProductErrorKind::InvalidRequest => MvApplicationErrorKind::InvalidRequest,
@@ -642,6 +883,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
 /// has supplied the exact fault root and trigger file.
 #[derive(Clone, Copy)]
 enum MvRecoveryPhase {
+    ValidationPendingSaved,
     DataPrepared,
     WriteCommitted,
     PublicationCommitted,
@@ -651,6 +893,7 @@ enum MvRecoveryPhase {
 impl MvRecoveryPhase {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::ValidationPendingSaved => "validation-pending-saved",
             Self::DataPrepared => "data-prepared",
             Self::WriteCommitted => "write-committed",
             Self::PublicationCommitted => "publication-committed",
@@ -797,12 +1040,12 @@ fn commit_empty_publication(
     ),
     MvApplicationError,
 > {
-    interpret_committed_write(
-        crate::query_execution::write_session::finish_empty_metadata_only_publication(
-            session, context,
-        )
-        .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome),
+    let outcome = crate::query_execution::write_session::finish_empty_metadata_only_publication(
+        session,
+        context.clone(),
     )
+    .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome);
+    reconcile_mv_commit_once(session, outcome, context)
 }
 
 fn commit_known(
@@ -821,10 +1064,36 @@ fn commit_known(
     // publication carries and the provider applies at finish. Skipping the call
     // here would silently drop the commit of a full-overwrite refresh that
     // legitimately truncates its target.
-    interpret_committed_write(
-        crate::query_execution::write_session::finish_write_session(authority, context)
-            .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome),
-    )
+    let session = Arc::clone(authority.session());
+    let outcome =
+        crate::query_execution::write_session::finish_write_session(authority, context.clone())
+            .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome);
+    reconcile_mv_commit_once(&session, outcome, context)
+}
+
+/// Adjudicate an explicit provider Unknown once on the retained exact session.
+/// If the provider cannot conclude, the management responsibility stays Unknown.
+fn reconcile_mv_commit_once(
+    session: &crate::query_execution::write_session::ConnectorWriteSession,
+    outcome: Result<
+        ExternalMutationOutcome<ConnectorWriteReceipt>,
+        novarocks_spi::connector::ConnectorError,
+    >,
+    context: ConnectorRequestContext,
+) -> Result<
+    (
+        novarocks_spi::connector::ExternalMutationEffect,
+        ConnectorWriteReceipt,
+    ),
+    MvApplicationError,
+> {
+    let outcome = match outcome {
+        Ok(ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+            session.reconcile(evidence, context)
+        }
+        other => other,
+    };
+    interpret_committed_write(outcome)
 }
 
 /// One reading of what a finished write session reported.
@@ -841,7 +1110,7 @@ fn interpret_committed_write(
     MvApplicationError,
 > {
     match outcome.map_err(|error| {
-        MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
+        MvApplicationError::new(MvApplicationErrorKind::CommitUnknown, error.to_string())
     })? {
         ExternalMutationOutcome::KnownCommitted {
             effect,
@@ -855,7 +1124,7 @@ fn interpret_committed_write(
             )),
         },
         ExternalMutationOutcome::KnownUncommitted { failure } => Err(MvApplicationError::new(
-            MvApplicationErrorKind::Engine,
+            MvApplicationErrorKind::TerminalFailure,
             failure.to_string(),
         )),
         ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(MvApplicationError::new(
@@ -871,6 +1140,9 @@ fn invalid(message: impl Into<String>) -> MvApplicationError {
 
 fn provider_failure(error: MvApplicationError) -> MvProviderFailure {
     let kind = match error.kind() {
+        MvApplicationErrorKind::ConsistencyFailed => MvProviderFailureKind::ConsistencyFailed,
+        MvApplicationErrorKind::CapacityRefused => MvProviderFailureKind::CapacityRefused,
+        MvApplicationErrorKind::TargetRefused => MvProviderFailureKind::TargetRefused,
         MvApplicationErrorKind::InvalidRequest => MvProviderFailureKind::InvalidRequest,
         MvApplicationErrorKind::Unavailable
         | MvApplicationErrorKind::Repository
@@ -910,6 +1182,163 @@ mod tests {
     use novarocks_mv_application::publication::{
         MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
     };
+
+    fn validation_error(
+        state: novarocks_execution_contract::VerificationState,
+        complete: bool,
+    ) -> crate::query_execution::contract::DistributedQueryError {
+        use novarocks_execution_contract::{
+            ContextVerificationFacts, QueryContextRef, TaskIdentity, TaskVerificationFacts,
+            TaskVerificationObservation, VerificationInstance, VerificationRecord,
+        };
+        use novarocks_types::{
+            AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId,
+            TaskId,
+        };
+        let execution =
+            QueryExecutionId::new(QueryId::new(9, 7), AttemptId::new(1).unwrap()).unwrap();
+        let backend = BackendProcessId::new_v7();
+        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            backend,
+        );
+        let instance = VerificationInstance {
+            plan_node_id: 17,
+            local_instance_id: 0,
+        };
+        let facts = crate::task_execution::execution::ReleasedVerificationFacts::for_test(
+            execution,
+            std::collections::BTreeMap::from([(
+                context,
+                ContextVerificationFacts {
+                    context,
+                    truncated: false,
+                    tasks: vec![TaskVerificationFacts {
+                        identity,
+                        observation: TaskVerificationObservation::Available(vec![
+                            VerificationRecord { instance, state },
+                        ]),
+                    }],
+                },
+            )]),
+            vec![(identity, instance)],
+            complete,
+        );
+        crate::query_execution::contract::DistributedQueryError::new(
+            crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+            "failed",
+        )
+        .with_task_failure(Some(
+            novarocks_execution_contract::TaskFailure::mv_apply_consistency(
+                99,
+                0,
+                novarocks_execution_contract::SafeDetail::truncating("bounded tuple"),
+            ),
+        ))
+        .with_attempt_verification(execution, Some(Arc::new(facts)))
+    }
+
+    #[test]
+    fn validation_completion_uses_complete_facts_instead_of_terminal_category() {
+        use crate::mv::domain::eligibility_document::ValidationCompletion;
+        use novarocks_execution_contract::VerificationState;
+        let error = validation_error(
+            VerificationState::Completed {
+                requested: 5,
+                matched: 2,
+            },
+            true,
+        );
+        let Some(ValidationCompletion::Invalid { evidence, .. }) =
+            validation_completion(&error, error.execution_id().unwrap())
+        else {
+            panic!("complete deficit must invalidate")
+        };
+        assert_eq!((evidence.requested, evidence.matched), (5, 2));
+        for state in [
+            VerificationState::NotStarted,
+            VerificationState::Completed {
+                requested: 5,
+                matched: 5,
+            },
+        ] {
+            let error = validation_error(state, true);
+            assert!(matches!(
+                validation_completion(&error, error.execution_id().unwrap()),
+                Some(ValidationCompletion::VerifiedUncommitted { .. })
+            ));
+        }
+        let error = validation_error(VerificationState::Started, true);
+        assert!(validation_completion(&error, error.execution_id().unwrap()).is_none());
+        let error = validation_error(
+            VerificationState::Completed {
+                requested: 5,
+                matched: 2,
+            },
+            false,
+        );
+        assert!(validation_completion(&error, error.execution_id().unwrap()).is_none());
+        let other = novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(9, 7),
+            novarocks_types::AttemptId::new(2).unwrap(),
+        )
+        .unwrap();
+        assert!(validation_completion(&error, other).is_none());
+    }
+
+    #[test]
+    fn write_preparation_classification_preserves_typed_target_and_capacity_refusal() {
+        use crate::query_execution::mv_native_write::MvWritePreparationError;
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, ConnectorTargetDeleteKind,
+        };
+        assert_eq!(
+            write_preparation_error(MvWritePreparationError::Connector(
+                ConnectorError::target_format_unsupported(
+                    "candidate",
+                    ConnectorTargetDeleteKind::Equality
+                )
+            ))
+            .kind(),
+            MvApplicationErrorKind::TargetRefused
+        );
+        assert_eq!(
+            write_preparation_error(MvWritePreparationError::Connector(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "budget"
+            )))
+            .kind(),
+            MvApplicationErrorKind::CapacityRefused
+        );
+        assert_eq!(
+            write_preparation_error(MvWritePreparationError::Contract(
+                "target format capacity".into()
+            ))
+            .kind(),
+            MvApplicationErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn explicit_unknown_mv_commit_adjudicates_once_and_keeps_unknown_if_unresolved() {
+        let fixture =
+            write_session_tests::fixture_with_outcome(1, 16, write_session_tests::commit_unknown());
+        let completion = session_completion(
+            &fixture.session,
+            7,
+            vec![(sole_target(), write_session_tests::commit_fragment_bytes())],
+        );
+        let error = commit_known(completion, write_session_tests::request_context()).unwrap_err();
+        assert_eq!(error.kind(), MvApplicationErrorKind::CommitUnknown);
+        let recorded = fixture.recorded.lock().unwrap();
+        assert_eq!(
+            (recorded.finish, recorded.reconcile, recorded.abort),
+            (1, 1, 0)
+        );
+    }
 
     fn committed_version(snapshot_id: i64) -> ConnectorCommittedVersion {
         ConnectorCommittedVersion::try_new(

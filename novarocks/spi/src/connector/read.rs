@@ -80,6 +80,17 @@ impl ConnectorScan {
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_change_window_admission(&admission, context)?;
+        if matches!(
+            admission,
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: ConnectorContentNetZeroBasis::SameSnapshot
+            }
+        ) && window.from_exclusive != window.to_inclusive
+        {
+            return Err(invalid(
+                "same-snapshot content proof has distinct window endpoints",
+            ));
+        }
         Self::try_new(
             owner,
             ConnectorScanSelection::ChangeWindow(window),
@@ -242,13 +253,35 @@ pub enum ConnectorScanAdmission {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorChangeWindowAdmission {
-    MetadataOnly,
+    /// The provider proved that every content equivalence class has zero delta
+    /// under the frozen window interpretation. Physical change flags alone do
+    /// not prove this fact.
+    ContentNetZero {
+        basis: ConnectorContentNetZeroBasis,
+    },
     Incremental {
         has_inserts: bool,
         has_deletes: bool,
         partition_impact: ConnectorChangeWindowPartitionImpact,
     },
     FullRebuild(ConnectorChangeWindowFullRebuildReason),
+}
+
+/// Provider-owned evidence for skipping a change-window source stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorContentNetZeroBasis {
+    SameSnapshot,
+    PhysicalIdentity,
+    ValidatedReplaceChain,
+}
+
+impl ConnectorChangeWindowAdmission {
+    pub const fn content_net_zero_basis(&self) -> Option<ConnectorContentNetZeroBasis> {
+        match self {
+            Self::ContentNetZero { basis } => Some(*basis),
+            Self::Incremental { .. } | Self::FullRebuild(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,20 +460,13 @@ fn validate_change_window_admission(
     context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     let bytes = match admission {
-        ConnectorChangeWindowAdmission::MetadataOnly => CHANGE_ADMISSION_BYTES,
-        ConnectorChangeWindowAdmission::Incremental {
-            has_inserts,
-            has_deletes,
-            partition_impact,
-        } => {
-            if !has_inserts && !has_deletes {
-                return Err(invalid(
-                    "connector incremental change-window admission has no row changes",
-                ));
-            }
-            CHANGE_ADMISSION_BYTES
-                .saturating_add(validate_partition_impact(partition_impact, context)?)
+        ConnectorChangeWindowAdmission::ContentNetZero { .. } => {
+            CHANGE_ADMISSION_BYTES.saturating_add(1)
         }
+        ConnectorChangeWindowAdmission::Incremental {
+            partition_impact, ..
+        } => CHANGE_ADMISSION_BYTES
+            .saturating_add(validate_partition_impact(partition_impact, context)?),
         ConnectorChangeWindowAdmission::FullRebuild(_) => {
             CHANGE_ADMISSION_BYTES.saturating_add(2 * std::mem::size_of::<i64>())
         }
@@ -679,7 +705,14 @@ fn connector_scan_admission_digest(admission: &ConnectorScanAdmission) -> [u8; 3
 
 fn hash_change_window_admission(digest: &mut Sha256, admission: &ConnectorChangeWindowAdmission) {
     match admission {
-        ConnectorChangeWindowAdmission::MetadataOnly => digest.update([0]),
+        ConnectorChangeWindowAdmission::ContentNetZero { basis } => digest.update([
+            0,
+            match basis {
+                ConnectorContentNetZeroBasis::SameSnapshot => 0,
+                ConnectorContentNetZeroBasis::PhysicalIdentity => 1,
+                ConnectorContentNetZeroBasis::ValidatedReplaceChain => 2,
+            },
+        ]),
         ConnectorChangeWindowAdmission::Incremental {
             has_inserts,
             has_deletes,
@@ -984,7 +1017,9 @@ mod tests {
         let error = ConnectorScan::try_new(
             owner.clone(),
             ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
-            ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::MetadataOnly),
+            ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: ConnectorContentNetZeroBasis::SameSnapshot,
+            }),
             handle(&owner, b"scan-v1"),
             Arc::new(Schema::empty()),
             Vec::new(),
@@ -1001,7 +1036,9 @@ mod tests {
         let mut scan = ConnectorScan::try_new_change_window(
             owner.clone(),
             window,
-            ConnectorChangeWindowAdmission::MetadataOnly,
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: ConnectorContentNetZeroBasis::SameSnapshot,
+            },
             handle(&owner, b"delta-v1"),
             Arc::new(Schema::empty()),
             Vec::new(),
@@ -1023,6 +1060,66 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    #[test]
+    fn content_proof_basis_changes_admission_digest_and_seal() {
+        let owner = owner();
+        let window = ConnectorChangeWindow::new(9, 9);
+        let mut digests = std::collections::BTreeSet::new();
+        for basis in [
+            ConnectorContentNetZeroBasis::SameSnapshot,
+            ConnectorContentNetZeroBasis::PhysicalIdentity,
+            ConnectorContentNetZeroBasis::ValidatedReplaceChain,
+        ] {
+            let admission = ConnectorChangeWindowAdmission::ContentNetZero { basis };
+            let mut scan = ConnectorScan::try_new_change_window(
+                owner.clone(),
+                window,
+                admission,
+                handle(&owner, b"delta-v1"),
+                Arc::new(Schema::empty()),
+                Vec::new(),
+                &context(1024, 4096),
+            )
+            .expect("content proof admission");
+            assert!(digests.insert(scan.admission_digest));
+            let changed_basis = if basis == ConnectorContentNetZeroBasis::PhysicalIdentity {
+                ConnectorContentNetZeroBasis::ValidatedReplaceChain
+            } else {
+                ConnectorContentNetZeroBasis::PhysicalIdentity
+            };
+            scan.admission = ConnectorScanAdmission::ChangeWindow(
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: changed_basis,
+                },
+            );
+            assert_eq!(
+                scan.validate(&owner, ConnectorScanSelection::ChangeWindow(window))
+                    .expect_err("proof basis tampering must fail")
+                    .kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
+        assert_eq!(digests.len(), 3);
+    }
+
+    #[test]
+    fn same_snapshot_content_proof_requires_equal_endpoints() {
+        let owner = owner();
+        let error = ConnectorScan::try_new_change_window(
+            owner.clone(),
+            ConnectorChangeWindow::new(9, 10),
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: ConnectorContentNetZeroBasis::SameSnapshot,
+            },
+            handle(&owner, b"delta-v1"),
+            Arc::new(Schema::empty()),
+            Vec::new(),
+            &context(1024, 4096),
+        )
+        .expect_err("distinct endpoints do not prove same snapshot");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -1111,9 +1208,9 @@ mod tests {
     }
 
     #[test]
-    fn incremental_without_row_changes_is_rejected() {
+    fn physical_change_flags_without_proof_remain_incremental() {
         let owner = owner();
-        let error = ConnectorScan::try_new_change_window(
+        let scan = ConnectorScan::try_new_change_window(
             owner.clone(),
             ConnectorChangeWindow::new(5, 5),
             ConnectorChangeWindowAdmission::Incremental {
@@ -1126,8 +1223,13 @@ mod tests {
             Vec::new(),
             &context(1024, 4096),
         )
-        .expect_err("empty incremental admission must fail");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        .expect("physical flags alone do not replace a content proof");
+        assert!(matches!(
+            scan.admission(),
+            ConnectorScanAdmission::ChangeWindow(
+                ConnectorChangeWindowAdmission::Incremental { .. }
+            )
+        ));
     }
 
     #[test]

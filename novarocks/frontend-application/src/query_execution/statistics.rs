@@ -491,6 +491,7 @@ fn admit_statistics_scan_binding(
                         schema: input_schema.clone(),
                         selector: ConnectorReadSelector::SnapshotId(version_ordinal),
                         mv_partition_selection: None,
+        mv_target_candidates: None,
                         statistics_pin: None,
                         planning_lease: planning_lease.clone(),
                     },

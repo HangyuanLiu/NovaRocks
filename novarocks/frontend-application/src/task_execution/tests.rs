@@ -1127,6 +1127,70 @@ struct Harness {
     statuses: BTreeMap<TaskId, u64>,
 }
 
+#[test]
+fn failed_verification_release_terminal_cleanup_still_dispatches_exact_release() {
+    let mut harness = Harness::new(&[0], &[0], 32);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    harness.execution.begin_terminal_cleanup();
+    harness.execution.request_verification_release();
+    for &context in &contexts {
+        harness
+            .execution
+            .observe_actor_abort_context_closed(context)
+            .unwrap();
+    }
+    assert!(
+        !harness
+            .execution
+            .released_verification_facts()
+            .is_complete()
+    );
+    let released = harness.released();
+    assert_eq!(released.len(), contexts.len());
+    for intent in released {
+        let OperationIntent::ReleaseQueryContext(request) = intent else {
+            panic!("terminal cleanup must issue only verification release");
+        };
+        let context = request.context();
+        harness
+            .execution
+            .acknowledge(&OperationAcknowledgement::new(
+                request.envelope().operation_id(),
+                OperationKind::ReleaseQueryContext,
+                OperationOutcome::ContextTerminalReceipt,
+                AckPayload::Release {
+                    receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
+                    outcome: ReleaseOutcome::AlreadyTerminal,
+                    runtime_filter: None,
+                    verification: Some(novarocks_execution_contract::ContextVerificationFacts {
+                        context,
+                        tasks: vec![],
+                        truncated: false,
+                    }),
+                },
+            ))
+            .unwrap();
+    }
+    assert!(!harness.execution.verification_release_pending());
+    assert!(
+        harness
+            .execution
+            .released_verification_facts()
+            .is_complete()
+    );
+    assert!(
+        !harness
+            .execution
+            .released_verification_facts()
+            .permits_rollback()
+    );
+}
+
 impl Harness {
     fn new(leaf_backends: &[usize], middle_backends: &[usize], plan_bytes: usize) -> Self {
         let processes = backends(
@@ -2959,6 +3023,7 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
             // A backend that answers NOT_READY has sealed nothing: it is
             // still draining, so there is no terminal observation to carry.
             runtime_filter: Some(fixture_runtime_filter_contribution()),
+            verification: None,
         },
     );
     assert_eq!(
@@ -3032,6 +3097,7 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
                     receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
                     outcome: ReleaseOutcome::Released,
                     runtime_filter: Some(fixture_runtime_filter_contribution()),
+                    verification: None,
                 },
             ),
             MonotonicInstant::from_origin(Duration::from_millis(50)),
@@ -7678,6 +7744,7 @@ fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
             ),
             outcome: ReleaseOutcome::Released,
             runtime_filter: None,
+            verification: None,
         },
     ));
     round.turn().expect("the release acknowledgement settles");

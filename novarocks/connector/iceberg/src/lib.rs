@@ -29,6 +29,8 @@ pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;
 mod authority_source;
+#[cfg(debug_assertions)]
+pub(crate) mod candidate_fixture;
 pub(crate) mod catalog;
 pub mod catalog_cache;
 pub mod catalog_config;
@@ -55,6 +57,7 @@ pub mod metadata_batch_reader;
 pub mod metadata_context;
 pub mod metadata_factory;
 pub mod metadata_read;
+mod mv_target_candidates;
 pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;

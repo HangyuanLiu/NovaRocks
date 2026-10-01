@@ -1013,9 +1013,22 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
+        "mv_content_key",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "mv_entry_id",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
         "mv_group_row_id",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
+    (
+        "mv_require_non_null",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    ("mv_weight_sum", BuiltinDisposition::AggregateBoundary),
     (
         "named_struct",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -1463,7 +1476,7 @@ pub(crate) fn builtin_disposition(name: &str) -> Option<BuiltinDisposition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn every_declared_builtin_has_one_explicit_disposition_and_unknown_has_none() {
@@ -1476,13 +1489,20 @@ mod tests {
                     .map(|name| (*name).to_owned()),
             )
             .collect::<BTreeSet<_>>();
-        let admitted = BUILTIN_DISPOSITIONS
-            .iter()
-            .map(|(name, _)| (*name).to_owned())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(BUILTIN_DISPOSITIONS.len(), 417);
-        assert_eq!(admitted.len(), BUILTIN_DISPOSITIONS.len());
-        assert_eq!(declared, admitted);
+        let mut admitted = BTreeMap::new();
+        for &(name, disposition) in BUILTIN_DISPOSITIONS {
+            assert_eq!(
+                admitted.insert(name.to_owned(), disposition),
+                None,
+                "builtin {name} has multiple explicit dispositions"
+            );
+            assert_eq!(
+                builtin_disposition(name),
+                Some(disposition),
+                "builtin {name} does not resolve to its explicit disposition"
+            );
+        }
+        assert_eq!(declared, admitted.keys().cloned().collect::<BTreeSet<_>>());
         assert!(
             BUILTIN_DISPOSITIONS
                 .windows(2)

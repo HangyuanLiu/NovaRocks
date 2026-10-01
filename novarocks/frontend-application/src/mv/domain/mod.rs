@@ -20,6 +20,7 @@ pub mod analysis_adapter;
 pub mod application;
 pub mod dependency;
 pub(crate) mod dependency_resolver;
+pub(crate) mod eligibility_document;
 pub(crate) mod flow;
 pub(crate) mod iceberg_aggregate_state;
 pub mod iceberg_backend;

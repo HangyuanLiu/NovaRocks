@@ -189,6 +189,21 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         )
     }
 
+    fn resolve_scalar_binding_trusted(
+        &self,
+        name: &str,
+        arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<ResolvedFunctionBinding, novarocks_functions::FunctionBindingError> {
+        self.resolve_bound_trusted(
+            name,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                logical_argument_count: arguments.len(),
+                arguments,
+            },
+        )
+    }
+
     fn resolve_window_binding(
         &self,
         name: &str,
@@ -221,6 +236,21 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
 
     fn contains_aggregate(&self, name: &str) -> bool {
         self.definition(name, FunctionKind::Aggregate).is_some()
+    }
+
+    fn resolve_table_binding_trusted(
+        &self,
+        name: &str,
+        arguments: &[FunctionArgument],
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted(
+            name,
+            FunctionKind::Table,
+            FunctionBindingRequest {
+                arguments,
+                logical_argument_count: arguments.len(),
+            },
+        )
     }
 
     fn resolve_aggregate_binding(
@@ -660,6 +690,12 @@ fn builtin_supports_ordered_update_channels(name: &str) -> bool {
 }
 
 fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataType]) -> bool {
+    if name == "mv_weight_sum" {
+        return matches!(
+            argument_types,
+            [DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64]
+        );
+    }
     if name != "dict_merge" {
         return true;
     }
@@ -715,6 +751,7 @@ fn builtin_overload_identity(
 }
 
 const ONE_ARG_AGGREGATES: &[&str] = &[
+    "mv_weight_sum",
     "any_value",
     "approx_count_distinct",
     "array_agg",
@@ -1046,6 +1083,9 @@ fn validate_builtin_selected_domain(
                     | DataType::Timestamp(..)
             ) || novarocks_types::largeint::is_largeint_data_type(ty)
         }
+        "mv_content_key" | "mv_require_non_null" => {
+            novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1.supports(ty)
+        }
         "mv_group_row_id" => matches!(
             ty,
             DataType::Boolean
@@ -1176,6 +1216,9 @@ fn scalar_result_nullable(name: &str, request: FunctionBindingRequest<'_>) -> bo
         // A NULL predicate fails the assertion; successful evaluations are true.
         "assert_true"
         | "mv_group_row_id"
+        | "mv_content_key"
+        | "mv_entry_id"
+        | "mv_require_non_null"
         | "state_all_zero"
         | "count_state_visible"
         | "count_distinct_state_visible"
@@ -1439,6 +1482,60 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         } else {
             Err(FunctionBindingError::InvalidBinding(
                 "selected UNNEST binding differs from its declared overload".into(),
+            ))
+        }
+    }
+}
+
+const BUILTIN_GENERATE_SERIES_FUNCTION_ID: &str = "builtin.table/generate_series/v1";
+const BUILTIN_GENERATE_SERIES_OVERLOAD_ID: &str = "builtin.table/generate_series/i64-triple-v1";
+
+struct BuiltinGenerateSeriesResolver;
+
+fn bind_builtin_generate_series(
+    request: FunctionBindingRequest<'_>,
+) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    if request.logical_argument_count != 3 || request.arguments.len() != 3 {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let exact = FunctionValueType::new(DataType::Int64, false);
+    if request.arguments.iter().any(|argument| {
+        !matches!(argument, FunctionArgument::Value { value_type, .. } if value_type == &exact)
+    }) {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    Ok(FunctionBindingSelection {
+        overload: FunctionOverloadId::try_new(BUILTIN_GENERATE_SERIES_OVERLOAD_ID)
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+        argument_types: vec![FunctionArgumentType::Value(exact.clone()); 3].into_boxed_slice(),
+        result_type: FunctionResultType::Relation(Box::from([exact])),
+        aggregate: None,
+    })
+}
+
+impl FunctionBindingResolver for BuiltinGenerateSeriesResolver {
+    fn resolve(
+        &self,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        bind_builtin_generate_series(request)
+    }
+
+    fn validate_selected(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<(), FunctionBindingError> {
+        if selected.overload.as_str() != BUILTIN_GENERATE_SERIES_OVERLOAD_ID {
+            return Err(FunctionBindingError::UnknownOverload(
+                selected.overload.clone(),
+            ));
+        }
+        if selected == &bind_builtin_generate_series(request)? {
+            Ok(())
+        } else {
+            Err(FunctionBindingError::InvalidBinding(
+                "selected generate_series binding differs from its declared overload".into(),
             ))
         }
     }
@@ -2078,7 +2175,14 @@ pub fn contribute_builtin_functions(
         })?;
         builder.register(FunctionDefinition::try_new_bound(
             &name,
-            FunctionVisibility::Public,
+            if matches!(
+                name.as_str(),
+                "mv_content_key" | "mv_entry_id" | "mv_require_non_null"
+            ) {
+                FunctionVisibility::Hidden
+            } else {
+                FunctionVisibility::Public
+            },
             declaration,
             resolver,
         )?)?;
@@ -2131,7 +2235,11 @@ pub fn contribute_builtin_functions(
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
         builder.register(FunctionDefinition::try_new_bound_aggregate(
             declaration.name,
-            FunctionVisibility::Public,
+            if declaration.name == "mv_weight_sum" {
+                FunctionVisibility::Hidden
+            } else {
+                FunctionVisibility::Public
+            },
             binding_declaration,
             Arc::clone(&resolver) as Arc<dyn novarocks_functions::FunctionBindingResolver>,
             resolver as Arc<dyn novarocks_functions::AggregateSignatureResolver>,
@@ -2172,6 +2280,43 @@ pub fn contribute_builtin_functions(
         FunctionVisibility::Public,
         unnest_declaration,
         Arc::new(BuiltinUnnestResolver),
+    )?)?;
+    let generate_series_declaration = FunctionBindingDeclaration::try_new(
+        FunctionId::try_new(BUILTIN_GENERATE_SERIES_FUNCTION_ID).map_err(|error| {
+            FunctionCatalogError::InvalidStableIdentity {
+                subject: "builtin table function",
+                value: error.to_string().into(),
+            }
+        })?,
+        FunctionKind::Table,
+        FunctionSemantics {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            // The pull cursor rejects zero steps and checked count/value overflow.
+            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::MayRaise,
+        },
+        [FunctionOverloadDeclaration {
+            identity: FunctionOverloadId::try_new(BUILTIN_GENERATE_SERIES_OVERLOAD_ID).map_err(
+                |error| FunctionCatalogError::InvalidStableIdentity {
+                    subject: "builtin table function overload",
+                    value: error.to_string().into(),
+                },
+            )?,
+            argument_pattern: "(Int64!, Int64!, Int64!)".into(),
+            result_pattern: "Relation<Int64!>".into(),
+            aggregate: None,
+        }],
+    )
+    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+        subject: "builtin table function binding declaration",
+        value: error.to_string().into(),
+    })?;
+    builder.register(FunctionDefinition::try_new_bound(
+        "generate_series",
+        FunctionVisibility::Hidden,
+        generate_series_declaration,
+        Arc::new(BuiltinGenerateSeriesResolver),
     )?)?;
     Ok(())
 }
@@ -2378,9 +2523,9 @@ pub fn builtin_engine_function_catalog() -> &'static EngineFunctionCatalog {
 ///   rather than with the clock functions.
 pub(crate) fn builtin_function_volatility(name: &str) -> FunctionVolatility {
     match name.to_ascii_lowercase().as_str() {
-        "rand" | "random" | "uuid" | "sleep" | "now" | "current_timestamp" | "current_date"
-        | "curdate" | "current_time" | "curtime" | "localtime" | "localtimestamp"
-        | "utc_timestamp" | "utc_time" => FunctionVolatility::Volatile,
+        "mv_entry_id" | "rand" | "random" | "uuid" | "sleep" | "now" | "current_timestamp"
+        | "current_date" | "curdate" | "current_time" | "curtime" | "localtime"
+        | "localtimestamp" | "utc_timestamp" | "utc_time" => FunctionVolatility::Volatile,
         _ => FunctionVolatility::Immutable,
     }
 }
@@ -2683,6 +2828,104 @@ mod tests {
     }
 
     #[test]
+    fn generate_series_is_hidden_and_trusted_binding_is_exact() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let arguments = vec![value_argument(DataType::Int64, false, None); 3];
+        assert_eq!(
+            crate::compiler::SqlFunctionCatalog::resolve_table_binding(
+                &catalog,
+                "generate_series",
+                &arguments,
+            ),
+            Err(FunctionBindingError::HiddenFunction),
+        );
+        let binding = crate::compiler::SqlFunctionCatalog::resolve_table_binding_trusted(
+            &catalog,
+            "generate_series",
+            &arguments,
+        )
+        .unwrap();
+        assert_eq!(
+            binding.function_id.as_str(),
+            BUILTIN_GENERATE_SERIES_FUNCTION_ID
+        );
+        assert_eq!(binding.kind, FunctionKind::Table);
+        assert_eq!(
+            binding.selected.overload.as_str(),
+            BUILTIN_GENERATE_SERIES_OVERLOAD_ID
+        );
+        assert_eq!(
+            binding.selected.argument_types.as_ref(),
+            &vec![FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, false)); 3]
+        );
+        assert_eq!(
+            binding.selected.result_type,
+            FunctionResultType::Relation(Box::from([FunctionValueType::new(
+                DataType::Int64,
+                false
+            )]))
+        );
+        assert_eq!(
+            binding.semantics,
+            FunctionSemantics {
+                volatility: FunctionVolatility::Immutable,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::MayRaise,
+            }
+        );
+        let request = FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: 3,
+        };
+        catalog.validate_bound(&binding, request).unwrap();
+        let mut forged = binding.clone();
+        forged.selected.result_type =
+            FunctionResultType::Relation(Box::from([FunctionValueType::new(
+                DataType::Int64,
+                true,
+            )]));
+        assert!(catalog.validate_bound(&forged, request).is_err());
+    }
+
+    #[test]
+    fn generate_series_rejects_arity_nullability_and_implicit_casts() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let exact = vec![value_argument(DataType::Int64, false, None); 3];
+        let mut wrong_type = exact.clone();
+        wrong_type[1] = value_argument(DataType::Int32, false, None);
+        let mut nullable = exact.clone();
+        nullable[2] = value_argument(DataType::Int64, true, None);
+        for arguments in [
+            Vec::new(),
+            exact[..2].to_vec(),
+            vec![value_argument(DataType::Int64, false, None); 4],
+            wrong_type,
+            nullable,
+        ] {
+            assert_eq!(
+                crate::compiler::SqlFunctionCatalog::resolve_table_binding_trusted(
+                    &catalog,
+                    "generate_series",
+                    &arguments,
+                ),
+                Err(FunctionBindingError::NoMatchingOverload)
+            );
+        }
+        assert!(matches!(
+            catalog.resolve_bound_trusted(
+                "generate_series",
+                FunctionKind::Table,
+                FunctionBindingRequest {
+                    arguments: &exact,
+                    logical_argument_count: 2
+                }
+            ),
+            Err(FunctionBindingError::InvalidBinding(_))
+        ));
+    }
+
+    #[test]
     fn aggregate_resolution_is_catalog_backed_and_exact() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let resolved = resolve_bound_aggregate(&catalog, "count", &[], &[], false)
@@ -2910,6 +3153,192 @@ mod tests {
             catalog
                 .definition("bool_and", FunctionKind::Aggregate)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn mv_require_non_null_binds_hidden_exact_native_content_types() {
+        use arrow::datatypes::{Field, TimeUnit};
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let child = Arc::new(Field::new("item", DataType::Float64, true));
+        let types = vec![
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(16),
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Decimal32(9, 2),
+            DataType::Decimal64(18, 4),
+            DataType::Decimal128(38, 5),
+            DataType::Decimal256(76, 7),
+            DataType::List(child.clone()),
+            DataType::LargeList(child.clone()),
+            DataType::FixedSizeList(child.clone(), 2),
+            DataType::Struct(vec![child].into()),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        ];
+        for data_type in types {
+            let arguments = [value_argument(data_type.clone(), true, None)];
+            assert_eq!(
+                crate::compiler::SqlFunctionCatalog::resolve_scalar_binding(
+                    &catalog,
+                    "mv_require_non_null",
+                    &arguments
+                ),
+                Err(FunctionBindingError::HiddenFunction)
+            );
+            let binding = crate::compiler::SqlFunctionCatalog::resolve_scalar_binding_trusted(
+                &catalog,
+                "mv_require_non_null",
+                &arguments,
+            )
+            .unwrap();
+            assert_eq!(
+                binding.function_id.as_str(),
+                "builtin.scalar/mv_require_non_null/v1"
+            );
+            assert_eq!(
+                scalar_result(&binding),
+                &FunctionValueType::new(data_type.clone(), false)
+            );
+            assert_eq!(
+                binding.selected.argument_types.as_ref(),
+                &[FunctionArgumentType::Value(FunctionValueType::new(
+                    data_type, true
+                ))]
+            );
+            assert_eq!(
+                binding.semantics.intrinsic_row_error,
+                novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+            );
+            assert_eq!(binding.semantics.volatility, FunctionVolatility::Immutable);
+            catalog
+                .validate_bound(
+                    &binding,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            crate::compiler::SqlFunctionCatalog::resolve_scalar_binding_trusted(
+                &catalog,
+                "mv_require_non_null",
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            crate::compiler::SqlFunctionCatalog::resolve_scalar_binding_trusted(
+                &catalog,
+                "mv_require_non_null",
+                &[value_argument(
+                    DataType::Duration(TimeUnit::Second),
+                    true,
+                    None
+                )]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mv_internal_functions_reject_user_calls_and_bind_trusted_calls() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let args = [value_argument(DataType::Int64, true, None)];
+        let request = FunctionBindingRequest {
+            logical_argument_count: args.len(),
+            arguments: &args,
+        };
+        assert!(
+            catalog
+                .resolve_bound_user("mv_content_key", FunctionKind::Scalar, request)
+                .is_err()
+        );
+        let bound = catalog
+            .resolve_bound_trusted("mv_content_key", FunctionKind::Scalar, request)
+            .unwrap();
+        assert_eq!(scalar_result(&bound).data_type, DataType::Binary);
+        assert!(!scalar_result(&bound).nullable);
+        assert_eq!(
+            crate::compiler::SqlFunctionCatalog::resolve_aggregate_signature(
+                &catalog,
+                "mv_weight_sum",
+                &[DataType::Int64]
+            ),
+            Err(FunctionResolutionError::HiddenFunction)
+        );
+        assert!(
+            catalog
+                .resolve_aggregate_trusted("mv_weight_sum", &[DataType::Int64])
+                .is_ok()
+        );
+        assert!(
+            catalog
+                .resolve_aggregate_trusted("mv_weight_sum", &[DataType::Float64])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mv_entry_id_is_hidden_volatile_and_non_nullable_binary() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let request = FunctionBindingRequest {
+            logical_argument_count: 0,
+            arguments: &[],
+        };
+        assert!(
+            catalog
+                .resolve_bound_user("mv_entry_id", FunctionKind::Scalar, request)
+                .is_err()
+        );
+        let bound = catalog
+            .resolve_bound_trusted("mv_entry_id", FunctionKind::Scalar, request)
+            .unwrap();
+        assert_eq!(scalar_result(&bound).data_type, DataType::Binary);
+        assert!(!scalar_result(&bound).nullable);
+        assert_eq!(
+            builtin_function_volatility("mv_entry_id"),
+            FunctionVolatility::Volatile
+        );
+        assert_eq!(
+            builtin_sql_function_catalog().volatility("mv_entry_id"),
+            FunctionVolatility::Volatile
         );
     }
 

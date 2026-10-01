@@ -233,6 +233,7 @@ pub(crate) fn completed_plan_submission_facts(
     topology: &CompletedPlanTopology,
 ) -> Result<SubmissionPlanFacts, String> {
     let mut stream_edge_sources = BTreeSet::new();
+    let mut predicate_fanout_sources = BTreeSet::new();
     for edge in plan.edges().values() {
         match edge.kind {
             EdgeKind::Stream => {
@@ -240,6 +241,9 @@ pub(crate) fn completed_plan_submission_facts(
             }
             EdgeKind::CteMulticast => {}
             EdgeKind::ChangeStreamRouter => {}
+            EdgeKind::PredicateFanout => {
+                predicate_fanout_sources.insert(u32::from(edge.source.fragment.get()));
+            }
         }
     }
     let mut fragments = Vec::with_capacity(plan.fragments().len());
@@ -248,7 +252,8 @@ pub(crate) fn completed_plan_submission_facts(
             FragmentSink::Result => NativeSubmissionFragmentRole::Result,
             FragmentSink::Stream { .. }
             | FragmentSink::Multicast { .. }
-            | FragmentSink::Router { .. } => NativeSubmissionFragmentRole::NonTerminal,
+            | FragmentSink::Router { .. }
+            | FragmentSink::PredicateFanout { .. } => NativeSubmissionFragmentRole::NonTerminal,
             other => {
                 return Err(format!(
                     "completed plan fragment {} has sink {other:?}, which this path does not submit",
@@ -309,6 +314,7 @@ pub(crate) fn completed_plan_submission_facts(
         topology.order.clone(),
         fragments,
         stream_edge_sources,
+        predicate_fanout_sources,
         cte_consumers,
         router_edges,
     ))

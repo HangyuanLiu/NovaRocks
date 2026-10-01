@@ -23,6 +23,7 @@
 mod arithmetic;
 mod array_generate;
 mod comparison;
+mod content;
 mod function;
 mod largeint;
 mod partition;
@@ -35,6 +36,10 @@ pub use arithmetic::{
 };
 pub use array_generate::array_generate_item_type;
 pub use comparison::OrderedComparisonAlgorithm;
+pub use content::{
+    NATIVE_RESULT_CONTENT_V1_CANONICAL_BYTES, ResultContentEquivalence,
+    quota_content_runtime_filter_type_supported,
+};
 pub use function::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,
     FunctionFailureBehavior, FunctionId, FunctionIdentityError, FunctionIntrinsicRowError,

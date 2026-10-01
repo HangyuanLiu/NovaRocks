@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 
+use crate::exec::operators::quota::QuotaOutputMemory;
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_spi::connector::ConnectorOutputMemoryToken;
 use novarocks_types::SlotId;
@@ -37,6 +38,7 @@ pub struct Chunk {
     pub batch: RecordBatch,
     chunk_schema: ChunkSchemaRef,
     accounting: Option<Arc<ChunkAccounting>>,
+    quota_output_memory: Option<Arc<QuotaOutputMemory>>,
     /// A provider reservation that already charges the Arrow buffers in this
     /// chunk to the admitted fragment hierarchy.
     ///
@@ -48,6 +50,18 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    pub(crate) fn try_new_quota_output(
+        schema: ChunkSchemaRef,
+        columns: Vec<ArrayRef>,
+        memory: Arc<QuotaOutputMemory>,
+    ) -> Result<Self, String> {
+        memory.validate_columns(&columns)?;
+        let mut chunk = Self::try_new_with_columns(schema, columns)?;
+        memory.validate_columns(chunk.columns())?;
+        chunk.quota_output_memory = Some(memory);
+        Ok(chunk)
+    }
+
     pub fn try_new_with_columns(
         chunk_schema: ChunkSchemaRef,
         columns: Vec<ArrayRef>,
@@ -60,6 +74,7 @@ impl Chunk {
             batch,
             chunk_schema,
             accounting: None,
+            quota_output_memory: None,
             connector_output_memory: None,
         })
     }
@@ -85,6 +100,7 @@ impl Chunk {
                 batch,
                 chunk_schema,
                 accounting: None,
+                quota_output_memory: None,
                 connector_output_memory: None,
             });
         }
@@ -96,6 +112,7 @@ impl Chunk {
             batch,
             chunk_schema,
             accounting: None,
+            quota_output_memory: None,
             connector_output_memory: None,
         })
     }
@@ -153,6 +170,7 @@ impl Chunk {
             batch: self.batch.slice(offset, length),
             chunk_schema: Arc::clone(&self.chunk_schema),
             accounting: None,
+            quota_output_memory: self.quota_output_memory.clone(),
             connector_output_memory: self.connector_output_memory.clone(),
         };
         if let Some(accounting) = self.accounting.as_ref() {
@@ -179,6 +197,13 @@ impl Chunk {
     }
 
     pub fn transfer_to(&mut self, tracker: &Arc<MemTracker>) {
+        if let Some(memory) = &self.quota_output_memory {
+            if let Err(error) = memory.validate_tracker(tracker) {
+                memory.refuse_transfer(&error);
+            }
+            return;
+        }
+
         if let Some(accounting) = self.accounting.as_ref() {
             accounting.transfer_to(tracker);
             return;
@@ -198,6 +223,10 @@ impl Chunk {
     /// the chunk so dropping it releases the live bytes instead of leaking an
     /// exceeded counter.
     pub fn try_transfer_to(&mut self, tracker: &Arc<MemTracker>) -> Result<(), String> {
+        if let Some(memory) = &self.quota_output_memory {
+            return memory.validate_tracker(tracker);
+        }
+
         if let Some(accounting) = self.accounting.as_ref() {
             return accounting.try_transfer_to(tracker);
         }
@@ -224,6 +253,12 @@ impl Chunk {
     /// retain only a zero-copy projection can then split the projected bytes
     /// from the unprojected remainder exactly.
     pub(crate) fn take_memory_lease(&mut self) -> Option<ChunkMemoryLease> {
+        // Allocation-backed Arrow ownership cannot be converted into a fungible
+        // accounting lease or released while any ArrayRef still owns a buffer.
+        if self.quota_output_memory.is_some() {
+            return None;
+        }
+
         if let Some(accounting) = self.accounting.take() {
             return Some(ChunkMemoryLease::native(accounting));
         }
@@ -244,7 +279,10 @@ impl Chunk {
         &mut self,
         output_memory: ConnectorOutputMemoryToken,
     ) -> Result<(), String> {
-        if self.accounting.is_some() || self.connector_output_memory.is_some() {
+        if self.accounting.is_some()
+            || self.connector_output_memory.is_some()
+            || self.quota_output_memory.is_some()
+        {
             return Err("chunk output memory already has an accounting owner".to_string());
         }
         self.connector_output_memory = Some(Arc::new(Mutex::new(output_memory)));
@@ -293,6 +331,7 @@ impl Default for Chunk {
             batch: RecordBatch::new_empty(Arc::new(Schema::empty())),
             chunk_schema: Arc::new(ChunkSchema::empty()),
             accounting: None,
+            quota_output_memory: None,
             connector_output_memory: None,
         }
     }

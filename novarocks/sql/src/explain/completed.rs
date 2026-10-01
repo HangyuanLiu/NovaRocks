@@ -1082,6 +1082,12 @@ fn render_sink(
             "  SINK multicast edges=[{}]",
             format_edge_ids(edges)
         ))?,
+        FragmentSink::PredicateFanout { branches } => {
+            lines.push(format_args!("  SINK predicate-fanout branches={}", branches.len()))?;
+            for branch in branches {
+                lines.push(format_args!("    branch predicate=e{} edge=edge{}", branch.predicate.get(), branch.edge.get()))?;
+            }
+        }
         FragmentSink::Router { effect, routes } => {
             lines.push(format_args!(
                 "  SINK router effect={} routes={}",
@@ -1294,6 +1300,7 @@ fn edge_kind(kind: novarocks_physical_plan::EdgeKind) -> &'static str {
     match kind {
         novarocks_physical_plan::EdgeKind::Stream => "stream",
         novarocks_physical_plan::EdgeKind::CteMulticast => "cte-multicast",
+        novarocks_physical_plan::EdgeKind::PredicateFanout => "predicate-fanout",
         novarocks_physical_plan::EdgeKind::ChangeStreamRouter => "change-stream-router",
     }
 }
@@ -2148,6 +2155,12 @@ fn runtime_filter_producer_target(
     target: novarocks_physical_plan::RuntimeFilterProducerTarget,
 ) -> String {
     match target {
+        novarocks_physical_plan::RuntimeFilterProducerTarget::QuotaContentField {
+            field_ordinal,
+            content_equivalence,
+        } => format!(
+            "QuotaContentField(field_ordinal={field_ordinal}, content_equivalence={content_equivalence:?})"
+        ),
         novarocks_physical_plan::RuntimeFilterProducerTarget::JoinBuildKey { equality } => {
             format!("JoinBuildKey(equality={})", equality.get())
         }
@@ -2177,6 +2190,15 @@ struct RuntimeFilterConsumerTargetDisplay<'a>(
 impl fmt::Display for RuntimeFilterConsumerTargetDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
+            novarocks_physical_plan::RuntimeFilterConsumerTarget::QuotaContentScanField {
+                producer,
+                lineage,
+            } => write!(
+                formatter,
+                "QuotaContentScanField(producer={}, lineage=[{}])",
+                producer.get(),
+                format_runtime_filter_lineage(lineage)
+            ),
             novarocks_physical_plan::RuntimeFilterConsumerTarget::JoinProbeKey { equality } => {
                 write!(formatter, "JoinProbeKey(equality={})", equality.get())
             }
@@ -2765,6 +2787,16 @@ fn render_node_contract(
         ));
     }
     match &node.kind {
+        NodeKind::QuotaPreclaim { spec } => lines.push(format_args!(
+            "{pad}  domain=n{}, need={:?}, entry=v{}, key=v{}, target-file=v{}, target-position=v{}, content={:?}, max-state-bytes={}",
+            spec.preselection_domain.get(), spec.demand_need, spec.demand_entry_id.get(), spec.demand_key.get(),
+            spec.target_file.get(), spec.target_position.get(), spec.content_equivalence, spec.max_state_bytes,
+        )),
+        NodeKind::QuotaTrim { spec } => lines.push(format_args!(
+            "{pad}  domain=n{}, need={:?}, seed-entry=v{}, candidate-entry=v{}, candidate-file=v{}, candidate-position=v{}, content={:?}, max-state-bytes={}",
+            spec.preselection_domain.get(), spec.seed_need, spec.seed_entry_id.get(), spec.candidate_entry_id.get(),
+            spec.candidate_file.get(), spec.candidate_position.get(), spec.content_equivalence, spec.max_state_bytes,
+        )),
         NodeKind::Scan {
             occurrence,
             relation,
@@ -3620,6 +3652,8 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
         let context = self.context;
         let node = self.node;
         match &node.kind {
+            NodeKind::QuotaPreclaim { .. } => formatter.write_str("QUOTA PRECLAIM")?,
+            NodeKind::QuotaTrim { .. } => formatter.write_str("QUOTA TRIM")?,
             NodeKind::Scan { .. } => {
                 formatter.write_str("SCAN")?;
                 if let Some(relation) = context.annotations.value(

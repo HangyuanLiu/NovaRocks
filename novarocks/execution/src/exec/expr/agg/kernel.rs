@@ -343,6 +343,29 @@ impl AggKernelEntry {
         .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn update_batch_typed(
+        &self,
+        state_ptrs: &[AggStatePtr],
+        input: AggregateInputBatch<'_>,
+    ) -> Result<(), super::registry::PreparedAggregateError> {
+        // SAFETY: every pointer denotes an initialized state for this entry.
+        unsafe {
+            self.kernel
+                .update_batch(self.state.offset, state_ptrs, input)
+        }
+    }
+    pub(crate) fn merge_batch_typed(
+        &self,
+        state_ptrs: &[AggStatePtr],
+        input: AggregateInputBatch<'_>,
+    ) -> Result<(), super::registry::PreparedAggregateError> {
+        // SAFETY: every pointer denotes an initialized state for this entry.
+        unsafe {
+            self.kernel
+                .merge_batch(self.state.offset, state_ptrs, input)
+        }
+    }
+
     pub fn update_batch(
         &self,
         state_ptrs: &[AggStatePtr],

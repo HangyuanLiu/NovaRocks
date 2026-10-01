@@ -44,9 +44,10 @@ pub use mv_rewrite::{
     SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
     SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
     SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
-    SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts,
-    SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
-    SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
+    SqlImvVisibleApplyFacts, SqlImvVisibleApplyKind, SqlMvDefinitionResolutionContext,
+    SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
+    SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation, SqlMvRewriteSelectionFacts,
+    SqlMvRewriteSourceOccurrenceFacts,
 };
 
 /// SQL's read-only observation of statement cancellation.
@@ -218,6 +219,17 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    fn resolve_scalar_binding_trusted(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     fn resolve_window_binding(
         &self,
         _name: &str,
@@ -230,6 +242,17 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     }
 
     fn resolve_table_binding(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    fn resolve_table_binding_trusted(
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
@@ -1476,6 +1499,15 @@ mod tests {
     }
     #[derive(Debug)]
     struct Functions;
+
+    #[test]
+    fn trusted_table_binding_requires_an_explicit_catalog_declaration() {
+        assert_eq!(
+            Functions.resolve_table_binding_trusted("generate_series", &[]),
+            Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+        );
+    }
+
     impl SqlFunctionCatalog for Functions {
         fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
             Arc::new(Self)

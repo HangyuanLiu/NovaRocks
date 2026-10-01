@@ -859,6 +859,7 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
         }),
         initial_domains: Vec::new(),
         assignment: Some(proto::TaskAssignment {
+            quota_domain_bindings: Vec::new(),
             instance_ordinal: 0,
             initial_scan_ranges: Vec::new(),
             sink_edge_ids: Vec::new(),

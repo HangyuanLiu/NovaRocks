@@ -37,7 +37,10 @@ pub use codec::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorReadRelationPayload,
 };
-pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
+pub use error::{
+    ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
+    ConnectorTargetDeleteKind, ConnectorTargetFormatUnsupported,
+};
 pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };

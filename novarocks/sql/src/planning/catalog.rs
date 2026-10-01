@@ -267,6 +267,121 @@ pub struct ConnectorReadTableFacts {
     pub planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
 }
 
+/// Exact SQL-only materialization for one frozen visible-bag target. The
+/// application retains the provider capability behind the binding token.
+pub struct SqlMvTargetBagTableFacts {
+    relation: novarocks_types::naming::TableIdentity,
+    target_table_uuid: String,
+    target_snapshot_id: Option<i64>,
+    visible_columns: Vec<novarocks_types::schema::ColumnDef>,
+    binding: crate::binding::SqlTableBindingId,
+}
+impl SqlMvTargetBagTableFacts {
+    pub fn try_new(
+        relation: novarocks_types::naming::TableIdentity,
+        target_table_uuid: String,
+        target_snapshot_id: Option<i64>,
+        visible_columns: Vec<novarocks_types::schema::ColumnDef>,
+        binding: crate::binding::SqlTableBindingId,
+    ) -> Result<Self, String> {
+        if relation.catalog.trim().is_empty()
+            || relation.namespace.trim().is_empty()
+            || relation.table.trim().is_empty()
+            || target_table_uuid.trim().is_empty()
+            || target_snapshot_id.is_some_and(|id| id < 0)
+            || visible_columns.is_empty()
+        {
+            return Err(
+                "visible-bag target materialization has incomplete exact identity/schema".into(),
+            );
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for column in &visible_columns {
+            if column.name.trim().is_empty()
+                || !names.insert(column.name.to_ascii_lowercase())
+                || !novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1
+                    .supports(&column.data_type)
+            {
+                return Err(
+                    "visible-bag target materialization has an invalid visible field".into(),
+                );
+            }
+        }
+        Ok(Self {
+            relation,
+            target_table_uuid,
+            target_snapshot_id,
+            visible_columns,
+            binding,
+        })
+    }
+}
+pub struct MvTargetBagTableMaterialization {
+    resolved: crate::catalog::ResolvedAnalyzerTable,
+}
+impl MvTargetBagTableMaterialization {
+    pub fn into_resolved_table(self) -> crate::catalog::ResolvedAnalyzerTable {
+        self.resolved
+    }
+}
+pub fn materialize_mv_target_bag_table(
+    facts: SqlMvTargetBagTableFacts,
+) -> MvTargetBagTableMaterialization {
+    use crate::planner::table::{
+        ScanSource, SqlMvTargetBagScan, SqlScanKind, SqlScanSource, SqlTableIdentity,
+    };
+    let metadata_columns = [
+        (
+            crate::common::ICEBERG_FILE_PATH_COL,
+            arrow::datatypes::DataType::Utf8,
+        ),
+        (
+            crate::common::ICEBERG_ROW_POS_COL,
+            arrow::datatypes::DataType::Int64,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, data_type)| novarocks_types::schema::ColumnDef {
+        name: name.into(),
+        data_type,
+        nullable: false,
+        write_default: None,
+        logical_type: None,
+    })
+    .collect();
+    let planner = TableDef {
+        name: facts.relation.table.clone(),
+        columns: facts.visible_columns.clone(),
+        iceberg_row_lineage_metadata_columns: metadata_columns,
+        source: ScanSource::Sql(SqlScanSource::new(
+            facts.binding,
+            SqlTableIdentity {
+                catalog: facts.relation.catalog.clone(),
+                namespace: facts.relation.namespace.clone(),
+                table: facts.relation.table,
+            },
+            SqlScanKind::MvTargetBag {
+                facts: SqlMvTargetBagScan {
+                    target_table_uuid: facts.target_table_uuid,
+                    target_snapshot_id: facts.target_snapshot_id,
+                    visible_columns: facts
+                        .visible_columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect(),
+                },
+            },
+        )),
+    };
+    MvTargetBagTableMaterialization {
+        resolved: crate::catalog::ResolvedAnalyzerTable::from_planner(
+            Some(&facts.relation.catalog),
+            &facts.relation.namespace,
+            planner,
+        ),
+    }
+}
+
 /// Immutable SQL materialization facts for one admission-frozen IMV target
 /// locator. Provider handles, leases, and scan materializations remain in
 /// Core's request-local binding store; SQL receives only the copied locator

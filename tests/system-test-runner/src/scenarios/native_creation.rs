@@ -660,6 +660,7 @@ impl RawCreate {
             }),
             initial_domains: self.initial_domains.clone(),
             assignment: Some(proto::TaskAssignment {
+                quota_domain_bindings: Vec::new(),
                 instance_ordinal: self.instance_ordinal,
                 initial_scan_ranges: Vec::new(),
                 sink_edge_ids: Vec::new(),

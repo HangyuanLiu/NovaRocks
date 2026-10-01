@@ -71,7 +71,7 @@ mod tests {
     fn default_annotation_has_no_partition_outcome() {
         let annotation = ImvPlanAnnotation::default();
         assert!(annotation.partition.is_none());
-        assert!(annotation.change_stream.join_refresh.is_none());
+        assert!(annotation.change_stream.visible_bag.is_none());
     }
 
     #[test]

@@ -176,13 +176,13 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
                 encoding: StateEncoding::NativeColumnV1,
             },
         ],
-        apply_key: ApplyKey {
+        apply_key: Some(ApplyKey {
             kind: ApplyKeyKind::GroupRowId,
             components: vec![ApplyKeyComponent {
                 logical_id: apply_key_id(44),
                 target_field_id: field_id(34),
             }],
-        },
+        }),
         aggregates: vec![AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "avg".to_string(),
@@ -480,6 +480,7 @@ impl ProjectionFixture {
                 .output_version
                 .as_ref()
                 .map(MvAcceleratorCommittedVersionRevision::from_committed),
+            eligibility_revision: None,
             configuration_revision: encode_configuration(&self.configuration)
                 .map_err(|e| e.to_string())?
                 .revision(),
@@ -520,6 +521,8 @@ pub fn observed_current(
         ),
     };
     super::documents::MvObservedCurrentDocuments {
+        eligibility: None,
+        eligibility_revision: None,
         management_target: crate::management::ManagedMvTarget::try_new(
             catalog,
             source.target.clone(),

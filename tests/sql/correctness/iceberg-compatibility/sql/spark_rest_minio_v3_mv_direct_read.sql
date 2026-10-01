@@ -67,8 +67,8 @@ if ! describe_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-s
   exit 1
 fi
 printf '%s\n' "$describe_out"
-if ! printf '%s\n' "$describe_out" | grep -Eq '(^|[[:space:]])__nova_base_row_id([[:space:]]|$)'; then
-  printf 'missing __nova_base_row_id in Spark DESCRIBE output\n' >&2
+if printf '%s\n' "$describe_out" | grep -Eq '(^|[[:space:]])(__nova_base_row_id|__nova_join_row_key|__branch_id__)([[:space:]]|$)'; then
+  printf 'non-aggregate MV schema contains a persisted identity column\n' >&2
   exit 1
 fi
 

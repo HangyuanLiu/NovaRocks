@@ -216,6 +216,20 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         pinned: &ConnectorPinnedFileSet,
     ) -> Result<Option<Self::Table>, ConnectorError>;
 
+    /// Freeze the writer's conservative MV candidate baseline at one exact snapshot.
+    fn get_mv_target_candidate_handle(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _exact_snapshot_id: i64,
+        _candidates: &crate::connector::write_stack::ConnectorMvTargetCandidateSelection,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support MV target candidate selection",
+        ))
+    }
+
     fn get_mv_target_partition_handle(
         &self,
         _session: &ConnectorSession,
@@ -769,6 +783,18 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
         self.provider
             .get_mv_target_partition_handle(session, name, selection)
+            .map(|value| value.map(|table| self.wrap_table(table)))
+    }
+
+    fn get_mv_target_candidate_handle(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        exact_snapshot_id: i64,
+        candidates: &crate::connector::write_stack::ConnectorMvTargetCandidateSelection,
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        self.provider
+            .get_mv_target_candidate_handle(session, name, exact_snapshot_id, candidates)
             .map(|value| value.map(|table| self.wrap_table(table)))
     }
 
@@ -1555,6 +1581,23 @@ mod tests {
     }
 
     impl ProviderReadMetadata for Probe {
+        fn get_mv_target_candidate_handle(
+            &self,
+            session: &ConnectorSession,
+            name: &SchemaTableName,
+            exact_snapshot_id: i64,
+            candidates: &crate::connector::write_stack::ConnectorMvTargetCandidateSelection,
+        ) -> Result<Option<Self::Table>, ConnectorError> {
+            assert_eq!(session.query_id(), "q");
+            assert_eq!((name.schema_name(), name.table_name()), ("db", "mv"));
+            assert_eq!(exact_snapshot_id, 41);
+            assert!(matches!(
+                candidates,
+                crate::connector::write_stack::ConnectorMvTargetCandidateSelection::All
+            ));
+            Ok(Some(Table))
+        }
+
         fn get_table_handle(
             &self,
             _session: &ConnectorSession,
@@ -1773,6 +1816,25 @@ mod tests {
                 .expect("transaction"),
             &()
         );
+    }
+
+    #[test]
+    fn mv_target_candidate_handle_forwards_exact_request_and_preserves_binding() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let name = SchemaTableName::try_new("db", "mv").unwrap();
+        let handle = ConnectorReadMetadata::get_mv_target_candidate_handle(
+            &adapter,
+            &session(),
+            &name,
+            41,
+            &crate::connector::write_stack::ConnectorMvTargetCandidateSelection::All,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(handle.binding(), adapter.binding());
+        adapter
+            .table(&handle)
+            .expect("same exact provider generation");
     }
 
     #[test]

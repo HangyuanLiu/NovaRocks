@@ -222,6 +222,8 @@ pub enum ConnectorWriteSessionFlavor {
     /// A publication whose application-owned durable facts are attached by
     /// the same existing write-session commit that publishes its data.
     ApplicationDocumentPublication {
+        /// Some is the strict visible-bag target path; None preserves aggregate publication.
+        target_candidates: Option<ConnectorMvTargetCandidateSelection>,
         declaration: ConnectorDocumentPublicationDeclaration,
         shape: ConnectorManagedPublicationShape,
     },
@@ -287,6 +289,14 @@ pub enum ConnectorManagedPublicationShape {
     /// change events to the branches the provider seals, and the session freezes
     /// the old delete artifacts those branches supersede.
     RowMutation,
+}
+
+/// The conservative planning-time candidate domain frozen before any task runs.
+/// Dynamic filtering may reduce reads but cannot narrow this frozen baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorMvTargetCandidateSelection {
+    All,
+    Partitions(crate::connector::read_stack::ConnectorMvTargetPartitionSelection),
 }
 
 /// One logical write target and its immutable recipe.

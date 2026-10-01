@@ -22,7 +22,7 @@ pub mod runtime;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::persistence::codec::{
-    ApplyKeyKind, ConfigurationDocument, DefinitionDocument, ExpressionKind,
+    ConfigurationDocument, DefinitionDocument, ExpressionKind,
     INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY, InterpretationDocument,
     PhysicalFieldLogicalIdentity, PublicationDocument, RefreshPolicy, StateRole,
     TargetPartitionTransform, internal_retraction_count_aggregate_identity,
@@ -282,24 +282,35 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             ));
         }
     }
-    match document.apply_key.kind {
-        ApplyKeyKind::BaseRowId | ApplyKeyKind::JoinRowKey | ApplyKeyKind::GroupRowId => {}
-    }
-    if document.apply_key.kind == ApplyKeyKind::GroupRowId && document.aggregates.is_empty() {
+    if document.aggregates.is_empty() {
+        if document.apply_key.is_some()
+            || !document.state_slots.is_empty()
+            || !document.branches.is_empty()
+            || document.target.fields.iter().any(|field| {
+                !matches!(
+                    field.logical_identity,
+                    PhysicalFieldLogicalIdentity::Output(_)
+                )
+            })
+        {
+            return Err(ValidationError::new(
+                "interpretation",
+                "visible tuple bag must bind only output fields, without apply key, state or branch fields",
+            ));
+        }
+    } else if document
+        .apply_key
+        .as_ref()
+        .is_none_or(|key| key.components.is_empty())
+    {
         return Err(ValidationError::new(
-            "interpretation.apply_key.kind",
-            "GROUP_ROW_ID requires aggregate interpretation",
-        ));
-    }
-    if document.apply_key.components.is_empty() {
-        return Err(ValidationError::new(
-            "interpretation.apply_key.components",
-            "at least one apply-key field is required",
+            "interpretation.apply_key",
+            "aggregate interpretation requires a nonempty GROUP_ROW_ID apply key",
         ));
     }
     let mut apply_logical_ids = BTreeSet::new();
     let mut apply_target_ids = BTreeSet::new();
-    for component in &document.apply_key.components {
+    for component in document.apply_key.iter().flat_map(|key| &key.components) {
         if !apply_logical_ids.insert(&component.logical_id) {
             return Err(ValidationError::new(
                 "interpretation.apply_key.components",
@@ -509,10 +520,14 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
                 ));
             }
             PhysicalFieldLogicalIdentity::ApplyKey(logical_id)
-                if !document.apply_key.components.iter().any(|component| {
-                    &component.logical_id == logical_id
-                        && component.target_field_id == field.target_field_id
-                }) =>
+                if !document
+                    .apply_key
+                    .iter()
+                    .flat_map(|key| &key.components)
+                    .any(|component| {
+                        &component.logical_id == logical_id
+                            && component.target_field_id == field.target_field_id
+                    }) =>
             {
                 return Err(ValidationError::new(
                     "interpretation.target.fields",
@@ -573,7 +588,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             slot.nullable,
         )?;
     }
-    for component in &document.apply_key.components {
+    for component in document.apply_key.iter().flat_map(|key| &key.components) {
         if !document.target.fields.iter().any(|field| {
             field.logical_identity
                 == PhysicalFieldLogicalIdentity::ApplyKey(component.logical_id.clone())
@@ -592,7 +607,10 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
         + document.branches.len()
         + document.target.fields.len()
         + document.target.partition_fields.len()
-        + document.apply_key.components.len()
+        + document
+            .apply_key
+            .as_ref()
+            .map_or(0, |key| key.components.len())
         + document
             .aggregates
             .iter()

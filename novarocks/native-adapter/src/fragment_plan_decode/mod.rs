@@ -29,6 +29,8 @@ mod hash_join_tests;
 mod nestloop_join;
 #[cfg(test)]
 mod project;
+mod quota_preclaim;
+mod quota_trim;
 #[cfg(test)]
 mod sort;
 #[cfg(test)]
@@ -96,6 +98,7 @@ pub(crate) fn decode_node_with_runtime_filters(
     ctx: &NativePlanDecodeContext,
     ledger: &mut NativeRuntimeFilterDecodeLedger,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    ledger.validate_quota_attachments(node)?;
     decode_node_inner(
         node,
         FieldPath::root("plan_fragment").field("root"),
@@ -309,7 +312,11 @@ fn attach_leaf_consumers(
                 ),
             ));
         };
-        let DecodedConsumerBindingTarget::SourceBoundary = target else {
+        if !matches!(
+            target,
+            DecodedConsumerBindingTarget::SourceBoundary
+                | DecodedConsumerBindingTarget::QuotaContentScanField { .. }
+        ) {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("runtime_filter_binding_ids"),
                 format!(
@@ -481,12 +488,21 @@ fn attach_producers(
         return Err(NativeFragmentDecodeError::inconsistent(
             path.clone().field("runtime_filter_binding_ids"),
             format!(
-                "native runtime-filter producer node_id={} must target a physical HashJoin or HashAggregate",
+                "native runtime-filter producer node_id={} must target a physical HashJoin, HashAggregate or QuotaPreclaim",
                 wire_node.node_id
             ),
         ));
     };
     match physical.kind.as_ref() {
+        Some(plan::plan_node::Kind::QuotaPreclaim(wire_quota)) => attach_quota_producers(
+            wire_node,
+            wire_quota,
+            bindings,
+            direct_inputs,
+            lowered,
+            arena,
+            path,
+        ),
         Some(plan::plan_node::Kind::HashJoin(wire_join)) => {
             attach_hash_join_producers(wire_node, wire_join, bindings, direct_inputs, lowered, path)
         }
@@ -504,7 +520,7 @@ fn attach_producers(
         kind => Err(NativeFragmentDecodeError::inconsistent(
             path.field("runtime_filter_binding_ids"),
             format!(
-                "native runtime-filter producer node_id={} must target a physical HashJoin or HashAggregate, got {kind:?}",
+                "native runtime-filter producer node_id={} must target a physical HashJoin, HashAggregate or QuotaPreclaim, got {kind:?}",
                 wire_node.node_id
             ),
         )),
@@ -618,8 +634,8 @@ fn attach_hash_join_producers(
                 ),
             ));
         }
-        validate_column_refs_exact(
-            binding.binding_id,
+        validate_input_column_refs_exact(
+            &format!("native runtime-filter binding_id={}", binding.binding_id),
             raw_build,
             build_layout,
             build_schema,
@@ -779,8 +795,8 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         }
-        validate_column_refs_exact(
-            binding.binding_id,
+        validate_input_column_refs_exact(
+            &format!("native runtime-filter binding_id={}", binding.binding_id),
             raw_group_key,
             input_layout,
             input_schema,
@@ -901,8 +917,8 @@ fn lower_binding_expression(
     arena: &mut ExprArena,
 ) -> Result<novarocks_execution::exec::expr::ExprId, NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
-    validate_column_refs_exact(
-        binding.binding_id,
+    validate_input_column_refs_exact(
+        &format!("native runtime-filter binding_id={}", binding.binding_id),
         &binding.expression,
         layout,
         schema,
@@ -911,8 +927,8 @@ fn lower_binding_expression(
     decode_expr_for_slot_layout(&binding.expression, expression_path, arena, layout)
 }
 
-fn validate_column_refs_exact(
-    binding_id: u32,
+pub(crate) fn validate_input_column_refs_exact(
+    context: &str,
     expression: &novarocks_proto_models::expr::Expr,
     layout: &Layout,
     schema: &ChunkSchemaRef,
@@ -923,27 +939,25 @@ fn validate_column_refs_exact(
     let kind = expression.kind.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone().field("kind"),
-            format!("native runtime-filter binding_id={binding_id} expression kind missing"),
+            format!("{context} expression kind missing"),
         )
     })?;
     if let Kind::ColumnRef(column) = kind {
         let column_path = path.clone().field("column_ref");
-        let slot_id = layout
-            .resolve_column_id(column.column_id)
-            .ok_or_else(|| {
-                NativeFragmentDecodeError::invalid_value(
-                    column_path.clone().field("column_id"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id}: ColumnRef column_id={} not found in input layout",
-                        column.column_id
-                    ),
-                )
-            })?;
+        let slot_id = layout.resolve_column_id(column.column_id).ok_or_else(|| {
+            NativeFragmentDecodeError::invalid_value(
+                column_path.clone().field("column_id"),
+                format!(
+                    "{context}: ColumnRef column_id={} not found in input layout",
+                    column.column_id
+                ),
+            )
+        })?;
         let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
             NativeFragmentDecodeError::inconsistent(
                 column_path.clone().field("column_id"),
                 format!(
-                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} has no ChunkSchema field",
+                    "{context} ColumnRef column_id={} has no ChunkSchema field",
                     column.column_id
                 ),
             )
@@ -952,7 +966,7 @@ fn validate_column_refs_exact(
             NativeFragmentDecodeError::missing(
                 path.clone().field("type"),
                 format!(
-                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type missing",
+                    "{context} ColumnRef column_id={} type missing",
                     column.column_id
                 ),
             )
@@ -966,7 +980,7 @@ fn validate_column_refs_exact(
             NativeFragmentDecodeError::invalid_value(
                 path.clone().field("type"),
                 format!(
-                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type: {error}",
+                    "{context} ColumnRef column_id={} type: {error}",
                     column.column_id
                 ),
             )
@@ -986,7 +1000,7 @@ fn validate_column_refs_exact(
             return Err(NativeFragmentDecodeError::inconsistent(
                 column_path,
                 format!(
-                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type/nullability does not exactly match direct input",
+                    "{context} ColumnRef column_id={} type/nullability does not exactly match direct input",
                     column.column_id
                 ),
             ));
@@ -994,7 +1008,7 @@ fn validate_column_refs_exact(
     }
 
     let visit = |child: &novarocks_proto_models::expr::Expr, child_path: FieldPath| {
-        validate_column_refs_exact(binding_id, child, layout, schema, child_path)
+        validate_input_column_refs_exact(context, child, layout, schema, child_path)
     };
     let missing = |child_path: FieldPath, detail: &'static str| {
         NativeFragmentDecodeError::missing(child_path, detail)
@@ -1244,6 +1258,22 @@ fn lower_physical_node(
         )
     })?;
     match kind {
+        plan::plan_node::Kind::QuotaPreclaim(quota) => quota_preclaim::lower(
+            node,
+            physical,
+            quota,
+            path.clone().field("quota_preclaim"),
+            physical_output_path.clone(),
+            children,
+        ),
+        plan::plan_node::Kind::QuotaTrim(quota) => quota_trim::lower(
+            node,
+            physical,
+            quota,
+            path.clone().field("quota_trim"),
+            physical_output_path.clone(),
+            children,
+        ),
         plan::plan_node::Kind::Values(values) => lower_values_node(
             node,
             physical,
@@ -2128,4 +2158,84 @@ mod tests {
         assert_eq!(order.comparator_digest(), [3; 32]);
         assert_eq!(order.digest(), [4; 32]);
     }
+}
+
+fn attach_quota_producers(
+    wire_node: &plan::DistributedNode,
+    wire: &plan::QuotaPreclaimNode,
+    bindings: &[DecodedRuntimeFilterBinding],
+    direct_inputs: &[(Layout, ChunkSchemaRef)],
+    lowered: &mut DecodedNode,
+    arena: &mut ExprArena,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    fn quota_node(
+        node: &mut ExecNode,
+    ) -> Option<&mut novarocks_execution::exec::node::quota_preclaim::QuotaPreclaimNode> {
+        match &mut node.kind {
+            ExecNodeKind::QuotaPreclaim(quota) => Some(quota),
+            ExecNodeKind::Limit(limit) => quota_node(&mut limit.input),
+            _ => None,
+        }
+    }
+    let quota = quota_node(&mut lowered.node).ok_or_else(|| {
+        NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            "quota filter producer lost its exact Preclaim kernel",
+        )
+    })?;
+    if quota.node_id != wire_node.node_id || !quota.runtime_filters.is_empty() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            "quota producer has conflicting attachments",
+        ));
+    }
+    let (layout, schema) = direct_inputs.first().ok_or_else(|| {
+        NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            "quota producer has no exact demand input",
+        )
+    })?;
+    for binding in bindings {
+        let DecodedBindingRole::Producer {
+            contract,
+            target: ProducerBindingTarget::QuotaContentField { ordinal, .. },
+        } = &binding.role
+        else {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                "QuotaPreclaim only accepts quota content-field producers",
+            ));
+        };
+        let demand_field = wire.demand_value_column_ids.get(*ordinal).ok_or_else(|| {
+            NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                "quota content field is absent from the complete demand tuple",
+            )
+        })?;
+        let Some(novarocks_proto_models::expr::expr::Kind::ColumnRef(field)) =
+            &binding.expression.kind
+        else {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                "quota producer must read one materialized demand field",
+            ));
+        };
+        if field.column_id != *demand_field
+            || wire.demand_value_column_ids.len() != wire.target_value_column_ids.len()
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                "quota producer reads the wrong complete-content demand field",
+            ));
+        }
+        let id = lower_binding_expression(binding, layout, schema, arena)?;
+        quota.runtime_filters.push(
+            novarocks_execution::exec::node::quota_preclaim::QuotaRuntimeFilterProducerBinding {
+                demand_expr_id: id,
+                contract: contract.clone(),
+            },
+        );
+    }
+    Ok(())
 }

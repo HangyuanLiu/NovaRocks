@@ -133,8 +133,12 @@ fn rejection_from_host(rejection: HostRejection) -> DomainExecutionRejection {
     use novarocks_execution_contract::TaskFailureCategory;
 
     let outcome = match rejection.category() {
-        TaskFailureCategory::ResourceExhausted => OperationOutcome::ResourceExhausted,
-        TaskFailureCategory::Protocol
+        TaskFailureCategory::ResourceExhausted | TaskFailureCategory::CapacityRefused { .. } => {
+            OperationOutcome::ResourceExhausted
+        }
+        TaskFailureCategory::MvApplyConsistency { .. }
+        | TaskFailureCategory::TargetFormatUnsupported { .. }
+        | TaskFailureCategory::Protocol
         | TaskFailureCategory::Exchange
         | TaskFailureCategory::Execution
         | TaskFailureCategory::Internal => OperationOutcome::InvalidStateOrRequest,

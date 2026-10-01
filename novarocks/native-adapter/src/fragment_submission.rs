@@ -186,6 +186,29 @@ pub fn decode_fragment_sink_assignment(
             stream.dest_node_id,
             decode_stream_partition(stream, path.clone().field("data_stream"))?,
         )],
+        plan::data_sink::Kind::PredicateFanout(fanout) => fanout
+            .branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                let branch_path = path
+                    .clone()
+                    .field("predicate_fanout")
+                    .field("branches")
+                    .index(index);
+                let stream = branch.stream.as_ref().ok_or_else(|| {
+                    error(
+                        branch_path.clone().field("stream"),
+                        ProtocolErrorKind::MissingField,
+                        "fanout branch requires stream",
+                    )
+                })?;
+                Ok((
+                    stream.dest_node_id,
+                    decode_stream_partition(stream, branch_path.field("stream"))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
         plan::data_sink::Kind::MultiCastDataStream(grouped) => grouped
             .sinks
             .iter()
@@ -245,6 +268,13 @@ pub fn decode_fragment_sink_assignment(
             destinations: groups.pop().expect("one stream edge was validated"),
             sender_id: None,
         }),
+        plan::data_sink::Kind::PredicateFanout(fanout) => {
+            debug_assert_eq!(groups.len(), fanout.branches.len());
+            Ok(FragmentSinkAssignment::DestinationGroups {
+                groups,
+                sender_id: None,
+            })
+        }
         plan::data_sink::Kind::MultiCastDataStream(grouped) => {
             debug_assert_eq!(groups.len(), grouped.sinks.len());
             Ok(FragmentSinkAssignment::DestinationGroups {

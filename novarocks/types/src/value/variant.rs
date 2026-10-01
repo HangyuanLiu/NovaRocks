@@ -259,6 +259,21 @@ impl VariantValue {
         &self.value
     }
 
+    /// Encodes typed result content without metadata dictionary IDs or physical offsets.
+    pub fn encode_result_content(&self, out: &mut Vec<u8>) -> Result<(), String> {
+        encode_variant_content(
+            &VariantRef {
+                metadata: &self.metadata,
+                value: &self.value,
+            },
+            self.metadata.raw(),
+            &mut |bytes| {
+                out.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
+    }
+
     pub fn to_json_local(&self) -> Result<String, String> {
         let tz = Local::now().offset().fix();
         self.to_json(Some(tz))
@@ -1111,6 +1126,164 @@ fn read_le_u32(data: &[u8], size: u8) -> Result<u32, String> {
         out |= (byte as u32) << (8 * i);
     }
     Ok(out)
+}
+
+/// Visits canonical VARIANT result content without copying its metadata or value.
+/// Counting and writing consumers use the same walker and byte vocabulary.
+pub fn visit_serialized_result_content(
+    data: &[u8],
+    write: &mut impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let (metadata, value) = split_serialized(data)?;
+    validate_metadata(metadata)?;
+    let parser = VariantMetadata {
+        raw: Vec::new(),
+        dict_size: 0,
+        offset_size: 1,
+        sorted: false,
+    };
+    encode_variant_content(
+        &VariantRef {
+            metadata: &parser,
+            value,
+        },
+        metadata,
+        write,
+    )
+}
+fn variant_metadata_key(metadata: &[u8], index: u32) -> Result<&[u8], String> {
+    let width = 1 + ((metadata[0] & OFFSET_SIZE_MASK) >> OFFSET_SIZE_SHIFT);
+    let count = read_le_u32(&metadata[HEADER_SIZE..], width)?;
+    if index >= count {
+        return Err("Variant content key index is out of range".into());
+    }
+    let offsets = HEADER_SIZE + width as usize + (index as usize) * width as usize;
+    let start = read_le_u32(&metadata[offsets..], width)? as usize;
+    let end = read_le_u32(&metadata[offsets + width as usize..], width)? as usize;
+    let base = HEADER_SIZE + width as usize * (count as usize + 2);
+    let key = metadata
+        .get(base + start..base + end)
+        .ok_or_else(|| "Variant content metadata offsets are invalid".to_string())?;
+    std::str::from_utf8(key).map_err(|_| "Variant content key is not valid UTF-8".to_string())?;
+    Ok(key)
+}
+
+fn encode_variant_content(
+    variant: &VariantRef<'_>,
+    metadata: &[u8],
+    out: &mut impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    fn bytes(
+        out: &mut impl FnMut(&[u8]) -> Result<(), String>,
+        value: &[u8],
+    ) -> Result<(), String> {
+        out(&(value.len() as u64).to_le_bytes())?;
+        out(value)
+    }
+    match variant.basic_type()? {
+        BasicType::Primitive => {
+            out(&[0])?;
+            let ty = variant.primitive_type()?;
+            out(&[ty as u8])?;
+            let size = match ty {
+                VariantPrimitiveType::Null
+                | VariantPrimitiveType::BooleanTrue
+                | VariantPrimitiveType::BooleanFalse => 0,
+                VariantPrimitiveType::Int8 => 1,
+                VariantPrimitiveType::Int16 => 2,
+                VariantPrimitiveType::Int32
+                | VariantPrimitiveType::Float
+                | VariantPrimitiveType::Date => 4,
+                VariantPrimitiveType::Int64
+                | VariantPrimitiveType::Double
+                | VariantPrimitiveType::TimestampTz
+                | VariantPrimitiveType::TimestampNtz
+                | VariantPrimitiveType::TimeNtz
+                | VariantPrimitiveType::TimestampTzNanos
+                | VariantPrimitiveType::TimestampNtzNanos => 8,
+                VariantPrimitiveType::Decimal4 => 5,
+                VariantPrimitiveType::Decimal8 => 9,
+                VariantPrimitiveType::Decimal16 => 17,
+                VariantPrimitiveType::Uuid => 16,
+                VariantPrimitiveType::String => {
+                    bytes(out, variant.get_string()?)?;
+                    return Ok(());
+                }
+                VariantPrimitiveType::Binary => {
+                    bytes(out, variant.get_binary()?)?;
+                    return Ok(());
+                }
+            };
+            out(variant.primitive_bytes(size)?)?;
+        }
+        BasicType::ShortString => {
+            out(&[1])?;
+            bytes(out, variant.get_string()?)?;
+        }
+        BasicType::Object => {
+            out(&[2])?;
+            let info = variant.object_info()?;
+            out(&(info.num_elements as u64).to_le_bytes())?;
+            for i in 0..info.num_elements as usize {
+                let id_pos = info.id_start_offset + i * info.id_size as usize;
+                bytes(
+                    out,
+                    variant_metadata_key(
+                        metadata,
+                        read_le_u32(&variant.value[id_pos..], info.id_size)?,
+                    )?,
+                )?;
+                let pos = info.offset_start_offset + i * info.offset_size as usize;
+                let start = info.data_start_offset
+                    + read_le_u32(&variant.value[pos..], info.offset_size)? as usize;
+                let end = info.data_start_offset
+                    + read_le_u32(
+                        &variant.value[pos + info.offset_size as usize..],
+                        info.offset_size,
+                    )? as usize;
+                let value = variant
+                    .value
+                    .get(start..end)
+                    .ok_or_else(|| "Invalid variant object content offsets".to_string())?;
+                encode_variant_content(
+                    &VariantRef {
+                        metadata: variant.metadata,
+                        value,
+                    },
+                    metadata,
+                    out,
+                )?;
+            }
+        }
+        BasicType::Array => {
+            out(&[3])?;
+            let info = variant.array_info()?;
+            out(&(info.num_elements as u64).to_le_bytes())?;
+            for i in 0..info.num_elements as usize {
+                let pos = info.offset_start_offset + i * info.offset_size as usize;
+                let start = info.data_start_offset
+                    + read_le_u32(&variant.value[pos..], info.offset_size)? as usize;
+                let end = info.data_start_offset
+                    + read_le_u32(
+                        &variant.value[pos + info.offset_size as usize..],
+                        info.offset_size,
+                    )? as usize;
+                let value = variant
+                    .value
+                    .get(start..end)
+                    .ok_or_else(|| "Invalid variant array content offsets".to_string())?;
+                encode_variant_content(
+                    &VariantRef {
+                        metadata: variant.metadata,
+                        value,
+                    },
+                    metadata,
+                    out,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn variant_to_json(

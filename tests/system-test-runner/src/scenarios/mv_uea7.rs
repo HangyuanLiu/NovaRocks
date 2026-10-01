@@ -24,6 +24,9 @@ use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
 };
+use novarocks_sql_test_runner::publication_fault_fixture::{
+    CatalogResponseLossControl, CatalogResponseLossFixture,
+};
 use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
@@ -43,6 +46,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 /// A restarted FE must still see the same external catalog and object store.
 pub(super) struct ManagedMvRestFixture {
     rest: IsolatedIcebergRestFixture,
+    catalog_proxy: Option<CatalogResponseLossFixture>,
     create_catalog_sql: String,
 }
 
@@ -53,7 +57,28 @@ impl ManagedMvRestFixture {
     ) -> Result<(Self, ScenarioLaunchConfig)> {
         let rest = IsolatedIcebergRestFixture::start(scenario_root)
             .context("start private Iceberg REST and MinIO fixture for managed MV")?;
+        Self::from_rest(rest, catalog, None)
+    }
+
+    pub(super) fn start_with_catalog_proxy(
+        scenario_root: &Path,
+        catalog: &str,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
+        let rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start private REST authority for commit response loss")?;
+        let proxy = CatalogResponseLossFixture::start(rest.endpoints().rest_uri.clone())?;
+        Self::from_rest(rest, catalog, Some(proxy))
+    }
+
+    fn from_rest(
+        rest: IsolatedIcebergRestFixture,
+        catalog: &str,
+        catalog_proxy: Option<CatalogResponseLossFixture>,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
         let endpoints = rest.endpoints().clone();
+        let catalog_uri = catalog_proxy
+            .as_ref()
+            .map_or(endpoints.rest_uri.as_str(), |proxy| proxy.uri());
         let identity = rest.static_s3_identity();
         let create_catalog_sql = format!(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\
@@ -72,7 +97,7 @@ impl ManagedMvRestFixture {
              \"aws.s3.endpoint\"=\"{}\",\
              \"aws.s3.region\"=\"us-east-1\",\
              \"aws.s3.enable_path_style_access\"=\"true\")",
-            endpoints.rest_uri, endpoints.rest_warehouse, endpoints.minio_endpoint,
+            catalog_uri, endpoints.rest_warehouse, endpoints.minio_endpoint,
         );
         let mut child_environment = CrossProcessChildEnvironment::default();
         for child in [&mut child_environment.fe, &mut child_environment.be] {
@@ -107,6 +132,7 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
         Ok((
             Self {
                 rest,
+                catalog_proxy,
                 create_catalog_sql,
             },
             launch,
@@ -121,7 +147,35 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
         &self.rest.endpoints().rest_uri
     }
 
+    pub(super) fn corrupt_private_visible_tuple(
+        &self,
+        namespace: &str,
+        table: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        super::mv_physical_corruption::replace_visible_value(
+            self.rest_uri(),
+            &self.rest.endpoints().minio_endpoint,
+            self.rest.static_s3_identity(),
+            namespace,
+            table,
+            timeout,
+        )
+    }
+
+    pub(super) fn catalog_proxy_control(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<CatalogResponseLossControl> {
+        self.catalog_proxy
+            .as_ref()
+            .context("managed MV catalog proxy is not installed")?
+            .control(deadline)
+    }
+
     pub(super) fn shutdown(&mut self) -> Result<()> {
+        // Stop the transparent proxy before its authoritative downstream.
+        self.catalog_proxy.take();
         self.rest
             .shutdown()
             .context("shutdown private managed MV REST fixture")

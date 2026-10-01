@@ -51,16 +51,17 @@ pub use program::{
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,
     LocalProgram, LocalProgramError, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
     MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramNode, ProgramNodeKind, ProjectExpressionSlot,
-    RowAssertion, SetOpKind, SortExpression, SortTopNType, StaticAggregateCall,
-    StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
-    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
-    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
-    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    QuotaContentFilter, QuotaNeed, QuotaPreclaimSpec, QuotaTrimSpec, RowAssertion, SetOpKind,
+    SortExpression, SortTopNType, StaticAggregateCall, StaticAggregateOrder,
+    StaticAggregateTypeSignature, StaticWindowFunction, StaticWriterProjection,
+    StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping,
+    UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind, WindowType,
+    WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
     WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
 };
 pub use requirements::{
     BindingRequirement, BindingRequirements, BindingRequirementsError, ProgramNodeId,
-    ScanSourceKind,
+    QuotaDomainId, ScanSourceKind,
 };
 pub use runtime_filter::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,

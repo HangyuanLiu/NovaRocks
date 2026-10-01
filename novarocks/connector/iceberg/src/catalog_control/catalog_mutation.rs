@@ -44,9 +44,8 @@ use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
 use crate::iceberg::spec::{
-    FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
-    SnapshotRetention, StructType, Summary, Transform, Type, UnboundPartitionField,
-    UnboundPartitionSpec, UnboundPartitionSpecBuilder,
+    FormatVersion, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    UnboundPartitionField, UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
 use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use crate::iceberg::{
@@ -2290,7 +2289,12 @@ fn execute_application_document_update(
         expected_table_uuid: Some(Arc::from(expected_uuid.to_string())),
         marker: None,
     };
-    let commit = match application_document_update_commit(table, expected_uuid, properties) {
+    let commit = match application_document_update_commit(
+        table,
+        expected_uuid,
+        base_snapshot_id,
+        properties,
+    ) {
         Ok(commit) => commit,
         Err(error) => return Ok(known_uncommitted(error)),
     };
@@ -2405,13 +2409,20 @@ fn execute_application_document_update(
 fn application_document_update_commit(
     table: &ConnectorTableIdentity,
     expected_uuid: uuid::Uuid,
+    expected_main_snapshot: Option<i64>,
     properties: HashMap<String, String>,
 ) -> Result<TableCommit, ConnectorError> {
     Ok(TableCommit::builder()
         .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![TableRequirement::UuidMatch {
-            uuid: expected_uuid,
-        }])
+        .requirements(vec![
+            TableRequirement::UuidMatch {
+                uuid: expected_uuid,
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".to_string(),
+                snapshot_id: expected_main_snapshot,
+            },
+        ])
         .updates(vec![TableUpdate::SetProperties {
             updates: properties,
         }])
@@ -4125,14 +4136,15 @@ mod tests {
         ]);
 
         let mut commit =
-            application_document_update_commit(&table, table_uuid, properties.clone()).unwrap();
+            application_document_update_commit(&table, table_uuid, Some(41), properties.clone())
+                .unwrap();
         assert_eq!(
             commit.identifier(),
             &crate::iceberg::TableIdent::from_strs(["managed", "mv"]).unwrap()
         );
         assert!(matches!(
             commit.take_requirements().as_slice(),
-            [TableRequirement::UuidMatch { uuid }] if *uuid == table_uuid
+            [TableRequirement::UuidMatch { uuid }, TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id: Some(41) }] if *uuid == table_uuid && r#ref == "main"
         ));
         assert!(matches!(
             commit.take_updates().as_slice(),

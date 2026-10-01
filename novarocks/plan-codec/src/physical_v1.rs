@@ -615,6 +615,8 @@ fn mechanical_output_slots(
         | NodeKind::SetOp { .. }
         | NodeKind::Values { .. }
         | NodeKind::Unpivot { .. }
+        | NodeKind::QuotaPreclaim { .. }
+        | NodeKind::QuotaTrim { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ChangeEventExpand { .. }
         | NodeKind::TableWriter { .. }
@@ -1050,6 +1052,7 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
             FragmentSink::Result
             | FragmentSink::Stream { .. }
             | FragmentSink::Multicast { .. }
+            | FragmentSink::PredicateFanout { .. }
             | FragmentSink::Router { .. } => {}
         }
         for node in fragment.nodes().values() {

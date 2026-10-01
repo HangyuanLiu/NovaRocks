@@ -231,6 +231,9 @@ fn engine_error(error: MvCreateProviderError) -> MvApplicationError {
 
 fn product_error(error: MvProductError) -> MvApplicationError {
     let kind = match error.kind() {
+        MvProductErrorKind::ConsistencyFailed => MvApplicationErrorKind::ConsistencyFailed,
+        MvProductErrorKind::CapacityRefused => MvApplicationErrorKind::CapacityRefused,
+        MvProductErrorKind::TargetRefused => MvApplicationErrorKind::TargetRefused,
         MvProductErrorKind::KnownCommittedFinalizeFailed => {
             MvApplicationErrorKind::KnownCommittedFinalizeFailed
         }

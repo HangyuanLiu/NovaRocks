@@ -27,6 +27,7 @@ pub enum ConnectorResourceClass {
     Metadata,
     SplitPlanning,
     ReaderState,
+    WriterState,
     ReaderOutput,
 }
 
@@ -59,7 +60,7 @@ pub trait ConnectorResourceLedger: Send + Sync {
     ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError>;
 }
 
-/// Mandatory resource capability for a backend reader or page source.
+/// Mandatory resource capability for a backend reader, page source or writer.
 ///
 /// A role host obtains this only after the exact task's tracker is installed.
 /// The type makes the execution dependency explicit; the host's admission

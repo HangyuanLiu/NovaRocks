@@ -57,6 +57,11 @@ pub fn eval_mv_state_function(
         "count_state_visible" => super::count::eval_count_state_visible(arena, expr, args, chunk),
         "state_all_zero" => super::count::eval_state_all_zero(arena, expr, args, chunk),
         "mv_group_row_id" => eval_mv_group_row_id(arena, expr, args, chunk),
+        "mv_content_key" => eval_mv_content_key(arena, args, chunk),
+        "mv_require_non_null" => eval_mv_require_non_null(arena, expr, args, chunk),
+        "mv_entry_id" => {
+            Err("mv_entry_id requires an exact task-bound top-level Project evaluation".into())
+        }
         "count_distinct_state_union" => {
             super::count_distinct::eval_count_distinct_state_union(arena, expr, args, chunk)
         }
@@ -113,11 +118,125 @@ fn eval_mv_group_row_id(
     crate::exec::mv::group_row_id::aggregate_group_row_id_array(&columns)
 }
 
+fn eval_mv_require_non_null(
+    arena: &ExprArena,
+    expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    let [input] = args else {
+        return Err("mv_require_non_null requires exactly one argument".into());
+    };
+    let expected = arena
+        .data_type(expr)
+        .ok_or_else(|| "mv_require_non_null requires an exact result type".to_string())?;
+    if arena.data_type(*input) != Some(expected)
+        || !novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1
+            .supports(expected)
+    {
+        return Err("mv_require_non_null requires an unchanged NativeResultContentV1 type".into());
+    }
+    let values = arena.eval(*input, chunk)?;
+    if values.data_type() != expected {
+        return Err("mv_require_non_null input array differs from its exact type".into());
+    }
+    let has_null = if matches!(
+        values.data_type(),
+        arrow::datatypes::DataType::Dictionary(..)
+    ) {
+        (0..values.len()).try_fold(false, |found, row| {
+            Ok::<_, String>(found || mv_representative_is_null(values.as_ref(), row)?)
+        })?
+    } else {
+        values.logical_null_count() != 0
+    };
+    if has_null {
+        return Err("mv_require_non_null encountered NULL in a non-null MV representative".into());
+    }
+    Ok(values)
+}
+
+// Checking dictionary values directly avoids allocating a decoded null bitmap,
+// including for nested dictionaries whose unused value domain contains NULL.
+fn mv_representative_is_null(values: &dyn arrow::array::Array, row: usize) -> Result<bool, String> {
+    use arrow::array::DictionaryArray;
+    use arrow::datatypes::*;
+    if row >= values.len() {
+        return Err("mv_require_non_null dictionary key is out of range".into());
+    }
+    if values.is_null(row) || matches!(values.data_type(), DataType::Null) {
+        return Ok(true);
+    }
+    let DataType::Dictionary(key, _) = values.data_type() else {
+        return Ok(false);
+    };
+    macro_rules! check_dictionary {
+        ($key:ty) => {{
+            let dictionary = values
+                .as_any()
+                .downcast_ref::<DictionaryArray<$key>>()
+                .ok_or_else(|| {
+                    "mv_require_non_null dictionary key type differs from its array".to_string()
+                })?;
+            let index = dictionary
+                .key(row)
+                .ok_or_else(|| "mv_require_non_null dictionary key is absent".to_string())?;
+            mv_representative_is_null(dictionary.values().as_ref(), index)
+        }};
+    }
+    match key.as_ref() {
+        DataType::Int8 => check_dictionary!(Int8Type),
+        DataType::Int16 => check_dictionary!(Int16Type),
+        DataType::Int32 => check_dictionary!(Int32Type),
+        DataType::Int64 => check_dictionary!(Int64Type),
+        DataType::UInt8 => check_dictionary!(UInt8Type),
+        DataType::UInt16 => check_dictionary!(UInt16Type),
+        DataType::UInt32 => check_dictionary!(UInt32Type),
+        DataType::UInt64 => check_dictionary!(UInt64Type),
+        _ => Err("mv_require_non_null dictionary key type is unsupported".into()),
+    }
+}
+
+fn eval_mv_content_key(
+    arena: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.is_empty() {
+        return Err("mv_content_key requires at least one argument".into());
+    }
+    let columns = args
+        .iter()
+        .map(|arg| arena.eval(*arg, chunk))
+        .collect::<Result<Vec<_>, _>>()?;
+    let types = args
+        .iter()
+        .zip(&columns)
+        .map(|(arg, column)| {
+            arena
+                .data_type(*arg)
+                .cloned()
+                .unwrap_or_else(|| column.data_type().clone())
+        })
+        .collect();
+    let encoder = crate::exec::hash_table::content_key::ContentKeyEncoder::try_new_types(types)?;
+    let mut builder = arrow::array::BinaryBuilder::new();
+    let mut key = Vec::new();
+    for row in 0..chunk.len() {
+        encoder.encode_row_into(&columns, row, &mut key)?;
+        builder.append_value(&key);
+    }
+    Ok(std::sync::Arc::new(builder.finish()))
+}
+
 static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
     ("count_state_union", "count_state_union"),
     ("count_state_visible", "count_state_visible"),
     ("state_all_zero", "state_all_zero"),
     ("mv_group_row_id", "mv_group_row_id"),
+    ("mv_content_key", "mv_content_key"),
+    ("mv_entry_id", "mv_entry_id"),
+    ("mv_require_non_null", "mv_require_non_null"),
     ("count_distinct_state_union", "count_distinct_state_union"),
     (
         "count_distinct_state_visible",
@@ -146,6 +265,21 @@ static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
 ];
 
 static MV_STATE_METADATA: &[FunctionMeta] = &[
+    FunctionMeta {
+        name: "mv_require_non_null",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "mv_entry_id",
+        min_args: 0,
+        max_args: 0,
+    },
+    FunctionMeta {
+        name: "mv_content_key",
+        min_args: 1,
+        max_args: usize::MAX,
+    },
     FunctionMeta {
         name: "count_state_union",
         min_args: 2,
@@ -367,5 +501,171 @@ mod tests {
         )
         .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+}
+
+#[cfg(test)]
+mod content_key_tests {
+    use super::*;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::ExprNode;
+    use arrow::array::{Array, BinaryArray, Float64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+    use std::sync::Arc;
+
+    fn require_non_null_input(values: ArrayRef) -> (ExprArena, ExprId, Chunk) {
+        let field = Field::new("representative", values.data_type().clone(), true);
+        let slot = SlotId::new(9);
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![values]).unwrap();
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(slot, &field, None).unwrap(),
+            ])
+            .unwrap(),
+        );
+        let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+        let mut arena = ExprArena::default();
+        let input = arena.push_typed(ExprNode::SlotId(slot), field.data_type().clone());
+        (arena, input, chunk)
+    }
+
+    #[test]
+    fn mv_require_non_null_preserves_array_buffers_and_float_bits() {
+        let bits = [
+            0_u64,
+            (-0.0_f64).to_bits(),
+            0x7ff8_0000_0000_0042,
+            0xfff8_0000_0000_0043,
+        ];
+        let values = Arc::new(Float64Array::from(bits.map(f64::from_bits).to_vec())) as ArrayRef;
+        let (arena, input, chunk) = require_non_null_input(values.clone());
+        assert_eq!(metadata("mv_require_non_null").unwrap().min_args, 1);
+        let output =
+            eval_mv_state_function("mv_require_non_null", &arena, input, &[input], &chunk).unwrap();
+        assert_eq!(output.data_type(), values.data_type());
+        let result = output.as_any().downcast_ref::<Float64Array>().unwrap();
+        let source = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(result.values().as_ptr(), source.values().as_ptr());
+        for (row, expected) in bits.into_iter().enumerate() {
+            assert_eq!(result.value(row).to_bits(), expected);
+        }
+        assert!(eval_mv_state_function("mv_require_non_null", &arena, input, &[], &chunk).is_err());
+        assert!(
+            eval_mv_state_function(
+                "mv_require_non_null",
+                &arena,
+                input,
+                &[input, input],
+                &chunk
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mv_require_non_null_rejects_physical_and_dictionary_value_nulls() {
+        use arrow::array::{DictionaryArray, Int8Array, Int64Array, StringArray};
+        use arrow::datatypes::Int8Type;
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0_i8, 1]),
+            Arc::new(StringArray::from(vec![Some("present"), None])),
+        )
+        .unwrap();
+        assert_eq!(dictionary.null_count(), 0);
+        let inputs = [
+            Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef,
+            Arc::new(dictionary) as ArrayRef,
+        ];
+        for values in inputs {
+            let (arena, input, chunk) = require_non_null_input(values);
+            let error =
+                eval_mv_state_function("mv_require_non_null", &arena, input, &[input], &chunk)
+                    .unwrap_err();
+            assert!(error.contains("encountered NULL"));
+        }
+        let inner = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0_i8, 1]),
+            Arc::new(StringArray::from(vec![Some("present"), None])),
+        )
+        .unwrap();
+        let outer = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![0_i8, 0]), Arc::new(inner))
+                .unwrap(),
+        ) as ArrayRef;
+        let (arena, input, chunk) = require_non_null_input(outer.clone());
+        let output =
+            eval_mv_state_function("mv_require_non_null", &arena, input, &[input], &chunk).unwrap();
+        let source = outer
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .unwrap();
+        let result = output
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .unwrap();
+        assert_eq!(
+            source.keys().values().as_ptr(),
+            result.keys().values().as_ptr()
+        );
+        assert!(Arc::ptr_eq(source.values(), result.values()));
+    }
+
+    #[test]
+    fn mv_require_non_null_rejects_missing_or_changed_type() {
+        let (mut arena, input, chunk) =
+            require_non_null_input(Arc::new(Float64Array::from(vec![1.0])));
+        let untyped = arena.push(ExprNode::SlotId(SlotId::new(9)));
+        assert!(
+            eval_mv_state_function("mv_require_non_null", &arena, untyped, &[input], &chunk)
+                .is_err()
+        );
+        let changed = arena.push_typed(ExprNode::SlotId(SlotId::new(9)), DataType::Int64);
+        assert!(
+            eval_mv_state_function("mv_require_non_null", &arena, changed, &[input], &chunk)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mv_content_key_scalar_dispatch_matches_public_encoder() {
+        let field = Field::new("v", DataType::Float64, true);
+        let slot = SlotId::new(1);
+        let values = Arc::new(Float64Array::from(vec![Some(0.), Some(-0.), None])) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field.clone()])),
+            vec![values.clone()],
+        )
+        .unwrap();
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(slot, &field, None).unwrap(),
+            ])
+            .unwrap(),
+        );
+        let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
+        let mut arena = ExprArena::default();
+        let input = arena.push_typed(ExprNode::SlotId(slot), DataType::Float64);
+        assert!(metadata("mv_content_key").is_some());
+        let output =
+            eval_mv_state_function("mv_content_key", &arena, input, &[input], &chunk).unwrap();
+        let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let encoder = crate::exec::hash_table::content_key::ContentKeyEncoder::try_new_types(vec![
+            DataType::Float64,
+        ])
+        .unwrap();
+        for row in 0..3 {
+            assert!(!output.is_null(row));
+            assert_eq!(
+                output.value(row),
+                encoder
+                    .encode_row(std::slice::from_ref(&values), row)
+                    .unwrap()
+            );
+        }
+        assert_ne!(output.value(0), output.value(1));
+        assert!(eval_mv_state_function("mv_content_key", &arena, input, &[], &chunk).is_err());
     }
 }

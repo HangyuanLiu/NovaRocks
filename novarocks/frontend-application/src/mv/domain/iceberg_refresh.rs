@@ -105,7 +105,7 @@ use novarocks_mv_application::persistence::schema::{
 };
 #[cfg(test)]
 use novarocks_mv_application::product::{MvIncrementalJoinMode, MvIncrementalWriteMode};
-use novarocks_parser::{Span, ast};
+use novarocks_parser::ast;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
@@ -1017,12 +1017,16 @@ fn prepare_iceberg_mv_create_with_ports(
     if !partition_fields.is_empty() && property.is_composed_aggregate_schema_contract_fallback() {
         return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
     }
-    let apply_key_column_name = refresh_contract.apply_key.column_name;
-    if analysis
-        .output_columns
-        .iter()
-        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
-    {
+    let apply_key_column_name = refresh_contract
+        .apply_key
+        .as_ref()
+        .map(|key| key.column_name);
+    if let Some(apply_key_column_name) = apply_key_column_name.filter(|name| {
+        analysis
+            .output_columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(name))
+    }) {
         return Err(format!(
             "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
         ));
@@ -1039,22 +1043,21 @@ fn prepare_iceberg_mv_create_with_ports(
     }
     let mut columns =
         create_target_columns_from_property(&property, &canonical_select_query, &analysis)?;
-    if identity_needs_physical_apply_key_column(&property.identity) {
-        columns.push(create_apply_key_table_column(&refresh_contract.apply_key)?);
-    }
     let branch_id_column_name = identity_needs_branch_id_column(&property.identity).then(|| {
         columns.push(branch_id_table_column());
         BRANCH_ID_COLUMN_NAME.to_string()
     });
-    let expected_apply_key_field_id = columns
-        .iter()
-        .position(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
-        .and_then(|idx| i32::try_from(idx + 1).ok())
-        .ok_or_else(|| {
-            format!(
-                "Iceberg MV target columns are missing apply-key column {apply_key_column_name}"
-            )
-        })?;
+    let expected_apply_key_field_id = apply_key_column_name
+        .map(|name| {
+            columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name))
+                .and_then(|idx| i32::try_from(idx + 1).ok())
+                .ok_or_else(|| {
+                    format!("Iceberg MV target columns are missing aggregate state key {name}")
+                })
+        })
+        .transpose()?;
     let aggregate_state_hidden_columns = aggregate_state_hidden_columns_from_property(
         &property,
         &canonical_select_query,
@@ -1076,19 +1079,25 @@ fn prepare_iceberg_mv_create_with_ports(
     let mut target_properties = vec![
         ("format-version".to_string(), "3".to_string()),
         ("write.row-lineage".to_string(), "true".to_string()),
-        (
-            APPLY_KEY_COLUMN_PROPERTY.to_string(),
-            apply_key_column_name.to_string(),
-        ),
-        (
-            APPLY_KEY_SOURCE_PROPERTY.to_string(),
-            create_apply_key_source_property(&refresh_contract.apply_key).to_string(),
-        ),
-        (
-            APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
-            expected_apply_key_field_id.to_string(),
-        ),
     ];
+    if let Some(apply_key) = refresh_contract.apply_key.as_ref() {
+        target_properties.extend([
+            (
+                APPLY_KEY_COLUMN_PROPERTY.to_string(),
+                apply_key.column_name.to_string(),
+            ),
+            (
+                APPLY_KEY_SOURCE_PROPERTY.to_string(),
+                create_apply_key_source_property(apply_key).to_string(),
+            ),
+            (
+                APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
+                expected_apply_key_field_id
+                    .ok_or("aggregate state key field identity is missing")?
+                    .to_string(),
+            ),
+        ]);
+    }
     if !aggregate_state_hidden_columns.is_empty() {
         target_properties.push((
             HIDDEN_COLUMNS_PROPERTY.to_string(),
@@ -1195,7 +1204,11 @@ fn build_create_documents_for_prepared_target(
             source_observations: &prepared.source_field_observations,
             prepared_target,
             target_identity: &prepared.property.identity,
-            apply_key_column_name: prepared.refresh_contract.apply_key.column_name,
+            apply_key_column_name: prepared
+                .refresh_contract
+                .apply_key
+                .as_ref()
+                .map(|key| key.column_name),
             branch_column_name: prepared.branch_id_column_name.as_deref(),
             configuration: create_configuration_document(&seed.refresh)?,
         },
@@ -1310,7 +1323,7 @@ fn validate_branch_union_contract(
             query_branch_count
         ));
     }
-    if interpretation.apply_key.kind != ApplyKeyKind::GroupRowId {
+    if interpretation.apply_key.as_ref().map(|key| key.kind) != Some(ApplyKeyKind::GroupRowId) {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} must use GroupRowId inner apply keys",
             target.catalog, target.namespace, target.table
@@ -1338,28 +1351,12 @@ fn validate_union_projection_schema_contract_for_base(
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), String> {
     let interpretation = projection.facts.interpretation();
-    if interpretation.branches.len() != branch_count {
-        return Err(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} interpretation has {} branches, query has {}",
-            iceberg_target.catalog,
-            iceberg_target.namespace,
-            iceberg_target.table,
-            interpretation.branches.len(),
-            branch_count
-        ));
+    if branch_count == 0 || !interpretation.aggregates.is_empty() {
+        return Err("UNION ALL visible-tuple refresh has invalid definition shape".into());
     }
-    if interpretation.apply_key.kind != ApplyKeyKind::BaseRowId {
-        return Err(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} must use BaseRowId inner apply keys",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ));
+    if interpretation.apply_key.is_some() || !interpretation.branches.is_empty() {
+        return Err("visible-tuple UNION ALL MV may not persist apply-key or branch fields".into());
     }
-    validate_branch_id_field(projection, target_observation).map_err(|error| {
-        format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} branch binding is invalid: {error}",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        )
-    })?;
     let renames =
         validate_schema_contract(projection, occurrence, base_observation, target_observation)?;
     if renames.is_empty() {
@@ -1871,28 +1868,11 @@ fn inner_row_identity(identity: &TargetIdentity) -> &TargetIdentity {
 /// strategy-based gating (ProjectionFilter / JoinProjectionFilter /
 /// UnionProjectionFilter required the column; the aggregate strategies did
 /// not).
-fn identity_needs_physical_apply_key_column(identity: &TargetIdentity) -> bool {
-    matches!(
-        inner_row_identity(identity),
-        TargetIdentity::BaseRowId | TargetIdentity::JoinRowKey(_, _)
-    )
-}
-
 /// A `__branch_id__` discriminant column is materialized iff the output is a
 /// UNION ALL (the identity top is `BranchScoped`). Reproduces the legacy gating
 /// (UnionProjectionFilter / BranchUnionAggregate required it).
 fn identity_needs_branch_id_column(identity: &TargetIdentity) -> bool {
-    matches!(identity, TargetIdentity::BranchScoped(_))
-}
-
-fn create_apply_key_table_column(apply_key: &ApplyKeyContract) -> Result<TableColumnDef, String> {
-    match apply_key.column_name {
-        HIDDEN_APPLY_KEY_COLUMN_NAME => Ok(apply_key_table_column()),
-        JOIN_APPLY_KEY_COLUMN_NAME => Ok(join_apply_key_table_column()),
-        other => Err(format!(
-            "Iceberg MV refresh contract apply-key column {other} is not a physical target apply-key column"
-        )),
-    }
+    matches!(identity, TargetIdentity::BranchScoped(inner) if matches!(inner.as_ref(), TargetIdentity::GroupRowId(_)))
 }
 
 fn base_snapshot_status_for_refresh(
@@ -2317,23 +2297,31 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_join_mv_uses_join_apply_key_column() {
-        let column = crate::mv::domain::refresh::target_apply::join_apply_key_table_column();
-        assert_eq!(column.name, JOIN_APPLY_KEY_COLUMN_NAME);
+    fn nonaggregate_refresh_contract_has_no_persisted_apply_key() {
+        use novarocks_sql::planning::mv::{SqlImvApplyKeyFacts, SqlImvRefreshContractFacts};
+        for apply_key in [
+            SqlImvApplyKeyFacts::ProjectionFilter,
+            SqlImvApplyKeyFacts::JoinProjectionFilter,
+            SqlImvApplyKeyFacts::UnionProjectionFilter,
+        ] {
+            let contract =
+                crate::mv::domain::analysis::refresh_property::map_sql_imv_refresh_contract(
+                    SqlImvRefreshContractFacts {
+                        base_refs: Vec::new(),
+                        apply_key,
+                        aggregate: None,
+                        join: None,
+                        branch: None,
+                    },
+                );
+            assert!(contract.apply_key.is_none());
+        }
     }
 
     #[test]
     fn create_apply_key_metadata_comes_from_refresh_contract() {
         use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 
-        assert_eq!(
-            create_apply_key_source_property(&ApplyKeyContract::projection_filter()),
-            SqlMvApplyKeySourceFacts::BaseRowId.table_property_value()
-        );
-        assert_eq!(
-            create_apply_key_source_property(&ApplyKeyContract::join_projection_filter()),
-            SqlMvApplyKeySourceFacts::JoinRowKey.table_property_value()
-        );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::aggregate_group_row()),
             SqlMvApplyKeySourceFacts::GroupRowId.table_property_value()
@@ -2349,9 +2337,9 @@ mod tests {
         let projection = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::SingleBase,
             has_agg_state: false,
-            identity: RefreshIdentity::BaseRowId,
-            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Int64,
+            identity: RefreshIdentity::VisibleTuple,
+            apply_key_column: None,
+            apply_key_value_type: None,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -2363,8 +2351,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::SingleBase,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -2378,9 +2366,9 @@ mod tests {
         let join = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: false,
-            identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            identity: RefreshIdentity::VisibleTuple,
+            apply_key_column: None,
+            apply_key_value_type: None,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -2395,8 +2383,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -2408,8 +2396,8 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::Utf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -2420,9 +2408,9 @@ mod tests {
         let union_projection = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: false,
-            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::BaseRowId)),
-            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::BranchInt64,
+            identity: RefreshIdentity::VisibleTuple,
+            apply_key_column: None,
+            apply_key_value_type: None,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
@@ -2435,25 +2423,25 @@ mod tests {
     fn repartition_support_rejects_specific_unsupported_shape() {
         let invalid = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-            has_agg_state: false,
-            identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
+            has_agg_state: true,
+            identity: RefreshIdentity::VisibleTuple,
+            apply_key_column: None,
+            apply_key_value_type: None,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
 
         let err = select_repartition_shape(&invalid).expect_err("shape must be rejected");
         assert!(err.contains("UnsupportedRepartitionShape"));
-        assert!(err.contains("JoinRowKey"));
+        assert!(err.contains("VisibleTuple"));
         assert!(err.contains("AllBasesRequired"));
-        assert!(err.contains("aggregate_state=false"));
+        assert!(err.contains("aggregate_state=true"));
 
         let branch_union_aggregate = RefreshCapabilities {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: true,
             identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::BranchUtf8,
+            apply_key_column: Some(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string()),
+            apply_key_value_type: Some(ApplyKeyValueType::BranchUtf8),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         let err = select_repartition_shape(&branch_union_aggregate)
@@ -2464,7 +2452,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_gating_matches_legacy_strategy_gating() {
+    fn branch_id_is_persisted_only_for_branch_scoped_aggregate_state() {
         use crate::mv::domain::analysis::refresh_property::TargetIdentity;
 
         let base_row = TargetIdentity::BaseRowId;
@@ -2476,20 +2464,12 @@ mod tests {
         let union_proj = TargetIdentity::BranchScoped(Box::new(TargetIdentity::BaseRowId));
         let union_agg = TargetIdentity::BranchScoped(Box::new(group_row.clone()));
 
-        // Physical apply-key column: required for base/join row identities
-        // (ProjectionFilter / JoinProjectionFilter / UnionProjectionFilter),
-        // not for group-row identities (the aggregate strategies).
-        assert!(identity_needs_physical_apply_key_column(&base_row));
-        assert!(identity_needs_physical_apply_key_column(&join_row));
-        assert!(identity_needs_physical_apply_key_column(&union_proj));
-        assert!(!identity_needs_physical_apply_key_column(&group_row));
-        assert!(!identity_needs_physical_apply_key_column(&union_agg));
-
-        // Branch id column: required iff the identity top is BranchScoped.
+        // A nonaggregate UNION ALL contributes ordinary visible rows and has
+        // no persisted branch discriminator.
         assert!(!identity_needs_branch_id_column(&base_row));
         assert!(!identity_needs_branch_id_column(&join_row));
         assert!(!identity_needs_branch_id_column(&group_row));
-        assert!(identity_needs_branch_id_column(&union_proj));
+        assert!(!identity_needs_branch_id_column(&union_proj));
         assert!(identity_needs_branch_id_column(&union_agg));
     }
 
@@ -2714,7 +2694,7 @@ fn plan_multi_base_affected_partitions(
                     (Some(previous), Some(current)) => {
                         match admit_for_base(base, previous, current) {
                             Ok((
-                                novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                                novarocks_spi::connector::ConnectorChangeWindowAdmission::ContentNetZero { .. },
                                 _,
                             )) => crate::mv::domain::model::AffectedTargetPartitions::known(
                                 std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
@@ -2813,7 +2793,9 @@ fn plan_aggregate_mv_affected_partitions(
                     connector_context,
                 ) {
                     Ok((
-                        novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::ContentNetZero {
+                            ..
+                        },
                         _,
                     )) => crate::mv::domain::model::AffectedTargetPartitions::known(
                         std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
@@ -3113,15 +3095,16 @@ fn refresh_connector_preparation_error(error: ConnectorError) -> RefreshError {
     }
 }
 
-/// A stale Accelerator projection can fail its exact schema binding before
-/// refresh reaches publication admission. Observe the provider's Current
-/// marker first so another incarnation closes this process's admission even
-/// when later planning fails against the changed metadata generation.
-fn close_management_on_current_incarnation_mismatch(
+/// Read exact Current documents through the strict provider boundary.
+/// Observation alone neither installs a projection nor readmits management.
+pub(crate) fn observe_current_mv_management_documents(
     source: &IcebergMvCorePorts,
     target: &IcebergMvTarget,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<bool, String> {
+) -> Result<
+    novarocks_spi::connector::document_storage::ConnectorDocumentManagementObservation,
+    String,
+> {
     use novarocks_spi::connector::document_storage::{
         ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
         ConnectorDocumentStorageLimits,
@@ -3138,13 +3121,6 @@ fn close_management_on_current_incarnation_mismatch(
         namespace: Arc::from(target.namespace.as_str()),
         table: Arc::from(target.table.as_str()),
     };
-    if !source
-        .management_entrance()?
-        .management_phase(&table)
-        .is_manageable()
-    {
-        return Ok(false);
-    }
     let lease = ConnectorControlResolver::acquire_current(source.connector_control(), &instance_id)
         .map_err(|error| format!("acquire MV Current marker catalog: {error}"))?;
     let binding = lease
@@ -3177,6 +3153,32 @@ fn close_management_on_current_incarnation_mismatch(
         )
         .map_err(|error| format!("observe MV Current marker documents: {error}"))?
         .into_parts();
+    Ok(observation)
+}
+
+/// A stale Accelerator projection can fail its exact schema binding before
+/// refresh reaches publication admission. Observe the provider's Current
+/// marker first so another incarnation closes this process's admission even
+/// when later planning fails against the changed metadata generation.
+fn close_management_on_current_incarnation_mismatch(
+    source: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<bool, String> {
+    let table = novarocks_spi::connector::ConnectorTableIdentity {
+        instance_id: ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    if !source
+        .management_entrance()?
+        .management_phase(&table)
+        .is_manageable()
+    {
+        return Ok(false);
+    }
+    let observation = observe_current_mv_management_documents(source, target, context)?;
     let closed = source
         .management_entrance()?
         .close_on_current_incarnation_mismatch(&observation);
@@ -3220,7 +3222,14 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     }
     let mv_definition =
         load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &iceberg_target)
-            .map_err(RefreshError::user)?;
+            .map_err(|error| {
+                let diagnostic = observe_current_mv_management_documents(
+                    source,
+                    &iceberg_target,
+                    connector_context,
+                );
+                RefreshError::user(diagnostic.err().unwrap_or(error))
+            })?;
     let target_binding = load_iceberg_mv_target_binding_typed(
         source.connector_control(),
         source.storage_observation(),
@@ -4683,116 +4692,6 @@ pub fn join_base_refs_for_definition<'a>(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn rewrite_snapshot_table_factor(
-    factor: &mut ast::TableFactor,
-    base: &TableIdentity,
-    snapshot_id: i64,
-    default_alias: Option<&str>,
-) -> Result<(), String> {
-    let ast::TableFactor::Table {
-        name,
-        version,
-        alias,
-        ..
-    } = factor
-    else {
-        return Err("join snapshot side must be a table".to_string());
-    };
-    if !object_name_matches_base(name, base)? {
-        return Err(format!(
-            "join snapshot rewrite expected base {}, got {}",
-            base.fqn(),
-            novarocks_parser::printer::print_object_name(name)
-        ));
-    }
-    if let Some(version) = version {
-        let rendered = novarocks_parser::printer::print_expr(&version.value);
-        if !rendered.contains(&snapshot_id.to_string()) {
-            return Err(format!(
-                "join snapshot side {} has conflicting version {rendered}",
-                base.fqn()
-            ));
-        }
-    }
-    *name = synthetic_snapshot_object_name(base, snapshot_id);
-    *version = None;
-    if alias.is_none()
-        && let Some(default_alias) = default_alias
-    {
-        *alias = Some(ast::TableAlias {
-            name: generated_ident(default_alias),
-            columns: Vec::new(),
-            explicit_as: true,
-            span: Span::new(0, 0),
-        });
-    }
-    Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn object_name_matches_base(name: &ast::ObjectName, base: &TableIdentity) -> Result<bool, String> {
-    let parts = object_name_identifier_parts(name);
-    Ok(match parts.as_slice() {
-        [table] => table.eq_ignore_ascii_case(&base.table),
-        [namespace, table] => {
-            namespace.eq_ignore_ascii_case(&base.namespace)
-                && table.eq_ignore_ascii_case(&base.table)
-        }
-        [catalog, namespace, table] => {
-            catalog.eq_ignore_ascii_case(&base.catalog)
-                && namespace.eq_ignore_ascii_case(&base.namespace)
-                && table.eq_ignore_ascii_case(&base.table)
-        }
-        _ => false,
-    })
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn object_name_identifier_parts(name: &ast::ObjectName) -> Vec<String> {
-    name.parts.iter().map(|ident| ident.value.clone()).collect()
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn synthetic_snapshot_table_name(base: &TableIdentity, snapshot_id: i64) -> String {
-    format!("{}__at_{}", base.table, snapshot_id)
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn synthetic_snapshot_object_name(base: &TableIdentity, snapshot_id: i64) -> ast::ObjectName {
-    ast::ObjectName {
-        parts: vec![
-            generated_ident(&base.namespace),
-            generated_ident(&synthetic_snapshot_table_name(base, snapshot_id)),
-        ],
-        span: Span::new(0, 0),
-    }
-}
-
-fn generated_ident(value: &str) -> ast::Ident {
-    ast::Ident {
-        value: value.to_string(),
-        quoted: false,
-        quote_style: None,
-        span: Span::new(0, 0),
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
 fn refresh_explain_rewrite_disabled_rules(
     is_aggregate_refresh: bool,
     optimizer_settings: &novarocks_sql::compiler::SessionOptimizerSettings,
@@ -5024,59 +4923,6 @@ mod join_delta_append_only_fast_path_tests {
         ));
     }
 
-    #[test]
-    fn join_delta_coalesce_uses_normalized_snapshot_ctes() {
-        let base_query = parse_query(
-            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
-        );
-        let left = base("left");
-        let right = base("right");
-        let branches = crate::mv::domain::iceberg_join_branch::plan_join_delta_branches(
-            &left,
-            &right,
-            crate::mv::domain::iceberg_join_branch::SnapshotWindow { from: 10, to: 11 },
-            crate::mv::domain::iceberg_join_branch::SnapshotWindow { from: 20, to: 21 },
-            true,
-            true,
-        );
-        let mut branch_queries = Vec::new();
-        for branch in &branches {
-            let mut branch_query =
-                crate::mv::domain::iceberg_join_branch::rewrite_join_branch_query(
-                    &base_query,
-                    branch,
-                    "l",
-                    "r",
-                )
-                .expect("branch rewrite");
-            normalize_join_branch_snapshot_tables(&mut branch_query, branch)
-                .expect("snapshot normalization");
-            branch_queries.push(branch_query);
-        }
-
-        let coalesced =
-            crate::mv::domain::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries(
-                &base_query,
-                branch_queries,
-                "left-uuid",
-                "right-uuid",
-            )
-            .expect("coalesce rewrite");
-        let rendered = novarocks_parser::printer::print_query(&coalesced);
-
-        assert!(rendered.contains("right__at_20"), "sql={rendered}");
-        assert!(rendered.contains("left__at_11"), "sql={rendered}");
-        assert!(!rendered.contains("VERSION AS OF"), "sql={rendered}");
-        assert!(
-            rendered.contains("__nr_join_delta_branch_0"),
-            "sql={rendered}"
-        );
-        assert!(
-            rendered.contains("__nr_join_delta_branch_1"),
-            "sql={rendered}"
-        );
-    }
-
     fn base(name: &str) -> TableIdentity {
         TableIdentity {
             catalog: "ice".to_string(),
@@ -5092,33 +4938,6 @@ mod join_delta_append_only_fast_path_tests {
         };
         query.clone()
     }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn normalize_join_branch_snapshot_tables(
-    query: &mut ast::Query,
-    branch: &crate::mv::domain::iceberg_join_branch::JoinDeltaBranchPlan,
-) -> Result<(), String> {
-    let ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("join branch snapshot normalization requires SELECT body".to_string());
-    };
-    let [from] = select.from.as_mut_slice() else {
-        return Err("join branch snapshot normalization requires one FROM item".to_string());
-    };
-    let [join] = from.joins.as_mut_slice() else {
-        return Err("join branch snapshot normalization requires one JOIN".to_string());
-    };
-    if let crate::mv::domain::iceberg_join_branch::BranchSide::Snapshot(snapshot_id) = branch.left {
-        rewrite_snapshot_table_factor(&mut from.relation, &branch.left_base, snapshot_id, None)?;
-    }
-    if let crate::mv::domain::iceberg_join_branch::BranchSide::Snapshot(snapshot_id) = branch.right
-    {
-        rewrite_snapshot_table_factor(&mut join.relation, &branch.right_base, snapshot_id, None)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -5161,6 +4980,9 @@ pub(crate) fn drop_iceberg_mv_with_product(
     let prepared = prepare_iceberg_mv_drop_management(ports, &target, connector_context)?;
     let projection = IcebergDropProjection {
         readiness: ports.readiness.as_ref(),
+        descriptor: prepared
+            .as_ref()
+            .map(|prepared| prepared.drop_descriptor.clone()),
         expected_object_id: prepared
             .as_ref()
             .map(|prepared| prepared.exact_target.object_id().clone()),
@@ -5207,6 +5029,7 @@ struct PreparedIcebergMvDrop {
     mutation_lease: novarocks_spi::connector::ConnectorCatalogMutationLease,
     document_lease: novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
     exact_target: novarocks_mv_application::management::ManagedMvTarget,
+    drop_descriptor: novarocks_mv_application::persistence::documents::MvCurrentDropDescriptor,
     disposition: Option<novarocks_mv_application::management::EffectDisposition>,
     provider_finalization_error: Option<String>,
 }
@@ -5226,17 +5049,6 @@ fn prepare_iceberg_mv_drop_management(
         ConnectorTableObjectSelector, ConnectorTableResolution,
     };
 
-    let ready = ports
-        .readiness()
-        .load_ready(&MvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|error| format!("load MV target before DROP admission: {error}"))?;
-    let Some(ready) = ready else {
-        return Ok(None);
-    };
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("name MV DROP catalog: {error}"))?;
     let table = ConnectorTableIdentity {
@@ -5252,19 +5064,21 @@ fn prepare_iceberg_mv_drop_management(
         .catalog_handle()
         .map_err(|error| format!("bind MV DROP catalog: {error}"))?
         .clone();
-    let binding = control
-        .binding()
-        .metadata()
-        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+    let binding = match control.binding().metadata().capture_table_object_binding(
+        ConnectorTableObjectCaptureRequest {
             table: table.clone(),
             resolution: ConnectorTableResolution::StrictBaseTable,
             selector: ConnectorTableObjectSelector::Current,
             context: context.clone(),
-        })
-        .map_err(|error| format!("bind MV DROP target: {error}"))?;
-    if binding.metadata.identity != table
-        || binding.object_id != ready.projection.facts.source_revision().target_object_id
-    {
+        },
+    ) {
+        Ok(binding) => binding,
+        Err(error) if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("bind MV DROP target: {error}")),
+    };
+    if binding.metadata.identity != table {
         return Err("MV DROP target changed before management admission".to_string());
     }
     let documents_lease = control
@@ -5281,14 +5095,20 @@ fn prepare_iceberg_mv_drop_management(
             context.clone(),
         )
         .map_err(|error| format!("build MV DROP observation: {error}"))?;
-        let observed = novarocks_mv_application::persistence::documents::observe_current_management_document_set(
-            &documents_lease,
-            request,
-            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-        )
-        .map(|observed| observed.into_parts())
-        .map_err(|error| format!("observe MV DROP documents: {error}"))?;
-        if entrance.close_on_current_incarnation_mismatch(&observed.0) {
+        let observed =
+            novarocks_mv_application::persistence::documents::observe_current_drop_descriptor(
+                &documents_lease,
+                request,
+                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(
+                ),
+            )
+            .map_err(|error| format!("observe MV DROP documents: {error}"))?;
+        if matches!(
+            entrance.management_phase(&table),
+            novarocks_mv_application::management::MvManagementPhase::Manageable
+                | novarocks_mv_application::management::MvManagementPhase::Managing
+        ) && entrance.close_on_current_incarnation_mismatch(&observed.0)
+        {
             tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
             return Err(
                 "MV Current marker names another process incarnation; management is closed"
@@ -5297,7 +5117,13 @@ fn prepare_iceberg_mv_drop_management(
         }
         Ok(observed)
     };
-    let (_, first_documents) = observe()?;
+    let (first_observation, first_documents) = observe()?;
+    crate::mv::domain::staged_create::establish_current_drop_management(
+        entrance.as_ref(),
+        &first_observation,
+        &first_documents,
+        control.control_runtime_id(),
+    )?;
     let dependencies = first_documents.management_dependencies(control.control_runtime_id());
     let management = entrance
         .acquire(
@@ -5331,6 +5157,7 @@ fn prepare_iceberg_mv_drop_management(
         mutation_lease,
         document_lease: documents_lease,
         exact_target,
+        drop_descriptor: documents,
         disposition: None,
         provider_finalization_error: None,
     }))
@@ -5338,6 +5165,7 @@ fn prepare_iceberg_mv_drop_management(
 
 struct IcebergDropProjection<'a> {
     readiness: &'a MvReadinessPort,
+    descriptor: Option<novarocks_mv_application::persistence::documents::MvCurrentDropDescriptor>,
     expected_object_id: Option<ConnectorTableObjectId>,
 }
 
@@ -5352,10 +5180,24 @@ impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjec
         novarocks_mv_application::ports::MvProviderFailure,
     > {
         let target = sql_target_from_product(target);
-        let readiness = self
-            .readiness
-            .prepare_drop(&target, if_exists)
-            .map_err(drop_preflight_projection_failure)?;
+        let readiness = match &self.descriptor {
+            Some(descriptor) => self
+                .readiness
+                .prepare_current_drop(descriptor)
+                .map_err(drop_preflight_projection_failure)?,
+            None if if_exists => {
+                novarocks_mv_application::readiness::MvDropReadiness::AlreadyAbsent
+            }
+            None => {
+                return Err(novarocks_mv_application::ports::MvProviderFailure::new(
+                    novarocks_mv_application::ports::MvProviderFailureKind::TargetReplaced,
+                    format!(
+                        "materialized view {}.{} does not exist",
+                        target.database, target.name
+                    ),
+                ));
+            }
+        };
         match (&readiness, &self.expected_object_id) {
             (
                 novarocks_mv_application::readiness::MvDropReadiness::ReadyToDrop(guard),

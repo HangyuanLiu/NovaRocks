@@ -914,15 +914,13 @@ fn publication_metadata_updates(
         .transpose()?
         .flatten();
     if let Some(metadata_properties) = metadata_properties {
-        let updates = updates.as_mut().ok_or_else(|| {
-            invalid("metadata-attached publication documents require an atomic managed repartition")
-        })?;
+        let updates = updates.get_or_insert_with(Vec::new);
         match updates.last_mut() {
             Some(crate::iceberg::TableUpdate::SetProperties { updates }) => {
                 for (key, value) in metadata_properties {
                     if updates.insert(key, value).is_some() {
                         return Err(invalid(
-                            "metadata-attached publication documents conflict with repartition properties",
+                            "metadata-attached publication documents conflict with atomic publication properties",
                         ));
                     }
                 }
@@ -1385,12 +1383,12 @@ impl IcebergWriteSessionControl {
                 None => facts.target_ref().to_string(),
             },
             snapshot_properties,
-            atomic_partition_replacement: publication_metadata_updates(
+            atomic_publication_updates: publication_metadata_updates(
                 handle.repartition(),
                 document_publication,
                 &metadata,
             )?
-            .map(crate::commit::run::AtomicPartitionReplacement::try_new)
+            .map(crate::commit::run::AtomicPublicationUpdates::try_new)
             .transpose()
             .map_err(invalid)?,
         };
@@ -1551,6 +1549,29 @@ impl IcebergWriteSessionControl {
             return Err(invalid(
                 "Iceberg write target no longer matches its sealed table generation/schema",
             ));
+        }
+        #[cfg(debug_assertions)]
+        let equality_seed = if document_publication.is_some()
+            && facts.target_ref() == "main"
+            && handle.commit_op_kind() == CommitOpKind::Overwrite
+            && initial.metadata().current_snapshot_id().is_none()
+        {
+            match crate::candidate_fixture::root()
+                .map(|root| super::fixture_seed::FixtureEqualitySeed::claim(&initial, &root))
+                .transpose()
+            {
+                Ok(seed) => seed.flatten().map(Arc::new),
+                Err(error) => {
+                    cleanup_session();
+                    return Err(invalid(error));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(debug_assertions)]
+        if let Some(seed) = equality_seed.as_ref() {
+            session_abort.record_data_file(seed.artifact_path().to_owned());
         }
         let observed_head = crate::ref_snapshot::resolve_branch_head_snapshot_id(
             initial.metadata(),
@@ -1755,11 +1776,24 @@ impl IcebergWriteSessionControl {
                 "runtime_bridge_enter",
                 phase_started,
             );
+            #[cfg(debug_assertions)]
+            let attempt_equality_seed = equality_seed.clone();
             let attempt_result = self
                 .runtime
                 .resources()
                 .catalog_runtime()
                 .block_on(async move {
+                    #[cfg(debug_assertions)]
+                    let data_snapshot_properties = {
+                        let mut properties = snapshot_properties.clone();
+                        if attempt_equality_seed.is_some() {
+                            // Only the final seed snapshot identifies the committed session.
+                            properties.remove(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
+                        }
+                        properties
+                    };
+                    #[cfg(not(debug_assertions))]
+                    let data_snapshot_properties = &snapshot_properties;
                     let ctx = crate::commit::action::CommitCtx {
                         collector: &collector,
                         table: &table,
@@ -1768,7 +1802,9 @@ impl IcebergWriteSessionControl {
                         commit_uuid,
                         abort_handle,
                         target_ref: &target_ref,
-                        snapshot_properties: &snapshot_properties,
+                        snapshot_properties: &data_snapshot_properties,
+
+                        metadata_updates: &[],
                     };
                     emit_iceberg_write_phase_marker(
                         session_id,
@@ -1776,9 +1812,13 @@ impl IcebergWriteSessionControl {
                         "data_stage_enter",
                         phase_started,
                     );
-                    let (mut transaction, data_outcome) = match operation {
+                    let (transaction, data_outcome) = match operation {
                         CommitOpKind::FastAppend => {
-                            crate::commit::fast_append::stage_eager_fast_append(ctx).await?
+                            crate::commit::fast_append::stage_eager_fast_append(
+                                ctx,
+                                initial_updates,
+                            )
+                            .await?
                         }
                         CommitOpKind::Overwrite => {
                             crate::commit::overwrite::stage_eager_overwrite(ctx, initial_updates)
@@ -1786,6 +1826,18 @@ impl IcebergWriteSessionControl {
                         }
                         _ => unreachable!("eager write path only accepts append/overwrite"),
                     };
+                    #[cfg(debug_assertions)]
+                    let (transaction, data_outcome) = if let Some(seed) = attempt_equality_seed {
+                        let original_snapshot = data_outcome.new_snapshot_id;
+                        let (transaction, data_outcome) = seed.stage(
+                            transaction, data_outcome, file_io.clone(),
+                            Arc::clone(&collector.abort_log), &snapshot_properties,
+                        ).await?;
+                        println!("NOVAROCKS_MV_EQUALITY_SEED token={} table_uuid={} original_snapshot={} final_snapshot={}",
+                            seed.token(), table.metadata().uuid(), original_snapshot, data_outcome.new_snapshot_id);
+                        (transaction, data_outcome)
+                    } else { (transaction, data_outcome) };
+                    let mut transaction = transaction;
                     emit_iceberg_write_phase_marker(
                         session_id,
                         attempt_number,
@@ -2896,8 +2948,11 @@ impl IcebergWriteSessionControl {
                 (Some(table), metadata)
             }
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
-            &request.flavor
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+            declaration,
+            shape,
+            ..
+        } = &request.flavor
         {
             let admitted_target = declaration.admission().target();
             if admitted_target.namespace.as_ref() != namespace
@@ -2972,8 +3027,11 @@ impl IcebergWriteSessionControl {
             None => crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, target_ref)
                 .map_err(|error| invalid(error.to_string()))?,
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
-            &request.flavor
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+            declaration,
+            shape,
+            ..
+        } = &request.flavor
         {
             // A publication's base comes from the publication's own write
             // preparation, whichever branch shape it goes on to seal. The
@@ -3122,7 +3180,18 @@ impl IcebergWriteSessionControl {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;
-                self.freeze_old_delete_references(table, &metadata, snapshot_id)?
+                self.freeze_old_delete_references(
+                    table,
+                    &metadata,
+                    snapshot_id,
+                    match &request.flavor {
+                        ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                            target_candidates,
+                            ..
+                        } => target_candidates.as_ref(),
+                        _ => None,
+                    },
+                )?
             } else {
                 Vec::new()
             },
@@ -3151,12 +3220,14 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
                 plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
             }
-            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
-                plan_document_publication_branches(
-                    &material,
-                    IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
-                )?
-            }
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
+                shape,
+                ..
+            } => plan_document_publication_branches(
+                &material,
+                IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
+            )?,
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
             ConnectorWriteSessionFlavor::DistributedRewrite(shape) => {
                 let table = table.as_ref().ok_or_else(|| {
@@ -3364,6 +3435,9 @@ impl IcebergWriteSessionControl {
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
         snapshot_id: i64,
+        candidates: Option<
+            &novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection,
+        >,
     ) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
         let owned = table.clone();
         let files = self
@@ -3375,18 +3449,74 @@ impl IcebergWriteSessionControl {
             })
             .map_err(|error| unavailable(error.to_string()))?
             .map_err(unavailable)?;
-        let mut targets = Vec::with_capacity(files.len());
-        for file in files {
-            let references = frozen_old_delete_references(&file)?;
-            targets.push(frozen_delete_merge_target(
-                &file,
-                metadata,
-                snapshot_id,
-                references,
-            )?);
-        }
+        let targets = freeze_target_delete_references(files, metadata, snapshot_id, candidates)?;
+        #[cfg(debug_assertions)]
+        crate::candidate_fixture::record(
+            metadata,
+            snapshot_id,
+            "writer-frozen",
+            targets
+                .iter()
+                .map(|target| target.data_file_path().to_owned()),
+        )
+        .map_err(invalid)?;
         Ok(targets)
     }
+}
+
+/// Freeze exactly the same candidate baseline admitted by target scanning.
+pub(crate) fn freeze_target_delete_references(
+    files: Vec<crate::manifest::DataFileWithStats>,
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+    candidates: Option<&novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection>,
+) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
+    let selected = match candidates {
+        Some(
+            novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection::Partitions(
+                selection,
+            ),
+        ) => {
+            crate::mv_target_candidates::validate_mv_target_partition_selection(
+                metadata, selection,
+            )?;
+            if selection.snapshot_id() != snapshot_id {
+                return Err(invalid(
+                    "MV candidate selection and write base snapshots disagree",
+                ));
+            }
+            crate::mv_target_candidates::select_mv_target_file_paths(
+                metadata,
+                Some(snapshot_id),
+                files.iter().map(|file| {
+                    (
+                        file.path.as_str(),
+                        file.partition_spec_id,
+                        file.partition_values.as_ref(),
+                    )
+                }),
+                selection,
+            )
+        }
+        _ => None,
+    };
+    let mut targets = Vec::with_capacity(files.len());
+    for file in files {
+        if selected
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(&file.path))
+        {
+            continue;
+        }
+        let references = frozen_old_delete_references(&file, candidates.is_some())?;
+        targets.push(frozen_delete_merge_target(
+            &file,
+            metadata,
+            snapshot_id,
+            references,
+        )?);
+    }
+    Ok(targets)
 }
 
 /// Freeze one data file's delete-branch merge target.
@@ -3459,8 +3589,9 @@ fn frozen_delete_merge_target(
 
 /// Freeze exact references to every position-delete artifact attached to one
 /// data file. It records what exists; it never opens one of those artifacts.
-fn frozen_old_delete_references(
+pub(crate) fn frozen_old_delete_references(
     file: &crate::manifest::DataFileWithStats,
+    strict_visible_bag: bool,
 ) -> Result<Vec<IcebergOldDeleteArtifactRef>, ConnectorError> {
     let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
         corrupt(format!(
@@ -3470,6 +3601,24 @@ fn frozen_old_delete_references(
     })?;
     let mut references = Vec::new();
     for delete in &file.delete_files {
+        if strict_visible_bag {
+            use crate::scan_model::{IcebergDeleteFileContent, IcebergDeleteFileFormat};
+            let kind = match (&delete.file_content, &delete.file_format) {
+                (IcebergDeleteFileContent::Equality, _) => {
+                    Some(novarocks_spi::connector::ConnectorTargetDeleteKind::Equality)
+                }
+                (IcebergDeleteFileContent::Position, IcebergDeleteFileFormat::Parquet) => {
+                    Some(novarocks_spi::connector::ConnectorTargetDeleteKind::ParquetPosition)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return Err(ConnectorError::target_format_unsupported(
+                    file.path.clone(),
+                    kind,
+                ));
+            }
+        }
         if !matches!(
             delete.file_content,
             crate::scan_model::IcebergDeleteFileContent::Position
@@ -4581,8 +4730,8 @@ mod eager_attempt_io_tests {
         let abort_handle = Arc::clone(&collector.abort_log);
         let commit_uuid = uuid::Uuid::from_bytes([attempt; 16]);
         let properties = BTreeMap::new();
-        let (mut transaction, outcome) =
-            crate::commit::fast_append::stage_eager_fast_append(crate::commit::action::CommitCtx {
+        let (mut transaction, outcome) = crate::commit::fast_append::stage_eager_fast_append(
+            crate::commit::action::CommitCtx {
                 collector: &collector,
                 table: &table,
                 catalog: &fixture.catalog,
@@ -4591,9 +4740,13 @@ mod eager_attempt_io_tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &properties,
-            })
-            .await
-            .expect("eager append stage");
+
+                metadata_updates: &[],
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("eager append stage");
         let staged_metadata = transaction.staged_table().metadata().clone();
         let artifacts = artifacts_for_staged_snapshot(
             &table,

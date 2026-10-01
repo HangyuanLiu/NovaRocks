@@ -59,7 +59,7 @@ pub struct MvCreateDocumentFacts<'a> {
     pub source_observations: &'a [MvCreateRelationObservation],
     pub prepared_target: &'a ConnectorPreparedCreateDocumentTarget,
     pub target_identity: &'a TargetIdentity,
-    pub apply_key_column_name: &'a str,
+    pub apply_key_column_name: Option<&'a str>,
     pub branch_column_name: Option<&'a str>,
     pub configuration: ConfigurationDocument,
 }
@@ -107,11 +107,15 @@ pub fn build_mv_create_documents(
         &aggregate.output_identities,
         &targets,
     )?;
-    let branches = branch_bindings(
-        input.sql_facts,
-        &aggregate.output_identities,
-        &aggregate.branch_identities,
-    )?;
+    let branches = if aggregate.aggregate_layout.aggregates.is_empty() {
+        Vec::new()
+    } else {
+        branch_bindings(
+            input.sql_facts,
+            &aggregate.output_identities,
+            &aggregate.branch_identities,
+        )?
+    };
     let mut target_fields = aggregate.target_fields;
     target_fields.extend(
         output_bindings
@@ -382,18 +386,18 @@ fn branch_bindings(
 
 fn apply_key_bindings(
     identity: &TargetIdentity,
-    column: &str,
+    column: Option<&str>,
     facts: &SqlMvCreatePersistenceFacts,
     outputs: &BTreeMap<u32, crate::persistence::identity::OutputIdentity>,
     targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
-) -> Result<(RuntimeApplyKeyFacts, Vec<RuntimePhysicalFieldFacts>), String> {
+) -> Result<(Option<RuntimeApplyKeyFacts>, Vec<RuntimePhysicalFieldFacts>), String> {
     let inner = match identity {
         TargetIdentity::BranchScoped(inner) => inner.as_ref(),
         value => value,
     };
     let (kind, semantic_outputs, label) = match inner {
-        TargetIdentity::BaseRowId => (ApplyKeyKind::BaseRowId, Vec::new(), "base-row-id"),
-        TargetIdentity::JoinRowKey(_, _) => (ApplyKeyKind::JoinRowKey, Vec::new(), "join-row-key"),
+        TargetIdentity::BaseRowId => return Ok((None, Vec::new())),
+        TargetIdentity::JoinRowKey(_, _) => return Ok((None, Vec::new())),
         TargetIdentity::GroupRowId(names) => (
             ApplyKeyKind::GroupRowId,
             names
@@ -419,16 +423,17 @@ fn apply_key_bindings(
     }
     let logical_id = ApplyKeyIdentity::try_new(Sha256::digest(bytes).to_vec())
         .map_err(|error| error.to_string())?;
+    let column = column.ok_or("aggregate interpretation requires a staged GroupRowId field")?;
     let target = target(targets, column)?;
     let target_field_id = field_identity(target.provider_field_id.clone())?;
     Ok((
-        RuntimeApplyKeyFacts {
+        Some(RuntimeApplyKeyFacts {
             kind,
             ordered_components: vec![RuntimeApplyKeyComponentFacts {
                 logical_id: logical_id.clone(),
                 target_field_id: target_field_id.clone(),
             }],
-        },
+        }),
         vec![RuntimePhysicalFieldFacts {
             logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(logical_id),
             target_field_id,

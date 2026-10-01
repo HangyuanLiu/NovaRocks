@@ -391,6 +391,7 @@ fn release_creation_metadata() -> novarocks::CreationMetadata {
         }),
         initial_domains: vec![],
         assignment: Some(novarocks::TaskAssignment {
+            quota_domain_bindings: Vec::new(),
             instance_ordinal: 9,
             initial_scan_ranges: vec![novarocks::TaskScanRanges {
                 plan_node_id: 11,

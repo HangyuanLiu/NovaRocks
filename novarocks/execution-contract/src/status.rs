@@ -220,8 +220,25 @@ impl fmt::Display for SafeFieldPath {
 }
 
 /// Closed category of a task's own failure.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TaskFailureCategory {
+    /// A checked reservation refused bounded resident state; retry needs intervention.
+    CapacityRefused {
+        resource: SafeDetail,
+        requested: u64,
+        limit: u64,
+    },
+    /// The exact target snapshot contains fewer occurrences than requested.
+    MvApplyConsistency {
+        requested: u64,
+        matched: u64,
+        sample: SafeDetail,
+    },
+    /// A candidate target file uses a deletion representation unsupported by apply.
+    TargetFormatUnsupported {
+        data_file: SafeDetail,
+        delete_kind: SafeDetail,
+    },
     /// An operator, connector, or runtime error inside this task.
     Execution,
     /// This task could not obtain memory, threads, or another local resource.
@@ -235,8 +252,11 @@ pub enum TaskFailureCategory {
 }
 
 impl TaskFailureCategory {
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::CapacityRefused { .. } => "CAPACITY_REFUSED",
+            Self::MvApplyConsistency { .. } => "MV_APPLY_CONSISTENCY",
+            Self::TargetFormatUnsupported { .. } => "TARGET_FORMAT_UNSUPPORTED",
             Self::Execution => "EXECUTION",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
             Self::Exchange => "EXCHANGE",
@@ -284,8 +304,49 @@ impl TaskFailure {
         }
     }
 
-    pub const fn category(&self) -> TaskFailureCategory {
-        self.category
+    pub fn category(&self) -> TaskFailureCategory {
+        self.category.clone()
+    }
+
+    pub fn capacity_refused(resource: SafeDetail, requested: u64, limit: u64) -> Self {
+        let detail = SafeDetail::truncating(&format!(
+            "capacity refused for {resource}: requested {requested}, limit {limit}"
+        ));
+        Self::new(
+            TaskFailureCategory::CapacityRefused {
+                resource,
+                requested,
+                limit,
+            },
+            detail,
+        )
+    }
+
+    pub fn mv_apply_consistency(requested: u64, matched: u64, sample: SafeDetail) -> Self {
+        let detail = SafeDetail::truncating(&format!(
+            "MV apply occurrence deficit: requested {requested}, matched {matched}; {sample}"
+        ));
+        Self::new(
+            TaskFailureCategory::MvApplyConsistency {
+                requested,
+                matched,
+                sample,
+            },
+            detail,
+        )
+    }
+
+    pub fn target_format_unsupported(data_file: SafeDetail, delete_kind: SafeDetail) -> Self {
+        let detail = SafeDetail::truncating(&format!(
+            "MV apply target format unsupported: {delete_kind} on {data_file}"
+        ));
+        Self::new(
+            TaskFailureCategory::TargetFormatUnsupported {
+                data_file,
+                delete_kind,
+            },
+            detail,
+        )
     }
 
     pub const fn detail(&self) -> &SafeDetail {

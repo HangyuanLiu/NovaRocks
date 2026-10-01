@@ -499,6 +499,10 @@ pub struct DistributedQueryError {
     message: String,
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
     pre_ready_topology_observation: bool,
+    task_failure: Option<novarocks_execution_contract::TaskFailure>,
+    execution_id: Option<novarocks_types::QueryExecutionId>,
+    verification_receipt:
+        Option<std::sync::Arc<crate::task_execution::execution::ReleasedVerificationFacts>>,
 }
 
 impl DistributedQueryError {
@@ -508,6 +512,9 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: false,
+            task_failure: None,
+            execution_id: None,
+            verification_receipt: None,
         }
     }
 
@@ -523,6 +530,9 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
+            task_failure: None,
+            execution_id: None,
+            verification_receipt: None,
         }
     }
 
@@ -536,6 +546,9 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: true,
+            task_failure: None,
+            execution_id: None,
+            verification_receipt: None,
         }
     }
 
@@ -552,7 +565,66 @@ impl DistributedQueryError {
             message: message.into(),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
+            task_failure: None,
+            execution_id: None,
+            verification_receipt: None,
         }
+    }
+
+    pub fn with_task_failure(
+        mut self,
+        failure: Option<novarocks_execution_contract::TaskFailure>,
+    ) -> Self {
+        self.task_failure = failure;
+        self
+    }
+
+    pub fn task_failure(&self) -> Option<&novarocks_execution_contract::TaskFailure> {
+        self.task_failure.as_ref()
+    }
+
+    pub fn execution_id(&self) -> Option<novarocks_types::QueryExecutionId> {
+        self.execution_id
+    }
+
+    pub fn verification_receipt(
+        &self,
+    ) -> Option<&crate::task_execution::execution::ReleasedVerificationFacts> {
+        self.verification_receipt.as_deref()
+    }
+
+    pub(crate) fn verification_receipt_arc(
+        &self,
+    ) -> Option<std::sync::Arc<crate::task_execution::execution::ReleasedVerificationFacts>> {
+        self.verification_receipt.clone()
+    }
+
+    /// Attach facts only from this error's exact attempt. Early failures can
+    /// retain their known attempt without claiming any release observation.
+    pub(crate) fn with_attempt_verification(
+        mut self,
+        execution_id: novarocks_types::QueryExecutionId,
+        receipt: Option<
+            std::sync::Arc<crate::task_execution::execution::ReleasedVerificationFacts>,
+        >,
+    ) -> Self {
+        if self.execution_id.is_some_and(|known| known != execution_id)
+            || receipt
+                .as_ref()
+                .is_some_and(|facts| facts.execution_id() != execution_id)
+        {
+            return Self::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "verification receipt does not belong to the exact execution attempt",
+            )
+            .with_task_failure(self.task_failure)
+            .with_attempt_verification(execution_id, None);
+        }
+        self.execution_id = Some(execution_id);
+        if receipt.is_some() {
+            self.verification_receipt = receipt;
+        }
+        self
     }
 
     pub fn kind(&self) -> DistributedQueryErrorKind {
@@ -579,6 +651,66 @@ impl fmt::Display for DistributedQueryError {
 }
 
 impl std::error::Error for DistributedQueryError {}
+
+#[cfg(test)]
+mod owned_verification_receipt_tests {
+    use super::*;
+    use crate::task_execution::execution::ReleasedVerificationFacts;
+    use novarocks_execution_contract::{SafeDetail, TaskFailure};
+    use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+    use std::sync::Arc;
+
+    fn execution(attempt: u64) -> QueryExecutionId {
+        QueryExecutionId::new(QueryId::new(8, 3), AttemptId::new(attempt).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn owned_verification_receipt_error_keeps_known_early_attempt_without_facts() {
+        let unknown =
+            DistributedQueryError::new(DistributedQueryErrorKind::Failed, "early failure");
+        assert_eq!(unknown.execution_id(), None);
+        assert!(unknown.verification_receipt().is_none());
+        let known = unknown.with_attempt_verification(execution(1), None);
+        assert_eq!(known.execution_id(), Some(execution(1)));
+        assert!(known.verification_receipt().is_none());
+    }
+
+    #[test]
+    fn owned_verification_receipt_error_preserves_typed_cause_and_exact_facts() {
+        let facts = Arc::new(ReleasedVerificationFacts::for_test(
+            execution(1),
+            Default::default(),
+            vec![],
+            false,
+        ));
+        let failure = TaskFailure::capacity_refused(SafeDetail::truncating("quota"), 4097, 4096);
+        let error = DistributedQueryError::new(DistributedQueryErrorKind::Failed, "quota refused")
+            .with_task_failure(Some(failure.clone()))
+            .with_attempt_verification(execution(1), Some(Arc::clone(&facts)))
+            .with_attempt_verification(execution(1), None);
+        assert_eq!(error.task_failure(), Some(&failure));
+        assert_eq!(error.verification_receipt(), Some(facts.as_ref()));
+        assert_eq!(error.clone(), error);
+    }
+
+    #[test]
+    fn owned_verification_receipt_error_refuses_foreign_facts_without_losing_typed_cause() {
+        let failure = TaskFailure::capacity_refused(SafeDetail::truncating("quota"), 4097, 4096);
+        let facts = Arc::new(ReleasedVerificationFacts::for_test(
+            execution(2),
+            Default::default(),
+            vec![],
+            true,
+        ));
+        let error = DistributedQueryError::new(DistributedQueryErrorKind::Failed, "quota refused")
+            .with_task_failure(Some(failure.clone()))
+            .with_attempt_verification(execution(1), Some(facts));
+        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+        assert_eq!(error.execution_id(), Some(execution(1)));
+        assert_eq!(error.task_failure(), Some(&failure));
+        assert!(error.verification_receipt().is_none());
+    }
+}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {

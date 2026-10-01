@@ -152,13 +152,13 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
                 encoding: StateEncoding::NativeColumnV1,
             },
         ],
-        apply_key: ApplyKey {
+        apply_key: Some(ApplyKey {
             kind: ApplyKeyKind::GroupRowId,
             components: vec![ApplyKeyComponent {
                 logical_id: apply_key_id(44),
                 target_field_id: field_id(34),
             }],
-        },
+        }),
         aggregates: vec![AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "avg".to_string(),
@@ -1177,5 +1177,54 @@ fn definition_and_publication_times_are_required_wire_facts() {
     assert!(matches!(
         decode_publication(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
         Err(PersistenceCodecError::MissingField(_))
+    ));
+}
+
+#[test]
+fn visible_tuple_bag_roundtrips_without_apply_key_or_branch_binding() {
+    let definition = encode_definition(&sample_definition()).unwrap();
+    let mut interpretation = sample_interpretation(&definition);
+    interpretation.apply_key = None;
+    interpretation.aggregates.clear();
+    interpretation.state_slots.clear();
+    interpretation.branches.clear();
+    interpretation.target.fields.retain(|field| {
+        matches!(
+            field.logical_identity,
+            PhysicalFieldLogicalIdentity::Output(_)
+        )
+    });
+    let encoded = encode_interpretation(&interpretation).unwrap();
+    let decoded =
+        decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    assert!(decoded.apply_key.is_none());
+    assert!(decoded.branches.is_empty());
+    assert_eq!(decoded, interpretation);
+}
+
+#[test]
+fn legacy_nonaggregate_interpretations_fail_closed_without_invalidating_aggregates() {
+    let definition = encode_definition(&sample_definition()).unwrap();
+    let aggregate = sample_interpretation(&definition);
+    let encoded = encode_interpretation(&aggregate).unwrap();
+    assert!(decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default()).is_ok());
+    for kind in [1, 2] {
+        let mut dto = super::interpretation_to_proto(&aggregate);
+        dto.apply_key.as_mut().unwrap().kind = Some(kind);
+        let error = decode_interpretation(&dto.encode_to_vec(), PersistenceDecodeBudget::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PersistenceCodecError::LegacyNonAggregateInterpretation
+        ));
+        assert!(error.to_string().contains("DROP"));
+    }
+    let mut dto = super::interpretation_to_proto(&aggregate);
+    dto.aggregates.clear();
+    dto.state_slots.clear();
+    dto.apply_key = None;
+    assert!(matches!(
+        decode_interpretation(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
+        Err(PersistenceCodecError::LegacyNonAggregateInterpretation)
     ));
 }

@@ -159,6 +159,7 @@ impl fmt::Display for FragmentExecutionErrorKind {
 pub struct FragmentExecutionError {
     kind: FragmentExecutionErrorKind,
     detail: String,
+    task_failure: Option<novarocks_execution_contract::TaskFailure>,
 }
 
 impl FragmentExecutionError {
@@ -166,7 +167,20 @@ impl FragmentExecutionError {
         Self {
             kind,
             detail: detail.into(),
+            task_failure: None,
         }
+    }
+
+    pub fn with_task_failure(
+        mut self,
+        failure: Option<novarocks_execution_contract::TaskFailure>,
+    ) -> Self {
+        self.task_failure = failure;
+        self
+    }
+
+    pub fn task_failure(&self) -> Option<&novarocks_execution_contract::TaskFailure> {
+        self.task_failure.as_ref()
     }
 
     pub fn kind(&self) -> FragmentExecutionErrorKind {

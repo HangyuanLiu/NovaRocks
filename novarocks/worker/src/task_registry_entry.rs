@@ -284,7 +284,24 @@ pub(super) fn estimate_retained_bytes(
 
 fn termination_bytes(termination: Option<&TerminationDetail>) -> usize {
     match termination {
-        Some(TerminationDetail::Failed(failure)) => failure.detail().as_str().len(),
+        Some(TerminationDetail::Failed(failure)) => {
+            let payload = match failure.category() {
+                novarocks_execution_contract::TaskFailureCategory::CapacityRefused {
+                    resource,
+                    ..
+                } => resource.as_str().len(),
+                novarocks_execution_contract::TaskFailureCategory::MvApplyConsistency {
+                    sample,
+                    ..
+                } => sample.as_str().len(),
+                novarocks_execution_contract::TaskFailureCategory::TargetFormatUnsupported {
+                    data_file,
+                    delete_kind,
+                } => data_file.as_str().len() + delete_kind.as_str().len(),
+                _ => 0,
+            };
+            failure.detail().as_str().len() + payload
+        }
         _ => 0,
     }
 }
@@ -325,9 +342,56 @@ pub(super) struct ContextEntry {
     /// this is encoded afterwards from the retired entry. It lives exactly as
     /// long as the retained context record.
     pub(super) released_evidence: ReleasedContextEvidence,
+    verification_tasks: BTreeMap<TaskIdentity, novarocks_execution_contract::TaskVerificationFacts>,
+    verification_truncated: bool,
+    verification_bytes: usize,
+    verification_instances: usize,
 }
 
 impl ContextEntry {
+    pub(super) fn record_verification(
+        &mut self,
+        context: novarocks_execution_contract::QueryContextRef,
+        facts: novarocks_execution_contract::TaskVerificationFacts,
+    ) {
+        use novarocks_execution_contract::*;
+        if self.verification_truncated {
+            return;
+        }
+        let instances = match &facts.observation {
+            TaskVerificationObservation::Available(records) => records.len(),
+            _ => 0,
+        };
+        let bytes = facts.retained_bytes();
+        if facts.identity.verify_query_context(context).is_err()
+            || facts.validate().is_err()
+            || self.verification_tasks.contains_key(&facts.identity)
+            || self.verification_tasks.len() >= VERIFICATION_MAX_TASKS_PER_CONTEXT
+            || self.verification_bytes.saturating_add(bytes) > VERIFICATION_MAX_CONTEXT_BYTES
+            || self.verification_instances.saturating_add(instances)
+                > VERIFICATION_MAX_INSTANCES_PER_CONTEXT
+        {
+            self.verification_truncated = true;
+            return;
+        }
+        self.verification_bytes += bytes;
+        self.verification_instances += instances;
+        self.verification_tasks.insert(facts.identity, facts);
+    }
+
+    pub(super) fn seal_verification(
+        &mut self,
+        context: novarocks_execution_contract::QueryContextRef,
+    ) -> novarocks_execution_contract::ContextVerificationFacts {
+        novarocks_execution_contract::ContextVerificationFacts {
+            context,
+            tasks: std::mem::take(&mut self.verification_tasks)
+                .into_values()
+                .collect(),
+            truncated: self.verification_truncated,
+        }
+    }
+
     pub(super) fn absent(source: Arc<TaskStatusSource>) -> Self {
         Self {
             state: QueryContextState::Absent,
@@ -345,6 +409,10 @@ impl ContextEntry {
             last_retire_revision: None,
             facts_released: false,
             released_evidence: ReleasedContextEvidence::none(),
+            verification_tasks: BTreeMap::new(),
+            verification_truncated: false,
+            verification_bytes: 0,
+            verification_instances: 0,
         }
     }
 

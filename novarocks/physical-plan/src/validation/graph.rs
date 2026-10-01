@@ -26,6 +26,28 @@ use crate::{
 };
 
 pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut ValidationContext) {
+    let domains = plan
+        .fragments()
+        .values()
+        .flat_map(|fragment| fragment.nodes().values())
+        .filter_map(|node| matches!(node.kind, NodeKind::QuotaPreclaim { .. }).then_some(node.id))
+        .collect::<BTreeSet<_>>();
+    for fragment in plan.fragments().values() {
+        for node in fragment.nodes().values() {
+            if let NodeKind::QuotaTrim { spec } = &node.kind
+                && !domains.contains(&spec.preselection_domain)
+            {
+                errors.push(ValidationError::new(
+                    format!(
+                        "fragments[{}].nodes[{}].quota_domain",
+                        fragment.id().get(),
+                        node.id.get()
+                    ),
+                    "QuotaTrim must refer to an exact plan-owned QuotaPreclaim domain",
+                ));
+            }
+        }
+    }
     let mut indegree = plan
         .fragments()
         .keys()
@@ -97,6 +119,63 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                         &path,
                         "sink contains a duplicate edge destination",
                     ));
+                }
+            }
+        }
+        FragmentSink::PredicateFanout { branches } => {
+            if branches.is_empty() || root_multiplicity != Some(RowMultiplicity::SingleCopy) {
+                errors.push(ValidationError::new(
+                    &path,
+                    "predicate fanout requires nonempty branches and single-copy input",
+                ));
+            }
+            for branch in branches {
+                if !edge_ids.insert(branch.edge) {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "predicate fanout repeats an edge",
+                    ));
+                }
+                let Some(predicate) = fragment.expressions().get(branch.predicate) else {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "predicate fanout requires a defined predicate",
+                    ));
+                    continue;
+                };
+                if predicate.owner != fragment.root()
+                    || predicate.ty.data_type != arrow_schema::DataType::Boolean
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "predicate fanout requires Boolean predicates owned by the producer root",
+                    ));
+                }
+                let mut pending = vec![branch.predicate];
+                let mut seen = BTreeSet::new();
+                while let Some(id) = pending.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let Some(expr) = fragment.expressions().get(id) else {
+                        continue;
+                    };
+                    if let crate::ExprKind::Value(value) = expr.kind
+                        && !root_values.contains(&value)
+                    {
+                        errors.push(ValidationError::new(
+                            &path,
+                            "fanout predicate reads outside the materialized root output",
+                        ));
+                    }
+                    if matches!(&expr.kind, crate::ExprKind::FunctionCall { function, .. } if function.volatility != crate::FunctionVolatility::Immutable)
+                    {
+                        errors.push(ValidationError::new(
+                            &path,
+                            "fanout predicates cannot reevaluate volatile functions",
+                        ));
+                    }
+                    expr.kind.expression_references(&mut pending);
                 }
             }
         }
@@ -236,7 +315,9 @@ pub(crate) fn import_origin_matches(
                 && *producer_value == source_value
         }
         (
-            crate::EdgeKind::Stream | crate::EdgeKind::ChangeStreamRouter,
+            crate::EdgeKind::Stream
+            | crate::EdgeKind::PredicateFanout
+            | crate::EdgeKind::ChangeStreamRouter,
             ValueOrigin::ExchangeImport {
                 edge: value_edge,
                 source_value: value_source,
@@ -545,6 +626,26 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
         let edges: &[EdgeId] = match fragment.sink() {
             FragmentSink::Stream { edge } => std::slice::from_ref(edge),
             FragmentSink::Multicast { edges } => edges,
+            FragmentSink::PredicateFanout { branches } => {
+                for branch in branches {
+                    if !referenced.insert(branch.edge) {
+                        errors.push(ValidationError::new(
+                            &path,
+                            "edge is referenced by more than one sink",
+                        ));
+                    }
+                    if !plan.edges().get(&branch.edge).is_some_and(|edge| {
+                        edge.source.fragment == fragment.id()
+                            && edge.kind == crate::EdgeKind::PredicateFanout
+                    }) {
+                        errors.push(ValidationError::new(
+                            &path,
+                            "predicate fanout edge has the wrong exact owner or kind",
+                        ));
+                    }
+                }
+                &[]
+            }
             FragmentSink::Router { routes, .. } => {
                 for route in routes {
                     if !referenced.insert(route.edge) {
@@ -704,6 +805,7 @@ pub(crate) fn edge_kind_matches_sink(sink: &FragmentSink, kind: crate::EdgeKind)
     match sink {
         FragmentSink::Stream { .. } => kind == crate::EdgeKind::Stream,
         FragmentSink::Multicast { .. } => kind == crate::EdgeKind::CteMulticast,
+        FragmentSink::PredicateFanout { .. } => kind == crate::EdgeKind::PredicateFanout,
         FragmentSink::Router { .. } => kind == crate::EdgeKind::ChangeStreamRouter,
         FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => false,
     }

@@ -292,6 +292,17 @@ impl<'a> TreeContext<'a> {
                     self.render_edge_sink(*edge, out);
                 }
             }
+            FragmentSink::PredicateFanout { branches } => {
+                out.push("  PREDICATE FANOUT SINK".into());
+                for branch in branches {
+                    out.push(format!(
+                        "    branch predicate={} edge=edge{}",
+                        self.expr(fragment, branch.predicate),
+                        branch.edge.get()
+                    ));
+                    self.render_edge_sink(branch.edge, out);
+                }
+            }
             FragmentSink::Router { routes, .. } => {
                 for route in routes.iter() {
                     self.render_edge_sink(route.edge, out);
@@ -820,6 +831,26 @@ impl TreeContext<'_> {
         let prefix = format!("{pad}{}:", self.display_id(fragment.id(), node.id));
         let stats = self.stats_suffix(fragment.id(), node.id);
         match &node.kind {
+            NodeKind::QuotaPreclaim { spec } => {
+                out.push(format!("{prefix}QUOTA PRECLAIM{stats}"));
+                out.push(format!(
+                    "{pad}     domain=n{}, need={:?}, content={:?}, max-state-bytes={}",
+                    spec.preselection_domain.get(),
+                    spec.demand_need,
+                    spec.content_equivalence,
+                    spec.max_state_bytes
+                ));
+            }
+            NodeKind::QuotaTrim { spec } => {
+                out.push(format!("{prefix}QUOTA TRIM{stats}"));
+                out.push(format!(
+                    "{pad}     domain=n{}, need={:?}, content={:?}, max-state-bytes={}",
+                    spec.preselection_domain.get(),
+                    spec.seed_need,
+                    spec.content_equivalence,
+                    spec.max_state_bytes
+                ));
+            }
             NodeKind::Scan {
                 relation: frozen,
                 residuals,

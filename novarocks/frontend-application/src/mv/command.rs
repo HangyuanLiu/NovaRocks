@@ -191,6 +191,8 @@ impl MvCommandExecutor {
                 self.mv_backend.as_ref(),
                 current_catalog,
                 &lower_typed_show(statement)?,
+                connector_context,
+                self.refresh_service.product_service(),
             ),
             MaterializedViewStatement::ExplainRefresh(statement) => self.execute_explain_refresh(
                 current_catalog,
@@ -198,6 +200,7 @@ impl MvCommandExecutor {
                 &lower_typed_refresh(&statement.refresh)?,
                 lower_typed_explain_level(statement.level),
                 connector_context,
+                execution,
             ),
         }
     }
@@ -237,6 +240,7 @@ impl MvCommandExecutor {
         statement: &MvRefreshRequest,
         level: novarocks_sql::compiler::ExplainLevel,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
         let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             &self.ports,
@@ -245,6 +249,7 @@ impl MvCommandExecutor {
             statement,
             level,
             connector_context,
+            execution,
         )?;
         build_string_query_result("Explain String", lines).map(StatementResult::Query)
     }

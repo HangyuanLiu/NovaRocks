@@ -87,6 +87,9 @@ use crate::planner::physical::{
     PhysicalPlanKind, PhysicalPlanNode, PlanSetOpKind, RedistributeMode, TopNPhase as SqlTopNPhase,
 };
 
+mod quota;
+use quota::{FanoutProducer, PendingQuotaFilter};
+
 const ROOT_FRAGMENT_ID: FragmentId = FragmentId::new(0);
 
 /// Lower the finalized SQL physical tree directly into the immutable contract.
@@ -262,6 +265,9 @@ struct ContractLoweringVisitor {
     dop_domain: PipelineDopDomain,
     provider_reads: Option<FinalizedProviderReadSet>,
     cte_producers: BTreeMap<CteId, CteProducer>,
+    fanout_producers: BTreeMap<ColumnId, FanoutProducer>,
+    quota_domains: BTreeMap<ColumnId, NodeId>,
+    quota_filters: Vec<PendingQuotaFilter>,
     annotated_nodes: BTreeSet<(FragmentId, NodeId)>,
     /// What each value is already called, so a column keeps one name.
     annotated_values: BTreeMap<(FragmentId, ValueId), String>,
@@ -450,6 +456,8 @@ fn join_output_pass_through(
 /// What one lowered node is called, for a message that names it.
 const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
     match kind {
+        NodeKind::QuotaPreclaim { .. } => "QuotaPreclaim",
+        NodeKind::QuotaTrim { .. } => "QuotaTrim",
         NodeKind::Scan { .. } => "Scan",
         NodeKind::Values { .. } => "Values",
         NodeKind::Filter { .. } => "Filter",
@@ -1291,6 +1299,9 @@ impl ContractLoweringVisitor {
             dop_domain,
             provider_reads,
             cte_producers: BTreeMap::new(),
+            fanout_producers: BTreeMap::new(),
+            quota_domains: BTreeMap::new(),
+            quota_filters: Vec::new(),
             annotated_nodes: BTreeSet::new(),
             annotated_values: BTreeMap::new(),
             runtime_filter_builds: BTreeMap::new(),
@@ -1530,6 +1541,7 @@ impl ContractLoweringVisitor {
         result_port: ResultPort,
     ) -> Result<PlanBuilder, ContractLoweringError> {
         self.plan_builder.set_result_port(result_port)?;
+        let quota_filter_ids = self.allocate_quota_filter_ids()?;
         let mut finished_fragments = BTreeMap::new();
         for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
             let (root, sink) = self.completions.remove(&fragment_id).ok_or(
@@ -1556,6 +1568,9 @@ impl ContractLoweringVisitor {
                 })?;
         }
         for filter in self.materialize_runtime_filters(&finished_fragments)? {
+            self.plan_builder.add_runtime_filter(filter)?;
+        }
+        for filter in self.materialize_quota_filters(&quota_filter_ids, &finished_fragments)? {
             self.plan_builder.add_runtime_filter(filter)?;
         }
         for fragment in finished_fragments.into_values() {
@@ -1620,6 +1635,10 @@ impl ContractLoweringVisitor {
             PhysicalPlanKind::HashAggregate(aggregate) => {
                 self.lower_hash_aggregate(plan, aggregate)
             }
+            PhysicalPlanKind::QuotaPreclaim(spec) => self.lower_quota_preclaim(plan, spec),
+            PhysicalPlanKind::QuotaTrim(spec) => self.lower_quota_trim(plan, spec),
+            PhysicalPlanKind::FanoutAnchor(anchor) => self.lower_fanout_anchor(plan, anchor),
+            PhysicalPlanKind::FanoutConsume(consume) => self.lower_fanout_consume(plan, consume),
             PhysicalPlanKind::CTEAnchor(anchor) => self.lower_cte_anchor(plan, anchor),
             PhysicalPlanKind::CTEProduce(_) => Err(ContractLoweringError::InvalidCte {
                 detail: "CTEProduce is only valid as the first child of its CTEAnchor".into(),
@@ -9848,6 +9867,10 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::NestLoopJoin(_) => "NestLoopJoin",
         PhysicalPlanKind::SetOp(_) => "SetOp",
         PhysicalPlanKind::ChangeEventExpand(_) => "ChangeEventExpand",
+        PhysicalPlanKind::QuotaPreclaim(_) => "QuotaPreclaim",
+        PhysicalPlanKind::QuotaTrim(_) => "QuotaTrim",
+        PhysicalPlanKind::FanoutAnchor(_) => "FanoutAnchor",
+        PhysicalPlanKind::FanoutConsume(_) => "FanoutConsume",
         PhysicalPlanKind::CTEAnchor(_) => "CTEAnchor",
         PhysicalPlanKind::CTEProduce(_) => "CTEProduce",
         PhysicalPlanKind::CTEConsume(_) => "CTEConsume",

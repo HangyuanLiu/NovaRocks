@@ -25,11 +25,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
+use crate::persistence::codec::preflight_current_document_set_with_eligibility;
 use crate::persistence::codec::{
     ConfigurationDocument, DefinitionDocument, EncodedDocument, InterpretationDocument,
     PersistenceCodecError, PublicationDocument, decode_configuration, decode_definition,
     decode_interpretation, decode_publication, encode_configuration, encode_definition,
     encode_interpretation, encode_publication, preflight_current_document_set,
+};
+use crate::persistence::eligibility::{
+    EligibilityDocument, EligibilityState, decode_eligibility, encode_eligibility,
 };
 use crate::persistence::identity::DocumentRevision;
 use crate::persistence::validation::{
@@ -56,6 +60,7 @@ const DEFINITION: &str = "definition";
 const INTERPRETATION: &str = "interpretation";
 const PUBLICATION: &str = "publication";
 const CONFIGURATION: &str = "configuration";
+const ELIGIBILITY: &str = "eligibility";
 const REFERENCES_DEFINITION: &str = "definition";
 const REFERENCES_INTERPRETATION: &str = "interpretation";
 const FORMAT_VERSION: u32 = 1;
@@ -78,6 +83,8 @@ pub struct MvObservedCurrentDocuments {
     pub(crate) publication_output_version: Option<ConnectorCommittedVersion>,
     pub(crate) configuration: ConfigurationDocument,
     pub(crate) configuration_revision: DocumentRevision,
+    pub(crate) eligibility: Option<EligibilityDocument>,
+    pub(crate) eligibility_revision: Option<DocumentRevision>,
 }
 
 impl MvObservedCurrentDocuments {
@@ -102,6 +109,14 @@ impl MvObservedCurrentDocuments {
 
     pub const fn publication_revision(&self) -> Option<DocumentRevision> {
         self.publication_revision
+    }
+
+    pub fn eligibility(&self) -> Option<&EligibilityDocument> {
+        self.eligibility.as_ref()
+    }
+
+    pub const fn eligibility_revision(&self) -> Option<DocumentRevision> {
+        self.eligibility_revision
     }
 
     /// The independently mutable configuration this target currently holds.
@@ -148,6 +163,7 @@ impl MvObservedCurrentDocuments {
                 .as_ref()
                 .map(MvAcceleratorCommittedVersionRevision::from_committed),
             configuration_revision: self.configuration_revision,
+            eligibility_revision: self.eligibility_revision,
             deployment_owner: self.deployment_owner.clone(),
             process_incarnation: self.process_incarnation.clone(),
         }
@@ -336,6 +352,50 @@ pub fn configuration_document_set(
     ConnectorDocumentSet::try_new(vec![configuration]).map_err(Into::into)
 }
 
+/// Writes an independently mutable, exact maintenance eligibility control fact.
+pub fn eligibility_document_set(
+    eligibility: &EligibilityDocument,
+) -> Result<ConnectorDocumentSet, MvDocumentError> {
+    let document = connector_document(
+        ELIGIBILITY,
+        encode_eligibility(eligibility)?,
+        Vec::new(),
+        ConnectorDocumentAttachment::TableMetadata,
+    )?;
+    ConnectorDocumentSet::try_new(vec![document]).map_err(Into::into)
+}
+
+/// Publishes data, P and Eligible as one atomic document set. A metadata-only
+/// management update must use eligibility_document_set and preserve its cause.
+pub fn publication_with_eligibility_document_set(
+    definition: &DefinitionDocument,
+    interpretation: &InterpretationDocument,
+    publication: &PublicationDocument,
+    eligibility: &EligibilityDocument,
+) -> Result<ConnectorDocumentSet, MvDocumentError> {
+    let p = encode_publication(publication)?;
+    if eligibility.state != EligibilityState::Eligible
+        || eligibility.binding.object_id != publication.output.object_id
+        || eligibility.binding.publication_id != publication.publication_id
+        || eligibility.binding.publication_revision != p.revision()
+        || eligibility.binding.computation_identity != definition.computation_identity
+    {
+        return Err(MvDocumentError::Contract(
+            "publication eligibility must bind exact new P and computation".into(),
+        ));
+    }
+    let mut documents = publication_document_set(definition, interpretation, publication)?
+        .documents()
+        .to_vec();
+    documents.extend(
+        eligibility_document_set(eligibility)?
+            .documents()
+            .iter()
+            .cloned(),
+    );
+    ConnectorDocumentSet::try_new(documents).map_err(Into::into)
+}
+
 /// Decodes one exact, lease-sealed management observation. Deferred bodies
 /// must be loaded through the original observation request before entering
 /// this application boundary.
@@ -380,6 +440,8 @@ fn decode_current_management_documents(
         publication_output_version: decoded.publication_output_version,
         configuration: decoded.configuration,
         configuration_revision: decoded.configuration_revision,
+        eligibility: decoded.eligibility,
+        eligibility_revision: decoded.eligibility_revision,
     })
 }
 
@@ -444,6 +506,286 @@ pub fn observe_current_management_document_set(
     Ok(MvObservedCurrentManagementDocumentSet {
         observation,
         documents,
+    })
+}
+
+/// Exact Current facts that authorize only retirement of a managed object.
+/// No interpretation or query-ready projection can be obtained from this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvCurrentDropDescriptor {
+    source_revision: MvAcceleratorSourceRevision,
+    configuration: ConfigurationDocument,
+    legacy_nonaggregate: bool,
+}
+
+impl MvCurrentDropDescriptor {
+    pub fn source_revision(&self) -> &MvAcceleratorSourceRevision {
+        &self.source_revision
+    }
+    pub fn configuration(&self) -> &ConfigurationDocument {
+        &self.configuration
+    }
+    pub fn is_legacy_nonaggregate(&self) -> bool {
+        self.legacy_nonaggregate
+    }
+    pub fn management_dependencies(
+        &self,
+        runtime: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> crate::management::ManagementDependencySet {
+        self.source_revision.management_dependencies(runtime)
+    }
+}
+
+/// Bounded decoding shared with the DROP-only Accelerator reader. Retired L
+/// contributes only its exact D/computation/object headers, never row semantics.
+pub(crate) fn decode_drop_document_bodies(
+    definition_bytes: &[u8],
+    interpretation_bytes: &[u8],
+    publication_bytes: Option<&[u8]>,
+    configuration_bytes: &[u8],
+    budget: PersistenceDecodeBudget,
+) -> Result<
+    (
+        DefinitionDocument,
+        ConfigurationDocument,
+        bool,
+        super::identity::ObjectIdentity,
+    ),
+    MvDocumentError,
+> {
+    use prost::Message;
+    preflight_current_document_set(
+        definition_bytes,
+        interpretation_bytes,
+        publication_bytes,
+        configuration_bytes,
+        budget,
+    )?;
+    let definition = decode_definition(definition_bytes, budget)?;
+    let configuration = decode_configuration(configuration_bytes, budget)?;
+    let d_revision = DocumentRevision::from_canonical_bytes(definition_bytes);
+    let l_revision = DocumentRevision::from_canonical_bytes(interpretation_bytes);
+    let (legacy, object) = match decode_interpretation(interpretation_bytes, budget) {
+        Ok(interpretation) => {
+            if interpretation.definition_revision != d_revision
+                || interpretation.computation_identity != definition.computation_identity
+            {
+                return Err(MvDocumentError::Contract(
+                    "DROP L does not bind exact D".into(),
+                ));
+            }
+            if let Some(bytes) = publication_bytes {
+                validate_document_set(
+                    &definition,
+                    d_revision,
+                    &interpretation,
+                    l_revision,
+                    &decode_publication(bytes, budget)?,
+                )?;
+            }
+            (false, interpretation.target.object_id)
+        }
+        Err(PersistenceCodecError::LegacyNonAggregateInterpretation) => {
+            let raw = super::generated::InterpretationDocument::decode(interpretation_bytes)
+                .map_err(PersistenceCodecError::ProtobufDecode)?;
+            if !raw.aggregates.is_empty()
+                || raw.encode_to_vec() != interpretation_bytes
+                || raw.definition_revision.as_deref() != Some(d_revision.as_bytes().as_slice())
+                || raw.computation_identity.as_deref()
+                    != Some(definition.computation_identity.as_bytes().as_slice())
+            {
+                return Err(MvDocumentError::Contract(
+                    "retired DROP L has invalid exact D/computation headers".into(),
+                ));
+            }
+            let object = super::identity::ObjectIdentity::try_new(
+                raw.target
+                    .and_then(|target| target.object_id)
+                    .ok_or_else(|| {
+                        MvDocumentError::Contract("retired DROP L has no target object".into())
+                    })?,
+            )
+            .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
+            (true, object)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(bytes) = publication_bytes {
+        let publication = decode_publication(bytes, budget)?;
+        if publication.definition_revision != d_revision
+            || publication.interpretation_revision != l_revision
+            || publication.output.object_id != object
+            || publication.inputs.len() != definition.relation_occurrences.len()
+            || publication
+                .inputs
+                .iter()
+                .zip(&definition.relation_occurrences)
+                .any(|(input, occurrence)| {
+                    input.relation_occurrence_id != occurrence.occurrence_id
+                        || input.object_id != occurrence.object_id
+                })
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP P does not bind exact D/L/source/target objects".into(),
+            ));
+        }
+    }
+    Ok((definition, configuration, legacy, object))
+}
+
+/// Observe a sealed Current package for explicit DROP. This accepts the typed
+/// retired nonaggregate format only after validating all exact envelope links.
+pub fn observe_current_drop_descriptor(
+    lease: &ConnectorDocumentStorageLease,
+    request: ConnectorDocumentObservationRequest,
+    budget: PersistenceDecodeBudget,
+) -> Result<
+    (
+        ConnectorDocumentManagementObservation,
+        MvCurrentDropDescriptor,
+    ),
+    MvDocumentError,
+> {
+    let retained = request.clone();
+    let observation = lease.observe_current_management(request)?;
+    let mut loaded = Vec::new();
+    for stored in observation.documents() {
+        if matches!(
+            stored.carrier(),
+            ConnectorDocumentCarrier::DeferredContent(_)
+        ) {
+            loaded.push(lease.load_document(
+                retained.try_load_request(stored.clone(), retained.context().clone())?,
+            )?);
+        }
+    }
+    let descriptor = decode_current_drop_descriptor(&observation, &loaded, budget)?;
+    Ok((observation, descriptor))
+}
+
+fn decode_current_drop_descriptor(
+    observation: &ConnectorDocumentManagementObservation,
+    loaded: &[ConnectorDocument],
+    budget: PersistenceDecodeBudget,
+) -> Result<MvCurrentDropDescriptor, MvDocumentError> {
+    observation.validate_sealed()?;
+    if observation.marker().kind() != MANAGED_MV_KIND {
+        return Err(MvDocumentError::Contract(
+            "DROP Current marker is not a materialized view".into(),
+        ));
+    }
+    let loaded = validate_loaded_documents(observation.documents(), loaded)?;
+    let mut by_name = BTreeMap::new();
+    for stored in observation.documents() {
+        validate_envelope(stored)?;
+        if by_name
+            .insert(stored.id().name().as_str(), stored)
+            .is_some()
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP Current has duplicate MV documents".into(),
+            ));
+        }
+        let body = resolved_content(stored, &loaded)?;
+        if DocumentRevision::from_canonical_bytes(body) != revision(stored) {
+            return Err(MvDocumentError::Contract(
+                "DROP document body differs from its exact revision".into(),
+            ));
+        }
+    }
+    if by_name.len()
+        != 3 + usize::from(by_name.contains_key(PUBLICATION))
+            + usize::from(by_name.contains_key(ELIGIBILITY))
+    {
+        return Err(MvDocumentError::Contract(
+            "DROP Current must contain exactly D/L/C and optional P/eligibility".into(),
+        ));
+    }
+    let d = required_document(&by_name, DEFINITION)?;
+    let l = required_document(&by_name, INTERPRETATION)?;
+    let c = required_document(&by_name, CONFIGURATION)?;
+    for stored in [d, l, c] {
+        require_attachment(stored, false)?;
+    }
+    require_exact_references(d, &[])?;
+    require_exact_references(c, &[])?;
+    require_exact_references(l, &[(REFERENCES_DEFINITION, d.id())])?;
+    let p = by_name.get(PUBLICATION).copied();
+    if let Some(p) = p {
+        require_attachment(p, true)?;
+        require_exact_references(
+            p,
+            &[
+                (REFERENCES_DEFINITION, d.id()),
+                (REFERENCES_INTERPRETATION, l.id()),
+            ],
+        )?;
+    }
+    let d_bytes = resolved_content(d, &loaded)?;
+    let l_bytes = resolved_content(l, &loaded)?;
+    let c_bytes = resolved_content(c, &loaded)?;
+    let p_bytes = p.map(|p| resolved_content(p, &loaded)).transpose()?;
+    let e = by_name.get(ELIGIBILITY).copied();
+    let e_bytes = e.map(|e| resolved_content(e, &loaded)).transpose()?;
+    preflight_current_document_set_with_eligibility(
+        d_bytes, l_bytes, p_bytes, c_bytes, e_bytes, budget,
+    )?;
+    let (definition, configuration, legacy_nonaggregate, object) =
+        decode_drop_document_bodies(d_bytes, l_bytes, p_bytes, c_bytes, budget)?;
+    if object.as_bytes() != observation.object_id().as_bytes().as_ref() {
+        return Err(MvDocumentError::Contract(
+            "DROP L names a different target object".into(),
+        ));
+    }
+    if let Some(e) = e {
+        require_attachment(e, false)?;
+        require_exact_references(e, &[])?;
+        let eligibility = decode_eligibility(e_bytes.expect("resolved E"), budget)?;
+        if eligibility.binding.object_id != object
+            || eligibility.binding.computation_identity != definition.computation_identity
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP eligibility belongs to another target/computation".into(),
+            ));
+        }
+        if matches!(eligibility.state, EligibilityState::Eligible) {
+            let publication = p_bytes
+                .map(|bytes| decode_publication(bytes, budget))
+                .transpose()?;
+            if publication.is_none_or(|p| eligibility.binding.publication_id != p.publication_id)
+                || Some(eligibility.binding.publication_revision) != p.map(revision)
+            {
+                return Err(MvDocumentError::Contract(
+                    "DROP Eligible does not bind exact Current P".into(),
+                ));
+            }
+        }
+    }
+    Ok(MvCurrentDropDescriptor {
+        source_revision: MvAcceleratorSourceRevision {
+            target: observation.target().clone(),
+            target_object_id: observation.object_id().clone(),
+            metadata_version: MvAcceleratorCommittedVersionRevision::from_committed(
+                observation.metadata_version(),
+            ),
+            definition_revision: revision(d),
+            interpretation_revision: revision(l),
+            configuration_revision: revision(c),
+            publication_revision: p.map(revision),
+            publication_output_version: p.map(|p| match p.attachment() {
+                ConnectorStoredDocumentAttachment::ExactOutput(output) => {
+                    MvAcceleratorCommittedVersionRevision::from_committed(output)
+                }
+                _ => unreachable!("validated exact output"),
+            }),
+            eligibility_revision: e.map(revision),
+            deployment_owner: DeploymentOwner::parse(observation.marker().owner())
+                .map_err(|e| MvDocumentError::Contract(e.to_string()))?,
+            process_incarnation: ProcessIncarnation::parse(observation.marker().incarnation())
+                .map_err(|e| MvDocumentError::Contract(e.to_string()))?,
+        },
+        configuration,
+        legacy_nonaggregate,
     })
 }
 
@@ -540,7 +882,7 @@ pub fn decode_frozen_publication_documents(
         validate_envelope(stored)?;
         if !matches!(
             stored.id().name().as_str(),
-            DEFINITION | INTERPRETATION | PUBLICATION | CONFIGURATION
+            DEFINITION | INTERPRETATION | PUBLICATION | CONFIGURATION | ELIGIBILITY
         ) || documents
             .insert(stored.id().name().as_str(), stored)
             .is_some()
@@ -616,6 +958,8 @@ struct DecodedDocumentSlice {
     publication_output_version: Option<ConnectorCommittedVersion>,
     configuration: ConfigurationDocument,
     configuration_revision: DocumentRevision,
+    eligibility: Option<EligibilityDocument>,
+    eligibility_revision: Option<DocumentRevision>,
 }
 
 fn decode_document_slice(
@@ -636,14 +980,12 @@ fn decode_document_slice(
             ));
         }
     }
-    let expected = if by_name.contains_key(PUBLICATION) {
-        4
-    } else {
-        3
-    };
+    let expected = 3
+        + usize::from(by_name.contains_key(PUBLICATION))
+        + usize::from(by_name.contains_key(ELIGIBILITY));
     if by_name.len() != expected {
         return Err(MvDocumentError::Contract(
-            "Current must contain exactly D/L/C and optional P".to_string(),
+            "Current must contain exactly D/L/C and optional P/eligibility".to_string(),
         ));
     }
 
@@ -663,11 +1005,16 @@ fn decode_document_slice(
         .get(PUBLICATION)
         .map(|stored| resolved_content(stored, &loaded_by_id))
         .transpose()?;
-    preflight_current_document_set(
+    let eligibility_content = by_name
+        .get(ELIGIBILITY)
+        .map(|stored| resolved_content(stored, &loaded_by_id))
+        .transpose()?;
+    preflight_current_document_set_with_eligibility(
         definition_content,
         interpretation_content,
         publication_content,
         configuration_content,
+        eligibility_content,
         budget,
     )?;
 
@@ -727,6 +1074,33 @@ fn decode_document_slice(
             }
         };
 
+    let (eligibility, eligibility_revision) = match by_name.get(ELIGIBILITY) {
+        Some(stored) => {
+            require_attachment(stored, false)?;
+            require_exact_references(stored, &[])?;
+            let eligibility =
+                decode_eligibility(eligibility_content.expect("resolved eligibility"), budget)?;
+            if eligibility.binding.object_id != interpretation.target.object_id
+                || eligibility.binding.computation_identity != definition.computation_identity
+            {
+                return Err(MvDocumentError::Contract(
+                    "eligibility belongs to another target object or computation".into(),
+                ));
+            }
+            if matches!(eligibility.state, EligibilityState::Eligible)
+                && publication.as_ref().is_none_or(|p| {
+                    eligibility.binding.publication_id != p.publication_id
+                        || Some(eligibility.binding.publication_revision) != publication_revision
+                })
+            {
+                return Err(MvDocumentError::Contract(
+                    "Eligible does not bind exact Current publication".into(),
+                ));
+            }
+            (Some(eligibility), Some(revision(stored)))
+        }
+        None => (None, None),
+    };
     Ok(DecodedDocumentSlice {
         definition,
         definition_revision,
@@ -737,6 +1111,8 @@ fn decode_document_slice(
         publication_output_version,
         configuration,
         configuration_revision,
+        eligibility,
+        eligibility_revision,
     })
 }
 
@@ -863,7 +1239,7 @@ fn validate_envelope(document: &ConnectorStoredDocument) -> Result<(), MvDocumen
         || document.format().version() != FORMAT_VERSION
         || !matches!(
             name,
-            DEFINITION | INTERPRETATION | PUBLICATION | CONFIGURATION
+            DEFINITION | INTERPRETATION | PUBLICATION | CONFIGURATION | ELIGIBILITY
         )
     {
         return Err(MvDocumentError::Contract(
@@ -1015,16 +1391,15 @@ mod tests {
 
     use crate::management::ManagementDependencySet;
     use crate::persistence::codec::{
-        ApplyKey, ApplyKeyComponent, ApplyKeyKind, BranchInterpretation, ExpressionKind,
-        ExpressionShape, OutputBinding, OutputDefinition, PhysicalFieldBinding,
-        PhysicalFieldLogicalIdentity, PublicationInput, PublicationKind, PublicationOutput,
-        PublicationStatistics, QueryDialect, QuerySource, RefreshPolicy, RelationOccurrence,
-        ResolutionContext, SourceFieldBinding, SourceFieldReference, TargetBinding,
-        build_definition,
+        BranchInterpretation, ExpressionKind, ExpressionShape, OutputBinding, OutputDefinition,
+        PhysicalFieldBinding, PhysicalFieldLogicalIdentity, PublicationInput, PublicationKind,
+        PublicationOutput, PublicationStatistics, QueryDialect, QuerySource, RefreshPolicy,
+        RelationOccurrence, ResolutionContext, SourceFieldBinding, SourceFieldReference,
+        TargetBinding, build_definition,
     };
     use crate::persistence::identity::{
-        ApplyKeyIdentity, BranchIdentity, FieldIdentity, NativeDataVersion, ObjectIdentity,
-        OutputIdentity, PartitionSpecVersion, PublicationIdentity, SchemaVersion,
+        BranchIdentity, FieldIdentity, NativeDataVersion, ObjectIdentity, OutputIdentity,
+        PartitionSpecVersion, PublicationIdentity, SchemaVersion,
     };
     use novarocks_spi::connector::document_storage::{
         ConnectorDeferredDocumentHandle, ConnectorDocumentCarrier, ConnectorDocumentDiscoveryPage,
@@ -1060,14 +1435,14 @@ mod tests {
         let output = opaque(3, OutputIdentity::try_new);
         let target_object = opaque(4, ObjectIdentity::try_new);
         let target_output = opaque(5, FieldIdentity::try_new);
-        let apply_logical = opaque(6, ApplyKeyIdentity::try_new);
+        let apply_logical = opaque(6, OutputIdentity::try_new);
         let target_apply = opaque(7, FieldIdentity::try_new);
         let target_schema = opaque(8, SchemaVersion::try_new);
         let target_spec = opaque(9, PartitionSpecVersion::try_new);
         let definition = build_definition(
             1_700_000_000_000,
             QuerySource {
-                effective_sql: "SELECT o.order_id FROM ice.sales.orders o".to_string(),
+                effective_sql: "SELECT o.order_id, 1 AS tag FROM ice.sales.orders o".to_string(),
                 dialect: QueryDialect::StarRocks,
                 resolution: ResolutionContext {
                     default_catalog: "ice".to_string(),
@@ -1089,40 +1464,55 @@ mod tests {
                     nullable: false,
                 }],
             }],
-            vec![OutputDefinition {
-                output_id: output.clone(),
-                name: "order_id".to_string(),
-                type_signature: "bigint".to_string(),
-                nullable: false,
-                expression: ExpressionShape {
-                    kind: ExpressionKind::Field,
-                    function_identity: None,
-                    source_fields: vec![SourceFieldReference {
-                        occurrence_id: 0,
-                        field_id: source_field,
-                    }],
+            vec![
+                OutputDefinition {
+                    output_id: output.clone(),
+                    name: "order_id".to_string(),
+                    type_signature: "bigint".to_string(),
+                    nullable: false,
+                    expression: ExpressionShape {
+                        kind: ExpressionKind::Field,
+                        function_identity: None,
+                        source_fields: vec![SourceFieldReference {
+                            occurrence_id: 0,
+                            field_id: source_field,
+                        }],
+                    },
                 },
-            }],
+                OutputDefinition {
+                    output_id: apply_logical.clone(),
+                    name: "tag".into(),
+                    type_signature: "bigint".into(),
+                    nullable: false,
+                    expression: ExpressionShape {
+                        kind: ExpressionKind::Literal,
+                        function_identity: None,
+                        source_fields: Vec::new(),
+                    },
+                },
+            ],
         )
         .expect("definition");
         let definition_revision = encode_definition(&definition).unwrap().revision();
         let interpretation = InterpretationDocument {
             definition_revision,
             computation_identity: definition.computation_identity,
-            outputs: vec![OutputBinding {
-                output_id: output.clone(),
-                target_field_id: target_output.clone(),
-                type_signature: "bigint".to_string(),
-                nullable: false,
-            }],
-            state_slots: Vec::new(),
-            apply_key: ApplyKey {
-                kind: ApplyKeyKind::BaseRowId,
-                components: vec![ApplyKeyComponent {
-                    logical_id: apply_logical.clone(),
+            outputs: vec![
+                OutputBinding {
+                    output_id: output.clone(),
+                    target_field_id: target_output.clone(),
+                    type_signature: "bigint".to_string(),
+                    nullable: false,
+                },
+                OutputBinding {
+                    output_id: apply_logical.clone(),
                     target_field_id: target_apply.clone(),
-                }],
-            },
+                    type_signature: "bigint".into(),
+                    nullable: false,
+                },
+            ],
+            state_slots: Vec::new(),
+            apply_key: None,
             aggregates: Vec::new(),
             branches: Vec::new(),
             target: TargetBinding {
@@ -1137,9 +1527,9 @@ mod tests {
                         nullable: false,
                     },
                     PhysicalFieldBinding {
-                        logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(apply_logical),
+                        logical_identity: PhysicalFieldLogicalIdentity::Output(apply_logical),
                         target_field_id: target_apply.clone(),
-                        type_signature: "binary".to_string(),
+                        type_signature: "bigint".to_string(),
                         nullable: false,
                     },
                 ],
@@ -1419,17 +1809,40 @@ mod tests {
             kind: PublicationKind::FullRefresh,
             statistics: PublicationStatistics::default(),
         };
-        let publication_set = publication_document_set(&definition, &interpretation, &publication)
-            .expect("publication documents");
+        let eligibility = EligibilityDocument {
+            binding: crate::persistence::eligibility::EligibilityBinding {
+                object_id: publication.output.object_id.clone(),
+                publication_id: publication.publication_id.clone(),
+                publication_revision: encode_publication(&publication).unwrap().revision(),
+                computation_identity: definition.computation_identity,
+                content_contract_identity:
+                    crate::persistence::eligibility::native_result_content_v1_identity(),
+                generation: 1,
+            },
+            state: EligibilityState::Eligible,
+        };
+        let publication_set = publication_with_eligibility_document_set(
+            &definition,
+            &interpretation,
+            &publication,
+            &eligibility,
+        )
+        .expect("atomic publication eligibility");
         let mut current = create
             .documents()
             .iter()
             .map(|document| stored(document, false))
             .collect::<Vec<_>>();
         current.push(stored(&publication_set.documents()[0], true));
+        current.push(stored(&publication_set.documents()[1], false));
 
         let decoded = decode_document_slice(&current, &[], PersistenceDecodeBudget::default())
             .expect("exact Current");
+        assert_eq!(decoded.eligibility, Some(eligibility.clone()));
+        assert_eq!(
+            decoded.eligibility_revision,
+            Some(encode_eligibility(&eligibility).unwrap().revision())
+        );
         assert_eq!(decoded.definition, definition);
         assert_eq!(decoded.interpretation, interpretation);
         assert_eq!(decoded.configuration, configuration);
@@ -1597,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    fn create_accepts_multiple_branch_identities_sharing_one_prepared_physical_field() {
+    fn create_rejects_nonaggregate_branch_target_bindings() {
         let (definition, mut interpretation, configuration, target) = fixture();
         let output_id = interpretation.outputs[0].output_id.clone();
         let shared_field_id = interpretation.outputs[0].target_field_id.clone();
@@ -1630,8 +2043,9 @@ mod tests {
             },
         ]);
 
-        create_document_set(&definition, &interpretation, &configuration, &target)
-            .expect("shared physical target field");
+        assert!(
+            create_document_set(&definition, &interpretation, &configuration, &target).is_err()
+        );
     }
 
     #[test]
@@ -1907,5 +2321,281 @@ mod tests {
             )
             .is_err()
         );
+    }
+    fn legacy_drop_documents() -> (
+        ConnectorDocumentStorageLease,
+        ConnectorDocumentObservationRequest,
+    ) {
+        use prost::Message;
+        let (definition, interpretation, configuration, target) = fixture();
+        let create =
+            create_document_set(&definition, &interpretation, &configuration, &target).unwrap();
+        let mut raw = super::super::generated::InterpretationDocument::decode(
+            encode_interpretation(&interpretation).unwrap().as_bytes(),
+        )
+        .unwrap();
+        raw.apply_key = Some(super::super::generated::ApplyKey {
+            kind: Some(1),
+            components: vec![],
+        });
+        let legacy = ConnectorDocument::try_new(
+            owner().unwrap(),
+            document_name(INTERPRETATION).unwrap(),
+            document_format(INTERPRETATION).unwrap(),
+            Bytes::from(raw.encode_to_vec()),
+            vec![
+                ConnectorDocumentReference::try_new(
+                    REFERENCES_DEFINITION,
+                    create.documents()[0].id().clone(),
+                )
+                .unwrap(),
+            ],
+            ConnectorDocumentAttachment::TableMetadata,
+        )
+        .unwrap();
+        let stored_documents = vec![
+            stored(&create.documents()[0], false),
+            stored(&legacy, false),
+            stored(&create.documents()[2], false),
+        ];
+        let lease = document_lease(
+            &target,
+            stored_documents,
+            vec![],
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"drop-metadata"), None).unwrap(),
+        );
+        let request = ConnectorDocumentObservationRequest::try_new(
+            lease.owner().clone(),
+            lease.catalog_handle().clone(),
+            target.target().clone(),
+            target.object_id().clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            request_context(),
+        )
+        .unwrap();
+        (lease, request)
+    }
+
+    #[test]
+    fn legacy_current_is_retirable_but_cannot_become_ordinary_documents() {
+        let (lease, request) = legacy_drop_documents();
+        assert!(matches!(
+            observe_current_management_documents(
+                &lease,
+                request.clone(),
+                PersistenceDecodeBudget::default()
+            ),
+            Err(MvDocumentError::Codec(
+                PersistenceCodecError::LegacyNonAggregateInterpretation
+            ))
+        ));
+        let (observation, descriptor) =
+            observe_current_drop_descriptor(&lease, request, PersistenceDecodeBudget::default())
+                .unwrap();
+        assert!(descriptor.is_legacy_nonaggregate());
+        assert_eq!(
+            &descriptor.source_revision().target_object_id,
+            observation.object_id()
+        );
+        let entrance = crate::management::ManagementEntrance::new(
+            DeploymentOwner::parse("deployment-a").unwrap(),
+            ProcessIncarnation::parse("process-a").unwrap(),
+        );
+        let runtime = ConnectorControlRuntimeId::from_bytes([7; 16]);
+        entrance
+            .install_fresh_drop_target(&observation, &descriptor, runtime)
+            .unwrap();
+        for operation in [novarocks_spi::connector::document_storage::ConnectorDocumentManagementOperation::Publication,novarocks_spi::connector::document_storage::ConnectorDocumentManagementOperation::SingleTargetUpdate] {
+            let request = crate::management::ManagementRequest::try_new(observation.catalog_handle().clone(),observation.target().clone(),Some(observation.object_id().clone()),operation,
+                Some(descriptor.management_dependencies(runtime)),crate::management::EffectScope::CATALOG_COMMIT).unwrap();
+            assert!(entrance.acquire(request,|| false).is_err());
+        }
+        let request = crate::management::ManagementRequest::try_new(
+            observation.catalog_handle().clone(),
+            observation.target().clone(),
+            Some(observation.object_id().clone()),
+            novarocks_spi::connector::document_storage::ConnectorDocumentManagementOperation::Drop,
+            Some(descriptor.management_dependencies(runtime)),
+            crate::management::EffectScope::CATALOG_AND_OBJECT_DELETION,
+        )
+        .unwrap();
+        let mut turn = entrance.acquire(request, || false).unwrap();
+        turn.mark_dispatched(crate::management::EffectResponsibility::new(
+            crate::management::EffectIdentity::from_bytes([8; 16]),
+            ManagedMvTarget::from_observation(&observation).unwrap(),
+            entrance.incarnation().clone(),
+            crate::management::EffectScope::CATALOG_AND_OBJECT_DELETION,
+            crate::management::ManagementTimestamp::from_unix_millis(1),
+        ))
+        .unwrap();
+        drop(turn);
+        assert!(
+            entrance
+                .install_fresh_drop_target(&observation, &descriptor, runtime)
+                .is_err(),
+            "fresh DROP must not erase Unknown"
+        );
+    }
+
+    #[test]
+    fn retired_drop_headers_are_exact_and_bounded() {
+        use prost::Message;
+        let (definition, interpretation, configuration, _) = fixture();
+        let d = encode_definition(&definition).unwrap();
+        let c = encode_configuration(&configuration).unwrap();
+        let mut raw = super::super::generated::InterpretationDocument::decode(
+            encode_interpretation(&interpretation).unwrap().as_bytes(),
+        )
+        .unwrap();
+        raw.apply_key = Some(super::super::generated::ApplyKey {
+            kind: Some(1),
+            components: vec![],
+        });
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &raw.encode_to_vec(),
+                None,
+                c.as_bytes(),
+                PersistenceDecodeBudget::default()
+            )
+            .unwrap()
+            .2
+        );
+        let tiny_budget = PersistenceDecodeBudget {
+            max_document_bytes: 1,
+            ..PersistenceDecodeBudget::default()
+        };
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &raw.encode_to_vec(),
+                None,
+                c.as_bytes(),
+                tiny_budget
+            )
+            .is_err()
+        );
+        raw.aggregates
+            .push(super::super::generated::AggregateInterpretation::default());
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &raw.encode_to_vec(),
+                None,
+                c.as_bytes(),
+                PersistenceDecodeBudget::default()
+            )
+            .is_err(),
+            "legacy tags cannot admit an unsupported aggregate L"
+        );
+        raw.aggregates.clear();
+        let wrong_publication = PublicationDocument {
+            publication_prepared_at_ms: 1,
+            publication_id: PublicationIdentity::try_new(vec![1]).unwrap(),
+            definition_revision: d.revision(),
+            interpretation_revision: DocumentRevision::from_canonical_bytes(b"another-L"),
+            inputs: definition
+                .relation_occurrences
+                .iter()
+                .map(|o| PublicationInput {
+                    relation_occurrence_id: o.occurrence_id,
+                    object_id: o.object_id.clone(),
+                    native_data_version: NativeDataVersion::try_new(vec![1]).unwrap(),
+                })
+                .collect(),
+            output: PublicationOutput {
+                object_id: interpretation.target.object_id.clone(),
+                empty_result: false,
+            },
+            kind: PublicationKind::FullRefresh,
+            statistics: PublicationStatistics::default(),
+        };
+        let p = encode_publication(&wrong_publication).unwrap();
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &raw.encode_to_vec(),
+                Some(p.as_bytes()),
+                c.as_bytes(),
+                PersistenceDecodeBudget::default()
+            )
+            .is_err()
+        );
+        raw.definition_revision = Some(vec![0; 32]);
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &raw.encode_to_vec(),
+                None,
+                c.as_bytes(),
+                PersistenceDecodeBudget::default()
+            )
+            .is_err()
+        );
+        raw.definition_revision = Some(d.revision().as_bytes().to_vec());
+        raw.computation_identity = None;
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &raw.encode_to_vec(),
+                None,
+                c.as_bytes(),
+                PersistenceDecodeBudget::default()
+            )
+            .is_err()
+        );
+        let truncated = vec![0xff];
+        assert!(
+            decode_drop_document_bodies(
+                d.as_bytes(),
+                &truncated,
+                None,
+                c.as_bytes(),
+                PersistenceDecodeBudget::default()
+            )
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn legacy_drop_reservation_keeps_queries_closed_and_rejects_stale_completion() {
+        let (lease, request) = legacy_drop_documents();
+        let (_, descriptor) =
+            observe_current_drop_descriptor(&lease, request, PersistenceDecodeBudget::default())
+                .unwrap();
+        let repository = Arc::new(crate::test_repository::InMemoryMvRepository::default());
+        let runtime = Arc::new(crate::process_runtime::ProcessRuntime::default());
+        let service = crate::readiness::MvReadinessService::new(repository, runtime.clone());
+        let source = descriptor.source_revision();
+        let target = crate::product::MvTarget::from_parts(
+            Some(source.target.instance_id.as_str()),
+            &source.target.namespace,
+            &source.target.table,
+        );
+        let crate::readiness::MvDropReadiness::ReadyToDrop(guard) =
+            service.prepare_current_drop(&descriptor).await.unwrap()
+        else {
+            panic!("Current object remains retirable without Accelerator");
+        };
+        assert_eq!(
+            guard.expected_target_object_id(),
+            Some(&source.target_object_id)
+        );
+        assert!(!guard.has_projection());
+        assert!(matches!(
+            runtime.readiness(&target),
+            crate::process_runtime::TargetReadiness::Unavailable(_)
+        ));
+        service
+            .invalidate_current(target, "a newer exact observation superseded DROP".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .delete_after_provider_drop(uuid::Uuid::now_v7(), guard)
+                .await
+                .unwrap(),
+            crate::readiness::MvProjectionInstallOutcome::Superseded
+        ));
     }
 }

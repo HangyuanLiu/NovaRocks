@@ -223,6 +223,7 @@ impl From<novarocks_type_contract::FunctionIdentityError> for ExecutionFunctionS
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedAggregateError {
+    TaskFailure(novarocks_execution_contract::TaskFailure),
     StatePointerCount { expected: usize, actual: usize },
     Input(String),
     CreateState(String),
@@ -235,6 +236,7 @@ pub(crate) enum PreparedAggregateError {
 impl fmt::Display for PreparedAggregateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TaskFailure(failure) => write!(formatter, "{failure}"),
             Self::StatePointerCount { expected, actual } => write!(
                 formatter,
                 "aggregate state pointer count {actual} does not match input row count {expected}"
@@ -895,8 +897,7 @@ impl ErasedAggregateKernel for LegacyKernelAdapter {
             .build_input_view(&self.spec, &values)
             .map_err(PreparedAggregateError::Input)?;
         self.function
-            .update_batch(&self.spec, offset, state_ptrs, &view)
-            .map_err(PreparedAggregateError::Update)
+            .update_batch_typed(&self.spec, offset, state_ptrs, &view)
     }
 
     unsafe fn merge_batch(
@@ -912,8 +913,7 @@ impl ErasedAggregateKernel for LegacyKernelAdapter {
             .build_merge_view(&self.spec, &values)
             .map_err(PreparedAggregateError::Input)?;
         self.function
-            .merge_batch(&self.spec, offset, state_ptrs, &view)
-            .map_err(PreparedAggregateError::Merge)
+            .merge_batch_typed(&self.spec, offset, state_ptrs, &view)
     }
 
     unsafe fn build_intermediate(

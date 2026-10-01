@@ -42,6 +42,10 @@ impl AggregateAllocator {
         Self { tracker }
     }
 
+    pub(crate) fn tracker(&self) -> &Arc<MemTracker> {
+        &self.tracker
+    }
+
     pub(crate) fn allocation_error(&self, operation: &str) -> String {
         format!(
             "ResourceExhausted: {operation}: aggregate allocation was rejected by memory tracker {} or the system allocator",

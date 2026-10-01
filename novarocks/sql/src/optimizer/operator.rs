@@ -33,6 +33,20 @@ use crate::planner::payload::MvRewriteSelection;
 use crate::planner::table::{BranchScope, TableDef};
 
 pub(crate) use crate::common::ScanVariantColumn;
+use crate::planner::quota::{
+    PlanFanoutConsumeNode, PlanFanoutDistribution, PlanQuotaPreclaimNode, PlanQuotaTrimNode,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct FanoutAnchorOp {
+    pub id: ColumnId,
+    pub branches: Vec<FanoutBranchOp>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct FanoutBranchOp {
+    pub predicate: ScalarId,
+    pub distribution: PlanFanoutDistribution,
+}
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -682,6 +696,10 @@ pub(crate) enum Operator {
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
     LogicalChangeEventExpand(ChangeEventExpandOp),
+    LogicalQuotaPreclaim(PlanQuotaPreclaimNode),
+    LogicalQuotaTrim(PlanQuotaTrimNode),
+    LogicalFanoutAnchor(FanoutAnchorOp),
+    LogicalFanoutConsume(PlanFanoutConsumeNode),
     LogicalCTEAnchor(CTEAnchorOp),
     LogicalCTEProduce(CTEProduceOp),
     LogicalCTEConsume(CTEConsumeOp),
@@ -705,6 +723,10 @@ pub(crate) enum Operator {
     PhysicalTopN(TopNOp),
     PhysicalWindow(WindowOp),
     PhysicalDistribution(PhysicalDistributionOp),
+    PhysicalQuotaPreclaim(PlanQuotaPreclaimNode),
+    PhysicalQuotaTrim(PlanQuotaTrimNode),
+    PhysicalFanoutAnchor(FanoutAnchorOp),
+    PhysicalFanoutConsume(PlanFanoutConsumeNode),
     PhysicalCTEAnchor(CTEAnchorOp),
     PhysicalCTEProduce(CTEProduceOp),
     PhysicalCTEConsume(CTEConsumeOp),
@@ -740,6 +762,10 @@ impl Operator {
                 | Operator::LogicalTableFunction(_)
                 | Operator::LogicalRepeat(_)
                 | Operator::LogicalChangeEventExpand(_)
+                | Operator::LogicalQuotaPreclaim(_)
+                | Operator::LogicalQuotaTrim(_)
+                | Operator::LogicalFanoutAnchor(_)
+                | Operator::LogicalFanoutConsume(_)
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)

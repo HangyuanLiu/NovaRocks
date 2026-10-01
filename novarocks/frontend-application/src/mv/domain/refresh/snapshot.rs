@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::mv::domain::model::RefreshMode;
+use novarocks_spi::connector::{ConnectorChangeWindowAdmission, ConnectorContentNetZeroBasis};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BaseSnapshotPolicy {
@@ -42,6 +43,16 @@ impl BaseSnapshotStatus {
             previous_snapshot_id,
             current_snapshot_id_before_pin,
         }
+    }
+
+    /// Equal immutable snapshot identities prove a zero content delta without
+    /// manifest discovery. Distinct endpoints require provider admission.
+    fn content_net_zero_proof(&self) -> Option<ConnectorChangeWindowAdmission> {
+        let previous = self.previous_snapshot_id?;
+        let current = self.current_snapshot_id_before_pin?;
+        (previous == current).then_some(ConnectorChangeWindowAdmission::ContentNetZero {
+            basis: ConnectorContentNetZeroBasis::SameSnapshot,
+        })
     }
 }
 
@@ -114,7 +125,9 @@ fn decide_single_base_refresh(statuses: &[BaseSnapshotStatus], label: &str) -> R
             "{label} refresh cannot continue: previously-refreshed base snapshot for {} is no longer reachable",
             status.fqn
         )),
-        (Some(previous), Some(current)) if previous == current => RefreshDecision::MetadataOnly,
+        (Some(_), Some(_)) if status.content_net_zero_proof().is_some() => {
+            RefreshDecision::MetadataOnly
+        }
         (Some(_), Some(_)) => RefreshDecision::Incremental,
     }
 }
@@ -162,7 +175,7 @@ fn decide_all_bases_required_refresh(
     if !has_previous {
         return RefreshDecision::FirstRefresh;
     }
-    if snapshots_are_unchanged(statuses) {
+    if all_occurrences_have_content_net_zero_proof(statuses) {
         RefreshDecision::MetadataOnly
     } else {
         RefreshDecision::Incremental
@@ -210,7 +223,7 @@ fn decide_join_pair_partial_initial_skip_refresh(
     if !has_previous && any_current {
         return RefreshDecision::FirstRefresh;
     }
-    if snapshots_are_unchanged(statuses) {
+    if all_occurrences_have_content_net_zero_proof(statuses) {
         RefreshDecision::MetadataOnly
     } else {
         RefreshDecision::Incremental
@@ -229,11 +242,10 @@ fn reject_invalid_base_statuses(
     None
 }
 
-fn snapshots_are_unchanged(statuses: &[BaseSnapshotStatus]) -> bool {
-    statuses.iter().all(|status| {
-        status.previous_snapshot_id == status.current_snapshot_id_before_pin
-            && status.previous_snapshot_id.is_some()
-    })
+fn all_occurrences_have_content_net_zero_proof(statuses: &[BaseSnapshotStatus]) -> bool {
+    statuses
+        .iter()
+        .all(|status| status.content_net_zero_proof().is_some())
 }
 
 fn missing_current_snapshot_fqn(statuses: &[BaseSnapshotStatus]) -> &str {

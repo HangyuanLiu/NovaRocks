@@ -2094,11 +2094,11 @@ mod hidden_column_tests {
     use super::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY, hidden_internal_columns};
 
     #[test]
-    fn an_mv_targets_apply_key_and_state_columns_are_hidden_from_sql() {
+    fn an_aggregate_mv_targets_group_key_and_state_columns_are_hidden_from_sql() {
         let properties = HashMap::from([
             (
                 APPLY_KEY_COLUMN_PROPERTY.to_string(),
-                "__nova_base_row_id".to_string(),
+                "__nova_group_row_id".to_string(),
             ),
             (
                 HIDDEN_COLUMNS_PROPERTY.to_string(),
@@ -2111,7 +2111,7 @@ mod hidden_column_tests {
 
         assert_eq!(
             hidden,
-            vec!["__nova_base_row_id", "__sum_state_v1", "__count_state_v1"],
+            vec!["__nova_group_row_id", "__sum_state_v1", "__count_state_v1"],
             "the apply key comes first and both property lists contribute; missing \
              either one leaks an engine-owned column into every SELECT * on the target"
         );
@@ -2120,6 +2120,12 @@ mod hidden_column_tests {
     #[test]
     fn a_plain_table_hides_nothing() {
         assert!(hidden_internal_columns(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_visible_bag_mv_target_hides_no_persisted_columns() {
+        let properties = HashMap::from([("comment".to_string(), "visible tuple bag".to_string())]);
+        assert!(hidden_internal_columns(&properties).is_empty());
     }
 }
 

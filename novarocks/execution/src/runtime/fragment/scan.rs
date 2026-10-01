@@ -202,6 +202,7 @@ mod tests {
 
     fn runtime_for_scan() -> crate::exec::node::LocalRuntimeBindings {
         crate::exec::node::LocalRuntimeBindings {
+            quota_domains: std::collections::BTreeMap::new(),
             scans: BTreeMap::from([(
                 novarocks_local_program::ProgramNodeId::new(0),
                 Arc::new(CountingFileSource) as Arc<dyn ScanSource>,

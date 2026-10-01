@@ -522,6 +522,21 @@ pub trait ConnectorReadMetadata: Send + Sync {
         pinned: &ConnectorPinnedFileSet,
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
 
+    /// Freeze the exact writer candidate baseline, independently of runtime filtering.
+    /// Providers must validate attached delete formats on every admitted candidate.
+    fn get_mv_target_candidate_handle(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _exact_snapshot_id: i64,
+        _candidates: &crate::connector::write_stack::ConnectorMvTargetCandidateSelection,
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support MV target candidate selection",
+        ))
+    }
+
     /// Freeze a Known MV target partition selection on a provider-validated
     /// exact target and snapshot. Providers that cannot prove file selection
     /// must return a snapshot-pinned unrestricted handle.

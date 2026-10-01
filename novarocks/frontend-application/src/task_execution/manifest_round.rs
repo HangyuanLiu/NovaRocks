@@ -375,11 +375,17 @@ impl ManifestAssembledRound {
                 if !detail.is_derived() {
                     let terminal =
                         NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                            AttemptFailureClass::ExecutionFailure,
+                            match detail {
+                                novarocks_execution_contract::TerminationDetail::Failed(failure) if matches!(failure.category(), novarocks_execution_contract::TaskFailureCategory::CapacityRefused { .. }) => AttemptFailureClass::ResourceGovernance,
+                                _ => AttemptFailureClass::ExecutionFailure,
+                            },
                             QueryExecutionError::new(
                                 QueryExecutionErrorKind::Failed,
                                 format!("Native Task attempt terminated: {detail:?}"),
-                            ),
+                            ).with_task_failure(match detail {
+                                novarocks_execution_contract::TerminationDetail::Failed(failure) => Some(failure.clone()),
+                                _ => None,
+                            }),
                         ));
                     if self.actor_gate.prepare_convergence() {
                         self.terminal = Some(terminal.clone());

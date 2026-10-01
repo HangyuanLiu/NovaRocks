@@ -51,6 +51,9 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &ConnectorRequestContext,
     affected_partitions: Option<&AffectedTargetPartitions>,
+    frozen_candidates: Option<
+        &novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection,
+    >,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
     let target = &rewrite.target;
     let target_table_uuid = rewrite.target_table_uuid.clone();
@@ -76,9 +79,125 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
         schema: metadata.schema.clone(),
         selector,
         mv_partition_selection: None,
+        mv_target_candidates: None,
         statistics_pin: None,
         planning_lease: planning_lease.clone(),
     };
+    let mut affected_read = target_read.clone();
+    if rewrite.analysis_facts().aggregate.is_some() {
+        if frozen_candidates.is_some() {
+            return Err("aggregate MV target cannot bind visible-bag candidates".into());
+        }
+        if let Some(
+            novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection::Partitions(
+                selection,
+            ),
+        ) = freeze_imv_target_candidates(rewrite, affected_partitions, false)?
+        {
+            affected_read.mv_partition_selection = Some(selection);
+        }
+    } else {
+        affected_read.mv_target_candidates = frozen_candidates.cloned();
+    }
+    let mv_target_read = MvTargetReadAdmission {
+        full: target_read.clone(),
+        affected_partitions: affected_read,
+        target_table_uuid: target_table_uuid.clone(),
+        frozen_snapshot_id,
+    };
+    let key = QueryTableBindingKey::mv_target(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        &target_table_uuid,
+        frozen_snapshot_id,
+    );
+    let is_aggregate = rewrite.analysis_facts().aggregate.is_some();
+    let aggregate_key = if is_aggregate {
+        let [key] = rewrite.runtime_bindings.apply_key.as_slice() else {
+            return Err("aggregate MV target binding requires one state key".into());
+        };
+        Some(key.name.clone())
+    } else {
+        if !rewrite.runtime_bindings.apply_key.is_empty()
+            || !rewrite.runtime_bindings.branches.is_empty()
+        {
+            return Err("visible-tuple target binding may not expose identity fields".into());
+        }
+        None
+    };
+    let branch_column = rewrite
+        .runtime_bindings
+        .branches
+        .first()
+        .map(|(_, field)| field.name.clone());
+    let visible_columns = rewrite
+        .target_arrow_schema
+        .fields()
+        .iter()
+        .map(|field| novarocks_types::schema::ColumnDef {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect::<Vec<_>>();
+    store.resolve_or_insert_with_id(key, |binding| {
+        let resolved = if let Some(apply_key_column) = aggregate_key {
+            novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
+                novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
+                    target.catalog.clone(),
+                    target.namespace.clone(),
+                    target.table.clone(),
+                    target_table_uuid.clone(),
+                    frozen_snapshot_id,
+                    apply_key_column,
+                    branch_column,
+                    binding,
+                )?,
+            )
+            .into_resolved_table()
+        } else {
+            novarocks_sql::planning::catalog::materialize_mv_target_bag_table(
+                novarocks_sql::planning::catalog::SqlMvTargetBagTableFacts::try_new(
+                    target.clone(),
+                    target_table_uuid.clone(),
+                    frozen_snapshot_id,
+                    visible_columns,
+                    binding,
+                )?,
+            )
+            .into_resolved_table()
+        };
+        Ok(QueryTableBinding {
+            resolved,
+            statistics_pin: None,
+            admission:
+                crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
+                    planning_lease,
+                ),
+            source_metadata: None,
+            scan_materialization: Some(mv_target_read.full.clone()),
+            mv_target_read: Some(mv_target_read),
+            write_target_admission: None,
+            frozen_cohort_read: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
+        })
+    })
+}
+
+/// Freeze the conservative candidate domain once for both target read and old-delete freezing.
+pub(crate) fn freeze_imv_target_candidates(
+    rewrite: &IcebergMvRewriteContext,
+    affected_partitions: Option<&AffectedTargetPartitions>,
+    strict_visible_bag: bool,
+) -> Result<
+    Option<novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection>,
+    String,
+> {
+    let frozen_snapshot_id = rewrite.target_snapshot_id;
     let selection = affected_partitions
         .and_then(|affected| match affected {
             AffectedTargetPartitions::Known { partitions } => Some(partitions),
@@ -135,69 +254,16 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
                 snapshot_id,
             ).map_err(|error| error.to_string())
         }).transpose()?;
-    let mut affected_read = target_read.clone();
-    affected_read.mv_partition_selection = selection;
-    let mv_target_read = MvTargetReadAdmission {
-        full: target_read.clone(),
-        affected_partitions: affected_read,
-        target_table_uuid: target_table_uuid.clone(),
-        frozen_snapshot_id,
-    };
-    let key = QueryTableBindingKey::mv_target(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        &target_table_uuid,
-        frozen_snapshot_id,
-    );
-    let [apply_key] = rewrite.runtime_bindings.apply_key.as_slice() else {
-        return Err("MV target binding requires one exact apply-key field".to_string());
-    };
-    let branch_column = match rewrite.runtime_bindings.branches.as_slice() {
-        [] => None,
-        [(_, first), rest @ ..] => {
-            if rest
-                .iter()
-                .any(|(_, field)| field.field_id != first.field_id || field.name != first.name)
-            {
-                return Err(
-                    "MV target binding has conflicting exact branch discriminator fields"
-                        .to_string(),
-                );
-            }
-            Some(first.name.clone())
-        }
-    };
-    let apply_key_column = apply_key.name.clone();
-    store.resolve_or_insert_with_id(key, |binding| {
-        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
-            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
-                target.catalog.clone(),
-                target.namespace.clone(),
-                target.table.clone(),
-                target_table_uuid.clone(),
-                frozen_snapshot_id,
-                apply_key_column.clone(),
-                branch_column.clone(),
-                binding,
-            )?,
-        )
-        .into_resolved_table();
-        Ok(QueryTableBinding {
-            resolved,
-            statistics_pin: None,
-            admission:
-                crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
-                    planning_lease,
-                ),
-            source_metadata: None,
-            scan_materialization: Some(mv_target_read.full.clone()),
-            mv_target_read: Some(mv_target_read),
-            write_target_admission: None,
-            frozen_cohort_read: None,
-            frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
-        })
+    use novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection as Selection;
+    if strict_visible_bag && frozen_snapshot_id.is_none() {
+        return Err(
+            "visible-tuple delete matching requires an exact published target snapshot".into(),
+        );
+    }
+    Ok(match selection {
+        Some(selection) => Some(Selection::Partitions(selection)),
+        None if strict_visible_bag => Some(Selection::All),
+        None => None,
     })
 }
 
@@ -299,6 +365,7 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                             schema: materialization.read_schema.clone(),
                             selector: ConnectorReadSelector::SnapshotId(frozen_snapshot_id),
                             mv_partition_selection: None,
+                            mv_target_candidates: None,
                             statistics_pin: materialization.statistics_pin.clone(),
                             planning_lease: materialization.planning_lease.clone(),
                         },

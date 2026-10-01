@@ -3268,3 +3268,34 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
         }
     }
 }
+
+#[test]
+fn visible_bag_freeze_refuses_legacy_delete_formats_before_writer_dispatch() {
+    use crate::commit::write_stack::control::frozen_old_delete_references;
+    use novarocks_spi::connector::ConnectorTargetDeleteKind;
+    let path = "s3://b/wh/db/t/data/p/f.parquet";
+    for (kind, format, expected) in [
+        (
+            crate::scan_model::IcebergDeleteFileContent::Equality,
+            crate::scan_model::IcebergDeleteFileFormat::Parquet,
+            ConnectorTargetDeleteKind::Equality,
+        ),
+        (
+            crate::scan_model::IcebergDeleteFileContent::Position,
+            crate::scan_model::IcebergDeleteFileFormat::Parquet,
+            ConnectorTargetDeleteKind::ParquetPosition,
+        ),
+    ] {
+        let mut delete = rewrite_deletion_vector("s3://b/old", path);
+        delete.file_content = kind;
+        delete.file_format = format;
+        let file = rewrite_data_file("p", vec![delete]);
+        let error = frozen_old_delete_references(&file, true).unwrap_err();
+        let fact = error.target_format_failure().expect("typed format refusal");
+        assert_eq!(fact.data_file, path);
+        assert_eq!(fact.delete_kind, expected);
+        assert!(!error.retryable_before_progress());
+    }
+    let file = rewrite_data_file("p", vec![rewrite_deletion_vector("s3://b/old", path)]);
+    assert_eq!(frozen_old_delete_references(&file, true).unwrap().len(), 1);
+}

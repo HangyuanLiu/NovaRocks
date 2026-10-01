@@ -192,11 +192,15 @@ fn validate_runtime_bindings(
     program: &LocalProgram,
     runtime: &LocalRuntimeBindings,
 ) -> Result<(), FragmentBindingError> {
+    let mut domains = BTreeSet::new();
     let mut scans = BTreeSet::new();
     let mut writers = BTreeSet::new();
     let mut finishers = BTreeSet::new();
     for requirement in program.requirements().entries() {
         match requirement {
+            BindingRequirement::QuotaDomain { domain } => {
+                domains.insert(*domain);
+            }
             BindingRequirement::Scan { node, .. } => {
                 scans.insert(*node);
             }
@@ -212,7 +216,12 @@ fn validate_runtime_bindings(
     let actual_scans = runtime.scans.keys().copied().collect::<BTreeSet<_>>();
     let actual_writers = runtime.writers.keys().copied().collect::<BTreeSet<_>>();
     let actual_finishers = runtime.finishers.keys().copied().collect::<BTreeSet<_>>();
-    if scans != actual_scans || writers != actual_writers || finishers != actual_finishers {
+    if domains != runtime.quota_domains.keys().copied().collect()
+        || runtime.quota_domains.values().any(|count| *count == 0)
+        || scans != actual_scans
+        || writers != actual_writers
+        || finishers != actual_finishers
+    {
         return Err(FragmentBindingError::new(
             FragmentBindingTarget::Instance,
             FragmentBindingErrorKind::InvalidAssignment,
@@ -897,6 +906,14 @@ pub(crate) mod tests {
                     ids.push(id);
                 }
             }
+            ExecNodeKind::QuotaPreclaim(n) => {
+                scan_ids(&n.demand, ids);
+                scan_ids(&n.target, ids);
+            }
+            ExecNodeKind::QuotaTrim(n) => {
+                scan_ids(&n.seeds, ids);
+                scan_ids(&n.candidates, ids);
+            }
             ExecNodeKind::AssertNumRows(n) => scan_ids(&n.input, ids),
             ExecNodeKind::Project(n) => scan_ids(&n.input, ids),
             ExecNodeKind::Unpivot(n) => scan_ids(&n.input, ids),
@@ -996,6 +1013,7 @@ pub(crate) mod tests {
         instance: FragmentInstanceSpec,
     ) -> Result<FragmentSubmission, FragmentBindingError> {
         let mut runtime_bindings = LocalRuntimeBindings {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::new(),
             writers: BTreeMap::new(),
             finishers: BTreeMap::new(),
@@ -1148,6 +1166,7 @@ pub(crate) mod tests {
             BTreeMap::new(),
         );
         let empty_sidecar = LocalRuntimeBindings {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::new(),
             writers: BTreeMap::new(),
             finishers: BTreeMap::new(),
@@ -1169,6 +1188,7 @@ pub(crate) mod tests {
             BTreeSet::new(),
         );
         let sidecar = LocalRuntimeBindings {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::from([(
                 novarocks_local_program::ProgramNodeId::new(0),
                 ScanNode::new_for_test(Arc::new(DummyScanOp)).source(),

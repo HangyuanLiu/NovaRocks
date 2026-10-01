@@ -27,6 +27,7 @@ mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
 mod parser;
 mod publication_catalog;
+pub mod publication_fault_fixture;
 mod publication_service;
 mod query_stats_contract;
 mod results;
@@ -2534,6 +2535,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     // the next case that attaches a catalog onto the same warehouse, so a case
     // that skipped its own cleanup fails the ones after it.
     let mut cleanup_only = false;
+    let mut retained_catalog_corruption: Option<publication_catalog::FixtureFaultGuard> = None;
 
     for step in &case.steps {
         if cleanup_only && !step.meta.cleanup {
@@ -2653,7 +2655,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         let mut publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
             Some(directive) => match ctx.publication_catalog_control.as_ref() {
                 Some(control) => {
-                    match control.arm_next(directive.action.as_str(), directive.fault.as_str()) {
+                    let armed = match step.meta.publication_catalog_fault_target.as_ref() {
+                        Some(target) => control.arm_targeted(
+                            directive.action.as_str(),
+                            directive.fault.as_str(),
+                            &target.namespace,
+                            &target.table,
+                        ),
+                        None => {
+                            control.arm_next(directive.action.as_str(), directive.fault.as_str())
+                        }
+                    };
+                    match armed {
                         Ok(guard) => {
                             let _ = writeln!(
                                 log,
@@ -2682,6 +2695,29 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             },
             None => None,
         };
+        if step
+            .meta
+            .publication_catalog_fault
+            .is_some_and(|directive| {
+                directive.fault == PublicationCatalogFault::CorruptPackageUntilClear
+            })
+        {
+            let deadline = ctx
+                .query_timeout
+                .checked_mul(2)
+                .and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds)));
+            let bounded = publication_catalog_fault_guard
+                .as_mut()
+                .context("persistent corruption guard is missing")
+                .and_then(|guard| {
+                    guard.bound_window(deadline.context("corruption deadline overflow")?)
+                });
+            if let Err(error) = bounded {
+                case_failed = true;
+                let _ = writeln!(log, "    ❌ bound publication corruption window: {error:#}");
+                break;
+            }
+        }
         let mut publication_service_hold = match step.meta.publication_service_hold.as_ref() {
             Some(directive) => match ctx.publication_service_control.as_ref() {
                 Some(control) => match control.arm(&directive.table) {
@@ -3680,6 +3716,40 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             preserve_case_failure_snapshot(ctx, &case.case_id, Some(step.query_number), &mut log);
         }
 
+        if step
+            .meta
+            .publication_catalog_fault
+            .is_some_and(|directive| {
+                directive.fault == PublicationCatalogFault::CorruptPackageUntilClear
+            })
+            && !case_failed
+        {
+            retained_catalog_corruption = publication_catalog_fault_guard.take();
+            let _ = writeln!(
+                log,
+                "    @publication_catalog_fault retained through the next step"
+            );
+        }
+        if (step.meta.publication_catalog_fault_clear || case_failed)
+            && let Some(guard) = retained_catalog_corruption.take()
+        {
+            match guard.finish() {
+                Ok(evidence) => {
+                    let _ = writeln!(
+                        log,
+                        "    @publication_catalog_fault window cleared trace={}",
+                        evidence.summary()
+                    );
+                }
+                Err(error) => {
+                    case_failed = true;
+                    let _ = writeln!(
+                        log,
+                        "    ❌ publication corruption window cleanup: {error:#}"
+                    );
+                }
+            }
+        }
         if let Some(guard) = publication_catalog_fault_guard {
             match guard.finish() {
                 Ok(evidence) => {
@@ -4395,16 +4465,17 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "NOVAROCKS_QUERY_LIFECYCLE_",
         "NOVAROCKS_QUERY_TERMINAL_",
     ];
-    sql.lines().any(|line| {
-        let line = line.trim_start();
-        DIRECTIVES
-            .iter()
-            .any(|directive| line.starts_with(&format!("-- @{directive}=")))
-            || (line.starts_with("-- @be_log")
-                && LIFECYCLE_EVIDENCE_MARKERS
-                    .iter()
-                    .any(|marker| line.contains(marker)))
-    })
+    sql.contains("${query_lifecycle_fault_root}")
+        || sql.lines().any(|line| {
+            let line = line.trim_start();
+            DIRECTIVES
+                .iter()
+                .any(|directive| line.starts_with(&format!("-- @{directive}=")))
+                || (line.starts_with("-- @be_log")
+                    && LIFECYCLE_EVIDENCE_MARKERS
+                        .iter()
+                        .any(|marker| line.contains(marker)))
+        })
 }
 
 fn sql_text_has_cleanup_fault_directive(sql: &str) -> bool {
@@ -4502,6 +4573,55 @@ fn validate_lnp_3d_mv_accelerator_preflight(
     Ok(())
 }
 
+fn validate_catalog_corruption_window(case: &SqlCase, mode: Mode) -> Result<()> {
+    let mut expecting_clear = false;
+    for step in &case.steps {
+        if expecting_clear {
+            anyhow::ensure!(
+                step.meta.publication_catalog_fault_clear
+                    && step.meta.publication_catalog_fault.is_none()
+                    && step.meta.publication_catalog_fault_target.is_none(),
+                "persistent corruption must be cleared after the immediately following step"
+            );
+            expecting_clear = false;
+            continue;
+        }
+        anyhow::ensure!(
+            !step.meta.publication_catalog_fault_clear,
+            "publication_catalog_fault_clear has no preceding persistent corruption"
+        );
+        if step.meta.publication_catalog_fault_target.is_some() {
+            anyhow::ensure!(
+                step.meta
+                    .publication_catalog_fault
+                    .is_some_and(|directive| matches!(
+                        directive.action,
+                        PublicationCatalogAction::TableCommit | PublicationCatalogAction::TableLoad
+                    )),
+                "exact publication fault target requires table-commit or table-load"
+            );
+        }
+        if step
+            .meta
+            .publication_catalog_fault
+            .is_some_and(|directive| {
+                directive.fault == PublicationCatalogFault::CorruptPackageUntilClear
+            })
+        {
+            anyhow::ensure!(
+                mode == Mode::Verify && step.meta.publication_catalog_fault_target.is_some(),
+                "persistent corruption requires verify mode and an exact table target"
+            );
+            expecting_clear = true;
+        }
+    }
+    anyhow::ensure!(
+        !expecting_clear,
+        "persistent corruption window is missing its clear step"
+    );
+    Ok(())
+}
+
 fn validate_publication_catalog_directives(
     suite_name: &str,
     cases: &[SqlCase],
@@ -4510,8 +4630,11 @@ fn validate_publication_catalog_directives(
     mode: Mode,
 ) -> Result<()> {
     for case in cases {
+        validate_catalog_corruption_window(case, mode)?;
         for step in &case.steps {
             if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_catalog_fault_target.is_none()
+                && !step.meta.publication_catalog_fault_clear
                 && step.meta.publication_service_hold.is_none()
                 && step.meta.publication_catalog_concurrent_shell.is_none()
             {
@@ -5119,11 +5242,22 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 suite.sql_glob.clone()
             };
 
-            let placeholder_vars = placeholder_variables_with_run_id(
+            let mut placeholder_vars = placeholder_variables_with_run_id(
                 &runner_config,
                 &suite.name,
                 cli.benchmark_run_id.as_deref(),
             );
+            if let Some(root) = server_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
+                .query_lifecycle_fault_directory()
+            {
+                let root = root
+                    .to_str()
+                    .context("fault fixture directory is not UTF-8")?
+                    .to_owned();
+                placeholder_vars.insert("query_lifecycle_fault_root".into(), root);
+            }
             let suite_init_hook =
                 load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
                     .with_context(|| {
@@ -5866,16 +6000,19 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
-        QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
-        RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep,
+        PublicationCatalogAction, PublicationCatalogFault, PublicationCatalogFaultDirective,
+        PublicationCatalogFaultTarget, QueryExecution, QueryLifecycleStructuredAssertion,
+        QueryMeta, ResultSet, RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation,
+        SqlErrorTier, SqlStep,
     };
     use crate::{
-        AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
+        AlterJobPollState, Cli, Mode, annotate_failure_with_engine_error_code,
         bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
         evaluate_expected_error_branch_with_sql_error_descriptors, execute_target_session_sql_with,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
-        statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
+        statement_starts_dml_operation, validate_catalog_corruption_window,
+        validate_dml_cluster_jobs, validate_fault_injection_jobs,
         validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
         validate_selected_suite_cluster, verify_runtime_filter_structured_assertion,
     };
@@ -5947,6 +6084,39 @@ mod tests {
             case_dbs: vec![],
             sequential: false,
         }
+    }
+
+    #[test]
+    fn corruption_window_requires_exact_target_and_immediate_explicit_clear() {
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault: Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableLoad,
+                fault: PublicationCatalogFault::CorruptPackageUntilClear,
+            }),
+            publication_catalog_fault_target: Some(PublicationCatalogFaultTarget {
+                namespace: "ns".into(),
+                table: "mv".into(),
+            }),
+            ..QueryMeta::default()
+        });
+        assert!(validate_catalog_corruption_window(&case, Mode::Verify).is_err());
+        case.steps.push(SqlStep {
+            query_number: 2,
+            sql: "SHOW MATERIALIZED VIEWS".into(),
+            meta: QueryMeta {
+                publication_catalog_fault_clear: true,
+                ..QueryMeta::default()
+            },
+        });
+        validate_catalog_corruption_window(&case, Mode::Verify).unwrap();
+        assert!(validate_catalog_corruption_window(&case, Mode::Record).is_err());
+        case.steps[1].meta.publication_catalog_fault = case.steps[0].meta.publication_catalog_fault;
+        assert!(validate_catalog_corruption_window(&case, Mode::Verify).is_err());
+        case.steps[1].meta.publication_catalog_fault = None;
+        case.steps[0].meta.publication_catalog_fault_target = None;
+        assert!(validate_catalog_corruption_window(&case, Mode::Verify).is_err());
+        case.steps.remove(0);
+        assert!(validate_catalog_corruption_window(&case, Mode::Verify).is_err());
     }
 
     #[test]
@@ -6051,6 +6221,9 @@ mod tests {
 
     #[test]
     fn lifecycle_fault_preflight_matches_faults_and_lifecycle_evidence() {
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "shell: fixture-arm '${query_lifecycle_fault_root}'"
+        ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,1\nSELECT 1;"
         ));

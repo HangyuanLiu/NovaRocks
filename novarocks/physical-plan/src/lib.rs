@@ -42,7 +42,7 @@ pub use novarocks_type_contract::{
     FunctionIdentityError, FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId,
     FunctionValueType, FunctionVolatility, OrderedComparisonAlgorithm, PartitionCountParameterId,
     PartitionCountParameterIdentityError, PartitionHashAlgorithm, PartitionSpaceId,
-    PartitionSpaceIdentityError,
+    PartitionSpaceIdentityError, ResultContentEquivalence,
 };
 pub use plan::*;
 pub use relation::*;
@@ -60,7 +60,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 5;
+pub const PLAN_CONTRACT_REVISION: u32 = 8;
 
 #[cfg(test)]
 mod tests;

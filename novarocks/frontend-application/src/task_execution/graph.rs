@@ -267,6 +267,12 @@ pub struct TaskGraph {
     producer_stages: BTreeMap<StageId, BTreeSet<StageId>>,
     contexts: BTreeSet<QueryContextRef>,
     seeds: BTreeMap<TaskId, TaskCreationSeed>,
+    expected_verification: Box<
+        [(
+            TaskIdentity,
+            novarocks_execution_contract::VerificationInstance,
+        )],
+    >,
 }
 
 impl TaskGraph {
@@ -299,6 +305,15 @@ impl TaskGraph {
 
     pub fn stage(&self, stage_id: StageId) -> Option<&StageNode> {
         self.stages.get(&stage_id)
+    }
+
+    pub fn expected_verification(
+        &self,
+    ) -> &[(
+        TaskIdentity,
+        novarocks_execution_contract::VerificationInstance,
+    )] {
+        &self.expected_verification
     }
 
     pub fn stages(&self) -> impl ExactSizeIterator<Item = &StageNode> + '_ {
@@ -552,6 +567,9 @@ pub fn build_task_graph(
         }
     }
 
+    bind_placed_quota_domains(&mut seeds)?;
+    let expected_verification = expected_quota_verification(&seeds);
+
     let mut producer_stages = BTreeMap::<StageId, BTreeSet<StageId>>::new();
     for edge in edges.values() {
         producer_stages
@@ -589,6 +607,7 @@ pub fn build_task_graph(
         producer_stages,
         contexts,
         seeds,
+        expected_verification,
     })
 }
 
@@ -632,6 +651,81 @@ fn task_topology_views(
             )
         })
         .collect()
+}
+
+fn expected_quota_verification(
+    seeds: &BTreeMap<TaskId, TaskCreationSeed>,
+) -> Box<
+    [(
+        TaskIdentity,
+        novarocks_execution_contract::VerificationInstance,
+    )],
+> {
+    seeds
+        .values()
+        .flat_map(|seed| {
+            seed.fragment()
+                .facts()
+                .quota_trims()
+                .iter()
+                .map(|&plan_node_id| {
+                    (
+                        seed.identity(),
+                        novarocks_execution_contract::VerificationInstance {
+                            plan_node_id,
+                            local_instance_id: 0,
+                        },
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Count exact placed preclaim Tasks, including placements with empty scan work.
+/// Only task assignments receive the result; shared static plan bytes remain frozen.
+fn bind_placed_quota_domains(
+    seeds: &mut BTreeMap<TaskId, TaskCreationSeed>,
+) -> Result<(), TaskExecutionError> {
+    let mut fragment_counts = BTreeMap::<FragmentId, u32>::new();
+    let mut domain_fragments = BTreeMap::<i32, FragmentId>::new();
+    for seed in seeds.values() {
+        let facts = seed.fragment().facts();
+        let fragment = facts.fragment_id();
+        let count = fragment_counts.entry(fragment).or_default();
+        *count = count.checked_add(1).ok_or_else(|| {
+            TaskExecutionError::Schedule(
+                "quota fragment task count exceeds the assignment representation".to_string(),
+            )
+        })?;
+        for &domain in facts.quota_preclaims() {
+            if domain_fragments
+                .insert(domain, fragment)
+                .is_some_and(|prior| prior != fragment)
+            {
+                return Err(TaskExecutionError::Schedule(
+                    "quota domain names preclaims in multiple fragments".to_string(),
+                ));
+            }
+        }
+    }
+    for seed in seeds.values_mut() {
+        let bindings = seed
+            .fragment()
+            .facts()
+            .quota_domains()
+            .iter()
+            .map(|&domain| {
+                let fragment = domain_fragments.get(&domain).ok_or_else(|| {
+                    TaskExecutionError::Schedule(format!(
+                        "quota domain {domain} has no placed preclaim task"
+                    ))
+                })?;
+                Ok((domain, fragment_counts[fragment]))
+            })
+            .collect::<Result<BTreeMap<_, _>, TaskExecutionError>>()?;
+        seed.bind_quota_domains(bindings)?;
+    }
+    Ok(())
 }
 
 /// Binds one task's facts into its creation seed.
@@ -960,6 +1054,9 @@ pub(crate) fn build_task_graph_from_manifest(
             )
         })
         .collect();
+    bind_placed_quota_domains(&mut seeds)?;
+    let expected_verification = expected_quota_verification(&seeds);
+
     let mut producer_stages = BTreeMap::<StageId, BTreeSet<StageId>>::new();
     for edge in edges.values() {
         producer_stages
@@ -977,6 +1074,7 @@ pub(crate) fn build_task_graph_from_manifest(
         producer_stages,
         contexts,
         seeds,
+        expected_verification,
     })
 }
 

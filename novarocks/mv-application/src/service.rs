@@ -184,6 +184,40 @@ impl MvProductService {
         operation(&mut scheduler)
     }
 
+    /// Release process-local suppression only after a manual refresh published.
+    pub fn clear_automatic_refresh_stop_after_manual_success(&self, mv_id: i64) -> bool {
+        self.with_refresh_scheduler(|scheduler| {
+            scheduler.clear_automatic_stop_after_manual_success(mv_id)
+        })
+    }
+
+    pub fn automatic_refresh_stop(
+        &self,
+        mv_id: i64,
+    ) -> Option<crate::scheduler_runtime::MvAutomaticRefreshStop> {
+        self.with_refresh_scheduler(|scheduler| scheduler.automatic_stop(mv_id).cloned())
+    }
+
+    /// Read bounded diagnostics while borrowing the process-owned stop record.
+    pub fn automatic_refresh_stop_diagnostic(
+        &self,
+        mv_id: i64,
+        maximum_error_bytes: usize,
+    ) -> Option<crate::scheduler_runtime::MvAutomaticRefreshStop> {
+        self.with_refresh_scheduler(|scheduler| {
+            scheduler.automatic_stop(mv_id).map(|stop| {
+                let mut end = stop.error.len().min(maximum_error_bytes);
+                while !stop.error.is_char_boundary(end) {
+                    end -= 1;
+                }
+                crate::scheduler_runtime::MvAutomaticRefreshStop {
+                    reason: stop.reason,
+                    error: stop.error[..end].to_owned(),
+                }
+            })
+        })
+    }
+
     /// Reserve the one immutable identity for a product refresh publication.
     /// Query and provider adapters may derive their wire values from it but
     /// cannot mint a second identity for the same product transition.
@@ -437,8 +471,7 @@ mod tests {
         definition::{CreateMvDefinitionRequest, MvDesiredRefreshPolicy},
         descriptor::MvDescriptorV3,
         schema::{
-            BaseContract, BaseSchemaSnapshot, HiddenApplyKeyContract, MvSchemaContract,
-            OutputContract, TargetContract,
+            BaseContract, BaseSchemaSnapshot, MvSchemaContract, OutputContract, TargetContract,
         },
         semantic::MvRefreshDesiredConfiguration,
     };
@@ -467,7 +500,6 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCommittedVersion, ConnectorTableObjectId, LakePublicationId,
     };
-    use novarocks_sql::planning::mv::ApplyKeySource;
     use uuid::Uuid;
 
     #[derive(Default)]
@@ -597,6 +629,20 @@ mod tests {
     struct KnownCommittedEffects {
         effects: Arc<CreateEffects>,
         published: MvRefreshPublicationFinalizationFacts,
+    }
+
+    struct FailedRefreshExecution {
+        failure: MvProviderFailure,
+    }
+
+    impl MvRefreshExecutionPort for FailedRefreshExecution {
+        fn execute_refresh(
+            self: Box<Self>,
+            _target: &MvTarget,
+            _attempt: &crate::product::MvRefreshAttemptIdentity,
+        ) -> Result<Box<dyn MvRefreshKnownCommittedPort>, MvProviderFailure> {
+            Err(self.failure)
+        }
     }
 
     impl MvRefreshExecutionPort for RefreshExecutionEffects {
@@ -785,11 +831,7 @@ mod tests {
                     table_uuid: "created-table".to_string(),
                     schema_id_at_create: 0,
                     visible_columns: Vec::new(),
-                    hidden_apply_key: HiddenApplyKeyContract {
-                        column_name: "__nova_base_row_id".to_string(),
-                        target_field_id: 1,
-                        source: ApplyKeySource::BaseRowId,
-                    },
+                    hidden_apply_key: None,
                     partition: None,
                 },
             },
@@ -885,6 +927,46 @@ mod tests {
 
         assert!(matches!(result, MvProductResult::Acknowledged));
         assert_eq!(effects.events(), ["project_known_committed"]);
+    }
+
+    #[test]
+    fn typed_apply_failures_survive_execute_refresh_and_release_the_lease() {
+        let service = service_with_refresh_readiness();
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
+        for (provider, product) in [
+            (
+                MvProviderFailureKind::ConsistencyFailed,
+                MvProductErrorKind::ConsistencyFailed,
+            ),
+            (
+                MvProviderFailureKind::CapacityRefused,
+                MvProductErrorKind::CapacityRefused,
+            ),
+            (
+                MvProviderFailureKind::TargetRefused,
+                MvProductErrorKind::TargetRefused,
+            ),
+        ] {
+            let attempt = service.reserve_refresh_attempt();
+            let error = service
+                .execute_refresh(
+                    &target,
+                    &attempt,
+                    Box::new(FailedRefreshExecution {
+                        failure: MvProviderFailure::new(provider, "commit unknown availability"),
+                    }),
+                )
+                .expect_err("typed execution failure ends the refresh");
+            assert_eq!(error.kind(), product);
+            assert_eq!(error.message(), "commit unknown availability");
+
+            let next = service.reserve_refresh_attempt();
+            drop(
+                service
+                    .begin_refresh_publication(&target, &next)
+                    .expect("failed execution releases its exact publication lease"),
+            );
+        }
     }
 
     #[test]

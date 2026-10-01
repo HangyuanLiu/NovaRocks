@@ -895,6 +895,94 @@ impl Rule for WindowToPhysical {
     }
 }
 
+pub(crate) struct QuotaPreclaimToPhysical;
+impl Rule for QuotaPreclaimToPhysical {
+    fn name(&self) -> &str {
+        "QuotaPreclaimToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalQuotaPreclaim(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalQuotaPreclaim(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalQuotaPreclaim(op.clone()),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+pub(crate) struct QuotaTrimToPhysical;
+impl Rule for QuotaTrimToPhysical {
+    fn name(&self) -> &str {
+        "QuotaTrimToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalQuotaTrim(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalQuotaTrim(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalQuotaTrim(op.clone()),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+pub(crate) struct FanoutAnchorToPhysical;
+impl Rule for FanoutAnchorToPhysical {
+    fn name(&self) -> &str {
+        "FanoutAnchorToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalFanoutAnchor(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalFanoutAnchor(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalFanoutAnchor(op.clone()),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+pub(crate) struct FanoutConsumeToPhysical;
+impl Rule for FanoutConsumeToPhysical {
+    fn name(&self) -> &str {
+        "FanoutConsumeToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalFanoutConsume(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalFanoutConsume(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalFanoutConsume(op.clone()),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 10. CTEAnchorToPhysical
 // ---------------------------------------------------------------------------

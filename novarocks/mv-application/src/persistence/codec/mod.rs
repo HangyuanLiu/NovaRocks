@@ -19,7 +19,7 @@
 //! persistence DTOs. No function in this module performs I/O.
 
 mod model;
-mod wire;
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -67,6 +67,7 @@ pub enum PersistenceCodecError {
         actual: usize,
     },
     MalformedWire(String),
+    LegacyNonAggregateInterpretation,
     UnknownFormatVersion {
         document: &'static str,
         version: u32,
@@ -91,6 +92,10 @@ impl std::fmt::Display for PersistenceCodecError {
             } => write!(
                 formatter,
                 "MV persistence {resource} uses {actual} bytes/items, exceeding the limit {maximum}"
+            ),
+            Self::LegacyNonAggregateInterpretation => write!(
+                formatter,
+                "legacy nonaggregate MV interpretation is unsupported; DROP the materialized view and recreate it"
             ),
             Self::MalformedWire(message) => write!(formatter, "malformed MV protobuf: {message}"),
             Self::UnknownFormatVersion { document, version } => write!(
@@ -267,6 +272,24 @@ pub fn preflight_current_document_set(
     configuration: &[u8],
     budget: PersistenceDecodeBudget,
 ) -> Result<(), PersistenceCodecError> {
+    preflight_current_document_set_with_eligibility(
+        definition,
+        interpretation,
+        publication,
+        configuration,
+        None,
+        budget,
+    )
+}
+
+pub fn preflight_current_document_set_with_eligibility(
+    definition: &[u8],
+    interpretation: &[u8],
+    publication: Option<&[u8]>,
+    configuration: &[u8],
+    eligibility: Option<&[u8]>,
+    budget: PersistenceDecodeBudget,
+) -> Result<(), PersistenceCodecError> {
     let required = [
         (definition, wire::Schema::DefinitionDocument),
         (interpretation, wire::Schema::InterpretationDocument),
@@ -278,6 +301,7 @@ pub fn preflight_current_document_set(
     for (bytes, schema) in required
         .into_iter()
         .chain(publication.map(|bytes| (bytes, wire::Schema::PublicationDocument)))
+        .chain(eligibility.map(|bytes| (bytes, wire::Schema::EligibilityDocument)))
     {
         let usage = wire::preflight(bytes, schema, budget)?;
         encoded_bytes = encoded_bytes.saturating_add(usage.encoded_bytes);
@@ -308,7 +332,9 @@ pub fn preflight_current_document_set(
     Ok(())
 }
 
-fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceCodecError> {
+pub(crate) fn encode_message(
+    message: impl Message,
+) -> Result<EncodedDocument, PersistenceCodecError> {
     let encoded_len = message.encoded_len();
     let maximum = PersistenceDecodeBudget::default().max_document_bytes;
     if encoded_len > maximum {
@@ -328,7 +354,10 @@ fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceC
     })
 }
 
-fn ensure_canonical(source: &[u8], message: impl Message) -> Result<(), PersistenceCodecError> {
+pub(crate) fn ensure_canonical(
+    source: &[u8],
+    message: impl Message,
+) -> Result<(), PersistenceCodecError> {
     if message.encode_to_vec() != source {
         return Err(PersistenceCodecError::MalformedWire(
             "document does not use canonical field and set ordering".to_string(),
@@ -337,7 +366,7 @@ fn ensure_canonical(source: &[u8], message: impl Message) -> Result<(), Persiste
     Ok(())
 }
 
-fn require_version(
+pub(crate) fn require_version(
     document: &'static str,
     version: Option<u32>,
 ) -> Result<(), PersistenceCodecError> {
@@ -348,7 +377,10 @@ fn require_version(
     Ok(())
 }
 
-fn required<T>(value: Option<T>, field: &'static str) -> Result<T, PersistenceCodecError> {
+pub(crate) fn required<T>(
+    value: Option<T>,
+    field: &'static str,
+) -> Result<T, PersistenceCodecError> {
     value.ok_or(PersistenceCodecError::MissingField(field))
 }
 
@@ -454,7 +486,10 @@ fn preflight_interpretation_source(
         + document.branches.len()
         + document.target.fields.len()
         + document.target.partition_fields.len()
-        + document.apply_key.components.len();
+        + document
+            .apply_key
+            .as_ref()
+            .map_or(0, |key| key.components.len());
     for output in &document.outputs {
         bytes = bytes
             .saturating_add(output.output_id.as_bytes().len())
@@ -467,7 +502,7 @@ fn preflight_interpretation_source(
             .saturating_add(slot.target_field_id.as_bytes().len())
             .saturating_add(slot.type_signature.len());
     }
-    for component in &document.apply_key.components {
+    for component in document.apply_key.iter().flat_map(|key| &key.components) {
         bytes = bytes
             .saturating_add(component.logical_id.as_bytes().len())
             .saturating_add(component.target_field_id.as_bytes().len());
@@ -789,14 +824,11 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                 }),
             })
             .collect(),
-        apply_key: Some(proto::ApplyKey {
-            kind: Some(match document.apply_key.kind {
-                ApplyKeyKind::BaseRowId => 1,
-                ApplyKeyKind::JoinRowKey => 2,
+        apply_key: document.apply_key.as_ref().map(|key| proto::ApplyKey {
+            kind: Some(match key.kind {
                 ApplyKeyKind::GroupRowId => 3,
             }),
-            components: document
-                .apply_key
+            components: key
                 .components
                 .iter()
                 .map(|component| proto::ApplyKeyComponent {
@@ -895,7 +927,22 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
 fn interpretation_from_proto(
     dto: proto::InterpretationDocument,
 ) -> Result<InterpretationDocument, PersistenceCodecError> {
-    let apply_key = required(dto.apply_key, "interpretation.apply_key")?;
+    if dto
+        .apply_key
+        .as_ref()
+        .is_some_and(|key| matches!(key.kind, Some(1 | 2)))
+        || (dto.aggregates.is_empty()
+            && (!dto.branches.is_empty()
+                || dto.target.as_ref().is_some_and(|target| {
+                    target
+                        .fields
+                        .iter()
+                        .any(|field| matches!(field.kind, Some(3 | 4)))
+                })))
+    {
+        return Err(PersistenceCodecError::LegacyNonAggregateInterpretation);
+    }
+    let apply_key = dto.apply_key;
     let target = required(dto.target, "interpretation.target")?;
     Ok(InterpretationDocument {
         definition_revision: DocumentRevision::try_from_bytes(&required(
@@ -962,32 +1009,34 @@ fn interpretation_from_proto(
                 })
             })
             .collect::<Result<_, PersistenceCodecError>>()?,
-        apply_key: ApplyKey {
-            kind: enum_value(apply_key.kind, "interpretation.apply_key.kind", |value| {
-                Some(match value {
-                    1 => ApplyKeyKind::BaseRowId,
-                    2 => ApplyKeyKind::JoinRowKey,
-                    3 => ApplyKeyKind::GroupRowId,
-                    _ => return None,
+        apply_key: apply_key
+            .map(|apply_key| {
+                Ok::<_, PersistenceCodecError>(ApplyKey {
+                    kind: enum_value(apply_key.kind, "interpretation.apply_key.kind", |value| {
+                        Some(match value {
+                            3 => ApplyKeyKind::GroupRowId,
+                            _ => return None,
+                        })
+                    })?,
+                    components: apply_key
+                        .components
+                        .into_iter()
+                        .map(|component| {
+                            Ok(ApplyKeyComponent {
+                                logical_id: ApplyKeyIdentity::try_new(required(
+                                    component.logical_id,
+                                    "interpretation.apply_key.component.logical_id",
+                                )?)?,
+                                target_field_id: FieldIdentity::try_new(required(
+                                    component.target_field_id,
+                                    "interpretation.apply_key.component.target_field_id",
+                                )?)?,
+                            })
+                        })
+                        .collect::<Result<_, PersistenceCodecError>>()?,
                 })
-            })?,
-            components: apply_key
-                .components
-                .into_iter()
-                .map(|component| {
-                    Ok(ApplyKeyComponent {
-                        logical_id: ApplyKeyIdentity::try_new(required(
-                            component.logical_id,
-                            "interpretation.apply_key.component.logical_id",
-                        )?)?,
-                        target_field_id: FieldIdentity::try_new(required(
-                            component.target_field_id,
-                            "interpretation.apply_key.component.target_field_id",
-                        )?)?,
-                    })
-                })
-                .collect::<Result<_, PersistenceCodecError>>()?,
-        },
+            })
+            .transpose()?,
         aggregates: dto
             .aggregates
             .into_iter()

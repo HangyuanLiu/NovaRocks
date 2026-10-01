@@ -77,8 +77,12 @@ pub(crate) fn freeze_completed_fragments(
             .ok_or_else(|| format!("encoded fragment {fragment_id} is absent from the plan"))?;
         let is_root = fragment_id == root_fragment_id;
         let has_stream_edge = plan.has_stream_edge_from(fragment_id);
+        let has_predicate_fanout = plan.has_predicate_fanout_from(fragment_id);
         let router_edges = router_edges_by_source.get(&fragment_id);
-        let is_producer = has_stream_edge || router_edges.is_some() || facts.cte_id().is_some();
+        let is_producer = has_stream_edge
+            || has_predicate_fanout
+            || router_edges.is_some()
+            || facts.cte_id().is_some();
         validate_fragment_output_kind(fragment_id, is_root, is_producer, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(
             fragment_id,
@@ -86,6 +90,7 @@ pub(crate) fn freeze_completed_fragments(
             has_stream_edge,
             router_edges.is_some(),
             facts.cte_id().is_some(),
+            has_predicate_fanout,
         )?;
         if !is_root && !has_stream_edge {
             if let Some((router_group_id, branch_edges)) = router_edges {

@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use novarocks_sql::planning::mv::ApplyKeySource;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -237,8 +234,7 @@ mod tests {
     fn sample_schema_contract() -> MvSchemaContract {
         use crate::persistence::schema::{
             BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
-            HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
-            TargetVisibleColumn,
+            OutputColumnLineage, OutputContract, TargetContract, TargetVisibleColumn,
         };
         use bytes::Bytes;
         use novarocks_spi::connector::ConnectorTableObjectId;
@@ -286,11 +282,7 @@ mod tests {
                     type_signature: "long".to_string(),
                     nullable: false,
                 }],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: "__nova_base_row_id".to_string(),
-                    target_field_id: 2,
-                    source: ApplyKeySource::BaseRowId,
-                },
+                hidden_apply_key: None,
                 partition: None,
             },
         }

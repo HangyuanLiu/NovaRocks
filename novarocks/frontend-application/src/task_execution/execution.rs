@@ -306,6 +306,182 @@ impl ReleasedRuntimeFilterContributions {
     }
 }
 
+/// Immutable release receipts from exactly one frozen query attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasedVerificationFacts {
+    execution: novarocks_types::QueryExecutionId,
+    contexts: BTreeMap<QueryContextRef, novarocks_execution_contract::ContextVerificationFacts>,
+    complete: bool,
+    expected: Box<
+        [(
+            TaskIdentity,
+            novarocks_execution_contract::VerificationInstance,
+        )],
+    >,
+}
+
+/// Fixed-size conclusion from every exact frozen verification instance.
+/// The receipt retains the task and operator identities behind these totals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedDeficitEvidence {
+    pub requested: u64,
+    pub matched: u64,
+}
+
+impl ReleasedVerificationFacts {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        execution: novarocks_types::QueryExecutionId,
+        contexts: BTreeMap<QueryContextRef, novarocks_execution_contract::ContextVerificationFacts>,
+        expected: Vec<(
+            TaskIdentity,
+            novarocks_execution_contract::VerificationInstance,
+        )>,
+        complete: bool,
+    ) -> Self {
+        Self {
+            execution,
+            contexts,
+            expected: expected.into_boxed_slice(),
+            complete,
+        }
+    }
+
+    pub fn contexts(
+        &self,
+    ) -> &BTreeMap<QueryContextRef, novarocks_execution_contract::ContextVerificationFacts> {
+        &self.contexts
+    }
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+    pub fn execution_id(&self) -> novarocks_types::QueryExecutionId {
+        self.execution
+    }
+
+    fn require_frozen_task_membership(
+        mut self,
+        frozen_task: impl Fn(TaskId) -> Option<TaskIdentity>,
+    ) -> Self {
+        // Empty or unavailable observations still carry an exact Task address.
+        // They cannot smuggle an unknown Task into an otherwise complete
+        // release receipt. Non-verifying frozen Tasks need no operator records.
+        self.complete &= self.contexts.values().all(|context| {
+            context
+                .tasks
+                .iter()
+                .all(|task| frozen_task(task.identity.task_id()) == Some(task.identity))
+        });
+        self
+    }
+
+    fn has_exact_expected_records(&self) -> bool {
+        use novarocks_execution_contract::TaskVerificationObservation;
+        if !self.complete || self.expected.is_empty() {
+            return false;
+        }
+        let expected = self.expected.iter().copied().collect::<BTreeSet<_>>();
+        if expected.len() != self.expected.len()
+            || expected
+                .iter()
+                .any(|(task, _)| task.query_execution_id() != self.execution)
+        {
+            return false;
+        }
+        let mut observed = BTreeSet::new();
+        let mut tasks = BTreeSet::new();
+        let mut frontend = None;
+        for (context_key, context) in &self.contexts {
+            if *context_key != context.context
+                || context.context.query_execution_id() != self.execution
+                || context.truncated
+                || context.validate().is_err()
+                || frontend.is_some_and(|id| id != context.context.frontend_process_id())
+            {
+                return false;
+            }
+            frontend = Some(context.context.frontend_process_id());
+            for task in &context.tasks {
+                if !tasks.insert(task.identity) {
+                    return false;
+                }
+                if let TaskVerificationObservation::Available(records) = &task.observation {
+                    for record in records {
+                        let key = (task.identity, record.instance);
+                        if !expected.contains(&key) || !observed.insert(key) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        observed == expected
+    }
+
+    /// Only complete conclusions from all frozen Task/Trim/local instances
+    /// can prove a deficit. Unstarted, partial or missing facts keep Pending.
+    pub fn completed_deficit_evidence(&self) -> Option<CompletedDeficitEvidence> {
+        use novarocks_execution_contract::{TaskVerificationObservation, VerificationState};
+        if !self.has_exact_expected_records() {
+            return None;
+        }
+        let mut requested = 0u64;
+        let mut matched = 0u64;
+        for task in self.contexts.values().flat_map(|context| &context.tasks) {
+            if let TaskVerificationObservation::Available(records) = &task.observation {
+                for record in records {
+                    let VerificationState::Completed {
+                        requested: need,
+                        matched: found,
+                    } = record.state
+                    else {
+                        return None;
+                    };
+                    requested = requested.checked_add(need)?;
+                    matched = matched.checked_add(found)?;
+                }
+            }
+        }
+        (requested > matched).then_some(CompletedDeficitEvidence { requested, matched })
+    }
+
+    /// Every expected instance must state the same safe side of the verification boundary.
+    pub fn permits_rollback(&self) -> bool {
+        let expected = &self.expected;
+        use novarocks_execution_contract::{TaskVerificationObservation, VerificationState};
+        if !self.has_exact_expected_records() {
+            return false;
+        }
+        let mut unique = BTreeSet::new();
+        let mut not_started = true;
+        let mut completed = true;
+        for &(identity, instance) in expected {
+            if identity.query_execution_id() != self.execution
+                || !unique.insert((identity, instance))
+            {
+                return false;
+            }
+            let Some(task) = self
+                .contexts
+                .values()
+                .flat_map(|context| context.tasks.iter())
+                .find(|task| task.identity == identity)
+            else {
+                return false;
+            };
+            let TaskVerificationObservation::Available(records) = &task.observation else {
+                return false;
+            };
+            let Some(record) = records.iter().find(|record| record.instance == instance) else {
+                return false;
+            };
+            not_started &= record.state == VerificationState::NotStarted;
+            completed &= matches!(record.state, VerificationState::Completed { requested, matched } if requested == matched);
+        }
+        not_started || completed
+    }
+}
+
 /// The task protocol of one query execution attempt.
 #[derive(Debug)]
 pub struct QueryTaskExecution {
@@ -691,6 +867,34 @@ impl QueryTaskExecution {
     /// an answer still outstanding. `is_complete` is the second question, and
     /// it is what stops an outstanding release from reading as an absent
     /// filter.
+    pub fn released_verification_facts(&self) -> ReleasedVerificationFacts {
+        let contexts = self
+            .owners
+            .iter()
+            .filter_map(|(&context, owner)| {
+                owner
+                    .is_released()
+                    .then(|| owner.verification().cloned())
+                    .flatten()
+                    .map(|facts| (context, facts))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let complete = self.owners.values().all(QueryContextOwner::is_released)
+            && contexts.len() == self.owners.len()
+            && contexts.iter().all(|(context, facts)| {
+                facts.context == *context && !facts.truncated && facts.validate().is_ok()
+            });
+        ReleasedVerificationFacts {
+            execution: self.graph.execution_id(),
+            contexts,
+            complete,
+            expected: self.graph.expected_verification().into(),
+        }
+        .require_frozen_task_membership(|task_id| {
+            self.graph.task(task_id).map(|task| task.identity())
+        })
+    }
+
     pub fn released_runtime_filter_contributions(&self) -> ReleasedRuntimeFilterContributions {
         ReleasedRuntimeFilterContributions {
             contributions: self
@@ -765,6 +969,20 @@ impl QueryTaskExecution {
             // Terminal cleanup forbids new normal work, but the actor can
             // still enqueue Abort effects for contexts the Worker holds.
             // Those exact, capacity-reserved effects must cross transport.
+            let lifecycle = self
+                .owners
+                .iter_mut()
+                .filter_map(|(&context, owner)| {
+                    owner
+                        .verification_release_pending()
+                        .then(|| owner.release_intent(now))
+                        .flatten()
+                        .map(|intent| {
+                            AdmissionCandidate::minted(OperationTarget::Context(context), intent)
+                        })
+                })
+                .collect::<VecDeque<_>>();
+            report.admission = self.enqueue_candidates(lifecycle, now)?;
             self.submit_queued_batches(&mut report)?;
             return Ok(report);
         }
@@ -1228,6 +1446,20 @@ impl QueryTaskExecution {
             self.operation_targets.remove(&operation_id);
             self.rollback_unsent(target, operation_id);
         }
+    }
+
+    /// Keep a separate Release observation domain after Abort has fulfilled
+    /// its cleanup duty. A missing receipt remains missing verification.
+    pub(crate) fn request_verification_release(&mut self) {
+        for owner in self.owners.values_mut() {
+            owner.request_verification_release();
+        }
+    }
+
+    pub(crate) fn verification_release_pending(&self) -> bool {
+        self.owners
+            .values()
+            .any(QueryContextOwner::verification_release_pending)
     }
 
     /// Forces one context down, ahead of everything queued for it.
@@ -2826,5 +3058,354 @@ mod covered_progress_tests {
         state.applied_prefix = 25;
         state.update_coverage_debt(settled);
         assert_eq!(state.coverage_debt, None);
+    }
+}
+
+#[cfg(test)]
+mod verification_receipt_tests {
+    use super::*;
+    use novarocks_execution_contract::{
+        ContextVerificationFacts, TaskVerificationFacts, TaskVerificationObservation,
+        VerificationInstance, VerificationRecord, VerificationState,
+    };
+    use novarocks_types::identity::{AttemptId, FrontendProcessId, QueryId};
+
+    fn receipts(states: [VerificationState; 2]) -> ReleasedVerificationFacts {
+        let execution =
+            novarocks_types::QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap())
+                .unwrap();
+        let frontend = FrontendProcessId::new_v7();
+        let mut contexts = BTreeMap::new();
+        let mut expected = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let backend = BackendProcessId::new_v7();
+            let context = QueryContextRef::new(execution, frontend, backend);
+            let identity = TaskIdentity::new(
+                execution,
+                StageId::new(1).unwrap(),
+                TaskId::new(index as u32 + 1).unwrap(),
+                backend,
+            );
+            let instance = VerificationInstance {
+                plan_node_id: 17,
+                local_instance_id: 0,
+            };
+            expected.push((identity, instance));
+            contexts.insert(
+                context,
+                ContextVerificationFacts {
+                    context,
+                    truncated: false,
+                    tasks: vec![TaskVerificationFacts {
+                        identity,
+                        observation: TaskVerificationObservation::Available(vec![
+                            VerificationRecord { instance, state },
+                        ]),
+                    }],
+                },
+            );
+        }
+        ReleasedVerificationFacts {
+            execution,
+            contexts,
+            complete: true,
+            expected: expected.into(),
+        }
+    }
+
+    #[test]
+    fn rollback_requires_every_frozen_instance_on_one_safe_side() {
+        let never = VerificationState::NotStarted;
+        let done = VerificationState::Completed {
+            requested: 3,
+            matched: 3,
+        };
+        assert!(receipts([never, never]).permits_rollback());
+        assert!(receipts([done, done]).permits_rollback());
+        for states in [
+            [never, done],
+            [never, VerificationState::Started],
+            [done, VerificationState::Started],
+        ] {
+            assert!(!receipts(states).permits_rollback());
+        }
+        let mut missing = receipts([never, never]);
+        missing.contexts.pop_first();
+        assert!(!missing.permits_rollback());
+        let mut incomplete = receipts([done, done]);
+        incomplete.complete = false;
+        assert!(!incomplete.permits_rollback());
+        let mut unavailable = receipts([never, never]);
+        unavailable.contexts.values_mut().next().unwrap().tasks[0].observation =
+            TaskVerificationObservation::Unavailable;
+        assert!(!unavailable.permits_rollback());
+        let mut wrong_instance = receipts([never, never]);
+        wrong_instance.expected[0].1.local_instance_id = 1;
+        assert!(!wrong_instance.permits_rollback());
+        let mut wrong_task = receipts([never, never]);
+        let (old, instance) = wrong_task.expected[0];
+        wrong_task.expected[0] = (
+            TaskIdentity::new(
+                old.query_execution_id(),
+                old.stage_id(),
+                TaskId::new(99).unwrap(),
+                old.backend_process_id(),
+            ),
+            instance,
+        );
+        assert!(!wrong_task.permits_rollback());
+        let mut duplicate = receipts([never, never]);
+        duplicate.expected[1] = duplicate.expected[0];
+        assert!(!duplicate.permits_rollback());
+        let mut absent = receipts([never, never]);
+        absent.expected = Box::default();
+        assert!(!absent.permits_rollback());
+    }
+
+    #[test]
+    fn released_verification_rejects_unknown_tasks_without_operator_records() {
+        for observation in [
+            TaskVerificationObservation::Available(Vec::new()),
+            TaskVerificationObservation::Unavailable,
+            TaskVerificationObservation::Truncated,
+        ] {
+            for state in [
+                VerificationState::NotStarted,
+                VerificationState::Completed {
+                    requested: 3,
+                    matched: 2,
+                },
+            ] {
+                let mut receipt = receipts([state, state]);
+                let frozen = receipt
+                    .expected
+                    .iter()
+                    .map(|(task, _)| (task.task_id(), *task))
+                    .collect::<BTreeMap<_, _>>();
+                let facts = receipt.contexts.values_mut().next().unwrap();
+                let task = facts.tasks[0].identity;
+                facts.tasks.push(TaskVerificationFacts {
+                    identity: TaskIdentity::new(
+                        task.query_execution_id(),
+                        task.stage_id(),
+                        TaskId::new(99).unwrap(),
+                        task.backend_process_id(),
+                    ),
+                    observation: observation.clone(),
+                });
+                facts.tasks.sort_by_key(|task| task.identity);
+                // The carrier is structurally valid and contains the genuine
+                // expected records. Only frozen membership rejects the extra
+                // address, including when it contributes no records.
+                assert!(facts.validate().is_ok());
+                let receipt =
+                    receipt.require_frozen_task_membership(|task| frozen.get(&task).copied());
+                assert!(!receipt.is_complete());
+                assert!(!receipt.permits_rollback());
+                assert_eq!(receipt.completed_deficit_evidence(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn released_verification_membership_compares_the_whole_frozen_identity() {
+        let mut receipt = receipts([VerificationState::NotStarted; 2]);
+        let frozen = receipt
+            .expected
+            .iter()
+            .map(|(task, _)| (task.task_id(), *task))
+            .collect::<BTreeMap<_, _>>();
+        let facts = receipt.contexts.values_mut().next().unwrap();
+        let task = facts.tasks[0].identity;
+        // Reusing a frozen TaskId in another Stage is not the frozen Task.
+        facts.tasks.push(TaskVerificationFacts {
+            identity: TaskIdentity::new(
+                task.query_execution_id(),
+                StageId::new(2).unwrap(),
+                task.task_id(),
+                task.backend_process_id(),
+            ),
+            observation: TaskVerificationObservation::Available(Vec::new()),
+        });
+        facts.tasks.sort_by_key(|task| task.identity);
+        assert!(facts.validate().is_ok());
+        let receipt = receipt.require_frozen_task_membership(|task| frozen.get(&task).copied());
+        assert!(!receipt.is_complete());
+        assert!(!receipt.permits_rollback());
+    }
+
+    #[test]
+    fn released_verification_allows_frozen_non_verifying_tasks_without_records() {
+        for observation in [
+            TaskVerificationObservation::Available(Vec::new()),
+            TaskVerificationObservation::Unavailable,
+        ] {
+            let mut receipt = receipts([VerificationState::NotStarted; 2]);
+            let mut frozen = receipt
+                .expected
+                .iter()
+                .map(|(task, _)| (task.task_id(), *task))
+                .collect::<BTreeMap<_, _>>();
+            let facts = receipt.contexts.values_mut().next().unwrap();
+            let task = facts.tasks[0].identity;
+            let non_verifying = TaskIdentity::new(
+                task.query_execution_id(),
+                task.stage_id(),
+                TaskId::new(99).unwrap(),
+                task.backend_process_id(),
+            );
+            frozen.insert(non_verifying.task_id(), non_verifying);
+            facts.tasks.push(TaskVerificationFacts {
+                identity: non_verifying,
+                observation,
+            });
+            facts.tasks.sort_by_key(|task| task.identity);
+            let receipt = receipt.require_frozen_task_membership(|task| frozen.get(&task).copied());
+            assert!(receipt.is_complete());
+            assert!(receipt.permits_rollback());
+        }
+    }
+
+    #[test]
+    fn completed_deficit_evidence_requires_all_frozen_instances_to_finish() {
+        let deficit = VerificationState::Completed {
+            requested: 5,
+            matched: 2,
+        };
+        let done = VerificationState::Completed {
+            requested: 3,
+            matched: 3,
+        };
+        let receipt = receipts([deficit, done]);
+        assert_eq!(
+            receipt.completed_deficit_evidence(),
+            Some(CompletedDeficitEvidence {
+                requested: 8,
+                matched: 5
+            })
+        );
+        assert!(!receipt.permits_rollback());
+        assert_eq!(receipts([done, done]).completed_deficit_evidence(), None);
+        for other in [VerificationState::NotStarted, VerificationState::Started] {
+            assert_eq!(
+                receipts([deficit, other]).completed_deficit_evidence(),
+                None
+            );
+        }
+        assert_eq!(
+            receipts([
+                VerificationState::Completed {
+                    requested: 5,
+                    matched: 6
+                },
+                done
+            ])
+            .completed_deficit_evidence(),
+            None
+        );
+        assert_eq!(
+            receipts([
+                VerificationState::Completed {
+                    requested: u64::MAX,
+                    matched: 0
+                },
+                VerificationState::Completed {
+                    requested: 1,
+                    matched: 0
+                },
+            ])
+            .completed_deficit_evidence(),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_deficit_evidence_rejects_incomplete_or_unavailable_release() {
+        let deficit = VerificationState::Completed {
+            requested: 5,
+            matched: 2,
+        };
+        let mut partial = receipts([deficit, deficit]);
+        partial.complete = false;
+        assert_eq!(partial.completed_deficit_evidence(), None);
+        let mut missing = receipts([deficit, deficit]);
+        missing.contexts.pop_first();
+        assert_eq!(missing.completed_deficit_evidence(), None);
+        let mut truncated = receipts([deficit, deficit]);
+        truncated.contexts.values_mut().next().unwrap().truncated = true;
+        assert_eq!(truncated.completed_deficit_evidence(), None);
+        for observation in [
+            TaskVerificationObservation::Truncated,
+            TaskVerificationObservation::Unavailable,
+        ] {
+            let mut receipt = receipts([deficit, deficit]);
+            receipt.contexts.values_mut().next().unwrap().tasks[0].observation = observation;
+            assert_eq!(receipt.completed_deficit_evidence(), None);
+        }
+    }
+
+    #[test]
+    fn completed_deficit_evidence_rejects_wrong_or_extra_frozen_identities() {
+        let deficit = VerificationState::Completed {
+            requested: 5,
+            matched: 2,
+        };
+        let mut wrong_local = receipts([deficit, deficit]);
+        wrong_local.expected[0].1.local_instance_id = 1;
+        assert_eq!(wrong_local.completed_deficit_evidence(), None);
+        let mut wrong_trim = receipts([deficit, deficit]);
+        wrong_trim.expected[0].1.plan_node_id = 18;
+        assert_eq!(wrong_trim.completed_deficit_evidence(), None);
+        let mut wrong_task = receipts([deficit, deficit]);
+        let (identity, instance) = wrong_task.expected[0];
+        wrong_task.expected[0] = (
+            TaskIdentity::new(
+                identity.query_execution_id(),
+                identity.stage_id(),
+                TaskId::new(99).unwrap(),
+                identity.backend_process_id(),
+            ),
+            instance,
+        );
+        assert_eq!(wrong_task.completed_deficit_evidence(), None);
+        let mut wrong_attempt = receipts([deficit, deficit]);
+        let (identity, instance) = wrong_attempt.expected[0];
+        let other_execution =
+            novarocks_types::QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(2).unwrap())
+                .unwrap();
+        wrong_attempt.expected[0] = (
+            TaskIdentity::new(
+                other_execution,
+                identity.stage_id(),
+                identity.task_id(),
+                identity.backend_process_id(),
+            ),
+            instance,
+        );
+        assert_eq!(wrong_attempt.completed_deficit_evidence(), None);
+        let mut duplicate = receipts([deficit, deficit]);
+        duplicate.expected[1] = duplicate.expected[0];
+        assert_eq!(duplicate.completed_deficit_evidence(), None);
+        let mut empty = receipts([deficit, deficit]);
+        empty.expected = Box::default();
+        assert_eq!(empty.completed_deficit_evidence(), None);
+        let mut extra = receipts([deficit, deficit]);
+        let TaskVerificationObservation::Available(records) =
+            &mut extra.contexts.values_mut().next().unwrap().tasks[0].observation
+        else {
+            unreachable!()
+        };
+        records.push(VerificationRecord {
+            instance: VerificationInstance {
+                plan_node_id: 18,
+                local_instance_id: 0,
+            },
+            state: deficit,
+        });
+        assert_eq!(extra.completed_deficit_evidence(), None);
+        let mut wrong_context = receipts([deficit, deficit]);
+        let other_context = *wrong_context.contexts.keys().next_back().unwrap();
+        wrong_context.contexts.values_mut().next().unwrap().context = other_context;
+        assert_eq!(wrong_context.completed_deficit_evidence(), None);
     }
 }

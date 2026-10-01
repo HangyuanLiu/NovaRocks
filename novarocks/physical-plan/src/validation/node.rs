@@ -450,7 +450,9 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::SetOp { .. }
         | NodeKind::Values { .. }
         | NodeKind::GenerateSeries { .. }
-        | NodeKind::ChangeEventExpand { .. } => None,
+        | NodeKind::ChangeEventExpand { .. }
+        | NodeKind::QuotaPreclaim { .. }
+        | NodeKind::QuotaTrim { .. } => None,
     };
     if let Some(exact) = exact
         && exact.as_slice() != node.output.columns.as_ref()
@@ -672,7 +674,9 @@ pub(crate) fn value_origin_allowed(
             | NodeKind::Unpivot { .. }
             | NodeKind::GenerateSeries { .. }
             | NodeKind::TableFunction { .. }
-            | NodeKind::ChangeEventExpand { .. },
+            | NodeKind::ChangeEventExpand { .. }
+            | NodeKind::QuotaPreclaim { .. }
+            | NodeKind::QuotaTrim { .. },
             ValueOrigin::NodeOutput {
                 node: owner,
                 output_ordinal,
@@ -688,7 +692,10 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
         | NodeKind::Values { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
-        NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
+        NodeKind::HashJoin { .. }
+        | NodeKind::NestLoopJoin { .. }
+        | NodeKind::QuotaPreclaim { .. }
+        | NodeKind::QuotaTrim { .. } => node.inputs.len() == 2,
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
         NodeKind::TableFunction { .. } => node.inputs.len() <= 1,
         _ => node.inputs.len() == 1,
@@ -2001,6 +2008,9 @@ pub(crate) fn validate_node_semantics(
                 }
             }
         }
+        NodeKind::QuotaPreclaim { .. } | NodeKind::QuotaTrim { .. } => {
+            validate_quota(fragment, node, path, errors)
+        }
         NodeKind::Unpivot { spec } => validate_unpivot(fragment, node, indexes, spec, path, errors),
     }
 }
@@ -3261,4 +3271,161 @@ pub(crate) fn writer_schema_shapes_match(
             .all(|(writer, finish)| {
                 writer.name == finish.name && writer.ty == finish.ty && writer.role == finish.role
             })
+}
+
+fn validate_quota(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let inputs = node
+        .inputs
+        .iter()
+        .filter_map(|id| fragment.nodes().get(id))
+        .collect::<Vec<_>>();
+    if inputs.len() != 2 {
+        return;
+    }
+    let mut require_column = |input: usize, value: ValueId, types: &[DataType]| {
+        if !inputs[input].output.columns.contains(&value)
+            || !fragment
+                .values()
+                .get(&value)
+                .is_some_and(|v| types.contains(&v.ty.data_type))
+        {
+            errors.push(ValidationError::new(
+                path,
+                "quota field is absent from its exact input or has the wrong type",
+            ));
+        }
+    };
+    let (domains, max_bytes, output_types) = match &node.kind {
+        NodeKind::QuotaPreclaim { spec } => {
+            for value in &spec.demand_values {
+                if let Some(value_def) = fragment.values().get(value) {
+                    require_column(0, *value, std::slice::from_ref(&value_def.ty.data_type));
+                }
+            }
+            require_column(0, spec.demand_entry_id, &[DataType::Binary]);
+            require_column(0, spec.demand_key, &[DataType::Binary]);
+            require_column(
+                0,
+                spec.demand_need.value(),
+                match spec.demand_need {
+                    crate::QuotaNeed::Count { .. } => &[DataType::Int64, DataType::UInt64],
+                    crate::QuotaNeed::NegativeWeight { .. } => &[DataType::Int64],
+                },
+            );
+            require_column(1, spec.target_file, &[DataType::Utf8]);
+            require_column(1, spec.target_position, &[DataType::Int64]);
+            let mut seen = BTreeSet::new();
+            if spec.target_values.is_empty()
+                || spec.target_values.iter().any(|v| {
+                    !seen.insert(*v)
+                        || *v == spec.target_file
+                        || *v == spec.target_position
+                        || !inputs[1].output.columns.contains(v)
+                        || !fragment
+                            .values()
+                            .get(v)
+                            .is_some_and(|v| spec.content_equivalence.supports(&v.ty.data_type))
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "quota target content values must be distinct supported visible input fields",
+                ));
+            }
+            if !spec.demand_values.is_empty()
+                && (spec.demand_values.len() != spec.target_values.len()
+                    || spec.demand_values.iter().zip(&spec.target_values).any(
+                        |(demand, target)| {
+                            fragment.values().get(demand).map(|v| &v.ty)
+                                != fragment.values().get(target).map(|v| &v.ty)
+                        },
+                    ))
+            {
+                errors.push(ValidationError::new(path,"quota demand visible representatives must match target content-field order and types"));
+            }
+            if spec.demand_entry_id == spec.demand_key
+                || spec.demand_entry_id == spec.demand_need.value()
+                || spec.demand_key == spec.demand_need.value()
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "quota demand fields must be distinct",
+                ));
+            }
+            (
+                spec.preselection_domain,
+                spec.max_state_bytes,
+                vec![DataType::Binary, DataType::Utf8, DataType::Int64],
+            )
+        }
+        NodeKind::QuotaTrim { spec } => {
+            require_column(0, spec.seed_entry_id, &[DataType::Binary]);
+            require_column(
+                0,
+                spec.seed_need.value(),
+                match spec.seed_need {
+                    crate::QuotaNeed::Count { .. } => &[DataType::Int64, DataType::UInt64],
+                    crate::QuotaNeed::NegativeWeight { .. } => &[DataType::Int64],
+                },
+            );
+            require_column(1, spec.candidate_entry_id, &[DataType::Binary]);
+            require_column(1, spec.candidate_file, &[DataType::Utf8]);
+            require_column(1, spec.candidate_position, &[DataType::Int64]);
+            (
+                spec.preselection_domain,
+                spec.max_state_bytes,
+                vec![DataType::Utf8, DataType::Int64],
+            )
+        }
+        _ => return,
+    };
+    if matches!(&node.kind, NodeKind::QuotaPreclaim { .. }) {
+        let mut pending = vec![inputs[1].id];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(target) = fragment.nodes().get(&id) {
+                if matches!(target.kind, NodeKind::ExchangeSource { .. }) {
+                    errors.push(ValidationError::new(
+                        path,
+                        "QuotaPreclaim target scan must remain in its exact owning fragment",
+                    ));
+                }
+                pending.extend(target.inputs.iter().copied());
+            }
+        }
+    }
+    if matches!(&node.kind, NodeKind::QuotaPreclaim { spec } if spec.preselection_domain != node.id)
+    {
+        errors.push(ValidationError::new(
+            path,
+            "QuotaPreclaim must define its own exact domain",
+        ));
+    }
+    if domains.get() > i32::MAX as u32 || max_bytes == 0 || max_bytes > i64::MAX as u64 {
+        errors.push(ValidationError::new(
+            path,
+            "quota state budget and exact domain reference must be representable",
+        ));
+    }
+    if node.output.columns.len() != output_types.len()
+        || node.output.columns.iter().zip(output_types).any(|(v, ty)| {
+            !fragment
+                .values()
+                .get(v)
+                .is_some_and(|v| v.ty.data_type == ty && !v.ty.nullable)
+        })
+    {
+        errors.push(ValidationError::new(
+            path,
+            "quota output must match its exact non-null narrow schema",
+        ));
+    }
 }

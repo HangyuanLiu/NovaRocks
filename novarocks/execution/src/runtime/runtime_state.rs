@@ -35,6 +35,7 @@ pub struct RuntimeState {
     query_options: Option<QueryOptions>,
     cache_options: Option<ExecutionCacheOptions>,
     error_state: std::sync::Arc<RuntimeErrorState>,
+    verification: Option<std::sync::Arc<crate::runtime::verification::TaskVerificationHolder>>,
     last_report_exec_state_ns: AtomicI64,
     query_id: Option<QueryId>,
     fragment_instance_id: Option<UniqueId>,
@@ -54,23 +55,56 @@ impl std::fmt::Debug for RuntimeState {
 
 #[derive(Debug, Default)]
 pub struct RuntimeErrorState {
-    error: std::sync::Mutex<Option<String>>,
+    error: std::sync::Mutex<Option<RuntimeFailure>>,
     stopped: std::sync::Condvar,
     #[cfg(test)]
     waiting: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeFailure {
+    message: String,
+    task_failure: Option<novarocks_execution_contract::TaskFailure>,
 }
 
 impl RuntimeErrorState {
     pub fn set_error(&self, err: String) {
         let mut guard = self.error.lock().expect("runtime error lock");
         if guard.is_none() {
-            *guard = Some(err);
+            *guard = Some(RuntimeFailure {
+                message: err,
+                task_failure: None,
+            });
             self.stopped.notify_all();
         }
     }
 
     pub fn error(&self) -> Option<String> {
-        self.error.lock().expect("runtime error lock").clone()
+        self.error
+            .lock()
+            .expect("runtime error lock")
+            .as_ref()
+            .map(|error| error.message.clone())
+    }
+
+    /// Publishes the exact typed cause at the same first-wins boundary as text errors.
+    pub fn set_failure(&self, failure: novarocks_execution_contract::TaskFailure) {
+        let mut guard = self.error.lock().expect("runtime error lock");
+        if guard.is_none() {
+            *guard = Some(RuntimeFailure {
+                message: failure.to_string(),
+                task_failure: Some(failure),
+            });
+            self.stopped.notify_all();
+        }
+    }
+
+    pub fn task_failure(&self) -> Option<novarocks_execution_contract::TaskFailure> {
+        self.error
+            .lock()
+            .expect("runtime error lock")
+            .as_ref()
+            .and_then(|error| error.task_failure.clone())
     }
 
     #[cfg(test)]
@@ -92,7 +126,7 @@ impl RuntimeErrorState {
         #[cfg(test)]
         self.waiting.fetch_sub(1, Ordering::Release);
         match guard.as_ref() {
-            Some(error) => Err(error.clone()),
+            Some(error) => Err(error.message.clone()),
             None => Ok(()),
         }
     }
@@ -104,6 +138,7 @@ impl Default for RuntimeState {
             query_options: None,
             cache_options: None,
             error_state: std::sync::Arc::new(RuntimeErrorState::default()),
+            verification: None,
             // A newly admitted fragment starts its report interval now. Using
             // the process-relative zero would make the first poll fire
             // immediately once the process had been alive for one interval.
@@ -124,6 +159,7 @@ impl Clone for RuntimeState {
             query_options: self.query_options.clone(),
             cache_options: self.cache_options.clone(),
             error_state: std::sync::Arc::clone(&self.error_state),
+            verification: self.verification.clone(),
             last_report_exec_state_ns: AtomicI64::new(
                 self.last_report_exec_state_ns.load(Ordering::Acquire),
             ),
@@ -138,6 +174,20 @@ impl Clone for RuntimeState {
 }
 
 impl RuntimeState {
+    pub fn with_verification(
+        mut self,
+        verification: std::sync::Arc<crate::runtime::verification::TaskVerificationHolder>,
+    ) -> Self {
+        self.verification = Some(verification);
+        self
+    }
+
+    pub fn verification(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::runtime::verification::TaskVerificationHolder>> {
+        self.verification.as_ref()
+    }
+
     pub fn new(
         query_options: Option<QueryOptions>,
         cache_options: Option<ExecutionCacheOptions>,
@@ -168,10 +218,15 @@ impl RuntimeState {
                 .unwrap_or_else(|| "fragment_unknown".to_string());
             Some(MemTracker::new_child(fragment_label, &query_tracker))
         });
+        let error_state = std::sync::Arc::new(RuntimeErrorState::default());
+        if let Some(tracker) = mem_tracker.as_ref() {
+            tracker.bind_runtime_error(&error_state);
+        }
         Self {
             query_options,
             cache_options,
-            error_state: std::sync::Arc::new(RuntimeErrorState::default()),
+            error_state,
+            verification: None,
             last_report_exec_state_ns: AtomicI64::new(monotonic_now_ns()),
             query_id,
             fragment_instance_id,
@@ -202,6 +257,11 @@ impl RuntimeState {
 
     pub(crate) fn mem_tracker(&self) -> Option<std::sync::Arc<MemTracker>> {
         self.mem_tracker.clone()
+    }
+
+    /// The exact frozen native Task fragment-instance identity.
+    pub fn fragment_instance_id(&self) -> Option<UniqueId> {
+        self.fragment_instance_id
     }
 
     pub fn backend_num(&self) -> Option<i32> {
@@ -260,6 +320,13 @@ impl RuntimeState {
 
     pub fn error(&self) -> Option<String> {
         self.error_state.error()
+    }
+
+    /// Preserve a task cause while returning the legacy operator diagnostic.
+    pub fn fail_task(&self, failure: novarocks_execution_contract::TaskFailure) -> String {
+        let message = failure.to_string();
+        self.error_state.set_failure(failure);
+        message
     }
 
     /// Return the maximum row count per in-memory chunk/RecordBatch.

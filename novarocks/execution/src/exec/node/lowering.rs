@@ -62,6 +62,7 @@ pub enum ExternalSinkRequirement {
 /// The exact runtime capabilities removed while a decoded plan is frozen.
 /// They are keyed by local node identity and never enter LocalProgram.
 pub struct LocalRuntimeBindings {
+    pub(crate) quota_domains: BTreeMap<lp::QuotaDomainId, u32>,
     pub(crate) scans: BTreeMap<lp::ProgramNodeId, Arc<dyn super::scan::ScanSource>>,
     pub(crate) writers: BTreeMap<lp::ProgramNodeId, super::table_writer::TableWriterRuntimeBinding>,
     pub(crate) finishers:
@@ -71,12 +72,27 @@ pub struct LocalRuntimeBindings {
 impl LocalRuntimeBindings {
     fn new() -> Self {
         Self {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::new(),
             writers: BTreeMap::new(),
             finishers: BTreeMap::new(),
         }
     }
 
+    pub fn bind_quota_domain(
+        &mut self,
+        domain: lp::QuotaDomainId,
+        count: u32,
+    ) -> std::result::Result<(), String> {
+        if count == 0 || self.quota_domains.contains_key(&domain) {
+            return Err("quota domain assignment must be nonzero and unique".into());
+        }
+        self.quota_domains.insert(domain, count);
+        Ok(())
+    }
+    pub fn quota_domain(&self, domain: lp::QuotaDomainId) -> Option<u32> {
+        self.quota_domains.get(&domain).copied()
+    }
     pub fn scan_count(&self) -> usize {
         self.scans.len()
     }
@@ -226,6 +242,14 @@ fn preflight(root: &ExecNode) -> Result<()> {
             };
         }
         match &node.kind {
+            ExecNodeKind::QuotaPreclaim(n) => {
+                push!(&n.demand);
+                push!(&n.target);
+            }
+            ExecNodeKind::QuotaTrim(n) => {
+                push!(&n.seeds);
+                push!(&n.candidates);
+            }
             ExecNodeKind::AssertNumRows(n) => push!(&n.input),
             ExecNodeKind::Project(n) => push!(&n.input),
             ExecNodeKind::Unpivot(n) => push!(&n.input),
@@ -271,6 +295,9 @@ struct Lowering<'a> {
 }
 
 impl Lowering<'_> {
+    fn quota_domain(&mut self, domain: lp::QuotaDomainId) {
+        if !self.requirements.iter().any(|r|matches!(r,lp::BindingRequirement::QuotaDomain{domain:existing} if *existing==domain)){self.requirements.push(lp::BindingRequirement::QuotaDomain{domain});}
+    }
     fn node(&mut self, node: ExecNode) -> Result<lp::ProgramNodeId> {
         let schema = crate::exec::pipeline::builder::output_chunk_schema_for_node(&node)
             .ok_or_else(|| LocalProgramLoweringError::new("node has no output chunk schema"))?;
@@ -363,6 +390,46 @@ impl Lowering<'_> {
                     },
                 };
                 (n.node_id, P::AssertNumRows { input, mode })
+            }
+            ExecNodeKind::QuotaPreclaim(n) => {
+                let demand = self.node(*n.demand)?;
+                let target = self.node(*n.target)?;
+                self.quota_domain(n.spec.preselection_domain);
+                let runtime_filters = n
+                    .runtime_filters
+                    .iter()
+                    .map(|filter| {
+                        Ok(lp::QuotaContentFilter {
+                            demand_expr: expr(filter.demand_expr_id),
+                            producer: freeze_producer(&filter.contract)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for filter in &runtime_filters {
+                    self.filter_requirement(filter.producer.binding_id())?;
+                }
+                (
+                    n.node_id,
+                    P::QuotaPreclaim {
+                        demand,
+                        target,
+                        spec: n.spec,
+                        runtime_filters,
+                    },
+                )
+            }
+            ExecNodeKind::QuotaTrim(n) => {
+                let seeds = self.node(*n.seeds)?;
+                let candidates = self.node(*n.candidates)?;
+                self.quota_domain(n.spec.preselection_domain);
+                (
+                    n.node_id,
+                    P::QuotaTrim {
+                        seeds,
+                        candidates,
+                        spec: n.spec,
+                    },
+                )
             }
             ExecNodeKind::Values(n) => {
                 let values = lp::StaticValues::try_new(n.chunk.batch, output.clone())
@@ -933,6 +1000,8 @@ impl Lowering<'_> {
             | ExecNodeKind::Unpivot(_)
             | ExecNodeKind::Filter(_)
             | ExecNodeKind::Repeat(_)
+            | ExecNodeKind::QuotaPreclaim(_)
+            | ExecNodeKind::QuotaTrim(_)
             | ExecNodeKind::ChangeEventExpand(_)
             | ExecNodeKind::UnionAll(_)
             | ExecNodeKind::Limit(_) => {

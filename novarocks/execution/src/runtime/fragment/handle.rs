@@ -61,6 +61,7 @@ pub struct FragmentPrepareContext {
     event_sink: Arc<dyn FragmentEventSink>,
     result_spec: Option<ResultWriteSpec>,
     result_identity: Option<novarocks_execution_contract::TaskIdentity>,
+    verification: Option<Arc<crate::runtime::verification::TaskVerificationHolder>>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
     debug_exec_node_output: bool,
@@ -590,6 +591,7 @@ impl Default for FragmentPrepareContext {
             event_sink: Arc::new(NoopFragmentEventSink),
             result_spec: None,
             result_identity: None,
+            verification: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
             debug_exec_node_output: false,
@@ -630,6 +632,7 @@ impl FragmentPrepareContext {
             edge_gates: None,
             result_spec: None,
             result_identity: None,
+            verification: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
             debug_exec_node_output: false,
@@ -665,6 +668,14 @@ impl FragmentPrepareContext {
         gates: Arc<crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates>,
     ) -> Self {
         self.edge_gates = Some(gates);
+        self
+    }
+
+    pub fn with_verification(
+        mut self,
+        verification: Arc<crate::runtime::verification::TaskVerificationHolder>,
+    ) -> Self {
+        self.verification = Some(verification);
         self
     }
 
@@ -729,6 +740,7 @@ impl FragmentPrepareContext {
             edge_gates: None,
             result_spec,
             result_identity: None,
+            verification: None,
             root_sink_dop,
             group_execution_scan_dop,
             debug_exec_node_output: false,
@@ -900,6 +912,7 @@ impl DormantFragmentHandle {
             None => prepared.start(),
         };
         let lifecycle = Arc::new(RunningFragmentLifecycle {
+            runtime_error: pipeline.runtime_error_state(),
             state: std::sync::Mutex::new(RunningFragmentState {
                 resources,
                 cancel_reason: None,
@@ -935,6 +948,7 @@ struct RunningFragmentInner {
 }
 
 struct RunningFragmentLifecycle {
+    runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     state: std::sync::Mutex<RunningFragmentState>,
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
@@ -1001,7 +1015,11 @@ impl RunningFragmentHandle {
                 .state
                 .lock()
                 .expect("running fragment state lock");
-            outcome_from_result(result, state.cancel_reason.clone())
+            outcome_from_result(
+                result,
+                state.cancel_reason.clone(),
+                self.inner.lifecycle.runtime_error.task_failure(),
+            )
         })
     }
 
@@ -1039,7 +1057,11 @@ impl RunningFragmentLifecycle {
             if let Some(fact) = state.terminal.as_ref() {
                 return fact.clone();
             }
-            let outcome = outcome_from_result(result, state.cancel_reason.clone());
+            let outcome = outcome_from_result(
+                result,
+                state.cancel_reason.clone(),
+                self.runtime_error.task_failure(),
+            );
             match &outcome {
                 FragmentOutcome::Succeeded => state.resources.finish_success(),
                 FragmentOutcome::Failed(error) => {
@@ -1105,15 +1127,16 @@ impl RunningFragmentLifecycle {
 fn outcome_from_result(
     result: Result<(), String>,
     cancel_reason: Option<FragmentCancelReason>,
+    task_failure: Option<novarocks_execution_contract::TaskFailure>,
 ) -> FragmentOutcome {
     match result {
         Ok(()) => FragmentOutcome::Succeeded,
         Err(error) => match cancel_reason {
             Some(reason) => FragmentOutcome::Cancelled { reason },
-            None => FragmentOutcome::Failed(FragmentExecutionError::new(
-                FragmentExecutionErrorKind::Pipeline,
-                error,
-            )),
+            None => FragmentOutcome::Failed(
+                FragmentExecutionError::new(FragmentExecutionErrorKind::Pipeline, error)
+                    .with_task_failure(task_failure),
+            ),
         },
     }
 }
@@ -1199,6 +1222,15 @@ pub fn prepare_fragment(
                 error,
             )
         })?;
+        let runtime_state = if let Some(verification) = &context.verification {
+            Arc::new(
+                Arc::try_unwrap(runtime_state)
+                    .expect("runtime state has a single preparation owner")
+                    .with_verification(Arc::clone(verification)),
+            )
+        } else {
+            runtime_state
+        };
         let materialized_sink = materialize_fragment_sink_with_result(
             program,
             instance,

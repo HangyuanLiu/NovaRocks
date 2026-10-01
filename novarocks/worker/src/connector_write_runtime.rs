@@ -434,6 +434,18 @@ mod tests {
                 expected_schema: Arc::new(arrow::datatypes::Schema::empty()),
                 physical,
                 context: request_context(),
+                resources: {
+                    let ledger =
+                        Arc::new(novarocks_execution::connector::WriterResourceLedger::new());
+                    ledger
+                        .install(
+                            novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                                "test writer task",
+                            ),
+                        )
+                        .expect("install writer tracker");
+                    ledger.resources()
+                },
             })
             .await
             .expect("open writer");

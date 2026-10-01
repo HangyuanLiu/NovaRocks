@@ -366,6 +366,152 @@ impl MvRepository for StateStoreMvRepository {
         Ok(Some(loaded))
     }
 
+    async fn find_drop_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<crate::repository::LoadedMvDropProjection>, MvRepositoryError> {
+        let lookup_key = target_key(target).map_err(corruption)?;
+        let Some(lookup) = self.read_record(&lookup_key).await? else {
+            return Ok(None);
+        };
+        let lookup: DecodedMvRecord<MvTargetLookup> =
+            decode_record(&lookup_key, &lookup.value).map_err(corruption)?;
+        let root_key = projection_by_id_key(lookup.value.mv_id).map_err(corruption)?;
+        let root = self
+            .read_record(&root_key)
+            .await?
+            .ok_or_else(|| corruption("DROP lookup references a missing root"))?;
+        let (mv_id, decoded_target, source_revision, _) =
+            codec::decode_drop_projection(&root_key, &root.value)
+                .map_err(corruption)?
+                .value;
+        if decoded_target != *target || mv_id != lookup.value.mv_id {
+            return Err(corruption("DROP lookup differs from exact root"));
+        }
+        Ok(Some(crate::repository::LoadedMvDropProjection {
+            mv_id,
+            target: decoded_target,
+            source_revision,
+            version: crate::repository::MvProjectionVersion::from_store(root.version),
+        }))
+    }
+
+    async fn ensure_no_drop_downstream_dependencies(
+        &self,
+        object: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<(), MvRepositoryError> {
+        for root in self
+            .scan_prefix(projection_prefix().map_err(corruption)?)
+            .await?
+        {
+            let (_, _, _, definition) = codec::decode_drop_projection(&root.key, &root.value)
+                .map_err(corruption)?
+                .value;
+            for occurrence in &definition.relation_occurrences {
+                if crate::persistence::exact_revision::persisted_object_names(
+                    &occurrence.object_id,
+                    object,
+                )
+                .map_err(|e| corruption(e.to_string()))?
+                {
+                    return Err(MvRepositoryError::new(
+                        MvRepositoryErrorKind::Conflict,
+                        "exact object has downstream materialized views",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_drop_projection(
+        &self,
+        _operation_id: Uuid,
+        expected: crate::repository::LoadedMvDropProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        let page_size = self.store.limits().max_page_size;
+        operation::run(
+            self.store.as_ref(),
+            &self.runner_metrics,
+            self.run_policy,
+            "delete exact DROP Accelerator root",
+            move |transaction| {
+                let expected = expected.clone();
+                Box::pin(async move {
+                    let key = projection_by_id_key(expected.mv_id).map_err(invalid_state_store)?;
+                    let Some(root) = transaction.get(&key).await? else {
+                        return Ok(false);
+                    };
+                    if &root.version != expected.version.store_version() {
+                        return Err(conflict_state_store("DROP root changed before delete"));
+                    }
+                    let (id, target, source, definition) =
+                        codec::decode_drop_projection(&key, &root.value)
+                            .map_err(invalid_state_store)?
+                            .value;
+                    if id != expected.mv_id
+                        || target != expected.target
+                        || source != expected.source_revision
+                    {
+                        return Err(conflict_state_store(
+                            "DROP exact identity changed before delete",
+                        ));
+                    }
+                    let rows = scan_write_prefix(
+                        transaction,
+                        dependency_by_downstream_prefix(id).map_err(invalid_state_store)?,
+                        page_size,
+                    )
+                    .await?;
+                    if rows.len() != definition.relation_occurrences.len() {
+                        return Err(invalid_state_store("DROP dependency index is incomplete"));
+                    }
+                    for row in &rows {
+                        let dependency: DecodedMvRecord<StoredMvDependency> =
+                            decode_record(&row.key, &row.value).map_err(invalid_state_store)?;
+                        if dependency_by_downstream_key(
+                            id,
+                            &dependency.value.upstream,
+                            dependency.value.occurrence_id,
+                        )
+                        .map_err(invalid_state_store)?
+                            != row.key
+                        {
+                            return Err(invalid_state_store(
+                                "DROP dependency key differs from its exact occurrence",
+                            ));
+                        }
+                        let occurrence = definition
+                            .relation_occurrences
+                            .iter()
+                            .find(|o| o.occurrence_id == dependency.value.occurrence_id)
+                            .ok_or_else(|| {
+                                invalid_state_store("DROP dependency occurrence differs from D")
+                            })?;
+                        if dependency.value.downstream_mv_id != id
+                            || dependency.value.upstream_object_id.as_ref()
+                                != occurrence.object_id.as_bytes()
+                            || dependency.value.upstream.catalog.as_deref()
+                                != Some(occurrence.catalog_at_binding.as_str())
+                            || dependency.value.upstream.database_or_namespace
+                                != occurrence.namespace_at_binding
+                            || dependency.value.upstream.name != occurrence.relation_at_binding
+                            || dependency.value.created_at_ms != definition.created_at_ms
+                        {
+                            return Err(invalid_state_store("DROP dependency root differs from D"));
+                        }
+                    }
+                    delete_indexes_for_drop_target(transaction, &target, id, page_size).await?;
+                    transaction
+                        .delete(key, Precondition::Version(root.version))
+                        .await?;
+                    Ok(true)
+                })
+            },
+        )
+        .await
+    }
+
     async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
         let records = self
             .scan_prefix(projection_prefix().map_err(corruption)?)
@@ -865,8 +1011,22 @@ async fn delete_indexes_for_projection(
     mv_id: i64,
     page_size: usize,
 ) -> Result<(), StateStoreError> {
-    let target_key = target_key(&definition_target(definition).map_err(invalid_state_store)?)
-        .map_err(invalid_state_store)?;
+    delete_indexes_for_drop_target(
+        transaction,
+        &definition_target(definition).map_err(invalid_state_store)?,
+        mv_id,
+        page_size,
+    )
+    .await
+}
+
+async fn delete_indexes_for_drop_target(
+    transaction: &mut dyn WriteTransaction,
+    target: &MvTarget,
+    mv_id: i64,
+    page_size: usize,
+) -> Result<(), StateStoreError> {
+    let target_key = target_key(target).map_err(invalid_state_store)?;
     let target = transaction
         .get(&target_key)
         .await?
@@ -900,6 +1060,11 @@ async fn delete_indexes_for_projection(
             .get(&upstream_key)
             .await?
             .ok_or_else(|| invalid_state_store("MV dependency index is asymmetric"))?;
+        let counterpart: DecodedMvRecord<StoredMvDependency> =
+            decode_record(&upstream_key, &upstream.value).map_err(invalid_state_store)?;
+        if counterpart.value != dependency.value {
+            return Err(invalid_state_store("MV dependency index pair differs"));
+        }
         transaction
             .delete(record.key, Precondition::Version(record.version))
             .await?;

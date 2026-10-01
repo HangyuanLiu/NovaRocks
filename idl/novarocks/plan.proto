@@ -376,6 +376,8 @@ message PlanNode {
     CteProduceNode cte_produce = 29;                 // CTE producer node.
     CteConsumeNode cte_consume = 30;                 // CTE consumer node.
     RedistributeNode redistribute = 31;              // explicit redistribution node.
+    QuotaPreclaimNode quota_preclaim = 33;
+    QuotaTrimNode quota_trim = 34;
     UnpivotNode unpivot = 32;                        // typed wide-to-long expansion node.
   }
 }
@@ -521,6 +523,19 @@ message RuntimeFilterAggregateTopNKey {
   uint32 limit = 2;
 }
 
+message RuntimeFilterQuotaContentField {
+  uint32 field_ordinal = 1;
+  ResultContentEquivalence content_equivalence = 2;
+  uint32 witness_id = 3;
+}
+
+message RuntimeFilterQuotaContentScanField {
+  uint32 producer_witness_id = 1;
+  uint32 field_ordinal = 2;
+  ResultContentEquivalence content_equivalence = 3;
+  int32 preclaim_node_id = 4;
+}
+
 message RuntimeFilterProducerRole {
   repeated RuntimeFilterContributionKind contribution_kinds = 1;
   RuntimeFilterCompletionRequirement completion_requirement = 2;
@@ -529,6 +544,7 @@ message RuntimeFilterProducerRole {
   oneof target {
     RuntimeFilterJoinBuildKey join_build_key = 4;
     RuntimeFilterAggregateTopNKey aggregate_topn_key = 5;
+    RuntimeFilterQuotaContentField quota_content_field = 6;
   }
 }
 
@@ -543,6 +559,7 @@ message RuntimeFilterConsumerRole {
   oneof target {
     uint32 direct_input_ordinal = 3;
     RuntimeFilterSourceBoundaryTarget source_boundary_target = 5;
+    RuntimeFilterQuotaContentScanField quota_content_scan_field = 6;
   }
 }
 
@@ -610,6 +627,7 @@ message FragmentEdgeKind {
   oneof kind {
     bool stream = 1;                                      // true for a normal stream edge.
     CteMulticastEdge cte_multicast = 2;                   // CTE multicast edge metadata.
+    bool predicate_fanout = 4; // true for a predicate fanout branch.
     ChangeStreamRouterEdge change_stream_router = 3; // Iceberg change-stream router edge metadata.
   }
 }
@@ -687,6 +705,7 @@ message DataSink {
     bool noop = 2;                                        // true for a no-op sink.
     ChangeStreamRouterSink change_stream_router = 4; // Iceberg change-stream router sink.
     DataStreamSink data_stream = 5;                       // Exchange stream sink.
+    PredicateFanoutSink predicate_fanout = 9;
     MultiCastDataStreamSink multi_cast_data_stream = 6;   // CTE-style multicast stream sink.
   }
   reserved 7;
@@ -1512,3 +1531,41 @@ message ChangeStreamBranchRoute {
   // branch's identity inside one sealed plan, not a cohort or an operation.
   uint32 write_target_ordinal = 13;
 }
+
+// Result content semantics are a closed public contract, independent of SQL equality.
+enum ResultContentEquivalence {
+  RESULT_CONTENT_EQUIVALENCE_UNSPECIFIED = 0;
+  RESULT_CONTENT_EQUIVALENCE_NATIVE_RESULT_CONTENT_V1 = 1;
+}
+message QuotaNeed {
+  oneof kind {
+    uint32 count_column_id = 1;
+    uint32 negative_weight_column_id = 2;
+  }
+}
+message QuotaPreclaimNode {
+  uint32 demand_entry_id_column_id = 1;
+  uint32 demand_key_column_id = 2;
+  QuotaNeed demand_need = 3;
+  repeated uint32 target_value_column_ids = 4;
+  uint32 target_file_column_id = 5;
+  uint32 target_position_column_id = 6;
+  ResultContentEquivalence content_equivalence = 7;
+  int32 preselection_domain_node_id = 8;
+  repeated uint32 demand_value_column_ids = 10;
+  uint64 max_state_bytes = 9;
+}
+message QuotaTrimNode {
+  uint32 seed_entry_id_column_id = 1;
+  QuotaNeed seed_need = 2;
+  uint32 candidate_entry_id_column_id = 3;
+  uint32 candidate_file_column_id = 4;
+  uint32 candidate_position_column_id = 5;
+  ResultContentEquivalence content_equivalence = 6;
+  int32 preselection_domain_node_id = 7;
+  uint64 max_state_bytes = 8;
+}
+
+// Every predicate reads the same already-materialized producer chunk.
+message PredicateFanoutBranch { DataStreamSink stream = 1; novarocks.expr.Expr predicate = 2; }
+message PredicateFanoutSink { repeated PredicateFanoutBranch branches = 1; }

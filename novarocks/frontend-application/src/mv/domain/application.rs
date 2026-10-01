@@ -265,6 +265,9 @@ pub struct MvRequestContext<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvApplicationErrorKind {
     InvalidRequest,
+    ConsistencyFailed,
+    CapacityRefused,
+    TargetRefused,
     Engine,
     Repository,
     Unavailable,

@@ -55,13 +55,13 @@ pub fn select_repartition_shape(
         capabilities.has_agg_state,
         &capabilities.identity,
     ) {
-        (BaseSnapshotPolicy::SingleBase, false, RefreshIdentity::BaseRowId) => {
+        (BaseSnapshotPolicy::SingleBase, false, RefreshIdentity::VisibleTuple) => {
             Ok(RepartitionShape::ProjectionFilterSingleBase)
         }
         (BaseSnapshotPolicy::SingleBase, true, RefreshIdentity::GroupRowId) => {
             Ok(RepartitionShape::AggregateSingleBase)
         }
-        (BaseSnapshotPolicy::JoinPairPartialInitialSkip, false, RefreshIdentity::JoinRowKey) => {
+        (BaseSnapshotPolicy::JoinPairPartialInitialSkip, false, RefreshIdentity::VisibleTuple) => {
             Ok(RepartitionShape::JoinProjectionFilter)
         }
         (BaseSnapshotPolicy::JoinPairPartialInitialSkip, true, RefreshIdentity::GroupRowId) => {
@@ -70,9 +70,7 @@ pub fn select_repartition_shape(
         (BaseSnapshotPolicy::AllBasesRequired, true, RefreshIdentity::GroupRowId) => {
             Ok(RepartitionShape::FanInAggregate)
         }
-        (BaseSnapshotPolicy::AllBasesRequired, false, RefreshIdentity::BranchScoped(inner))
-            if matches!(inner.as_ref(), RefreshIdentity::BaseRowId) =>
-        {
+        (BaseSnapshotPolicy::AllBasesRequired, false, RefreshIdentity::VisibleTuple) => {
             Ok(RepartitionShape::UnionProjectionFilter)
         }
         _ => Err(format!(

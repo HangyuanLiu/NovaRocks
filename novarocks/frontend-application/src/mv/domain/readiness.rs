@@ -247,6 +247,13 @@ impl MvReadinessPort {
         )
     }
 
+    pub(crate) fn prepare_current_drop(
+        &self,
+        descriptor: &novarocks_mv_application::persistence::documents::MvCurrentDropDescriptor,
+    ) -> Result<MvDropReadiness, MvProjectionError> {
+        self.block_on(self.service.prepare_current_drop(descriptor))
+    }
+
     /// Synchronous bridge to the product-owned post-provider-delete CAS.
     pub(crate) fn delete_after_provider_drop(
         &self,

@@ -213,7 +213,24 @@ fn write_support_denial(
         if let Err(error) = ensure_overwrite_single_partition_spec_from_metadata(metadata) {
             return Some(invalid(error));
         }
-        if let Err(error) = ensure_no_equality_deletes_from_metadata(metadata) {
+        // Preparation signs the exact managed target; session admission still
+        // checks its sealed Full/Data publication declaration before any write.
+        let full_replacement_shape = request.purpose
+            == ConnectorWriteAdmissionPurpose::MaterializedViewRefresh
+            && matches!(request.input, ConnectorWriteInputRequest::Data { .. })
+            && request.target_ref.as_str() == "main";
+        let managed_full_replacement = if full_replacement_shape {
+            match crate::document_storage::observation::managed_marker(metadata) {
+                Ok(marker) => marker.kind() == "mv",
+                Err(error) if error.kind() == ConnectorErrorKind::NotFound => false,
+                Err(error) => return Some(error),
+            }
+        } else {
+            false
+        };
+        if !managed_full_replacement
+            && let Err(error) = ensure_no_equality_deletes_from_metadata(metadata)
+        {
             return Some(invalid(error));
         }
     }
@@ -1289,6 +1306,148 @@ mod tests {
                 &owner,
             )
             .expect("application-managed MV refresh outcome"),
+        );
+    }
+
+    #[test]
+    fn managed_full_replacement_allows_equality_baseline_only_for_exact_data_main() {
+        use crate::iceberg::spec::{
+            Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
+        };
+        let owner = owner();
+        let with_equality = |properties| {
+            let metadata = metadata_with_properties(properties);
+            let snapshot = Snapshot::builder()
+                .with_snapshot_id(7)
+                .with_sequence_number(1)
+                .with_timestamp_ms(metadata.last_updated_ms())
+                .with_schema_id(metadata.current_schema_id())
+                .with_manifest_list("file:///warehouse/db/t/metadata/base.avro")
+                .with_summary(Summary {
+                    operation: Operation::Delete,
+                    additional_properties: HashMap::from([(
+                        "total-equality-deletes".into(),
+                        "1".into(),
+                    )]),
+                })
+                .build();
+            metadata
+                .into_builder(None)
+                .add_snapshot(snapshot)
+                .unwrap()
+                .set_ref(
+                    "main",
+                    SnapshotReference {
+                        snapshot_id: 7,
+                        retention: SnapshotRetention::Branch {
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                            max_ref_age_ms: None,
+                        },
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata
+        };
+        let managed = with_equality(HashMap::from([
+            (
+                crate::document_storage::observation::MANAGED_KIND_PROPERTY.into(),
+                "mv".into(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.into(),
+                "deployment".into(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.into(),
+                "writer".into(),
+            ),
+        ]));
+        let payload = table_payload(Some(table_info(&managed)));
+        let mut request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+        );
+        request.intent = ConnectorWriteIntent::Overwrite;
+        let exact_preparation = expect_prepared(prepare_write(request.clone(), &owner).unwrap());
+        let mut ordinary = request.clone();
+        ordinary.purpose = ConnectorWriteAdmissionPurpose::OrdinaryDml;
+        expect_denied(prepare_write(ordinary, &owner).unwrap());
+        let mut branch = request.clone();
+        branch.target_ref = ConnectorWriteTargetRef::parse("other").unwrap();
+        assert!(
+            write_support_denial(&managed, &branch, "ice.db.t")
+                .unwrap()
+                .message()
+                .contains("equality-delete")
+        );
+        let mut non_data = request.clone();
+        non_data.input = ConnectorWriteInputRequest::RowLineage {
+            data_fields: Vec::new(),
+            row_identity_fields: Vec::new(),
+        };
+        assert!(write_support_denial(&managed, &non_data, "ice.db.t").is_some());
+        let unowned = with_equality(HashMap::new());
+        let payload = table_payload(Some(table_info(&unowned)));
+        let mut unowned_request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+        );
+        unowned_request.intent = ConnectorWriteIntent::Overwrite;
+        assert!(
+            expect_denied(prepare_write(unowned_request.clone(), &owner).unwrap())
+                .message()
+                .contains("equality-delete")
+        );
+        unowned_request.purpose = ConnectorWriteAdmissionPurpose::OrdinaryDml;
+        assert!(
+            expect_denied(prepare_write(unowned_request, &owner).unwrap())
+                .message()
+                .contains("equality-delete")
+        );
+        let partial = with_equality(HashMap::from([(
+            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.into(),
+            "deployment".into(),
+        )]));
+        assert_eq!(
+            write_support_denial(&partial, &request, "ice.db.t")
+                .unwrap()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        let mut wrong_type = request;
+        let ConnectorWriteInputRequest::Data { fields } = &mut wrong_type.input else {
+            unreachable!()
+        };
+        fields[0] = ConnectorWriteFieldRequest::new(Field::new("id", DataType::Float64, true));
+        // Proposed types are hints: the provider signs its frozen target's
+        // exact schema rather than signing a caller-supplied type or cast.
+        let rebound = expect_prepared(prepare_write(wrong_type.clone(), &owner).unwrap());
+        let ConnectorWriteInputShape::Data { fields } = rebound.input() else {
+            panic!("full replacement must sign a data shape");
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|binding| binding.field().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true)
+            ]
+        );
+        assert_eq!(rebound.digest(), exact_preparation.digest());
+        let ConnectorWriteInputRequest::Data { fields } = &mut wrong_type.input else {
+            unreachable!()
+        };
+        fields[0] = ConnectorWriteFieldRequest::new(Field::new("absent", DataType::Int64, false));
+        assert!(
+            prepare_write(wrong_type, &owner).is_err(),
+            "unknown fields must remain refused"
         );
     }
 

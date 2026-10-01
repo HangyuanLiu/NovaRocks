@@ -86,10 +86,15 @@ pub struct ManagementDependencySet {
     definition_revision: [u8; 32],
     interpretation_revision: [u8; 32],
     publication_base: Option<[u8; 32]>,
+    eligibility_revision: Option<[u8; 32]>,
     control_runtime_id: ConnectorControlRuntimeId,
 }
 
 impl ManagementDependencySet {
+    pub const fn with_eligibility_revision(mut self, revision: Option<[u8; 32]>) -> Self {
+        self.eligibility_revision = revision;
+        self
+    }
     pub const fn new(
         definition_revision: [u8; 32],
         interpretation_revision: [u8; 32],
@@ -100,6 +105,7 @@ impl ManagementDependencySet {
             definition_revision,
             interpretation_revision,
             publication_base,
+            eligibility_revision: None,
             control_runtime_id,
         }
     }
@@ -297,6 +303,8 @@ struct TargetAdmissionState {
     installed_observation: Option<ManagementObservationLiveness>,
     ready: bool,
     incarnation_mismatch: bool,
+    drop_only: bool,
+    registration_predecessor: Option<ProcessIncarnation>,
 }
 
 impl ManagementEntrance {
@@ -326,6 +334,76 @@ impl ManagementEntrance {
         &self,
         observation: &ManagementObservationState,
         dependencies: ManagementDependencySet,
+    ) -> Result<MvCurrentManagementAdmission, ManagementAdmissionError> {
+        self.install_observed_target_for_use(observation, dependencies, false)
+    }
+
+    /// Completes normal readmission but admits retirement only. No capability
+    /// usable by ordinary readiness is returned to the caller.
+    pub fn install_observed_drop_target(
+        &self,
+        observation: &ManagementObservationState,
+        descriptor: &crate::persistence::documents::MvCurrentDropDescriptor,
+        runtime: ConnectorControlRuntimeId,
+    ) -> Result<(), ManagementAdmissionError> {
+        let source = descriptor.source_revision();
+        if observation.target().table() != &source.target
+            || observation.target().object_id() != &source.target_object_id
+            || source.deployment_owner != self.inner.owner
+            || source.process_incarnation != self.inner.incarnation
+            || observation.latest_metadata_version().map(crate::persistence::definition::MvAcceleratorCommittedVersionRevision::from_committed).as_ref() != Some(&source.metadata_version)
+        {
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        self.install_observed_target_for_use(
+            observation,
+            descriptor.management_dependencies(runtime),
+            true,
+        )
+        .map(|_| ())
+    }
+
+    /// Bootstrap retirement from sealed Current only when this entrance has
+    /// no prior responsibility for the target. Existing Unknown is never reset.
+    pub fn install_fresh_drop_target(
+        &self,
+        observation: &ConnectorDocumentManagementObservation,
+        descriptor: &crate::persistence::documents::MvCurrentDropDescriptor,
+        runtime: ConnectorControlRuntimeId,
+    ) -> Result<(), ManagementAdmissionError> {
+        if self.management_phase(observation.target()) != MvManagementPhase::NotObserved {
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        let target = ManagedMvTarget::from_observation(observation)
+            .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        let mut state = ManagementObservationState::try_new(
+            target,
+            self.inner.owner.clone(),
+            self.inner.incarnation.clone(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: self.inner.incarnation.clone(),
+            },
+            vec![],
+            None,
+            None,
+        )
+        .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        let pending = state
+            .begin_current_observation(super::ManagementObservationRequestId::from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            ))
+            .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        state
+            .complete_current_observation(pending, observation)
+            .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        self.install_observed_drop_target(&state, descriptor, runtime)
+    }
+
+    fn install_observed_target_for_use(
+        &self,
+        observation: &ManagementObservationState,
+        dependencies: ManagementDependencySet,
+        drop_only: bool,
     ) -> Result<MvCurrentManagementAdmission, ManagementAdmissionError> {
         if observation.phase() != ManagementObservationPhase::Ready {
             return Err(ManagementAdmissionError::ReadmissionIncomplete);
@@ -384,6 +462,8 @@ impl ManagementEntrance {
                 installed_observation: Some(observation.liveness().clone()),
                 ready: true,
                 incarnation_mismatch: false,
+                drop_only,
+                registration_predecessor: None,
             },
         );
         Ok(admission)
@@ -423,6 +503,81 @@ impl ManagementEntrance {
             None,
             Some(authorization),
         )
+        .map(|observation| {
+            observation.with_registration_predecessor(current.registration_predecessor.clone())
+        })
+    }
+
+    /// Records a registration effect under the exact readmission authority
+    /// that dispatched it. Permits close the old responsibilities; their
+    /// original Unknown terminal facts are never rewritten.
+    pub fn record_readmission_registration_terminal(
+        &self,
+        observation: &ManagementObservationState,
+        terminal: &super::EffectTerminalFact,
+    ) -> Result<(), ManagementAdmissionError> {
+        use super::EffectTerminalFact;
+        let responsibility = match terminal {
+            EffectTerminalFact::KnownCommitted(effect)
+            | EffectTerminalFact::KnownUncommitted(effect) => effect,
+            EffectTerminalFact::CommitUnknown(effect) => effect.responsibility(),
+        };
+        let mut state = lock(&self.inner.state);
+        let current = state
+            .get_mut(observation.target().table())
+            .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+        let unresolved = current
+            .unsettled
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if observation.phase()
+            != ManagementObservationPhase::RegistrationRequired(
+                super::RegistrationRequirement::Incarnation,
+            )
+            || observation.local_owner() != &self.inner.owner
+            || observation.local_incarnation() != &self.inner.incarnation
+            || current.target != *observation.target()
+            || unresolved.is_empty()
+            || unresolved != *observation.resolved_effects()
+            || current.pending_committed_effect.is_some()
+            || current.pending_continuation.as_ref() != Some(observation.continuation())
+            || !matching_authorization(
+                current.pending_observation.as_ref(),
+                observation.authorization(),
+            )
+            || responsibility.target() != observation.target()
+            || responsibility.dispatching_incarnation() != &self.inner.incarnation
+            || responsibility.scope() != EffectScope::CATALOG_COMMIT
+        {
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        match terminal {
+            EffectTerminalFact::KnownCommitted(_) => {}
+            EffectTerminalFact::KnownUncommitted(_) => {
+                current.pending_observation = None;
+                observation.liveness().close();
+            }
+            EffectTerminalFact::CommitUnknown(effect) => {
+                let predecessor = observation
+                    .registration_marker_incarnation()
+                    .cloned()
+                    .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+                // All original barriers were covered by exact permits before
+                // registration could dispatch. Keep the new effect's own
+                // identity, scope, timestamp and immutable Unknown result.
+                current.unsettled = HashMap::from([(responsibility.identity(), effect.clone())]);
+                current.registration_predecessor = Some(predecessor);
+                current.pending_continuation = Some(ManagementContinuation::SameOwner {
+                    previous_incarnation: self.inner.incarnation.clone(),
+                });
+                current.pending_observation = None;
+                current.installed_observation = None;
+                current.ready = false;
+                observation.liveness().close();
+            }
+        }
+        Ok(())
     }
 
     /// Starts the mandatory exact re-observation after a successful external
@@ -517,6 +672,8 @@ impl ManagementEntrance {
                 installed_observation: None,
                 ready: false,
                 incarnation_mismatch: false,
+                drop_only: false,
+                registration_predecessor: None,
             },
         );
         ManagementObservationState::try_new(
@@ -989,6 +1146,101 @@ impl ManagementEntranceLease {
         Ok(())
     }
 
+    /// Settle a metadata control effect while retaining this exact activity turn.
+    /// A committed effect requires a new sealed Current observation; only the
+    /// independently mutable eligibility revision may advance during this turn.
+    /// Unknown keeps its responsibility and refuses every subsequent effect.
+    pub fn record_intermediate_terminal(
+        &mut self,
+        disposition: EffectDisposition,
+        observe: impl FnOnce() -> Result<
+            (
+                ConnectorDocumentManagementObservation,
+                MvObservedCurrentDocuments,
+            ),
+            ManagementAdmissionError,
+        >,
+    ) -> Result<Option<MvCurrentManagementAdmission>, ManagementAdmissionError> {
+        let old_dependencies = self
+            .request
+            .expected_dependencies
+            .clone()
+            .ok_or(ManagementAdmissionError::InvalidRequest)?;
+        if self.request.operation != ConnectorDocumentManagementOperation::Publication {
+            return Err(ManagementAdmissionError::InvalidRequest);
+        }
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if disposition != EffectDisposition::KnownUncommitted {
+            let inner = self
+                .entrance
+                .upgrade()
+                .ok_or(ManagementAdmissionError::EntranceDropped)?;
+            let targets = lock(&inner.state);
+            let current = targets
+                .get(&self.request.table)
+                .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+            if let Some(observation) = &current.installed_observation {
+                // Cached readiness must lose its old sealed admission before
+                // Current may change or its catalog outcome becomes unknown.
+                observation.close();
+            }
+        }
+        match disposition {
+            EffectDisposition::CommitUnknown => {
+                record_unsettled(&self.entrance, responsibility.clone())?;
+                return Err(ManagementAdmissionError::EffectUnsettled);
+            }
+            EffectDisposition::KnownUncommitted => {
+                self.dispatched.take();
+                return Ok(None);
+            }
+            EffectDisposition::KnownCommitted => {
+                record_committed(&self.entrance, responsibility.clone())?;
+                self.dispatched.take();
+            }
+        }
+        let entrance = ManagementEntrance {
+            inner: self
+                .entrance
+                .upgrade()
+                .ok_or(ManagementAdmissionError::EntranceDropped)?,
+        };
+        let mut state = entrance
+            .begin_committed_convergence(
+                &self.request.table,
+                ManagementContinuation::SameOwner {
+                    previous_incarnation: entrance.incarnation().clone(),
+                },
+            )
+            .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        let pending = state
+            .begin_current_observation(super::ManagementObservationRequestId::from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            ))
+            .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        let (observation, documents) = observe()?;
+        state
+            .complete_current_observation(pending, &observation)
+            .map_err(|_| ManagementAdmissionError::ReadmissionIncomplete)?;
+        let dependencies = documents.management_dependencies(old_dependencies.control_runtime_id);
+        if dependencies.definition_revision != old_dependencies.definition_revision
+            || dependencies.interpretation_revision != old_dependencies.interpretation_revision
+            || dependencies.publication_base != old_dependencies.publication_base
+            || dependencies.control_runtime_id != old_dependencies.control_runtime_id
+        {
+            return Err(ManagementAdmissionError::DependencyChanged);
+        }
+        let admission = entrance.install_observed_target(&state, dependencies.clone())?;
+        if !admission.matches(&documents) {
+            admission.liveness.close();
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        self.request.expected_dependencies = Some(dependencies);
+        Ok(Some(admission))
+    }
+
     pub fn record_terminal(
         mut self,
         disposition: EffectDisposition,
@@ -1128,6 +1380,8 @@ fn record_committed(
         installed_observation: None,
         ready: false,
         incarnation_mismatch: false,
+        drop_only: false,
+        registration_predecessor: None,
     });
     if target.target != *responsibility.target()
         || !target.unsettled.is_empty()
@@ -1257,6 +1511,10 @@ fn validate_request_against_state(
                     ManagementAdmissionError::EffectUnsettled
                 });
             }
+            if current.drop_only && request.operation != ConnectorDocumentManagementOperation::Drop
+            {
+                return Err(ManagementAdmissionError::ReadmissionIncomplete);
+            }
             if current.target.catalog() != &request.catalog
                 || request.expected_object_id.as_ref() != Some(current.target.object_id())
             {
@@ -1313,6 +1571,8 @@ fn record_unsettled(
         installed_observation: None,
         ready: false,
         incarnation_mismatch: false,
+        drop_only: false,
+        registration_predecessor: None,
     });
     if target.target != *responsibility.target()
         || target.pending_committed_effect.is_some()
@@ -1349,4 +1609,148 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod intermediate_tests {
+    use super::*;
+    use bytes::Bytes;
+    use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
+
+    fn admitted_turn() -> (ManagementEntrance, ManagementEntranceLease, ManagedMvTarget) {
+        let catalog = CatalogHandle::new(
+            ConnectorInstanceId::parse("iceberg").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        );
+        let table = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
+            namespace: Arc::from("db"),
+            table: Arc::from("mv"),
+        };
+        let target = ManagedMvTarget::try_new(
+            catalog.clone(),
+            table.clone(),
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"object")).unwrap(),
+        )
+        .unwrap();
+        let dependencies = ManagementDependencySet::new(
+            [1; 32],
+            [2; 32],
+            Some([3; 32]),
+            ConnectorControlRuntimeId::from_bytes([4; 16]),
+        );
+        let entrance = ManagementEntrance::new(
+            DeploymentOwner::parse("owner").unwrap(),
+            ProcessIncarnation::parse("incarnation").unwrap(),
+        );
+        lock(&entrance.inner.state).insert(
+            table.clone(),
+            TargetAdmissionState {
+                target: target.clone(),
+                dependencies: dependencies.clone(),
+                unsettled: HashMap::new(),
+                pending_committed_effect: None,
+                pending_continuation: None,
+                pending_observation: None,
+                installed_observation: Some(ManagementObservationLiveness::new()),
+                ready: true,
+                incarnation_mismatch: false,
+                drop_only: false,
+                registration_predecessor: None,
+            },
+        );
+        let request = ManagementRequest::try_new(
+            catalog,
+            table,
+            Some(target.object_id().clone()),
+            ConnectorDocumentManagementOperation::Publication,
+            Some(dependencies),
+            EffectScope::CATALOG_COMMIT,
+        )
+        .unwrap();
+        let lease = entrance.acquire(request, || false).unwrap();
+        (entrance, lease, target)
+    }
+
+    fn responsibility(target: &ManagedMvTarget, identity: u8) -> EffectResponsibility {
+        EffectResponsibility::new(
+            EffectIdentity::from_bytes([identity; 16]),
+            target.clone(),
+            ProcessIncarnation::parse("incarnation").unwrap(),
+            EffectScope::CATALOG_COMMIT,
+            super::super::ManagementTimestamp::from_unix_millis(1000),
+        )
+    }
+
+    #[test]
+    fn intermediate_uncommitted_retains_the_turn_and_accepts_the_next_exact_effect() {
+        let (entrance, mut lease, target) = admitted_turn();
+        let old_projection_liveness = lock(&entrance.inner.state)
+            .get(target.table())
+            .unwrap()
+            .installed_observation
+            .clone()
+            .unwrap();
+        lease.mark_dispatched(responsibility(&target, 1)).unwrap();
+        let admission = lease
+            .record_intermediate_terminal(EffectDisposition::KnownUncommitted, || {
+                panic!("uncommitted effects require no Current observation")
+            })
+            .unwrap();
+        assert!(admission.is_none());
+        assert!(lease.activity.is_some());
+        assert!(lease.dispatched.is_none());
+        assert!(old_projection_liveness.is_open());
+        assert!(
+            lock(&entrance.inner.state)
+                .get(target.table())
+                .unwrap()
+                .ready
+        );
+        lease.mark_dispatched(responsibility(&target, 2)).unwrap();
+        lease
+            .record_terminal(EffectDisposition::KnownUncommitted)
+            .unwrap();
+    }
+
+    #[test]
+    fn intermediate_unknown_preserves_responsibility_and_blocks_every_later_effect() {
+        let (entrance, mut lease, target) = admitted_turn();
+        let old_projection_liveness = lock(&entrance.inner.state)
+            .get(target.table())
+            .unwrap()
+            .installed_observation
+            .clone()
+            .unwrap();
+        lease.mark_dispatched(responsibility(&target, 1)).unwrap();
+        assert_eq!(
+            lease
+                .record_intermediate_terminal(EffectDisposition::CommitUnknown, || panic!(
+                    "unknown effects cannot mint a Current admission"
+                ))
+                .unwrap_err(),
+            ManagementAdmissionError::EffectUnsettled
+        );
+        assert!(lease.activity.is_some());
+        assert!(!old_projection_liveness.is_open());
+        assert!(
+            matches!(lease.dispatched.as_ref(), Some(DispatchedEffect::Exact(effect)) if effect.identity() == EffectIdentity::from_bytes([1;16]))
+        );
+        assert_eq!(
+            lease
+                .mark_dispatched(responsibility(&target, 2))
+                .unwrap_err(),
+            ManagementAdmissionError::InvalidEffect
+        );
+        drop(lease);
+        let state = lock(&entrance.inner.state);
+        let current = state.get(target.table()).unwrap();
+        assert!(!current.ready);
+        assert_eq!(current.unsettled.len(), 1);
+        assert!(
+            current
+                .unsettled
+                .contains_key(&EffectIdentity::from_bytes([1; 16]))
+        );
+    }
 }

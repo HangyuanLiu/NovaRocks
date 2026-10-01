@@ -36,6 +36,15 @@ pub fn infer_agg_function_types(
         name if is_state_combinator_aggregate_function(name) => {
             Ok((DataType::Binary, Some(DataType::Binary)))
         }
+        "mv_weight_sum" => {
+            if !matches!(
+                first_arg,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            ) {
+                return Err("mv_weight_sum requires a signed integer".into());
+            }
+            Ok((DataType::Int64, Some(DataType::Int64)))
+        }
         "count" => Ok((DataType::Int64, Some(DataType::Int64))),
         "sum" => {
             let out = match &first_arg {

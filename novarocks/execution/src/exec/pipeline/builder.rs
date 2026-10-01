@@ -660,6 +660,8 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         ExecNodeKind::AssertNumRows(AssertNumRowsNode { input, .. }) => {
             output_chunk_schema_for_node(input)
         }
+        ExecNodeKind::QuotaPreclaim(n) => Some(Arc::clone(&n.output_chunk_schema)),
+        ExecNodeKind::QuotaTrim(n) => Some(Arc::clone(&n.output_chunk_schema)),
         ExecNodeKind::Values(values) => Some(values.chunk.chunk_schema_ref()),
         ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
         ExecNodeKind::Unpivot(unpivot) => Some(Arc::clone(&unpivot.output_chunk_schema)),
@@ -1019,6 +1021,9 @@ fn build_pipeline_for_node(
     ctx: &mut PipelineBuildContext,
 ) -> Result<PipelineBuildResult, String> {
     match &node.kind {
+        ExecNodeKind::QuotaPreclaim(_) | ExecNodeKind::QuotaTrim(_) => {
+            Err("quota execution requires exact LocalRuntimeBindings".into())
+        }
         ExecNodeKind::RuntimeFilterConsumer(consumer) => {
             validate_native_consumer_specs(&consumer.bindings, ctx)?;
             let mut build = build_pipeline_for_node(&consumer.input, ctx)?;

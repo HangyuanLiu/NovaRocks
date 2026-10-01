@@ -105,6 +105,7 @@ pub(crate) fn validate_expression(
     fragment: &Fragment,
     expression: &crate::ExprNode,
     expression_scopes: &BTreeMap<NodeId, VisibleInputIndex>,
+    sink_expressions: &BTreeSet<ExprId>,
     window_roots: &BTreeSet<ExprId>,
     operator_roots: &BTreeSet<ExprId>,
     parents: &[ExpressionParentReference],
@@ -166,9 +167,16 @@ pub(crate) fn validate_expression(
             }
             Some(_) => {
                 if owner.is_some()
-                    && expression_scopes
-                        .get(&expression.owner)
-                        .is_some_and(|scope| !scope.contains(value))
+                    && if sink_expressions.contains(&expression.id) {
+                        !fragment.nodes().get(&fragment.root()).is_some_and(|root| {
+                            expression.owner == fragment.root()
+                                && root.output.columns.contains(value)
+                        })
+                    } else {
+                        expression_scopes
+                            .get(&expression.owner)
+                            .is_some_and(|scope| !scope.contains(value))
+                    }
                 {
                     errors.push(ValidationError::new(
                         &path,
@@ -1223,7 +1231,9 @@ pub(crate) fn validate_expression_reachability(
     errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].expressions", fragment.id().get());
-    let mut pending = Vec::new();
+    let mut pending = sink_expression_ids(fragment)
+        .into_iter()
+        .collect::<Vec<_>>();
     for node in fragment.nodes().values() {
         node.kind.expression_references(&mut pending);
         if let NodeKind::Scan { derived_values, .. } = &node.kind {
@@ -1361,4 +1371,23 @@ pub(crate) fn validate_expression_values_on_port(
         }
         expression.kind.expression_references(&mut pending);
     }
+}
+
+pub(crate) fn sink_expression_ids(fragment: &Fragment) -> BTreeSet<ExprId> {
+    let mut pending = match fragment.sink() {
+        crate::FragmentSink::PredicateFanout { branches } => branches
+            .iter()
+            .map(|branch| branch.predicate)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let mut result = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if result.insert(id)
+            && let Some(expr) = fragment.expressions().get(id)
+        {
+            expr.kind.expression_references(&mut pending);
+        }
+    }
+    result
 }

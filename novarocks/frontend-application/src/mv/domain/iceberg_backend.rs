@@ -31,7 +31,11 @@ impl IcebergMvBackend {
 }
 
 impl IcebergMvBackend {
-    pub fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
+    pub fn list_mvs(
+        &self,
+        req: ListMvsRequest,
+        product_service: &novarocks_mv_application::service::MvProductService,
+    ) -> Result<Vec<MvListRow>, String> {
         crate::mv::domain::analysis_adapter::list_mv_rows_with_ports(
             self.ports.readiness().as_ref(),
             // The entrance is what decides whether this process may write a
@@ -41,6 +45,9 @@ impl IcebergMvBackend {
             req.current_catalog.as_deref(),
             &req.stmt,
             Some(MvStorageEngine::Iceberg),
+            self.ports.connector_control(),
+            &req.connector_context,
+            product_service,
         )
     }
 }

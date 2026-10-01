@@ -51,6 +51,7 @@ use novarocks_spi::connector::write_stack::{
     target_ordinal_to_wire,
 };
 
+use crate::connector::WriterResourceLedger;
 use crate::exec::chunk::{Chunk, ChunkSchema, record_batch_additional_bytes, record_batch_bytes};
 use crate::exec::expr::agg::SealedExecutionFunctionSet;
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -286,12 +287,14 @@ impl TableWriterOperatorFactory {
         let physical = plan
             .physical_template
             .for_driver(u32::try_from(driver_id.max(0)).unwrap_or(u32::MAX));
+        let resource_ledger = Arc::new(WriterResourceLedger::new());
         let request = ConnectorOpenWriterRequest {
             handle: plan.handle.clone(),
             target: plan.target,
             expected_schema: Arc::clone(&plan.expected_schema),
             physical,
             context: plan.request_context.clone(),
+            resources: resource_ledger.resources(),
         };
         let target = plan.target;
         let fragment_encoder = Arc::clone(&plan.fragment_encoder);
@@ -334,6 +337,8 @@ impl TableWriterOperatorFactory {
             name: self.name.clone(),
             projection: plan.projection.clone(),
             writer,
+            resource_ledger,
+            resource_install_error: None,
             target,
             relation: plan.writer_multiplex_schema.clone(),
             partial_aggregate,
@@ -413,6 +418,8 @@ struct TableWriterOperator {
     name: String,
     projection: TableWriterInputProjection,
     writer: AsyncWriterOwner<WriterCompletion>,
+    resource_ledger: Arc<WriterResourceLedger>,
+    resource_install_error: Option<String>,
     target: WriteTargetOrdinal,
     relation: WriterMultiplexRelationSchema,
     partial_aggregate: Option<Box<dyn Operator>>,
@@ -494,6 +501,10 @@ impl Operator for TableWriterOperator {
     }
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        if let Err(error) = self.resource_ledger.install(Arc::clone(&tracker)) {
+            self.resource_install_error = Some(error);
+            return;
+        }
         self.writer.set_mem_tracker(Arc::clone(&tracker));
         let result_tracker = MemTracker::new_child("ConnectorWriterResult", &tracker);
         *self
@@ -528,6 +539,7 @@ impl Operator for TableWriterOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.resource_ledger.bind_runtime_state(state)?;
         self.target_multiplex_batch_bytes = state
             .execution_runtime()
             .map(|runtime| runtime.config().exchange_max_transmit_batched_bytes)
@@ -543,6 +555,14 @@ impl Operator for TableWriterOperator {
     }
 
     fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if let Some(error) = self.resource_install_error.as_ref() {
+            self.state = TableWriterState::Failed;
+            return Err(error.clone());
+        }
+        if let Err(error) = self.resource_ledger.ensure_installed() {
+            self.state = TableWriterState::Failed;
+            return Err(error);
+        }
         if let Some(partial) = self.partial_aggregate.as_mut() {
             partial.activate(state)?;
         }
@@ -1430,6 +1450,11 @@ pub(crate) mod tests {
     }
 
     fn bind(operator: &mut Box<dyn Operator>, state: &RuntimeState) {
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.prepare().expect("prepare");
         operator
             .bind_runtime_state(state)
@@ -1897,6 +1922,7 @@ pub(crate) mod tests {
         stats: Arc<WriteExecutionStats>,
         fragments_per_writer: usize,
         fragment_bytes: usize,
+        resource_bytes: u64,
         /// Every driver id this execution has been asked to open a writer for.
         pub driver_ids: std::sync::Mutex<Vec<u32>>,
         pub writer_rows: Arc<std::sync::Mutex<Vec<(u32, usize)>>>,
@@ -1909,9 +1935,15 @@ pub(crate) mod tests {
                 stats,
                 fragments_per_writer: 1,
                 fragment_bytes: 8,
+                resource_bytes: 0,
                 driver_ids: std::sync::Mutex::new(Vec::new()),
                 writer_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        pub fn with_resource_bytes(mut self, bytes: u64) -> Self {
+            self.resource_bytes = bytes;
+            self
         }
 
         pub fn with_fragments(mut self, count: usize, bytes: usize) -> Self {
@@ -1931,6 +1963,14 @@ pub(crate) mod tests {
             &self,
             request: ConnectorOpenWriterRequest,
         ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+            let resources = if self.resource_bytes == 0 {
+                None
+            } else {
+                Some(request.resources.try_reserve(
+                    novarocks_spi::connector::ConnectorResourceClass::WriterState,
+                    self.resource_bytes,
+                )?)
+            };
             self.stats.opened.fetch_add(1, Ordering::Relaxed);
             let driver_id = request.physical.driver_id();
             self.driver_ids
@@ -1944,6 +1984,7 @@ pub(crate) mod tests {
                 writer_rows: Arc::clone(&self.writer_rows),
                 fragments_per_writer: self.fragments_per_writer,
                 fragment_bytes: self.fragment_bytes,
+                _resources: resources,
             }))
         }
     }
@@ -1955,6 +1996,7 @@ pub(crate) mod tests {
         writer_rows: Arc<std::sync::Mutex<Vec<(u32, usize)>>>,
         fragments_per_writer: usize,
         fragment_bytes: usize,
+        _resources: Option<novarocks_spi::connector::ConnectorResourceReservation>,
     }
 
     #[async_trait::async_trait]
@@ -2155,6 +2197,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn writer_activation_without_admitted_tracker_fails_closed() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
+        let factory = writer_factory(&writer_node(execution));
+        let mut operator = factory.create(1, 0);
+        let state = test_runtime_state();
+        operator.prepare().expect("prepare");
+        operator.bind_runtime_state(&state).expect("bind");
+        assert!(
+            operator
+                .activate(&state)
+                .expect_err("missing tracker")
+                .contains("admitted task memory tracker")
+        );
+        assert_eq!(stats.opened.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn writer_provider_state_is_charged_to_its_exact_task_until_abort_converges() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution =
+            Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_resource_bytes(64));
+        let mut operator = writer_factory(&writer_node(execution)).create(1, 0);
+        let tracker = MemTracker::new_root("exact writer task");
+        let sibling = MemTracker::new_root("other task");
+        let state = test_runtime_state_with_mem(Some(Arc::clone(&tracker)));
+        bind(&mut operator, &state);
+        assert!(poll_until(
+            || stats.opened.load(Ordering::Acquire) == 1,
+            Duration::from_secs(5)
+        ));
+        assert_eq!(tracker.current(), 64);
+        assert_eq!(sibling.current(), 0);
+        operator.cancel();
+        assert!(poll_until(
+            || operator.pending_finish().is_none(),
+            Duration::from_secs(5)
+        ));
+        assert_eq!(stats.aborted.load(Ordering::Acquire), 1);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
     fn prepared_writer_does_not_open_provider_until_activation() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
@@ -2163,6 +2248,11 @@ pub(crate) mod tests {
         let state = test_runtime_state();
 
         operator.prepare().expect("prepare writer");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind writer");
         assert_eq!(stats.opened.load(Ordering::Acquire), 0);
 
@@ -2187,6 +2277,11 @@ pub(crate) mod tests {
         let state = test_runtime_state();
 
         operator.prepare().expect("prepare writer");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind writer");
         operator.cancel();
 
@@ -2264,6 +2359,11 @@ pub(crate) mod tests {
         }));
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
         ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![7, 11]))
@@ -2488,6 +2588,11 @@ pub(crate) mod tests {
         )));
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
 
@@ -2607,6 +2712,11 @@ pub(crate) mod tests {
         operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         operator.prepare().expect("prepare");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
         assert!(poll_until(
@@ -2693,6 +2803,11 @@ pub(crate) mod tests {
         operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         operator.prepare().expect("prepare");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
         assert!(poll_until(
@@ -2938,6 +3053,11 @@ pub(crate) mod tests {
         let mut operator = factory.create_operator(1, 0);
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
         ProcessorOperator::set_finishing(&mut operator, &state).expect("request finish");
@@ -3080,6 +3200,11 @@ pub(crate) mod tests {
         operator.set_profiles(profiles.clone());
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
+        operator.set_mem_tracker(
+            state
+                .mem_tracker()
+                .unwrap_or_else(|| MemTracker::new_root("test writer task")),
+        );
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
 
@@ -3194,7 +3319,10 @@ pub(crate) mod tests {
         let runtime_state = Arc::new(test_runtime_state_with_mem(Some(Arc::clone(&memory))));
         let factory = writer_factory(&writer_node(execution));
         let mut writer = factory.create(1, 0);
-        bind(&mut writer, runtime_state.as_ref());
+        writer.prepare().expect("prepare writer");
+        writer
+            .bind_runtime_state(runtime_state.as_ref())
+            .expect("bind writer");
         let mut driver = PipelineDriver::new(
             0,
             vec![

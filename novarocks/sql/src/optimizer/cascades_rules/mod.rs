@@ -47,6 +47,10 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::AssertOneRowToPhysical),
         Box::new(implement::TopNToPhysical), // NEW
         Box::new(implement::WindowToPhysical),
+        Box::new(implement::QuotaPreclaimToPhysical),
+        Box::new(implement::QuotaTrimToPhysical),
+        Box::new(implement::FanoutAnchorToPhysical),
+        Box::new(implement::FanoutConsumeToPhysical),
         Box::new(implement::CTEAnchorToPhysical),
         Box::new(implement::CTEProduceToPhysical),
         Box::new(implement::CTEConsumeToPhysical),

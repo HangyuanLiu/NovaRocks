@@ -26,8 +26,8 @@ use novarocks_spi::connector::{
     ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
     ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
-    ConnectorChangeWindowReplaceFailure, ConnectorError, ConnectorErrorKind,
-    ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorChangeWindowReplaceFailure, ConnectorContentNetZeroBasis, ConnectorError,
+    ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
 };
 
 use crate::iceberg::spec::{
@@ -38,7 +38,7 @@ use crate::resources::IcebergCatalogRuntime;
 
 #[derive(Debug)]
 enum LineageAdmission {
-    MetadataOnly,
+    ContentNetZero(ConnectorContentNetZeroBasis),
     Incremental,
     FullRebuild(ConnectorChangeWindowFullRebuildReason),
 }
@@ -63,7 +63,9 @@ pub(crate) fn plan_change_window(
         ));
     }
     match classify_lineage(metadata, from_exclusive, to_inclusive)? {
-        LineageAdmission::MetadataOnly => return Ok(ConnectorChangeWindowAdmission::MetadataOnly),
+        LineageAdmission::ContentNetZero(basis) => {
+            return Ok(ConnectorChangeWindowAdmission::ContentNetZero { basis });
+        }
         LineageAdmission::FullRebuild(reason) => {
             return Ok(ConnectorChangeWindowAdmission::FullRebuild(reason));
         }
@@ -151,7 +153,9 @@ fn endpoint_admission(
         }
     }
     if added.is_empty() && removed.is_empty() && !row_deletes {
-        return Ok(ConnectorChangeWindowAdmission::MetadataOnly);
+        return Ok(ConnectorChangeWindowAdmission::ContentNetZero {
+            basis: ConnectorContentNetZeroBasis::PhysicalIdentity,
+        });
     }
     Ok(ConnectorChangeWindowAdmission::Incremental {
         has_inserts: !added.is_empty(),
@@ -195,14 +199,16 @@ fn classify_lineage(
     from_exclusive: i64,
     to_inclusive: i64,
 ) -> Result<LineageAdmission, ConnectorError> {
-    if from_exclusive == to_inclusive {
-        return Ok(LineageAdmission::MetadataOnly);
-    }
     let Some(mut current) = metadata.snapshot_by_id(to_inclusive) else {
         return Err(corrupt(format!(
             "Iceberg change-window upper snapshot {to_inclusive} is missing from metadata"
         )));
     };
+    if from_exclusive == to_inclusive {
+        return Ok(LineageAdmission::ContentNetZero(
+            ConnectorContentNetZeroBasis::SameSnapshot,
+        ));
+    }
     if metadata.snapshot_by_id(from_exclusive).is_none() {
         return Ok(LineageAdmission::FullRebuild(
             ConnectorChangeWindowFullRebuildReason::LineageBroken {
@@ -220,7 +226,7 @@ fn classify_lineage(
             .map(|value| value.as_ref());
         match classify_snapshot(snapshot, parent)? {
             SnapshotDecision::Changed => changed = true,
-            SnapshotDecision::MetadataOnly => {}
+            SnapshotDecision::ValidatedReplace => {}
             SnapshotDecision::FullRebuild(reason) => {
                 return Ok(LineageAdmission::FullRebuild(reason));
             }
@@ -272,7 +278,7 @@ fn classify_lineage(
         }
     }
     Ok(if !changed {
-        LineageAdmission::MetadataOnly
+        LineageAdmission::ContentNetZero(ConnectorContentNetZeroBasis::ValidatedReplaceChain)
     } else {
         LineageAdmission::Incremental
     })
@@ -324,7 +330,7 @@ fn type_differs_only_by_field_names(previous: &Type, next: &Type) -> bool {
 
 enum SnapshotDecision {
     Changed,
-    MetadataOnly,
+    ValidatedReplace,
     FullRebuild(ConnectorChangeWindowFullRebuildReason),
 }
 
@@ -345,7 +351,7 @@ fn classify_snapshot(
             if let Some(failure) = validate_replace_snapshot(snapshot, parent)? {
                 SnapshotDecision::FullRebuild(unproven_replace(snapshot_id, failure))
             } else {
-                SnapshotDecision::MetadataOnly
+                SnapshotDecision::ValidatedReplace
             }
         }
     })
@@ -770,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_replace_is_metadata_only() {
+    fn valid_replace_establishes_content_net_zero() {
         let parent = snapshot(1, None, Operation::Append, &[("total-records", "100")], 0);
         let replace = snapshot(
             2,
@@ -785,7 +791,7 @@ mod tests {
         );
         assert!(matches!(
             classify_snapshot(&replace, Some(&parent)).expect("replace admission"),
-            SnapshotDecision::MetadataOnly
+            SnapshotDecision::ValidatedReplace
         ));
     }
 
@@ -830,11 +836,51 @@ mod tests {
     }
 
     #[test]
-    fn equal_endpoints_are_metadata_only_without_ordering_snapshot_identities() {
-        let metadata = metadata_with_snapshots(Vec::new());
+    fn equal_endpoints_have_same_snapshot_content_proof() {
+        let metadata = metadata_with_snapshots(vec![snapshot(41, None, Operation::Append, &[], 0)]);
         assert!(matches!(
             classify_lineage(&metadata, 41, 41).expect("equal endpoint admission"),
-            LineageAdmission::MetadataOnly
+            LineageAdmission::ContentNetZero(ConnectorContentNetZeroBasis::SameSnapshot)
+        ));
+    }
+
+    #[test]
+    fn validated_replace_chain_has_an_explicit_content_proof() {
+        let parent = snapshot(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let replace = |id, parent| {
+            snapshot(
+                id,
+                Some(parent),
+                Operation::Replace,
+                &[
+                    ("total-records", "100"),
+                    ("added-data-files", "3"),
+                    ("deleted-data-files", "2"),
+                ],
+                0,
+            )
+        };
+        let metadata = metadata_with_snapshots(vec![parent, replace(2, 1), replace(3, 2)]);
+        assert!(matches!(
+            classify_lineage(&metadata, 1, 3).unwrap(),
+            LineageAdmission::ContentNetZero(ConnectorContentNetZeroBasis::ValidatedReplaceChain)
+        ));
+    }
+
+    #[test]
+    fn physical_replacement_without_a_proof_requires_the_source_stream() {
+        let metadata = metadata_with_snapshots(vec![]);
+        let old = endpoint_file(&metadata, 10, 2, false);
+        let mut new = old.clone();
+        new.path = "replacement".to_owned();
+        // Identical row counts and column facts do not establish bag equality.
+        assert!(matches!(
+            endpoint_admission(&metadata, &[old], &[new], &request_context()).unwrap(),
+            ConnectorChangeWindowAdmission::Incremental {
+                has_inserts: true,
+                has_deletes: true,
+                ..
+            }
         ));
     }
 
@@ -848,6 +894,13 @@ mod tests {
                 from_snapshot_id: 1
             })
         ));
+    }
+
+    #[test]
+    fn absent_equal_endpoints_do_not_establish_a_same_snapshot_proof() {
+        let metadata = metadata_with_snapshots(Vec::new());
+        let error = classify_lineage(&metadata, 41, 41).expect_err("same snapshot must exist");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]
@@ -1022,7 +1075,9 @@ mod tests {
         assert_eq!(pruned.deletes.member_count(), 0);
         assert!(matches!(
             endpoint_admission(&metadata, &[from.clone()], &[pruned], &request_context()).unwrap(),
-            ConnectorChangeWindowAdmission::MetadataOnly
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: ConnectorContentNetZeroBasis::PhysicalIdentity
+            }
         ));
         let changed = endpoint_file(&metadata, 20, 3, false);
         assert!(matches!(
@@ -1041,7 +1096,9 @@ mod tests {
         let file = endpoint_file(&metadata, 10, 2, false);
         assert!(matches!(
             endpoint_admission(&metadata, &[], &[], &request_context()).unwrap(),
-            ConnectorChangeWindowAdmission::MetadataOnly
+            ConnectorChangeWindowAdmission::ContentNetZero {
+                basis: ConnectorContentNetZeroBasis::PhysicalIdentity
+            }
         ));
         assert!(matches!(
             endpoint_admission(&metadata, &[], &[file.clone()], &request_context()).unwrap(),
