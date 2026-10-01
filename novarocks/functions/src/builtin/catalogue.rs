@@ -1423,16 +1423,6 @@ fn utf8_constant(argument: Option<&FunctionArgument>) -> Option<&str> {
     }
 }
 
-fn int64_constant(argument: Option<&FunctionArgument>) -> Option<i64> {
-    match argument {
-        Some(FunctionArgument::Value {
-            constant: Some(crate::FunctionLiteral::Int64(value)),
-            ..
-        }) => Some(*value),
-        _ => None,
-    }
-}
-
 fn struct_field_type(
     data_type: &DataType,
     field_name: &str,
@@ -1657,11 +1647,6 @@ pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Opti
                 .into(),
         ),
         "null_or_empty" => DataType::Boolean,
-        "round" | "truncate" => match argument_types.first() {
-            Some(DataType::Decimal128(_, scale)) => DataType::Decimal128(38, *scale),
-            _ if argument_types.len() >= 2 => DataType::Float64,
-            _ => DataType::Int64,
-        },
         "row" | "struct" => DataType::Struct(
             argument_types
                 .iter()
@@ -1755,6 +1740,9 @@ fn bind_dynamic_scalar_result(
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FunctionValueType, FunctionBindingError> {
+    if matches!(name, "round" | "truncate") {
+        return super::rounding_binding::bind_result(name, request, work);
+    }
     if function_id.as_str() == "builtin.scalar/__array_literal/v1"
         && request.arguments.is_empty()
         && let Some(expected) = request.expected_result_type
@@ -1908,12 +1896,6 @@ fn bind_dynamic_scalar_result(
             result.ok_or(FunctionBindingError::UnknownFunction)?
         }
     };
-    if matches!(name, "round" | "truncate")
-        && let DataType::Decimal128(precision, scale) = result
-        && let Some(decimal_places) = int64_constant(request.arguments.get(1))
-    {
-        result = DataType::Decimal128(precision, (decimal_places as i8).max(0).min(scale));
-    }
     if matches!(name, "variant_get" | "try_variant_get") {
         if !(2..=3).contains(&request.arguments.len())
             || utf8_constant(request.arguments.get(1)).is_none()
@@ -2187,7 +2169,7 @@ fn bind_dynamic_scalar_result(
             }
         }
         "md5sum_numeric" | "xx_hash3_128" => full_result.logical_type = ValueLogicalType::LargeInt,
-        "array_generate" | "round" | "truncate" => {
+        "array_generate" => {
             let values = dynamic_values(request, work)?;
             if !observed_all(
                 values.into_iter(),
@@ -2215,7 +2197,9 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
+            if !matches!(self.canonical_name.as_ref(), "round" | "truncate") {
+                binding_control::request_types(request, work)?;
+            }
             if request.logical_argument_count != request.arguments.len() {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
@@ -2795,6 +2779,165 @@ mod tests {
             ],
         );
         assert_eq!(scalar_result(&variant).data_type, DataType::Int64);
+    }
+
+    #[test]
+    fn rounding_catalogue_keeps_actual_source_domains_in_fresh_and_frozen_bindings() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let encoded = DataType::Dictionary(
+            Box::new(DataType::UInt8),
+            Box::new(DataType::Decimal128(18, 6)),
+        );
+        // An encoded Decimal uses ROUND's cast path, not its outer Decimal
+        // branch. TRUNCATE's NumericArrayView does not decode that carrier.
+        let cases = [
+            (DataType::UInt64, true, false, DataType::Int64),
+            (DataType::Float16, true, false, DataType::Int64),
+            (DataType::Boolean, true, false, DataType::Int64),
+            (DataType::Utf8, true, false, DataType::Int64),
+            (DataType::Decimal256(76, 6), true, false, DataType::Int64),
+            (encoded, true, false, DataType::Int64),
+            (DataType::Date32, false, false, DataType::Int64),
+            (DataType::Float32, true, true, DataType::Int64),
+            (DataType::Null, true, true, DataType::Int64),
+            (
+                DataType::Decimal128(18, 6),
+                true,
+                true,
+                DataType::Decimal128(38, 6),
+            ),
+        ];
+        for (source, round, truncate, expected) in cases {
+            for (name, admitted) in [("round", round), ("truncate", truncate)] {
+                let arguments = [value_argument(source.clone(), true, None)];
+                let request = FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                };
+                let result = catalog.resolve_bound_user(
+                    name,
+                    FunctionKind::Scalar,
+                    request,
+                    crate::binding_test_control(),
+                );
+                if !admitted {
+                    assert!(result.is_err(), "{name} must reject {source:?}");
+                    continue;
+                }
+                let binding = result.unwrap();
+                assert_eq!(
+                    scalar_result(&binding),
+                    &FunctionValueType::new(expected.clone(), true)
+                );
+                assert_eq!(
+                    binding.selected.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(FunctionValueType::new(
+                        source.clone(),
+                        true,
+                    ))]
+                );
+                catalog
+                    .validate_bound(&binding, request, crate::binding_test_control())
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rounding_catalogue_has_one_result_author_and_refuses_forged_frozen_scale() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for name in ["round", "truncate"] {
+            for (digits, scale) in [(2, 2), (-1, 0), (128, 0), (256, 0), (258, 2)] {
+                let arguments = [
+                    value_argument(DataType::Decimal128(18, 6), false, None),
+                    value_argument(
+                        DataType::Int64,
+                        false,
+                        Some(crate::FunctionLiteral::Int64(digits)),
+                    ),
+                ];
+                let expected_override = FunctionValueType::new(DataType::Int32, false);
+                let request = FunctionBindingRequest {
+                    expected_result_type: Some(&expected_override),
+                    arguments: &arguments,
+                    logical_argument_count: 2,
+                };
+                let mut binding = catalog
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        request,
+                        crate::binding_test_control(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    scalar_result(&binding),
+                    &FunctionValueType::new(DataType::Decimal128(38, scale), true)
+                );
+                catalog
+                    .validate_bound(&binding, request, crate::binding_test_control())
+                    .unwrap();
+                binding.selected.result_type = FunctionResultType::Scalar(FunctionValueType::new(
+                    DataType::Decimal128(38, 5),
+                    true,
+                ));
+                assert!(
+                    catalog
+                        .validate_bound(&binding, request, crate::binding_test_control())
+                        .is_err(),
+                    "{name} must refuse a foreign result scale"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounding_catalogue_checks_shared_carrier_grammar_before_cast_authoring() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let field = |ty, nullable| Arc::new(arrow_schema::Field::new("v", ty, nullable));
+        let invalid_sources = [
+            DataType::Decimal128(0, 0),
+            DataType::Decimal256(77, 0),
+            DataType::Dictionary(Box::new(DataType::Float64), Box::new(DataType::Float64)),
+            DataType::RunEndEncoded(field(DataType::Int32, true), field(DataType::Float64, true)),
+            DataType::Union(
+                [
+                    (7, field(DataType::Float64, true)),
+                    (7, field(DataType::Utf8, true)),
+                ]
+                .into_iter()
+                .collect(),
+                arrow_schema::UnionMode::Dense,
+            ),
+            // Even an unselected child is required to be a valid carrier.
+            DataType::Union(
+                [
+                    (7, field(DataType::Float64, true)),
+                    (1, field(DataType::Decimal128(0, 0), true)),
+                ]
+                .into_iter()
+                .collect(),
+                arrow_schema::UnionMode::Dense,
+            ),
+        ];
+        for source in invalid_sources {
+            let arguments = [value_argument(source, true, None)];
+            let result = catalog.resolve_bound_user(
+                "round",
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+                crate::binding_test_control(),
+            );
+            assert!(matches!(
+                result,
+                Err(FunctionBindingError::InvalidBinding(_))
+            ));
+        }
     }
 
     #[test]

@@ -3056,16 +3056,6 @@ impl<'a> super::AnalyzerContext<'a> {
                     return_type = DataType::Struct(fields.into());
                 }
             }
-            // For round/truncate with decimal input and constant 2nd arg,
-            // use the target decimal places as the output scale.
-            if matches!(name.as_str(), "round" | "truncate")
-                && let DataType::Decimal128(p, s) = &return_type
-                && args_typed.len() >= 2
-                && let ExprKind::Literal(LiteralValue::Int(d)) = &args_typed[1].kind
-            {
-                let target = (*d as i8).max(0).min(*s);
-                return_type = DataType::Decimal128(*p, target);
-            }
             // variant_get / try_variant_get: the path argument and optional
             // 3rd result-type argument are string literals (Spark-aligned).
             // Surface the type argument as the expression's static type;

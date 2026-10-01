@@ -103,6 +103,11 @@ impl From<novarocks_type_contract::ValueTypeError> for KernelFailure {
         type_failure(error)
     }
 }
+impl From<novarocks_type_contract::CarrierParameterError> for KernelFailure {
+    fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
+        invalid(&error.to_string())
+    }
+}
 
 impl From<crate::EvaluationContractError> for KernelFailure {
     fn from(_: crate::EvaluationContractError) -> Self {

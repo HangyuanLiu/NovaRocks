@@ -203,10 +203,15 @@ pub fn validate_type_observed(
     validate_value_type_structure_observed(&value.data_type, |visit| {
         work.step().map_err(compile_failure)?;
         match visit {
-            ValueTypeVisit::TypeNode(DataType::Timestamp(_, Some(zone)))
-                if zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES =>
-            {
-                return Err(KernelFailure::ResourceExhausted);
+            ValueTypeVisit::TypeNode(ty) => {
+                if let DataType::Timestamp(_, Some(zone)) = ty
+                    && zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
+                {
+                    return Err(KernelFailure::ResourceExhausted);
+                }
+                validate_arrow_carrier_parameters_observed::<KernelFailure>(ty, || {
+                    work.step().map_err(compile_failure)
+                })?;
             }
             ValueTypeVisit::Field(field) => {
                 if field.name().len() > MAX_ARROW_FIELD_NAME_BYTES

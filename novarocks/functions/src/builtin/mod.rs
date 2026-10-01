@@ -46,3 +46,4 @@ mod numeric_unary;
 mod numeric_unary_owner;
 mod rand;
 mod rand_owner;
+mod rounding_binding;

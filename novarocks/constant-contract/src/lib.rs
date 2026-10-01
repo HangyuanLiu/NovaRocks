@@ -30,10 +30,11 @@ mod selected_scalar;
 
 use arrow_array::{Array, ArrayRef, make_array};
 use arrow_data::ArrayData;
-use arrow_schema::{DataType, Field, TimeUnit, UnionMode};
+use arrow_schema::{DataType, Field, UnionMode};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-    ValueTypeError, ValueTypeVisit,
+    CarrierParameterError, CompileCheckpoints, CompileControlError, CompilePhase,
+    FunctionValueType, PureCompileControl, ValueTypeError, ValueTypeVisit,
+    validate_arrow_carrier_parameters_observed,
 };
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
@@ -90,6 +91,14 @@ impl From<ValueTypeError> for ConstantError {
 impl From<CompileControlError> for ConstantError {
     fn from(value: CompileControlError) -> Self {
         Self::Control(value)
+    }
+}
+impl From<CarrierParameterError> for ConstantError {
+    fn from(value: CarrierParameterError) -> Self {
+        match value {
+            CarrierParameterError::Invalid(message) => Self::Invalid(message),
+            CarrierParameterError::Decimal(error) => Self::Arrow(error.to_string()),
+        }
     }
 }
 impl fmt::Display for ConstantError {
@@ -372,7 +381,9 @@ fn validate_type(
             work.step()?;
             match visit {
                 ValueTypeVisit::TypeNode(t) => {
-                    validate_carrier_parameters(t, work)?;
+                    validate_arrow_carrier_parameters_observed::<ConstantError>(t, || {
+                        work.step().map_err(Into::into)
+                    })?;
                     nodes = checked_add(nodes, 1)?;
                     limit(
                         nodes,
@@ -505,7 +516,9 @@ fn scan_data(
         novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
         "constant array exceeds intrinsic Arrow type depth",
     )?;
-    validate_carrier_parameters(data.data_type(), work)?;
+    validate_arrow_carrier_parameters_observed::<ConstantError>(data.data_type(), || {
+        work.step().map_err(Into::into)
+    })?;
     let expected_children = match data.data_type() {
         DataType::Struct(fields) => fields.len(),
         DataType::Union(fields, _) => fields.len(),
@@ -1780,79 +1793,6 @@ fn factory_preflight(
     Ok(())
 }
 
-fn validate_carrier_parameters(
-    ty: &DataType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ConstantError> {
-    use arrow_array::types::*;
-    let decimal = match ty {
-        DataType::Decimal32(p, s) => Some(validate_decimal_precision_and_scale::<Decimal32Type>(
-            *p, *s,
-        )),
-        DataType::Decimal64(p, s) => Some(validate_decimal_precision_and_scale::<Decimal64Type>(
-            *p, *s,
-        )),
-        DataType::Decimal128(p, s) => Some(validate_decimal_precision_and_scale::<Decimal128Type>(
-            *p, *s,
-        )),
-        DataType::Decimal256(p, s) => Some(validate_decimal_precision_and_scale::<Decimal256Type>(
-            *p, *s,
-        )),
-        _ => None,
-    };
-    if let Some(result) = decimal {
-        result.map_err(|e| ConstantError::Arrow(e.to_string()))?;
-    }
-    let invalid = match ty {
-        DataType::Time32(unit) => !matches!(unit, TimeUnit::Second | TimeUnit::Millisecond),
-        DataType::Time64(unit) => !matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond),
-        DataType::FixedSizeBinary(width) | DataType::FixedSizeList(_, width) => *width < 0,
-        DataType::Dictionary(key, _) => !matches!(
-            key.as_ref(),
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-        ),
-        DataType::RunEndEncoded(ends, _) => {
-            ends.is_nullable()
-                || !matches!(
-                    ends.data_type(),
-                    DataType::Int16 | DataType::Int32 | DataType::Int64
-                )
-        }
-        DataType::Map(entries, _) => {
-            entries.is_nullable()
-                || !matches!(entries.data_type(), DataType::Struct(fields) if fields.len() == 2 && !fields[0].is_nullable())
-        }
-        DataType::Union(fields, _) => {
-            if fields.len() > 128 {
-                return Err(ConstantError::Invalid("too many Union type ids"));
-            }
-            let mut ids = [false; 128];
-            for (id, _) in fields.iter() {
-                work.step()?;
-                if id < 0 || ids[id as usize] {
-                    return Err(ConstantError::Invalid("invalid or duplicate Union type id"));
-                }
-                ids[id as usize] = true;
-            }
-            false
-        }
-        _ => false,
-    };
-    if invalid {
-        Err(ConstantError::Invalid(
-            "invalid Arrow constant carrier parameters",
-        ))
-    } else {
-        Ok(())
-    }
-}
 fn validate_decimal_value(row: Row<'_>) -> Result<(), ConstantError> {
     use arrow_array::types::*;
     let result = match row.data.data_type() {

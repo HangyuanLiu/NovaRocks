@@ -413,6 +413,258 @@ fn projection(sql: &str) -> crate::analysis::TypedExpr {
     select.projection.remove(0).expr
 }
 
+#[test]
+fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
+    use novarocks_functions::FunctionResultType;
+
+    for name in ["round", "truncate"] {
+        for (digits, expected_scale) in [
+            (Some("2"), 2),
+            (Some("-1"), 0),
+            (Some("128"), 0),
+            (Some("256"), 0),
+            (Some("digits"), 6),
+            (Some("CAST(NULL AS BIGINT)"), 6),
+            (None, 6),
+        ] {
+            let arguments = match digits {
+                Some(digits) => format!("decimal_value, {digits}"),
+                None => "decimal_value".to_string(),
+            };
+            let sql = format!(
+                "SELECT round({arguments}) FROM \
+                 (SELECT CAST(1.234 AS DECIMAL(18, 6)) AS decimal_value, 2 AS digits) source"
+            );
+            let mut statements = novarocks_parser::parse(&sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
+                panic!("expected the decimal call query");
+            };
+            if name == "truncate" {
+                // TRUNCATE is a statement keyword in the current parser. Rename
+                // only this call AST to isolate the analyzer contract regression.
+                let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                    panic!("expected the decimal call projection");
+                };
+                let Some(ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call))) =
+                    select.projection.first_mut()
+                else {
+                    panic!("expected the ordinary scalar call AST");
+                };
+                call.name.parts.last_mut().unwrap().value = "truncate".to_string();
+            }
+            let resolved = super::analyze(query, &SourceCatalog, "default").unwrap().0;
+            let QueryBody::Select(mut select) = resolved.body else {
+                panic!("expected the analyzed decimal call projection");
+            };
+            let expression = select.projection.remove(0).expr;
+            let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+                panic!("expected the actual selected decimal call: {sql}");
+            };
+            assert_eq!(args[0].value_type.data_type, DataType::Decimal128(18, 6));
+            assert_eq!(args[0].value_type.logical_type, ValueLogicalType::Physical);
+            if digits == Some("digits") {
+                assert!(matches!(args[1].kind, ExprKind::ColumnRef { .. }));
+            }
+            let expected = FunctionValueType::new(DataType::Decimal128(38, expected_scale), true);
+            let FunctionResultType::Scalar(selected) = &binding.selected.result_type else {
+                panic!("decimal scalar selected a relation result: {sql}");
+            };
+            assert_eq!(selected, &expected, "independent decimal shape: {sql}");
+            assert_eq!(
+                &expression.value_type, selected,
+                "exact result owner: {sql}"
+            );
+            assert_eq!(
+                binding.function_id.as_str(),
+                format!("builtin.scalar/{name}/v1"),
+                "the real builtin must author the selected result: {sql}"
+            );
+        }
+    }
+}
+
+/// This fixture's declared scalar preserves the source scale and ignores the
+/// digits value. Its spelling does not grant the builtin ROUND result policy.
+struct ScalePreservingRoundResolver;
+
+impl ScalePreservingRoundResolver {
+    fn selection(
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        novarocks_functions::FunctionBindingSelection,
+        novarocks_functions::FunctionBindingError,
+    > {
+        use novarocks_functions::{
+            FunctionArgument, FunctionArgumentType, FunctionBindingError, FunctionBindingSelection,
+            FunctionOverloadId, FunctionResultType,
+        };
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            CompilePhase::FunctionSpecialization,
+        )?;
+        let result = (|| {
+            let [
+                FunctionArgument::Value {
+                    value_type: source, ..
+                },
+                FunctionArgument::Value {
+                    value_type: digits, ..
+                },
+            ] = request.arguments
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            work.step()?;
+            if request.logical_argument_count != 2
+                || request.expected_result_type.is_some()
+                || source.logical_type != ValueLogicalType::Physical
+                || source.data_type != DataType::Decimal128(18, 6)
+                || digits.logical_type != ValueLogicalType::Physical
+                || !matches!(
+                    digits.data_type,
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                )
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            work.step()?;
+            Ok(FunctionBindingSelection {
+                overload: FunctionOverloadId::try_new("test.scalar/scale_preserving_round/0/v1")
+                    .unwrap(),
+                argument_types: vec![
+                    FunctionArgumentType::Value(source.clone()),
+                    FunctionArgumentType::Value(digits.clone()),
+                ]
+                .into_boxed_slice(),
+                result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                    DataType::Decimal128(38, 6),
+                    true,
+                )),
+                aggregate: None,
+            })
+        })();
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.control_error().is_some())
+        {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+}
+
+impl novarocks_functions::FunctionBindingResolver for ScalePreservingRoundResolver {
+    fn resolve(
+        &self,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        novarocks_functions::FunctionBindingSelection,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Self::selection(request, control)
+    }
+
+    fn validate_selected(
+        &self,
+        selected: &novarocks_functions::FunctionBindingSelection,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        if selected == &Self::selection(request, control)? {
+            Ok(())
+        } else {
+            Err(novarocks_functions::FunctionBindingError::NoMatchingOverload)
+        }
+    }
+}
+
+#[test]
+fn same_spelling_custom_round_result_is_not_reauthored_by_analyzer() {
+    use novarocks_functions::{
+        EngineFunctionCatalogBuilder, FunctionBindingDeclaration, FunctionDefinition,
+        FunctionFailureBehavior, FunctionId, FunctionKind, FunctionOverloadDeclaration,
+        FunctionOverloadId, FunctionResultType, FunctionVisibility, FunctionVolatility,
+    };
+    use novarocks_type_contract::{
+        ArgumentControl, FunctionEffectDeclaration, FunctionInstanceState,
+        FunctionIntrinsicRowError, FunctionNullBehavior, ObservableEffects,
+    };
+
+    let identity = FunctionId::try_new("test.scalar/scale_preserving_round/v1").unwrap();
+    let declaration = FunctionBindingDeclaration::try_new_complete(
+        identity.clone(),
+        FunctionKind::Scalar,
+        [FunctionOverloadDeclaration::from_effects(
+            FunctionOverloadId::try_new("test.scalar/scale_preserving_round/0/v1").unwrap(),
+            "Physical Decimal128(18,6), Physical signed integer",
+            "Physical Decimal128(38,6), nullable; preserve the source scale",
+            None,
+            FunctionEffectDeclaration {
+                value_stability: FunctionVolatility::Immutable,
+                own_row_error: FunctionIntrinsicRowError::NoRowError,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                null_behavior: FunctionNullBehavior::Strict,
+                argument_control: ArgumentControl::Eager,
+                instance_state: FunctionInstanceState::None,
+                observable_effects: ObservableEffects::NONE,
+                environment_dependencies: Box::new([]),
+            },
+        )],
+    )
+    .unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(
+            FunctionDefinition::try_new_bound(
+                "round",
+                FunctionVisibility::Public,
+                declaration,
+                Arc::new(ScalePreservingRoundResolver),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let catalog = builder.seal_bound().unwrap();
+    let statements =
+        novarocks_parser::parse("SELECT round(CAST(1.234 AS DECIMAL(18, 6)), 2)").unwrap();
+    let [ast::Statement::Query(query)] = statements.as_slice() else {
+        panic!("expected the custom round query");
+    };
+    let resolved = super::analyze_with_function_catalog(
+        query,
+        &SourceCatalog,
+        "default",
+        &catalog,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap()
+    .0;
+    let QueryBody::Select(select) = resolved.body else {
+        panic!("expected the custom round projection");
+    };
+    let expression = &select.projection[0].expr;
+    let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+        panic!("expected the custom selected round call");
+    };
+    assert_eq!(binding.function_id, identity);
+    assert!(matches!(
+        args[1].kind,
+        ExprKind::Literal(crate::analysis::LiteralValue::Int(2))
+    ));
+    let FunctionResultType::Scalar(selected) = &binding.selected.result_type else {
+        panic!("custom round must select a scalar");
+    };
+    assert_eq!(
+        selected,
+        &FunctionValueType::new(DataType::Decimal128(38, 6), true)
+    );
+    assert_eq!(&expression.value_type, selected);
+}
+
 fn assert_selected_conversion(expression: &crate::analysis::TypedExpr, suffix: &str) {
     let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
         panic!(

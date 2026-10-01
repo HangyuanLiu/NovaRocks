@@ -18,6 +18,7 @@
 use super::*;
 use arrow_array::types::Int8Type;
 use arrow_array::{DictionaryArray, Float64Array, Int8Array, Int64Array, StringArray};
+use arrow_schema::TimeUnit;
 use std::sync::Mutex;
 
 struct Control {
@@ -75,6 +76,32 @@ fn pool(array: ArrayRef, nullable: bool) -> ConstantPool {
 fn eq(l: &ConstantValue, r: &ConstantValue) -> bool {
     l.equals_observed(r, CompilePhase::Validate, &Control::good())
         .unwrap()
+}
+
+#[test]
+fn shared_decimal_parameter_grammar_matches_arrow_for_every_precision_and_scale() {
+    use arrow_array::types::{
+        Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType,
+        validate_decimal_precision_and_scale,
+    };
+    fn compare<T: DecimalType>(constructor: fn(u8, i8) -> DataType) {
+        for precision in u8::MIN..=u8::MAX {
+            for scale in i8::MIN..=i8::MAX {
+                let actual = validate_arrow_carrier_parameters_observed::<ConstantError>(
+                    &constructor(precision, scale),
+                    || Ok(()),
+                )
+                .map_err(|error| error.to_string());
+                let expected = validate_decimal_precision_and_scale::<T>(precision, scale)
+                    .map_err(|error| error.to_string());
+                assert_eq!(actual, expected, "precision={precision}, scale={scale}");
+            }
+        }
+    }
+    compare::<Decimal32Type>(DataType::Decimal32);
+    compare::<Decimal64Type>(DataType::Decimal64);
+    compare::<Decimal128Type>(DataType::Decimal128);
+    compare::<Decimal256Type>(DataType::Decimal256);
 }
 
 #[test]

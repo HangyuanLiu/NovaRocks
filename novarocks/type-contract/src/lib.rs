@@ -22,6 +22,7 @@
 
 mod arithmetic;
 mod array_generate;
+mod carrier_parameters;
 mod coercion;
 mod comparison;
 mod comparison_coercion;
@@ -48,6 +49,7 @@ pub use arithmetic::{
     is_checked_decimal_numeric_cast,
 };
 pub use array_generate::array_generate_item_type;
+pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
 pub use coercion::wider_type;
 pub use comparison::OrderedComparisonAlgorithm;
 pub use comparison_coercion::{
