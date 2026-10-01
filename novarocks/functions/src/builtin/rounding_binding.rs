@@ -23,7 +23,7 @@ use crate::{
     FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionLiteral,
     FunctionValueType,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, UnionFields};
 use novarocks_type_contract::{
     CompileCheckpoints, MAX_VALUE_TYPE_DEPTH, ValueLogicalType, field_logical_type,
 };
@@ -98,6 +98,39 @@ fn field_probe(
     )
 }
 
+/// The single Union-path author for binding and immutable cast recipes.
+/// `child_depth` is the depth of each field, including nested encoded fields.
+/// The result borrows the selected field and reports nominal identity after
+/// Arrow's carrier choice; nominal identity never chooses another sibling.
+pub(super) fn select_union_cast_field<'a>(
+    fields: &'a UnionFields,
+    target: CastTarget,
+    child_depth: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(i8, &'a Field, CastCapability)>, FunctionBindingError> {
+    // Arrow iterates declaration order, including non-monotonic type IDs.
+    for pass in 0..3 {
+        work.step()?;
+        for (type_id, field) in fields.iter() {
+            work.step()?;
+            let capability = match pass {
+                0 if target.exact(field.data_type()) => {
+                    field_probe(field, target, child_depth, work)?
+                }
+                1 if target.same_family(field.data_type()) => {
+                    field_probe(field, target, child_depth, work)?
+                }
+                2 => field_probe(field, target, child_depth, work)?,
+                _ => CastCapability::Unavailable,
+            };
+            if capability != CastCapability::Unavailable {
+                return Ok(Some((type_id, field, capability)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Mirrors Arrow's scalar cast-path choice, ignoring nominal metadata while
 /// choosing a child, then retaining the selected path's logical identity.
 /// The caller must first run the shared observed full-type preflight.
@@ -118,34 +151,8 @@ pub(super) fn cast_capability(
         }
         DataType::RunEndEncoded(_, value) => field_probe(value, target, depth + 1, work)?,
         DataType::FixedSizeList(value, 1) => field_probe(value, target, depth + 1, work)?,
-        DataType::Union(fields, _) => {
-            let mut chosen = CastCapability::Unavailable;
-            // Preserve field iteration order, including non-monotonic tags.
-            for pass in 0..3 {
-                work.step()?;
-                for (_, field) in fields.iter() {
-                    work.step()?;
-                    let candidate = match pass {
-                        0 if target.exact(field.data_type()) => {
-                            field_probe(field, target, depth + 1, work)?
-                        }
-                        1 if target.same_family(field.data_type()) => {
-                            field_probe(field, target, depth + 1, work)?
-                        }
-                        2 => field_probe(field, target, depth + 1, work)?,
-                        _ => CastCapability::Unavailable,
-                    };
-                    if candidate != CastCapability::Unavailable {
-                        chosen = candidate;
-                        break;
-                    }
-                }
-                if chosen != CastCapability::Unavailable {
-                    break;
-                }
-            }
-            chosen
-        }
+        DataType::Union(fields, _) => select_union_cast_field(fields, target, depth + 1, work)?
+            .map_or(CastCapability::Unavailable, |(_, _, capability)| capability),
         // No recursive Arrow probe or nominal carrier inference for containers.
         DataType::List(_)
         | DataType::LargeList(_)
@@ -322,6 +329,88 @@ mod tests {
             cast_capability(source, ValueLogicalType::Physical, target, 1, work)
         })
         .unwrap()
+    }
+    #[test]
+    fn shared_union_path_returns_the_original_tag_and_borrowed_field() {
+        for (target, types, expected_tag) in [
+            (
+                CastTarget::Float64,
+                [DataType::Float32, DataType::Float64],
+                1,
+            ),
+            (CastTarget::Int64, [DataType::Int32, DataType::Int64], 1),
+            (CastTarget::Float64, [DataType::Utf8, DataType::Float32], 1),
+            (
+                CastTarget::Float64,
+                [DataType::Boolean, DataType::UInt64],
+                7,
+            ),
+        ] {
+            let source = union(
+                types
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, ty)| Field::new(format!("child{i}"), ty, true))
+                    .collect(),
+            );
+            let DataType::Union(fields, _) = &source else {
+                unreachable!()
+            };
+            let (tag, chosen, capability) =
+                binding_control::scope(crate::binding_test_control(), |work| {
+                    binding_control::value_type(
+                        &FunctionValueType::new(source.clone(), true),
+                        work,
+                    )?;
+                    select_union_cast_field(fields, target, 2, work)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(tag, expected_tag);
+            assert_eq!(capability, CastCapability::Physical);
+            let original = fields.iter().find(|(id, _)| *id == tag).unwrap().1;
+            assert!(std::ptr::eq(chosen, original.as_ref()));
+            assert_eq!(probe(&source, target), capability);
+        }
+    }
+    #[test]
+    fn shared_union_path_keeps_chosen_nominal_identity_and_no_match() {
+        let source = union(vec![json_field(), Field::new("text", DataType::Utf8, true)]);
+        let DataType::Union(fields, _) = &source else {
+            unreachable!()
+        };
+        let (tag, chosen, capability) =
+            binding_control::scope(crate::binding_test_control(), |work| {
+                binding_control::value_type(&FunctionValueType::new(source.clone(), true), work)?;
+                select_union_cast_field(fields, CastTarget::Float64, 2, work)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag, 7);
+        assert!(std::ptr::eq(
+            chosen,
+            fields.iter().next().unwrap().1.as_ref()
+        ));
+        assert_eq!(capability, CastCapability::NonPhysical);
+        assert_eq!(probe(&source, CastTarget::Float64), capability);
+
+        let source = union(vec![
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("more_bytes", DataType::LargeBinary, true),
+        ]);
+        let DataType::Union(fields, _) = &source else {
+            unreachable!()
+        };
+        let choice = binding_control::scope(crate::binding_test_control(), |work| {
+            binding_control::value_type(&FunctionValueType::new(source.clone(), true), work)?;
+            select_union_cast_field(fields, CastTarget::Int64, 2, work)
+        })
+        .unwrap();
+        assert!(choice.is_none());
+        assert_eq!(
+            probe(&source, CastTarget::Int64),
+            CastCapability::Unavailable
+        );
     }
     #[test]
     fn actual_primitive_round_capability_matches_arrow_for_each_target() {
