@@ -253,33 +253,17 @@ pub fn connector_table_materialization_from_metadata(
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
-    use novarocks_spi::connector::{
-        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
-    };
+    use novarocks_spi::connector::{ConnectorTableColumnRole, ConnectorTableColumnVisibility};
 
     let mut columns = Vec::new();
     let mut row_lineage_metadata_columns = Vec::new();
     for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
         let fact = metadata.planning_facts.column_facts().get(ordinal);
-        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
-            Some(ConnectorTableColumnSemanticKind::Bitmap) => {
-                Some(novarocks_types::schema::SqlType::Bitmap)
-            }
-            Some(ConnectorTableColumnSemanticKind::Hll) => {
-                Some(novarocks_types::schema::SqlType::Hll)
-            }
-            _ => None,
-        };
-        let column = novarocks_types::schema::ColumnDef {
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: crate::connector::connector_write_default_at(
-                &metadata.planning_facts,
-                ordinal,
-            ),
-            logical_type,
-        };
+        let column = crate::connector::sql_column_from_connector_field(
+            field,
+            &metadata.planning_facts,
+            ordinal,
+        )?;
         match fact.map(|fact| fact.role()) {
             Some(ConnectorTableColumnRole::RowLineageSystem) => {
                 row_lineage_metadata_columns.push(column)

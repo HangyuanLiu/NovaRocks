@@ -149,15 +149,13 @@ impl StatisticsCollectionProgram {
                 "statistics requirements contain duplicate artifact identities",
             ));
         }
-        let mut inputs = BTreeMap::<usize, (&str, &DataType, bool)>::new();
+        let mut inputs =
+            BTreeMap::<usize, (&str, &novarocks_type_contract::FunctionValueType)>::new();
         for requirement in &required {
             let input = requirement.input();
-            if let Some((name, data_type, nullable)) = inputs.insert(
-                input.ordinal(),
-                (input.name(), input.data_type(), input.nullable()),
-            ) && (name != input.name()
-                || data_type != input.data_type()
-                || nullable != input.nullable())
+            if let Some((name, value_type)) =
+                inputs.insert(input.ordinal(), (input.name(), input.value_type()))
+                && (name != input.name() || value_type != input.value_type())
             {
                 return Err(contract_violation(
                     "statistics requirements disagree on a scan column ordinal",
@@ -440,8 +438,13 @@ fn admit_statistics_scan_binding(
         program
             .scan_columns()
             .iter()
-            .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
-            .collect::<Vec<_>>(),
+            .map(|column| {
+                column
+                    .value_type()
+                    .try_to_field(column.name())
+                    .map_err(|error| contract_violation(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     ));
     let scan_identity =
         novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
@@ -691,6 +694,138 @@ mod tests {
     fn identity(field_id: i32, blob_type: &str) -> StatisticsArtifactIdentity {
         StatisticsArtifactIdentity::try_new(vec![field_id], Arc::<str>::from(blob_type))
             .expect("identity")
+    }
+
+    fn collection_requirement(
+        value_type: novarocks_type_contract::FunctionValueType,
+        field_id: i32,
+    ) -> novarocks_spi::connector::StatisticsRequiredAggregation {
+        novarocks_spi::connector::StatisticsRequiredAggregation::try_new(
+            novarocks_spi::connector::StatisticsScanColumn::try_new(0, "v", value_type)
+                .expect("checked scan column"),
+            "$test_stat",
+            identity(field_id, "test/blob"),
+        )
+        .expect("checked statistics requirement")
+    }
+
+    fn collection_program(
+        required: Vec<novarocks_spi::connector::StatisticsRequiredAggregation>,
+    ) -> Result<super::StatisticsCollectionProgram, super::DistributedQueryError> {
+        use bytes::Bytes;
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorTableHandle, StatisticsDataVersion,
+        };
+
+        super::StatisticsCollectionProgram::try_new(
+            ConnectorTableHandle::try_new(
+                ConnectorInstanceId::parse("statistics_value_type_test").expect("instance id"),
+                Bytes::from_static(b"table"),
+            )
+            .expect("checked table handle"),
+            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))
+                .expect("checked data version"),
+            Some(7),
+            required,
+            super::StatisticsExecutionPolicy::try_new(
+                super::StatisticsExecutionMode::SynchronousWait,
+                std::time::Duration::from_secs(30),
+            )
+            .expect("bounded attempt policy"),
+        )
+    }
+
+    #[test]
+    fn statistics_program_keeps_exact_tagged_scan_columns() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        for (carrier, logical) in [
+            (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+            (DataType::LargeBinary, ValueLogicalType::Variant),
+        ] {
+            let authored = FunctionValueType::try_with_logical_type(carrier, true, logical)
+                .expect("authored source type");
+            let field = authored.try_to_field("v").expect("tagged source field");
+            let source = FunctionValueType::try_from_field(&field).expect("exact field projection");
+            assert_eq!(source, authored);
+            let program = collection_program(vec![
+                collection_requirement(source.clone(), 1),
+                collection_requirement(source.clone(), 2),
+            ])
+            .expect("same ordinal and exact type can serve distinct artifacts");
+            assert_eq!(program.required_aggregations().len(), 2);
+            assert_eq!(program.read_version_ordinal(), 7);
+            let columns = program.scan_columns();
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].ordinal(), 0);
+            assert_eq!(columns[0].value_type(), &source);
+            assert_eq!(
+                columns[0]
+                    .value_type()
+                    .try_to_field("v")
+                    .expect("scan schema"),
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_program_rejects_same_ordinal_with_a_different_root_domain() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        for (carrier, logical) in [
+            (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+            (DataType::LargeBinary, ValueLogicalType::Variant),
+        ] {
+            let semantic = FunctionValueType::try_with_logical_type(carrier.clone(), true, logical)
+                .expect("authored semantic source");
+            let physical = FunctionValueType::new(carrier, true);
+            for (first, second) in [(semantic.clone(), physical.clone()), (physical, semantic)] {
+                let error = collection_program(vec![
+                    collection_requirement(first, 1),
+                    collection_requirement(second, 2),
+                ])
+                .err()
+                .expect("same carrier and nullability cannot hide a root conflict");
+                assert_eq!(
+                    error.kind(),
+                    super::DistributedQueryErrorKind::ContractViolation
+                );
+                assert_eq!(
+                    error.message(),
+                    "statistics requirements disagree on a scan column ordinal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_scan_field_admission_rejects_unknown_and_wrong_tags() {
+        use novarocks_type_contract::{
+            FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType, ValueTypeError,
+        };
+
+        for (carrier, tag, expected) in [
+            (
+                DataType::FixedSizeBinary(16),
+                "unknown",
+                ValueTypeError::UnknownLogicalMetadata,
+            ),
+            (
+                DataType::LargeBinary,
+                "uuid",
+                ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Uuid),
+            ),
+            (
+                DataType::FixedSizeBinary(16),
+                "variant",
+                ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Variant),
+            ),
+        ] {
+            let field = Field::new("v", carrier, true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into());
+            assert_eq!(FunctionValueType::try_from_field(&field), Err(expected));
+        }
     }
 
     fn chunk(rows: &[(&[i32], &str, &[u8], &[(&str, &str)])]) -> Chunk {

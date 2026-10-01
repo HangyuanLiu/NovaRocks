@@ -122,7 +122,9 @@ impl WriterMultiplexRelationSchema {
             .zip(layout.schema().fields())
             .skip(WRITE_RELATION_FRAGMENT_INDEX + 1)
             .map(|(slot, field)| {
-                WriterAuxiliaryChannel::try_new(slot.0, field.name(), field.data_type().clone())
+                let value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
+                    .map_err(|error| error.to_string())?;
+                WriterAuxiliaryChannel::try_new(slot.0, field.name(), value_type)
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -302,9 +304,16 @@ mod tests {
                 novarocks_spi::connector::write_stack::WriterAuxiliaryChannel::try_new(
                     7,
                     "opaque_aux",
-                    arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::from(vec![
-                        arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Utf8, true),
-                    ])),
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::from(vec![
+                            arrow::datatypes::Field::new(
+                                "v",
+                                arrow::datatypes::DataType::Utf8,
+                                true,
+                            ),
+                        ])),
+                        true,
+                    ),
                 )
                 .expect("channel"),
             ])

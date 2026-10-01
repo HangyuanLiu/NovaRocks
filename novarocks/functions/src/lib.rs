@@ -71,7 +71,7 @@ pub use novarocks_constant_contract::{
 pub use novarocks_type_contract::{
     AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
+    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility, ValueLogicalType,
 };
 pub use pure_catalogue::*;
 pub use scalar_kernel::*;
@@ -279,6 +279,25 @@ impl ResolvedAggregateSignature {
 
 /// Safe parametric aggregate signature resolver.
 pub trait AggregateSignatureResolver: Send + Sync {
+    /// Declare the complete value domains admitted by this family before any
+    /// carrier-only kernel signature is materialized.
+    fn validate_value_arguments(
+        &self,
+        argument_types: &[novarocks_type_contract::FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        for argument in argument_types {
+            argument
+                .validate()
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
+            if argument.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+                return Err(FunctionResolutionError::BadSignature(
+                    "aggregate family does not declare this root logical identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_aggregate(
         &self,
         argument_types: &[DataType],
@@ -593,6 +612,25 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
     type Kernel: TypedAggregateKernel;
     type PrepareError: fmt::Display + Send + Sync + 'static;
 
+    /// Declare the complete value domains admitted by this family before any
+    /// carrier-only kernel signature is materialized.
+    fn validate_value_arguments(
+        &self,
+        argument_types: &[novarocks_type_contract::FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        for argument in argument_types {
+            argument
+                .validate()
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
+            if argument.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+                return Err(FunctionResolutionError::BadSignature(
+                    "aggregate family does not declare this root logical identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn overloads(&self) -> &[AggregateOverloadDeclaration];
 
     fn resolve_signature(
@@ -689,6 +727,13 @@ struct TypedFamilySignatureResolver<F> {
 }
 
 impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatureResolver<F> {
+    fn validate_value_arguments(
+        &self,
+        argument_types: &[novarocks_type_contract::FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        self.family.validate_value_arguments(argument_types)
+    }
+
     fn resolve_aggregate(
         &self,
         argument_types: &[DataType],

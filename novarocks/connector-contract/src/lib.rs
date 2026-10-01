@@ -81,7 +81,10 @@ pub use recipe::{
     MAX_CONNECTOR_RECIPE_BYTES, MAX_CONNECTOR_RECIPE_COLUMNS, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
     MAX_CONNECTOR_RECIPE_SPLIT_WEIGHT,
 };
-pub use type_projection::{connector_type_accepts_arrow, connector_type_for_arrow};
+pub use type_projection::{
+    connector_type_accepts_arrow, connector_type_accepts_value_type, connector_type_for_arrow,
+    connector_type_for_value_type,
+};
 pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECISION};
 pub use write::{ConnectorWriteFieldToken, MAX_CONNECTOR_WRITE_TARGETS, WriteTargetOrdinal};
 pub use write_input::{

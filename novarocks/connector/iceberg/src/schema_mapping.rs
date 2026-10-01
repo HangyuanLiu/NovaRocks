@@ -62,11 +62,51 @@ fn sql_read_field(
     field: &Field,
     iceberg_field: &crate::iceberg::spec::NestedField,
 ) -> Result<Field, String> {
-    Ok(field.clone().with_data_type(sql_read_data_type(
+    use crate::iceberg::spec::{PrimitiveType, Type};
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+
+    // Storage authors the domain. Equal-width FIXED and UUID, or a binary
+    // carrier and VARIANT, do not confer the same semantic identity.
+    let logical = match iceberg_field.field_type.as_ref() {
+        Type::Primitive(PrimitiveType::Uuid) => ValueLogicalType::Uuid,
+        Type::Primitive(PrimitiveType::Variant) => ValueLogicalType::Variant,
+        _ => ValueLogicalType::Physical,
+    };
+    if let Some(label) = field.metadata().get(NR_LOGICAL_TYPE_KEY) {
+        let declared = ValueLogicalType::from_metadata_value(label).map_err(|error| {
+            format!(
+                "Iceberg field {} has invalid logical metadata: {error}",
+                field.name()
+            )
+        })?;
+        if declared != logical {
+            return Err(format!(
+                "Iceberg field {} logical metadata conflicts with its storage type",
+                field.name()
+            ));
+        }
+    }
+    let data_type = sql_read_data_type(
         field.data_type(),
         iceberg_field.field_type.as_ref(),
         field.name(),
-    )?))
+    )?;
+    logical.validate_carrier(&data_type).map_err(|error| {
+        format!(
+            "Iceberg field {} has incompatible logical carrier: {error}",
+            field.name()
+        )
+    })?;
+    let mut metadata = field.metadata().clone();
+    if let Some(label) = logical.metadata_value() {
+        metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
+    }
+    // Clone the actual field, including provider annotations and dictionary
+    // identity; replace only the carrier already authored by this read owner.
+    Ok(field
+        .clone()
+        .with_data_type(data_type)
+        .with_metadata(metadata))
 }
 
 fn sql_read_data_type(
@@ -615,7 +655,9 @@ mod tests {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::{
-        apply_scan_field_id_recursive, canonical_name_mapping, sql_read_schema_from_iceberg,
+        ICEBERG_INITIAL_DEFAULT_META_KEY, annotate_read_schema_from_scan_model,
+        apply_scan_field_id_recursive, canonical_name_mapping, sql_read_field,
+        sql_read_schema_from_iceberg,
     };
     use crate::iceberg::spec::{
         ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema, StructType, Type,
@@ -679,6 +721,225 @@ mod tests {
         };
         assert!(children.iter().all(|child| child.metadata().is_empty()));
         assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn real_storage_schema_authors_uuid_variant_and_distinct_fixed_domains() {
+        use novarocks_type_contract::{ValueLogicalType, field_logical_type};
+        let iceberg = IcebergSchema::builder()
+            .with_schema_id(8)
+            .with_fields(vec![
+                NestedField::required(11, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
+                NestedField::optional(12, "fixed", Type::Primitive(PrimitiveType::Fixed(16)))
+                    .into(),
+                NestedField::optional(13, "variant", Type::Primitive(PrimitiveType::Variant))
+                    .into(),
+                NestedField::required(14, "binary", Type::Primitive(PrimitiveType::Binary)).into(),
+            ])
+            .build()
+            .unwrap();
+        let schema = sql_read_schema_from_iceberg(&iceberg).unwrap();
+        for (ordinal, carrier, logical, nullable, id) in [
+            (
+                0,
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::Uuid,
+                false,
+                11,
+            ),
+            (
+                1,
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::Physical,
+                true,
+                12,
+            ),
+            (
+                2,
+                DataType::LargeBinary,
+                ValueLogicalType::Variant,
+                true,
+                13,
+            ),
+            (3, DataType::Binary, ValueLogicalType::Physical, false, 14),
+        ] {
+            let field = schema.field(ordinal);
+            assert_eq!(field.data_type(), &carrier);
+            assert_eq!(field.is_nullable(), nullable);
+            assert_eq!(field_logical_type(field).unwrap(), logical);
+            assert_eq!(
+                field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+                Some(&id.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_storage_fields_preserve_uuid_and_variant_in_read_schema() {
+        use novarocks_type_contract::{ValueLogicalType, field_logical_type};
+        let iceberg = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "record",
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            2,
+                            "identity",
+                            Type::Primitive(PrimitiveType::Uuid),
+                        )),
+                        Arc::new(NestedField::optional(
+                            3,
+                            "payload",
+                            Type::Primitive(PrimitiveType::Variant),
+                        )),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "identities",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        5,
+                        Type::Primitive(PrimitiveType::Uuid),
+                        false,
+                    )))),
+                )
+                .into(),
+                NestedField::optional(
+                    6,
+                    "objects",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::map_key_element(
+                            7,
+                            Type::Primitive(PrimitiveType::Uuid),
+                        )),
+                        Arc::new(NestedField::map_value_element(
+                            8,
+                            Type::Primitive(PrimitiveType::Variant),
+                            true,
+                        )),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let schema = sql_read_schema_from_iceberg(&iceberg).unwrap();
+        let DataType::Struct(record) = schema.field(0).data_type() else {
+            panic!("record")
+        };
+        let DataType::List(items) = schema.field(1).data_type() else {
+            panic!("items")
+        };
+        let DataType::Map(entries, _) = schema.field(2).data_type() else {
+            panic!("map")
+        };
+        let DataType::Struct(map) = entries.data_type() else {
+            panic!("entries")
+        };
+        for (field, logical, id) in [
+            (record[0].as_ref(), ValueLogicalType::Uuid, 2),
+            (record[1].as_ref(), ValueLogicalType::Variant, 3),
+            (items.as_ref(), ValueLogicalType::Uuid, 5),
+            (map[0].as_ref(), ValueLogicalType::Uuid, 7),
+            (map[1].as_ref(), ValueLogicalType::Variant, 8),
+        ] {
+            assert_eq!(field_logical_type(field).unwrap(), logical);
+            assert_eq!(
+                field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+                Some(&id.to_string())
+            );
+        }
+        assert!(!record[0].is_nullable());
+        assert!(record[1].is_nullable());
+        assert!(items.is_nullable());
+        // Preserve the existing read owner's explicit map-key widening.
+        assert!(map[0].is_nullable());
+        assert!(!map[1].is_nullable());
+        let frozen = crate::schema_facts::iceberg_schema_def(&iceberg);
+        let annotated = annotate_read_schema_from_scan_model(&schema, &frozen).unwrap();
+        assert!(novarocks_type_contract::arrow_schemas_exact(
+            &schema, &annotated
+        ));
+    }
+
+    #[test]
+    fn authored_logical_metadata_conflicts_and_wrong_uuid_carriers_fail() {
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
+        let uuid = NestedField::optional(11, "u", Type::Primitive(PrimitiveType::Uuid));
+        for field in [
+            Field::new("u", DataType::Utf8, true),
+            Field::new("u", DataType::FixedSizeBinary(15), true),
+            Field::new("u", DataType::FixedSizeBinary(16), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "largeint".into())].into()),
+            Field::new("u", DataType::FixedSizeBinary(16), true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+        ] {
+            assert!(sql_read_field(&field, &uuid).is_err());
+        }
+        let valid = Field::new("u", DataType::FixedSizeBinary(16), true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "uuid".into())].into());
+        assert_eq!(
+            field_logical_type(&sql_read_field(&valid, &uuid).unwrap()).unwrap(),
+            ValueLogicalType::Uuid
+        );
+        let fixed = NestedField::optional(12, "u", Type::Primitive(PrimitiveType::Fixed(16)));
+        assert!(sql_read_field(&valid, &fixed).is_err());
+        let binary = NestedField::optional(13, "u", Type::Primitive(PrimitiveType::Binary));
+        let forged_variant = Field::new("u", DataType::LargeBinary, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "variant".into())].into());
+        assert!(sql_read_field(&forged_variant, &binary).is_err());
+        let variant = NestedField::optional(14, "u", Type::Primitive(PrimitiveType::Variant));
+        assert!(sql_read_field(&valid, &variant).is_err());
+        // An unlabelled LargeBinary field itself does not author VARIANT.
+        let plain = sql_read_field(
+            &Field::new("u", DataType::LargeBinary, true),
+            &NestedField::optional(15, "u", Type::Primitive(PrimitiveType::Binary)),
+        )
+        .unwrap();
+        assert_eq!(
+            field_logical_type(&plain).unwrap(),
+            ValueLogicalType::Physical
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn read_field_projection_preserves_provider_metadata_and_dictionary_facts() {
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, arrow_fields_exact};
+        let source = Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
+            [
+                (PARQUET_FIELD_ID_META_KEY.into(), "91".into()),
+                ("provider.annotation".into(), "opaque-source-fact".into()),
+                (
+                    ICEBERG_INITIAL_DEFAULT_META_KEY.into(),
+                    "\"00112233-4455-6677-8899-aabbccddeeff\"".into(),
+                ),
+            ]
+            .into(),
+        );
+        let uuid = NestedField::required(91, "u", Type::Primitive(PrimitiveType::Uuid));
+        let mut metadata = source.metadata().clone();
+        metadata.insert(NR_LOGICAL_TYPE_KEY.into(), "uuid".into());
+        let projected = sql_read_field(&source, &uuid).unwrap();
+        assert!(arrow_fields_exact(
+            &projected,
+            &source.with_metadata(metadata)
+        ));
+        let dictionary = Field::new_dict(
+            "codes",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true,
+            72,
+            true,
+        )
+        .with_metadata([("provider.annotation".into(), "kept".into())].into());
+        let storage = NestedField::optional(72, "codes", Type::Primitive(PrimitiveType::String));
+        assert!(arrow_fields_exact(
+            &sql_read_field(&dictionary, &storage).unwrap(),
+            &dictionary
+        ));
     }
 
     #[test]

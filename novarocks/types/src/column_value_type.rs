@@ -76,6 +76,7 @@ fn sql_declaration(
         ValueLogicalType::Hll => SqlType::Hll,
         ValueLogicalType::Bitmap => SqlType::Bitmap,
         ValueLogicalType::LargeInt => SqlType::LargeInt,
+        ValueLogicalType::Uuid => SqlType::Uuid,
         ValueLogicalType::Physical => match data_type {
             DataType::Boolean => SqlType::Boolean,
             DataType::Int8 => SqlType::TinyInt,
@@ -140,6 +141,7 @@ fn root(declaration: &SqlType) -> ValueLogicalType {
         SqlType::Hll => ValueLogicalType::Hll,
         SqlType::Bitmap => ValueLogicalType::Bitmap,
         SqlType::LargeInt => ValueLogicalType::LargeInt,
+        SqlType::Uuid => ValueLogicalType::Uuid,
         _ => ValueLogicalType::Physical,
     }
 }
@@ -160,6 +162,7 @@ impl ColumnDef {
             ValueLogicalType::Hll => Some(SqlType::Hll),
             ValueLogicalType::Bitmap => Some(SqlType::Bitmap),
             ValueLogicalType::LargeInt => Some(SqlType::LargeInt),
+            ValueLogicalType::Uuid => Some(SqlType::Uuid),
             domain => return Err(ColumnValueTypeError::UnrepresentableRootDomain(domain)),
         };
         Ok(Self {
@@ -383,6 +386,7 @@ mod tests {
             (DataType::Binary, ValueLogicalType::Hll),
             (DataType::Binary, ValueLogicalType::Bitmap),
             (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+            (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
         ] {
             let original = FunctionValueType {
                 data_type: carrier,
@@ -408,10 +412,9 @@ mod tests {
             nullable: false,
             logical_type: ValueLogicalType::Uuid,
         };
-        assert_eq!(
-            ColumnDef::from_value_type("uuid".into(), uuid, None).unwrap_err(),
-            ColumnValueTypeError::UnrepresentableRootDomain(ValueLogicalType::Uuid)
-        );
+        let column = ColumnDef::from_value_type("uuid".into(), uuid.clone(), None).unwrap();
+        assert_eq!(column.logical_type, Some(SqlType::Uuid));
+        assert_eq!(column.declared_value_type().unwrap(), uuid);
     }
     #[test]
     fn declared_children_preserve_source_shape_and_provider_facts() {

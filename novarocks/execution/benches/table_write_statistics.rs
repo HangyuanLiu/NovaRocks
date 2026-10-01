@@ -938,7 +938,7 @@ fn build_theta_plan(
     let channel = WriterAuxiliaryChannel::try_new(
         THETA_PARTIAL_SLOT.0,
         "theta_partial",
-        resolved.intermediate_type.clone(),
+        novarocks_type_contract::FunctionValueType::new(resolved.intermediate_type.clone(), true),
     )
     .map_err(|error| error.to_string())?;
     let relation = WriterMultiplexRelationSchema::try_new(

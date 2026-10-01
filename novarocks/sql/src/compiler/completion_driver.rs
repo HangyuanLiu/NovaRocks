@@ -29,7 +29,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
-    ProviderReadOccurrenceId, ScanReadBudget, ValueType,
+    ProviderReadOccurrenceId, ScanReadBudget,
 };
 use novarocks_spi::connector::StatisticsMetric;
 
@@ -38,7 +38,7 @@ use super::completion::{
     MaterializedViewFact, MaterializedViewNeed, MaterializedViewOutcome, ProviderReadColumnNeed,
     ProviderReadFact, ProviderReadNeed, ProviderReadStaticContract, SqlCompileRequest,
     SqlDisplayIntent, SqlNeedBatch, StatisticsFact, StatisticsNeed,
-    provider_connector_type_for_engine, provider_relation_need_from_sql_scan,
+    provider_relation_need_from_sql_scan,
 };
 use super::completion_catalog::CatalogCompletionState;
 use super::completion_predicate::{ProviderPredicateColumn, lower_provider_predicates};
@@ -814,7 +814,8 @@ fn provider_or_ready_step(
         .session
         .optimizer_settings
         .connector_static_predicate_pushdown_enabled();
-    let (physical, needs) = collect_provider_needs(physical, next_need_ordinal, offer_predicates)?;
+    let (physical, needs) =
+        collect_provider_needs(physical, next_need_ordinal, offer_predicates, control)?;
     if !needs.is_empty() {
         return Ok(CompilerStep::need(
             SqlNeedBatch::ProviderReads(needs.clone()),
@@ -854,6 +855,7 @@ pub(crate) fn collect_provider_needs(
     plan: PhysicalPlanNode,
     mut next_need_ordinal: u32,
     offer_predicates: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>), SqlCompileError> {
     #[derive(Default)]
     struct ProviderReadOccurrenceAllocator {
@@ -876,7 +878,9 @@ pub(crate) fn collect_provider_needs(
         occurrence_allocator: &mut ProviderReadOccurrenceAllocator,
         needs: &mut Vec<ProviderReadNeed>,
         offer_predicates: bool,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<PhysicalPlanNode, SqlCompileError> {
+        work.step()?;
         let PhysicalPlanNode {
             kind,
             children,
@@ -893,6 +897,7 @@ pub(crate) fn collect_provider_needs(
                     occurrence_allocator,
                     needs,
                     offer_predicates,
+                    work,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -916,7 +921,7 @@ pub(crate) fn collect_provider_needs(
                     &source.kind,
                 )
                 .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-                let (columns, predicate_columns) = provider_columns(&output_columns, &scan)?;
+                let (columns, predicate_columns) = provider_columns(&output_columns, &scan, work)?;
                 let predicates = if offer_predicates {
                     lower_provider_predicates(&scan, &predicate_columns)
                 } else {
@@ -949,6 +954,10 @@ pub(crate) fn collect_provider_needs(
         })
     }
 
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::ProviderValidation,
+    )?;
     let mut needs = Vec::new();
     let mut occurrence_allocator = ProviderReadOccurrenceAllocator::default();
     let plan = walk(
@@ -957,8 +966,25 @@ pub(crate) fn collect_provider_needs(
         &mut occurrence_allocator,
         &mut needs,
         offer_predicates,
+        &mut work,
     )?;
+    work.finish()?;
     Ok((plan, needs.into_boxed_slice()))
+}
+
+enum ProviderColumnProjectionError {
+    Source(novarocks_types::ColumnValueTypeError),
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_types::ColumnValueTypeError> for ProviderColumnProjectionError {
+    fn from(error: novarocks_types::ColumnValueTypeError) -> Self {
+        Self::Source(error)
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for ProviderColumnProjectionError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Source(error.into())
+    }
 }
 
 type ProviderColumnProjection = (
@@ -969,31 +995,37 @@ type ProviderColumnProjection = (
 fn provider_columns(
     output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<ProviderColumnProjection, SqlCompileError> {
-    let synthetic = scan
-        .variant_columns
-        .iter()
-        .map(|column| column.synthetic_column_id)
-        .collect::<BTreeSet<_>>();
+    let mut synthetic = BTreeSet::new();
+    for column in &scan.variant_columns {
+        work.step()?;
+        synthetic.insert(column.synthetic_column_id);
+    }
     let source_columns = scan
         .table
         .columns
         .iter()
-        .chain(&scan.table.iceberg_row_lineage_metadata_columns)
-        .collect::<Vec<_>>();
-    let source_scan_columns = scan
-        .columns
-        .iter()
-        .filter(|column| !synthetic.contains(&column.column_id))
-        .collect::<Vec<_>>();
+        .chain(&scan.table.iceberg_row_lineage_metadata_columns);
+    let mut source_scan_columns = BTreeMap::<_, Vec<_>>::new();
+    for column in &scan.columns {
+        work.step()?;
+        if !synthetic.contains(&column.column_id) {
+            source_scan_columns
+                .entry(column.column_id)
+                .or_default()
+                .push(column);
+        }
+    }
     // A scan names the provider fields it reads, which need not be all of
     // them: a statement rewritten onto a materialized view reads the columns
     // that view was matched for. So each one is found by the name it carries
     // rather than by standing at the field's position.
     let mut source_by_name = BTreeMap::new();
-    for column in &source_columns {
+    for column in source_columns {
+        work.step()?;
         if source_by_name
-            .insert(column.name.as_str(), *column)
+            .insert(column.name.as_str(), column)
             .is_some()
         {
             return Err(SqlCompileError::Compilation(format!(
@@ -1005,36 +1037,43 @@ fn provider_columns(
     let mut columns = Vec::new();
     let mut predicate_columns = BTreeMap::new();
     for output in output_columns {
+        work.step()?;
         if synthetic.contains(&output.column_id) {
             continue;
         }
-        let mut matches = source_scan_columns
-            .iter()
-            .filter(|column| column.column_id == output.column_id);
-        let logical = matches.next().ok_or_else(|| {
+        let matches = source_scan_columns.get(&output.column_id).ok_or_else(|| {
             SqlCompileError::Compilation(format!(
                 "scan output column id {} has no exact source-column binding",
-                output.column_id
+                output.column_id,
             ))
         })?;
-        if matches.next().is_some() {
+        if matches.len() != 1 {
             return Err(SqlCompileError::Compilation(format!(
                 "scan output column id {} repeats its source-column binding",
-                output.column_id
+                output.column_id,
             )));
         }
+        let logical = matches[0];
         let source = source_by_name.get(logical.name.as_str()).ok_or_else(|| {
             SqlCompileError::Compilation(format!(
                 "scan source column '{}' is not a field of the provider schema",
                 logical.name
             ))
         })?;
+        let source_value_type = source
+            .declared_value_type_observed(|| {
+                work.step().map_err(ProviderColumnProjectionError::Control)
+            })
+            .map_err(|error| match error {
+                ProviderColumnProjectionError::Control(error) => SqlCompileError::from(error),
+                ProviderColumnProjectionError::Source(error) => {
+                    SqlCompileError::Compilation(error.to_string())
+                }
+            })?;
         if logical.name != source.name
-            || logical.value_type.data_type != source.data_type
-            || logical.value_type.nullable != source.nullable
+            || logical.value_type != source_value_type
             || output.name != source.name
-            || output.value_type.data_type != source.data_type
-            || output.value_type.nullable != source.nullable
+            || output.value_type != source_value_type
         {
             return Err(SqlCompileError::Compilation(format!(
                 "scan output '{}' differs from its exact provider schema column",
@@ -1042,12 +1081,13 @@ fn provider_columns(
             )));
         }
         let connector_type =
-            provider_connector_type_for_engine(&source.data_type).ok_or_else(|| {
-                SqlCompileError::Compilation(format!(
-                    "scan output '{}' has no exact provider value type",
-                    output.name
-                ))
-            })?;
+            novarocks_connector_contract::connector_type_for_value_type(&source_value_type)
+                .ok_or_else(|| {
+                    SqlCompileError::Compilation(format!(
+                        "scan output '{}' has no exact provider value type",
+                        output.name,
+                    ))
+                })?;
         let ordinal = u32::try_from(columns.len()).map_err(|_| {
             SqlCompileError::Compilation("provider projection exceeds u32".to_string())
         })?;
@@ -1055,7 +1095,7 @@ fn provider_columns(
             ProviderReadColumnNeed::try_new(
                 ordinal,
                 source.name.clone(),
-                ValueType::new(source.data_type.clone(), source.nullable),
+                source_value_type,
                 connector_type,
             )
             .map_err(|error| SqlCompileError::Compilation(error.to_string()))?,
@@ -1129,6 +1169,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
+    use novarocks_physical_plan::ValueType;
     use novarocks_physical_plan::{
         ExactInputVersion, NodeKind, PredicateGuaranteeKind, ProviderColumnReference,
         ProviderReadReference,
@@ -1201,6 +1242,157 @@ mod tests {
             },
             DEFAULT_COMPLETION_LIMITS,
         )
+    }
+
+    fn provider_type_scan(value_type: ValueType, count: usize) -> PhysicalPlanNode {
+        use crate::analysis::OutputColumn;
+        use crate::binding::SqlTableBindingScopeId;
+        use crate::column_id::ColumnId;
+        use crate::planner::payload::PlanScanNode;
+        use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanStats, PlannerConfidence};
+        use std::num::{NonZeroU32, NonZeroU64};
+        let columns = (0..count)
+            .map(|index| OutputColumn {
+                column_id: ColumnId(index as u32 + 1),
+                name: format!("c{index}"),
+                value_type: value_type.clone(),
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        let scan = PlanScanNode {
+            database: "db".into(),
+            table: TableDef {
+                name: "t".into(),
+                columns: columns
+                    .iter()
+                    .map(|column| {
+                        novarocks_types::schema::ColumnDef::from_value_type(
+                            column.name.clone(),
+                            column.value_type.clone(),
+                            None,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::Sql(SqlScanSource::new(
+                    SqlTableBindingId::new(
+                        SqlTableBindingScopeId::new(NonZeroU64::new(1).unwrap()),
+                        NonZeroU32::new(1).unwrap(),
+                    ),
+                    SqlTableIdentity {
+                        catalog: "iceberg".into(),
+                        namespace: "db".into(),
+                        table: "t".into(),
+                    },
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                )),
+            },
+            alias: None,
+            columns: columns.clone(),
+            predicates: vec![],
+            required_columns: None,
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        };
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Scan(scan.into()),
+            children: vec![],
+            output_columns: columns,
+            stats: PhysicalPlanStats {
+                output_row_count: 0.0,
+                row_count_confidence: PlannerConfidence::Fallback,
+                column_statistics: Default::default(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    #[test]
+    fn provider_completion_keeps_source_uuid_and_rejects_same_carrier_root_forgery() {
+        use novarocks_type_contract::ValueLogicalType;
+        for logical in [ValueLogicalType::Uuid, ValueLogicalType::Physical] {
+            let value_type =
+                ValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
+                    .unwrap();
+            let plan = provider_type_scan(value_type.clone(), 1);
+            let (_, needs) =
+                collect_provider_needs(plan.clone(), 7, false, &SqlCompileControl::unbounded())
+                    .unwrap();
+            assert_eq!(needs[0].columns()[0].engine_type(), &value_type);
+            let mut forged = plan;
+            forged.output_columns[0].value_type.logical_type = if logical == ValueLogicalType::Uuid
+            {
+                ValueLogicalType::Physical
+            } else {
+                ValueLogicalType::Uuid
+            };
+            assert!(matches!(
+                collect_provider_needs(forged, 7, false, &SqlCompileControl::unbounded()),
+                Err(SqlCompileError::Compilation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_completion_controls_actual_work_and_never_returns_partial_needs() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            observations: std::sync::Mutex<Vec<u32>>,
+            failure: Option<CompileControlError>,
+            fail_at: usize,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::ProviderValidation);
+                let mut observations = self.observations.lock().unwrap();
+                observations.push(units);
+                if observations.len() == self.fail_at
+                    && let Some(error) = self.failure
+                {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+        let plan = provider_type_scan(ValueType::new(DataType::Int32, false), 320);
+        let owner = Owner {
+            observations: Default::default(),
+            failure: None,
+            fail_at: usize::MAX,
+        };
+        let (_, needs) = collect_provider_needs(plan.clone(), 0, false, &owner).unwrap();
+        assert_eq!(needs[0].columns().len(), 320);
+        let observations = owner.observations.lock().unwrap().clone();
+        assert_eq!(observations[0], 0);
+        assert!(observations.iter().all(|units| *units <= 256));
+        assert!(observations.iter().sum::<u32>() >= 320 * 3);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            // Entry, real interior work and final publication all preserve the
+            // exact typed error even if the owner would allow another call.
+            for fail_at in [1, 2, observations.len()] {
+                let owner = Owner {
+                    observations: Default::default(),
+                    failure: Some(error),
+                    fail_at,
+                };
+                let result = collect_provider_needs(plan.clone(), 0, false, &owner);
+                assert!(matches!(result, Err(actual) if actual == SqlCompileError::from(error)));
+                assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
+            }
+        }
     }
 
     struct CancelOnSecondObservation(AtomicUsize);

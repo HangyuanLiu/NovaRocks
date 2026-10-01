@@ -100,6 +100,28 @@ impl FunctionValueType {
         }
     }
 
+    /// Read an explicitly authored root domain from its actual Arrow field.
+    /// Missing metadata declares Physical; no carrier confers another identity.
+    pub fn try_from_field(field: &arrow_schema::Field) -> Result<Self, crate::ValueTypeError> {
+        Self::try_with_logical_type(
+            field.data_type().clone(),
+            field.is_nullable(),
+            crate::field_logical_type(field)?,
+        )
+    }
+
+    /// Materialize a new schema field from this exact authored value type.
+    /// Root identity is explicit metadata; nested fields remain unchanged.
+    pub fn try_to_field(&self, name: impl Into<String>) -> Result<Field, crate::ValueTypeError> {
+        self.validate()?;
+        let field = Field::new(name, self.data_type.clone(), self.nullable);
+        Ok(match self.logical_type.metadata_value() {
+            Some(tag) => field
+                .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into()),
+            None => field,
+        })
+    }
+
     pub fn try_with_logical_type(
         data_type: DataType,
         nullable: bool,
@@ -378,6 +400,50 @@ pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
 #[cfg(test)]
 mod tests {
     use super::{AggregateStateFormatId, FunctionId, FunctionIdentityError};
+
+    #[test]
+    fn source_field_value_domain_is_explicit_and_validated() {
+        use crate::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        use arrow_schema::{DataType, Field};
+        let physical = Field::new("bytes", DataType::FixedSizeBinary(16), false);
+        assert_eq!(
+            FunctionValueType::try_from_field(&physical).unwrap(),
+            FunctionValueType::new(DataType::FixedSizeBinary(16), false)
+        );
+        let uuid = physical
+            .clone()
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "uuid".to_owned())].into());
+        let exact_uuid = FunctionValueType::try_from_field(&uuid).unwrap();
+        assert_eq!(exact_uuid.logical_type, ValueLogicalType::Uuid);
+        assert_eq!(
+            FunctionValueType::try_from_field(&exact_uuid.try_to_field("roundtrip").unwrap())
+                .unwrap(),
+            exact_uuid
+        );
+        assert!(
+            FunctionValueType::try_from_field(&uuid.with_data_type(DataType::FixedSizeBinary(15)))
+                .is_err()
+        );
+        let unknown =
+            physical.with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "unknown".to_owned())].into());
+        assert!(FunctionValueType::try_from_field(&unknown).is_err());
+        let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
+            [
+                (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+                ("provider.field_id".to_owned(), "91".to_owned()),
+            ]
+            .into(),
+        );
+        let nested = Field::new(
+            "values",
+            DataType::LargeList(std::sync::Arc::new(item)),
+            true,
+        );
+        assert_eq!(
+            FunctionValueType::try_from_field(&nested).unwrap(),
+            FunctionValueType::new(nested.data_type().clone(), true)
+        );
+    }
 
     #[test]
     fn stable_function_identity_is_bounded() {

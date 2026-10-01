@@ -2045,7 +2045,10 @@ pub(crate) mod tests {
                 WriterAuxiliaryChannel::try_new(
                     10_000 + u32::try_from(index).expect("channel index"),
                     format!("partial_{index}"),
-                    resolved.intermediate_type.clone(),
+                    novarocks_type_contract::FunctionValueType::new(
+                        resolved.intermediate_type.clone(),
+                        true,
+                    ),
                 )
                 .expect("auxiliary channel")
             })
@@ -2564,8 +2567,12 @@ pub(crate) mod tests {
 
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
-        let channel = WriterAuxiliaryChannel::try_new(20_000, "huge", DataType::Binary)
-            .expect("binary auxiliary channel");
+        let channel = WriterAuxiliaryChannel::try_new(
+            20_000,
+            "huge",
+            novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+        )
+        .expect("binary auxiliary channel");
         let relation = WriterMultiplexRelationSchema::try_new(
             WriterMultiplexSchema::try_new(vec![channel.clone()]).expect("multiplex contract"),
         )
@@ -2643,7 +2650,7 @@ pub(crate) mod tests {
                 WriterAuxiliaryChannel::try_new(
                     30_000 + u32::try_from(index).expect("channel index"),
                     format!("binary_partial_{index}"),
-                    DataType::Binary,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
                 )
                 .expect("binary channel")
             })

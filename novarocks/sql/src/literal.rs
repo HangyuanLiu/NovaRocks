@@ -959,6 +959,7 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
                 .into(),
         )),
         SqlType::Variant => Ok(DataType::LargeBinary),
+        SqlType::Uuid => Ok(DataType::FixedSizeBinary(16)),
     }
 }
 

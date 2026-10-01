@@ -502,6 +502,7 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
                     .collect(),
             ),
             SqlType::Variant => type_name("VARIANT", vec![]),
+            SqlType::Uuid => type_name("UUID", vec![]),
         }
     }
 

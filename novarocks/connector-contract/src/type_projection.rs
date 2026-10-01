@@ -74,6 +74,27 @@ pub fn connector_type_for_arrow(data_type: &arrow_schema::DataType) -> Option<Co
     }
 }
 
+/// Project the connector comparison type from a complete authored engine
+/// value. UUID identity comes from its explicit domain, never fixed width.
+pub fn connector_type_for_value_type(
+    value_type: &novarocks_type_contract::FunctionValueType,
+) -> Option<ConnectorValueType> {
+    value_type.validate().ok()?;
+    if value_type.logical_type == novarocks_type_contract::ValueLogicalType::Uuid {
+        Some(ConnectorValueType::Uuid)
+    } else {
+        connector_type_for_arrow(&value_type.data_type)
+    }
+}
+
+/// Check both the exact carrier and the declared UUID correspondence.
+pub fn connector_type_accepts_value_type(
+    connector_type: ConnectorValueType,
+    value_type: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    connector_type_for_value_type(value_type) == Some(connector_type)
+}
+
 /// Check an explicitly frozen connector type against its exact Arrow carrier.
 /// UUID and fixed binary share a carrier; this check never infers a UUID.
 pub fn connector_type_accepts_arrow(
@@ -89,6 +110,40 @@ pub fn connector_type_accepts_arrow(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, TimeUnit};
+
+    #[test]
+    fn complete_assignment_type_preserves_explicit_uuid_identity() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
+        let uuid = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        assert_eq!(
+            connector_type_for_value_type(&physical),
+            Some(ConnectorValueType::Fixed { length: 16 })
+        );
+        assert_eq!(
+            connector_type_for_value_type(&uuid),
+            Some(ConnectorValueType::Uuid)
+        );
+        assert!(!connector_type_accepts_value_type(
+            ConnectorValueType::Uuid,
+            &physical
+        ));
+        assert!(!connector_type_accepts_value_type(
+            ConnectorValueType::Fixed { length: 16 },
+            &uuid
+        ));
+        let invalid = FunctionValueType {
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: ValueLogicalType::Uuid,
+        };
+        assert_eq!(connector_type_for_value_type(&invalid), None);
+    }
 
     #[test]
     fn assignment_types_preserve_exact_width_scale_and_time_unit() {

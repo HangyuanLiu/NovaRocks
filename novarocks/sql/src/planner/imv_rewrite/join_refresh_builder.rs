@@ -1530,6 +1530,12 @@ mod tests {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
         let domains = [
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap(),
             FunctionValueType::new(
@@ -1591,16 +1597,16 @@ mod tests {
     }
 
     #[test]
-    fn locator_schema_rejects_unrepresentable_root_instead_of_plain_fixed16() {
+    fn locator_schema_rejects_unrepresentable_object_root_instead_of_plain_binary() {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
         let key = OutputColumn {
             column_id: ColumnId(1),
             name: "apply_key".into(),
             value_type: FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
+                DataType::Binary,
                 false,
-                ValueLogicalType::Uuid,
+                ValueLogicalType::Object,
             )
             .unwrap(),
             is_internal: false,

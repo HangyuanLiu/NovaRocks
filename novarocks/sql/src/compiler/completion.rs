@@ -277,9 +277,9 @@ impl ProviderReadColumnNeed {
         if name.trim().is_empty() {
             return Err(CompletionProtocolError::InvalidProviderReadColumn { ordinal });
         }
-        if !novarocks_connector_contract::connector_type_accepts_arrow(
+        if !novarocks_connector_contract::connector_type_accepts_value_type(
             connector_type,
-            &engine_type.data_type,
+            &engine_type,
         ) {
             return Err(CompletionProtocolError::ProviderReadColumnTypeMismatch { ordinal });
         }
@@ -637,8 +637,9 @@ impl ProviderReadNeed {
                         id,
                         reason: "program provider read projects more columns than it can address",
                     })?;
-                let connector_type = provider_connector_type_for_engine(&engine_type.data_type)
-                    .ok_or(CompletionProtocolError::InvalidProviderReadColumn { ordinal })?;
+                let connector_type =
+                    novarocks_connector_contract::connector_type_for_value_type(&engine_type)
+                        .ok_or(CompletionProtocolError::InvalidProviderReadColumn { ordinal })?;
                 ProviderReadColumnNeed::try_new(ordinal, name, engine_type, connector_type)
             })
             .collect::<Result<Vec<_>, _>>()?;

@@ -650,6 +650,7 @@ pub fn begin_final_connector_write_plan(
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
@@ -678,6 +679,7 @@ pub fn begin_final_connector_write_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        &control,
     )
     .map_err(|error| error.to_string())?;
     Ok((
@@ -811,6 +813,7 @@ pub fn begin_final_dml_read_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<(DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
@@ -825,6 +828,7 @@ pub fn begin_final_dml_read_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        &control,
     )
     .map_err(|error| error.to_string())?;
     Ok((
@@ -944,6 +948,7 @@ pub fn begin_final_ctas_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
@@ -966,6 +971,7 @@ pub fn begin_final_ctas_connector_write_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        control,
     )
     .map_err(|error| error.to_string())?;
     Ok((
@@ -1158,6 +1164,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         DmlChangeStreamCompletion,
@@ -1202,6 +1209,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        control,
     )
     .map_err(|error| error.to_string())?;
     Ok((
@@ -1250,6 +1258,7 @@ pub fn begin_final_dml_change_stream(
     ),
     String,
 > {
+    let control = request.optimize_request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
@@ -1292,6 +1301,7 @@ pub fn begin_final_dml_change_stream(
         compiled.function_catalog,
         request.pre_expand_keyed_assert,
         request.shape,
+        &control,
     )
 }
 
@@ -2088,16 +2098,9 @@ pub fn statistics_provider_read_need(
             ),
             version: crate::compiler::ProviderReadVersionNeed::Snapshot(scan.version_ordinal),
         },
-        scan.columns.iter().map(|column| {
-            (
-                Box::<str>::from(column.name()),
-                novarocks_physical_plan::ValueType {
-                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
-                    data_type: column.data_type().clone(),
-                    nullable: column.nullable(),
-                },
-            )
-        }),
+        scan.columns
+            .iter()
+            .map(|column| (Box::<str>::from(column.name()), column.value_type().clone())),
     )
     .map_err(|error| error.to_string())
 }
@@ -2166,21 +2169,12 @@ fn build_statistics_connector_physical(
         .columns
         .iter()
         .map(|column| {
-            let column_id = factory.create(
-                None,
-                column.name().to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    column.data_type().clone(),
-                    column.nullable(),
-                ),
-            );
+            let column_id =
+                factory.create(None, column.name().to_string(), column.value_type().clone());
             crate::analysis::OutputColumn {
                 column_id,
                 name: column.name().to_string(),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    column.data_type().clone(),
-                    column.nullable(),
-                ),
+                value_type: column.value_type().clone(),
 
                 is_internal: false,
             }
@@ -2203,14 +2197,15 @@ fn build_statistics_connector_physical(
                 columns: scan
                     .columns
                     .iter()
-                    .map(|column| novarocks_types::schema::ColumnDef {
-                        name: column.name().to_string(),
-                        data_type: column.data_type().clone(),
-                        nullable: column.nullable(),
-                        write_default: None,
-                        logical_type: None,
+                    .map(|column| {
+                        novarocks_types::schema::ColumnDef::from_value_type(
+                            column.name().to_string(),
+                            column.value_type().clone(),
+                            None,
+                        )
+                        .map_err(|error| error.to_string())
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()?,
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: crate::planner::table::ScanSource::Sql(
                     crate::planner::table::SqlScanSource::new(
@@ -2284,9 +2279,7 @@ fn build_statistics_connector_physical(
                     requirement.input().name()
                 )
             })?;
-        if input.value_type.data_type != *requirement.input().data_type()
-            || input.value_type.nullable != requirement.input().nullable()
-        {
+        if &input.value_type != requirement.input().value_type() {
             return Err(format!(
                 "ANALYZE aggregate input `{}` does not match its pinned scan type",
                 requirement.input().name()
@@ -2314,56 +2307,42 @@ fn build_statistics_connector_physical(
                 requirement.input().data_type()
             )
         })?;
+        let result_type = crate::functions::aggregate_result_type(&resolved);
+        if result_type.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+            || result_type.data_type != arrow::datatypes::DataType::Binary
+        {
+            return Err(
+                "ANALYZE aggregate must produce an exact Physical Binary artifact body".into(),
+            );
+        }
         let partial_output_id = factory.create(
             None,
             format!("analyze_state_{index}"),
-            novarocks_type_contract::FunctionValueType::new(
-                crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .data_type
-                    .clone(),
-                crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .nullable,
-            ),
+            crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .clone(),
         );
         let result_nullable = crate::functions::aggregate_result_type(&resolved).nullable;
         let final_output_id = factory.create(
             None,
             format!("analyze_body_{index}"),
-            novarocks_type_contract::FunctionValueType::new(
-                crate::functions::aggregate_result_type(&resolved)
-                    .data_type
-                    .clone(),
-                result_nullable,
-            ),
+            crate::functions::aggregate_result_type(&resolved).clone(),
         );
         body_nullable |= result_nullable;
         let output_name = format!("analyze_body_{index}");
         final_columns.push(crate::analysis::OutputColumn {
             column_id: final_output_id,
             name: output_name.clone(),
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                crate::functions::aggregate_result_type(&resolved)
-                    .data_type
-                    .clone(),
-                result_nullable,
-            ),
+            value_type: crate::functions::aggregate_result_type(&resolved).clone(),
 
             is_internal: true,
         });
         partial_columns.push(crate::analysis::OutputColumn {
             column_id: partial_output_id,
             name: format!("analyze_state_{index}"),
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .data_type
-                    .clone(),
-                crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .nullable,
-            ),
+            value_type: crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .clone(),
 
             is_internal: true,
         });
@@ -2386,15 +2365,9 @@ fn build_statistics_connector_physical(
                     qualifier: None,
                     column: format!("analyze_state_{index}"),
                 },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    crate::functions::aggregate_selection(&resolved)
-                        .intermediate_type
-                        .data_type
-                        .clone(),
-                    crate::functions::aggregate_selection(&resolved)
-                        .intermediate_type
-                        .nullable,
-                ),
+                value_type: crate::functions::aggregate_selection(&resolved)
+                    .intermediate_type
+                    .clone(),
             }],
             distinct: false,
             result_type: crate::functions::aggregate_result_type(&resolved)
@@ -2623,6 +2596,86 @@ mod tests {
         StatisticsNumericNature, StatisticsRowCoverage,
     };
 
+    fn statistics_scan_with_type(
+        value_type: novarocks_type_contract::FunctionValueType,
+    ) -> super::StatisticsConnectorScan {
+        super::StatisticsConnectorScan {
+            binding: crate::binding::SqlTableBindingId::new_for_test(1),
+            catalog: "iceberg".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+            version_ordinal: 42,
+            columns: vec![
+                novarocks_spi::connector::StatisticsScanColumn::try_new(0, "u", value_type)
+                    .unwrap(),
+            ],
+        }
+    }
+
+    #[test]
+    fn statistics_provider_need_preserves_uuid_and_physical_fixed16_identity() {
+        use novarocks_spi::connector::read_stack::value::ConnectorValueType;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for (value_type, connector_type) in [
+            (
+                FunctionValueType::new(arrow::datatypes::DataType::FixedSizeBinary(16), true),
+                ConnectorValueType::Fixed { length: 16 },
+            ),
+            (
+                FunctionValueType::try_with_logical_type(
+                    arrow::datatypes::DataType::FixedSizeBinary(16),
+                    true,
+                    ValueLogicalType::Uuid,
+                )
+                .unwrap(),
+                ConnectorValueType::Uuid,
+            ),
+        ] {
+            let scan = statistics_scan_with_type(value_type.clone());
+            let need = super::statistics_provider_read_need(&scan).unwrap();
+            assert_eq!(need.columns()[0].engine_type(), &value_type);
+            assert_eq!(need.columns()[0].connector_type(), connector_type);
+        }
+    }
+
+    #[test]
+    fn statistics_pinned_scan_rejects_equal_carrier_with_different_root_domain() {
+        use novarocks_spi::connector::{
+            StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+        };
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let source = FunctionValueType::try_with_logical_type(
+            arrow::datatypes::DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        let scan = statistics_scan_with_type(source);
+        let requirement = StatisticsRequiredAggregation::try_new(
+            StatisticsScanColumn::try_new(
+                0,
+                "u",
+                FunctionValueType::new(arrow::datatypes::DataType::FixedSizeBinary(16), true),
+            )
+            .unwrap(),
+            "$test",
+            StatisticsArtifactIdentity::try_new(vec![7], "test/blob").unwrap(),
+        )
+        .unwrap();
+        let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
+        let error = super::build_statistics_connector_physical(
+            scan,
+            &[requirement],
+            &functions,
+            novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("does not match its pinned scan type"),
+            "{error}"
+        );
+    }
+
     fn statistics_final_context() -> super::DmlFinalPlanContext {
         use novarocks_physical_plan::{
             ExactInputVersion, PipelineDopDomain, PlanVersionId, ProviderColumnReference,
@@ -2742,8 +2795,15 @@ mod tests {
             .expect("aggregate overload")],
         );
         let requirement = StatisticsRequiredAggregation::try_new(
-            StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
-                .expect("scan column"),
+            StatisticsScanColumn::try_new(
+                0,
+                "id",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            )
+            .expect("scan column"),
             "$test_blob_aggregate",
             StatisticsArtifactIdentity::try_new(vec![7], "test-blob-v1")
                 .expect("artifact identity"),
@@ -2758,8 +2818,15 @@ mod tests {
                 table: "t".into(),
                 version_ordinal: 42,
                 columns: vec![
-                    StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
-                        .expect("scan column"),
+                    StatisticsScanColumn::try_new(
+                        0,
+                        "id",
+                        novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        ),
+                    )
+                    .expect("scan column"),
                 ],
             },
             &[requirement],
@@ -3248,8 +3315,10 @@ mod tests {
                 StatisticsScanColumn::try_new(
                     0,
                     "order_id",
-                    arrow::datatypes::DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 )
                 .expect("scan column"),
                 "$test_change_stream_blob",

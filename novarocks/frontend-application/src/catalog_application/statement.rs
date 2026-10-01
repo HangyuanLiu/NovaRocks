@@ -390,6 +390,7 @@ pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataTy
                 .collect::<Result<_, String>>()?,
         ),
         SqlType::Variant => ConnectorDataType::Variant,
+        SqlType::Uuid => return Err("UUID is an external source domain, not a SQL DDL type".into()),
     })
 }
 

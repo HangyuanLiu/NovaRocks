@@ -187,6 +187,7 @@ impl ColumnRefFactory {
             ValueLogicalType::Bitmap => Some(SqlType::Bitmap),
             ValueLogicalType::Variant => Some(SqlType::Variant),
             ValueLogicalType::LargeInt => Some(SqlType::LargeInt),
+            ValueLogicalType::Uuid => Some(SqlType::Uuid),
             _ => None,
         }
     }

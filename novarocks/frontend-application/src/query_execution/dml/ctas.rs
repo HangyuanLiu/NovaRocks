@@ -701,6 +701,7 @@ fn prepare_planned_ctas_connector_write(
             .statistics_requirements(write_target_ordinal)
             .map_err(|error| error.to_string())?,
         &planned.optimizer_settings,
+        &crate::query_execution::planning::sql_compile_control_from_execution(execution),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();

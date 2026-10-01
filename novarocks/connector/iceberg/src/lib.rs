@@ -74,6 +74,7 @@ pub mod schema_mapping;
 pub mod statistics_ancestry;
 pub mod statistics_basis;
 pub mod statistics_codec;
+mod statistics_value_type;
 pub mod stats_assembler;
 pub mod stats_loader;
 pub mod storage_inspector;

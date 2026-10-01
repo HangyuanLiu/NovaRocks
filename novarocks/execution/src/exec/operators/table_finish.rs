@@ -1997,7 +1997,7 @@ mod tests {
                     WriterAuxiliaryChannel::try_new(
                         100 + u32::try_from(index).expect("channel slot"),
                         format!("partial_{index}"),
-                        DataType::Binary,
+                        novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
                     )
                     .expect("auxiliary channel")
                 })

@@ -689,7 +689,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
     String,
 > {
     let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )
     .map_err(|error| error.to_string())?
     .into_optimized_output()
@@ -720,6 +720,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         compiled.function_catalog,
         None,
         shape,
+        &control,
     )
 }
 
@@ -847,7 +848,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
     String,
 > {
     let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )
     .map_err(|error| error.to_string())?
     .into_optimized_output()
@@ -873,6 +874,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         compiled.function_catalog,
         None,
         shape,
+        &control,
     )
 }
 

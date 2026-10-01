@@ -2985,7 +2985,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 WriterRelationFieldRole::CommitFragment => WriterDerivedKind::CommitFragment,
                 WriterRelationFieldRole::Auxiliary => WriterDerivedKind::RelationAuxiliary,
             };
-            let ty = ValueType::new(field.data_type().clone(), field.is_nullable());
+            let ty = ValueType::try_from_field(field)
+                .map_err(|error| invalid_write(error.to_string()))?;
             let value = self.fragment_mut().add_value(
                 ty.clone(),
                 ValueOrigin::WriterDerived {
@@ -8039,19 +8040,22 @@ fn writer_import_schema(
             .iter()
             .zip(values)
             .enumerate()
-            .map(|(index, (field, value))| WriterRelationField {
-                value: *value,
-                name: field.name().clone().into_boxed_str(),
-                ty: ValueType::new(field.data_type().clone(), field.is_nullable()),
-                role: match index {
-                    0 => WriterRelationFieldRole::Kind,
-                    1 => WriterRelationFieldRole::TargetOrdinal,
-                    2 => WriterRelationFieldRole::RowCount,
-                    3 => WriterRelationFieldRole::CommitFragment,
-                    _ => WriterRelationFieldRole::Auxiliary,
-                },
+            .map(|(index, (field, value))| {
+                Ok(WriterRelationField {
+                    value: *value,
+                    name: field.name().clone().into_boxed_str(),
+                    ty: ValueType::try_from_field(field)
+                        .map_err(|error| invalid_write(error.to_string()))?,
+                    role: match index {
+                        0 => WriterRelationFieldRole::Kind,
+                        1 => WriterRelationFieldRole::TargetOrdinal,
+                        2 => WriterRelationFieldRole::RowCount,
+                        3 => WriterRelationFieldRole::CommitFragment,
+                        _ => WriterRelationFieldRole::Auxiliary,
+                    },
+                })
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, ContractLoweringError>>()?
             .into_boxed_slice(),
     })
 }
@@ -11183,7 +11187,12 @@ mod tests {
             false,
         )]);
         let requirement = StatisticsRequiredAggregation::try_new(
-            StatisticsScanColumn::try_new(0, "order_id", DataType::Int64, false).unwrap(),
+            StatisticsScanColumn::try_new(
+                0,
+                "order_id",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .unwrap(),
             "$test_writer_stat",
             StatisticsArtifactIdentity::try_new(vec![1], "test-writer-stat-v1").unwrap(),
         )

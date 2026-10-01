@@ -380,11 +380,12 @@ pub(crate) fn metadata_sql_schema(
     schema: &Schema,
 ) -> Result<SchemaRef, ConnectorError> {
     let domains = metadata_declarations(metadata)?;
-    apply_schema(
+    let arrow = apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(schema).map_err(corrupt)?,
         schema,
         &domains,
-    )
+    )?;
+    apply_source_logical_schema(arrow, schema, metadata.properties())
 }
 
 #[cfg(test)]
@@ -393,11 +394,116 @@ pub(crate) fn sql_schema(
     properties: &HashMap<String, String>,
 ) -> Result<SchemaRef, ConnectorError> {
     let domains = declarations(schema, properties)?;
-    apply_schema(
+    let arrow = apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(schema).map_err(corrupt)?,
         schema,
         &domains,
-    )
+    )?;
+    apply_source_logical_schema(arrow, schema, properties)
+}
+
+/// These legacy declarations address top-level names, not retained field IDs.
+/// They cannot prove a renamed historical field or a domain from its carrier.
+fn apply_source_logical_schema(
+    arrow: SchemaRef,
+    schema: &Schema,
+    properties: &HashMap<String, String>,
+) -> Result<SchemaRef, ConnectorError> {
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
+
+    let storage_fields = schema.as_struct().fields();
+    if arrow.fields().len() != storage_fields.len() {
+        return Err(corrupt("Iceberg logical source schema arity differs"));
+    }
+    let mut declared = BTreeMap::new();
+    for (key, value) in properties {
+        let Some(name) = key.strip_prefix(LEGACY_PREFIX) else {
+            continue;
+        };
+        let logical = match value.to_ascii_lowercase().as_str() {
+            "hll" => ValueLogicalType::Hll,
+            "bitmap" => ValueLogicalType::Bitmap,
+            "largeint" => ValueLogicalType::LargeInt,
+            // Scalar integers retain their existing field-ID/history rules.
+            // Other properties do not author one of these opaque domains.
+            _ => continue,
+        };
+        let mut matches = storage_fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name.eq_ignore_ascii_case(name));
+        let Some((ordinal, storage)) = matches.next() else {
+            // Current metadata can declare a column absent from a historical
+            // schema. Its name proves nothing about another historical field.
+            continue;
+        };
+        if matches.next().is_some() || declared.insert(ordinal, logical).is_some() {
+            return Err(corrupt("Iceberg logical source declaration is ambiguous"));
+        }
+        let expected_storage = match logical {
+            ValueLogicalType::Hll | ValueLogicalType::Bitmap => PrimitiveType::Binary,
+            ValueLogicalType::LargeInt => PrimitiveType::Fixed(16),
+            _ => unreachable!("only declared opaque domains reach storage validation"),
+        };
+        if storage.field_type.as_ref() != &Type::Primitive(expected_storage) {
+            return Err(corrupt(
+                "Iceberg logical declaration differs from its exact storage carrier",
+            ));
+        }
+    }
+    let mut fields = Vec::with_capacity(arrow.fields().len());
+    for (ordinal, (field, storage)) in arrow.fields().iter().zip(storage_fields).enumerate() {
+        if field.name() != &storage.name || field.is_nullable() == storage.required {
+            return Err(corrupt("Iceberg logical source field identity differs"));
+        }
+        let logical =
+            declared
+                .get(&ordinal)
+                .copied()
+                .unwrap_or_else(|| match storage.field_type.as_ref() {
+                    Type::Primitive(PrimitiveType::Uuid) => ValueLogicalType::Uuid,
+                    Type::Primitive(PrimitiveType::Variant) => ValueLogicalType::Variant,
+                    _ => ValueLogicalType::Physical,
+                });
+        let expected_carrier = match logical {
+            ValueLogicalType::Hll | ValueLogicalType::Bitmap => Some(DataType::Binary),
+            ValueLogicalType::LargeInt => Some(DataType::FixedSizeBinary(16)),
+            _ => None,
+        };
+        if expected_carrier
+            .as_ref()
+            .is_some_and(|expected| field.data_type() != expected)
+        {
+            return Err(corrupt("Iceberg logical source SQL carrier differs"));
+        }
+        if field.metadata().contains_key(NR_LOGICAL_TYPE_KEY)
+            && field_logical_type(field).map_err(|error| corrupt(error.to_string()))? != logical
+        {
+            return Err(corrupt(
+                "Iceberg logical source metadata conflicts with its declaration",
+            ));
+        }
+        logical
+            .validate_carrier(field.data_type())
+            .map_err(|error| corrupt(error.to_string()))?;
+        if declared.contains_key(&ordinal) {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                NR_LOGICAL_TYPE_KEY.into(),
+                logical
+                    .metadata_value()
+                    .expect("declared domains have labels")
+                    .into(),
+            );
+            fields.push(Arc::new(field.as_ref().clone().with_metadata(metadata)));
+        } else {
+            fields.push(field.clone());
+        }
+    }
+    Ok(Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        arrow.metadata().clone(),
+    )))
 }
 
 pub(crate) fn apply_schema(
@@ -689,5 +795,248 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    fn opaque_source_schema() -> Schema {
+        use crate::iceberg::spec::{Literal, PrimitiveLiteral, StructType};
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(
+                    NestedField::required(10, "h", Type::Primitive(PrimitiveType::Binary))
+                        .with_initial_default(Literal::Primitive(PrimitiveLiteral::Binary(vec![
+                            1, 2,
+                        ]))),
+                ),
+                Arc::new(NestedField::optional(
+                    11,
+                    "b",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    12,
+                    "l",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::optional(
+                    13,
+                    "plain",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    14,
+                    "fixed",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::optional(
+                    15,
+                    "json",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::optional(
+                    16,
+                    "record",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                        17,
+                        "u",
+                        Type::Primitive(PrimitiveType::Uuid),
+                    ))])),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn opaque_source_properties() -> HashMap<String, String> {
+        HashMap::from([
+            (format!("{LEGACY_PREFIX}H"), "HLL".into()),
+            (format!("{LEGACY_PREFIX}b"), "bitmap".into()),
+            (format!("{LEGACY_PREFIX}l"), "largeint".into()),
+        ])
+    }
+
+    #[test]
+    fn table_metadata_authors_only_declared_opaque_source_domains() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType, field_logical_type};
+        let storage = opaque_source_schema();
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            storage,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://opaque-source".into(),
+            crate::iceberg::spec::FormatVersion::V3,
+            opaque_source_properties(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        // Table creation assigns the persisted field IDs. Compare annotations
+        // against that actual owner schema rather than the pre-creation IDs.
+        let base =
+            crate::schema_mapping::sql_read_schema_from_iceberg(metadata.current_schema()).unwrap();
+        let projected = metadata_sql_schema(&metadata, metadata.current_schema()).unwrap();
+        for (ordinal, logical) in [
+            ValueLogicalType::Hll,
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Physical,
+            ValueLogicalType::Physical,
+            ValueLogicalType::Physical,
+            ValueLogicalType::Physical,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let field = projected.field(ordinal);
+            assert_eq!(field_logical_type(field).unwrap(), logical);
+            assert_eq!(field.data_type(), base.field(ordinal).data_type());
+            assert_eq!(field.is_nullable(), base.field(ordinal).is_nullable());
+            for (key, value) in base.field(ordinal).metadata() {
+                assert_eq!(field.metadata().get(key), Some(value));
+            }
+            FunctionValueType::try_from_field(field).unwrap();
+        }
+        assert_eq!(projected.field(0).data_type(), &DataType::Binary);
+        assert!(!projected.field(0).is_nullable());
+        assert_eq!(
+            projected.field(2).data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+        assert_eq!(projected.field(6), base.field(6));
+        assert_eq!(projected.metadata(), base.metadata());
+        let plain = sql_schema(metadata.current_schema(), &HashMap::new()).unwrap();
+        assert_eq!(
+            field_logical_type(plain.field(0)).unwrap(),
+            ValueLogicalType::Physical
+        );
+        assert_eq!(
+            field_logical_type(plain.field(2)).unwrap(),
+            ValueLogicalType::Physical
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn source_domain_authoring_keeps_actual_field_annotations_and_dictionary_identity() {
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
+        let storage = opaque_source_schema();
+        let base = crate::schema_mapping::sql_read_schema_from_iceberg(&storage).unwrap();
+        let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
+        let mut annotations = fields[0].metadata().clone();
+        annotations.insert("provider.annotation".into(), "retained".into());
+        annotations.insert("default.annotation".into(), "0102".into());
+        fields[0] = Arc::new(
+            fields[0]
+                .as_ref()
+                .clone()
+                .with_metadata(annotations.clone()),
+        );
+        fields[5] = Arc::new(
+            arrow::datatypes::Field::new_dict(
+                "json",
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                true,
+                93,
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                "provider.dictionary".into(),
+                "retained".into(),
+            )])),
+        );
+        let annotated = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            HashMap::from([("schema.annotation".into(), "retained".into())]),
+        ));
+        let projected =
+            apply_source_logical_schema(annotated.clone(), &storage, &opaque_source_properties())
+                .unwrap();
+        annotations.insert(NR_LOGICAL_TYPE_KEY.into(), "hll".into());
+        assert_eq!(projected.field(0).metadata(), &annotations);
+        assert_eq!(projected.field(5).dict_id(), Some(93));
+        assert_eq!(projected.field(5).dict_is_ordered(), Some(true));
+        assert_eq!(projected.field(5), annotated.field(5));
+        assert_eq!(
+            field_logical_type(projected.field(0)).unwrap(),
+            ValueLogicalType::Hll
+        );
+        assert_eq!(projected.field(6), annotated.field(6));
+        assert_eq!(projected.metadata(), annotated.metadata());
+        // An identical explicit declaration is checked, not overwritten.
+        assert!(
+            apply_source_logical_schema(projected, &storage, &opaque_source_properties()).is_ok()
+        );
+    }
+
+    #[test]
+    fn source_domain_declarations_reject_wrong_storage_carrier_and_explicit_metadata() {
+        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+        let storage = opaque_source_schema();
+        for (name, value) in [("json", "hll"), ("fixed", "bitmap"), ("plain", "largeint")] {
+            let error = sql_schema(
+                &storage,
+                &HashMap::from([(format!("{LEGACY_PREFIX}{name}"), value.into())]),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        }
+        let base = crate::schema_mapping::sql_read_schema_from_iceberg(&storage).unwrap();
+        for (ordinal, label) in [(0, "bitmap"), (0, "unknown"), (3, "hll"), (5, "json")] {
+            let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
+            let mut metadata = fields[ordinal].metadata().clone();
+            metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
+            fields[ordinal] = Arc::new(fields[ordinal].as_ref().clone().with_metadata(metadata));
+            let error = apply_source_logical_schema(
+                Arc::new(arrow::datatypes::Schema::new(fields)),
+                &storage,
+                &opaque_source_properties(),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        }
+        for carrier in [DataType::LargeBinary, DataType::Utf8] {
+            let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
+            fields[0] = Arc::new(fields[0].as_ref().clone().with_data_type(carrier));
+            assert!(
+                apply_source_logical_schema(
+                    Arc::new(arrow::datatypes::Schema::new(fields)),
+                    &storage,
+                    &opaque_source_properties()
+                )
+                .is_err()
+            );
+        }
+        let mut duplicate = opaque_source_properties();
+        duplicate.insert(format!("{LEGACY_PREFIX}h"), "hll".into());
+        assert!(sql_schema(&storage, &duplicate).is_err());
+    }
+
+    #[test]
+    fn current_name_declarations_do_not_invent_historical_or_json_domains() {
+        use novarocks_type_contract::{ValueLogicalType, field_logical_type};
+        let historical = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    10,
+                    "old_h",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    15,
+                    "json",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let mut properties = opaque_source_properties();
+        properties.insert(format!("{LEGACY_PREFIX}json"), "json".into());
+        let projected = sql_schema(&historical, &properties).unwrap();
+        for field in projected.fields() {
+            assert_eq!(
+                field_logical_type(field).unwrap(),
+                ValueLogicalType::Physical
+            );
+        }
     }
 }

@@ -312,9 +312,11 @@ pub fn plan_writer_statistics(
                         target.target.get()
                     )
                 })?;
+            let input_value_type =
+                novarocks_type_contract::FunctionValueType::try_from_field(input)
+                    .map_err(|error| error.to_string())?;
             if input.name() != requirement.input().name()
-                || input.data_type() != requirement.input().data_type()
-                || input.is_nullable() != requirement.input().nullable()
+                || &input_value_type != requirement.input().value_type()
             {
                 return Err(format!(
                     "write aggregate input ordinal {} does not match the pinned column for target {}",
@@ -330,10 +332,7 @@ pub fn plan_writer_statistics(
                     qualifier: None,
                     column: requirement.input().name().to_string(),
                 },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    requirement.input().data_type().clone(),
-                    requirement.input().nullable(),
-                ),
+                value_type: requirement.input().value_type().clone(),
             };
             let resolved = crate::functions::resolve_sql_aggregate_binding(
                 functions,
@@ -349,7 +348,10 @@ pub fn plan_writer_statistics(
                     requirement.input().data_type()
                 )
             })?;
-            if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary {
+            if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary
+                || crate::functions::aggregate_result_type(&resolved).logical_type
+                    != novarocks_type_contract::ValueLogicalType::Physical
+            {
                 return Err(format!(
                     "write aggregate `{}` output {:?} cannot feed the binary Root value slot",
                     requirement.function_name(),
@@ -373,10 +375,14 @@ pub fn plan_writer_statistics(
                     WriterAuxiliaryChannel::try_new(
                         intermediate_slot_id,
                         format!("auxiliary_channel_{ordinal}"),
-                        crate::functions::aggregate_selection(&resolved)
-                            .intermediate_type
-                            .data_type
-                            .clone(),
+                        {
+                            let mut transport_type =
+                                crate::functions::aggregate_selection(&resolved)
+                                    .intermediate_type
+                                    .clone();
+                            transport_type.nullable = true;
+                            transport_type
+                        },
                     )
                     .map_err(|error| error.to_string())?,
                 );
@@ -500,7 +506,7 @@ fn validate_plan(
     let channels = schema
         .auxiliary_channels()
         .iter()
-        .map(|channel| (channel.slot_id(), channel.data_type()))
+        .map(|channel| (channel.slot_id(), channel.value_type()))
         .collect::<BTreeMap<_, _>>();
     let partial_slots = partial_by_target
         .values()
@@ -516,11 +522,11 @@ fn validate_plan(
         let Some(data_type) = channels.get(&call.intermediate_input_slot_id) else {
             return Err("write final aggregate reads an unknown auxiliary slot".to_string());
         };
-        if **data_type
-            != crate::functions::aggregate_selection(&call.resolved)
-                .intermediate_type
-                .data_type
-        {
+        let mut transport_type = crate::functions::aggregate_selection(&call.resolved)
+            .intermediate_type
+            .clone();
+        transport_type.nullable = true;
+        if **data_type != transport_type {
             return Err(
                 "write aggregate intermediate type differs from its typed tail".to_string(),
             );
@@ -594,7 +600,12 @@ mod tests {
 
     fn requirement(field_id: i32) -> StatisticsRequiredAggregation {
         StatisticsRequiredAggregation::try_new(
-            StatisticsScanColumn::try_new(0, "k", DataType::Int64, false).expect("input"),
+            StatisticsScanColumn::try_new(
+                0,
+                "k",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("input"),
             "binary_stat",
             StatisticsArtifactIdentity::try_new(vec![field_id], "generic-binary")
                 .expect("identity"),
@@ -615,7 +626,12 @@ mod tests {
         let input_schema = input_schema();
         let required = vec![
             StatisticsRequiredAggregation::try_new(
-                StatisticsScanColumn::try_new(0, "k", DataType::Int64, false).expect("input"),
+                StatisticsScanColumn::try_new(
+                    0,
+                    "k",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("input"),
                 "count",
                 StatisticsArtifactIdentity::try_new(vec![11], "generic-binary").expect("identity"),
             )
@@ -632,6 +648,44 @@ mod tests {
         )
         .expect_err("count does not produce a binary artifact body");
         assert!(plan.contains("binary Root value slot"));
+    }
+
+    #[test]
+    fn writer_auxiliary_validation_rejects_same_carrier_with_changed_state_domain() {
+        let schema = input_schema();
+        let required = vec![requirement(11)];
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let plan = plan_writer_statistics(
+            &[WriterStatisticsTargetInput {
+                target,
+                input_schema: &schema,
+                requirements: &required,
+            }],
+            &binary_catalog(),
+        )
+        .unwrap();
+        let original = &plan.schema().auxiliary_channels()[0];
+        let changed = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            original.data_type().clone(),
+            true,
+            novarocks_type_contract::ValueLogicalType::Hll,
+        )
+        .unwrap();
+        let changed_schema = WriterMultiplexSchema::try_new(vec![
+            WriterAuxiliaryChannel::try_new(original.slot_id(), original.name(), changed).unwrap(),
+        ])
+        .unwrap();
+        let error = super::validate_plan(
+            &changed_schema,
+            &plan.partial_by_target,
+            plan.final_plan.calls(),
+            plan.final_plan.unpivot().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("intermediate type differs from its typed tail"),
+            "{error}"
+        );
     }
 
     #[test]

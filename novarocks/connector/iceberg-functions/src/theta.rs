@@ -30,9 +30,9 @@ use novarocks_functions::{
     AggregateBindOptions, AggregateImplementationIdentity, AggregateInputBatch,
     AggregateOverloadDeclaration, AggregateOverloadIdentity, AggregateStateFormatIdentity,
     AggregateStateMemoryPolicy, EngineFunctionCatalogBuilder, FunctionBundleContributor,
-    FunctionCatalogError, FunctionResolutionError, FunctionVisibility, FunctionVolatility,
-    ResolvedAggregateSignature, TypedAggregateFamily, TypedAggregateKernel,
-    TypedAggregateRegistration,
+    FunctionCatalogError, FunctionResolutionError, FunctionValueType, FunctionVisibility,
+    FunctionVolatility, ResolvedAggregateSignature, TypedAggregateFamily, TypedAggregateKernel,
+    TypedAggregateRegistration, ValueLogicalType,
 };
 
 use crate::canonical::{CanonicalKind, PreparedCanonicalBatch, canonical_width};
@@ -171,6 +171,46 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
     /// canonical empty sketch, not the absence of one.
     fn produces_null(&self) -> bool {
         false
+    }
+
+    fn validate_value_arguments(
+        &self,
+        arguments: &[FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        let [argument] = arguments else {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: self.overloads.len(),
+                binding_enforced: true,
+            });
+        };
+        argument
+            .validate()
+            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
+        match argument.logical_type {
+            ValueLogicalType::Physical => {}
+            // Iceberg UUID uses its exact raw 16 bytes. This grants no
+            // numeric meaning to the fixed-binary carrier. LARGEINT statistics
+            // retain the existing storage-byte policy as well.
+            ValueLogicalType::Uuid | ValueLogicalType::LargeInt
+                if argument.data_type == DataType::FixedSizeBinary(16) => {}
+            // These source-declared opaque domains retain the original raw
+            // serialized-byte statistics policy, without interpreting them.
+            ValueLogicalType::Hll | ValueLogicalType::Bitmap
+                if argument.data_type == DataType::Binary => {}
+            // Existing Iceberg VARIANT statistics hash the serialized raw
+            // bytes. This preserves that source-authored domain without
+            // parsing it or deriving identity from a LargeBinary carrier.
+            ValueLogicalType::Variant if argument.data_type == DataType::LargeBinary => {}
+            _ => {
+                return Err(FunctionResolutionError::BadSignature(format!(
+                    "Iceberg Theta does not support input value domain {argument:?}"
+                )));
+            }
+        }
+        // The original canonical family remains the sole carrier admission
+        // rule, including fixed width, decimal shape, and temporal units.
+        self.resolve_signature(std::slice::from_ref(&argument.data_type))
+            .map(|_| ())
     }
 
     fn resolve_signature(
@@ -601,6 +641,265 @@ mod tests {
             resolved.state_format.as_str(),
             ICEBERG_THETA_STATE_FORMAT_IDENTITY
         );
+    }
+
+    fn theta_value_request(
+        arguments: &[novarocks_functions::FunctionArgument],
+    ) -> novarocks_functions::FunctionBindingRequest<'_> {
+        novarocks_functions::FunctionBindingRequest {
+            arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
+        }
+    }
+
+    fn theta_value_argument(
+        value_type: FunctionValueType,
+    ) -> novarocks_functions::FunctionArgument {
+        novarocks_functions::FunctionArgument::Value {
+            value_type,
+            constant: None,
+        }
+    }
+
+    #[test]
+    fn exact_uuid_variant_and_physical_bindings_keep_overload_and_state_identity() {
+        use novarocks_functions::{FunctionArgumentType, FunctionKind, FunctionResultType};
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        IcebergFunctionBundle.contribute(&mut builder).unwrap();
+        let catalog = builder.seal().unwrap();
+        for nullable in [false, true] {
+            for (value_type, overload) in [
+                (
+                    FunctionValueType::new(DataType::Int32, nullable),
+                    "iceberg/theta-stat/int/v1",
+                ),
+                (
+                    FunctionValueType::new(DataType::FixedSizeBinary(4), nullable),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::new(DataType::FixedSizeBinary(16), nullable),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        nullable,
+                        ValueLogicalType::Uuid,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::new(DataType::LargeBinary, nullable),
+                    "iceberg/theta-stat/large-binary/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        nullable,
+                        ValueLogicalType::Variant,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/large-binary/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        nullable,
+                        ValueLogicalType::LargeInt,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/fixed/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::Binary,
+                        nullable,
+                        ValueLogicalType::Hll,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/binary/v1",
+                ),
+                (
+                    FunctionValueType::try_with_logical_type(
+                        DataType::Binary,
+                        nullable,
+                        ValueLogicalType::Bitmap,
+                    )
+                    .unwrap(),
+                    "iceberg/theta-stat/binary/v1",
+                ),
+            ] {
+                let arguments = [theta_value_argument(value_type.clone())];
+                let request = theta_value_request(&arguments);
+                let bound = catalog
+                    .resolve_bound_trusted(
+                        ICEBERG_THETA_AGGREGATE_NAME,
+                        FunctionKind::Aggregate,
+                        request,
+                    )
+                    .unwrap();
+                catalog.validate_bound(&bound, request).unwrap();
+                assert_eq!(
+                    bound.selected.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(value_type)]
+                );
+                assert_eq!(bound.selected.overload.as_str(), overload);
+                assert_eq!(
+                    bound.selected.result_type,
+                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, false))
+                );
+                let state = bound.selected.aggregate.as_ref().unwrap();
+                assert_eq!(
+                    state.intermediate_type,
+                    FunctionValueType::new(DataType::Binary, false)
+                );
+                assert_eq!(
+                    state.state_format.as_str(),
+                    ICEBERG_THETA_STATE_FORMAT_IDENTITY
+                );
+            }
+        }
+        let registration = iceberg_theta_registration().unwrap();
+        assert_eq!(
+            registration.implementation().as_str(),
+            ICEBERG_THETA_IMPLEMENTATION_IDENTITY
+        );
+        let raw = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_java_oracle(
+            "uuid",
+            Arc::new(FixedSizeBinaryArray::try_from_iter([raw].into_iter()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn exact_theta_validation_rejects_root_forgery_and_new_logical_domains() {
+        use novarocks_functions::{FunctionArgumentType, FunctionKind};
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        IcebergFunctionBundle.contribute(&mut builder).unwrap();
+        let catalog = builder.seal().unwrap();
+        let uuid = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        let arguments = [theta_value_argument(uuid.clone())];
+        let bound = catalog
+            .resolve_bound_trusted(
+                ICEBERG_THETA_AGGREGATE_NAME,
+                FunctionKind::Aggregate,
+                theta_value_request(&arguments),
+            )
+            .unwrap();
+        // Even another admitted domain cannot replace a frozen source while
+        // the real expression still supplies UUID.
+        let mut changed = bound.clone();
+        changed.selected.argument_types[0] = FunctionArgumentType::Value(FunctionValueType::new(
+            DataType::FixedSizeBinary(16),
+            false,
+        ));
+        assert!(
+            catalog
+                .validate_bound(&changed, theta_value_request(&arguments))
+                .is_err()
+        );
+        for value_type in [
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                false,
+                ValueLogicalType::Object,
+            )
+            .unwrap(),
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                false,
+                ValueLogicalType::Percentile,
+            )
+            .unwrap(),
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap(),
+            FunctionValueType {
+                data_type: DataType::Binary,
+                nullable: false,
+                logical_type: ValueLogicalType::Variant,
+            },
+            FunctionValueType {
+                data_type: DataType::FixedSizeBinary(4),
+                nullable: false,
+                logical_type: ValueLogicalType::Uuid,
+            },
+        ] {
+            let arguments = [theta_value_argument(value_type.clone())];
+            let request = theta_value_request(&arguments);
+            assert!(
+                catalog
+                    .resolve_bound_trusted(
+                        ICEBERG_THETA_AGGREGATE_NAME,
+                        FunctionKind::Aggregate,
+                        request,
+                    )
+                    .is_err(),
+                "{value_type:?}"
+            );
+            let mut changed = bound.clone();
+            changed.selected.argument_types[0] = FunctionArgumentType::Value(value_type.clone());
+            // Change both the request and selected root to exercise the
+            // family gate after exact expression/selection correspondence.
+            assert!(
+                catalog.validate_bound(&changed, request).is_err(),
+                "{value_type:?}"
+            );
+        }
+        let family = IcebergThetaAggregateFamily::try_new().unwrap();
+        assert!(family.validate_value_arguments(&[uuid]).is_ok());
+        assert!(
+            family
+                .validate_value_arguments(&[FunctionValueType::new(DataType::UInt8, false)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn variant_statistics_preserve_the_existing_serialized_raw_bytes() {
+        use novarocks_functions::FunctionKind;
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        IcebergFunctionBundle.contribute(&mut builder).unwrap();
+        let catalog = builder.seal().unwrap();
+        let variant = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Variant,
+        )
+        .unwrap();
+        let arguments = [theta_value_argument(variant)];
+        let request = theta_value_request(&arguments);
+        let bound = catalog
+            .resolve_bound_trusted(
+                ICEBERG_THETA_AGGREGATE_NAME,
+                FunctionKind::Aggregate,
+                request,
+            )
+            .unwrap();
+        catalog.validate_bound(&bound, request).unwrap();
+        assert_eq!(
+            bound.selected.overload.as_str(),
+            "iceberg/theta-stat/large-binary/v1"
+        );
+        let raw_a: &[u8] = &[0, 1, 255, 127];
+        let raw_b: &[u8] = &[127, 255, 1, 0];
+        // The legacy producer supplied these exact serialized bytes. The
+        // family must not decode VARIANT values or normalize their contents.
+        let values = vec![Some(raw_a), None, Some(raw_b), Some(raw_a)];
+        let actual = run_update(Arc::new(LargeBinaryArray::from(values.clone())));
+        let old_binary = run_update(Arc::new(BinaryArray::from(values)));
+        assert_eq!(actual, old_binary);
+        assert_eq!(estimate_compact_theta(&actual).unwrap(), 2.0);
     }
 
     #[test]

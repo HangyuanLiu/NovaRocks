@@ -456,24 +456,21 @@ struct ParametricAggregateBindingResolver {
 
 impl ParametricAggregateBindingResolver {
     fn argument_types(
+        &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<Vec<arrow_schema::DataType>, FunctionBindingError> {
-        request
+        let values = request
             .arguments
             .iter()
             .map(|argument| match argument {
-                FunctionArgument::Value { value_type, .. }
-                    if value_type.logical_type
-                        == novarocks_type_contract::ValueLogicalType::Physical =>
-                {
-                    Ok(value_type.data_type.clone())
-                }
-                FunctionArgument::Value { .. } => Err(invalid(
-                    "legacy aggregate resolver does not declare root logical identities",
-                )),
+                FunctionArgument::Value { value_type, .. } => Ok(value_type.clone()),
                 FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        self.aggregate_resolver
+            .validate_value_arguments(&values)
+            .map_err(|error| invalid(&error.to_string()))?;
+        Ok(values.into_iter().map(|value| value.data_type).collect())
     }
 
     fn selection(
@@ -510,7 +507,7 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
         &self,
         request: FunctionBindingRequest<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        let argument_types = Self::argument_types(request)?;
+        let argument_types = self.argument_types(request)?;
         let logical = self
             .aggregate_resolver
             .resolve_aggregate(&argument_types[..request.logical_argument_count])
@@ -532,7 +529,7 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
     ) -> Result<(), FunctionBindingError> {
-        let argument_types = Self::argument_types(request)?;
+        let argument_types = self.argument_types(request)?;
         let selected_overload =
             crate::AggregateOverloadIdentity::try_new(selected.overload.as_str())
                 .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
