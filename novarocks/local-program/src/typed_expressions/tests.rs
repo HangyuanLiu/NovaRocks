@@ -521,3 +521,237 @@ fn signature_type_work_uses_one_scope_and_preserves_all_three_control_failures()
         }
     }
 }
+
+fn cv_policy() -> novarocks_functions::ConstantPolicy {
+    novarocks_functions::ConstantPolicy {
+        max_rows: 1_000_000,
+        max_array_nodes: 4096,
+        max_logical_elements: 16_000_000,
+        max_retained_buffer_bytes: 64 * 1024 * 1024,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1024 * 1024,
+        max_library_validation_work: 1024 * 1024 * 1024,
+        max_library_validation_bytes: 64 * 1024 * 1024,
+    }
+}
+fn cv(
+    array: arrow_array::ArrayRef,
+    ty: FunctionValueType,
+    ordinal: u32,
+) -> novarocks_functions::ConstantValue {
+    novarocks_functions::ConstantPool::try_new(
+        Arc::new(ty.try_to_field("selected").unwrap()),
+        ty,
+        array.to_data(),
+        cv_policy(),
+        CompilePhase::LowerProgram,
+        &Control::default(),
+    )
+    .unwrap()
+    .value(ordinal)
+    .unwrap()
+}
+fn cv_node(value: novarocks_functions::ConstantValue) -> StaticExprNode {
+    let ty = value.value_type().data_type.clone();
+    StaticExprNode::new(StaticExprKind::Constant(value), ty, None)
+}
+
+#[test]
+fn shared_constants_keep_selected_rows_float_bits_and_exact_complete_types() {
+    use arrow_array::{Array, Float32Array, StringArray, StructArray};
+    let floats = [0x8000_0000u32, 0x7fc0_0042];
+    let ty = FunctionValueType::new(DataType::Float32, false);
+    let source = cv(
+        Arc::new(Float32Array::from(floats.map(f32::from_bits).to_vec())),
+        ty.clone(),
+        1,
+    );
+    let typed = ProgramTypedExpressions::try_new(
+        resolved(vec![cv_node(source.clone())], None),
+        main_types(vec![FunctionArgumentType::Value(ty)]),
+        &Control::default(),
+    )
+    .unwrap();
+    let arena = &typed.resolved_calls().snapshot().roots().arenas()[&ProgramExpressionArena::Main];
+    let StaticExprKind::Constant(stored) = arena.nodes()[0].kind() else {
+        panic!("missing checked constant")
+    };
+    assert_eq!(stored.ordinal(), 1);
+    assert!(Arc::ptr_eq(stored.pool().array(), source.pool().array()));
+    assert_eq!(
+        stored
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(stored.ordinal() as usize)
+            .to_bits(),
+        floats[1]
+    );
+
+    let child = Arc::new(
+        Field::new("json", DataType::Utf8, true).with_metadata(HashMap::from([
+            (
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+                "json".to_owned(),
+            ),
+            ("provider".to_owned(), "source".to_owned()),
+        ])),
+    );
+    let array = Arc::new(StructArray::new(
+        vec![child.clone()].into(),
+        vec![Arc::new(StringArray::from(vec![Some("null"), Some("{}")]))],
+        None,
+    ));
+    let exact = FunctionValueType::new(array.data_type().clone(), false);
+    let nested = cv(array, exact.clone(), 1);
+    ProgramTypedExpressions::try_new(
+        resolved(vec![cv_node(nested.clone())], None),
+        main_types(vec![FunctionArgumentType::Value(exact)]),
+        &Control::default(),
+    )
+    .unwrap();
+    let wrong = FunctionValueType::new(
+        DataType::Struct(
+            vec![Arc::new(child.as_ref().clone().with_metadata(
+                HashMap::from([
+                    (
+                        novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+                        "json".to_owned(),
+                    ),
+                    ("provider".to_owned(), "different".to_owned()),
+                ]),
+            ))]
+            .into(),
+        ),
+        false,
+    );
+    assert_eq!(
+        ProgramTypedExpressions::try_new(
+            resolved(vec![cv_node(nested)], None),
+            main_types(vec![FunctionArgumentType::Value(wrong)]),
+            &Control::default(),
+        )
+        .unwrap_err(),
+        ProgramExpressionTypeError::TypeMismatch
+    );
+}
+
+#[test]
+fn shared_constants_reject_logical_nullable_and_carrier_retagging() {
+    use arrow_array::{Float32Array, StringArray};
+    let json_type =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    let json = cv(
+        Arc::new(StringArray::from(vec![None::<&str>, Some("null")])),
+        json_type.clone(),
+        0,
+    );
+    assert!(
+        json.is_null_observed(CompilePhase::LowerProgram, &Control::default())
+            .unwrap()
+    );
+    ProgramTypedExpressions::try_new(
+        resolved(vec![cv_node(json.clone())], None),
+        main_types(vec![FunctionArgumentType::Value(json_type.clone())]),
+        &Control::default(),
+    )
+    .unwrap();
+    for wrong in [
+        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap(),
+    ] {
+        assert_eq!(
+            ProgramTypedExpressions::try_new(
+                resolved(vec![cv_node(json.clone())], None),
+                main_types(vec![FunctionArgumentType::Value(wrong)]),
+                &Control::default(),
+            )
+            .unwrap_err(),
+            ProgramExpressionTypeError::TypeMismatch
+        );
+    }
+    let float = cv(
+        Arc::new(Float32Array::from(vec![1.0])),
+        FunctionValueType::new(DataType::Float32, false),
+        0,
+    );
+    assert_eq!(
+        ImmutableExpressions::try_new(
+            vec![StaticExprNode::new(
+                StaticExprKind::Constant(float),
+                DataType::Float64,
+                None
+            )],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .unwrap_err(),
+        crate::StaticExpressionError::ConstantTypeMismatch
+    );
+}
+
+#[test]
+fn shared_constant_backing_is_bounded_as_retained_storage_and_deduplicated() {
+    use arrow_array::BinaryArray;
+    let payload = vec![7u8; 9 * 1024 * 1024];
+    let make = || {
+        cv(
+            Arc::new(BinaryArray::from(vec![payload.as_slice()])),
+            FunctionValueType::new(DataType::Binary, false),
+            0,
+        )
+    };
+    let same = make();
+    arena(vec![
+        cv_node(same.clone()),
+        cv_node(same.clone()),
+        cv_node(same),
+    ]);
+    assert_eq!(
+        ImmutableExpressions::try_new(
+            vec![cv_node(make()), cv_node(make())],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .unwrap_err(),
+        crate::StaticExpressionError::TooManyBytes
+    );
+}
+
+#[test]
+fn shared_constant_definition_control_never_becomes_a_partial_typed_program() {
+    let constant = cv(
+        Arc::new(BooleanArray::from(vec![true])),
+        FunctionValueType::new(DataType::Boolean, false),
+        0,
+    );
+    let source = resolved(vec![cv_node(constant); 320], None);
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in [0, 256] {
+            assert_eq!(
+                ProgramTypedExpressions::try_new(
+                    source.clone(),
+                    main_types(vec![value(DataType::Boolean, false); 320]),
+                    &Control {
+                        at: Some(at),
+                        failure: Some(error)
+                    },
+                )
+                .unwrap_err(),
+                ProgramExpressionTypeError::Control(error)
+            );
+        }
+    }
+}

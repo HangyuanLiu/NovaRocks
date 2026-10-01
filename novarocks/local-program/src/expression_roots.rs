@@ -767,7 +767,8 @@ fn validate_intrinsic_correspondence(
                     has_else: *has_else_expr,
                 }
             }
-            StaticExprKind::Literal(_)
+            StaticExprKind::Constant(_)
+            | StaticExprKind::Literal(_)
             | StaticExprKind::SlotId(_)
             | StaticExprKind::ArrayExpr { .. }
             | StaticExprKind::StructExpr { .. }
@@ -810,7 +811,9 @@ fn validate_intrinsic_correspondence(
             Ok(())
         };
         match definition.kind() {
-            StaticExprKind::Literal(_) | StaticExprKind::SlotId(_) => {}
+            StaticExprKind::Constant(_)
+            | StaticExprKind::Literal(_)
+            | StaticExprKind::SlotId(_) => {}
             StaticExprKind::ArrayExpr { elements }
             | StaticExprKind::StructExpr { fields: elements }
             | StaticExprKind::Case {

@@ -116,23 +116,27 @@ impl<'a> Selection<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum EvaluatedArgument<'a> {
     Scalar(&'a ArrayRef),
+    /// One checked SQL value. Other rows in its retained pool are not inputs.
+    Constant(&'a crate::ConstantValue),
     Column(&'a ArrayRef),
     SelectedColumn(&'a SelectedValues<'a>),
 }
 
 impl<'a> EvaluatedArgument<'a> {
-    pub const fn array(self) -> &'a ArrayRef {
+    pub fn array(self) -> &'a ArrayRef {
         match self {
             Self::Scalar(array) | Self::Column(array) => array,
+            Self::Constant(value) => value.pool().array(),
             Self::SelectedColumn(output) => output.values(),
         }
     }
 
     /// After validation, use ordinals and rows from the same Selection walk.
     /// Compact arguments retain original row identity without a full scatter.
-    pub const fn value_row(self, selected_ordinal: usize, batch_row: usize) -> usize {
+    pub fn value_row(self, selected_ordinal: usize, batch_row: usize) -> usize {
         match self {
             Self::Scalar(_) => 0,
+            Self::Constant(value) => value.ordinal() as usize,
             Self::Column(_) => batch_row,
             Self::SelectedColumn(_) => selected_ordinal,
         }
@@ -162,6 +166,9 @@ impl<'a> EvaluatedArgument<'a> {
         observe: impl FnMut() -> Result<(), E>,
     ) -> Result<(), E> {
         let expected_rows = match self {
+            // The immutable owner has already checked this ordinal. A pool
+            // may contain many rows; the call broadcasts only this value.
+            Self::Constant(_) => return Ok(()),
             Self::Scalar(_) => 1,
             Self::Column(_) => selection.batch_rows(),
             Self::SelectedColumn(output) => {

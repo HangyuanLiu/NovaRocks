@@ -407,7 +407,7 @@ fn expr_references_slot(arena: &ExprArena, expr: ExprId, slot_id: SlotId) -> boo
         return false;
     };
     match node {
-        ExprNode::Literal(_) => false,
+        ExprNode::Constant(_) | ExprNode::Literal(_) => false,
         ExprNode::SlotId(slot) => *slot == slot_id,
         ExprNode::ArrayExpr { elements } | ExprNode::StructExpr { fields: elements } => elements
             .iter()

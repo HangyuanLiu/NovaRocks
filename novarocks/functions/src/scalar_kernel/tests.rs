@@ -163,6 +163,7 @@ fn contract_with_argument_nullability(
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     Good,
+    EchoConstant,
     RowError,
     Null,
     WrongSelection,
@@ -219,6 +220,25 @@ impl ScalarKernelInstance for Instance {
         }
         let rows = input.selection().len();
         let array: ArrayRef = match self.mode {
+            Mode::EchoConstant => {
+                let argument = input.arguments()[0];
+                let array = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                Arc::new(Int64Array::from(
+                    input
+                        .selection()
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, row)| {
+                            let index = argument.value_row(ordinal, row);
+                            (!array.is_null(index)).then(|| array.value(index))
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            }
             Mode::RowError | Mode::Null => Arc::new(Int64Array::from(vec![None; rows])),
             Mode::WrongType => Arc::new(Int32Array::from(vec![1; rows])),
             _ => Arc::new(Int64Array::from(vec![self.next; rows])),
@@ -729,4 +749,72 @@ fn unrepresentable_lifetime_bound_fails_before_state_creation() {
         Err(KernelFailure::ResourceExhausted)
     ));
     assert_eq!(creations.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn prepared_scalar_reads_only_the_explicit_constant_ordinal_for_every_selected_row() {
+    struct ConstantCompileControl;
+    impl PureCompileControl for ConstantCompileControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let policy = crate::ConstantPolicy {
+        max_rows: 100,
+        max_array_nodes: 100,
+        max_logical_elements: 100,
+        max_retained_buffer_bytes: 1024 * 1024,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 64 * 1024,
+        max_library_validation_work: 1024 * 1024,
+        max_library_validation_bytes: 1024 * 1024,
+    };
+    let ty = FunctionValueType::new(DataType::Int64, true);
+    let pool = crate::ConstantPool::try_new(
+        Arc::new(ty.try_to_field("source").unwrap()),
+        ty,
+        Int64Array::from(vec![None, Some(7), Some(91)]).to_data(),
+        policy,
+        CompilePhase::FunctionSpecialization,
+        &ConstantCompileControl,
+    )
+    .unwrap();
+    let (prepared, calls) = preparation(
+        ArgumentControl::Eager,
+        Mode::EchoConstant,
+        FunctionIntrinsicRowError::NoRowError,
+        true,
+    );
+    let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+    let selection = Selection::try_sparse(1000, &[0, 399, 999]).unwrap();
+    for (ordinal, expected) in [(1, Some(7)), (0, None), (2, Some(91))] {
+        let value = pool.value(ordinal).unwrap();
+        let argument = EvaluatedArgument::Constant(&value);
+        assert!(Arc::ptr_eq(argument.array(), pool.array()));
+        let arguments = [argument];
+        let result = instance
+            .evaluate(selection, &arguments, &Control::default())
+            .unwrap();
+        assert_eq!(result.selection(), selection);
+        assert_eq!(
+            result
+                .values()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![expected; 3]
+        );
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    let value = pool.value(1).unwrap();
+    let arguments = [EvaluatedArgument::Constant(&value)];
+    let result = instance
+        .evaluate(Selection::all(0), &arguments, &Control::default())
+        .unwrap();
+    assert!(result.values().is_empty());
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
 }

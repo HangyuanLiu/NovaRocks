@@ -136,7 +136,7 @@ fn collect_referenced_slots_with_bound(
         return false;
     };
     match node {
-        ExprNode::Literal(_) => true,
+        ExprNode::Constant(_) | ExprNode::Literal(_) => true,
         ExprNode::SlotId(slot_id) => {
             if !bound.contains(slot_id) {
                 slots.insert(*slot_id);

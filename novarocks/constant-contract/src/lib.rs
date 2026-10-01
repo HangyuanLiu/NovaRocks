@@ -26,6 +26,7 @@ mod tests;
 
 mod semantic_key;
 pub use semantic_key::ConstantSemanticKey;
+mod selected_scalar;
 
 use arrow_array::{Array, ArrayRef, make_array};
 use arrow_data::ArrayData;

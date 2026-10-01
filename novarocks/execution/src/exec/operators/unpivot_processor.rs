@@ -618,14 +618,75 @@ fn validate_static_contract(
                 .slot(literal_output_slot_ids[literal_index])
                 .expect("validated output slot membership");
             let constant_type = match constant {
-                UnpivotConstant::Scalar { expr_id, .. } => {
-                    let Some(ExprNode::Literal(value)) = arena.node(*expr_id) else {
-                        return Err(format!(
-                            "unpivot mapping {mapping_index} scalar constant {literal_index} is not a literal expression"
-                        ));
+                UnpivotConstant::Scalar { expr_id, nullable } => {
+                    let retained = match arena.node(*expr_id) {
+                        Some(ExprNode::Literal(value)) => execution_literal_retained_bytes(value),
+                        Some(ExprNode::Constant(value)) => {
+                            let target =
+                                novarocks_type_contract::FunctionValueType::try_from_field(
+                                    output_slot.field(),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            if value.value_type().logical_type != target.logical_type
+                                || value.value_type().nullable != *nullable
+                                || !novarocks_type_contract::arrow_data_types_exact(
+                                    &value.value_type().data_type,
+                                    &target.data_type,
+                                )
+                            {
+                                return Err(
+                                    "unpivot constant differs from its frozen complete type".into(),
+                                );
+                            }
+                            let facts = value.pool().resource_facts();
+                            let mut logical_carrier = &value.value_type().data_type;
+                            loop {
+                                logical_carrier = match logical_carrier {
+                                    DataType::Dictionary(_, values) => values,
+                                    DataType::RunEndEncoded(_, values) => values.data_type(),
+                                    _ => break,
+                                };
+                            }
+                            if matches!(
+                                logical_carrier,
+                                DataType::List(_)
+                                    | DataType::LargeList(_)
+                                    | DataType::FixedSizeList(_, _)
+                                    | DataType::ListView(_)
+                                    | DataType::LargeListView(_)
+                                    | DataType::Struct(_)
+                                    | DataType::Map(_, _)
+                                    | DataType::Union(_, _)
+                            ) {
+                                // Conservatively include the retained pool's
+                                // admitted logical extent, not only one row.
+                                nested_element_count = nested_element_count
+                                    .checked_add(
+                                        usize::try_from(facts.logical_elements_upper_bound)
+                                            .map_err(
+                                                |_| "unpivot nested element count overflowed",
+                                            )?,
+                                    )
+                                    .ok_or_else(|| {
+                                        "unpivot nested element count overflowed".to_string()
+                                    })?;
+                            }
+                            facts
+                                .retained_buffer_capacity_bytes
+                                .checked_add(facts.metadata_bytes)
+                                .and_then(|bytes| usize::try_from(bytes).ok())
+                                .ok_or_else(|| {
+                                    "unpivot constant byte charge overflowed".to_string()
+                                })?
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unpivot mapping {mapping_index} scalar constant {literal_index} is not a literal expression"
+                            ));
+                        }
                     };
                     constant_bytes = constant_bytes
-                        .checked_add(execution_literal_retained_bytes(value))
+                        .checked_add(retained)
                         .ok_or_else(|| "unpivot constant byte charge overflowed".to_string())?;
                     arena.data_type(*expr_id).cloned().ok_or_else(|| {
                         format!(
@@ -1124,9 +1185,19 @@ mod tests {
 
     #[test]
     fn supports_independent_passthrough_literal_and_value_types() {
+        independent_type_case(ExprNode::Literal(LiteralValue::Int8(7)));
+        let source = cv_constant(
+            Arc::new(arrow::array::Int8Array::from(vec![99, 7])),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+            1,
+        );
+        independent_type_case(ExprNode::Constant(source));
+    }
+
+    fn independent_type_case(label: ExprNode) {
         let state = RuntimeState::default();
         let mut arena = ExprArena::default();
-        let label = arena.push_typed(ExprNode::Literal(LiteralValue::Int8(7)), DataType::Int8);
+        let label = arena.push_typed(label, DataType::Int8);
         let factory = UnpivotProcessorFactory::new(
             11,
             Arc::new(arena),
@@ -1304,5 +1375,164 @@ mod tests {
 
         drop(operator);
         assert_eq!(tracker.current(), 0);
+    }
+    fn cv_constant(
+        array: ArrayRef,
+        ty: novarocks_type_contract::FunctionValueType,
+        ordinal: u32,
+    ) -> novarocks_functions::ConstantValue {
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        novarocks_functions::ConstantPool::try_new(
+            Arc::new(ty.try_to_field("source").unwrap()),
+            ty,
+            array.to_data(),
+            novarocks_functions::ConstantPolicy {
+                max_rows: 10000,
+                max_array_nodes: 100,
+                max_logical_elements: 10000,
+                max_retained_buffer_bytes: 1024 * 1024,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 65536,
+                max_library_validation_work: 1024 * 1024,
+                max_library_validation_bytes: 1024 * 1024,
+            },
+            novarocks_type_contract::CompilePhase::Validate,
+            &Control,
+        )
+        .unwrap()
+        .value(ordinal)
+        .unwrap()
+    }
+
+    #[test]
+    fn shared_scalar_constants_cannot_retag_logical_identity_or_nullability() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for source in [
+            cv_constant(
+                Arc::new(StringArray::from(vec!["{}"])),
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
+                0,
+            ),
+            cv_constant(
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                FunctionValueType::new(DataType::Utf8, true),
+                0,
+            ),
+        ] {
+            let mut arena = ExprArena::default();
+            let id = arena.push_typed(ExprNode::Constant(source), DataType::Utf8);
+            let error = UnpivotProcessorFactory::new(
+                1,
+                Arc::new(arena),
+                vec![],
+                SlotId::new(11),
+                vec![SlotId::new(12)],
+                vec![UnpivotValueMapping {
+                    input_value_slot_id: SlotId::new(1),
+                    constants: vec![UnpivotConstant::Scalar {
+                        expr_id: id,
+                        nullable: false,
+                    }],
+                }],
+                schema(vec![
+                    (11, "value", DataType::Int64, false),
+                    (12, "label", DataType::Utf8, false),
+                ]),
+                128,
+                1024,
+            )
+            .err()
+            .expect("shared CV retagging must be refused");
+            assert!(error.contains("frozen complete type"), "{error}");
+        }
+    }
+
+    #[test]
+    fn encoded_nested_constants_cannot_bypass_the_element_limit() {
+        use arrow::array::{DictionaryArray, Int8Array, Int16Array, ListArray, RunArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Int8Type, Int16Type};
+        use novarocks_type_contract::FunctionValueType;
+
+        for elements in [4093_i32, 4094, 4095, 5000] {
+            let values: ArrayRef = Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::Utf8, false)),
+                OffsetBuffer::new(vec![0_i32, elements].into()),
+                Arc::new(StringArray::from(vec![""; elements as usize])),
+                None,
+            ));
+            let encoded: [ArrayRef; 2] = [
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![0]),
+                        Arc::clone(&values),
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(
+                    RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1]), values.as_ref())
+                        .unwrap(),
+                ),
+            ];
+            for (encoding, array) in encoded.into_iter().enumerate() {
+                let ty = array.data_type().clone();
+                let source = cv_constant(array, FunctionValueType::new(ty.clone(), false), 0);
+                // REE retains its run-end row as well as the encoded value.
+                let logical_elements = elements as u64 + if encoding == 0 { 2 } else { 3 };
+                assert_eq!(
+                    source.pool().resource_facts().logical_elements_upper_bound,
+                    logical_elements
+                );
+                let mut arena = ExprArena::default();
+                let id = arena.push_typed(ExprNode::Constant(source), ty.clone());
+                let result = UnpivotProcessorFactory::new(
+                    1,
+                    Arc::new(arena),
+                    vec![],
+                    SlotId::new(11),
+                    vec![SlotId::new(12)],
+                    vec![UnpivotValueMapping {
+                        input_value_slot_id: SlotId::new(1),
+                        constants: vec![UnpivotConstant::Scalar {
+                            expr_id: id,
+                            nullable: false,
+                        }],
+                    }],
+                    schema(vec![
+                        (11, "value", DataType::Int64, false),
+                        (12, "label", ty, false),
+                    ]),
+                    128,
+                    1024,
+                );
+                if logical_elements <= 4096 {
+                    assert!(
+                        result.is_ok(),
+                        "encoded nested payload at the limit must be accepted"
+                    );
+                } else {
+                    let error = result
+                        .err()
+                        .expect("encoded nested payload must count toward the same element limit");
+                    assert!(error.contains("nested element limit"), "{error}");
+                }
+            }
+        }
     }
 }

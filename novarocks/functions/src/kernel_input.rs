@@ -29,6 +29,9 @@ use arrow_array::{Array, DictionaryArray, RunArray, UnionArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{CompileCheckpoints, FunctionValueType};
 
+#[cfg(test)]
+mod constant_tests;
+
 pub(crate) struct EvaluationCheckpoints<'a> {
     control: &'a dyn KernelEvaluationControl,
     pending: u32,
@@ -61,8 +64,19 @@ pub(crate) fn validate_argument_observed(
     value_type: &FunctionValueType,
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), KernelFailure> {
+    control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
     argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
+    if let EvaluatedArgument::Constant(value) = argument {
+        work.step()?;
+        if value.value_type().logical_type != value_type.logical_type
+            || (value.value_type().nullable && !value_type.nullable)
+        {
+            return Err(invalid(
+                "constant argument differs from its exact logical type or nullability",
+            ));
+        }
+    }
     if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
         argument.array().data_type(),
         &value_type.data_type,

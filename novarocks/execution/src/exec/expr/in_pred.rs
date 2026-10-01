@@ -972,7 +972,7 @@ fn expr_contains_slot(arena: &ExprArena, id: ExprId) -> bool {
                     .iter()
                     .any(|(_, expr)| expr_contains_slot(arena, *expr))
         }
-        Some(ExprNode::Literal(_)) | None => false,
+        Some(ExprNode::Constant(_) | ExprNode::Literal(_)) | None => false,
     }
 }
 

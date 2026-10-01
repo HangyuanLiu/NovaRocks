@@ -126,6 +126,9 @@ pub enum StaticFunctionKind {
 
 #[derive(Clone, Debug)]
 pub enum StaticExprKind {
+    /// A checked value retaining its complete field/type and pool ordinal.
+    Constant(novarocks_functions::ConstantValue),
+    /// Construction-path literal pending the production compiler migration.
     Literal(StaticLiteral),
     SlotId(SlotId),
     ArrayExpr {
@@ -198,7 +201,7 @@ impl StaticExprKind {
 
     fn references(&self) -> Vec<ProgramExprId> {
         match self {
-            Self::Literal(_) | Self::SlotId(_) => Vec::new(),
+            Self::Constant(_) | Self::Literal(_) | Self::SlotId(_) => Vec::new(),
             Self::ArrayExpr { elements } | Self::StructExpr { fields: elements } => {
                 elements.clone()
             }
@@ -315,6 +318,7 @@ pub enum StaticExpressionError {
     DuplicateLambdaSlot,
     InvalidMetadataArity,
     UnsupportedDecimalCastPolicy,
+    ConstantTypeMismatch,
 }
 
 impl fmt::Display for StaticExpressionError {
@@ -338,6 +342,7 @@ impl ImmutableExpressions {
         let mut depths = Vec::with_capacity(nodes.len());
         let mut dynamic_bytes = session_time_zone.as_ref().map_or(0, |zone| zone.len());
         let mut charged_dicts = HashSet::new();
+        let mut charged_constant_arrays = HashSet::new();
         for (index, node) in nodes.iter().enumerate() {
             let mut depth = 1_usize;
             for child in node.kind.references() {
@@ -365,6 +370,29 @@ impl ImmutableExpressions {
                 dynamic_bytes = dynamic_bytes
                     .checked_add(literal.dynamic_bytes())
                     .ok_or(StaticExpressionError::TooManyBytes)?;
+            }
+            if let StaticExprKind::Constant(value) = &node.kind {
+                if !novarocks_type_contract::arrow_data_types_exact(
+                    &node.data_type,
+                    &value.value_type().data_type,
+                ) {
+                    return Err(StaticExpressionError::ConstantTypeMismatch);
+                }
+                // This pointer deduplicates retained ownership only; it is
+                // never a semantic equality test. A selected row retains the
+                // whole immutable pool, including its unselected buffers.
+                let array = Arc::as_ptr(value.pool().array()) as *const () as usize;
+                if charged_constant_arrays.insert(array) {
+                    let facts = value.pool().resource_facts();
+                    let retained = facts
+                        .retained_buffer_capacity_bytes
+                        .checked_add(facts.metadata_bytes)
+                        .and_then(|bytes| usize::try_from(bytes).ok())
+                        .ok_or(StaticExpressionError::TooManyBytes)?;
+                    dynamic_bytes = dynamic_bytes
+                        .checked_add(retained)
+                        .ok_or(StaticExpressionError::TooManyBytes)?;
+                }
             }
             if let StaticExprKind::DictDecode { dict, .. } = &node.kind
                 && charged_dicts.insert(Arc::as_ptr(dict))

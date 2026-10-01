@@ -108,6 +108,7 @@ fn thaw_kind(kind: &StaticExprKind) -> ExprNode {
     use StaticExprKind as Static;
     match kind {
         Static::Literal(value) => ExprNode::Literal(thaw_literal(value)),
+        Static::Constant(value) => ExprNode::Constant(value.clone()),
         Static::SlotId(slot) => ExprNode::SlotId(*slot),
         Static::ArrayExpr { elements } => ExprNode::ArrayExpr {
             elements: elements.iter().copied().map(old_id).collect(),
@@ -263,6 +264,7 @@ fn id(id: ExprId) -> ProgramExprId {
 fn freeze_kind(node: ExprNode) -> StaticExprKind {
     match node {
         ExprNode::Literal(value) => StaticExprKind::Literal(freeze_literal(value)),
+        ExprNode::Constant(value) => StaticExprKind::Constant(value),
         ExprNode::SlotId(slot) => StaticExprKind::SlotId(slot),
         ExprNode::ArrayExpr { elements } => StaticExprKind::ArrayExpr {
             elements: elements.into_iter().map(id).collect(),

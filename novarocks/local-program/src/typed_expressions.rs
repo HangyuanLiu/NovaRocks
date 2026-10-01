@@ -133,6 +133,9 @@ impl ProgramTypedExpressions {
                     (_, FunctionArgumentType::Value(value)) => {
                         validate(value, &mut work)?;
                         same_carrier(definition.data_type(), &value.data_type, &mut work)?;
+                        if let StaticExprKind::Constant(constant) = definition.kind() {
+                            same_value(constant.value_type(), value, false, &mut work)?;
+                        }
                     }
                 }
             }
