@@ -1000,6 +1000,21 @@ type ProviderColumnProjection = (
     BTreeMap<crate::column_id::ColumnId, ProviderPredicateColumn>,
 );
 
+fn preflight_provider_value_type(
+    value_type: &novarocks_type_contract::FunctionValueType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    use novarocks_functions::KernelFailure;
+    novarocks_functions::validate_function_value_type_observed(value_type, work).map_err(|error| {
+        match error {
+            KernelFailure::Cancelled => SqlCompileError::Cancelled,
+            KernelFailure::DeadlineExceeded => SqlCompileError::DeadlineExceeded,
+            KernelFailure::ResourceExhausted => SqlCompileError::ResourceExhausted,
+            error => SqlCompileError::Compilation(error.to_string()),
+        }
+    })
+}
+
 fn provider_columns(
     output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
@@ -1073,6 +1088,11 @@ fn provider_columns(
                 work.step().map_err(ProviderColumnProjectionError::Control)
             })
             .map_err(ProviderColumnProjectionError::into_compile_error)?;
+        // The exact walk hashes metadata lookup keys. Admit all three actual
+        // types under the existing frozen field bounds before that operation.
+        for value_type in [&source_value_type, &logical.value_type, &output.value_type] {
+            preflight_provider_value_type(value_type, work)?;
+        }
         if logical.name != source.name
             || !logical
                 .value_type
@@ -1454,15 +1474,34 @@ mod tests {
         // traversal separately so the failure below must occur in comparison.
         scan.table.columns[0].logical_type = None;
         let mut source_work = 0;
-        scan.table.columns[0]
+        let source_value_type = scan.table.columns[0]
             .declared_value_type_observed::<novarocks_types::ColumnValueTypeError>(|| {
                 source_work += 1;
                 Ok(())
             })
             .unwrap();
-        // Four outer steps precede this source projection. The first full
-        // checkpoint after those steps and the source walk is in exact Eq.
-        let fail_at = (source_work + 4) / 256 + 2;
+        let counter = Owner {
+            failure: CompileControlError::Cancelled,
+            fail_at: usize::MAX,
+            observations: Default::default(),
+        };
+        let mut preflight_work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &counter,
+            CompilePhase::ProviderValidation,
+        )
+        .unwrap();
+        for value_type in [
+            &source_value_type,
+            &scan.columns[0].value_type,
+            &plan.output_columns[0].value_type,
+        ] {
+            super::preflight_provider_value_type(value_type, &mut preflight_work).unwrap();
+        }
+        preflight_work.finish().unwrap();
+        let preflight_units = counter.observations.lock().unwrap().iter().sum::<u32>() as usize;
+        // Four outer steps precede the source projection and frozen preflight.
+        // Their first following full checkpoint must be inside exact Eq.
+        let fail_at = (source_work + preflight_units + 4) / 256 + 2;
         for failure in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
@@ -1486,6 +1525,60 @@ mod tests {
             collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()).unwrap();
         assert_eq!(needs.len(), 1);
         assert_eq!(needs[0].columns().len(), 1);
+    }
+
+    #[test]
+    fn provider_completion_preflights_metadata_before_exact_comparison() {
+        use novarocks_type_contract::{
+            MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
+        };
+        let value_type = |key_bytes, value_bytes| {
+            ValueType::new(
+                DataType::Struct(
+                    vec![
+                        arrow::datatypes::Field::new("nested", DataType::Int32, false)
+                            .with_metadata(
+                                [("k".repeat(key_bytes), "v".repeat(value_bytes))].into(),
+                            ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let near = value_type(
+            MAX_ARROW_FIELD_METADATA_KEY_BYTES,
+            MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
+        );
+        let (_, needs) = collect_provider_needs(
+            provider_type_scan(near.clone(), 1),
+            0,
+            false,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert_eq!(needs[0].columns()[0].engine_type(), &near);
+        for over in [
+            value_type(MAX_ARROW_FIELD_METADATA_KEY_BYTES + 1, 1),
+            value_type(1, MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
+        ] {
+            for position in 0..3 {
+                let mut plan = provider_type_scan(near.clone(), 1);
+                let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
+                    panic!("scan fixture")
+                };
+                match position {
+                    0 => scan.table.columns[0].data_type = over.data_type.clone(),
+                    1 => scan.columns[0].value_type = over.clone(),
+                    2 => plan.output_columns[0].value_type = over.clone(),
+                    _ => unreachable!(),
+                }
+                assert!(matches!(
+                    collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()),
+                    Err(SqlCompileError::ResourceExhausted)
+                ));
+            }
+        }
     }
 
     struct CancelOnSecondObservation(AtomicUsize);

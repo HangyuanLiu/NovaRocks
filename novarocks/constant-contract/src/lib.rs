@@ -24,6 +24,9 @@
 #[cfg(test)]
 mod tests;
 
+mod semantic_key;
+pub use semantic_key::ConstantSemanticKey;
+
 use arrow_array::{Array, ArrayRef, make_array};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, TimeUnit, UnionMode};
