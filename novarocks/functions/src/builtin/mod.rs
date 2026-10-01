@@ -34,6 +34,8 @@ mod binding_control_tests;
 
 mod abs;
 mod abs_owner;
+mod bit_shift;
+mod bit_shift_owner;
 mod dround;
 mod dround_owner;
 mod numeric_binary;
