@@ -2310,7 +2310,11 @@ pub(super) fn scalar_definition_parts(
             .into_iter()
             .zip(signatures)
             .map(|(identity, signature)| FunctionOverloadDeclaration {
-                effects: (name == "abs").then(super::abs_owner::effects),
+                effects: match name {
+                    "abs" => Some(super::abs_owner::effects()),
+                    "rand" | "random" => Some(super::rand_owner::effects()),
+                    _ => None,
+                },
                 semantics: builtin_scalar_semantics(name),
                 identity,
                 argument_pattern: signature.clone().into_boxed_str(),
@@ -2402,15 +2406,15 @@ pub fn contribute_builtin_functions(
             }
         };
         let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
-        let definition = if name == "abs" {
-            super::abs_owner::definition(declaration, resolver)?
-        } else {
-            FunctionDefinition::try_new_bound(
+        let definition = match name.as_str() {
+            "abs" => super::abs_owner::definition(declaration, resolver)?,
+            "rand" | "random" => super::rand_owner::definition(&name, declaration, resolver)?,
+            _ => FunctionDefinition::try_new_bound(
                 &name,
                 FunctionVisibility::Public,
                 declaration,
                 Arc::new(resolver),
-            )?
+            )?,
         };
         builder.register(definition)?;
     }

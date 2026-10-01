@@ -33,4 +33,5 @@ arrow-cast.workspace = true
 arrow-schema.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-constant-contract.workspace = true
+rand.workspace = true
 sha2.workspace = true
