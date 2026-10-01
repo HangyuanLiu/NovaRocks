@@ -37,7 +37,7 @@ use crate::planner::physical::{
     PhysicalPlanStats, TopNPhase,
 };
 #[cfg(test)]
-use novarocks_types::aggregate::mangle_distinct_aggregate_name;
+use novarocks_functions::aggregate_types::mangle_distinct_aggregate_name;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

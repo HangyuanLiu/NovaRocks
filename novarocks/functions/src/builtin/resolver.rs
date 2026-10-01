@@ -37,13 +37,13 @@
 //! 4. **Polymorphic widening.** Signatures that opt in to widening can
 //!    merge repeated `Any(name)` bindings through `wider_type`.
 
-use arrow::datatypes::DataType;
-use novarocks_functions::{FunctionResolutionError, ResolvedFunctionSignature};
+use crate::{FunctionResolutionError, ResolvedFunctionSignature};
+use arrow_schema::DataType;
 
 use super::registry;
 use super::signature::{BindMode, Bindings, Signature, TypeSpec, anchor_matches, realize, unify};
 
-pub(crate) type ResolvedScalarFunction = ResolvedFunctionSignature;
+pub type ResolvedScalarFunction = ResolvedFunctionSignature;
 
 /// Why a function call could not be resolved against the registry.
 ///
@@ -51,7 +51,7 @@ pub(crate) type ResolvedScalarFunction = ResolvedFunctionSignature;
 /// hand-written `infer_*` fallback. A caller that supports argument binding
 /// must inspect `NoMatchingSignature::binding_enforced` before taking a
 /// fallback path, so an opt-in signature policy cannot be bypassed.
-pub(crate) type ResolveError = FunctionResolutionError;
+pub type ResolveError = FunctionResolutionError;
 
 /// Resolve a scalar function call to its instantiated signature.
 ///
@@ -59,14 +59,14 @@ pub(crate) type ResolveError = FunctionResolutionError;
 /// to `argument_types`. `UnknownFunction` still permits the legacy
 /// `infer_*` fallback; callers must inspect `NoMatchingSignature` before
 /// using that fallback for a registered function.
-pub(crate) fn resolve_scalar_function_signature(
+pub fn resolve_scalar_function_signature(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<ResolvedScalarFunction, ResolveError> {
     resolve_scalar_function_signature_with_overload(name, arg_types).map(|(_, resolved)| resolved)
 }
 
-pub(crate) fn resolve_scalar_function_signature_with_overload(
+pub fn resolve_scalar_function_signature_with_overload(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<(usize, ResolvedScalarFunction), ResolveError> {
@@ -138,7 +138,7 @@ pub(crate) fn resolve_scalar_function_signature_with_overload(
 
 /// Validate one catalog-selected overload without running overload selection.
 /// This is the BE-side path for a frozen binding identity.
-pub(crate) fn resolve_scalar_function_signature_at_overload(
+pub fn resolve_scalar_function_signature_at_overload(
     name: &str,
     overload_index: usize,
     arg_types: &[DataType],
@@ -197,7 +197,7 @@ fn binding_enforced_for_arity(candidates: &[Signature], n_args: usize) -> bool {
     dead_code,
     reason = "Retained for staged SQL planner migration consumers and test helpers."
 )]
-pub(crate) fn resolve_scalar_function(
+pub fn resolve_scalar_function(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<DataType, ResolveError> {
@@ -381,7 +381,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow::datatypes::{Field, TimeUnit};
+    use arrow_schema::{Field, TimeUnit};
 
     fn list_of(item: DataType) -> DataType {
         DataType::List(Arc::new(Field::new("item", item, true)))
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn slice_functions_bind_only_their_declared_temporal_domains() {
-        let timestamp = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        let timestamp = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
         for (name, domain) in [("time_slice", timestamp), ("date_slice", DataType::Date32)] {
             for arity in [3, 4] {
                 let mut args = vec![domain.clone(), DataType::Int32, DataType::Utf8];

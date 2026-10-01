@@ -18,14 +18,14 @@
 //! [`Signature`] / [`TypeSpec`] — the data the registry stores per function.
 //!
 //! `TypeSpec` is a structural description used at registration time. It
-//! resembles `arrow::datatypes::DataType` but adds a `Any(name)` variant for
+//! resembles `arrow_schema::DataType` but adds a `Any(name)` variant for
 //! type variables (the equivalent of StarRocks' `ANY_ELEMENT`, `ANY_ARRAY`
 //! etc.), so a single record can stand in for a family of concrete
 //! signatures like `array_append(List<T>, T) -> List<T>`.
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field};
+use arrow_schema::{DataType, Field};
 
 /// Structural type used in registered function signatures.
 ///
@@ -42,7 +42,7 @@ use arrow::datatypes::{DataType, Field};
 ///    occurrence of `Any("T")` in a single signature must bind to the same
 ///    concrete type for the match to succeed.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TypeSpec {
+pub enum TypeSpec {
     Boolean,
     Int8,
     Int16,
@@ -92,13 +92,13 @@ pub(crate) enum TypeSpec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArgumentBindingPolicy {
+pub enum ArgumentBindingPolicy {
     Legacy,
     CoerceAndEnforce,
 }
 
 impl ArgumentBindingPolicy {
-    pub(crate) fn is_enforced(self) -> bool {
+    pub fn is_enforced(self) -> bool {
         matches!(self, Self::CoerceAndEnforce)
     }
 }
@@ -118,16 +118,16 @@ impl ArgumentBindingPolicy {
 /// is correctly rejected (instead of silently widening `T` to `Utf8`
 /// and producing `List<Utf8>`).
 #[derive(Clone, Debug)]
-pub(crate) struct Signature {
-    pub(crate) args: Vec<TypeSpec>,
-    pub(crate) ret: TypeSpec,
-    pub(crate) variadic: bool,
-    pub(crate) widening: bool,
-    pub(crate) argument_binding: ArgumentBindingPolicy,
+pub struct Signature {
+    pub args: Vec<TypeSpec>,
+    pub ret: TypeSpec,
+    pub variadic: bool,
+    pub widening: bool,
+    pub argument_binding: ArgumentBindingPolicy,
 }
 
 impl Signature {
-    pub(crate) fn new(args: Vec<TypeSpec>, ret: TypeSpec) -> Self {
+    pub fn new(args: Vec<TypeSpec>, ret: TypeSpec) -> Self {
         Self {
             args,
             ret,
@@ -137,7 +137,7 @@ impl Signature {
         }
     }
 
-    pub(crate) fn variadic(args: Vec<TypeSpec>, ret: TypeSpec) -> Self {
+    pub fn variadic(args: Vec<TypeSpec>, ret: TypeSpec) -> Self {
         Self {
             args,
             ret,
@@ -153,17 +153,17 @@ impl Signature {
     /// `coalesce` / `if` / `ifnull` / `case` whose semantics genuinely
     /// produce the wider type — not for structural polymorphism like
     /// `array_append(List<T>, T)`.
-    pub(crate) fn with_widening(mut self) -> Self {
+    pub fn with_widening(mut self) -> Self {
         self.widening = true;
         self
     }
 
-    pub(crate) fn with_argument_coercion(mut self) -> Self {
+    pub fn with_argument_coercion(mut self) -> Self {
         self.argument_binding = ArgumentBindingPolicy::CoerceAndEnforce;
         self
     }
 
-    pub(crate) fn canonical(&self) -> String {
+    pub fn canonical(&self) -> String {
         let mut value = String::from("(");
         for (index, argument) in self.args.iter().enumerate() {
             if index > 0 {
@@ -260,7 +260,7 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         // through to the polymorphic pass so the concrete decimal is bound
         // before a return type tries to name it.
         (TypeSpec::LargeInt, DataType::FixedSizeBinary(width))
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_type_contract::LARGEINT_BYTE_WIDTH =>
         {
             true
         }
@@ -333,9 +333,9 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Utf8 => DataType::Utf8,
         TypeSpec::Binary => DataType::Binary,
         TypeSpec::Date => DataType::Date32,
-        TypeSpec::Datetime => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        TypeSpec::Datetime => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
         TypeSpec::LargeInt => {
-            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+            DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH)
         }
         TypeSpec::Decimal128Of(name) => bindings
             .lookup(name)
@@ -385,7 +385,7 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
 /// `Strict` requires every occurrence to bind to the same concrete type
 /// — used by the polymorphic match pass.
 ///
-/// `Widening` merges conflicting bindings via [`novarocks_types::wider_type`]
+/// `Widening` merges conflicting bindings via [`novarocks_type_contract::wider_type`]
 /// — used by the widening-cast match pass, which is what makes a call
 /// like `coalesce(Int8, Int64)` match the signature
 /// `coalesce(Any("T"), Any("T"), ...) -> Any("T")` and yield `Int64`.
@@ -460,7 +460,7 @@ impl Bindings {
                 self.replace(name, dt);
                 return true;
             }
-            let widened = novarocks_types::wider_type(&existing, dt);
+            let widened = novarocks_type_contract::wider_type(&existing, dt);
             for entry in self.entries.iter_mut() {
                 if entry.0 == name {
                     entry.1 = widened.clone();
@@ -517,9 +517,9 @@ fn merge_undecided_types(existing: &DataType, incoming: &DataType) -> Option<Dat
 }
 
 fn merge_undecided_fields(
-    existing: &arrow::datatypes::FieldRef,
-    incoming: &arrow::datatypes::FieldRef,
-) -> Option<arrow::datatypes::FieldRef> {
+    existing: &arrow_schema::FieldRef,
+    incoming: &arrow_schema::FieldRef,
+) -> Option<arrow_schema::FieldRef> {
     if existing.data_type() == &DataType::Null {
         return Some(incoming.clone());
     }
@@ -626,7 +626,7 @@ pub(crate) fn unify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::TimeUnit;
+    use arrow_schema::TimeUnit;
 
     fn list_of(item: DataType) -> DataType {
         DataType::List(Arc::new(Field::new("item", item, true)))

@@ -2326,7 +2326,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 None
             } else {
                 let executable_name =
-                    novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
+                    novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(
+                        &name,
+                        is_distinct,
+                    );
                 if !self.function_catalog.contains_aggregate(&executable_name) {
                     // Legacy declarations are type-inspection facts, not installed selected bindings.
                     // A custom contribution of the same name is resolved by its own catalog identity.
@@ -2587,7 +2590,10 @@ impl<'a> super::AnalyzerContext<'a> {
             validate_aggregate_function_call(&name, &arg_types)
                 .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
             let executable_name =
-                novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
+                novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(
+                    &name,
+                    is_distinct,
+                );
             bound_aggregate = Some(resolve_aggregate_function_call_with_order(
                 self.function_catalog,
                 &executable_name,

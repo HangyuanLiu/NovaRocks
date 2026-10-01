@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use novarocks_type_contract::canonical_agg_decimal_type;
 
-use crate::largeint;
+use novarocks_type_contract as largeint;
 
 /// Returns (output_type, intermediate_type) for aggregate functions.
 /// `None` as intermediate_type means the execution layer should use its default.

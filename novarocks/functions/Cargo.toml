@@ -29,6 +29,7 @@ doctest = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-cast.workspace = true
 arrow-schema.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-constant-contract.workspace = true

@@ -3971,6 +3971,7 @@ name = "novarocks-functions"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-schema",
  "novarocks-constant-contract",
  "novarocks-type-contract",

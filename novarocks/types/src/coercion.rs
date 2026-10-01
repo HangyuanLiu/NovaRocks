@@ -19,28 +19,9 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields};
 
-use crate::predicate::{is_integer, is_largeint};
+use crate::predicate::is_largeint;
 
-fn wider_decimal_type(
-    left_precision: u8,
-    left_scale: i8,
-    left_is_256: bool,
-    right_precision: u8,
-    right_scale: i8,
-    right_is_256: bool,
-) -> DataType {
-    let scale = left_scale.max(right_scale);
-    let left_int_digits = i16::from(left_precision) - i16::from(left_scale);
-    let right_int_digits = i16::from(right_precision) - i16::from(right_scale);
-    let precision =
-        (left_int_digits.max(right_int_digits).max(0) + i16::from(scale)).clamp(1, 76) as u8;
-
-    if left_is_256 || right_is_256 || precision > 38 {
-        DataType::Decimal256(precision, scale)
-    } else {
-        DataType::Decimal128(precision, scale)
-    }
-}
+pub use novarocks_type_contract::wider_type;
 
 /// The same type with a provider's own decoration taken off its nested fields.
 ///
@@ -113,175 +94,6 @@ pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
         }
         other => other.clone(),
     }
-}
-
-/// Determine the wider type for unifying two types (comparisons, CASE, UNION, etc.).
-pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
-    if a == b {
-        return a.clone();
-    }
-    match (a, b) {
-        (DataType::Null, other) | (other, DataType::Null) => other.clone(),
-        (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
-            DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH)
-        }
-        (DataType::List(left_field), DataType::List(right_field)) => {
-            DataType::List(Arc::new(Field::new(
-                left_field.name(),
-                wider_type(left_field.data_type(), right_field.data_type()),
-                left_field.is_nullable() || right_field.is_nullable(),
-            )))
-        }
-        (DataType::Map(left_entries, _), DataType::Map(right_entries, _)) => {
-            wider_map_type(left_entries, right_entries)
-        }
-        (DataType::Struct(left_fields), DataType::Struct(right_fields))
-            if left_fields.len() == right_fields.len() =>
-        {
-            if let Some(fields) = wider_struct_fields_by_name(left_fields, right_fields) {
-                return DataType::Struct(fields);
-            }
-            DataType::Struct(Fields::from(
-                left_fields
-                    .iter()
-                    .zip(right_fields.iter())
-                    .map(|(left_field, right_field)| {
-                        Arc::new(Field::new(
-                            left_field.name(),
-                            wider_type(left_field.data_type(), right_field.data_type()),
-                            left_field.is_nullable() || right_field.is_nullable(),
-                        ))
-                    })
-                    .collect::<Vec<_>>(),
-            ))
-        }
-        // VARCHAR wins before DECIMAL, matching StarRocks TypeManager:
-        // getAssignmentCompatibleType handles string pairs before decimal
-        // pairs, and ARRAY/MAP/STRUCT common types recurse through this rule.
-        (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
-        (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
-        // Decimal + Decimal -> wider Decimal. Promote to Decimal256 when the
-        // common precision exceeds Decimal128 or either side is already wide.
-        (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
-            wider_decimal_type(*p1, *s1, false, *p2, *s2, false)
-        }
-        (DataType::Decimal128(p1, s1), DataType::Decimal256(p2, s2)) => {
-            wider_decimal_type(*p1, *s1, false, *p2, *s2, true)
-        }
-        (DataType::Decimal256(p1, s1), DataType::Decimal128(p2, s2)) => {
-            wider_decimal_type(*p1, *s1, true, *p2, *s2, false)
-        }
-        (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => {
-            wider_decimal_type(*p1, *s1, true, *p2, *s2, true)
-        }
-        // Decimal + Integer -> Decimal. Keep the existing decimal metadata;
-        // integer literal narrowing happens before this common-type step.
-        (
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
-            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
-        )
-        | (
-            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
-        ) => match (a, b) {
-            (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => {
-                DataType::Decimal128(*p, *s)
-            }
-            (DataType::Decimal256(p, s), _) | (_, DataType::Decimal256(p, s)) => {
-                DataType::Decimal256(*p, *s)
-            }
-            _ => unreachable!(),
-        },
-        // Decimal + Float -> Float64 (StarRocks FE: promote to Double).
-        (
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
-            DataType::Float64 | DataType::Float32,
-        )
-        | (
-            DataType::Float64 | DataType::Float32,
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
-        ) => DataType::Float64,
-        // Decimal + other -> Decimal.
-        (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => {
-            DataType::Decimal128(*p, *s)
-        }
-        (DataType::Decimal256(p, s), _) | (_, DataType::Decimal256(p, s)) => {
-            DataType::Decimal256(*p, *s)
-        }
-        // DATE + DATETIME -> DATETIME (StarRocks: only DATETIME signatures exist
-        // for comparison/greatest/least/coalesce with mixed date+datetime input).
-        (DataType::Timestamp(u, tz), DataType::Date32)
-        | (DataType::Date32, DataType::Timestamp(u, tz)) => DataType::Timestamp(*u, tz.clone()),
-        (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
-        (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
-        (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
-        (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int64,
-        (DataType::Int16, _) | (_, DataType::Int16) => DataType::Int16,
-        _ => a.clone(),
-    }
-}
-
-fn wider_struct_fields_by_name(left_fields: &Fields, right_fields: &Fields) -> Option<Fields> {
-    let right_by_name = right_fields
-        .iter()
-        .map(|field| (field.name().as_str(), field))
-        .collect::<std::collections::HashMap<_, _>>();
-    if left_fields
-        .iter()
-        .any(|field| !right_by_name.contains_key(field.name().as_str()))
-    {
-        return None;
-    }
-    Some(Fields::from(
-        left_fields
-            .iter()
-            .map(|left_field| {
-                let right_field = right_by_name.get(left_field.name().as_str())?;
-                Some(Arc::new(Field::new(
-                    left_field.name(),
-                    wider_type(left_field.data_type(), right_field.data_type()),
-                    left_field.is_nullable() || right_field.is_nullable(),
-                )))
-            })
-            .collect::<Option<Vec<_>>>()?,
-    ))
-}
-
-fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
-    let DataType::Struct(left_fields) = left_entries.data_type() else {
-        return DataType::Map(Arc::new(left_entries.clone()), false);
-    };
-    let DataType::Struct(right_fields) = right_entries.data_type() else {
-        return DataType::Map(Arc::new(left_entries.clone()), false);
-    };
-    if left_fields.len() != 2 || right_fields.len() != 2 {
-        return DataType::Map(Arc::new(left_entries.clone()), false);
-    }
-
-    let key_type = wider_type(left_fields[0].data_type(), right_fields[0].data_type());
-    let value_type = wider_type(left_fields[1].data_type(), right_fields[1].data_type());
-    DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new(
-                        "key",
-                        key_type,
-                        left_fields[0].is_nullable() || right_fields[0].is_nullable(),
-                    )),
-                    Arc::new(Field::new(
-                        "value",
-                        value_type,
-                        left_fields[1].is_nullable() || right_fields[1].is_nullable(),
-                    )),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
-    )
 }
 
 /// Common decimal type for a decimal-vs-decimal comparison / equi-join key.
@@ -819,6 +631,26 @@ mod tests {
     fn wider_type_decimal_vs_float64_returns_float64() {
         let result = wider_type(&DataType::Decimal128(7, 2), &DataType::Float64);
         assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn public_carrier_api_uses_the_neutral_owner() {
+        let cases = [
+            (
+                DataType::Decimal128(38, 0),
+                DataType::Decimal128(38, 20),
+                DataType::Decimal256(58, 20),
+            ),
+            (
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            ),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(crate::wider_type(&left, &right), expected);
+            assert_eq!(novarocks_type_contract::wider_type(&left, &right), expected);
+        }
     }
 
     #[test]

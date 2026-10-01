@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_schema::DataType;
+//! Pure builtin signature resolution and source-audited declaration inventory.
+//! SQL syntax and the application catalogue stay with their respective owners.
 
-pub(crate) fn is_largeint(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::FixedSizeBinary(width)
-            if *width == crate::largeint::LARGEINT_BYTE_WIDTH
-    )
-}
+pub mod intrinsic;
+pub mod registry;
+pub mod resolver;
+pub mod signature;
+
+pub mod catalogue;

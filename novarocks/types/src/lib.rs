@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod aggregate;
 pub mod arrow_cast;
 pub mod arrow_primitive;
 pub mod cluster_role;

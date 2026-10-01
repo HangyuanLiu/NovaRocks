@@ -1053,52 +1053,7 @@ pub fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
 /// Callers that need top-level column nullability enforcement must keep
 /// their own `Field::is_nullable()` check; this helper deliberately operates
 /// on `DataType` only.
-pub fn arrow_type_equals_ignoring_metadata(a: &DataType, b: &DataType) -> bool {
-    use DataType::*;
-    match (a, b) {
-        (List(a), List(b))
-        | (LargeList(a), LargeList(b))
-        | (ListView(a), ListView(b))
-        | (LargeListView(a), LargeListView(b)) => {
-            arrow_type_equals_ignoring_metadata(a.data_type(), b.data_type())
-        }
-        (FixedSizeList(a, a_size), FixedSizeList(b, b_size)) => {
-            a_size == b_size && arrow_type_equals_ignoring_metadata(a.data_type(), b.data_type())
-        }
-        (Struct(a), Struct(b)) => {
-            a.len() == b.len()
-                && a.iter().zip(b.iter()).all(|(af, bf)| {
-                    arrow_type_equals_ignoring_metadata(af.data_type(), bf.data_type())
-                })
-        }
-        (Map(a_field, a_sorted), Map(b_field, b_sorted)) => {
-            a_sorted == b_sorted
-                && arrow_type_equals_ignoring_metadata(a_field.data_type(), b_field.data_type())
-        }
-        (Dictionary(a_key, a_value), Dictionary(b_key, b_value)) => {
-            arrow_type_equals_ignoring_metadata(a_key, b_key)
-                && arrow_type_equals_ignoring_metadata(a_value, b_value)
-        }
-        (RunEndEncoded(a_run_ends, a_values), RunEndEncoded(b_run_ends, b_values)) => {
-            arrow_type_equals_ignoring_metadata(a_run_ends.data_type(), b_run_ends.data_type())
-                && arrow_type_equals_ignoring_metadata(a_values.data_type(), b_values.data_type())
-        }
-        (Union(a_fields, a_mode), Union(b_fields, b_mode)) => {
-            a_mode == b_mode
-                && a_fields.len() == b_fields.len()
-                && a_fields.iter().all(|(a_tag, a_field)| {
-                    b_fields.iter().any(|(b_tag, b_field)| {
-                        a_tag == b_tag
-                            && arrow_type_equals_ignoring_metadata(
-                                a_field.data_type(),
-                                b_field.data_type(),
-                            )
-                    })
-                })
-        }
-        _ => a == b,
-    }
-}
+pub use novarocks_type_contract::arrow_type_equals_ignoring_metadata;
 
 pub fn compare_literals(left: &Literal, right: &Literal) -> Result<std::cmp::Ordering, String> {
     use std::cmp::Ordering;

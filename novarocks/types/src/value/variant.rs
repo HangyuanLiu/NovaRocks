@@ -14,7 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::DataType;
+#[cfg(test)]
+use arrow_schema::TimeUnit;
 use base64::Engine;
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, Offset, Timelike, Utc,
@@ -820,22 +822,7 @@ pub fn parse_variant_path(path: &str) -> Result<VariantPath, String> {
 }
 
 /// Map a `variant_get` type-string literal to its SQL Arrow type.
-pub fn variant_get_target_type(type_str: &str) -> Result<DataType, String> {
-    match type_str.trim().to_ascii_lowercase().as_str() {
-        "boolean" | "bool" => Ok(DataType::Boolean),
-        "int" | "integer" | "int32" => Ok(DataType::Int32),
-        "bigint" | "long" | "int64" => Ok(DataType::Int64),
-        "float" | "float32" => Ok(DataType::Float32),
-        "double" | "float64" => Ok(DataType::Float64),
-        "string" | "varchar" => Ok(DataType::Utf8),
-        "date" => Ok(DataType::Date32),
-        "datetime" | "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        other => Err(format!(
-            "variant_get: unsupported type '{other}' \\
-             (supported: boolean, int, bigint, float, double, string, date, datetime)"
-        )),
-    }
-}
+pub use novarocks_type_contract::variant_get_target_type;
 
 fn normalize_variant_path(path: &str) -> String {
     let trimmed = path.trim();
