@@ -32,6 +32,15 @@ use novarocks_type_contract::{
 };
 use std::{sync::Mutex, time::Duration};
 
+fn assert_first_quantum_failure(work: &[u32]) {
+    let (quantum, entries) = work.split_last().expect("observed control failure");
+    assert_eq!(*quantum, 256);
+    // Nested admitted constant checks may each observe their own entry. The
+    // first positive quantum must still fail immediately, with no later work.
+    assert!(!entries.is_empty());
+    assert!(entries.iter().all(|units| *units == 0));
+}
+
 #[derive(Default)]
 struct CompileControl {
     failure: Option<CompileControlError>,
@@ -690,7 +699,7 @@ fn compile_control_failures_preserve_entry_and_positive_work_classification() {
             WindowCallContract::try_window(wide_call.clone(), options(), &control).unwrap_err(),
             expected
         );
-        assert_eq!(*control.work.lock().unwrap(), [0, 256]);
+        assert_first_quantum_failure(&control.work.lock().unwrap());
         let control = CompileControl {
             failure: Some(failure),
             positive_only: true,
@@ -744,7 +753,7 @@ fn runtime_control_failures_preserve_entry_and_mid_partition_quantum() {
                     .unwrap_err(),
                 failure
             );
-            assert_eq!(*control.work.lock().unwrap(), [0, 256]);
+            assert_first_quantum_failure(&control.work.lock().unwrap());
         }
     }
 }
@@ -889,6 +898,6 @@ fn output_projection_preserves_entry_and_midwork_outer_control_failures() {
                 .unwrap_err(),
             failure
         );
-        assert_eq!(*control.work.lock().unwrap(), [0, 256]);
+        assert_first_quantum_failure(&control.work.lock().unwrap());
     }
 }

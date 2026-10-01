@@ -102,17 +102,21 @@ fn type_only_preparation_rejects_malformed_or_unbounded_lambda_metadata() {
             ..fixture.input()
         };
         let control = Control::default();
-        let receipt = refine_call_effects(&owner, input, &control).unwrap();
-        let result =
-            crate::ScalarCallContract::from_refined(input, &receipt, selected.clone(), &control);
+        let result = refine_call_effects(&owner, input, &control);
         if resource_failure {
-            assert_eq!(result, Err(crate::KernelFailure::ResourceExhausted));
+            assert!(matches!(
+                result,
+                Err(CallEffectRefinementError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
         } else {
             assert!(matches!(
                 result,
-                Err(crate::KernelFailure::InvalidProgram(_))
+                Err(CallEffectRefinementError::InvalidInput(_))
             ));
         }
+        assert_eq!(owner.calls(), 0);
     }
 }
 

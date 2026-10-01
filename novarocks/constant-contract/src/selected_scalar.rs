@@ -80,6 +80,39 @@ impl ConstantValue {
         work.finish()?;
         Ok(value)
     }
+
+    /// Read an exact terminal signed integer carrier losslessly into i64.
+    /// This preserves source Field/FVT identity; it does not retag a value or
+    /// convert unsigned, temporal, decimal, fixed-binary or LARGEINT carriers.
+    pub fn signed_integer_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<i64>, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let value = if let Some(row) = selected_row(self, &mut work)? {
+            macro_rules! signed {
+                ($native:ty, $width:expr) => {{
+                    work.step()?;
+                    let bytes = primitive_bytes(row, $width)?.try_into().map_err(|_| {
+                        ConstantError::Invalid("selected signed integer constant has wrong width")
+                    })?;
+                    Some(i64::from(<$native>::from_ne_bytes(bytes)))
+                }};
+            }
+            match row.data.data_type() {
+                DataType::Int8 => signed!(i8, 1),
+                DataType::Int16 => signed!(i16, 2),
+                DataType::Int32 => signed!(i32, 4),
+                DataType::Int64 => signed!(i64, 8),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        work.finish()?;
+        Ok(value)
+    }
 }
 
 fn selected_row<'a>(
@@ -431,6 +464,228 @@ mod tests {
                 short.utf8_observed(CompilePhase::Encode, &control),
                 Err(ConstantError::Control(error))
             );
+        }
+    }
+
+    #[test]
+    fn signed_integer_access_preserves_all_widths_bounds_and_selected_ordinals() {
+        for (array, lower, upper) in [
+            (
+                Arc::new(Int8Array::from(vec![7, i8::MIN, i8::MAX])) as ArrayRef,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+            ),
+            (
+                Arc::new(arrow_array::Int16Array::from(vec![7, i16::MIN, i16::MAX])) as ArrayRef,
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+            ),
+            (
+                Arc::new(Int32Array::from(vec![7, i32::MIN, i32::MAX])) as ArrayRef,
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+            ),
+            (
+                Arc::new(Int64Array::from(vec![7, i64::MIN, i64::MAX])) as ArrayRef,
+                i64::MIN,
+                i64::MAX,
+            ),
+        ] {
+            let p = pool(array, false);
+            for (ordinal, expected) in [(1, lower), (2, upper)] {
+                let selected = p.value(ordinal).unwrap();
+                let original_type = selected.value_type().clone();
+                assert_eq!(
+                    selected
+                        .signed_integer_observed(
+                            CompilePhase::FunctionSpecialization,
+                            &Control::good()
+                        )
+                        .unwrap(),
+                    Some(expected)
+                );
+                assert_eq!(selected.value_type(), &original_type);
+                if original_type.data_type != DataType::Int64 {
+                    assert_eq!(int(&selected), None);
+                }
+            }
+        }
+        let sliced = pool(
+            Arc::new(arrow_array::Int16Array::from(vec![0, -123, 42]).slice(1, 1)),
+            false,
+        )
+        .value(0)
+        .unwrap();
+        assert_eq!(
+            sliced
+                .signed_integer_observed(CompilePhase::Validate, &Control::good())
+                .unwrap(),
+            Some(-123)
+        );
+    }
+
+    #[test]
+    fn signed_integer_access_resolves_int32_dictionary_runs_and_typed_nulls() {
+        let dict = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0, 1]),
+            Arc::new(Int32Array::from(vec![88, i32::MIN])) as ArrayRef,
+        )
+        .unwrap();
+        let p = pool(Arc::new(dict), false);
+        assert_eq!(
+            p.value(1)
+                .unwrap()
+                .signed_integer_observed(CompilePhase::Validate, &Control::good())
+                .unwrap(),
+            Some(i64::from(i32::MIN))
+        );
+        let run = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![1, 4]),
+            &Int32Array::from(vec![99, -777]),
+        )
+        .unwrap();
+        assert_eq!(
+            pool(Arc::new(run), false)
+                .value(3)
+                .unwrap()
+                .signed_integer_observed(CompilePhase::Validate, &Control::good())
+                .unwrap(),
+            Some(-777)
+        );
+        for array in [
+            Arc::new(Int8Array::from(vec![None])) as ArrayRef,
+            Arc::new(arrow_array::Int16Array::from(vec![None])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(vec![0]),
+                    Arc::new(Int32Array::from(vec![None])) as ArrayRef,
+                )
+                .unwrap(),
+            ) as ArrayRef,
+            Arc::new(
+                RunArray::<Int32Type>::try_new(
+                    &Int32Array::from(vec![2]),
+                    &Int32Array::from(vec![None]),
+                )
+                .unwrap(),
+            ) as ArrayRef,
+        ] {
+            assert_eq!(
+                pool(array, true)
+                    .value(0)
+                    .unwrap()
+                    .signed_integer_observed(CompilePhase::Validate, &Control::good())
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn signed_integer_access_refuses_unsigned_temporal_decimal_and_largeint_carriers() {
+        for array in [
+            Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![7])) as ArrayRef,
+            Arc::new(arrow_array::Date32Array::from(vec![7])) as ArrayRef,
+            Arc::new(
+                arrow_array::Decimal128Array::from(vec![7])
+                    .with_precision_and_scale(10, 0)
+                    .unwrap(),
+            ) as ArrayRef,
+            Arc::new(arrow_array::Float64Array::from(vec![7.0])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["7"])) as ArrayRef,
+        ] {
+            assert_eq!(
+                pool(array, false)
+                    .value(0)
+                    .unwrap()
+                    .signed_integer_observed(CompilePhase::Validate, &Control::good())
+                    .unwrap(),
+                None
+            );
+        }
+        let value_type = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        let bytes = 7i128.to_le_bytes();
+        let array = arrow_array::FixedSizeBinaryArray::try_from_iter([bytes].into_iter()).unwrap();
+        let largeint = ConstantPool::try_new(
+            Arc::new(value_type.try_to_field("literal").unwrap()),
+            value_type,
+            array.to_data(),
+            policy(),
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .unwrap()
+        .value(0)
+        .unwrap();
+        assert_eq!(
+            largeint
+                .signed_integer_observed(CompilePhase::Validate, &Control::good())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn signed_integer_access_propagates_entry_interior_and_final_typed_controls() {
+        // A real selected scalar traverses nested run searches. This reaches
+        // an interior quantum without adding work or a synthetic callback.
+        let ends = Int32Array::from((1..=512).collect::<Vec<i32>>());
+        let mut values = vec![0i32; 512];
+        values[511] = -777;
+        let mut encoded: ArrayRef = Arc::new(Int32Array::from(values));
+        for _ in 0..16 {
+            encoded = Arc::new(RunArray::<Int32Type>::try_new(&ends, encoded.as_ref()).unwrap());
+        }
+        let selected = pool(encoded, false).value(511).unwrap();
+        assert_eq!(
+            selected
+                .signed_integer_observed(CompilePhase::LowerProgram, &Control::good())
+                .unwrap(),
+            Some(-777)
+        );
+        let short = pool(Arc::new(Int8Array::from(vec![-7])), false)
+            .value(0)
+            .unwrap();
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at_positive in [false, true] {
+                let control = Control::failing(error, at_positive);
+                assert_eq!(
+                    selected.signed_integer_observed(CompilePhase::LowerProgram, &control),
+                    Err(ConstantError::Control(error))
+                );
+                assert_eq!(
+                    *control.calls.lock().unwrap(),
+                    if at_positive {
+                        vec![
+                            (CompilePhase::LowerProgram, 0),
+                            (CompilePhase::LowerProgram, 256),
+                        ]
+                    } else {
+                        vec![(CompilePhase::LowerProgram, 0)]
+                    }
+                );
+            }
+            let control = Control::failing(error, true);
+            assert_eq!(
+                short.signed_integer_observed(CompilePhase::FunctionSpecialization, &control),
+                Err(ConstantError::Control(error))
+            );
+            let calls = control.calls.lock().unwrap();
+            assert_eq!(calls[0], (CompilePhase::FunctionSpecialization, 0));
+            assert_eq!(calls.len(), 2);
+            assert!(calls[1].1 > 0 && calls[1].1 < 256);
         }
     }
 }

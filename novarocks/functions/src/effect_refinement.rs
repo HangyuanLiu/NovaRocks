@@ -135,6 +135,13 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
             EffectContractError::ProofScopeMismatch,
         ));
     }
+    // Specialization consumes already-coerced arguments. Check their complete
+    // types before any owner operation; this does not resolve FE coercions or
+    // infer a legacy literal payload's type.
+    validate_input_types(input, &mut work)?;
+    work.finish().map_err(CallEffectRefinementError::Control)?;
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+        .map_err(CallEffectRefinementError::Control)?;
     let declaration = owner
         .declaration(input.function_id, input.selected)
         .map_err(CallEffectRefinementError::Owner)?;
@@ -240,9 +247,144 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
     Ok(RefinedCallEffects { input, effects })
 }
 
+fn input_type_failure<E: Error>(error: crate::KernelFailure) -> CallEffectRefinementError<E> {
+    match error {
+        crate::KernelFailure::Cancelled => {
+            CallEffectRefinementError::Control(CompileControlError::Cancelled)
+        }
+        crate::KernelFailure::DeadlineExceeded => {
+            CallEffectRefinementError::Control(CompileControlError::DeadlineExceeded)
+        }
+        crate::KernelFailure::ResourceExhausted => {
+            CallEffectRefinementError::Control(CompileControlError::ResourceExhausted)
+        }
+        _ => CallEffectRefinementError::InvalidInput("call input has an invalid complete type"),
+    }
+}
+
+fn validate_input_types<E: Error>(
+    input: CallEffectInput<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), CallEffectRefinementError<E>> {
+    use crate::{FunctionArgument, FunctionArgumentType, FunctionResultType};
+    use novarocks_type_contract::{FunctionValueType, fits_nested_nullability_observed};
+
+    let validate = |value: &FunctionValueType, work: &mut CompileCheckpoints<'_>| {
+        crate::kernel_input::validate_type_observed(value, work).map_err(input_type_failure::<E>)
+    };
+    let exact = |actual: &FunctionValueType,
+                 selected: &FunctionValueType,
+                 work: &mut CompileCheckpoints<'_>| {
+        actual
+            .exactly_equals_observed::<crate::KernelFailure>(selected, || {
+                work.step().map_err(crate::kernel_control::compile_failure)
+            })
+            .map_err(input_type_failure::<E>)
+    };
+    for (actual, selected) in input
+        .request
+        .arguments
+        .iter()
+        .zip(&input.selected.argument_types)
+    {
+        work.step().map_err(CallEffectRefinementError::Control)?;
+        match (actual, selected) {
+            (FunctionArgument::Value { value_type, .. }, FunctionArgumentType::Value(expected)) => {
+                validate(value_type, work)?;
+                validate(expected, work)?;
+                if value_type.logical_type != expected.logical_type
+                    || (value_type.nullable && !expected.nullable)
+                    || !fits_nested_nullability_observed::<crate::KernelFailure>(
+                        &value_type.data_type,
+                        &expected.data_type,
+                        || work.step().map_err(crate::kernel_control::compile_failure),
+                    )
+                    .map_err(input_type_failure::<E>)?
+                {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "call value argument differs from its already-coerced selected domain",
+                    ));
+                }
+            }
+            (
+                FunctionArgument::Lambda {
+                    parameter_types,
+                    result_type,
+                },
+                FunctionArgumentType::Lambda {
+                    parameter_types: expected_parameters,
+                    result_type: expected_result,
+                },
+            ) => {
+                if parameter_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+                    || expected_parameters.len() > MAX_CALL_EFFECT_ARGUMENTS
+                {
+                    return Err(CallEffectRefinementError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ));
+                }
+                if parameter_types.len() != expected_parameters.len() {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "call lambda parameter count differs from the selected signature",
+                    ));
+                }
+                validate(result_type, work)?;
+                validate(expected_result, work)?;
+                if !exact(result_type, expected_result, work)? {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "call lambda result differs from its exact selected type",
+                    ));
+                }
+                for (actual, selected) in parameter_types.iter().zip(expected_parameters) {
+                    work.step().map_err(CallEffectRefinementError::Control)?;
+                    validate(actual, work)?;
+                    validate(selected, work)?;
+                    if !exact(actual, selected, work)? {
+                        return Err(CallEffectRefinementError::InvalidInput(
+                            "call lambda parameter differs from its exact selected type",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(CallEffectRefinementError::InvalidInput(
+                    "call argument kind differs from the selected signature",
+                ));
+            }
+        }
+    }
+    match &input.selected.result_type {
+        FunctionResultType::Scalar(result) => validate(result, work)?,
+        FunctionResultType::Relation(results) => {
+            if results.len() > MAX_CALL_EFFECT_ARGUMENTS {
+                return Err(CallEffectRefinementError::Control(
+                    CompileControlError::ResourceExhausted,
+                ));
+            }
+            for result in results {
+                work.step().map_err(CallEffectRefinementError::Control)?;
+                validate(result, work)?;
+            }
+        }
+    }
+    if let Some(aggregate) = &input.selected.aggregate {
+        validate(&aggregate.intermediate_type, work)?;
+    }
+    if let Some(expected) = input.request.expected_result_type {
+        // Legacy selection treats this as an owner-specific constraint, not a
+        // universal equality requirement. The exact owner checks its meaning.
+        validate(expected, work)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "effect_refinement/higher_order_tests.rs"]
 mod higher_order_tests;
+
+#[cfg(test)]
+#[path = "effect_refinement/input_types_tests.rs"]
+mod input_types_tests;
 
 /// Only exact-owner recomputation constructs this token. In particular, Stable
 /// eligibility requires the owner to prove a complete frozen environment; the

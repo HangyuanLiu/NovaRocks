@@ -61,7 +61,7 @@ pub use function::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,
     FunctionFailureBehavior, FunctionId, FunctionIdentityError, FunctionIntrinsicRowError,
     FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
-    fits_nested_nullability,
+    fits_nested_nullability, fits_nested_nullability_observed,
 };
 pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use logical::{

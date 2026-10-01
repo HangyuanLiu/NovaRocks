@@ -59,10 +59,11 @@ impl RuntimeControl {
         }
     }
     fn assert_quantum_failure(&self) {
-        assert_eq!(
-            *self.work.lock().unwrap(),
-            vec![0, crate::MAX_UNOBSERVED_KERNEL_WORK]
-        );
+        let work = self.work.lock().unwrap();
+        let (quantum, entries) = work.split_last().expect("observed control failure");
+        assert_eq!(*quantum, crate::MAX_UNOBSERVED_KERNEL_WORK);
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|units| *units == 0));
     }
 }
 impl KernelEvaluationControl for RuntimeControl {

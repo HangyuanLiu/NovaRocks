@@ -1209,7 +1209,10 @@ fn required_error_reborrow_observes_complete_independent_sparse_outer_rows() {
             );
             let work = control.work.lock().unwrap();
             if positive_only {
-                assert_eq!(*work, [0, 256]);
+                let (quantum, entries) = work.split_last().expect("observed control failure");
+                assert_eq!(*quantum, 256);
+                assert!(!entries.is_empty());
+                assert!(entries.iter().all(|units| *units == 0));
             } else {
                 assert_eq!(*work, [0]);
             }

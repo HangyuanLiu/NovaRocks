@@ -830,10 +830,10 @@ impl PositiveEvaluationControl {
         }
     }
     fn assert_first_work_failure(&self) {
-        assert_eq!(
-            *self.work.lock().unwrap(),
-            vec![0, crate::MAX_UNOBSERVED_KERNEL_WORK]
-        );
+        let work = self.work.lock().unwrap();
+        assert!(work.len() >= 2);
+        assert!(work[..work.len() - 1].iter().all(|units| *units == 0));
+        assert_eq!(work.last(), Some(&crate::MAX_UNOBSERVED_KERNEL_WORK));
     }
 }
 impl KernelEvaluationControl for PositiveEvaluationControl {
@@ -1054,7 +1054,14 @@ fn call_preparation_bounds_frozen_field_and_timezone_facts_at_exact_limits() {
     fn prepare(state: FunctionValueType) -> Result<FunctionCallContract, KernelFailure> {
         let fixture = Fixture::new(&[], &[], state);
         let input = fixture.input();
-        let receipt = refine_call_effects(&fixture, input, &CompileControl(None)).unwrap();
+        let receipt = refine_call_effects(&fixture, input, &CompileControl(None)).map_err(
+            |error| match error {
+                crate::CallEffectRefinementError::Control(error) => {
+                    crate::kernel_control::compile_failure(error)
+                }
+                other => panic!("unexpected state refinement failure: {other}"),
+            },
+        )?;
         FunctionCallContract::from_refined(
             input,
             &receipt,
