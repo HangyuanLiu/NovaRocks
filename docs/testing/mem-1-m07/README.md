@@ -22,7 +22,7 @@
 | Linux 正式测试 | 用户后续手动执行 | 用户明确取消本次 agent 的 Linux 测试要求；不阻塞本地实施，保留复现材料 |
 | 共享 REST / MinIO fixture | READY | `DOCKER_CONTEXT=desktop-linux` 的 BOM 离线校验/up 通过；原 OrbStack 空 daemon 判断已纠正，无需下载输入 |
 | P01 / P02 / P03 | 已完成对应切片 | 共享合同/纯 renderer/vendor framing 已留收据；完整产品切换仍待 P04–P08 |
-| P04 context-root core | 定向通过，P04 继续 | [收据](evidence/p04-context-root/README.md)：301 Worker、54 Native host、3 Observable、28 Renderer；尚未接入真实 Native producer/fetch/lane |
+| P04 context-root core | 定向通过，P04 继续 | [原核心收据](evidence/p04-context-root/README.md)：301 Worker、54 Native host、3 Observable、28 Renderer；后续 Host producer 接管和 reader 收据列于下文，真实 fetch/lane 仍待接线 |
 
 ## 验证口径
 
@@ -57,3 +57,5 @@ P04 真实 Host 的 ClientRows/CountOnly 接管与 context 留存已保存本地
 P04 seal/ACK 竞态端口已准确携带实际接受水位，codec 仅允许 closed marker 保留未生效 ACK；[收据](evidence/p04-seal-watermark/README.md)，Worker309/codec5/真实Host61共375定向通过。实际Native服务和传输copy生命周期继续，P04未完成。
 
 P04 StatisticsArtifactV1 独立流式 codec 已完成模块切片，main 通过真实 library consumer 的12项定向测试/目标Clippy/Native all-target check/fmt/diff；[收据](evidence/p04-statistics-codec/README.md)。STA1准确声明先验、逐turn工作及实际零分配已证明；Session/SQL/FE/源头32MiB增长防护仍继续，未开启该domain产品路径。
+
+P04 Native reader 的同一 admission ACK/完整发送 pregrant 与 strong-only owner 已保存模块切片，401 项相关测试和两包 all-target Clippy/fmt/diff 通过；[收据](evidence/p04-native-reader/README.md)。包括满池 ACK、真实 alias、回调 seal、task horizon 后 replay；真实 HTTP/H2 仍未接线，P04 继续、V1 未 advertise。统计源头的 Unpivot→Project→Root permit 缝隙已准确定位，见 [增长审计](statistics-source-growth-audit.md)。

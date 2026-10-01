@@ -16,7 +16,7 @@
 // under the License.
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::result_batch::{FetchResult, ResultBatch};
@@ -199,36 +199,48 @@ impl ResultRetainedBudget {
             state.process_retained_bytes = next_process;
             state.process_high_water_bytes = state.process_high_water_bytes.max(next_process);
         }
-        let budget = Arc::downgrade(self);
         Ok(ResultWriteAdmission::Granted(ResultWriteCredit::new(
             bytes,
-            move |released| {
-                if released == 0 {
-                    return;
-                }
-                let Some(budget) = budget.upgrade() else {
-                    return;
-                };
-                {
-                    let mut state = budget.state.lock().expect("result retained budget lock");
-                    let stream = state
-                        .stream_retained_bytes
-                        .get_mut(&key)
-                        .expect("result stream reservation exists");
-                    *stream = stream
-                        .checked_sub(released)
-                        .expect("released result stream bytes were retained");
-                    if *stream == 0 {
-                        state.stream_retained_bytes.remove(&key);
-                    }
-                    state.process_retained_bytes = state
-                        .process_retained_bytes
-                        .checked_sub(released)
-                        .expect("released process result bytes were retained");
-                }
-                budget.writable.notify_observers();
-            },
+            Self::stream_credit_release(Arc::downgrade(self), key),
         )))
+    }
+
+    /// Requested Box backing of the very same release closure issued below.
+    /// Root owners cover their finite issuer shells in the existing fixed grant.
+    pub(crate) fn stream_credit_control_backing_bytes(key: ResultBufferKey) -> usize {
+        std::mem::size_of_val(&Self::stream_credit_release(Weak::new(), key))
+    }
+
+    fn stream_credit_release(
+        budget: Weak<Self>,
+        key: ResultBufferKey,
+    ) -> impl Fn(usize) + Send + Sync + 'static {
+        move |released| {
+            if released == 0 {
+                return;
+            }
+            let Some(budget) = budget.upgrade() else {
+                return;
+            };
+            {
+                let mut state = budget.state.lock().expect("result retained budget lock");
+                let stream = state
+                    .stream_retained_bytes
+                    .get_mut(&key)
+                    .expect("result stream reservation exists");
+                *stream = stream
+                    .checked_sub(released)
+                    .expect("released result stream bytes were retained");
+                if *stream == 0 {
+                    state.stream_retained_bytes.remove(&key);
+                }
+                state.process_retained_bytes = state
+                    .process_retained_bytes
+                    .checked_sub(released)
+                    .expect("released process result bytes were retained");
+            }
+            budget.writable.notify_observers();
+        }
     }
 }
 

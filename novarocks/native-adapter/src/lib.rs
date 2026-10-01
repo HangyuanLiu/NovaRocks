@@ -63,6 +63,7 @@ pub mod fragment_window;
 pub mod management_http;
 pub mod native_client;
 mod root_producer_pool;
+pub mod root_result_reader;
 pub mod root_result_session;
 pub mod root_statistics_codec;
 pub use native_client::NativeRpcClient;

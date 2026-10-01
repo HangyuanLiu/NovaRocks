@@ -221,6 +221,27 @@ struct ChannelState {
     active_builder: bool,
 }
 
+impl ChannelState {
+    fn acknowledge_and_retire(
+        &mut self,
+        consumed: u64,
+    ) -> Result<(u64, [Option<RootResultData>; 2]), RootChannelError> {
+        let ack = self.stream.acknowledge(consumed)?;
+        // The fixed W=2 queue exits outside the channel/context fence.
+        let mut retired: [Option<RootResultData>; 2] = [None, None];
+        for slot in &mut retired {
+            if self
+                .payloads
+                .front()
+                .is_some_and(|data| data.sequence().get() <= ack.accepted_consumed)
+            {
+                *slot = self.payloads.pop_front();
+            }
+        }
+        Ok((ack.accepted_consumed, retired))
+    }
+}
+
 pub struct RootResultChannel {
     spec: RootResultWriteSpec,
     budget: Arc<ResultRetainedBudget>,
@@ -236,6 +257,37 @@ impl RootResultChannel {
     // One installed producer bridge and one scoped host observer. Driver
     // readiness lives in the separate RootInputAuthority registry.
     const WRITABLE_CALLBACK_CAPACITY: usize = 2;
+
+    fn retained_reservation_positions() -> usize {
+        let geometry = NativeResultSupportGeometry::V1;
+        (2 + geometry.root_live_send_holders * geometry.root_independent_payload_copies_per_send)
+            as usize
+    }
+
+    fn credit_control_backing_bytes(task: novarocks_execution_contract::TaskIdentity) -> usize {
+        let geometry = NativeResultSupportGeometry::V1;
+        let positions = Self::retained_reservation_positions();
+        let segments = (geometry.root_active_segment_positions
+            + geometry.root_queued_segment_positions
+            + geometry.root_retired_segment_tail_positions) as usize;
+        // One budget closure for the fixed root grant, each segment and each
+        // finite reservation. Reservation's second Box captures this exact
+        // owner (the release closure calls its method without field splitting).
+        let bytes = (1 + segments + positions)
+            * ResultRetainedBudget::stream_credit_control_backing_bytes(ResultBufferKey::Task(
+                task,
+            ))
+            + positions * std::mem::size_of::<RetainedReservationOwner>();
+        // Source-audited pinned std 1.92 Darwin Box<pal::Mutex>: one for each
+        // reservation's private credit lock and the root ChannelState lock.
+        // No concurrent initialization is possible for these private credits.
+        #[cfg(target_vendor = "apple")]
+        let bytes = bytes
+            + std::alloc::Layout::array::<(isize, [u8; 56])>(positions + 1)
+                .expect("finite root mutex layouts fit usize")
+                .size();
+        bytes
+    }
     pub fn try_open(
         spec: RootResultWriteSpec,
         budget: Arc<ResultRetainedBudget>,
@@ -286,6 +338,7 @@ impl RootResultChannel {
             + std::mem::size_of::<Weak<ResultRetainedBudget>>()
             + Observable::bounded_backing_bytes(Self::WRITABLE_CALLBACK_CAPACITY)
                 .map_err(|_| RootChannelError::Capacity)?
+            + Self::credit_control_backing_bytes(spec.task)
             + 32 * std::mem::size_of::<usize>();
         if core_bytes > Self::CORE_METADATA_CAPACITY {
             return Err(RootChannelError::Capacity);
@@ -311,7 +364,7 @@ impl RootResultChannel {
                 physical.wake();
             }
         }));
-        Ok(Arc::new(Self {
+        let channel = Arc::new(Self {
             state: Mutex::new(ChannelState {
                 lifetime: RootResultLifetime::new(spec.task),
                 stream,
@@ -330,7 +383,11 @@ impl RootResultChannel {
             limits,
             physical,
             _budget_wake: budget_wake,
-        }))
+        });
+        // Initialize Darwin's lazy mutex before this Arc can be shared. A
+        // racing first lock would temporarily allocate multiple candidates.
+        drop(channel.state.lock().unwrap());
+        Ok(channel)
     }
     pub fn spec(&self) -> &RootResultWriteSpec {
         &self.spec
@@ -383,11 +440,9 @@ impl RootResultChannel {
         if !self.state.lock().unwrap().lifetime.allows_read() {
             return Err(RootChannelError::Closed);
         }
-        let geometry = NativeResultSupportGeometry::V1;
         // One scratch owner, one input and the exact independent send copies.
         // Small reservations cannot grow an unbounded list of credit objects.
-        let positions = (2 + geometry.root_live_send_holders
-            * geometry.root_independent_payload_copies_per_send) as usize;
+        let positions = Self::retained_reservation_positions();
         if self
             .physical
             .retained_reservations
@@ -761,19 +816,7 @@ impl RootResultChannel {
                     RootReadOutcome::AwaitTerminalControl,
                 ));
             }
-            let ack = state.stream.acknowledge(read.consumed())?;
-            // Move at most two queue owners out of the lock before destroying
-            // them; credit callbacks and physical wakeups never re-enter it.
-            let mut retired: [Option<RootResultData>; 2] = [None, None];
-            for slot in &mut retired {
-                if state
-                    .payloads
-                    .front()
-                    .is_some_and(|data| data.sequence().get() <= ack.accepted_consumed)
-                {
-                    *slot = state.payloads.pop_front();
-                }
-            }
+            let (accepted, retired) = state.acknowledge_and_retire(read.consumed())?;
             let outcome = (|| {
                 Ok(match read.wanted() {
                     None => RootReadOutcome::AckOnly,
@@ -812,13 +855,32 @@ impl RootResultChannel {
                 })
             })();
             (
-                outcome.map(|outcome| self.reply(ack.accepted_consumed, outcome)),
+                outcome.map(|outcome| self.reply(accepted, outcome)),
                 retired,
             )
         };
         drop(retired);
         self.physical.writable.notify_observers();
         reply
+    }
+
+    /// Apply only the request's cumulative ACK. No payload alias or new read
+    /// position is constructed here. Retired allocations exit outside the
+    /// channel lock, before a native sender asks for independent copy space.
+    fn apply_consumed(&self, consumed: u64) -> Result<u64, RootChannelError> {
+        let (accepted, retired) = {
+            let mut state = self.state.lock().unwrap();
+            if !state.context_owned {
+                return Err(RootChannelError::Identity);
+            }
+            if !state.lifetime.allows_read() {
+                return Err(RootChannelError::Closed);
+            }
+            state.acknowledge_and_retire(consumed)?
+        };
+        drop(retired);
+        self.physical.writable.notify_observers();
+        Ok(accepted)
     }
     fn reply(&self, accepted_consumed: u64, outcome: RootReadOutcome) -> RootResultReply {
         RootResultReply {
@@ -890,6 +952,42 @@ pub struct RootChannelRead {
     guard: Arc<RootDeliveryOwner>,
 }
 impl RootChannelRead {
+    /// Apply this original admission's ACK before reserving native copy space.
+    /// This neither offers a payload nor creates another read holder. A repeat
+    /// by `read()` is idempotent; seal winning this cut refuses the late ACK.
+    pub fn apply_consumed(&self) -> Result<u64, RootChannelError> {
+        self.channel.apply_consumed(self.request.consumed())
+    }
+    /// Snapshot the actual applied ACK frontier of this original admission.
+    /// In particular, send pregrant losing to seal can return a closed marker
+    /// without rerouting, applying the late ACK or minting another read owner.
+    pub fn accepted_consumed(&self) -> u64 {
+        self.channel.snapshot().consumed_through
+    }
+    /// The admitted read position is already counted under the context fence.
+    /// Reserve all independent native payload backings before any prost/HTTP
+    /// allocation, using this original root/process budget. A concurrent seal
+    /// rejects growth; it does not invent a new read position or a new wallet.
+    pub fn try_reserve_native_send_backing(
+        &self,
+    ) -> Result<ResultWriteAdmission, RootChannelError> {
+        let geometry = NativeResultSupportGeometry::V1;
+        let bytes = geometry
+            .root_segment_backing_capacity_bytes
+            .checked_mul(geometry.root_independent_payload_copies_per_send)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or(RootChannelError::Capacity)?;
+        self.channel.try_reserve(bytes)
+    }
+    /// Suballocate finite native wrapper/Arc metadata from the original fixed
+    /// root envelope before constructing them. The returned owner follows the
+    /// actual wrappers and aliases, independently of handler completion.
+    pub fn try_reserve_native_send_metadata(
+        &self,
+        bytes: usize,
+    ) -> Result<RootMetadataReservation, RootChannelError> {
+        self.channel.try_reserve_metadata(bytes)
+    }
     pub async fn read(self) -> Result<RootResultDelivery, RootChannelError> {
         self.channel.read_admitted(&self.request, self.guard).await
     }
@@ -1187,6 +1285,128 @@ mod tests {
         drop(retry);
         drop(alias);
         assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
+    }
+
+    fn channel_with_native_send_budget() -> (Arc<RootResultChannel>, Arc<ResultRetainedBudget>) {
+        let geometry = NativeResultSupportGeometry::V1;
+        let bytes = (geometry.root_fixed_schema_cursor_driver_capacity_bytes
+            + geometry.root_independent_payload_copies_per_send
+                * geometry.root_segment_backing_capacity_bytes) as usize;
+        let limits = WorkerResultRetainedLimits::try_new(bytes, bytes).unwrap();
+        let budget = ResultRetainedBudget::new(limits.per_process());
+        let channel = RootResultChannel::try_open(
+            RootResultWriteSpec {
+                task: task(),
+                contract: Arc::new(RootOutputContract::new(RootProfileId::V1, facts())),
+            },
+            Arc::clone(&budget),
+            limits,
+        )
+        .unwrap();
+        channel.mark_context_owned().unwrap();
+        (channel, budget)
+    }
+
+    #[tokio::test]
+    async fn native_fetch_ack_retires_backing_before_send_copy_pregrant() {
+        let (channel, budget) = channel_with_native_send_budget();
+        publish(&channel, b"a", false);
+        drop(channel.read(&read(&channel, Some(1), 0)).await.unwrap());
+        let admitted = channel.begin_read(&read(&channel, Some(2), 1)).unwrap();
+        assert!(matches!(
+            admitted.try_reserve_native_send_backing().unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        assert_eq!(channel.snapshot().consumed_through, 0);
+        assert_eq!(admitted.apply_consumed().unwrap(), 1);
+        assert_eq!(
+            admitted.apply_consumed().unwrap(),
+            1,
+            "ACK replay is idempotent"
+        );
+        assert_eq!(channel.snapshot().data_positions, 0);
+        assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
+        let ResultWriteAdmission::Granted(send) =
+            admitted.try_reserve_native_send_backing().unwrap()
+        else {
+            panic!("actual ACK retirement freed enough space for the same admitted read");
+        };
+        assert_eq!(channel.physical.deliveries.load(Ordering::Acquire), 1);
+        let reply = admitted.read().await.unwrap();
+        assert_eq!(reply.reply().accepted_consumed, 1);
+        assert_eq!(reply.reply().outcome, RootReadOutcome::NotReady);
+        drop(reply);
+        assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024 + send.bytes());
+        drop(send);
+        assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
+        assert!(channel.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn native_pregrant_ack_cannot_return_a_live_segment_alias_budget() {
+        let (channel, budget) = channel_with_native_send_budget();
+        publish(&channel, b"a", false);
+        let offered = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
+        let alias = data(&offered).body().clone();
+        drop(offered);
+        let retained = budget.retained_bytes_for_test();
+        let admitted = channel.begin_read(&read(&channel, Some(2), 1)).unwrap();
+        assert_eq!(admitted.apply_consumed().unwrap(), 1);
+        assert_eq!(channel.snapshot().data_positions, 0);
+        assert_eq!(budget.retained_bytes_for_test(), retained);
+        assert!(matches!(
+            admitted.try_reserve_native_send_backing().unwrap(),
+            ResultWriteAdmission::Blocked
+        ));
+        drop(alias);
+        let ResultWriteAdmission::Granted(send) =
+            admitted.try_reserve_native_send_backing().unwrap()
+        else {
+            panic!("last actual alias exit returned the capacity");
+        };
+        assert_eq!(admitted.accepted_consumed(), 1);
+        drop(send);
+        drop(admitted);
+        assert!(channel.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn seal_before_native_ack_pregrant_preserves_the_applied_frontier() {
+        let (channel, _) = channel(facts());
+        channel.mark_context_owned().unwrap();
+        publish(&channel, b"a", false);
+        drop(channel.read(&read(&channel, Some(1), 0)).await.unwrap());
+        let admitted = channel.begin_read(&read(&channel, None, 1)).unwrap();
+        channel.close(RootRetentionClose::ContextReleased);
+        assert_eq!(admitted.apply_consumed(), Err(RootChannelError::Closed));
+        assert_eq!(admitted.accepted_consumed(), 0);
+        assert!(matches!(
+            admitted.try_reserve_native_send_backing(),
+            Err(RootChannelError::Closed)
+        ));
+        let reply = admitted.read().await.unwrap();
+        assert_eq!(reply.reply().accepted_consumed, 0);
+        assert_eq!(reply.reply().outcome, RootReadOutcome::AwaitTerminalControl);
+        drop(reply);
+        assert!(channel.physical_idle());
+    }
+
+    #[test]
+    fn native_ack_pregrant_refuses_unoffered_data_without_retiring_it() {
+        let (channel, budget) = channel(facts());
+        channel.mark_context_owned().unwrap();
+        publish(&channel, b"a", false);
+        let retained = budget.retained_bytes_for_test();
+        let admitted = channel.begin_read(&read(&channel, None, 1)).unwrap();
+        assert_eq!(
+            admitted.apply_consumed(),
+            Err(RootChannelError::Stream(
+                StreamError::AcknowledgementBeyondOffered
+            ))
+        );
+        assert_eq!(channel.snapshot().consumed_through, 0);
+        assert_eq!(channel.snapshot().data_positions, 1);
+        assert_eq!(budget.retained_bytes_for_test(), retained);
     }
     #[tokio::test]
     async fn aliases_hold_delivery_positions_after_handler_and_ack() {

@@ -1,0 +1,163 @@
+{
+  "schema": 1,
+  "parent_commit": "f65f83969eed245f8fb91a2700749057496e1f78",
+  "sources": {
+    "novarocks/worker/src/result_buffer.rs": "42227ecb933f5ba0d1e0333d2062bdf03690329e4eb826e0633a43be40e7f649",
+    "novarocks/worker/src/root_result_channel.rs": "cb079be8152c39aac44ee1d8bb2c6417b9d7a74383737b4100ed76ed815cd92e",
+    "novarocks/native-adapter/src/lib.rs": "d0377a6149775e00ae4143f883fa40e185dd870e89c7d173afd7f0846904ef68",
+    "novarocks/native-adapter/src/root_result_reader.rs": "5e9c584d681723e3f29febabe5e47789cb45ea41218affc22af629a17e739760",
+    "novarocks/native-adapter/tests/root_result_reader.rs": "9fcb7b078d20c477db876944fbc6de3800a4190f13f65e02bf8d687fd98dbe0d",
+    "docs/testing/mem-1-m07/statistics-source-growth-audit.md": "9fae2f97c7cbbc6f5b0e1f00f5ad26efd7981cb46337822d5b7d26be4ef021da"
+  },
+  "audited_toolchain": {
+    "rust": "1.92.0-aarch64-apple-darwin",
+    "ArcInner_lines": [
+      380,
+      385
+    ],
+    "Arc_into_inner_lines": [
+      1132,
+      1159
+    ],
+    "alloc_sync_rs_sha256": "73773bd4533d9664b5c3b16a7db01234529acc26ec8dc74567fc5108d3b319d5",
+    "mutex_pthread_rs_sha256": "1aa80435780abe34a365179635e92fb5935894fb9b4f615eb45b336958c28035"
+  },
+  "logs": {
+    "worker.log.gz": {
+      "command": "cargo test --offline --locked -p novarocks-worker --lib -- --test-threads=1",
+      "exit_code": 0,
+      "raw_bytes": 31373,
+      "raw_sha256": "c142a99f295dc45c71eaf43d204a1d481054d6789ff0952ada9e64e06820158e",
+      "gzip_sha256": "6d0cb5bcb4a4b28c4e9bb466cfced9706fd34e85befe0bd61bb4eec68c88e6d2",
+      "source_scope": "current sources above"
+    },
+    "worker-clippy.log.gz": {
+      "command": "cargo clippy --offline --locked -p novarocks-worker --all-targets",
+      "exit_code": 0,
+      "raw_bytes": 35101,
+      "raw_sha256": "ac3eafa98cb13c2e68368148520a884363f07cd3598e05acefcbe7b36ebd77b8",
+      "gzip_sha256": "d074685c16052c274db6a42bca61cb89955766d9a0ec4cfa8c14c686f355ae03",
+      "source_scope": "current sources above"
+    },
+    "reader-main.log.gz": {
+      "command": "cargo test --offline --locked -p novarocks-native-adapter --test root_result_reader -- --test-threads=1",
+      "exit_code": 0,
+      "raw_bytes": 45412,
+      "raw_sha256": "fa1ad7eb08f291c01a53016448930033c39d7e2bacb59b73419fa9562e27d45b",
+      "gzip_sha256": "083992fbc9aefeb91c795eda4bb8f409c366f489a1af6f2d8c7b9ee04ce686df",
+      "source_scope": "current sources above"
+    },
+    "session.log.gz": {
+      "command": "cargo test --offline --locked -p novarocks-native-adapter --test root_producer_session -- --test-threads=1",
+      "exit_code": 0,
+      "raw_bytes": 45250,
+      "raw_sha256": "09540455a2eec7a6b7076067ba7ad0f1a8f22b0c1e7fe75f10eb968e923eaaa5",
+      "gzip_sha256": "9edd17a38a9be37b40bbcec0685e4a1b65c0af86a06a18f2d8b50dfa054c45a4",
+      "source_scope": "current sources above"
+    },
+    "host.log.gz": {
+      "command": "cargo test --offline --locked -p novarocks-native-adapter --lib backend_task_execution::execution_host -- --test-threads=1",
+      "exit_code": 0,
+      "raw_bytes": 51776,
+      "raw_sha256": "69cb80a7655b5a5056cdf04be2c1d1323a30bac3adce905a1c920a73cb9a1b23",
+      "gzip_sha256": "bfbbe90c3ce93def03d6cdd1b60c027068488d39c48cfe682d5ec4e266b02531",
+      "source_scope": "current sources above"
+    },
+    "native-clippy.log.gz": {
+      "command": "cargo clippy --offline --locked -p novarocks-native-adapter --all-targets",
+      "exit_code": 0,
+      "raw_bytes": 112783,
+      "raw_sha256": "b1693cc960f3d830becc46b1b75d2f6e5d4cc8c52bad99d30ba0d5b64ca30ac3",
+      "gzip_sha256": "4442734464c83d6b7e19ef34a5d747ab676abf12f9bdfd22581f3944c60b0baf",
+      "source_scope": "current sources above"
+    },
+    "fmt.log.gz": {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0,
+      "raw_bytes": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "source_scope": "current sources above"
+    },
+    "diff.log.gz": {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "raw_bytes": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+      "source_scope": "current sources above"
+    },
+    "worker-first.log.gz": {
+      "command": "cargo test --offline --locked -p novarocks-worker --lib root_result_channel -- --test-threads=1",
+      "exit_code": 0,
+      "raw_bytes": 2690,
+      "raw_sha256": "2a2d54cfe7ec1f87b2eb5ce9a2a12d8caebd7db1c06fb253a0c16e7d81f6d4aa",
+      "gzip_sha256": "0fd9a9cefd088999ec457b386b37590e46ce5acb294d0b3e0c7b0313f2ba2075",
+      "source_scope": "current sources above"
+    },
+    "agent-reader-v1.log.gz": {
+      "command": "cargo test -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 101,
+      "raw_bytes": 45941,
+      "raw_sha256": "e02f74443895f48402aac0bf03d2a4febdffdeee7fe40ebda243b9233139cae5",
+      "gzip_sha256": "31fa518362412683f3e3d174f17c3da34304a5bc68476ff0f3ca4df2dfe5ac80",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-v2.log.gz": {
+      "command": "cargo test -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 0,
+      "raw_bytes": 45083,
+      "raw_sha256": "4b1044738f0ceadcb5d2f085d65e97d522c705a3bd86382d7cf22be2e692e100",
+      "gzip_sha256": "7351a9cbee313337cc81ed11211f327117a2c8bb02a2ab20dd3301f48665f947",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-v3.log.gz": {
+      "command": "cargo test -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 0,
+      "raw_bytes": 45323,
+      "raw_sha256": "71b85b584f4a53b77178302abfaaff34878cf5011953362ebc8c34a5523a4afc",
+      "gzip_sha256": "e8811c2b1cf226af8c4f87ee56baefa0d6066cd695615d6ccd83a7545567bdd3",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-v4.log.gz": {
+      "command": "cargo test -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 101,
+      "raw_bytes": 45864,
+      "raw_sha256": "3c89529c7960a6f0949569d8b948615dff08f5511b718a69e97b98cde8c3bbb2",
+      "gzip_sha256": "314833bd02245b63cb58dc39f00f51b3c535860d9d569212b55abae47d9ee1cc",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-v5.log.gz": {
+      "command": "cargo test -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 0,
+      "raw_bytes": 45219,
+      "raw_sha256": "f57283409cb03d9a140d192d3c84a99ddf989420b49f26ebf8a76bdd507007d5",
+      "gzip_sha256": "138e576f5744a1024500eed2a09443df665d16839c1f3e517bcd88a532de82b1",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-v6.log.gz": {
+      "command": "cargo test -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 0,
+      "raw_bytes": 45412,
+      "raw_sha256": "91d9914c46285e1fbf11e23b5b712496d5775d300c3e12008124e9cdca5a8245",
+      "gzip_sha256": "acb4159418db9726fe53708df083c67ef9d120f0fde2026db85ed81c4f966428",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-clippy-v1.log.gz": {
+      "command": "cargo clippy -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 0,
+      "raw_bytes": 109303,
+      "raw_sha256": "691ef8c7d65da9f30c6cfd4f958fc593bf5cb82eaf5e208befd95acae54f45d3",
+      "gzip_sha256": "58195f415ca7ac27403c26d23491a47b4fd7bee1b655550f0a1fe744a04e19c9",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    },
+    "agent-reader-clippy-v2.log.gz": {
+      "command": "cargo clippy -p novarocks-native-adapter --test root_result_reader",
+      "exit_code": 0,
+      "raw_bytes": 109303,
+      "raw_sha256": "6e7e44ba3ce5fcf489c19048a3cd68a68607e2b6f80fb19804d2a29b4648a3ee",
+      "gzip_sha256": "a55e6418e8bdd0a8e5ef599bc6d55b30f347a309582b2ee5ff31ebfc5868150e",
+      "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
+    }
+  }
+}
