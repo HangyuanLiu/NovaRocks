@@ -1412,7 +1412,7 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    for name in ["bitnot", "bitand", "bitor", "bitxor"] {
+    for name in ["bitand", "bitor", "bitxor"] {
         add_for_every(m, name, INTEGER_TYPES, |t| {
             Signature::new(vec![t.clone(), t.clone()], t.clone())
         });

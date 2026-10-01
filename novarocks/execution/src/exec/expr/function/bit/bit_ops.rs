@@ -706,3 +706,319 @@ mod legacy_shift_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod legacy_bitwise_contract_tests {
+    use super::*;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::ExprNode;
+    use crate::exec::expr::function::FunctionKind;
+    use arrow::array::{Int8Array, Int16Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    fn evaluate_result(name: &'static str, arrays: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+        let output_type = arrays[0].data_type().clone();
+        let fields = arrays
+            .iter()
+            .enumerate()
+            .map(|(index, array)| {
+                Field::new(format!("argument{index}"), array.data_type().clone(), true)
+            })
+            .collect::<Vec<_>>();
+        let slots = (0..arrays.len())
+            .map(|index| SlotId::new(index as u32 + 1))
+            .collect::<Vec<_>>();
+        let types = arrays
+            .iter()
+            .map(|array| array.data_type().clone())
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+        let schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        let mut arena = ExprArena::default();
+        let arguments = slots
+            .into_iter()
+            .zip(types)
+            .map(|(slot, ty)| arena.push_typed(ExprNode::SlotId(slot), ty))
+            .collect::<Vec<_>>();
+        let call = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Bit(name),
+                args: arguments,
+            },
+            output_type.clone(),
+        );
+        let frozen = arena.into_immutable().unwrap();
+        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
+        assert_eq!(output.data_type(), &output_type);
+        Ok(output)
+    }
+    fn evaluate(name: &'static str, arrays: Vec<ArrayRef>) -> ArrayRef {
+        evaluate_result(name, arrays).unwrap()
+    }
+    fn signed(ty: &DataType, values: &[Option<i64>]) -> ArrayRef {
+        match ty {
+            DataType::Int8 => Arc::new(Int8Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i8::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int16 => Arc::new(Int16Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i16::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int32 => Arc::new(Int32Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i32::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int64 => Arc::new(Int64Array::from(values.to_vec())),
+            _ => panic!("fixture requires a signed integer carrier"),
+        }
+    }
+    fn assert_signed(output: &ArrayRef, expected: &[Option<i64>]) {
+        let converted = cast(output, &DataType::Int64).unwrap();
+        assert_eq!(
+            converted
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    fn assert_large(output: &ArrayRef, expected: &[Option<i128>]) {
+        // This exact BE16 carrier oracle does not grant a Physical Fixed16
+        // source the logical LARGEINT authority required by the new owner.
+        assert_eq!(output.data_type(), &DataType::FixedSizeBinary(16));
+        let array = output
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(array.len(), expected.len());
+        for (row, expected) in expected.iter().enumerate() {
+            match expected {
+                Some(expected) => {
+                    assert!(!array.is_null(row));
+                    assert_eq!(array.value(row), expected.to_be_bytes().as_slice());
+                    assert_eq!(
+                        largeint::i128_from_be_bytes(array.value(row)).unwrap(),
+                        *expected
+                    );
+                }
+                None => assert!(array.is_null(row)),
+            }
+        }
+    }
+    fn widths() -> [(DataType, i64, i64); 4] {
+        [
+            (DataType::Int8, i8::MIN as i64, i8::MAX as i64),
+            (DataType::Int16, i16::MIN as i64, i16::MAX as i64),
+            (DataType::Int32, i32::MIN as i64, i32::MAX as i64),
+            (DataType::Int64, i64::MIN, i64::MAX),
+        ]
+    }
+    #[test]
+    fn signed_binary_operations_preserve_widened_sign_extension_for_all_widths() {
+        for (ty, min, max) in widths() {
+            let left = signed(
+                &ty,
+                &[Some(-1), Some(min), Some(max), Some(0), Some(1), Some(-2)],
+            );
+            let right = signed(
+                &ty,
+                &[Some(1), Some(-1), Some(min), Some(max), Some(-1), Some(3)],
+            );
+            assert_signed(
+                &evaluate("bitand", vec![left.clone(), right.clone()]),
+                &[Some(1), Some(min), Some(0), Some(0), Some(1), Some(2)],
+            );
+            assert_signed(
+                &evaluate("bitor", vec![left.clone(), right.clone()]),
+                &[Some(-1), Some(-1), Some(-1), Some(max), Some(-1), Some(-1)],
+            );
+            assert_signed(
+                &evaluate("bitxor", vec![left, right]),
+                &[Some(-2), Some(max), Some(-1), Some(max), Some(-2), Some(-3)],
+            );
+        }
+    }
+    #[test]
+    fn signed_unary_not_preserves_source_width_after_i64_complement() {
+        for (ty, min, max) in widths() {
+            assert_signed(
+                &evaluate(
+                    "bitnot",
+                    vec![signed(
+                        &ty,
+                        &[
+                            Some(min),
+                            Some(max),
+                            Some(-1),
+                            Some(0),
+                            Some(1),
+                            Some(-2),
+                            None,
+                        ],
+                    )],
+                ),
+                &[
+                    Some(max),
+                    Some(min),
+                    Some(0),
+                    Some(-1),
+                    Some(-2),
+                    Some(1),
+                    None,
+                ],
+            );
+        }
+    }
+    #[test]
+    fn i64_high_and_low_bit_patterns_have_independent_signed_expected_values() {
+        let high = 1_i64 << 62;
+        let left = signed(
+            &DataType::Int64,
+            &[Some(high + 5), Some(i64::MIN), Some(i64::MAX)],
+        );
+        let right = signed(&DataType::Int64, &[Some(-high), Some(5), Some(5)]);
+        assert_signed(
+            &evaluate("bitand", vec![left.clone(), right.clone()]),
+            &[Some(high), Some(0), Some(5)],
+        );
+        assert_signed(
+            &evaluate("bitor", vec![left.clone(), right.clone()]),
+            &[Some(-high + 5), Some(i64::MIN + 5), Some(i64::MAX)],
+        );
+        assert_signed(
+            &evaluate("bitxor", vec![left, right]),
+            &[Some(i64::MIN + 5), Some(i64::MIN + 5), Some(i64::MAX - 5)],
+        );
+    }
+    #[test]
+    fn largeint_binary_operations_keep_upper100_bits_extrema_and_big_endian_bytes() {
+        let high = 1_i128 << 100;
+        let left = largeint::array_from_i128(&[
+            Some(high + 5),
+            Some(i128::MIN),
+            Some(i128::MAX),
+            Some(-1),
+            Some(0),
+        ])
+        .unwrap();
+        let right = largeint::array_from_i128(&[
+            Some(high + 10),
+            Some(-1),
+            Some(i128::MIN),
+            Some(high),
+            Some(-1),
+        ])
+        .unwrap();
+        assert_large(
+            &evaluate("bitand", vec![left.clone(), right.clone()]),
+            &[Some(high), Some(i128::MIN), Some(0), Some(high), Some(0)],
+        );
+        assert_large(
+            &evaluate("bitor", vec![left.clone(), right.clone()]),
+            &[Some(high + 15), Some(-1), Some(-1), Some(-1), Some(-1)],
+        );
+        assert_large(
+            &evaluate("bitxor", vec![left, right]),
+            &[
+                Some(15),
+                Some(i128::MAX),
+                Some(-1),
+                Some(-high - 1),
+                Some(-1),
+            ],
+        );
+    }
+    #[test]
+    fn largeint_unary_not_retains_all128_bits_and_exact_nulls() {
+        let high = 1_i128 << 100;
+        let values = largeint::array_from_i128(&[
+            Some(i128::MIN),
+            Some(i128::MAX),
+            Some(high + 5),
+            Some(-1),
+            Some(0),
+            None,
+        ])
+        .unwrap();
+        assert_large(
+            &evaluate("bitnot", vec![values]),
+            &[
+                Some(i128::MAX),
+                Some(i128::MIN),
+                Some(-high - 6),
+                Some(0),
+                Some(-1),
+                None,
+            ],
+        );
+    }
+    #[test]
+    fn binary_nulls_and_real_slices_preserve_each_argument_row_and_output_width() {
+        let left = signed(
+            &DataType::Int16,
+            &[Some(999), Some(-1), None, Some(1), None, Some(7)],
+        );
+        let right = signed(
+            &DataType::Int16,
+            &[Some(888), Some(1), Some(1), None, None, Some(7)],
+        );
+        for (name, value) in [("bitand", 1), ("bitor", -1), ("bitxor", -2)] {
+            assert_signed(
+                &evaluate(name, vec![left.slice(1, 4), right.slice(1, 4)]),
+                &[Some(value), None, None, None],
+            );
+        }
+        let high = 1_i128 << 100;
+        let left =
+            largeint::array_from_i128(&[Some(99), Some(high + 5), None, Some(1), None, Some(7)])
+                .unwrap();
+        let right =
+            largeint::array_from_i128(&[Some(99), Some(high + 10), Some(1), None, None, Some(7)])
+                .unwrap();
+        for (name, value) in [("bitand", high), ("bitor", high + 15), ("bitxor", 15)] {
+            assert_large(
+                &evaluate(name, vec![left.slice(1, 4), right.slice(1, 4)]),
+                &[Some(value), None, None, None],
+            );
+        }
+    }
+    #[test]
+    fn real_expression_dispatch_rejects_bitnot_binary_arity_for_every_source_profile() {
+        for (ty, _, _) in widths() {
+            let error = evaluate_result(
+                "bitnot",
+                vec![signed(&ty, &[Some(1)]), signed(&ty, &[Some(2)])],
+            )
+            .unwrap_err();
+            assert_eq!(error, "bitnot expects 1 to 1 arguments, got 2");
+        }
+        let error = evaluate_result(
+            "bitnot",
+            vec![
+                largeint::array_from_i128(&[Some(1)]).unwrap(),
+                largeint::array_from_i128(&[Some(2)]).unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "bitnot expects 1 to 1 arguments, got 2");
+        // A genuine unary call remains accepted; a false blanket rejection
+        // of bitnot cannot make this negative-arity oracle pass.
+        assert_signed(
+            &evaluate("bitnot", vec![signed(&DataType::Int8, &[Some(1)])]),
+            &[Some(-2)],
+        );
+    }
+}
