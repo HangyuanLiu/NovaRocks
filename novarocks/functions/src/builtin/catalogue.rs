@@ -1392,7 +1392,7 @@ pub fn dynamic_scalar_names() -> &'static [&'static str] {
     DYNAMIC_SCALAR_FUNCTIONS
 }
 
-struct BuiltinDynamicScalarResolver {
+pub(super) struct BuiltinDynamicScalarResolver {
     function_id: FunctionId,
     canonical_name: Box<str>,
     overload: FunctionOverloadId,
@@ -2351,58 +2351,82 @@ pub(super) fn scalar_definition_parts(
     Ok((declaration, resolver))
 }
 
+pub(super) fn dynamic_definition_parts(
+    name: &str,
+) -> Result<(FunctionBindingDeclaration, BuiltinDynamicScalarResolver), FunctionCatalogError> {
+    if !matches!(
+        builtin_disposition(name),
+        Some(BuiltinDisposition::InstalledScalar(_))
+    ) {
+        return Err(FunctionCatalogError::InvalidStableIdentity {
+            subject: "unclassified dynamic scalar implementation",
+            value: name.into(),
+        });
+    }
+    let function_id =
+        FunctionId::try_new(format!("builtin.scalar/{name}/v1")).map_err(|error| {
+            FunctionCatalogError::InvalidStableIdentity {
+                subject: "dynamic scalar function",
+                value: error.to_string().into(),
+            }
+        })?;
+    let overload = FunctionOverloadId::try_new(format!("builtin.scalar/{name}/dynamic-v1"))
+        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+            subject: "dynamic scalar overload",
+            value: error.to_string().into(),
+        })?;
+    let overload_declaration = if name == "truncate" {
+        FunctionOverloadDeclaration::from_effects(
+            overload.clone(),
+            "owner-derived",
+            "owner-derived",
+            None,
+            super::truncate_owner::effects(),
+        )
+    } else {
+        FunctionOverloadDeclaration {
+            effects: None,
+            semantics: builtin_scalar_semantics(name),
+            identity: overload.clone(),
+            argument_pattern: "owner-derived".into(),
+            result_pattern: "owner-derived".into(),
+            aggregate: None,
+        }
+    };
+    let declaration = FunctionBindingDeclaration::try_new(
+        function_id.clone(),
+        FunctionKind::Scalar,
+        [overload_declaration],
+    )
+    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+        subject: "dynamic scalar binding declaration",
+        value: error.to_string().into(),
+    })?;
+    let resolver = BuiltinDynamicScalarResolver {
+        function_id,
+        canonical_name: name.into(),
+        overload,
+    };
+    Ok((declaration, resolver))
+}
+
 pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
     builder.register(super::value_conversion::value_conversion_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
-        if !matches!(
-            builtin_disposition(name),
-            Some(BuiltinDisposition::InstalledScalar(_))
-        ) {
-            return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "unclassified dynamic scalar implementation",
-                value: (*name).into(),
-            });
-        }
-        let function_id =
-            FunctionId::try_new(format!("builtin.scalar/{name}/v1")).map_err(|error| {
-                FunctionCatalogError::InvalidStableIdentity {
-                    subject: "dynamic scalar function",
-                    value: error.to_string().into(),
-                }
-            })?;
-        let overload = FunctionOverloadId::try_new(format!("builtin.scalar/{name}/dynamic-v1"))
-            .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-                subject: "dynamic scalar overload",
-                value: error.to_string().into(),
-            })?;
-        let declaration = FunctionBindingDeclaration::try_new(
-            function_id.clone(),
-            FunctionKind::Scalar,
-            [FunctionOverloadDeclaration {
-                effects: None,
-                semantics: builtin_scalar_semantics(name),
-                identity: overload.clone(),
-                argument_pattern: "owner-derived".into(),
-                result_pattern: "owner-derived".into(),
-                aggregate: None,
-            }],
-        )
-        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "dynamic scalar binding declaration",
-            value: error.to_string().into(),
-        })?;
-        builder.register(FunctionDefinition::try_new_bound(
-            name,
-            FunctionVisibility::Public,
-            declaration,
-            Arc::new(BuiltinDynamicScalarResolver {
-                function_id: function_id.clone(),
-                canonical_name: (*name).into(),
-                overload,
-            }),
-        )?)?;
+        let (declaration, resolver) = dynamic_definition_parts(name)?;
+        let definition = if *name == "truncate" {
+            super::truncate_owner::definition(declaration, resolver)?
+        } else {
+            FunctionDefinition::try_new_bound(
+                name,
+                FunctionVisibility::Public,
+                declaration,
+                Arc::new(resolver),
+            )?
+        };
+        builder.register(definition)?;
     }
     for (name, signatures) in registry::builtin_scalar_declarations() {
         let kind = match builtin_disposition(&name) {

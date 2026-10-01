@@ -47,3 +47,5 @@ mod numeric_unary_owner;
 mod rand;
 mod rand_owner;
 mod rounding_binding;
+mod truncate;
+mod truncate_owner;
