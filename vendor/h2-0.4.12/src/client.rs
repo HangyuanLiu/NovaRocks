@@ -147,7 +147,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::Instrument;
 
@@ -307,6 +307,7 @@ pub struct PushPromises {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Builder {
+    initial_settings_deadline: Option<Instant>,
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -667,6 +668,7 @@ impl Builder {
     /// ```
     pub fn new() -> Builder {
         Builder {
+            initial_settings_deadline: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             retain_data_payloads: false,
             send_frame_buffer: None,
@@ -690,6 +692,17 @@ impl Builder {
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
+    }
+
+    /// Set an absolute deadline for the opt-in initial SETTINGS phase.
+    ///
+    /// The same deadline covers the preface and initial peer SETTINGS/ACK
+    /// flush. Poll `Connection::poll_initial_settings` before exposing request
+    /// dispatch. The caller must arrange deadline wakeups; no timer is created.
+    /// Success clears the deadline and does not time application streams.
+    pub fn initial_settings_deadline(&mut self, deadline: Instant) -> &mut Self {
+        self.initial_settings_deadline = Some(deadline);
+        self
     }
 
     /// Indicates the initial window size (in octets) for stream-level
@@ -1464,14 +1477,42 @@ where
 
 // ===== impl Connection =====
 
-async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
+fn check_initial_settings_deadline(deadline: Option<Instant>) -> Result<(), crate::Error> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(crate::Error::from_io(std::io::ErrorKind::TimedOut.into()));
+    }
+    Ok(())
+}
+
+async fn bind_connection<T>(io: &mut T, deadline: Option<Instant>) -> Result<(), crate::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     tracing::debug!("binding client connection");
 
     let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
+    if deadline.is_none() {
+        // Preserve the ordinary constructor and its existing error details.
+        io.write_all(msg).await.map_err(crate::Error::from_io)?;
+    } else {
+        let mut written = 0;
+        std::future::poll_fn(|cx| {
+            while written < msg.len() {
+                check_initial_settings_deadline(deadline)?;
+                let count = ready!(Pin::new(&mut *io).poll_write(cx, &msg[written..]))
+                    .map_err(crate::Error::from_io)?;
+                if count == 0 {
+                    return Poll::Ready(Err(crate::Error::from_io(
+                        std::io::ErrorKind::WriteZero.into(),
+                    )));
+                }
+                written += count;
+            }
+            check_initial_settings_deadline(deadline)?;
+            Poll::Ready(Ok(()))
+        })
+        .await?;
+    }
 
     tracing::debug!("client connection bound");
 
@@ -1487,6 +1528,9 @@ where
         mut io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
+        // This executes on the constructor future's first actual poll, before
+        // binding pools or writing the connection preface.
+        check_initial_settings_deadline(builder.initial_settings_deadline)?;
         if builder.receive_header_map_pool.is_some() && builder.receive_header_field_pool.is_none()
         {
             return Err(crate::Error::from_io(std::io::Error::new(
@@ -1639,7 +1683,9 @@ where
             .map(crate::SendFrameBuffer::bind)
             .transpose()
             .map_err(crate::Error::from_io)?;
-        bind_connection(&mut io).await?;
+        check_initial_settings_deadline(builder.initial_settings_deadline)?;
+        bind_connection(&mut io, builder.initial_settings_deadline).await?;
+        check_initial_settings_deadline(builder.initial_settings_deadline)?;
 
         // Create the codec
         let mut codec = Codec::with_frame_buffers(
@@ -1658,6 +1704,7 @@ where
                     .expect("validated header block maximum"),
             }),
         );
+        codec.set_initial_settings_deadline(builder.initial_settings_deadline);
         codec.set_retain_data_payloads(builder.retain_data_payloads);
         if let Some(max) = builder.max_send_header_table_size {
             codec.set_max_send_header_table_size(max as usize);
@@ -1702,6 +1749,7 @@ where
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
                 settings: builder.settings.clone(),
+                initial_settings_deadline: builder.initial_settings_deadline,
             },
         );
         let send_request = SendRequest {
@@ -1714,7 +1762,22 @@ where
             connection.set_target_window_size(sz);
         }
 
+        check_initial_settings_deadline(builder.initial_settings_deadline)?;
         Ok((send_request, connection))
+    }
+
+    /// Poll the opt-in initial SETTINGS phase without application dispatch.
+    ///
+    /// Success proves the initial remote non-ACK SETTINGS were applied and the
+    /// initial local SETTINGS and peer ACK were flushed. Without an installed
+    /// deadline this returns Ready immediately, preserving the legacy path.
+    /// A failure is terminal; subsequent phase polls report ConnectionAborted.
+    /// Arrange an external wakeup for the absolute deadline while IO is pending.
+    pub fn poll_initial_settings(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.inner.poll_initial_settings(cx).map_err(Into::into)
     }
 
     /// Sets the target window size for the whole connection.

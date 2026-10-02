@@ -200,9 +200,24 @@ where
     }
 
     fn call(&mut self, req: Uri) -> Self::Future {
+        let started = std::time::Instant::now();
+        let mut initial_settings_deadline = None;
         let mut builder = self.settings.clone();
         if let Some(factory) = &self.factory {
             let configured = factory().and_then(|config| {
+                if let Some(timeout) = config.initial_settings_timeout {
+                    if timeout.is_zero() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
+                    }
+                    let deadline = started.checked_add(timeout).ok_or_else(|| {
+                        crate::Error::from(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+                    })?;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+                    }
+                    initial_settings_deadline = Some(deadline);
+                    builder.initial_settings_deadline(deadline);
+                }
                 config
                     .apply(&mut builder, self.inherited_max_header_list_size)
                     .map_err(Into::into)
@@ -212,12 +227,43 @@ where
                 return Box::pin(async move { Err(error) });
             }
         }
+        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Box::pin(async {
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+            });
+        }
         let fut = self.connector.call(req);
         let executor = self.executor.clone();
 
         Box::pin(async move {
-            let io = fut.await.map_err(Into::into)?;
-            let (send_request, conn) = builder.handshake(io).await?;
+            let acquisition = async move {
+                // A queued first poll cannot perform connector I/O after D.
+                if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    return Err(crate::Error::from(std::io::Error::from(
+                        std::io::ErrorKind::TimedOut,
+                    )));
+                }
+                let io = fut
+                    .await
+                    .map_err(|error| -> crate::Error { error.into() })?;
+                builder
+                    .handshake(io)
+                    .await
+                    .map_err(|error| -> crate::Error { error.into() })
+            };
+            let (send_request, conn) = match initial_settings_deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquisition)
+                        .await
+                        .map_err(|_| {
+                            crate::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                        })??
+                }
+                None => acquisition.await?,
+            };
+            if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
 
             Executor::<BoxFuture<'static, ()>>::execute(
                 &executor,

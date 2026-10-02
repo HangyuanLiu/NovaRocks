@@ -14,6 +14,10 @@ pub(crate) type Http2ConnectionFactory =
 /// connection budget or deadline. Default options preserve existing settings.
 #[derive(Debug, Default)]
 pub struct Http2ConnectionConfig {
+    /// Opt-in total acquisition deadline from before factory execution through
+    /// TCP/TLS, preface, applied peer initial SETTINGS and actual initial flush.
+    /// None preserves legacy acquisition. This never times application streams.
+    pub initial_settings_timeout: Option<std::time::Duration>,
     /// Local maximum inbound frame payload. This is not an outbound ceiling.
     pub max_frame_size: Option<u32>,
     /// Local maximum inbound decoded header list; overrides the Endpoint value.
@@ -59,6 +63,11 @@ impl Http2ConnectionConfig {
         builder: &mut Builder<E>,
         inherited_max_header_list_size: Option<u32>,
     ) -> io::Result<()> {
+        if self.initial_settings_timeout.is_some_and(|d| d.is_zero()) {
+            return Err(invalid(
+                "initial settings acquisition timeout must be positive",
+            ));
+        }
         if self.send_header_block_pool.is_some() && self.max_send_header_table_size != Some(0) {
             return Err(invalid(
                 "per-connection send header block pool requires explicit max_send_header_table_size(0)",

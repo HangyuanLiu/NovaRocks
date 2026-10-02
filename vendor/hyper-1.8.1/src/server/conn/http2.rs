@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::rt::{Read, Write};
 use futures_core::ready;
@@ -65,6 +65,15 @@ where
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: Http2ServerConnExec<S::Future, B>,
 {
+    /// Whether this connection has entered the serving phase.
+    ///
+    /// With [`Builder::initial_settings_deadline`] installed, this becomes
+    /// true only after the peer's initial SETTINGS and initial output flush
+    /// have completed successfully. Observing it does not drive any I/O.
+    pub fn initial_settings_complete(&self) -> bool {
+        self.conn.initial_settings_complete()
+    }
+
     /// Start a graceful shutdown process for this connection.
     ///
     /// This `Connection` should continue to be polled until shutdown
@@ -118,6 +127,17 @@ impl<E> Builder<E> {
             timer: Time::Empty,
             h2_builder: Default::default(),
         }
+    }
+
+    /// Require the peer's initial SETTINGS and the initial output flush before
+    /// this absolute deadline, before dispatching requests to the service.
+    ///
+    /// The deadline is checked while polling. The caller must provide a wake
+    /// at the deadline when I/O is pending; this setting installs no timer.
+    /// Successful completion removes the deadline from application streams.
+    pub fn initial_settings_deadline(&mut self, deadline: Instant) -> &mut Self {
+        self.h2_builder.initial_settings_deadline = Some(deadline);
+        self
     }
 
     /// Configures the maximum number of pending reset streams allowed before a GOAWAY will be sent.

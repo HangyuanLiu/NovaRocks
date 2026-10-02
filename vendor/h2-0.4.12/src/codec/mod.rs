@@ -88,6 +88,12 @@ where
 }
 
 impl<T, B> Codec<T, B> {
+    /// Bound only the opt-in bootstrap phase; its caller supplies timer wakes.
+    pub(crate) fn set_initial_settings_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.inner.set_initial_settings_deadline(deadline);
+        self.framed_write().set_initial_settings_deadline(deadline);
+    }
+
     pub fn set_retain_data_payloads(&mut self, retain: bool) {
         self.framed_write().set_retain_data_payloads(retain);
     }

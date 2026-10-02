@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::rt::{Read, Write};
 use futures_core::ready;
@@ -264,6 +264,17 @@ where
             timer: Time::Empty,
             h2_builder: Default::default(),
         }
+    }
+
+    /// Require the peer's initial SETTINGS and the initial output flush before
+    /// this absolute deadline, before returning a usable connection.
+    ///
+    /// The deadline is checked while polling. The caller must provide a wake
+    /// at the deadline when I/O is pending; this setting installs no timer.
+    /// Successful completion removes the deadline from application streams.
+    pub fn initial_settings_deadline(&mut self, deadline: Instant) -> &mut Self {
+        self.h2_builder.initial_settings_deadline = Some(deadline);
+        self
     }
 
     /// Provide a timer to execute background HTTP2 tasks.

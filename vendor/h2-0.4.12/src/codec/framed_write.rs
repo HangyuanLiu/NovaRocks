@@ -24,6 +24,7 @@ pub struct FramedWrite<T, B> {
     /// Upstream `AsyncWrite`
     inner: T,
     final_flush_done: bool,
+    initial_settings_deadline: Option<std::time::Instant>,
 
     encoder: Encoder<B>,
     // Encoder's actual private Vec drops before this original owner. The
@@ -114,6 +115,7 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            initial_settings_deadline: None,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 send_header_block_pool: None,
@@ -165,7 +167,9 @@ where
         let _e = span.enter();
 
         loop {
+            self.check_initial_settings_deadline()?;
             while !self.encoder.is_empty() {
+                self.check_initial_settings_deadline()?;
                 let written = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
@@ -195,6 +199,7 @@ where
                 // while upstream flush is Pending or has failed. In Native's
                 // SendBuf<Bytes>, advancing also retains the original owner.
                 ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+                self.check_initial_settings_deadline()?;
                 let next = self.encoder.unset_frame();
                 debug_assert!(matches!(next, ControlFlow::Break));
                 return Poll::Ready(Ok(()));
@@ -209,6 +214,7 @@ where
         tracing::trace!("flushing buffer");
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+        self.check_initial_settings_deadline()?;
 
         Poll::Ready(Ok(()))
     }
@@ -392,6 +398,20 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    pub(crate) fn set_initial_settings_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.initial_settings_deadline = deadline;
+    }
+
+    fn check_initial_settings_deadline(&self) -> io::Result<()> {
+        if self
+            .initial_settings_deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
+
     pub fn set_retain_data_payloads(&mut self, retain: bool) {
         self.encoder.retain_data_payloads = retain;
     }

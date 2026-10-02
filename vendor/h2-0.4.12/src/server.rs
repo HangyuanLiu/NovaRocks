@@ -125,7 +125,7 @@ use http::{HeaderMap, Method, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::instrument::{Instrument, Instrumented};
@@ -234,6 +234,7 @@ pub struct Connection<T, B: Buf> {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Builder {
+    initial_settings_deadline: Option<Instant>,
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -332,11 +333,13 @@ enum Handshaking<T, B: Buf> {
 /// Flush a Sink
 struct Flush<T, B> {
     codec: Option<Codec<T, B>>,
+    initial_settings_deadline: Option<Instant>,
 }
 
 /// Read the client connection preface
 struct ReadPreface<T, B> {
     codec: Option<Codec<T, B>>,
+    initial_settings_deadline: Option<Instant>,
     pos: usize,
 }
 
@@ -393,6 +396,15 @@ where
     fn handshake2(io: T, builder: Builder) -> Handshake<T, B> {
         let span = tracing::trace_span!("server_handshake");
         let entered = span.enter();
+
+        if let Err(error) = check_initial_settings_deadline(builder.initial_settings_deadline) {
+            drop(entered);
+            return Handshake {
+                builder,
+                state: Handshaking::Failed(Some(error)),
+                span,
+            };
+        }
 
         if builder.receive_header_map_pool.is_some() && builder.receive_header_field_pool.is_none()
         {
@@ -662,6 +674,7 @@ where
                     .expect("validated header block maximum"),
             }),
         );
+        codec.set_initial_settings_deadline(builder.initial_settings_deadline);
         codec.set_retain_data_payloads(builder.retain_data_payloads);
         if let Some(max) = builder.max_send_header_table_size {
             codec.set_max_send_header_table_size(max as usize);
@@ -695,8 +708,10 @@ where
             .expect("invalid SETTINGS frame");
 
         // Create the handshake future.
-        let state =
-            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")));
+        let state = Handshaking::Flushing(
+            Flush::new(codec, builder.initial_settings_deadline)
+                .instrument(tracing::trace_span!("flush")),
+        );
 
         drop(entered);
 
@@ -705,6 +720,22 @@ where
             state,
             span,
         }
+    }
+
+    /// Poll the opt-in initial SETTINGS phase without accepting requests.
+    ///
+    /// Success proves the initial remote non-ACK SETTINGS were applied and the
+    /// initial local SETTINGS and peer ACK were flushed. Without an installed
+    /// deadline this returns Ready immediately, preserving the legacy path.
+    /// A failure is terminal; subsequent phase polls report ConnectionAborted.
+    /// Arrange an external wakeup for the absolute deadline while IO is pending.
+    pub fn poll_initial_settings(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.connection
+            .poll_initial_settings(cx)
+            .map_err(Into::into)
     }
 
     /// Accept the next incoming request on this connection.
@@ -947,6 +978,7 @@ impl Builder {
     /// ```
     pub fn new() -> Builder {
         Builder {
+            initial_settings_deadline: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -969,6 +1001,17 @@ impl Builder {
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
+    }
+
+    /// Set an absolute deadline for the opt-in initial SETTINGS phase.
+    ///
+    /// The same deadline covers the preface and initial peer SETTINGS/ACK
+    /// flush. Poll `Connection::poll_initial_settings` before exposing request
+    /// dispatch. The caller must arrange deadline wakeups; no timer is created.
+    /// Success clears the deadline and does not time application streams.
+    pub fn initial_settings_deadline(&mut self, deadline: Instant) -> &mut Self {
+        self.initial_settings_deadline = Some(deadline);
+        self
     }
 
     /// Indicates the initial window size (in octets) for stream-level
@@ -1736,8 +1779,11 @@ impl<B: Buf> SendPushedResponse<B> {
 // ===== impl Flush =====
 
 impl<T, B: Buf> Flush<T, B> {
-    fn new(codec: Codec<T, B>) -> Self {
-        Flush { codec: Some(codec) }
+    fn new(codec: Codec<T, B>, initial_settings_deadline: Option<Instant>) -> Self {
+        Flush {
+            codec: Some(codec),
+            initial_settings_deadline,
+        }
     }
 }
 
@@ -1749,8 +1795,11 @@ where
     type Output = Result<Codec<T, B>, crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        check_initial_settings_deadline(self.initial_settings_deadline)?;
         // Flush the codec
         ready!(self.codec.as_mut().unwrap().flush(cx)).map_err(crate::Error::from_io)?;
+
+        check_initial_settings_deadline(self.initial_settings_deadline)?;
 
         // Return the codec
         Poll::Ready(Ok(self.codec.take().unwrap()))
@@ -1758,9 +1807,10 @@ where
 }
 
 impl<T, B: Buf> ReadPreface<T, B> {
-    fn new(codec: Codec<T, B>) -> Self {
+    fn new(codec: Codec<T, B>, initial_settings_deadline: Option<Instant>) -> Self {
         ReadPreface {
             codec: Some(codec),
+            initial_settings_deadline,
             pos: 0,
         }
     }
@@ -1782,6 +1832,7 @@ where
         let mut rem = PREFACE.len() - self.pos;
 
         while rem > 0 {
+            check_initial_settings_deadline(self.initial_settings_deadline)?;
             let mut buf = ReadBuf::new(&mut buf[..rem]);
             ready!(Pin::new(self.inner_mut()).poll_read(cx, &mut buf))
                 .map_err(crate::Error::from_io)?;
@@ -1803,11 +1854,19 @@ where
             rem -= n; // TODO test
         }
 
+        check_initial_settings_deadline(self.initial_settings_deadline)?;
         Poll::Ready(Ok(self.codec.take().unwrap()))
     }
 }
 
 // ===== impl Handshake =====
+
+fn check_initial_settings_deadline(deadline: Option<Instant>) -> Result<(), crate::Error> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(crate::Error::from_io(io::ErrorKind::TimedOut.into()));
+    }
+    Ok(())
+}
 
 impl<T, B: Buf> Future for Handshake<T, B>
 where
@@ -1822,6 +1881,8 @@ where
         tracing::trace!(state = ?self.state);
 
         loop {
+            check_initial_settings_deadline(self.builder.initial_settings_deadline)?;
+            let deadline = self.builder.initial_settings_deadline;
             match &mut self.state {
                 Handshaking::Flushing(flush) => {
                     // We're currently flushing a pending SETTINGS frame. Poll the
@@ -1838,7 +1899,8 @@ where
                         }
                     };
                     self.state = Handshaking::ReadingPreface(
-                        ReadPreface::new(codec).instrument(tracing::trace_span!("read_preface")),
+                        ReadPreface::new(codec, deadline)
+                            .instrument(tracing::trace_span!("read_preface")),
                     );
                 }
                 Handshaking::ReadingPreface(read) => {
@@ -1861,6 +1923,7 @@ where
                                 .builder
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
+                            initial_settings_deadline: self.builder.initial_settings_deadline,
                         },
                     );
 
@@ -1870,6 +1933,7 @@ where
                         c.set_target_window_size(sz);
                     }
 
+                    check_initial_settings_deadline(self.builder.initial_settings_deadline)?;
                     return Poll::Ready(Ok(c));
                 }
                 Handshaking::Failed(error) => {

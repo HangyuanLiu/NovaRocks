@@ -28,6 +28,10 @@ use std::time::Duration;
 #[path = "native_server_capacity_tests.rs"]
 mod capacity_tests;
 
+#[cfg(test)]
+#[path = "native_initial_settings_tests.rs"]
+mod initial_settings_tests;
+
 use axum::Router;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
@@ -440,7 +444,7 @@ where
                     }
                     Ok(accepted) => accepted,
                 };
-                let accepted_at = tokio::time::Instant::now();
+                let accepted_at = std::time::Instant::now();
                 consecutive_accept_errors = 0;
                 let app = app.clone();
                 let incoming = incoming.clone();
@@ -455,6 +459,11 @@ where
                 // Binding remains the subsequent Hyper/H2 connection's owner.
                 let mut served = served;
                 let mut builder = http2::Builder::new(TokioExecutor::new());
+                let initial_settings_deadline = transport_capacity.as_ref().map(|_| {
+                    accepted_at + Duration::from_millis(
+                        novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
+                    )
+                });
                 let capacity = match &transport_capacity {
                     Some(factory) => match factory.try_config(TransportClass::Data) {
                         Ok(config) => {
@@ -462,6 +471,7 @@ where
                                 served.close("transport_geometry", &error.to_string());
                                 continue;
                             }
+                            builder.initial_settings_deadline(initial_settings_deadline.expect("funded listener has an absolute bootstrap deadline"));
                             Some(config)
                         }
                         Err(error) => {
@@ -473,12 +483,14 @@ where
                 };
                 let mut drain = drain_rx.clone();
                 tokio::spawn(async move {
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        served.close("transport_handshake", "Native acquisition deadline elapsed before first poll");
+                        on_transport_handshake_failure();
+                        return;
+                    }
                     let handshake = incoming.accept(stream);
-                    let accepted = if capacity.is_some() {
-                        let deadline = accepted_at + Duration::from_millis(
-                            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
-                        );
-                        match tokio::time::timeout_at(deadline, handshake).await {
+                    let accepted = if let Some(deadline) = initial_settings_deadline {
+                        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handshake).await {
                             Ok(result) => result,
                             Err(_) => {
                                 served.close("transport_handshake", "Native TLS handshake deadline elapsed");
@@ -489,6 +501,11 @@ where
                     } else {
                         handshake.await
                     };
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        served.close("transport_handshake", "Native acquisition deadline elapsed during TLS");
+                        on_transport_handshake_failure();
+                        return;
+                    }
                     let stream = match accepted {
                         Ok(stream) => stream,
                         Err(error) => {
@@ -511,8 +528,23 @@ where
                         builder.serve_connection(TokioIo::new(stream), service)
                     );
                     let mut winding_down = false;
+                    let mut waiting_initial_settings = initial_settings_deadline.is_some();
+                    // A completed bootstrap disarms only this acquisition
+                    // deadline. Application streams keep their own lifetime.
+                    let deadline = initial_settings_deadline.unwrap_or(accepted_at);
+                    let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                    tokio::pin!(deadline);
                     let outcome = loop {
                         tokio::select! {
+                            _ = &mut deadline, if waiting_initial_settings => {
+                                if connection.as_ref().get_ref().initial_settings_complete() {
+                                    waiting_initial_settings = false;
+                                } else {
+                                    served.close("transport_handshake", "Native HTTP/2 initial settings deadline elapsed");
+                                    on_transport_handshake_failure();
+                                    return;
+                                }
+                            }
                             outcome = &mut connection => break outcome,
                             // A closed channel means the listener is gone, which
                             // asks for the same thing as an explicit signal.
@@ -525,6 +557,9 @@ where
                             }
                         }
                     };
+                    if outcome.is_err() && !connection.as_ref().get_ref().initial_settings_complete() && initial_settings_deadline.is_some() {
+                        on_transport_handshake_failure();
+                    }
                     // The serving future still holds the actual transport;
                     // these construction handles may retire independently.
                     drop(capacity);

@@ -2,7 +2,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_core::ready;
@@ -78,6 +78,7 @@ fn try_set_date_header_if_missing(headers: &mut http::HeaderMap) -> crate::Resul
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
+    pub(crate) initial_settings_deadline: Option<Instant>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -110,6 +111,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            initial_settings_deadline: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -163,6 +165,11 @@ where
     Handshaking {
         ping_config: ping::Config,
         hs: Handshake<Compat<T>, SendBuf<B::Data>>,
+        wait_initial_settings: bool,
+    },
+    InitialSettings {
+        ping_config: ping::Config,
+        conn: Option<Connection<Compat<T>, SendBuf<B::Data>>>,
     },
     Serving(Serving<T, B>),
 }
@@ -193,6 +200,9 @@ where
         timer: Time,
     ) -> Server<T, S, B, E> {
         let mut builder = h2::server::Builder::default();
+        if let Some(deadline) = config.initial_settings_deadline {
+            builder.initial_settings_deadline(deadline);
+        }
         builder
             .initial_window_size(config.initial_stream_window_size)
             .initial_connection_window_size(config.initial_conn_window_size)
@@ -272,6 +282,7 @@ where
             state: State::Handshaking {
                 ping_config,
                 hs: handshake,
+                wait_initial_settings: config.initial_settings_deadline.is_some(),
             },
             service,
             date_header: config.date_header,
@@ -282,7 +293,7 @@ where
     pub(crate) fn graceful_shutdown(&mut self) {
         trace!("graceful_shutdown");
         match self.state {
-            State::Handshaking { .. } => {
+            State::Handshaking { .. } | State::InitialSettings { .. } => {
                 self.close_pending = true;
             }
             State::Serving(ref mut srv) => {
@@ -291,6 +302,10 @@ where
                 }
             }
         }
+    }
+
+    pub(crate) fn initial_settings_complete(&self) -> bool {
+        matches!(self.state, State::Serving(_))
     }
 }
 
@@ -311,8 +326,41 @@ where
                 State::Handshaking {
                     ref mut hs,
                     ref ping_config,
+                    wait_initial_settings,
                 } => {
                     let mut conn = ready!(Pin::new(hs).poll(cx).map_err(crate::Error::new_h2))?;
+                    if wait_initial_settings {
+                        State::InitialSettings {
+                            ping_config: ping_config.clone(),
+                            conn: Some(conn),
+                        }
+                    } else {
+                        let ping = if ping_config.is_enabled() {
+                            let pp = conn.ping_pong().expect("conn.ping_pong");
+                            Some(ping::channel(pp, ping_config.clone(), me.timer.clone()))
+                        } else {
+                            None
+                        };
+                        State::Serving(Serving {
+                            ping,
+                            conn,
+                            closing: None,
+                            date_header: me.date_header,
+                        })
+                    }
+                }
+                State::InitialSettings {
+                    ref mut conn,
+                    ref ping_config,
+                } => {
+                    ready!(conn
+                        .as_mut()
+                        .expect("initial SETTINGS phase owns its connection")
+                        .poll_initial_settings(cx)
+                        .map_err(crate::Error::new_h2))?;
+                    let mut conn = conn
+                        .take()
+                        .expect("completed initial SETTINGS phase owns its connection");
                     let ping = if ping_config.is_enabled() {
                         let pp = conn.ping_pong().expect("conn.ping_pong");
                         Some(ping::channel(pp, ping_config.clone(), me.timer.clone()))

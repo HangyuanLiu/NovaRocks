@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::rt::{Read, Write};
@@ -80,6 +80,7 @@ const DEFAULT_INITIAL_MAX_SEND_STREAMS: usize = 100;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
+    pub(crate) initial_settings_deadline: Option<Instant>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -112,6 +113,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            initial_settings_deadline: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -145,6 +147,9 @@ impl Default for Config {
 
 fn new_builder(config: &Config) -> Builder {
     let mut builder = Builder::default();
+    if let Some(deadline) = config.initial_settings_deadline {
+        builder.initial_settings_deadline(deadline);
+    }
     builder
         .initial_max_send_streams(config.initial_max_send_streams)
         .initial_window_size(config.initial_stream_window_size)
@@ -238,6 +243,12 @@ where
         .handshake::<_, SendBuf<B::Data>>(Compat::new(io))
         .await
         .map_err(crate::Error::new_h2)?;
+
+    if config.initial_settings_deadline.is_some() {
+        crate::common::future::poll_fn(|cx| conn.poll_initial_settings(cx))
+            .await
+            .map_err(crate::Error::new_h2)?;
+    }
 
     // An mpsc channel is used entirely to detect when the
     // 'Client' has been dropped. This is to get around a bug

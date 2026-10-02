@@ -214,6 +214,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
     };
     let owner = Bytes::from_owner_with_exit_guard(Bytes::new(), credit);
     Ok(Http2ConnectionConfig {
+        initial_settings_timeout: None,
         max_frame_size: Some(FRAME_BYTES as u32),
         max_header_list_size: Some(FRAME_BYTES as u32),
         max_receive_header_block_size: Some(FRAME_BYTES),
@@ -994,4 +995,48 @@ async fn actual_channel_factory_refuses_oversized_block_before_first_headers() {
         }
     }
     reserve_all(&original_budget, attempt_bytes());
+}
+
+#[tokio::test]
+async fn initial_settings_allowance_includes_synchronous_factory_before_connector_call() {
+    // This component-only 50ms setting distinguishes the factory-origin
+    // allowance; the installed Native profile remains exactly two seconds.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let endpoint = Endpoint::from_static("http://localhost:9070").http2_connection_factory(|| {
+        std::thread::sleep(Duration::from_millis(80));
+        Ok::<_, io::Error>(Http2ConnectionConfig {
+            initial_settings_timeout: Some(Duration::from_millis(50)),
+            ..Http2ConnectionConfig::default()
+        })
+    });
+    let connector = service_fn(move |_: Uri| {
+        counted.fetch_add(1, Ordering::AcqRel);
+        async { Err::<TokioIo<DuplexStream>, _>(io::Error::from(io::ErrorKind::ConnectionRefused)) }
+    });
+    let result = endpoint.connect_with_connector(connector).await;
+    assert!(result.is_err());
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        0,
+        "the factory cannot restart the allowance before connector.call"
+    );
+}
+
+#[tokio::test]
+async fn zero_initial_settings_allowance_refuses_before_connector_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let endpoint = Endpoint::from_static("http://localhost:9070").http2_connection_factory(|| {
+        Ok::<_, io::Error>(Http2ConnectionConfig {
+            initial_settings_timeout: Some(Duration::ZERO),
+            ..Http2ConnectionConfig::default()
+        })
+    });
+    let connector = service_fn(move |_: Uri| {
+        counted.fetch_add(1, Ordering::AcqRel);
+        async { Err::<TokioIo<DuplexStream>, _>(io::Error::from(io::ErrorKind::ConnectionRefused)) }
+    });
+    assert!(endpoint.connect_with_connector(connector).await.is_err());
+    assert_eq!(calls.load(Ordering::Acquire), 0);
 }

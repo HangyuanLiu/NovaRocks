@@ -38,6 +38,7 @@ pub struct FramedRead<T> {
     goaway_pool: Option<crate::ReceiveBufferPool>,
     header_buffer: Option<crate::receive_header::BoundHeaderBlockBuffer>,
     header_map_pool: Option<http::header::HeaderMapAllocationPool>,
+    initial_settings_deadline: Option<std::time::Instant>,
 }
 
 enum ReadKind<T> {
@@ -152,6 +153,7 @@ impl<T> FramedRead<T> {
             goaway_pool: None,
             header_buffer,
             header_map_pool,
+            initial_settings_deadline: None,
         }
     }
 
@@ -160,6 +162,20 @@ impl<T> FramedRead<T> {
             ReadKind::Default(inner) => inner.get_ref(),
             ReadKind::Fixed(inner) => inner.get_ref(),
         }
+    }
+
+    pub(crate) fn set_initial_settings_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.initial_settings_deadline = deadline;
+    }
+
+    fn check_initial_settings_deadline(&self) -> Result<(), Error> {
+        if self
+            .initial_settings_deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
     }
 
     pub fn get_mut(&mut self) -> &mut T {
@@ -694,7 +710,15 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let span = tracing::trace_span!("FramedRead::poll_next");
         let _e = span.enter();
+        let mut initial_settings_frames = 0;
         loop {
+            self.check_initial_settings_deadline()?;
+            if self.initial_settings_deadline.is_some() && initial_settings_frames == 32 {
+                // Skipped unknown frames and CONTINUATIONs must not monopolize
+                // a bootstrap poll until D. The count has no escaped backing.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             tracing::trace!("poll");
             if let Some(pool) = &self.receive_pool {
                 ready!(pool.poll_ready(cx));
@@ -757,6 +781,10 @@ where
                     (decoded, false)
                 }
             };
+            if self.initial_settings_deadline.is_some() {
+                initial_settings_frames += 1;
+            }
+            self.check_initial_settings_deadline()?;
             if let Some(mut frame) = decoded? {
                 if let (true, Some(pool), Frame::Data(data)) =
                     (needs_data_copy, &self.receive_pool, &mut frame)

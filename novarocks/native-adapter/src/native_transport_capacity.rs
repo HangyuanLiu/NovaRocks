@@ -412,6 +412,9 @@ impl NativeTransportCapacityFactory {
         let d = self.core().dimensions;
         let owner = self.claim(class)?;
         Ok(Http2ConnectionConfig {
+            initial_settings_timeout: Some(std::time::Duration::from_millis(
+                NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
+            )),
             max_frame_size: Some(d.frame as u32),
             max_header_list_size: Some(d.header as u32),
             max_receive_header_block_size: Some(d.header),
@@ -467,6 +470,10 @@ pub fn configure_server<E>(
     let d = Dimensions::frozen()?;
     let g = NativeResultSupportGeometry::V1;
     if config.max_frame_size != Some(d.frame as u32)
+        || config.initial_settings_timeout
+            != Some(std::time::Duration::from_millis(
+                g.transport_handshake_deadline_ms,
+            ))
         || config.max_header_list_size != Some(d.header as u32)
         || config.max_receive_header_block_size != Some(d.header)
         || config.header_table_size != Some(0)

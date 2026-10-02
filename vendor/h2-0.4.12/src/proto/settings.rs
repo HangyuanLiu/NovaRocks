@@ -11,8 +11,7 @@ pub(crate) struct Settings {
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
     remote: Option<frame::Settings>,
-    /// Whether the connection has received the initial SETTINGS frame from the
-    /// remote peer.
+    /// Whether the initial remote SETTINGS finished applying successfully.
     has_received_remote_initial_settings: bool,
 }
 
@@ -99,13 +98,9 @@ impl Settings {
         }
     }
 
-    /// Sets `true` to `self.has_received_remote_initial_settings`.
-    /// Returns `true` if this method is called for the first time.
-    /// (i.e. it is the initial SETTINGS frame from the remote peer)
-    fn mark_remote_initial_settings_as_received(&mut self) -> bool {
-        let has_received = self.has_received_remote_initial_settings;
-        self.has_received_remote_initial_settings = true;
-        !has_received
+    /// This is application evidence, not evidence that its ACK was flushed.
+    pub(crate) fn has_applied_remote_initial_settings(&self) -> bool {
+        self.has_received_remote_initial_settings
     }
 
     pub(crate) fn poll_send<T, B, C, P>(
@@ -133,7 +128,7 @@ impl Settings {
 
             tracing::trace!("ACK sent; applying settings");
 
-            let is_initial = self.mark_remote_initial_settings_as_received();
+            let is_initial = !self.has_received_remote_initial_settings;
             streams.apply_remote_settings(&settings, is_initial)?;
 
             if let Some(val) = settings.header_table_size() {
@@ -143,6 +138,10 @@ impl Settings {
             if let Some(val) = settings.max_frame_size() {
                 dst.set_max_send_frame_size(val as usize);
             }
+
+            // Do not publish readiness before every fallible application step
+            // succeeds. The separate initial phase still requires codec flush.
+            self.has_received_remote_initial_settings = true;
         }
 
         self.remote = None;

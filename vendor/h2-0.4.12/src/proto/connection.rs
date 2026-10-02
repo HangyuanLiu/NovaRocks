@@ -11,7 +11,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 
 /// An H2 connection
@@ -24,6 +24,9 @@ where
     codec: Codec<T, Prioritized<B>>,
 
     inner: ConnectionInner<P, B>,
+
+    initial_settings_deadline: Option<Instant>,
+    initial_settings_failed: bool,
 }
 
 // Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
@@ -84,6 +87,7 @@ pub(crate) struct Config {
     pub remote_reset_stream_max: usize,
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
+    pub initial_settings_deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -130,6 +134,8 @@ where
         let streams = Streams::new(streams_config(&config));
         Connection {
             codec,
+            initial_settings_deadline: config.initial_settings_deadline,
+            initial_settings_failed: false,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -262,6 +268,9 @@ where
 
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        if self.initial_settings_deadline.is_some() || self.initial_settings_failed {
+            ready!(self.poll_initial_settings(cx))?;
+        }
         // XXX(eliza): cloning the span is unfortunately necessary here in
         // order to placate the borrow checker — `self` is mutably borrowed by
         // `poll2`, which means that we can't borrow `self.span` to enter it.
@@ -313,6 +322,97 @@ where
                 }
             }
         }
+    }
+
+    /// Drive only the opt-in initial SETTINGS phase, without application reads
+    /// or stream dispatch. The caller supplies deadline wakeups; this kernel
+    /// allocates no timer. None preserves the ordinary connection contract.
+    pub(crate) fn poll_initial_settings(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Error>> {
+        if self.initial_settings_failed {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()));
+        }
+        if self.initial_settings_deadline.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        let result = self.poll_initial_settings_inner(cx);
+        if matches!(result, Poll::Ready(Err(_))) {
+            // An error cannot be repaired into readiness by a later successful
+            // poll_flush. Keep an inline terminal latch, not a cloned error
+            // payload or an additional callback allocation.
+            self.initial_settings_failed = true;
+        }
+        result
+    }
+
+    fn check_initial_settings_phase(&self) -> Result<(), Error> {
+        if self
+            .initial_settings_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if !matches!(self.inner.state, State::Open)
+            || self.inner.error.is_some()
+            || self.inner.go_away.is_going_away()
+        {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        Ok(())
+    }
+
+    fn poll_initial_settings_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        // Bound a single turn even when control input is continuously ready.
+        // The codec independently checks the same deadline for skipped unknown
+        // frames and incomplete header fragments inside its raw-frame loop.
+        for _ in 0..32 {
+            self.check_initial_settings_phase()?;
+            ready!(self.poll_ready(cx))?;
+            self.check_initial_settings_phase()?;
+            ready!(self.codec.flush(cx))?;
+            self.check_initial_settings_phase()?;
+            if self.inner.settings.has_applied_remote_initial_settings() {
+                // This flush covers both the buffered initial local SETTINGS
+                // and the ACK for the fully applied initial remote SETTINGS.
+                // Local::WaitingAck alone never establishes physical flush.
+                self.codec.set_initial_settings_deadline(None);
+                self.initial_settings_deadline = None;
+                return Poll::Ready(Ok(()));
+            }
+            self.check_initial_settings_phase()?;
+            let frame = ready!(Pin::new(&mut self.codec).poll_next(cx)?);
+            self.check_initial_settings_phase()?;
+            match frame {
+                Some(Frame::Headers(_)) | Some(Frame::Data(_)) | Some(Frame::PushPromise(_)) => {
+                    // Do not create or dispatch an application stream before
+                    // the peer's initial SETTINGS have committed.
+                    return Poll::Ready(Err(Error::library_go_away(Reason::PROTOCOL_ERROR)));
+                }
+                Some(Frame::GoAway(frame)) => {
+                    return Poll::Ready(Err(Error::remote_go_away(
+                        frame.debug_data().clone(),
+                        frame.reason(),
+                    )));
+                }
+                None => return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into())),
+                frame => match self.inner.as_dyn().recv_frame(frame)? {
+                    ReceivedFrame::Settings(frame) => self.inner.settings.recv_settings(
+                        frame,
+                        &mut self.codec,
+                        &mut self.inner.streams,
+                    )?,
+                    ReceivedFrame::Continue => (),
+                    ReceivedFrame::Done => {
+                        return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                    }
+                },
+            }
+        }
+        self.check_initial_settings_phase()?;
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
