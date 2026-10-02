@@ -140,3 +140,19 @@ attempt encoded none of its own. A full per-target transport window cannot be
 produced at the default task transport budget without a capacity probe. That
 cross-target admission is therefore checked by the frontend's real admission
 pass and transport supervisor composition tests, not by these scenarios.
+
+
+`mv/recursive-type-restart` uses a private REST/S3/Spark publication and native
+1FE+3BE. Run it explicitly with `--cluster-size 3 --timeout-secs 1200`.
+It freezes SDK schema UUID/IDs, required children, actual Parquet field IDs and
+complete ordered bags checked independently by SDK and Spark. It proves native
+lake-document loading, wipes the MV Accelerator, replaces only FE, and reads the
+existing result before any refresh. D/L/P/E and exact provider bindings must
+remain equal. The subsequent real source DV plus additions and FULL are checked
+against complete independent endpoint bags; FULL also requires zero deletes and
+exact summary totals. A per-job Spark container has an exact ownership token,
+image and container identity, bounded execution, and an independently bounded
+cleanup receipt. Logs and stage receipts are retained under `recursive-spark`.
+Physical dictionary/plain page evidence belongs to the separate compatibility
+SQL cases; native result values are compared across restart, while SDK/Spark
+supply the independent content oracle.

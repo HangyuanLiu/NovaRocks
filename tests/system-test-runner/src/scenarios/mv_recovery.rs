@@ -48,6 +48,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement::default()),
         Box::new(MvLakePublicationRestartRebuild::default()),
+        Box::new(MvRecursiveTypeRestart::default()),
     ]
 }
 
@@ -3346,4 +3347,827 @@ mod validation_baseline_tests {
         metadata["current-snapshot-id"] = json!(42);
         assert!(validation_baseline_from_metadata(&metadata).is_err());
     }
+}
+
+#[derive(Default)]
+struct MvRecursiveTypeRestart {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+impl Scenario for MvRecursiveTypeRestart {
+    fn name(&self) -> &'static str {
+        "mv/recursive-type-restart"
+    }
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, mut launch) = ManagedMvRestFixture::start(root, "system_mv_recursive")?;
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD".into(),
+            "1".into(),
+        );
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("recursive fixture initialized twice");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_recursive";
+        let mut conn = connect(context)?;
+        let call_spark = |context: &ScenarioContext,
+                          stage: &str,
+                          invocation: &str|
+         -> Result<serde_json::Value> {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            // Execute on the exact isolated publication under the scenario deadline.
+            // It creates/reaps one owned Spark job and returns one bounded parsed receipt.
+            slot.as_ref()
+                .context("recursive fixture missing")?
+                .run_recursive_spark_until(
+                    context.scenario_root(),
+                    stage,
+                    invocation,
+                    context.deadline(),
+                )
+        };
+        let create = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("recursive fixture missing")?
+            .create_catalog_sql()
+            .to_owned();
+        execute(
+            context,
+            &mut conn,
+            "create private recursive catalog",
+            &create,
+        )?;
+        let initialized = call_spark(
+            context,
+            "initialize",
+            "RecursiveTypeFixture.initialize(\"ns\")",
+        )?;
+        validate_recursive_receipt(&initialized, "initialize")?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        execute(
+            context,
+            &mut conn,
+            "create recursive output MV",
+            "CREATE MATERIALIZED VIEW recursive_mv DISTRIBUTED BY HASH(label) BUCKETS 3 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT label,payload,ordered FROM recursive_source",
+        )?;
+        refresh(context, &mut conn, "recursive_mv")?;
+        let initial = call_spark(
+            context,
+            "initial",
+            "RecursiveTypeFixture.observe(\"ns\",\"initial\")",
+        )?;
+        validate_recursive_receipt(&initial, "initial")?;
+        for (source_key, target_key) in [
+            ("source_uuid", "source_uuid"),
+            ("schema_id", "source_schema_id"),
+            ("schema_json", "source_schema_json"),
+            ("snapshot", "source_snapshot"),
+            ("fields", "source_fields"),
+        ] {
+            if recursive_required(&initialized, source_key)?
+                != recursive_required(&initial, target_key)?
+            {
+                bail!("initial target observation lost exact source identity/schema/frontier");
+            }
+        }
+        let initial_native: Vec<Row> = query(
+            context,
+            &mut conn,
+            "SELECT label,payload,ordered FROM recursive_mv",
+            "freeze complete native recursive result before FE replacement",
+        )?;
+        if initial_native.len() != 6 {
+            bail!("initial native recursive visible bag has wrong cardinality");
+        }
+        let initial_native = initial_native
+            .into_iter()
+            .map(Row::unwrap)
+            .collect::<Vec<_>>();
+        let target_uuid = recursive_uuid(&initial, "table_uuid")?;
+        let rest_uri = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("recursive fixture missing")?
+            .rest_uri()
+            .to_owned();
+        // Bounded REST GET compares exact D/L/P/E manifests
+        // (P from exact current snapshot; D/L/E from table metadata), strict versions,
+        // 32-byte revisions, attachment identity, table UUID and exact schema JSON.
+        let before = recursive_lake_binding(context, &rest_uri, "recursive_mv", &target_uuid)?;
+        let sdk_schema: serde_json::Value =
+            serde_json::from_str(recursive_string(&initial, "schema_json", 256 * 1024)?)?;
+        if recursive_required(&before, "snapshot")? != recursive_required(&initial, "snapshot")?
+            || recursive_required(&before, "schema_id")?
+                != recursive_required(&initial, "schema_id")?
+            || recursive_required(&before, "schema")? != &sdk_schema
+        {
+            bail!("REST lake baseline differs from exact SDK snapshot/schema binding");
+        }
+        let proof: Vec<Row> = query(
+            context,
+            &mut conn,
+            &format!(
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.recursive_mv', level => 'provenance')"
+            ),
+            "prove canonical recursive lake documents",
+        )?;
+        if proof.first().and_then(|r| r.get::<String, _>(0)).as_deref() != Some("provenance")
+            || proof.first().and_then(|r| r.get::<String, _>(4)).as_deref()
+                != Some("lake-documents")
+        {
+            bail!("recursive provenance is not authoritative lake documents");
+        }
+        let wiped: Vec<Row> = query(
+            context,
+            &mut conn,
+            &format!(
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.recursive_mv', level => 'wipe')"
+            ),
+            "wipe MV Accelerator after lake document proof",
+        )?;
+        if wiped.first().and_then(|r| r.get::<String, _>(0)).as_deref() != Some("wipe")
+            || wiped.first().and_then(|r| r.get::<String, _>(4)).as_deref()
+                != Some("accelerator-wiped")
+        {
+            bail!("recursive Accelerator wipe was not confirmed");
+        }
+        let (fe_before, be_before) = context.process_launch_identities();
+        let fe_before = fe_before.clone();
+        let be_before = be_before.to_vec();
+        drop(conn);
+        restart_frontend(context, "restart FE after recursive Accelerator wipe")?;
+        let (fe_after, be_after) = context.process_launch_identities();
+        if *fe_after == fe_before || be_after != be_before.as_slice() {
+            bail!("recursive recovery did not replace only the exact FE process");
+        }
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        // Force native decoding/reading before any rebuilding refresh. The independent
+        // Spark comparison alone would only establish external read compatibility.
+        let rows: Vec<Row> = query(
+            context,
+            &mut conn,
+            "SELECT label,payload,ordered FROM recursive_mv",
+            "read recursive restored MV through native FE/BE",
+        )?;
+        if rows.len() != 6 {
+            bail!("restored recursive visible bag has wrong cardinality");
+        }
+        let mut unmatched = initial_native.clone();
+        for row in rows {
+            let values = row.unwrap();
+            let position = unmatched
+                .iter()
+                .position(|old| *old == values)
+                .context("native recursive restart changed a complete visible row")?;
+            unmatched.swap_remove(position);
+        }
+        if !unmatched.is_empty() {
+            bail!("native recursive restart lost visible row multiplicity");
+        }
+        let after = recursive_lake_binding(context, &rest_uri, "recursive_mv", &target_uuid)?;
+        if before != after {
+            bail!("FE restart changed frozen D/L/P/E or provider schema binding");
+        }
+        let restored = call_spark(
+            context,
+            "restored",
+            "RecursiveTypeFixture.observe(\"ns\",\"restored\")",
+        )?;
+        validate_recursive_receipt(&restored, "restored")?;
+        for key in [
+            "table_uuid",
+            "source_uuid",
+            "source_schema_json",
+            "source_schema_id",
+            "source_snapshot",
+            "source_fields",
+            "schema_json",
+            "schema_id",
+            "fields",
+            "snapshot",
+            "bag",
+            "data_files",
+            "delete_files",
+            "summary",
+        ] {
+            if recursive_required(&initial, key)? != recursive_required(&restored, key)? {
+                bail!("recursive restart changed exact receipt field {key}");
+            }
+        }
+        resume_management_after_fe_restart(context, &mut conn, catalog, "recursive_mv")?;
+        let changed = call_spark(context, "mutate", "RecursiveTypeFixture.mutate(\"ns\")")?;
+        validate_recursive_receipt(&changed, "mutate")?;
+        for key in ["source_uuid", "schema_id", "schema_json", "fields"] {
+            if recursive_required(&initialized, key)? != recursive_required(&changed, key)? {
+                bail!("source mutation replaced its exact schema/object");
+            }
+        }
+        if recursive_required(&changed, "from_snapshot")?
+            != recursive_required(&initialized, "snapshot")?
+        {
+            bail!("source mutation starts from another frozen endpoint");
+        }
+        refresh(context, &mut conn, "recursive_mv")?;
+        let incremental = call_spark(
+            context,
+            "incremental",
+            "RecursiveTypeFixture.observe(\"ns\",\"incremental\")",
+        )?;
+        validate_recursive_receipt(&incremental, "incremental")?;
+        execute(
+            context,
+            &mut conn,
+            "full recursive rebuild",
+            "REFRESH MATERIALIZED VIEW recursive_mv FULL WITH SYNC MODE",
+        )?;
+        let full = call_spark(
+            context,
+            "full",
+            "RecursiveTypeFixture.observe(\"ns\",\"full\")",
+        )?;
+        validate_recursive_receipt(&full, "full")?;
+        for endpoint in [&incremental, &full] {
+            for key in [
+                "table_uuid",
+                "source_uuid",
+                "source_schema_json",
+                "source_schema_id",
+                "source_fields",
+                "schema_json",
+                "schema_id",
+                "fields",
+            ] {
+                if recursive_required(&initial, key)? != recursive_required(endpoint, key)? {
+                    bail!("refresh replaced exact recursive binding field {key}");
+                }
+            }
+            if recursive_required(endpoint, "source_snapshot")?
+                != recursive_required(&changed, "snapshot")?
+                || recursive_required(endpoint, "bag")? != recursive_required(&changed, "bag")?
+            {
+                bail!("refresh is not the exact complete source endpoint");
+            }
+        }
+        if recursive_required(&full, "snapshot")? == recursive_required(&incremental, "snapshot")? {
+            bail!("FULL did not create its exact replacement snapshot");
+        }
+        context.action("verified recursive provider identities, complete independent ordered bags and lake-only recovery on native 1FE+3BE");
+        Ok(())
+    }
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        if let Some(mut fixture) = fixture {
+            fixture.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+// D/L/E belong to table metadata; P belongs to the exact current output snapshot.
+// This comparison supplements native provenance loading; it is not a codec decoder.
+fn recursive_lake_binding(
+    context: &ScenarioContext,
+    rest: &str,
+    table: &str,
+    expected_uuid: &str,
+) -> Result<serde_json::Value> {
+    use std::io::Read;
+    if table != "recursive_mv" {
+        bail!("recursive binding table is not frozen");
+    }
+    let mut response = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read recursive exact lake binding")?)
+        .build()?
+        .get(format!(
+            "{}/v1/namespaces/ns/tables/{table}",
+            rest.trim_end_matches('/')
+        ))
+        .send()?
+        .error_for_status()?;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    context.remaining("finish recursive exact lake binding")?;
+    if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+        bail!("recursive REST metadata exceeds fixture budget");
+    }
+    let loaded: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let m = recursive_required(&loaded, "metadata")?;
+    if recursive_required(m, "format-version")?.as_u64() != Some(3) {
+        bail!("recursive REST table format version differs");
+    }
+    let uuid = recursive_uuid(m, "table-uuid")?;
+    if uuid != expected_uuid {
+        bail!("recursive REST table has a different exact provider UUID");
+    }
+    let snapshot = recursive_positive(m, "current-snapshot-id")?;
+    let snapshots = recursive_required(m, "snapshots")?
+        .as_array()
+        .context("recursive snapshots absent/not an array")?;
+    if snapshots.len() > 64 {
+        bail!("recursive snapshot-list fixture budget exceeded");
+    }
+    let mut matching = snapshots
+        .iter()
+        .filter(|s| s.get("snapshot-id").and_then(serde_json::Value::as_i64) == Some(snapshot));
+    let current = matching
+        .next()
+        .context("exact recursive current snapshot absent")?;
+    if matching.next().is_some() {
+        bail!("exact recursive current snapshot duplicated");
+    }
+    let schema_id = recursive_schema_id(m, "current-schema-id")?;
+    let schemas = recursive_required(m, "schemas")?
+        .as_array()
+        .context("recursive schemas absent/not an array")?;
+    if schemas.len() > 64 {
+        bail!("recursive schema-list fixture budget exceeded");
+    }
+    let mut matching = schemas
+        .iter()
+        .filter(|s| s.get("schema-id").and_then(serde_json::Value::as_i64) == Some(schema_id));
+    let schema = matching
+        .next()
+        .context("recursive exact current schema absent")?;
+    if matching.next().is_some() {
+        bail!("recursive exact current schema duplicated");
+    }
+    recursive_json_budget(schema)?;
+    let location = recursive_string(m, "location", 4096)?;
+    let table_properties = recursive_required(m, "properties")?;
+    let summary = recursive_required(current, "summary")?;
+    Ok(
+        serde_json::json!({"table_uuid":uuid,"snapshot":snapshot,"schema_id":schema_id,"schema":schema,
+        "definition":recursive_document(table_properties,"definition","table-metadata",snapshot,location)?,
+        "interpretation":recursive_document(table_properties,"interpretation","table-metadata",snapshot,location)?,
+        "eligibility":recursive_document(table_properties,"eligibility","table-metadata",snapshot,location)?,
+        "publication":recursive_document(summary,"publication","exact-output",snapshot,location)?}),
+    )
+}
+
+// Bounded evidence checks. Native provenance remains the payload authority.
+fn recursive_required<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a serde_json::Value> {
+    value
+        .as_object()
+        .context("recursive receipt is not an object")?
+        .get(key)
+        .with_context(|| format!("recursive required field {key} absent"))
+}
+fn recursive_string<'a>(value: &'a serde_json::Value, key: &str, cap: usize) -> Result<&'a str> {
+    let text = recursive_required(value, key)?
+        .as_str()
+        .with_context(|| format!("recursive {key} is not a string"))?;
+    if text.is_empty() || text.len() > cap {
+        bail!("recursive {key} string budget invalid");
+    }
+    Ok(text)
+}
+fn recursive_positive(value: &serde_json::Value, key: &str) -> Result<i64> {
+    let number = recursive_required(value, key)?
+        .as_i64()
+        .with_context(|| format!("recursive {key} is not an exact signed integer"))?;
+    if number <= 0 {
+        bail!("recursive {key} is not positive");
+    }
+    Ok(number)
+}
+fn recursive_schema_id(value: &serde_json::Value, key: &str) -> Result<i64> {
+    let number = recursive_required(value, key)?
+        .as_i64()
+        .context("recursive schema ID is not an exact integer")?;
+    if !(0..=i64::from(i32::MAX)).contains(&number) {
+        bail!("recursive schema ID is outside its provider domain");
+    }
+    Ok(number)
+}
+fn recursive_uuid(value: &serde_json::Value, key: &str) -> Result<String> {
+    let text = recursive_string(value, key, 36)?;
+    let parts = text.split('-').collect::<Vec<_>>();
+    if parts.iter().map(|p| p.len()).collect::<Vec<_>>() != [8, 4, 4, 4, 12]
+        || !parts.iter().all(|p| {
+            p.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        || parts.iter().all(|p| p.bytes().all(|b| b == b'0'))
+    {
+        bail!("recursive {key} is not a canonical nonzero UUID");
+    }
+    Ok(text.into())
+}
+fn recursive_json_budget(value: &serde_json::Value) -> Result<()> {
+    let mut pending = vec![(value, 1usize)];
+    let mut nodes = 0usize;
+    let mut text = 0usize;
+    while let Some((value, depth)) = pending.pop() {
+        nodes += 1;
+        if nodes > 32_768 || depth > 64 {
+            bail!("recursive JSON structural budget exceeded");
+        }
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, child) in fields {
+                    text = text
+                        .checked_add(key.len())
+                        .context("recursive JSON text overflow")?;
+                    pending.push((child, depth + 1));
+                }
+            }
+            serde_json::Value::Array(values) => {
+                if values.len() > 32_768 {
+                    bail!("recursive JSON array budget exceeded");
+                }
+                pending.extend(values.iter().map(|v| (v, depth + 1)));
+            }
+            serde_json::Value::String(s) => {
+                text = text
+                    .checked_add(s.len())
+                    .context("recursive JSON text overflow")?;
+            }
+            _ => (),
+        }
+        if text > 256 * 1024 {
+            bail!("recursive JSON text budget exceeded");
+        }
+    }
+    Ok(())
+}
+fn recursive_fields(value: &serde_json::Value, key: &str) -> Result<()> {
+    let fields = recursive_required(value, key)?
+        .as_array()
+        .context("recursive field facts are not an array")?;
+    if fields.is_empty() || fields.len() > 256 {
+        bail!("recursive field-fact count invalid");
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for field in fields {
+        let path = recursive_string(field, "path", 4096)?;
+        let id = recursive_positive(field, "id")?;
+        if id > i64::from(i32::MAX) || !ids.insert(id) || !paths.insert(path) {
+            bail!("recursive field identity absent/duplicate/out of range");
+        }
+        recursive_required(field, "required")?
+            .as_bool()
+            .context("recursive required fact is not Boolean")?;
+        recursive_string(field, "kind", 64)?;
+    }
+    Ok(())
+}
+fn recursive_files(value: &serde_json::Value, key: &str, delete: bool) -> Result<()> {
+    let files = recursive_required(value, key)?
+        .as_array()
+        .context("recursive file facts are not an array")?;
+    if files.len() > 64 || (!delete && files.is_empty()) {
+        bail!("recursive file count invalid");
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    for file in files {
+        let path = recursive_string(file, "path", 4096)?;
+        let content = recursive_string(file, "content", 64)?;
+        recursive_string(file, "format", 32)?;
+        let count = recursive_required(file, "record_count")?
+            .as_u64()
+            .context("recursive record count is not an exact unsigned integer")?;
+        let size = recursive_positive(file, "file_size")?;
+        if count > 1000 || size > 16 * 1024 * 1024 || (!delete && content != "DATA") {
+            bail!("recursive file facts exceed exact fixture domain");
+        }
+        let identity = if delete {
+            if content != "POSITION_DELETES" || recursive_string(file, "format", 32)? != "PUFFIN" {
+                bail!("recursive expected real position DV absent");
+            }
+            let referenced = recursive_string(file, "referenced_data_file", 4096)?;
+            let offset = recursive_required(file, "content_offset")?
+                .as_u64()
+                .context("recursive DV offset absent/noninteger")?;
+            let length = recursive_positive(file, "content_size")? as u64;
+            if offset
+                .checked_add(length)
+                .context("recursive DV slice overflow")?
+                > size as u64
+            {
+                bail!("recursive DV slice leaves physical file");
+            }
+            format!("{path}|{referenced}|{offset}|{length}")
+        } else {
+            path.to_owned()
+        };
+        if !identities.insert(identity) {
+            bail!("recursive exact file identity repeated");
+        }
+    }
+    Ok(())
+}
+fn validate_recursive_receipt(value: &serde_json::Value, stage: &str) -> Result<()> {
+    if serde_json::to_vec(value)?.len() > 256 * 1024 {
+        bail!("recursive receipt exceeds byte budget");
+    }
+    recursive_json_budget(value)?;
+    let expected = match stage {
+        "initialize" => "recursive_source_initial",
+        "mutate" => "recursive_source_changed",
+        "initial" | "restored" | "incremental" | "full" => "recursive_mv_observed",
+        _ => bail!("unknown exact recursive stage"),
+    };
+    if recursive_string(value, "record", 64)? != expected {
+        bail!("recursive receipt belongs to another stage");
+    }
+    recursive_uuid(value, "source_uuid")?;
+    recursive_schema_id(value, "schema_id")?;
+    recursive_positive(value, "snapshot")?;
+    let schema: serde_json::Value =
+        serde_json::from_str(recursive_string(value, "schema_json", 256 * 1024)?)?;
+    recursive_json_budget(&schema)?;
+    schema
+        .as_object()
+        .context("recursive schema is not an object")?;
+    recursive_fields(value, "fields")?;
+    recursive_files(value, "data_files", false)?;
+    recursive_files(value, "delete_files", true)?;
+    recursive_required(value, "summary")?
+        .as_object()
+        .context("recursive exact snapshot summary absent/not an object")?;
+    let bag = recursive_required(value, "bag")?
+        .as_array()
+        .context("recursive bag absent/not an array")?;
+    if bag.len() > 1000 {
+        bail!("recursive bag count exceeded");
+    }
+    let mut total = 0u64;
+    let mut contents = std::collections::BTreeSet::new();
+    for entry in bag {
+        let content = recursive_string(entry, "content", 16 * 1024)?;
+        let node: serde_json::Value = serde_json::from_str(content)?;
+        recursive_json_budget(&node)?;
+        let count = recursive_positive(entry, "count")? as u64;
+        total = total
+            .checked_add(count)
+            .context("recursive bag count overflow")?;
+        if !contents.insert(content) || total > 1000 {
+            bail!("recursive bag identity/count invalid");
+        }
+    }
+    let expected_rows = if matches!(stage, "initialize" | "initial" | "restored") {
+        6
+    } else {
+        7
+    };
+    if total != expected_rows {
+        bail!("recursive complete bag endpoint count differs");
+    }
+    if matches!(stage, "initialize" | "mutate") {
+        if recursive_positive(value, "to_snapshot")? != recursive_positive(value, "snapshot")? {
+            bail!("recursive to-snapshot does not identify emitted source");
+        }
+        recursive_files(value, "added_files", false)?;
+        if stage == "initialize" {
+            if !recursive_required(value, "from_snapshot")?.is_null() {
+                bail!("initial source has a prior snapshot");
+            }
+        } else if recursive_positive(value, "from_snapshot")?
+            == recursive_positive(value, "to_snapshot")?
+        {
+            bail!("recursive mutation did not advance its frontier");
+        }
+    } else {
+        if recursive_string(value, "stage", 32)? != stage {
+            bail!("recursive observation stage mismatch");
+        }
+        recursive_uuid(value, "table_uuid")?;
+        recursive_schema_id(value, "source_schema_id")?;
+        recursive_positive(value, "source_snapshot")?;
+        recursive_fields(value, "source_fields")?;
+        let source: serde_json::Value =
+            serde_json::from_str(recursive_string(value, "source_schema_json", 256 * 1024)?)?;
+        recursive_json_budget(&source)?;
+        source
+            .as_object()
+            .context("recursive source schema is not an object")?;
+    }
+    if stage == "full" {
+        let files = recursive_required(value, "data_files")?.as_array().unwrap();
+        if !recursive_required(value, "delete_files")?
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            bail!("FULL retains actual delete facts");
+        }
+        let records = files.iter().try_fold(0u64, |n, f| {
+            n.checked_add(
+                recursive_required(f, "record_count")?
+                    .as_u64()
+                    .context("FULL file count not integer")?,
+            )
+            .context("FULL count overflow")
+        })?;
+        let bytes = files.iter().try_fold(0u64, |n, f| {
+            n.checked_add(recursive_positive(f, "file_size")? as u64)
+                .context("FULL size overflow")
+        })?;
+        let summary = recursive_required(value, "summary")?;
+        for (key, expected) in [
+            ("total-data-files", files.len() as u64),
+            ("total-delete-files", 0),
+            ("total-records", records),
+            ("total-files-size", bytes),
+            ("total-position-deletes", 0),
+            ("total-equality-deletes", 0),
+        ] {
+            let text = recursive_string(summary, key, 20)?;
+            let actual = text
+                .parse::<u64>()
+                .context("FULL summary total is not a bounded unsigned integer")?;
+            if text != actual.to_string() || actual != expected {
+                bail!("FULL summary {key} differs from actual complete files");
+            }
+        }
+        if records != total {
+            bail!("FULL total physical records differ from full independent bag");
+        }
+    }
+    Ok(())
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecursiveManifest {
+    version: u16,
+    documents: Vec<RecursiveEnvelope>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecursiveEnvelope {
+    version: u16,
+    owner: String,
+    name: String,
+    format_owner: String,
+    format_name: String,
+    format_version: u32,
+    revision: [u8; 32],
+    encoded_len: u64,
+    references: Vec<RecursiveReference>,
+    attachment: RecursiveAttachment,
+    carrier: RecursiveCarrier,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecursiveReference {
+    relationship: String,
+    owner: String,
+    name: String,
+    revision: [u8; 32],
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum RecursiveAttachment {
+    TableMetadata,
+    ExactOutput {
+        committed_version: Vec<u8>,
+        snapshot_id: Option<i64>,
+    },
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum RecursiveCarrier {
+    Available { content: Vec<u8> },
+    Deferred { location: String },
+}
+fn recursive_document(
+    properties: &serde_json::Value,
+    name: &str,
+    attachment: &str,
+    snapshot: i64,
+    _table_location: &str,
+) -> Result<serde_json::Value> {
+    let encoded = recursive_string(properties, "novarocks.documents.v1", 256 * 1024)?;
+    let manifest: RecursiveManifest = serde_json::from_str(encoded)?;
+    if manifest.version != 1 || manifest.documents.is_empty() || manifest.documents.len() > 64 {
+        bail!("recursive exact manifest version/count invalid");
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    let mut references = 0usize;
+    let mut selected = None;
+    for document in &manifest.documents {
+        if document.version != 1
+            || document.format_version == 0
+            || document.encoded_len == 0
+            || document.encoded_len > 8 * 1024 * 1024
+        {
+            bail!("recursive document version/length invalid");
+        }
+        for text in [
+            &document.owner,
+            &document.name,
+            &document.format_owner,
+            &document.format_name,
+        ] {
+            if text.is_empty() || text.len() > 128 {
+                bail!("recursive document identity budget invalid");
+            }
+        }
+        if !identities.insert((&document.owner, &document.name, document.revision)) {
+            bail!("recursive exact envelope identity duplicate");
+        }
+        references = references
+            .checked_add(document.references.len())
+            .context("recursive reference overflow")?;
+        if references > 256 {
+            bail!("recursive manifest reference budget exceeded");
+        }
+        let mut edges = std::collections::BTreeSet::new();
+        for edge in &document.references {
+            for text in [&edge.relationship, &edge.owner, &edge.name] {
+                if text.is_empty() || text.len() > 128 {
+                    bail!("recursive reference identity budget invalid");
+                }
+            }
+            if !edges.insert((&edge.relationship, &edge.owner, &edge.name, edge.revision)) {
+                bail!("recursive exact reference duplicate");
+            }
+        }
+        match &document.carrier {
+            RecursiveCarrier::Available { content } => {
+                if content.len() as u64 != document.encoded_len
+                    || Sha256::digest(content).as_slice() != document.revision
+                {
+                    bail!("recursive available carrier length/revision differs");
+                }
+            }
+            RecursiveCarrier::Deferred { location } => {
+                if location.is_empty() || location.len() > 4096 {
+                    bail!("recursive deferred carrier location budget invalid");
+                }
+                reqwest::Url::parse(location)
+                    .context("recursive deferred carrier is not an absolute URI")?;
+                // Freeze the exact opaque reference. Native provenance validates its
+                // admitted owner; creation storage roots need not equal table location.
+            }
+        }
+        if let RecursiveAttachment::ExactOutput {
+            committed_version,
+            snapshot_id,
+        } = &document.attachment
+            && (committed_version.is_empty()
+                || committed_version.len() > 1024
+                || snapshot_id.is_none_or(|id| id <= 0))
+        {
+            bail!("recursive exact-output attachment invalid");
+        }
+        if document.owner == "novarocks.mv" && document.name == name {
+            if document.format_owner != "novarocks.mv"
+                || document.format_name != name
+                || document.format_version != 1
+            {
+                bail!("recursive selected document format differs from its exact contract");
+            }
+            if selected.is_some() {
+                bail!("recursive selected document name is ambiguous");
+            }
+            let valid = match (&document.attachment, attachment) {
+                (RecursiveAttachment::TableMetadata, "table-metadata") => true,
+                (
+                    RecursiveAttachment::ExactOutput {
+                        snapshot_id: Some(id),
+                        ..
+                    },
+                    "exact-output",
+                ) => *id == snapshot,
+                _ => false,
+            };
+            if !valid {
+                bail!("recursive document has wrong exact carrier attachment");
+            }
+            selected = Some(serde_json::to_value(document)?);
+        }
+    }
+    selected.context("recursive exact selected document absent")
 }

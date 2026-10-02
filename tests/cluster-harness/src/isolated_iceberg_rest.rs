@@ -266,6 +266,652 @@ impl FixtureProfile {
     }
 }
 
+const OWNED_SPARK_INPUT_BYTES: usize = 256 * 1024;
+const OWNED_SPARK_LOG_BYTES: u64 = 4 * 1024 * 1024;
+const OWNED_SPARK_CONTROL_BYTES: usize = 64 * 1024;
+const OWNED_SPARK_CLEANUP_BUDGET: Duration = Duration::from_secs(20);
+
+const OWNED_SPARK_INSPECTION_TEMPLATE: &str = "{\"id\":{{json .Id}},\"name\":{{json .Name}},\"project\":{{json (index .Config.Labels \"com.docker.compose.project\")}},\"service\":{{json (index .Config.Labels \"com.docker.compose.service\")}},\"owner\":{{json (index .Config.Labels \"novarocks.fixture.owner\")}},\"fixture_kind\":{{json (index .Config.Labels \"novarocks.fixture.kind\")}},\"token\":{{json (index .Config.Labels \"novarocks.fixture.spark-job\")}},\"image_id\":{{json .Image}},\"image_reference\":{{json .Config.Image}},\"status\":{{json .State.Status}},\"exit_code\":{{json .State.ExitCode}}}";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OwnedSparkJobIdentity {
+    pub token: String,
+    pub container_id: String,
+    pub image: IsolatedIcebergRestImageIdentity,
+    pub script_sha256: String,
+    pub defaults_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OwnedSparkCleanupReceipt {
+    pub confirmed_gone: bool,
+    pub forced: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OwnedSparkJobReceipt {
+    pub identity: OwnedSparkJobIdentity,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+    pub exit_code: i32,
+    pub cleanup: OwnedSparkCleanupReceipt,
+}
+
+#[derive(Clone, Deserialize)]
+struct OwnedSparkInspection {
+    id: String,
+    name: String,
+    project: Option<String>,
+    service: Option<String>,
+    owner: Option<String>,
+    fixture_kind: Option<String>,
+    token: Option<String>,
+    image_id: String,
+    image_reference: String,
+    status: String,
+    exit_code: i32,
+}
+
+struct OwnedSparkJob<'a> {
+    fixture: &'a IsolatedIcebergRestFixture,
+    token: String,
+    name: String,
+    expected_image: IsolatedIcebergRestImageIdentity,
+    container_id: Option<String>,
+    // A failed launch command may have reached Docker even without an acknowledgement.
+    creation_attempted: bool,
+    creation_confirmed: bool,
+    cleaned: bool,
+    cleanup_deadline: Option<Instant>,
+    directory: PathBuf,
+}
+
+fn owned_spark_command_until(
+    mut command: Command,
+    deadline: Instant,
+    what: &str,
+    secrets: &[&str],
+) -> Result<Output> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("owned Spark job absolute deadline elapsed")?;
+    ensure!(
+        !remaining.is_zero(),
+        "owned Spark job absolute deadline elapsed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let bytes = libc::rlim_t::try_from(OWNED_SPARK_CONTROL_BYTES)
+            .context("owned Spark control byte limit cannot be represented")?;
+        // This appends one async-signal-safe hook. Existing Command hooks and
+        // process-group settings remain intact. The kernel bounds the actual
+        // tempfile writers, including a compose plugin inheriting these fds.
+        unsafe {
+            command.pre_exec(move || {
+                let limit = libc::rlimit {
+                    rlim_cur: bytes,
+                    rlim_max: bytes,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    bail!("owned Spark control commands require Unix bounded writers");
+    let output = run_bounded_command(
+        command,
+        remaining.min(FIXTURE_DOCKER_TIMEOUT),
+        what,
+        secrets,
+    )?;
+    ensure!(
+        output.stdout.len() < OWNED_SPARK_CONTROL_BYTES
+            && output.stderr.len() < OWNED_SPARK_CONTROL_BYTES,
+        "owned Spark control output reached its byte bound; receipt is incomplete"
+    );
+    // Callers deliberately report status only, never raw Docker output.
+    Ok(output)
+}
+
+fn owned_spark_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .context("create private owned Spark input/output")?;
+    file.write_all(bytes)
+        .context("write private owned Spark input/output")?;
+    file.sync_all()
+        .context("sync private owned Spark input/output")
+}
+
+fn owned_spark_read_defaults(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path).context("open exact private Spark defaults")?;
+    let mut bytes = Vec::new();
+    file.take(OWNED_SPARK_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= OWNED_SPARK_INPUT_BYTES,
+        "owned Spark defaults are empty or exceed their byte bound"
+    );
+    Ok(bytes)
+}
+
+fn validate_owned_spark_input_size(script_bytes: usize, defaults_bytes: usize) -> Result<()> {
+    ensure!(
+        script_bytes > 0
+            && defaults_bytes > 0
+            && script_bytes
+                .checked_add(defaults_bytes)
+                .is_some_and(|bytes| bytes <= OWNED_SPARK_INPUT_BYTES),
+        "combined owned Spark inputs are empty or exceed their byte bound"
+    );
+    Ok(())
+}
+
+fn validate_owned_spark_identity(
+    value: &OwnedSparkInspection,
+    name: &str,
+    project: &str,
+    token: &str,
+    image: &IsolatedIcebergRestImageIdentity,
+    previous_container_id: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        value.id.len() == 64
+            && value.id.bytes().all(|c| c.is_ascii_hexdigit())
+            && value.name.strip_prefix('/') == Some(name)
+            && value.project.as_deref() == Some(project)
+            && value.service.as_deref() == Some("spark")
+            && value.owner.as_deref() == Some(project)
+            && value.fixture_kind.as_deref() == Some("isolated")
+            && value.token.as_deref().unwrap_or("") == token
+            && value.image_id == image.image_id
+            && value.image_reference == image.image_reference,
+        "owned Spark container identity is foreign or changed; refusing removal"
+    );
+    ensure!(
+        previous_container_id.is_none_or(|expected| value.id == expected),
+        "owned Spark container ID changed; refusing removal"
+    );
+    Ok(())
+}
+
+// Absence only concludes cleanup before any launch attempt or after an exact
+// identity was observed. A lost create acknowledgement can still race a late
+// Docker create; empty discovery alone must retain Unknown.
+fn owned_spark_absence_can_complete(
+    creation_attempted: bool,
+    creation_confirmed: bool,
+    container_id: Option<&str>,
+) -> bool {
+    !creation_attempted || (creation_confirmed && container_id.is_some())
+}
+
+fn validate_owned_spark_logs(directory: &Path) -> Result<()> {
+    for name in ["stdout.log", "stderr.log"] {
+        let metadata = fs::symlink_metadata(directory.join(name))?;
+        ensure!(
+            metadata.file_type().is_file() && metadata.len() < OWNED_SPARK_LOG_BYTES,
+            "owned Spark log reached its byte bound or is not a regular file; receipt is incomplete"
+        );
+    }
+    Ok(())
+}
+
+impl OwnedSparkJob<'_> {
+    fn command(&self, args: &[&str], deadline: Instant, what: &str) -> Result<Output> {
+        let mut command = controlled_command("docker");
+        command.current_dir(&self.fixture.repo_root).args(args);
+        owned_spark_command_until(
+            command,
+            deadline,
+            what,
+            &[
+                &self.fixture.minio_root_identity.access_key_id,
+                &self.fixture.minio_root_identity.secret_access_key,
+            ],
+        )
+    }
+
+    fn inspect(&self, id: &str, deadline: Instant) -> Result<OwnedSparkInspection> {
+        // Inspect selected non-secret facts, never Config.Env or full metadata.
+
+        let output = self.command(
+            &[
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                OWNED_SPARK_INSPECTION_TEMPLATE,
+                id,
+            ],
+            deadline,
+            "inspect exact owned Spark container",
+        )?;
+        ensure!(
+            output.status.success(),
+            "cannot inspect exact owned Spark container"
+        );
+        let value: OwnedSparkInspection = serde_json::from_slice(&output.stdout)
+            .context("decode owned Spark container identity")?;
+        validate_owned_spark_identity(
+            &value,
+            &self.name,
+            &self.fixture.compose_project,
+            &self.token,
+            &self.expected_image,
+            self.container_id.as_deref(),
+        )?;
+        Ok(value)
+    }
+
+    fn discover(&mut self, deadline: Instant) -> Result<Option<OwnedSparkInspection>> {
+        // The exact name covers an unknown compose start result. The token
+        // label narrows discovery, and inspect proves the complete identity.
+        let name_filter = format!("name=^/{}$", self.name);
+        let token_filter = format!("label=novarocks.fixture.spark-job={}", self.token);
+        let output = self.command(
+            &[
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                &name_filter,
+                "--filter",
+                &token_filter,
+            ],
+            deadline,
+            "discover owned Spark container",
+        )?;
+        ensure!(
+            output.status.success(),
+            "cannot discover owned Spark container"
+        );
+        let text = std::str::from_utf8(&output.stdout).context("decode owned Spark discovery")?;
+        let ids = text.lines().filter(|id| !id.is_empty()).collect::<Vec<_>>();
+        ensure!(
+            ids.len() <= 1,
+            "owned Spark job has ambiguous container identity"
+        );
+        let Some(id) = ids.first() else {
+            return Ok(None);
+        };
+        let inspection = self.inspect(id, deadline)?;
+        self.container_id = Some(inspection.id.clone());
+        self.creation_confirmed = true;
+        Ok(Some(inspection))
+    }
+
+    fn check_logs(&self) -> Result<()> {
+        validate_owned_spark_logs(&self.directory.join("output"))
+    }
+
+    fn cleanup(&mut self, deadline: Instant) -> Result<OwnedSparkCleanupReceipt> {
+        let started = Instant::now();
+        let deadline = *self.cleanup_deadline.get_or_insert(deadline);
+        let mut forced = false;
+        loop {
+            if let Some(value) = self.discover(deadline)? {
+                forced |= value.status != "exited";
+                // Revalidate immediately before the irreversible operation.
+                self.inspect(&value.id, deadline)?;
+                let output = self.command(
+                    &["rm", "--force", &value.id],
+                    deadline,
+                    "remove exact owned Spark container",
+                )?;
+                ensure!(
+                    output.status.success(),
+                    "owned Spark removal was not confirmed"
+                );
+            } else if owned_spark_absence_can_complete(
+                self.creation_attempted,
+                self.creation_confirmed,
+                self.container_id.as_deref(),
+            ) {
+                if let Some(id) = &self.container_id {
+                    let filter = format!("id={id}");
+                    let output = self.command(
+                        &["ps", "-aq", "--no-trunc", "--filter", &filter],
+                        deadline,
+                        "confirm exact owned Spark container gone",
+                    )?;
+                    ensure!(
+                        output.status.success()
+                            && output.stdout.iter().all(|c| c.is_ascii_whitespace()),
+                        "owned Spark container still exists or its absence is unconfirmed"
+                    );
+                }
+                self.cleaned = true;
+                return Ok(OwnedSparkCleanupReceipt {
+                    confirmed_gone: true,
+                    forced,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            // A lost create result with no observed container cannot prove
+            // quiescence. Keep looking under the independent cleanup budget;
+            // expiry remains Unknown, never an invented successful removal.
+            ensure!(
+                Instant::now() < deadline,
+                "owned Spark cleanup is unconfirmed"
+            );
+            thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+}
+
+impl Drop for OwnedSparkJob<'_> {
+    fn drop(&mut self) {
+        if !self.cleaned
+            && self
+                .cleanup(Instant::now() + OWNED_SPARK_CLEANUP_BUDGET)
+                .is_err()
+        {
+            // No raw Docker output, configuration or credential values.
+            eprintln!("owned Spark job {} cleanup remains unconfirmed", self.token);
+        }
+    }
+}
+
+impl IsolatedIcebergRestFixture {
+    /// Execute one bounded script on this exact private provider publication.
+    /// A nonzero exit is returned as evidence; the scenario must reject it.
+    /// Success always includes a confirmed cleanup of the exact container.
+    pub fn run_owned_spark_until(
+        &self,
+        script: &str,
+        receipt_dir: &Path,
+        absolute_deadline: Instant,
+    ) -> Result<OwnedSparkJobReceipt> {
+        self.assert_owned_paths()?;
+        ensure!(
+            self.active && cfg!(unix),
+            "owned Spark requires an active private Unix fixture"
+        );
+        ensure!(
+            !script.is_empty() && script.len() <= OWNED_SPARK_INPUT_BYTES,
+            "owned Spark script is empty or exceeds its byte bound"
+        );
+        ensure!(
+            Instant::now() < absolute_deadline,
+            "owned Spark absolute deadline elapsed"
+        );
+        let receipt_dir = receipt_dir
+            .canonicalize()
+            .context("resolve owned Spark receipt root")?;
+        ensure!(
+            receipt_dir.is_dir() && receipt_dir.starts_with(&self.scenario_root),
+            "owned Spark receipts must belong to this scenario root"
+        );
+        let manifest = read_manifest(&self.find_manifest()?)?;
+        self.assert_isolated_manifest(&manifest)?;
+        let entry = runtime_entry_from_manifest(&self.repo_root, &manifest)?;
+        let defaults_path = entry
+            .configuration_directory
+            .join("spark-defaults.conf")
+            .canonicalize()?;
+        ensure!(
+            defaults_path.starts_with(&entry.configuration_directory),
+            "owned Spark defaults escaped the exact publication"
+        );
+        let defaults = owned_spark_read_defaults(&defaults_path)?;
+        validate_owned_spark_input_size(script.len(), defaults.len())?;
+        let token = unique_fixture_id();
+        let name = format!(
+            "nr-spark-job-{}",
+            token.strip_prefix(FIXTURE_PREFIX).unwrap_or(&token)
+        );
+        let directory = receipt_dir.join(&name);
+        fs::create_dir(&directory).context("create unique owned Spark receipt directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let input = directory.join("input");
+        let output = directory.join("output");
+        ensure!(
+            !input.as_os_str().as_encoded_bytes().contains(&b':')
+                && !output.as_os_str().as_encoded_bytes().contains(&b':'),
+            "owned Spark input/output paths cannot be represented as exact Docker mounts"
+        );
+        fs::create_dir(&input)?;
+        fs::create_dir(&output)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&input, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&output, fs::Permissions::from_mode(0o700))?;
+        }
+        owned_spark_write(&input.join("query.scala"), script.as_bytes())?;
+        owned_spark_write(&input.join("spark-defaults.conf"), &defaults)?;
+        owned_spark_write(&output.join("stdout.log"), b"")?;
+        owned_spark_write(&output.join("stderr.log"), b"")?;
+        let project_filter = format!("label=com.docker.compose.project={}", self.compose_project);
+        let mut baseline = controlled_command("docker");
+        baseline.current_dir(&self.repo_root).args([
+            "ps",
+            "-q",
+            "--no-trunc",
+            "--filter",
+            &project_filter,
+            "--filter",
+            "label=com.docker.compose.service=spark",
+        ]);
+        let baselines = owned_spark_command_until(
+            baseline,
+            absolute_deadline,
+            "freeze original private Spark service",
+            &[],
+        )?;
+        ensure!(
+            baselines.status.success(),
+            "cannot freeze original private Spark service"
+        );
+        let baseline_ids = std::str::from_utf8(&baselines.stdout)?
+            .lines()
+            .collect::<Vec<_>>();
+        ensure!(
+            baseline_ids.len() == 1,
+            "private Spark service identity is ambiguous before job launch"
+        );
+        let mut image_command = controlled_command("docker");
+        image_command.current_dir(&self.repo_root).args([
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            OWNED_SPARK_INSPECTION_TEMPLATE,
+            baseline_ids[0],
+        ]);
+        let image = owned_spark_command_until(
+            image_command,
+            absolute_deadline,
+            "freeze private Spark image",
+            &[],
+        )?;
+        ensure!(image.status.success(), "cannot freeze private Spark image");
+        let baseline: OwnedSparkInspection = serde_json::from_slice(&image.stdout)
+            .context("decode original private Spark identity")?;
+        let published_image = &manifest
+            .spark
+            .as_ref()
+            .context("private publication has no exact Spark image")?
+            .image;
+        let expected_image = IsolatedIcebergRestImageIdentity {
+            image_id: published_image.clone(),
+            image_reference: published_image.clone(),
+        };
+        ensure!(
+            published_image.strip_prefix("sha256:").is_some_and(
+                |digest| digest.len() == 64 && digest.bytes().all(|c| c.is_ascii_hexdigit())
+            ) && baseline.id == baseline_ids[0]
+                && baseline.status == "running"
+                && baseline.token.as_deref().is_none_or(str::is_empty),
+            "private Spark service does not match its immutable publication"
+        );
+        validate_owned_spark_identity(
+            &baseline,
+            baseline
+                .name
+                .strip_prefix('/')
+                .context("invalid private Spark name")?,
+            &self.compose_project,
+            "",
+            &expected_image,
+            None,
+        )?;
+        let mut job = OwnedSparkJob {
+            fixture: self,
+            token,
+            name,
+            expected_image,
+            container_id: None,
+            creation_attempted: false,
+            creation_confirmed: false,
+            cleaned: false,
+            cleanup_deadline: None,
+            directory,
+        };
+        let script_sha256 = sha256_hex(script.as_bytes());
+        let defaults_sha256 = sha256_hex(&defaults);
+        let outcome = (|| -> Result<(String, i32)> {
+            let input_mount = format!("{}:/uea-input:ro", input.display());
+            let output_mount = format!("{}:/uea-output:rw", output.display());
+            let label = format!("novarocks.fixture.spark-job={}", job.token);
+            let mut launch = controlled_command("docker");
+            launch.current_dir(&self.repo_root).args(["compose", "--env-file", &manifest.compose_env,
+                "-p", &self.compose_project, "-f", &manifest.compose_file,
+                "run", "--detach", "--pull", "never", "--no-deps", "--name", &job.name,
+                "--label", &label, "--volume", &input_mount, "--volume", &output_mount,
+                "--entrypoint", "/bin/bash", "spark", "-lc",
+                // Container-side file limits bound output at its actual writer,
+                // before it can consume unbounded host storage. Reaching either
+                // cap is a failure, never a truncated successful receipt.
+                "set -euo pipefail; exec > /uea-output/stdout.log 2> /uea-output/stderr.log; ulimit -f 4096; exec /opt/spark/bin/spark-shell --properties-file /uea-input/spark-defaults.conf -i /uea-input/query.scala < /dev/null"]);
+            job.creation_attempted = true;
+            let launched = owned_spark_command_until(
+                launch,
+                absolute_deadline,
+                "launch exact owned Spark job",
+                &[
+                    &self.minio_root_identity.access_key_id,
+                    &self.minio_root_identity.secret_access_key,
+                ],
+            )?;
+            ensure!(
+                launched.status.success(),
+                "owned Spark launch result is unsuccessful"
+            );
+            let returned_id = std::str::from_utf8(&launched.stdout)?.trim();
+            ensure!(
+                returned_id.len() == 64 && returned_id.bytes().all(|c| c.is_ascii_hexdigit()),
+                "owned Spark launch lacks an exact container ID"
+            );
+            let value = job
+                .discover(absolute_deadline)?
+                .context("owned Spark launch has no matching container")?;
+            ensure!(
+                returned_id == value.id,
+                "owned Spark launch and discovery disagree"
+            );
+            loop {
+                job.check_logs()?;
+                let current = job.inspect(&value.id, absolute_deadline)?;
+                match current.status.as_str() {
+                    "exited" => {
+                        let waited = job.command(
+                            &["wait", &value.id],
+                            absolute_deadline,
+                            "wait exact owned Spark exit",
+                        )?;
+                        ensure!(waited.status.success(), "owned Spark wait was unsuccessful");
+                        let exit_code =
+                            std::str::from_utf8(&waited.stdout)?.trim().parse::<i32>()?;
+                        ensure!(
+                            exit_code == current.exit_code,
+                            "owned Spark wait and inspect exit disagree"
+                        );
+                        job.check_logs()?;
+                        return Ok((value.id, exit_code));
+                    }
+                    "created" | "running" => {}
+                    _ => bail!("owned Spark container has an unsupported lifecycle state"),
+                }
+                ensure!(
+                    Instant::now() < absolute_deadline,
+                    "owned Spark execution exceeded its absolute deadline"
+                );
+                thread::sleep(
+                    Duration::from_millis(50)
+                        .min(absolute_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        })();
+        let cleanup = job.cleanup(Instant::now() + OWNED_SPARK_CLEANUP_BUDGET);
+        match (outcome, cleanup) {
+            (Ok((container_id, exit_code)), Ok(cleanup)) => {
+                let receipt = OwnedSparkJobReceipt {
+                    identity: OwnedSparkJobIdentity {
+                        token: job.token.clone(),
+                        container_id,
+                        image: job.expected_image.clone(),
+                        script_sha256,
+                        defaults_sha256,
+                    },
+                    stdout_path: output.join("stdout.log"),
+                    stderr_path: output.join("stderr.log"),
+                    exit_code,
+                    cleanup,
+                };
+                owned_spark_write(
+                    &job.directory.join("receipt.json"),
+                    &serde_json::to_vec_pretty(&receipt)?,
+                )?;
+                Ok(receipt)
+            }
+            (result, cleanup) => {
+                // Persist status-only failure facts, without tool diagnostics.
+                let evidence = serde_json::json!({ "token": job.token, "script_sha256": script_sha256,
+                    "defaults_sha256": defaults_sha256, "execution_confirmed": result.is_ok(),
+                    "cleanup_confirmed": cleanup.as_ref().is_ok_and(|r| r.confirmed_gone),
+                    "creation_attempted": job.creation_attempted, "creation_confirmed": job.creation_confirmed,
+                    "container_id": job.container_id, "image": job.expected_image,
+                    "exit_code": result.as_ref().ok().map(|(_, code)| *code),
+                    "stdout_path": output.join("stdout.log"), "stderr_path": output.join("stderr.log") });
+                let _ = owned_spark_write(
+                    &job.directory.join("failure.json"),
+                    &serde_json::to_vec_pretty(&evidence)?,
+                );
+                match (result, cleanup) {
+                    (Err(error), Ok(_)) => {
+                        Err(error.context("owned Spark failed; exact container cleanup confirmed"))
+                    }
+                    (_, Err(_)) => bail!(
+                        "owned Spark failed or completed, but exact cleanup remains unconfirmed; see private receipt directory"
+                    ),
+                    (Ok(_), Ok(_)) => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
 impl IsolatedIcebergRestFixture {
     /// Starts a fresh REST Catalog and MinIO compose project below
     /// `scenario_root`.  The caller must retain the fixture for the entire
@@ -1843,6 +2489,12 @@ struct Manifest {
     runtime_dir: String,
     minio: ManifestMinio,
     iceberg_rest: ManifestIcebergRest,
+    spark: Option<ManifestSpark>,
+}
+
+#[derive(Deserialize)]
+struct ManifestSpark {
+    image: String,
 }
 
 #[derive(Deserialize)]
@@ -2110,6 +2762,271 @@ fn truncate_for_diagnostics(text: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    fn owned_spark_inspection() -> (OwnedSparkInspection, IsolatedIcebergRestImageIdentity) {
+        let image = IsolatedIcebergRestImageIdentity {
+            image_id: format!("sha256:{}", "a".repeat(64)),
+            image_reference: format!("sha256:{}", "a".repeat(64)),
+        };
+        (
+            OwnedSparkInspection {
+                id: "b".repeat(64),
+                name: "/nr-spark-job-test".into(),
+                project: Some("nr-isolated-rest-test".into()),
+                service: Some("spark".into()),
+                owner: Some("nr-isolated-rest-test".into()),
+                fixture_kind: Some("isolated".into()),
+                token: Some("isolated-rest-test".into()),
+                image_id: image.image_id.clone(),
+                image_reference: image.image_reference.clone(),
+                status: "exited".into(),
+                exit_code: 0,
+            },
+            image,
+        )
+    }
+
+    #[test]
+    fn owned_spark_foreign_identity_is_rejected_before_removal() {
+        let (value, image) = owned_spark_inspection();
+        let validate = |value: &OwnedSparkInspection, previous: Option<&str>| {
+            validate_owned_spark_identity(
+                value,
+                "nr-spark-job-test",
+                "nr-isolated-rest-test",
+                "isolated-rest-test",
+                &image,
+                previous,
+            )
+        };
+        validate(&value, Some(&value.id)).unwrap();
+        for field in [
+            "id",
+            "name",
+            "project",
+            "service",
+            "owner",
+            "kind",
+            "token",
+            "image_id",
+            "reference",
+        ] {
+            let mut foreign = value.clone();
+            match field {
+                "id" => foreign.id = "short-id".into(),
+                "name" => foreign.name = "/foreign-job".into(),
+                "project" => foreign.project = Some("foreign-project".into()),
+                "service" => foreign.service = Some("rest".into()),
+                "owner" => foreign.owner = Some("foreign-owner".into()),
+                "kind" => foreign.fixture_kind = Some("shared".into()),
+                "token" => foreign.token = None,
+                "image_id" => foreign.image_id = format!("sha256:{}", "c".repeat(64)),
+                "reference" => foreign.image_reference = "mutable:tag".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate(&foreign, None).is_err(),
+                "{field} must refuse removal"
+            );
+        }
+        let changed_id = "d".repeat(64);
+        assert!(validate(&value, Some(&changed_id)).is_err());
+    }
+
+    #[test]
+    fn owned_spark_unknown_creation_never_concludes_empty_discovery() {
+        assert!(owned_spark_absence_can_complete(false, false, None));
+        assert!(!owned_spark_absence_can_complete(true, false, None));
+        // A compose acknowledgement without a fully inspected identity is not proof.
+        assert!(!owned_spark_absence_can_complete(true, true, None));
+        assert!(!owned_spark_absence_can_complete(
+            true,
+            false,
+            Some("observed-id")
+        ));
+        assert!(owned_spark_absence_can_complete(
+            true,
+            true,
+            Some("observed-id")
+        ));
+    }
+
+    #[test]
+    fn owned_spark_cleanup_retries_do_not_restart_the_independent_budget() {
+        let (_root, fixture, _) = manifest_fixture();
+        let (_, image) = owned_spark_inspection();
+        let expired = Instant::now();
+        let mut job = OwnedSparkJob {
+            fixture: &fixture,
+            token: "isolated-rest-test".into(),
+            name: "nr-spark-job-test".into(),
+            expected_image: image,
+            container_id: None,
+            creation_attempted: true,
+            creation_confirmed: false,
+            cleaned: false,
+            cleanup_deadline: Some(expired),
+            directory: fixture.scenario_root.clone(),
+        };
+        let error = job
+            .cleanup(Instant::now() + Duration::from_secs(20))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("absolute deadline elapsed"));
+        assert_eq!(job.cleanup_deadline, Some(expired));
+        assert!(!job.cleaned);
+        // Drop retries with that same expired deadline, so it cannot invoke Docker.
+    }
+
+    #[test]
+    fn owned_spark_expired_absolute_deadline_prevents_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-exist");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf dispatched > \"$1\"", "probe"]); // POSIX positional path, no interpolation.
+        command.arg(&marker);
+        let error =
+            owned_spark_command_until(command, Instant::now(), "expired probe", &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("absolute deadline elapsed"));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn owned_spark_each_command_consumes_the_same_absolute_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut first = Command::new("/bin/sh");
+        first.args(["-c", "exec sleep 3"]);
+        let error = owned_spark_command_until(first, deadline, "deadline probe", &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("was killed"));
+        let second = Command::new("/nonexistent-owned-spark-command");
+        let error = owned_spark_command_until(second, deadline, "second probe", &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("absolute deadline elapsed"));
+    }
+
+    #[test]
+    fn owned_spark_control_writer_stops_at_the_kernel_byte_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("actual-writer.bin");
+        let mut command = Command::new("/bin/dd");
+        command.args(["if=/dev/zero", "bs=1048576", "count=128"]);
+        command.arg(format!("of={}", destination.display()));
+        let output = owned_spark_command_until(
+            command,
+            Instant::now() + Duration::from_secs(5),
+            "bounded writer probe",
+            &[],
+        )
+        .unwrap();
+        assert!(!output.status.success(), "128 MiB writer must not complete");
+        assert_eq!(
+            fs::metadata(destination).unwrap().len(),
+            OWNED_SPARK_CONTROL_BYTES as u64
+        );
+        // Both capture fds use the same inherited kernel limit. Exact-cap
+        // capture is refused, even if the child handles its write failure.
+        for stream in ["stdout", "stderr"] {
+            let mut command = Command::new("/bin/sh");
+            let script = if stream == "stdout" {
+                "exec /bin/dd if=/dev/zero bs=1048576 count=128"
+            } else {
+                "exec /bin/dd if=/dev/zero bs=1048576 count=128 >&2"
+            };
+            command.args(["-c", script]);
+            let error = owned_spark_command_until(
+                command,
+                Instant::now() + Duration::from_secs(5),
+                "bounded capture probe",
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("reached its byte bound"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_spark_control_limit_preserves_existing_process_group_and_hooks() {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("/bin/sh");
+        command.process_group(0);
+        // A preceding hook must still execute after the bounded-writer hook
+        // is appended. Changing umask is async-signal-safe in the child.
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        command.args([
+            "-c",
+            "printf '%s ' \"$$\"; umask; exec ps -o pgid= -p \"$$\"",
+        ]);
+        let output = owned_spark_command_until(
+            command,
+            Instant::now() + Duration::from_secs(5),
+            "process group probe",
+            &[],
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        let facts = text.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(facts.len(), 3, "{text}");
+        assert_eq!(
+            facts[0], facts[2],
+            "child remains its own process-group leader"
+        );
+        assert_eq!(
+            facts[1], "0077",
+            "existing pre_exec hook must remain effective"
+        );
+    }
+
+    #[test]
+    fn owned_spark_combined_inputs_are_bounded_without_overflow() {
+        validate_owned_spark_input_size(1, OWNED_SPARK_INPUT_BYTES - 1).unwrap();
+        assert!(validate_owned_spark_input_size(1, OWNED_SPARK_INPUT_BYTES).is_err());
+        assert!(validate_owned_spark_input_size(usize::MAX, 1).is_err());
+        assert!(validate_owned_spark_input_size(0, 1).is_err());
+        assert!(validate_owned_spark_input_size(1, 0).is_err());
+    }
+
+    #[test]
+    fn owned_spark_full_logs_reject_cap_and_nonregular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let stdout = root.path().join("stdout.log");
+        let stderr = root.path().join("stderr.log");
+        owned_spark_write(&stdout, b"complete stdout").unwrap();
+        owned_spark_write(&stderr, b"complete stderr").unwrap();
+        validate_owned_spark_logs(root.path()).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&stdout).unwrap();
+        file.set_len(OWNED_SPARK_LOG_BYTES - 1).unwrap();
+        validate_owned_spark_logs(root.path()).unwrap();
+        file.set_len(OWNED_SPARK_LOG_BYTES).unwrap();
+        assert!(validate_owned_spark_logs(root.path()).is_err());
+        drop(file);
+        fs::remove_file(&stdout).unwrap();
+        std::os::unix::fs::symlink(&stderr, &stdout).unwrap();
+        assert!(validate_owned_spark_logs(root.path()).is_err());
+    }
+
+    #[test]
+    fn owned_spark_private_inputs_cannot_overwrite_or_follow_existing_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("query.scala");
+        owned_spark_write(&file, b"first").unwrap();
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(owned_spark_write(&file, b"replacement").is_err());
+        let link = root.path().join("foreign-link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(owned_spark_write(&link, b"replacement").is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"first");
+    }
 
     #[test]
     fn controlled_environment_preserves_transport_and_private_supply_only() {

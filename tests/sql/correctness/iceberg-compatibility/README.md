@@ -46,3 +46,22 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 ```
+
+
+The visible bag cases use checked-in official Iceberg SDK fixture code under
+`tests/sql/fixtures/mv-visible-content-encodings/fixture.scala`:
+
+- `novarocks_mv_dictionary_encodings` proves controlled dictionary/plain scalar
+  Parquet pages, duplicate content, a real source/target DV, and FULL replacement.
+- `novarocks_mv_visible_content_encodings` adds nullable and empty arrays, maps,
+  structs and array order, checked by complete independent Spark content bags.
+- `novarocks_mv_recursive_schema` checks required recursive children, optional
+  list elements/map values, both map entry orders, actual source/target UUID and
+  schema/field IDs, SDK and Spark complete bags, real retractions and additions,
+  and FULL with exact file summary totals and no delete files.
+
+These cases freeze the fixture publication before Spark invocation and retain
+stage logs/receipts under `reports/uea7b3`. They do not establish a particular
+Arrow array encoding inside the matcher. The system scenario
+`mv/recursive-type-restart` separately covers native lake-only recovery after
+FE replacement and owns each Spark job's exact bounded lifecycle and cleanup.
