@@ -249,6 +249,7 @@ fn fixture(
                 match ty.data_type {
                     DataType::Boolean => LiteralValue::Boolean(false),
                     DataType::Int64 => LiteralValue::Int64(0),
+                    DataType::UInt64 => LiteralValue::UInt64(0),
                     DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
                     _ => {
                         panic!("nonnullable fixture requires an implemented exact numeric literal")
@@ -303,6 +304,7 @@ fn fixture(
             let value = match source_type.data_type {
                 DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Int64 => LiteralValue::Int64(71),
+                DataType::UInt64 => LiteralValue::UInt64(u64::MAX),
                 DataType::Float64 => LiteralValue::Float64Bits((-0.0_f64).to_bits()),
                 _ => panic!("constant fixture requires an implemented exact numeric literal"),
             };
@@ -1048,3 +1050,6 @@ mod cast_float_tests;
 
 #[path = "cast_bool_tests.rs"]
 mod cast_bool_tests;
+
+#[path = "cast_unsigned_tests.rs"]
+mod cast_unsigned_tests;

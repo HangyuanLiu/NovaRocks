@@ -847,3 +847,6 @@ fn float_integer_cast_all_definitions_use_the_frozen_allow_mode_for_successful_n
         }
     }
 }
+
+#[path = "cast_unsigned_tests.rs"]
+mod cast_unsigned_tests;

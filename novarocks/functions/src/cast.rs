@@ -27,6 +27,7 @@ use crate::{
 };
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
 use arrow_schema::DataType;
@@ -121,26 +122,81 @@ impl SignedWidth {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum UnsignedWidth {
+    U8,
+    U16,
+    U32,
+    U64,
+}
+impl UnsignedWidth {
+    fn from_type(ty: &DataType) -> Option<Self> {
+        match ty {
+            DataType::UInt8 => Some(Self::U8),
+            DataType::UInt16 => Some(Self::U16),
+            DataType::UInt32 => Some(Self::U32),
+            DataType::UInt64 => Some(Self::U64),
+            _ => None,
+        }
+    }
+    fn validate(self, array: &dyn Array) -> bool {
+        match self {
+            Self::U8 => array.as_any().is::<UInt8Array>(),
+            Self::U16 => array.as_any().is::<UInt16Array>(),
+            Self::U32 => array.as_any().is::<UInt32Array>(),
+            Self::U64 => array.as_any().is::<UInt64Array>(),
+        }
+    }
+}
+
+/// Successful-NULL obligations of exact primitive carrier casts. This is a
+/// static semantic fact, not an installed runtime capability whitelist.
+pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
+    let integer = |ty: &DataType| match ty {
+        DataType::Int8 => Some((true, 8)),
+        DataType::Int16 => Some((true, 16)),
+        DataType::Int32 => Some((true, 32)),
+        DataType::Int64 => Some((true, 64)),
+        DataType::UInt8 => Some((false, 8)),
+        DataType::UInt16 => Some((false, 16)),
+        DataType::UInt32 => Some((false, 32)),
+        DataType::UInt64 => Some((false, 64)),
+        _ => None,
+    };
+    match (integer(source), integer(target)) {
+        (Some((true, _)), Some((false, _))) => true,
+        (Some((false, source)), Some((true, target))) => target <= source,
+        (Some((_, source)), Some((_, target))) => target < source,
+        (_, Some(_)) if matches!(source, DataType::Float32 | DataType::Float64) => !allow,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
     Boolean,
     Signed(SignedWidth),
+    Unsigned(UnsignedWidth),
     F32,
     F64,
 }
 impl Source {
     fn from_type(ty: &DataType) -> Option<Self> {
-        SignedWidth::from_type(ty).map(Self::Signed).or(match ty {
-            DataType::Boolean => Some(Self::Boolean),
-            DataType::Float32 => Some(Self::F32),
-            DataType::Float64 => Some(Self::F64),
-            _ => None,
-        })
+        SignedWidth::from_type(ty)
+            .map(Self::Signed)
+            .or_else(|| UnsignedWidth::from_type(ty).map(Self::Unsigned))
+            .or(match ty {
+                DataType::Boolean => Some(Self::Boolean),
+                DataType::Float32 => Some(Self::F32),
+                DataType::Float64 => Some(Self::F64),
+                _ => None,
+            })
     }
     fn validate(self, array: &dyn Array) -> bool {
         match self {
             Self::Boolean => array.as_any().is::<BooleanArray>(),
             Self::Signed(width) => width.validate(array),
+            Self::Unsigned(width) => width.validate(array),
             Self::F32 => array.as_any().is::<Float32Array>(),
             Self::F64 => array.as_any().is::<Float64Array>(),
         }
@@ -153,27 +209,32 @@ impl Source {
 enum Target {
     Boolean,
     Signed(SignedWidth),
+    Unsigned(UnsignedWidth),
     F32,
     F64,
 }
 impl Target {
     fn from_type(ty: &DataType) -> Option<Self> {
-        SignedWidth::from_type(ty).map(Self::Signed).or(match ty {
-            DataType::Boolean => Some(Self::Boolean),
-            DataType::Float32 => Some(Self::F32),
-            DataType::Float64 => Some(Self::F64),
-            _ => None,
-        })
+        SignedWidth::from_type(ty)
+            .map(Self::Signed)
+            .or_else(|| UnsignedWidth::from_type(ty).map(Self::Unsigned))
+            .or(match ty {
+                DataType::Boolean => Some(Self::Boolean),
+                DataType::Float32 => Some(Self::F32),
+                DataType::Float64 => Some(Self::F64),
+                _ => None,
+            })
     }
 }
 
-/// Signed narrowing failures are successful NULLs. Floating-to-signed failures
+/// Integer range failures are successful NULLs. Floating-to-integer failures
 /// use the original ALLOW policy independently of the decimal overflow policy.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CastRowResult {
     Null,
     Boolean(bool),
     Signed(i64),
+    Unsigned(u64),
     Float32(f32),
     Float64(f64),
     RowError(RowDataError),
@@ -214,11 +275,11 @@ impl PreparedCastRecipe {
             let target =
                 Target::from_type(&result.data_type).ok_or(CastPrepareError::Unsupported)?;
             work.step()?;
-            let successful_null = match (source_kind, target) {
-                (Source::Signed(source), Target::Signed(target)) => target < source,
-                (Source::F32 | Source::F64, Target::Signed(_)) => !allow_throw_exception,
-                _ => false,
-            };
+            let successful_null = carrier_cast_can_produce_null(
+                &source.data_type,
+                &result.data_type,
+                allow_throw_exception,
+            );
             let valid_nullable = result.nullable || (!source.nullable && !successful_null);
             work.step()?;
             if !valid_nullable {
@@ -270,7 +331,7 @@ impl PreparedCastRecipe {
             context,
             ExpressionEffects {
                 may_raise_row_error: self.source_kind.is_float()
-                    && matches!(self.target, Target::Signed(_))
+                    && matches!(self.target, Target::Signed(_) | Target::Unsigned(_))
                     && self.allow_throw_exception,
                 ..ExpressionEffects::PURE_VALUE
             },
@@ -315,6 +376,15 @@ impl PreparedCastRecipe {
                         Target::Signed(SignedWidth::I64) => {
                             num_cast::<$native, i64>(source).map(CastRowResult::Signed)
                         }
+                        Target::Unsigned(UnsignedWidth::U8) => num_cast::<$native, u8>(source)
+                            .map(|v| CastRowResult::Unsigned(u64::from(v))),
+                        Target::Unsigned(UnsignedWidth::U16) => num_cast::<$native, u16>(source)
+                            .map(|v| CastRowResult::Unsigned(u64::from(v))),
+                        Target::Unsigned(UnsignedWidth::U32) => num_cast::<$native, u32>(source)
+                            .map(|v| CastRowResult::Unsigned(u64::from(v))),
+                        Target::Unsigned(UnsignedWidth::U64) => {
+                            num_cast::<$native, u64>(source).map(CastRowResult::Unsigned)
+                        }
                         Target::F32 => num_cast::<$native, f32>(source).map(CastRowResult::Float32),
                         Target::F64 => num_cast::<$native, f64>(source).map(CastRowResult::Float64),
                     };
@@ -333,10 +403,15 @@ impl PreparedCastRecipe {
                             work.step()?;
                             return Ok(CastRowResult::Boolean(value));
                         }
-                        Target::Signed(SignedWidth::I8) => num_cast::<$native, i8>(source).map(i64::from),
-                        Target::Signed(SignedWidth::I16) => num_cast::<$native, i16>(source).map(i64::from),
-                        Target::Signed(SignedWidth::I32) => num_cast::<$native, i32>(source).map(i64::from),
-                        Target::Signed(SignedWidth::I64) => num_cast::<$native, i64>(source),
+                        Target::Signed(SignedWidth::I8) => num_cast::<$native, i8>(source).map(|v| CastRowResult::Signed(i64::from(v))),
+                        Target::Signed(SignedWidth::I16) => num_cast::<$native, i16>(source).map(|v| CastRowResult::Signed(i64::from(v))),
+                        Target::Signed(SignedWidth::I32) => num_cast::<$native, i32>(source).map(|v| CastRowResult::Signed(i64::from(v))),
+                        Target::Signed(SignedWidth::I64) => num_cast::<$native, i64>(source).map(CastRowResult::Signed),
+                        Target::Unsigned(UnsignedWidth::U8) => num_cast::<$native, u8>(source).map(|v| CastRowResult::Unsigned(u64::from(v))),
+                        Target::Unsigned(UnsignedWidth::U16) => num_cast::<$native, u16>(source).map(|v| CastRowResult::Unsigned(u64::from(v))),
+                        Target::Unsigned(UnsignedWidth::U32) => num_cast::<$native, u32>(source).map(|v| CastRowResult::Unsigned(u64::from(v))),
+                        Target::Unsigned(UnsignedWidth::U64) => num_cast::<$native, u64>(source).map(CastRowResult::Unsigned),
+
                         Target::F32 => {
                             // Same-width identity must not quiet a signaling NaN
                             // by routing it through a different floating width.
@@ -352,7 +427,7 @@ impl PreparedCastRecipe {
                     };
                     work.step()?;
                     match converted {
-                        Some(value) => CastRowResult::Signed(value),
+                        Some(value) => value,
                         None if !self.allow_throw_exception => CastRowResult::Null,
                         None => {
                             let name = match self.target {
@@ -360,6 +435,10 @@ impl PreparedCastRecipe {
                                 Target::Signed(SignedWidth::I16) => "SMALLINT",
                                 Target::Signed(SignedWidth::I32) => "INT",
                                 Target::Signed(SignedWidth::I64) => "BIGINT",
+                                Target::Unsigned(UnsignedWidth::U8) => "TINYINT UNSIGNED",
+                                Target::Unsigned(UnsignedWidth::U16) => "SMALLINT UNSIGNED",
+                                Target::Unsigned(UnsignedWidth::U32) => "INT UNSIGNED",
+                                Target::Unsigned(UnsignedWidth::U64) => "BIGINT UNSIGNED",
                                 _ => return Err(internal("floating cast contains a foreign frozen target")),
                             };
                             work.step()?;
@@ -389,6 +468,7 @@ impl PreparedCastRecipe {
                     let result = match self.target {
                         Target::Boolean => CastRowResult::Boolean(value),
                         Target::Signed(_) => CastRowResult::Signed(i64::from(value)),
+                        Target::Unsigned(_) => CastRowResult::Unsigned(u64::from(value)),
                         Target::F32 => CastRowResult::Float32(f32::from(u8::from(value))),
                         Target::F64 => CastRowResult::Float64(f64::from(u8::from(value))),
                     };
@@ -399,6 +479,10 @@ impl PreparedCastRecipe {
                 Source::Signed(SignedWidth::I16) => convert!(Int16Array, i16),
                 Source::Signed(SignedWidth::I32) => convert!(Int32Array, i32),
                 Source::Signed(SignedWidth::I64) => convert!(Int64Array, i64),
+                Source::Unsigned(UnsignedWidth::U8) => convert!(UInt8Array, u8),
+                Source::Unsigned(UnsignedWidth::U16) => convert!(UInt16Array, u16),
+                Source::Unsigned(UnsignedWidth::U32) => convert!(UInt32Array, u32),
+                Source::Unsigned(UnsignedWidth::U64) => convert!(UInt64Array, u64),
                 Source::F32 => {
                     convert_float!(Float32Array, f32, |value: f32| value, |value: f32| value
                         as f64)
@@ -499,3 +583,7 @@ mod float_identity_tests;
 #[cfg(test)]
 #[path = "cast_bool_tests.rs"]
 mod bool_tests;
+
+#[cfg(test)]
+#[path = "cast_unsigned_tests.rs"]
+mod unsigned_tests;

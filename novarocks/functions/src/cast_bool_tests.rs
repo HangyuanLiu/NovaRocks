@@ -569,10 +569,10 @@ fn bool_cast_checks_concrete_classes_addresses_required_journals_and_nullable_pr
 }
 
 #[test]
-fn bool_cast_does_not_author_nominal_fixed_bytes_unsigned_or_unsupported_operation_capabilities() {
+fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operation_capabilities() {
     let boolean = ty(DataType::Boolean, true);
     for source in [
-        ty(DataType::UInt64, true),
+        ty(DataType::Binary, true),
         ty(DataType::Float16, true),
         ty(DataType::Decimal128(10, 0), true),
         ty(DataType::FixedSizeBinary(16), true),

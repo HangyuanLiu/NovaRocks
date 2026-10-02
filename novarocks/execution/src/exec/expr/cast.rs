@@ -5341,3 +5341,7 @@ mod cast_value_conversion_oracle_tests;
 #[cfg(test)]
 #[path = "cast_bool_oracle_tests.rs"]
 mod cast_bool_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_unsigned_oracle_tests.rs"]
+mod cast_unsigned_oracle_tests;

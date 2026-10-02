@@ -170,36 +170,14 @@ impl ProgramTypedExpressions {
                                 )? {
                                 return Err(ProgramExpressionTypeError::TypeMismatch);
                             }
-                            // This rule describes successful NULLs of signed narrowing,
-                            // independently of the currently installed runtime subset.
-                            let signed_width = |ty: &arrow_schema::DataType| match ty {
-                                arrow_schema::DataType::Int8 => Some(8),
-                                arrow_schema::DataType::Int16 => Some(16),
-                                arrow_schema::DataType::Int32 => Some(32),
-                                arrow_schema::DataType::Int64 => Some(64),
-                                _ => None,
-                            };
+                            // Successful NULLs share the primitive cast semantic author;
+                            // this does not require a dead definition to be runtime-installed.
                             if *operation == novarocks_functions::CastOperation::Carrier
-                                && let (Some(source), Some(target)) = (
-                                    signed_width(&source.data_type),
-                                    signed_width(&value.data_type),
+                                && novarocks_functions::carrier_cast_can_produce_null(
+                                    &source.data_type,
+                                    &value.data_type,
+                                    *allow_throw_exception,
                                 )
-                                && target < source
-                                && !value.nullable
-                            {
-                                return Err(ProgramExpressionTypeError::TypeMismatch);
-                            }
-                            // A nonnullable floating input can still fail safe numeric
-                            // conversion. Only the authored throwing mode turns that
-                            // failure into an error instead of a successful SQL NULL.
-                            if *operation == novarocks_functions::CastOperation::Carrier
-                                && matches!(
-                                    source.data_type,
-                                    arrow_schema::DataType::Float32
-                                        | arrow_schema::DataType::Float64
-                                )
-                                && signed_width(&value.data_type).is_some()
-                                && !allow_throw_exception
                                 && !value.nullable
                             {
                                 return Err(ProgramExpressionTypeError::TypeMismatch);
