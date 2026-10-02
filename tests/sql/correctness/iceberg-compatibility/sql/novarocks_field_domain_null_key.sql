@@ -19,6 +19,7 @@
 -- @order_sensitive=false
 -- @tags=iceberg,field_domain,json,null_map_key,ctas,mv
 -- Reject actual visible NULL keys without advancing the lake publication.
+-- Freeze the full MAP<INT,JSON> expression type explicitly for CTAS and MV.
 
 -- query 1
 -- @skip_result_check=true
@@ -58,7 +59,7 @@ CREATE MATERIALIZED VIEW null_key_mv
 DISTRIBUTED BY HASH(id) BUCKETS 3
 REFRESH DEFERRED MANUAL
 PROPERTIES ('storage_engine'='iceberg')
-AS SELECT id,map{CAST(NULL AS INT):CAST(id AS JSON)} AS m FROM null_key_guard;
+AS SELECT id,CAST(map{CAST(NULL AS INT):CAST(id AS JSON)} AS MAP<INT,JSON>) AS m FROM null_key_guard;
 
 -- query 3
 SELECT id,m FROM null_key_guard;
@@ -93,7 +94,7 @@ INSERT INTO null_key_guard VALUES (5,map{CAST(NULL AS INT):CAST('{}' AS JSON)});
 -- @expect_error=NULL map key
 CREATE TABLE null_key_ctas
 TBLPROPERTIES ("format-version"="3","write.row-lineage"="true") AS
-SELECT map{CAST(NULL AS INT):CAST(id AS JSON)} AS m FROM null_key_guard;
+SELECT CAST(map{CAST(NULL AS INT):CAST(id AS JSON)} AS MAP<INT,JSON>) AS m FROM null_key_guard;
 
 -- query 7
 -- @expect_error=NULL map key
@@ -129,7 +130,7 @@ SELECT id,m FROM null_key_guard;
 -- query 10
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS null_key_domains_${uuid0}.ns_${uuid0}.null_key_mv;
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.null_key_mv;
 DROP TABLE IF EXISTS null_key_domains_${uuid0}.ns_${uuid0}.null_key_ctas FORCE;
 DROP TABLE IF EXISTS null_key_domains_${uuid0}.ns_${uuid0}.null_key_guard FORCE;
 DROP DATABASE null_key_domains_${uuid0}.ns_${uuid0};
