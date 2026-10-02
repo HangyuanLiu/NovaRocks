@@ -59,7 +59,13 @@ fn frozen_field(
 fn frozen_facts(
     location: &str,
     fields: Vec<crate::scan_model::IcebergSchemaFieldDef>,
+    input: &ArrowSchemaRef,
 ) -> FrozenDataWriteFacts {
+    let annotated = crate::schema_mapping::annotate_schema_from_scan_model(
+        input,
+        &crate::scan_model::IcebergSchemaDef { fields },
+    )
+    .unwrap();
     FrozenDataWriteFacts {
         table_location: location.to_string(),
         data_location: format!("{location}/data"),
@@ -67,7 +73,7 @@ fn frozen_facts(
         partition_source_column_names: Vec::new(),
         partition_column_names: Vec::new(),
         transform_exprs: Vec::new(),
-        data_input_schema: IcebergSchemaDef { fields },
+        data_input_schema: Arc::new(iceberg_schema_from_arrow_schema(&annotated).unwrap()),
         parquet_row_group_size_bytes: Some(1024),
     }
 }
@@ -159,6 +165,7 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
             frozen_field(7, "zoned", vec![]),
             frozen_field(8, "variant", vec![]),
         ],
+        &input_schema,
     );
     let ctx =
         staged_write_context_from_frozen_facts(&local_binding(), &input_schema, facts).unwrap();
@@ -305,6 +312,22 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
             "physical storage must not carry a narrow logical label"
         );
     }
+    let zoned_column = builder
+        .parquet_schema()
+        .columns()
+        .iter()
+        .find(|c| c.self_type().get_basic_info().id() == 7)
+        .unwrap();
+    assert!(
+        matches!(
+            zoned_column.logical_type_ref(),
+            Some(LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: true,
+                ..
+            })
+        ),
+        "provider Timestamptz must retain the physical adjusted-to-UTC annotation"
+    );
     let variant_field = builder
         .parquet_schema()
         .root_schema()
@@ -321,7 +344,7 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
     assert_eq!(output_schema.field(1).data_type(), &DataType::Int32);
     assert_eq!(
         output_schema.field(6).data_type(),
-        input_schema.field(6).data_type()
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
     );
     assert!(output_schema.field(0).is_nullable());
     assert_eq!(
@@ -454,6 +477,7 @@ async fn frozen_narrow_identity_partition_writes_standard_int_files_under_exact_
             frozen_field(11, "tiny", vec![]),
             frozen_field(12, "small", vec![]),
         ],
+        &schema,
     );
     facts.partition_source_column_names = vec!["tiny".to_string()];
     facts.partition_column_names = vec!["tiny".to_string()];
@@ -523,5 +547,241 @@ async fn frozen_narrow_identity_partition_writes_standard_int_files_under_exact_
     assert_eq!(
         actual,
         vec![(-128, None), (-128, Some(-32768)), (127, Some(32767))]
+    );
+}
+
+fn recursive_provider_schema() -> Arc<crate::iceberg::spec::Schema> {
+    use crate::iceberg::spec::{NestedField as N, PrimitiveType as P, Type as T};
+    let integer = || T::Primitive(P::Int);
+    let string = || T::Primitive(P::String);
+    let map = |key_id, value_id, required| {
+        T::Map(MapType::new(
+            Arc::new(N::map_key_element(key_id, string())),
+            Arc::new(N::map_value_element(value_id, integer(), required)),
+        ))
+    };
+    Arc::new(
+        crate::iceberg::spec::Schema::builder()
+            .with_schema_id(19)
+            .with_fields(vec![
+                Arc::new(N::optional(
+                    1,
+                    "payload",
+                    T::Struct(StructType::new(vec![
+                        Arc::new(N::required(
+                            2,
+                            "items",
+                            T::List(ListType::new(Arc::new(N::list_element(3, integer(), true)))),
+                        )),
+                        Arc::new(N::required(4, "attrs", map(5, 6, true))),
+                        Arc::new(N::optional(
+                            7,
+                            "detail",
+                            T::Struct(StructType::new(vec![
+                                Arc::new(N::required(8, "code", integer())),
+                                Arc::new(N::optional(9, "note", string())),
+                            ])),
+                        )),
+                    ])),
+                )),
+                Arc::new(N::optional(10, "ordered", map(11, 12, false))),
+            ])
+            .build()
+            .unwrap(),
+    )
+}
+
+fn recursive_runtime_schema(provider: &crate::iceberg::spec::Schema) -> ArrowSchemaRef {
+    fn widen(field: &Field) -> Arc<Field> {
+        let dtype = match field.data_type() {
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(|f| widen(f)).collect()),
+            DataType::List(element) => DataType::List(widen(element)),
+            DataType::Map(entries, sorted) => {
+                let DataType::Struct(children) = entries.data_type() else {
+                    unreachable!()
+                };
+                DataType::Map(
+                    Arc::new(entries.as_ref().clone().with_data_type(DataType::Struct(
+                        children.iter().map(|f| widen(f)).collect(),
+                    ))),
+                    *sorted,
+                )
+            }
+            scalar => scalar.clone(),
+        };
+        Arc::new(field.clone().with_data_type(dtype).with_nullable(true))
+    }
+    let read = crate::schema_mapping::sql_read_schema_from_iceberg(provider).unwrap();
+    Arc::new(Schema::new(
+        read.fields().iter().map(|f| widen(f)).collect::<Vec<_>>(),
+    ))
+}
+
+fn recursive_runtime_map(dtype: &DataType, null_key: bool, nullable_value: bool) -> ArrayRef {
+    use arrow::array::StringArray;
+    let DataType::Map(entries, sorted) = dtype else {
+        unreachable!()
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        unreachable!()
+    };
+    let keys = Arc::new(StringArray::from(vec![if null_key {
+        None
+    } else {
+        Some("key")
+    }])) as ArrayRef;
+    let values = Arc::new(Int32Array::from(vec![if nullable_value {
+        None
+    } else {
+        Some(1)
+    }])) as ArrayRef;
+    let entries_array = StructArray::try_new(fields.clone(), vec![keys, values], None).unwrap();
+    Arc::new(
+        MapArray::try_new(
+            entries.clone(),
+            OffsetBuffer::new(vec![0, 1].into()),
+            entries_array,
+            None,
+            *sorted,
+        )
+        .unwrap(),
+    )
+}
+
+fn recursive_runtime_batch(schema: &ArrowSchemaRef, null_key: bool) -> RecordBatch {
+    use arrow::array::StringArray;
+    let DataType::Struct(fields) = schema.field(0).data_type() else {
+        unreachable!()
+    };
+    let DataType::List(element) = fields[0].data_type() else {
+        unreachable!()
+    };
+    let items = Arc::new(
+        ListArray::try_new(
+            element.clone(),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let attrs = recursive_runtime_map(fields[1].data_type(), null_key, false);
+    let DataType::Struct(detail_fields) = fields[2].data_type() else {
+        unreachable!()
+    };
+    let detail = Arc::new(
+        StructArray::try_new(
+            detail_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let payload =
+        Arc::new(StructArray::try_new(fields.clone(), vec![items, attrs, detail], None).unwrap())
+            as ArrayRef;
+    let ordered = recursive_runtime_map(schema.field(1).data_type(), false, true);
+    RecordBatch::try_new(schema.clone(), vec![payload, ordered]).unwrap()
+}
+
+fn recursive_frozen_facts(
+    location: &str,
+    provider: Arc<crate::iceberg::spec::Schema>,
+) -> FrozenDataWriteFacts {
+    FrozenDataWriteFacts {
+        table_location: location.into(),
+        data_location: format!("{location}/data"),
+        target_partition_spec_id: 7,
+        partition_source_column_names: vec![],
+        partition_column_names: vec![],
+        transform_exprs: vec![],
+        data_input_schema: provider,
+        parquet_row_group_size_bytes: Some(1024),
+    }
+}
+
+#[tokio::test]
+async fn frozen_recursive_writer_preserves_actual_parquet_required_fields() {
+    use parquet::basic::Repetition;
+    let dir = tempfile::tempdir().unwrap();
+    let location = format!("file://{}", dir.path().display());
+    let provider = recursive_provider_schema();
+    let runtime = recursive_runtime_schema(&provider);
+    let ctx = staged_write_context_from_frozen_facts(
+        &local_binding(),
+        &runtime,
+        recursive_frozen_facts(&location, provider.clone()),
+    )
+    .unwrap();
+    let files = crate::commit::data_writer::write_record_batches(
+        &ctx,
+        vec![recursive_runtime_batch(&runtime, false)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(files.len(), 1);
+    let path = files[0].data_file.file_path();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(
+        File::open(path.strip_prefix("file://").unwrap_or(path)).unwrap(),
+    )
+    .unwrap();
+    fn visit(
+        node: &parquet::schema::types::Type,
+        actual: &mut std::collections::BTreeMap<i32, Repetition>,
+    ) {
+        let info = node.get_basic_info();
+        if info.has_id() {
+            assert!(actual.insert(info.id(), info.repetition()).is_none());
+        }
+        if node.is_group() {
+            for child in node.get_fields() {
+                visit(child, actual);
+            }
+        }
+    }
+    let mut actual = std::collections::BTreeMap::new();
+    visit(reader.parquet_schema().root_schema(), &mut actual);
+    assert_eq!(actual.len(), 12);
+    for (id, repetition) in actual {
+        let field = provider.field_by_id(id).unwrap();
+        assert_eq!(
+            repetition,
+            if field.required {
+                Repetition::REQUIRED
+            } else {
+                Repetition::OPTIONAL
+            },
+            "actual footer repetition for {} (id={id})",
+            field.name
+        );
+    }
+    assert_eq!(files[0].data_file.record_count(), 1);
+}
+
+#[tokio::test]
+async fn frozen_recursive_writer_rejects_actual_null_required_map_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let location = format!("file://{}", dir.path().display());
+    let provider = recursive_provider_schema();
+    let runtime = recursive_runtime_schema(&provider);
+    let ctx = staged_write_context_from_frozen_facts(
+        &local_binding(),
+        &runtime,
+        recursive_frozen_facts(&location, provider),
+    )
+    .unwrap();
+    let error = crate::commit::data_writer::write_record_batches(
+        &ctx,
+        vec![recursive_runtime_batch(&runtime, true)],
+    )
+    .await
+    .err()
+    .expect("NULL key must fail before write success");
+    assert!(
+        error.contains("Iceberg MAP keys must be non-null"),
+        "{error}"
     );
 }

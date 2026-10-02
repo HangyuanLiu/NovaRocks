@@ -3984,7 +3984,7 @@ fn data_branch_recipe(
         transforms.push(field.transform.to_string());
     }
     IcebergDataBranchRecipe::try_new(
-        Some(crate::schema_facts::iceberg_schema_def(schema)),
+        Some(schema.clone()),
         sources,
         names,
         transforms,

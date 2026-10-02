@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(fields[1].data_type(), &DataType::LargeBinary);
         assert_eq!(
             fields[2].data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()))
         );
         let DataType::Map(entries, _) = fields[3].data_type() else {
             panic!("map")

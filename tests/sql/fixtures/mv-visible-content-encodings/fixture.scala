@@ -484,7 +484,12 @@ object RecursiveTypeFixture {
           org.apache.iceberg.parquet.ParquetTypeVisitor.visit(raw,visitor)
           require(rawIds.nonEmpty,"No raw Parquet semantic field IDs observed")
           val rawById=rawIds.map(n=>n.get("id").asInt()->n).toMap
-          require(expected.forall(f=>rawById.get(f.id).exists(n=>n.get("repetition").asText()==(if(f.required) "REQUIRED" else "OPTIONAL"))),"Raw Parquet field required/optional fact differs from provider schema")
+          val requirednessMismatches=expected.flatMap { f =>
+            val actual=rawById.get(f.id).map(n=>n.get("repetition").asText()).getOrElse("MISSING")
+            if(actual==(if(f.required) "REQUIRED" else "OPTIONAL")) Vector.empty[String]
+            else Vector("path="+f.path+",id="+f.id+",expected.required="+f.required+",actual.repetition="+actual)
+          }
+          require(requirednessMismatches.isEmpty,"Raw Parquet field required/optional fact differs from provider schema: "+requirednessMismatches.mkString("; "))
           val physical=org.apache.iceberg.parquet.ParquetSchemaUtil.convertAndPrune(raw)
           val observed=facts(physical).map(f=>f.id->f).toMap
           require(expected.forall(f=>observed.get(f.id).contains(f)),"Actual Parquet field IDs, required or recursive shape differ from provider schema")

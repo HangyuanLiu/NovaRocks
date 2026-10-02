@@ -17,4 +17,6 @@
 
 //! One revision authority for every private Iceberg codec.
 
-pub(crate) const ICEBERG_CONTRACT_REVISION: u32 = 2;
+// Complete frozen writer schemas replace the field-ID-only recipe. Older
+// peers must be rejected at the provider compatibility boundary.
+pub(crate) const ICEBERG_CONTRACT_REVISION: u32 = 3;

@@ -107,10 +107,10 @@ fn sql_read_data_type(
     match iceberg_type {
         Type::Primitive(PrimitiveType::Binary) => Ok(DataType::Binary),
         Type::Primitive(PrimitiveType::Variant) => Ok(DataType::LargeBinary),
-        Type::Primitive(PrimitiveType::Timestamptz) => {
+        Type::Primitive(PrimitiveType::Timestamptz) if widen_map_keys => {
             Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
-        Type::Primitive(PrimitiveType::TimestamptzNs) => {
+        Type::Primitive(PrimitiveType::TimestamptzNs) if widen_map_keys => {
             Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
         }
         Type::Primitive(_) => Ok(arrow_type.clone()),
@@ -211,6 +211,9 @@ fn sql_read_data_type(
 /// private serialization. IDs and required remain provider facts, independent
 /// of the read carrier's map-key widening and timestamp normalization.
 pub(crate) fn validate_exact_schema(schema: &crate::iceberg::spec::Schema) -> Result<(), String> {
+    if schema.schema_id() < 0 {
+        return Err("provider schema ID must be nonnegative".into());
+    }
     validate_provider_fields(schema.as_struct().fields().iter().map(AsRef::as_ref))
 }
 
@@ -511,6 +514,46 @@ pub fn apply_name_mapping_to_schema(
         fields,
         schema.metadata().clone(),
     )))
+}
+
+/// Recover the exact provider write projection from one sealed SDK schema.
+/// SQL input carriers can widen required children; that read policy must never
+/// determine Parquet repetition. Preserve input metadata while using the
+/// provider's recursive engine write mapping for types and nullability.
+pub(crate) fn annotate_write_schema_from_iceberg(
+    input: &SchemaRef,
+    provider: &crate::iceberg::spec::Schema,
+) -> Result<SchemaRef, String> {
+    let write = sql_write_schema_from_iceberg(provider)?;
+    let fields = input
+        .fields()
+        .iter()
+        .map(|field| {
+            if is_write_virtual_column(field.name())
+                || reserved_row_lineage_field_id(field)?.is_some()
+            {
+                return Ok(field.as_ref().clone());
+            }
+            let exact = write
+                .fields()
+                .iter()
+                .find(|p| p.name() == field.name())
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg writer field {} is absent from its exact provider schema",
+                        field.name()
+                    )
+                })?;
+            let mut metadata = field.metadata().clone();
+            metadata.extend(exact.metadata().clone());
+            Ok(exact.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let projected = Arc::new(Schema::new_with_metadata(fields, input.metadata().clone()));
+    annotate_schema_from_scan_model(
+        &projected,
+        &crate::schema_facts::iceberg_schema_def(provider),
+    )
 }
 
 /// Re-annotate a generic native writer schema with the frozen Iceberg field-ID

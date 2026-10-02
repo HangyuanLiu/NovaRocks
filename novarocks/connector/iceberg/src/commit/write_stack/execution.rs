@@ -248,12 +248,16 @@ impl IcebergDataStackWriter {
                 "Iceberg data writer handle carries no data branch recipe",
             )
         })?;
-        let input_schema = recipe.input_schema().cloned().ok_or_else(|| {
-            error(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg data writer handle carries no frozen input schema",
-            )
-        })?;
+        let input_schema = recipe
+            .input_schema()
+            .cloned()
+            .map(Arc::new)
+            .ok_or_else(|| {
+                error(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg data writer handle carries no frozen input schema",
+                )
+            })?;
         let binding = execution.binding.for_request(request.context.clone());
         let facts = FrozenDataWriteFacts {
             table_location: handle.table().table_location().to_string(),

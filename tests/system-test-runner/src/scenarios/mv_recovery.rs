@@ -3854,6 +3854,23 @@ fn recursive_files(value: &serde_json::Value, key: &str, delete: bool) -> Result
         let path = recursive_string(file, "path", 4096)?;
         let content = recursive_string(file, "content", 64)?;
         recursive_string(file, "format", 32)?;
+        let spec_id = recursive_required(file, "spec_id")?
+            .as_i64()
+            .context("recursive spec ID is not an exact signed integer")?;
+        if !(0..=i64::from(i32::MAX)).contains(&spec_id) {
+            bail!("recursive spec ID is outside its provider domain");
+        }
+        for key in ["data_sequence", "file_sequence"] {
+            let sequence = recursive_required(file, key)?;
+            if !sequence.is_null() {
+                let number = sequence
+                    .as_i64()
+                    .with_context(|| format!("recursive {key} is not an exact signed integer"))?;
+                if number < 0 {
+                    bail!("recursive {key} is negative");
+                }
+            }
+        }
         let count = recursive_required(file, "record_count")?
             .as_u64()
             .context("recursive record count is not an exact unsigned integer")?;
@@ -3864,6 +3881,11 @@ fn recursive_files(value: &serde_json::Value, key: &str, delete: bool) -> Result
         let identity = if delete {
             if content != "POSITION_DELETES" || recursive_string(file, "format", 32)? != "PUFFIN" {
                 bail!("recursive expected real position DV absent");
+            }
+            let equality_ids = recursive_required(file, "equality_ids")?;
+            if !equality_ids.is_null() && !equality_ids.as_array().is_some_and(|ids| ids.is_empty())
+            {
+                bail!("recursive position DV equality IDs are neither null nor an empty array");
             }
             let referenced = recursive_string(file, "referenced_data_file", 4096)?;
             let offset = recursive_required(file, "content_offset")?
@@ -3886,6 +3908,126 @@ fn recursive_files(value: &serde_json::Value, key: &str, delete: bool) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod recursive_file_receipt_tests {
+    use super::recursive_files;
+    use serde_json::{Value, json};
+
+    fn data_file() -> Value {
+        json!({
+            "path": "s3://private/ns/recursive_source/data/initial.parquet",
+            "content": "DATA",
+            "format": "PARQUET",
+            "spec_id": 0,
+            "record_count": 6,
+            "file_size": 256,
+            "data_sequence": null,
+            "file_sequence": null
+        })
+    }
+
+    fn position_dv() -> Value {
+        json!({
+            "path": "s3://private/ns/recursive_source/data/delete.puffin",
+            "content": "POSITION_DELETES",
+            "format": "PUFFIN",
+            "spec_id": 0,
+            "record_count": 1,
+            "file_size": 256,
+            "data_sequence": null,
+            "file_sequence": null,
+            "referenced_data_file": "s3://private/ns/recursive_source/data/initial.parquet",
+            "content_offset": 8,
+            "content_size": 64,
+            "equality_ids": null
+        })
+    }
+
+    fn validate(file: Value, delete: bool) -> anyhow::Result<()> {
+        recursive_files(&json!({"files": [file]}), "files", delete)
+    }
+
+    #[test]
+    fn explicit_null_sequences_and_position_dv_equality_ids_are_valid() {
+        validate(data_file(), false).unwrap();
+        validate(position_dv(), true).unwrap();
+        let mut dv = position_dv();
+        dv["equality_ids"] = json!([]);
+        validate(dv, true).unwrap();
+        for mut file in [data_file(), position_dv()] {
+            file["spec_id"] = json!(i32::MAX);
+            file["data_sequence"] = json!(0);
+            file["file_sequence"] = json!(i64::MAX);
+            let delete = file["content"] == "POSITION_DELETES";
+            validate(file, delete).unwrap();
+        }
+    }
+
+    #[test]
+    fn required_file_fact_keys_cannot_be_omitted() {
+        for (file, delete) in [(data_file(), false), (position_dv(), true)] {
+            for key in ["spec_id", "data_sequence", "file_sequence"] {
+                let mut missing = file.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert!(
+                    validate(missing, delete).is_err(),
+                    "missing {key}, delete={delete}"
+                );
+            }
+        }
+        let mut missing = position_dv();
+        missing.as_object_mut().unwrap().remove("equality_ids");
+        assert!(validate(missing, true).is_err());
+    }
+
+    #[test]
+    fn spec_id_and_present_sequences_reject_nonintegral_or_out_of_range_values() {
+        for (file, delete) in [(data_file(), false), (position_dv(), true)] {
+            for key in ["spec_id", "data_sequence", "file_sequence"] {
+                let mut invalid = vec![
+                    json!(-1),
+                    json!(0.0),
+                    json!(true),
+                    json!("0"),
+                    json!([]),
+                    json!({}),
+                    json!(u64::MAX),
+                ];
+                if key == "spec_id" {
+                    invalid.extend([Value::Null, json!(i64::from(i32::MAX) + 1)]);
+                }
+                for value in invalid {
+                    let mut malformed = file.clone();
+                    malformed[key] = value.clone();
+                    assert!(
+                        validate(malformed, delete).is_err(),
+                        "accepted invalid {key}={value}, delete={delete}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn position_dv_equality_ids_reject_nonempty_or_scalar_values() {
+        for value in [
+            json!([1]),
+            json!([null]),
+            json!(0),
+            json!(false),
+            json!(""),
+            json!({}),
+        ] {
+            let mut dv = position_dv();
+            dv["equality_ids"] = value.clone();
+            assert!(
+                validate(dv, true).is_err(),
+                "accepted invalid equality_ids={value}"
+            );
+        }
+    }
 }
 fn validate_recursive_receipt(value: &serde_json::Value, stage: &str) -> Result<()> {
     if serde_json::to_vec(value)?.len() > 256 * 1024 {

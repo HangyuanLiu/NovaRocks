@@ -48,7 +48,7 @@ use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::delete_file::IcebergFileFormat;
-use crate::scan_model::IcebergSchemaDef;
+
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
 pub(crate) fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -841,7 +841,7 @@ impl IcebergWriterOutput {
 /// data writer writes through.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
-    input_schema: Option<IcebergSchemaDef>,
+    input_schema: Option<Arc<crate::iceberg::spec::Schema>>,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
@@ -860,12 +860,15 @@ pub struct IcebergDataBranchRecipe {
 
 impl IcebergDataBranchRecipe {
     pub fn try_new(
-        input_schema: Option<IcebergSchemaDef>,
+        input_schema: Option<Arc<crate::iceberg::spec::Schema>>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
         row_lineage: bool,
     ) -> Result<Self, ConnectorError> {
+        if let Some(schema) = &input_schema {
+            crate::schema_mapping::validate_exact_schema(schema).map_err(invalid)?;
+        }
         if partition_source_column_names.len() != partition_column_names.len()
             || partition_column_names.len() != transform_exprs.len()
         {
@@ -891,8 +894,8 @@ impl IcebergDataBranchRecipe {
         })
     }
 
-    pub fn input_schema(&self) -> Option<&IcebergSchemaDef> {
-        self.input_schema.as_ref()
+    pub fn input_schema(&self) -> Option<&crate::iceberg::spec::Schema> {
+        self.input_schema.as_deref()
     }
     pub fn partition_source_column_names(&self) -> &[String] {
         &self.partition_source_column_names
@@ -937,6 +940,14 @@ impl IcebergWriterHandle {
     ) -> Result<Self, ConnectorError> {
         if output.file_format() != IcebergFileFormat::Parquet {
             return Err(invalid("Iceberg data writer must produce Parquet"));
+        }
+        if data
+            .input_schema()
+            .is_some_and(|schema| schema.schema_id() != table.schema_id())
+        {
+            return Err(invalid(
+                "Iceberg data writer schema ID differs from its exact table generation",
+            ));
         }
         Ok(Self {
             branch: IcebergWriteBranch::Data,
