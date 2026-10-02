@@ -262,6 +262,7 @@ pub struct Builder {
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
     receive_header_block_buffer: Option<crate::ReceiveHeaderBlockBuffer>,
     receive_header_field_pool: Option<crate::ReceiveHeaderFieldPool>,
+    receive_header_table_buffer: Option<crate::ReceiveHeaderTableBuffer>,
     receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams due to protocol error across
@@ -392,6 +393,15 @@ where
         let span = tracing::trace_span!("server_handshake");
         let entered = span.enter();
 
+        if let Some(buffer) = &builder.receive_header_table_buffer {
+            if builder.receive_header_field_pool.is_none()
+                || buffer.max_table_bytes()
+                    < builder.settings.header_table_size().unwrap_or(4096) as usize
+            {
+                drop(entered);
+                return Handshake { builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header table buffer requires a field pool and capacity covering the initial and advertised incoming table")))), span };
+            }
+        }
         if let Some(pool) = &builder.receive_header_field_pool {
             if builder.receive_header_block_buffer.is_none()
                 || builder
@@ -435,6 +445,22 @@ where
                 span,
             };
         }
+        let receive_table_buffer = match builder
+            .receive_header_table_buffer
+            .as_ref()
+            .map(crate::ReceiveHeaderTableBuffer::bind)
+            .transpose()
+        {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
         let receive_header_buffer = match builder
             .receive_header_block_buffer
             .as_ref()
@@ -562,6 +588,7 @@ where
             receive_header_buffer.map(|encoded| crate::codec::HeaderBuffers {
                 encoded,
                 fields: receive_field_pool,
+                table: receive_table_buffer,
                 max_list: builder.settings.max_header_list_size().unwrap_or(16 << 20) as usize,
                 max_encoded: builder
                     .max_receive_header_block_size
@@ -869,6 +896,7 @@ impl Builder {
             receive_frame_buffer: None,
             receive_header_block_buffer: None,
             receive_header_field_pool: None,
+            receive_header_table_buffer: None,
             receive_goaway_buffer_pool: None,
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
@@ -1306,12 +1334,31 @@ impl Builder {
         self
     }
 
+    /// Install original typed incoming HPACK table backing. Requires a fixed
+    /// field pool and capacity covering both the initial 4096-byte table and
+    /// the advertised incoming ceiling. Binds once before handshake I/O.
+    pub fn receive_header_table_buffer(
+        &mut self,
+        buffer: crate::ReceiveHeaderTableBuffer,
+    ) -> &mut Self {
+        self.receive_header_table_buffer = Some(buffer);
+        self
+    }
+
     /// Supply fixed retained DATA backing owned through its last Bytes alias.
     /// One pool binds once to one connection. A reused pool or a local receive
     /// frame maximum exceeding its buffer size is refused before handshake I/O.
     /// This does not bound the original codec read or header/write backing.
     pub fn receive_buffer_pool(&mut self, pool: crate::ReceiveBufferPool) -> &mut Self {
         self.receive_buffer_pool = Some(pool);
+        self
+    }
+
+    /// Advertise the maximum incoming HPACK dynamic table size.
+    /// The decoder applies this ceiling when the peer acknowledges SETTINGS;
+    /// the peer still selects its table maximum through an HPACK size update.
+    pub fn header_table_size(&mut self, size: u32) -> &mut Self {
+        self.settings.set_header_table_size(Some(size));
         self
     }
 

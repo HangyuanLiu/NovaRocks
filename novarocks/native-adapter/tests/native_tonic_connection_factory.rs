@@ -217,6 +217,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
         max_frame_size: Some(FRAME_BYTES as u32),
         max_header_list_size: Some(FRAME_BYTES as u32),
         max_receive_header_block_size: Some(FRAME_BYTES),
+        header_table_size: None,
         max_send_header_table_size: Some(0),
         send_header_block_pool: Some(SendHeaderBlockPool::new(FRAME_BYTES, owner.clone())?),
         max_receive_buffered_events: Some(8),
@@ -229,6 +230,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
             owner.clone(),
         )?),
         receive_header_field_pool: None,
+        receive_header_table_buffer: None,
         send_frame_buffer: Some(SendFrameBuffer::new(65536, FRAME_BYTES, owner.clone())?),
         receive_goaway_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner)?),
     })

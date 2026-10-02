@@ -360,6 +360,29 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Advertise the incoming HPACK dynamic table size to the peer.
+    ///
+    /// The initial 4096-byte protocol table remains available before the peer
+    /// acknowledges SETTINGS. This does not configure the outbound encoder.
+    pub fn header_table_size(&mut self, size: u32) -> &mut Self {
+        self.h2_builder.header_table_size = Some(size);
+        self
+    }
+
+    /// Install original-funded fixed incoming HPACK table slots.
+    ///
+    /// Requires the decoded field pool and its fixed raw/encoded input chain.
+    /// Capacity must cover both the initial 4096-byte table and the advertised
+    /// incoming table size. One buffer binds once; escaped field owners and
+    /// HeaderMap storage remain separate. Default None keeps upstream behavior.
+    pub fn receive_header_table_buffer(
+        &mut self,
+        buffer: h2::ReceiveHeaderTableBuffer,
+    ) -> &mut Self {
+        self.h2_builder.receive_header_table_buffer = Some(buffer);
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

@@ -32,3 +32,12 @@ header-list cap are checked. The attempt override takes priority over Endpoint's
 explicit cap, then Hyper's existing 16KiB default; the chosen cap is explicitly
 forwarded. A conflicting cap is rejected before a dial future. Default None and
 existing Status/metadata semantics are unchanged.
+
+
+Each connection factory attempt can also supply receive_header_table_buffer
+and an incoming header_table_size advertisement. Before dialing, apply
+requires the original decoded field pool and table capacity covering the
+advertised ceiling (4096 by default); the constructor separately requires
+capacity for the initial 4096-byte protocol table. Both options move into the
+actual Hyper attempt. Endpoint has no incoming table-size API to inherit.
+Defaults are None, and the outbound table ceiling remains independent.

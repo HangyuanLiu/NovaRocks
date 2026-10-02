@@ -62,6 +62,8 @@ pub(crate) struct Config {
     pub(crate) receive_frame_buffer: Option<h2::ReceiveFrameBuffer>,
     pub(crate) receive_header_block_buffer: Option<h2::ReceiveHeaderBlockBuffer>,
     pub(crate) receive_header_field_pool: Option<h2::ReceiveHeaderFieldPool>,
+    pub(crate) receive_header_table_buffer: Option<h2::ReceiveHeaderTableBuffer>,
+    pub(crate) header_table_size: Option<u32>,
     pub(crate) send_frame_buffer: Option<h2::SendFrameBuffer>,
     pub(crate) receive_goaway_buffer_pool: Option<h2::ReceiveBufferPool>,
     pub(crate) max_header_list_size: u32,
@@ -91,6 +93,8 @@ impl Default for Config {
             receive_frame_buffer: None,
             receive_header_block_buffer: None,
             receive_header_field_pool: None,
+            receive_header_table_buffer: None,
+            header_table_size: None,
             send_frame_buffer: None,
             receive_goaway_buffer_pool: None,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
@@ -173,6 +177,12 @@ where
         }
         if let Some(pool) = &config.receive_header_field_pool {
             builder.receive_header_field_pool(pool.clone());
+        }
+        if let Some(buffer) = &config.receive_header_table_buffer {
+            builder.receive_header_table_buffer(buffer.clone());
+        }
+        if let Some(size) = config.header_table_size {
+            builder.header_table_size(size);
         }
         if let Some(buffer) = &config.receive_frame_buffer {
             builder.receive_frame_buffer(buffer.clone());

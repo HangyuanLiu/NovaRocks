@@ -6,7 +6,6 @@ use http::header;
 use http::method::{self, Method};
 use http::status::{self, StatusCode};
 
-use std::cmp;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::str::Utf8Error;
@@ -15,8 +14,9 @@ use std::str::Utf8Error;
 #[derive(Debug)]
 pub struct Decoder {
     // Protocol indicated that the max table size will update
-    max_size_update: Option<usize>,
+    required_min: Option<usize>,
     last_max_update: usize,
+    can_resize: bool,
     table: Table,
     buffer: BytesMut,
     max_field_size: Option<usize>,
@@ -39,6 +39,7 @@ pub enum DecoderError {
     IntegerOverflow,
     HeaderFieldTooLarge,
     HeaderFieldPoolExhausted,
+    HeaderTableBufferExhausted,
     NeedMore(NeedMore),
 }
 
@@ -142,9 +143,45 @@ enum Representation {
 
 #[derive(Debug)]
 struct Table {
-    entries: VecDeque<Header>,
+    entries: TableEntries,
     size: usize,
     max_size: usize,
+}
+
+#[derive(Debug)]
+enum TableEntries {
+    Default(VecDeque<Header>),
+    Fixed(crate::receive_header_table::BoundHeaderTableBuffer),
+}
+
+impl TableEntries {
+    fn get(&self, index: usize) -> Option<&Header> {
+        match self {
+            Self::Default(entries) => entries.get(index),
+            Self::Fixed(entries) => entries.get(index),
+        }
+    }
+    fn back(&self) -> Option<&Header> {
+        match self {
+            Self::Default(entries) => entries.back(),
+            Self::Fixed(entries) => entries.back(),
+        }
+    }
+    fn pop_back(&mut self) -> Option<Header> {
+        match self {
+            Self::Default(entries) => entries.pop_back(),
+            Self::Fixed(entries) => entries.pop_back(),
+        }
+    }
+    fn push_front(&mut self, header: Header) -> Result<(), DecoderError> {
+        match self {
+            Self::Default(entries) => {
+                entries.push_front(header);
+                Ok(())
+            }
+            Self::Fixed(entries) => entries.push_front(header),
+        }
+    }
 }
 
 struct StringMarker {
@@ -160,8 +197,9 @@ impl Decoder {
     /// Creates a new `Decoder` with all settings set to default values.
     pub fn new(size: usize) -> Decoder {
         Decoder {
-            max_size_update: None,
+            required_min: None,
             last_max_update: size,
+            can_resize: true,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
             max_field_size: None,
@@ -178,14 +216,30 @@ impl Decoder {
         pool: Option<crate::ReceiveHeaderFieldPool>,
     ) -> Self {
         Self {
-            max_size_update: None,
+            required_min: None,
             last_max_update: size,
+            can_resize: true,
             table: Table::new(size),
             buffer: BytesMut::new(),
             max_field_size: Some(max),
             max_encoded_string_size: Some(max_encoded),
             field_pool: pool,
         }
+    }
+
+    /// Install the original typed table before any table entry can allocate.
+    pub(crate) fn new_bounded_with_table(
+        size: usize,
+        max: usize,
+        max_encoded: usize,
+        pool: Option<crate::ReceiveHeaderFieldPool>,
+        table: Option<crate::receive_header_table::BoundHeaderTableBuffer>,
+    ) -> Self {
+        let mut decoder = Self::new_bounded(size, max, max_encoded, pool);
+        if let Some(table) = table {
+            decoder.table.entries = TableEntries::Fixed(table);
+        }
+        decoder
     }
 
     /// Enable pre-allocation field limits and compact string backing.
@@ -212,12 +266,24 @@ impl Decoder {
     /// Queues a potential size update
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
-        let size = match self.max_size_update {
-            Some(v) => cmp::max(v, size),
-            None => size,
-        };
+        // SETTINGS ACK changes the allowed ceiling, not the peer's selected
+        // table maximum or its live entries. Preserve a required minimum even
+        // if a later ACK raises the ceiling before the next header block.
+        self.last_max_update = size;
+        if size < self.table.max_size {
+            self.required_min = Some(self.required_min.map_or(size, |min| min.min(size)));
+        }
+    }
 
-        self.max_size_update = Some(size);
+    pub(crate) fn begin_block(&mut self) {
+        self.can_resize = true;
+    }
+
+    pub(crate) fn finish_block(&self) -> Result<(), DecoderError> {
+        if self.required_min.is_some() {
+            return Err(DecoderError::InvalidMaxDynamicSize);
+        }
+        Ok(())
     }
 
     /// Compatibility entry for existing upstream decoder tests.
@@ -226,7 +292,9 @@ impl Decoder {
     where
         F: FnMut(Header),
     {
-        self.decode_source(src, f)
+        self.begin_block();
+        self.decode_source(src, f)?;
+        self.finish_block()
     }
 
     pub(crate) fn decode_source<S, F>(&mut self, src: &mut S, mut f: F) -> Result<(), DecoderError>
@@ -235,12 +303,6 @@ impl Decoder {
         F: FnMut(Header),
     {
         use self::Representation::*;
-
-        let mut can_resize = true;
-
-        if let Some(size) = self.max_size_update.take() {
-            self.last_max_update = size;
-        }
 
         let span = tracing::trace_span!("hpack::decode");
         let _e = span.enter();
@@ -251,36 +313,40 @@ impl Decoder {
             // At this point we are always at the beginning of the next block
             // within the HPACK data. The type of the block can always be
             // determined from the first byte.
-            match Representation::load(ty)? {
+            let representation = Representation::load(ty)?;
+            if self.required_min.is_some() && !matches!(representation, SizeUpdate) {
+                return Err(DecoderError::InvalidMaxDynamicSize);
+            }
+            match representation {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
                     let entry = self.decode_indexed(src)?;
+                    self.can_resize = false;
                     src.commit();
                     f(entry);
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
                     let entry = self.decode_literal(src, true)?;
 
                     // Insert the header into the table
-                    self.table.insert(entry.clone());
+                    self.table.insert(entry.clone())?;
+                    self.can_resize = false;
                     src.commit();
 
                     f(entry);
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
                     let entry = self.decode_literal(src, false)?;
+                    self.can_resize = false;
                     src.commit();
                     f(entry);
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
                     let entry = self.decode_literal(src, false)?;
+                    self.can_resize = false;
                     src.commit();
 
                     // TODO: Track that this should never be indexed
@@ -289,7 +355,7 @@ impl Decoder {
                 }
                 SizeUpdate => {
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
+                    if !self.can_resize {
                         return Err(DecoderError::InvalidMaxDynamicSize);
                     }
 
@@ -306,7 +372,7 @@ impl Decoder {
     fn process_size_update<S: DecodeSource>(&mut self, buf: &mut S) -> Result<(), DecoderError> {
         let new_size = decode_int(buf, 5)?;
 
-        if new_size > self.last_max_update {
+        if new_size > self.last_max_update || self.required_min.is_some_and(|min| new_size > min) {
             return Err(DecoderError::InvalidMaxDynamicSize);
         }
 
@@ -317,6 +383,7 @@ impl Decoder {
         );
 
         self.table.set_max_size(new_size);
+        self.required_min = None;
 
         Ok(())
     }
@@ -716,7 +783,7 @@ impl DecodeSource for BorrowedSource<'_> {
 impl Table {
     fn new(max_size: usize) -> Table {
         Table {
-            entries: VecDeque::new(),
+            entries: TableEntries::Default(VecDeque::new()),
             size: 0,
             max_size,
         }
@@ -750,17 +817,18 @@ impl Table {
         }
     }
 
-    fn insert(&mut self, entry: Header) {
+    fn insert(&mut self, entry: Header) -> Result<(), DecoderError> {
         let len = entry.len();
 
         self.reserve(len);
 
-        if self.size + len <= self.max_size {
+        if len <= self.max_size {
+            // Reserve has made room; commit the size only after the fixed
+            // typed ring accepted the entry, with no heap fallback.
+            self.entries.push_front(entry)?;
             self.size += len;
-
-            // Track the entry
-            self.entries.push_front(entry);
         }
+        Ok(())
     }
 
     fn set_max_size(&mut self, size: usize) {
@@ -770,7 +838,7 @@ impl Table {
     }
 
     fn reserve(&mut self, size: usize) {
-        while self.size + size > self.max_size {
+        while size > self.max_size || self.size > self.max_size - size {
             match self.entries.pop_back() {
                 Some(last) => {
                     self.size -= last.len();

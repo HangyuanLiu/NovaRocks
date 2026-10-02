@@ -55,3 +55,11 @@ The additive receive_header_field_pool builder option is cloned and forwarded
 on both H2 directions. It preserves the existing explicit Hyper header-list
 limits and leaves HeaderMap/framework allocations separate. Default None does
 not install a pool.
+
+
+Both HTTP/2 directions also forward the optional original typed
+receive_header_table_buffer through their cloned Config. The server builder
+adds header_table_size(u32) to advertise the incoming ceiling, matching the
+existing client API. h2 applies it only on SETTINGS ACK and retains the
+initial 4096-byte table before that ACK. Default buffer and server setting
+remain None; table backing and field payload owners remain independent.

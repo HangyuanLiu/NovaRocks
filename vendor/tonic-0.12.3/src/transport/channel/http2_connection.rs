@@ -20,6 +20,8 @@ pub struct Http2ConnectionConfig {
     pub max_header_list_size: Option<u32>,
     /// Complete HPACK block and literal allocation precheck limit.
     pub max_receive_header_block_size: Option<usize>,
+    /// Advertised incoming HPACK table size; the pre-ACK table starts at 4096.
+    pub header_table_size: Option<u32>,
     /// Local outbound HPACK table ceiling; zero disables dynamic storage.
     pub max_send_header_table_size: Option<u32>,
     /// Fresh fixed whole HPACK block; requires explicit zero outbound table cap.
@@ -39,6 +41,9 @@ pub struct Http2ConnectionConfig {
     /// Fresh fixed decoded field backing, requiring raw/encoded input and a
     /// block maximum. HeaderMap storage and dynamic tables remain separate.
     pub receive_header_field_pool: Option<h2::ReceiveHeaderFieldPool>,
+    /// Fresh fixed incoming HPACK slots, requiring the decoded field pool.
+    /// Capacity covers the initial table and the advertised incoming limit.
+    pub receive_header_table_buffer: Option<h2::ReceiveHeaderTableBuffer>,
     /// Fresh fixed outbound storage and local frame cap; HPACK is separate.
     pub send_frame_buffer: Option<h2::SendFrameBuffer>,
     /// Fresh independent GOAWAY debug backing through the last error alias.
@@ -84,6 +89,13 @@ impl Http2ConnectionConfig {
         } else {
             None
         };
+        if let Some(buffer) = &self.receive_header_table_buffer {
+            if self.receive_header_field_pool.is_none()
+                || self.header_table_size.unwrap_or(4096) as usize > buffer.max_table_bytes()
+            {
+                return Err(invalid("per-connection header table buffer requires a decoded field pool and fitting advertised incoming table size"));
+            }
+        }
         let max_frame = self.max_frame_size.unwrap_or(16384) as usize;
         if !(16384..=16777215).contains(&max_frame) {
             return Err(invalid("invalid per-connection HTTP/2 frame maximum"));
@@ -142,6 +154,9 @@ impl Http2ConnectionConfig {
         if let Some(max) = self.max_receive_header_block_size {
             builder.max_receive_header_block_size(max);
         }
+        if let Some(size) = self.header_table_size {
+            builder.header_table_size(size);
+        }
         if let Some(max) = self.max_send_header_table_size {
             builder.max_send_header_table_size(max);
         }
@@ -163,6 +178,9 @@ impl Http2ConnectionConfig {
         }
         if let Some(pool) = self.receive_header_field_pool {
             builder.receive_header_field_pool(pool);
+        }
+        if let Some(buffer) = self.receive_header_table_buffer {
+            builder.receive_header_table_buffer(buffer);
         }
         if let Some(raw) = self.receive_frame_buffer {
             builder.receive_frame_buffer(raw);

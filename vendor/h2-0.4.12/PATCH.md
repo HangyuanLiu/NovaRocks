@@ -135,3 +135,39 @@ acquire a pooled field. Existing default owned decoding is unchanged.
 This covers original decoded string backing and wrappers only. Dynamic table
 storage, HeaderMap containers, Method/Scheme/Status and complete connection
 metadata remain independently required; Native has not installed this profile.
+
+
+## Original typed incoming dynamic-table backing and block state
+
+ReceiveHeaderTableBuffer is an additive once-bound incoming-table owner. Its
+checked allocation_capacity_bound uses the actual Layout of Option<Header>
+slots, Core and Arc, rather than treating HPACK's logical 32-byte entry
+charge as Rust metadata. Capacity covers the initial 4096-byte table and the
+advertised incoming ceiling. Client/server configuration requires the fixed
+field pool and checks geometry before binding or handshake I/O. The selected
+decoder uses a fixed newest-first ring; insertion, eviction and index lookup
+never grow that typed backing or fall back to VecDeque. Defaults retain the
+upstream VecDeque path. Field payload aliases retain their independent arena.
+
+The once-only bind CAS exclusively extracts the original typed Vec from Core
+into a noncloneable lease. No live table entry is stored in the shared Core.
+The lease declares its typed Vec before its original owner: Vec drop glue
+clears entries and physically frees backing before table credit exits, also
+when a field destructor unwinds. Final strong handles use Arc::into_inner.
+The buffer is not returned or rebound; no table-owner cycle is created.
+
+SETTINGS ACK updates the permitted incoming ceiling without evicting the
+peer-selected table. A necessary reduction preserves both the lowest pending
+ceiling and the latest ceiling. The peer must send a sufficiently small size
+update at the next block start; partial integers do not discharge it. A peer
+already using a smaller selected maximum needs no artificial update.
+HEADERS/PUSH_PROMISE begin block state exactly once; CONTINUATION cannot
+re-enable resizing after a complete field. Only END_HEADERS finishes a block,
+including an empty fragment. Missing, out-of-range or late size updates are
+connection COMPRESSION_ERROR. Existing field-pool resource exhaustion keeps
+its prior PROTOCOL_ERROR mapping. A sticky semantic malformed block continues
+HPACK/table decoding through END_HEADERS before its stream reset.
+
+Only typed table backing is funded here. HTTP HeaderMap, pseudo-header and
+framework/stream/socket/TLS metadata, full Native connection capacity and
+production profile/lane/deadline installation remain separate.

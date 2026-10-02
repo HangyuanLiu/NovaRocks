@@ -80,6 +80,7 @@ enum Continuable {
 pub(crate) struct HeaderBuffers {
     pub(crate) encoded: crate::receive_header::BoundHeaderBlockBuffer,
     pub(crate) fields: Option<crate::ReceiveHeaderFieldPool>,
+    pub(crate) table: Option<crate::receive_header_table::BoundHeaderTableBuffer>,
     pub(crate) max_list: usize,
     pub(crate) max_encoded: usize,
 }
@@ -116,11 +117,12 @@ impl<T> FramedRead<T> {
     fn with_reader(inner: ReadKind<T>, max_frame: usize, headers: Option<HeaderBuffers>) -> Self {
         let (hpack, header_buffer, max_header_list_size, max_header_block_size) = match headers {
             Some(headers) => (
-                hpack::Decoder::new_bounded(
+                hpack::Decoder::new_bounded_with_table(
                     DEFAULT_SETTINGS_HEADER_TABLE_SIZE,
                     headers.max_list,
                     headers.max_encoded,
                     headers.fields,
+                    headers.table,
                 ),
                 Some(headers.encoded),
                 headers.max_list,
@@ -345,23 +347,13 @@ fn decode_frame_input(
             }
             let is_end_headers = frame.is_end_headers();
 
+            hpack.begin_block();
             // Load the HPACK encoded headers
-            match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
-                Ok(_) => {},
-                Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
-                Err(frame::Error::Hpack(hpack::DecoderError::HeaderFieldTooLarge)) => {
-                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
-                },
-                Err(frame::Error::MalformedMessage) => {
-                    let id = $head.stream_id();
-                    proto_err!(stream: "malformed header block; stream={:?}", id);
-                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
-                },
-                Err(e) => {
-                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
-                }
+            let result = frame.load_hpack(&mut payload, max_header_list_size, hpack);
+            if is_end_headers {
+                hpack.finish_block().map_err(|_| Error::library_go_away(Reason::COMPRESSION_ERROR))?;
             }
+            check_header_decode(result, is_end_headers, $head.stream_id())?;
 
             if is_end_headers {
                 frame.into()
@@ -401,9 +393,15 @@ fn decode_frame_input(
                 return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
             }
             let is_end_headers = frame.is_end_headers();
+            hpack.begin_block();
             let result = $buffer.decode(|src, committed| {
                 frame.load_hpack_borrowed(src, committed, max_header_list_size, hpack)
             });
+            if is_end_headers {
+                hpack
+                    .finish_block()
+                    .map_err(|_| Error::library_go_away(Reason::COMPRESSION_ERROR))?;
+            }
             check_header_decode(result, is_end_headers, $head.stream_id())?;
             if is_end_headers {
                 frame.into()
@@ -627,6 +625,11 @@ fn decode_frame_input(
                     partial.frame.load_hpack(buf, max_header_list_size, hpack)
                 }
             };
+            if is_end_headers {
+                hpack
+                    .finish_block()
+                    .map_err(|_| Error::library_go_away(Reason::COMPRESSION_ERROR))?;
+            }
             check_header_decode(result, is_end_headers, head.stream_id())?;
 
             if is_end_headers {
@@ -653,9 +656,12 @@ fn check_header_decode(
     match result {
         Ok(()) => Ok(()),
         Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !end => Ok(()),
-        Err(frame::Error::Hpack(hpack::DecoderError::HeaderFieldTooLarge)) => {
-            Err(Error::library_go_away(Reason::COMPRESSION_ERROR))
-        }
+        Err(frame::Error::Hpack(
+            hpack::DecoderError::HeaderFieldTooLarge | hpack::DecoderError::InvalidMaxDynamicSize,
+        )) => Err(Error::library_go_away(Reason::COMPRESSION_ERROR)),
+        // A semantic stream failure cannot end the connection's HPACK block.
+        // Keep decoding CONTINUATIONs and table insertions until END_HEADERS.
+        Err(frame::Error::MalformedMessage) if !end => Ok(()),
         Err(frame::Error::MalformedMessage) => {
             Err(Error::library_reset(id, Reason::PROTOCOL_ERROR))
         }
