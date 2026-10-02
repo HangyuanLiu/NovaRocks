@@ -74,13 +74,13 @@ impl From<RootUseBindingError> for ControlCodecError {
 fn required(value: Option<u32>, message: &'static str) -> Result<u32, ControlCodecError> {
     value.ok_or(ControlCodecError::InvalidShape(message))
 }
-fn encode_demand(demand: EvaluationDemand) -> i32 {
+pub(crate) fn encode_demand(demand: EvaluationDemand) -> i32 {
     match demand {
         EvaluationDemand::Value => wire::EvaluationDemand::Value as i32,
         EvaluationDemand::TruthOnly => wire::EvaluationDemand::TruthOnly as i32,
     }
 }
-fn decode_demand(demand: i32) -> Result<EvaluationDemand, ControlCodecError> {
+pub(crate) fn decode_demand(demand: i32) -> Result<EvaluationDemand, ControlCodecError> {
     match wire::EvaluationDemand::try_from(demand) {
         Ok(wire::EvaluationDemand::Value) => Ok(EvaluationDemand::Value),
         Ok(wire::EvaluationDemand::TruthOnly) => Ok(EvaluationDemand::TruthOnly),
@@ -202,7 +202,7 @@ fn decode_guard(guard: &wire::DomainGuard) -> Result<DomainGuard, ControlCodecEr
     };
     Ok(DomainGuard { owner, kind })
 }
-fn encode_site(site: ExpressionRootSite) -> wire::RootSite {
+pub(crate) fn encode_site(site: ExpressionRootSite) -> wire::RootSite {
     use wire::root_site::Role;
     let role = match site.role {
         ExpressionRootRole::ScanResidual { predicate } => Role::ScanResidual(predicate),
@@ -263,7 +263,7 @@ fn encode_site(site: ExpressionRootSite) -> wire::RootSite {
         role: Some(role),
     }
 }
-fn decode_site(site: &wire::RootSite) -> Result<ExpressionRootSite, ControlCodecError> {
+pub(crate) fn decode_site(site: &wire::RootSite) -> Result<ExpressionRootSite, ControlCodecError> {
     use wire::root_site::Role;
     let node = NodeId::new(required(site.node_id, "root node is missing")?);
     let role = match site
