@@ -90,6 +90,7 @@ use crate::sdk_control::{PaimonSdkExecutionResources, PaimonSdkReadControl};
 use crate::split_source::{PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits};
 use crate::wire::read::PaimonReadWireCodec;
 
+mod program_recipe;
 mod recipe;
 pub use recipe::PaimonReadRecipeCompiler;
 
