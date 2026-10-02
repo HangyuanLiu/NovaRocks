@@ -47,3 +47,6 @@ Both connection builders expose max_send_header_table_size(u32), default None, p
 ## Complete outbound HPACK block pool forwarding
 
 Both connection builders expose send_header_block_pool(h2::SendHeaderBlockPool), default None. Cloned private Config preserves and forwards the original once-bound owner; h2 requires an explicit outbound table ceiling of zero. Real peers decode multi-frame blocks and original Worker grants stay held through actual connection exit and remaining builder/pool handles. The independent fixed writer owns copied wire bytes. HTTP metadata, inbound decoding and complete Native connection ownership remain separate; product defaults and performance acceptance are unchanged.
+
+
+Both HTTP/2 builders and cloned h2 configs forward receive_header_block_buffer to h2. A fresh original fixed encoded input buffer is supplied per connection, independently of raw frame/DATA/GOAWAY/send owners; h2 validates fixed raw input and an explicit positive block maximum before binding/I/O. Default None preserves the owned decoder. Decoded HTTP/HPACK storage and complete Native profile remain separate.

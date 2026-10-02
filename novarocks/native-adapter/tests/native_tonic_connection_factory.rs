@@ -22,7 +22,10 @@
 //! HPACK and Tonic/Hyper/error metadata are separate. Watchdogs only fail hangs.
 
 use bytes::Bytes;
-use h2::{ReceiveBufferPool, ReceiveFrameBuffer, SendFrameBuffer, SendHeaderBlockPool};
+use h2::{
+    ReceiveBufferPool, ReceiveFrameBuffer, ReceiveHeaderBlockBuffer, SendFrameBuffer,
+    SendHeaderBlockPool,
+};
 use hyper::body::Body;
 use hyper::http::{Request, Response, Uri};
 use hyper::rt::Executor;
@@ -193,6 +196,7 @@ fn connector(
 }
 fn attempt_bytes() -> usize {
     ReceiveFrameBuffer::allocation_capacity_bound(FRAME_BYTES).unwrap()
+        + ReceiveHeaderBlockBuffer::allocation_capacity_bound(FRAME_BYTES).unwrap()
         + SendFrameBuffer::allocation_capacity_bound(65536, FRAME_BYTES).unwrap()
         + SendHeaderBlockPool::allocation_capacity_bound(FRAME_BYTES).unwrap()
         + 2 * ReceiveBufferPool::allocation_capacity_bound(2, FRAME_BYTES).unwrap()
@@ -220,6 +224,10 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
         retain_data_payloads: true,
         receive_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner.clone())?),
         receive_frame_buffer: Some(ReceiveFrameBuffer::new(FRAME_BYTES, owner.clone())?),
+        receive_header_block_buffer: Some(ReceiveHeaderBlockBuffer::new(
+            FRAME_BYTES,
+            owner.clone(),
+        )?),
         send_frame_buffer: Some(SendFrameBuffer::new(65536, FRAME_BYTES, owner.clone())?),
         receive_goaway_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner)?),
     })
@@ -367,7 +375,7 @@ async fn factory_rejection_happens_before_connector_call_or_owned_io() {
 
 #[tokio::test]
 async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant() {
-    for case in 0..13 {
+    for case in 0..17 {
         let original_budget = budget(1);
         let factory_budget = original_budget.clone();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -378,7 +386,12 @@ async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant(
                     0 => config.max_frame_size = Some(0),
                     1 => config.max_frame_size = Some(16383),
                     2 => config.max_frame_size = Some(16777216),
-                    3 => config.max_receive_header_block_size = Some(0),
+                    3 => {
+                        // Preserve the scalar-only check independently of the
+                        // new owned workspace geometry checks below.
+                        config.receive_header_block_buffer = None;
+                        config.max_receive_header_block_size = Some(0);
+                    }
                     4 => config.max_receive_buffered_events = Some(0),
                     5 => config.max_send_buffer_size = Some(usize::MAX),
                     6 => config.max_frame_size = Some(32768),
@@ -393,11 +406,19 @@ async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant(
                         // Isolate GOAWAY geometry from DATA and raw input.
                         config.receive_buffer_pool = None;
                         config.receive_frame_buffer = None;
+                        config.receive_header_block_buffer = None;
                         config.max_frame_size = Some(32768);
                     }
-                    10 => config.max_receive_header_block_size = Some(usize::MAX),
+                    10 => {
+                        config.receive_header_block_buffer = None;
+                        config.max_receive_header_block_size = Some(usize::MAX);
+                    }
                     11 => config.max_send_header_table_size = None,
                     12 => config.max_send_header_table_size = Some(1),
+                    13 => config.receive_frame_buffer = None,
+                    14 => config.max_receive_header_block_size = None,
+                    15 => config.max_receive_header_block_size = Some(0),
+                    16 => config.max_receive_header_block_size = Some(FRAME_BYTES + 1),
                     _ => unreachable!(),
                 }
                 Ok::<_, io::Error>(config)
@@ -413,6 +434,12 @@ async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant(
             format!("{error:?}").contains("per-connection"),
             "case {case}: {error:?}"
         );
+        if case >= 13 {
+            assert!(
+                format!("{error:?}").contains("encoded header buffer requires"),
+                "case {case} must refuse at the owned encoded-input geometry gate: {error:?}"
+            );
+        }
         assert_eq!(
             calls.load(Ordering::Acquire),
             0,
@@ -547,6 +574,111 @@ async fn reusing_a_once_bound_pool_refuses_after_dial_before_the_next_preface() 
     drop(endpoint);
     drop(pool);
     reserve_all(&original_budget, pool_bytes);
+}
+
+#[tokio::test]
+async fn reused_header_workspace_alone_proves_actual_factory_forwarding() {
+    let carrier_bytes = Bytes::owner_with_exit_guard_metadata_size::<Bytes, ResultWriteCredit>();
+    let header_bytes =
+        ReceiveHeaderBlockBuffer::allocation_capacity_bound(FRAME_BYTES).unwrap() + carrier_bytes;
+    let raw_bytes =
+        ReceiveFrameBuffer::allocation_capacity_bound(FRAME_BYTES).unwrap() + carrier_bytes;
+    let total = header_bytes + 2 * raw_bytes;
+    let original_budget = ResultRetainedBudget::new(NonZeroUsize::new(total).unwrap());
+    let ResultWriteAdmission::Granted(header_credit) =
+        original_budget.try_reserve_process(header_bytes).unwrap()
+    else {
+        panic!("original header workspace pregrant");
+    };
+    let header = ReceiveHeaderBlockBuffer::new(
+        FRAME_BYTES,
+        Bytes::from_owner_with_exit_guard(Bytes::new(), header_credit),
+    )
+    .unwrap();
+    let shared_header = header.clone();
+    let factory_budget = original_budget.clone();
+    let factories = Arc::new(AtomicUsize::new(0));
+    let factory_calls = factories.clone();
+    let executor = ManualExecutor::default();
+    let endpoint = Endpoint::from_static("http://localhost")
+        .executor(executor.clone())
+        .http2_connection_factory(move || {
+            factory_calls.fetch_add(1, Ordering::AcqRel);
+            let ResultWriteAdmission::Granted(raw_credit) = factory_budget
+                .try_reserve_process(raw_bytes)
+                .map_err(io::Error::other)?
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "fresh raw pregrant unavailable",
+                ));
+            };
+            // Every raw input is fresh. The header workspace is the ONLY reused
+            // once-bound object; no DATA/GOAWAY/writer/outbound pool can mask a
+            // missing Tonic -> Hyper -> h2 header-workspace forwarding seam.
+            Ok::<_, io::Error>(Http2ConnectionConfig {
+                max_frame_size: Some(FRAME_BYTES as u32),
+                max_header_list_size: Some(FRAME_BYTES as u32),
+                max_receive_header_block_size: Some(FRAME_BYTES),
+                receive_frame_buffer: Some(ReceiveFrameBuffer::new(
+                    FRAME_BYTES,
+                    Bytes::from_owner_with_exit_guard(Bytes::new(), raw_credit),
+                )?),
+                receive_header_block_buffer: Some(shared_header.clone()),
+                ..Default::default()
+            })
+        });
+    let (first, first_peer, first_exit) = io_pair();
+    let (second, mut second_peer, second_exit) = io_pair();
+    let (first_close, first_join) = response_peer(first_peer, b"decoded with original workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inputs = Arc::new(Mutex::new(VecDeque::from([first, second])));
+    let channel = endpoint
+        .clone()
+        .connect_with_connector(connector(inputs.clone(), calls.clone()))
+        .await
+        .unwrap();
+    let response = drive(&executor, channel.clone().oneshot(boxed_request()))
+        .await
+        .unwrap();
+    let data = first_data(&executor, response).await;
+    assert_eq!(data.as_ref(), b"decoded with original workspace");
+    drop(data);
+    first_close.send(()).unwrap();
+    first_join.await.unwrap();
+    drive(&executor, first_exit).await.unwrap();
+    drop(channel);
+    drain(&executor).await;
+    reserve_all(&original_budget, 2 * raw_bytes);
+    blocked(&original_budget, total);
+
+    let error = endpoint
+        .clone()
+        .connect_with_connector(connector(inputs, calls.clone()))
+        .await
+        .unwrap_err();
+    let diagnostic = format!("{error:?}");
+    assert!(
+        diagnostic.contains("encoded header buffer already bound"),
+        "{diagnostic}"
+    );
+    assert_eq!(factories.load(Ordering::Acquire), 2);
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        2,
+        "once-bind refusal follows an actual fresh dial"
+    );
+    second_exit.await.unwrap();
+    assert_eq!(
+        second_peer.read(&mut [0]).await.unwrap(),
+        0,
+        "reused header workspace must refuse before the second preface"
+    );
+    drop(error);
+    drop(endpoint);
+    drop(header);
+    drain(&executor).await;
+    reserve_all(&original_budget, total);
 }
 
 #[tokio::test]

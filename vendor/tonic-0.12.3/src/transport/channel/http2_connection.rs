@@ -34,6 +34,8 @@ pub struct Http2ConnectionConfig {
     pub receive_buffer_pool: Option<h2::ReceiveBufferPool>,
     /// Fresh fixed raw frame input, independent of decoded frame copies.
     pub receive_frame_buffer: Option<h2::ReceiveFrameBuffer>,
+    /// Fresh original encoded input, requiring fixed raw input and block maximum.
+    pub receive_header_block_buffer: Option<h2::ReceiveHeaderBlockBuffer>,
     /// Fresh fixed outbound storage and local frame cap; HPACK is separate.
     pub send_frame_buffer: Option<h2::SendFrameBuffer>,
     /// Fresh independent GOAWAY debug backing through the last error alias.
@@ -46,6 +48,15 @@ impl Http2ConnectionConfig {
             return Err(invalid(
                 "per-connection send header block pool requires explicit max_send_header_table_size(0)",
             ));
+        }
+        if let Some(buffer) = &self.receive_header_block_buffer {
+            if self.receive_frame_buffer.is_none()
+                || self
+                    .max_receive_header_block_size
+                    .is_none_or(|max| max == 0 || max > buffer.max_encoded_bytes())
+            {
+                return Err(invalid("per-connection encoded header buffer requires fixed raw input and a valid explicit block maximum"));
+            }
         }
         let max_frame = self.max_frame_size.unwrap_or(16384) as usize;
         if !(16384..=16777215).contains(&max_frame) {
@@ -120,6 +131,9 @@ impl Http2ConnectionConfig {
         builder.retain_data_payloads(self.retain_data_payloads);
         if let Some(pool) = self.receive_buffer_pool {
             builder.receive_buffer_pool(pool);
+        }
+        if let Some(buffer) = self.receive_header_block_buffer {
+            builder.receive_header_block_buffer(buffer);
         }
         if let Some(raw) = self.receive_frame_buffer {
             builder.receive_frame_buffer(raw);

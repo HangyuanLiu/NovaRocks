@@ -540,6 +540,16 @@ where
         self
     }
 
+    /// Install fixed encoded header input; requires fixed raw input and an
+    /// explicit block maximum. Supply a fresh buffer for each connection.
+    pub fn receive_header_block_buffer(
+        &mut self,
+        buffer: h2::ReceiveHeaderBlockBuffer,
+    ) -> &mut Self {
+        self.h2_builder.receive_header_block_buffer = Some(buffer);
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

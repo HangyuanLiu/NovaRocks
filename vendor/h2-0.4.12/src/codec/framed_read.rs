@@ -36,6 +36,7 @@ pub struct FramedRead<T> {
     max_header_block_size: Option<usize>,
     receive_pool: Option<crate::ReceiveBufferPool>,
     goaway_pool: Option<crate::ReceiveBufferPool>,
+    header_buffer: Option<crate::receive_header::BoundHeaderBlockBuffer>,
 }
 
 enum ReadKind<T> {
@@ -58,10 +59,16 @@ struct Partial {
     frame: Continuable,
 
     /// Partial header payload
-    buf: BytesMut,
+    buf: HeaderInput,
 
     continuation_frames_count: usize,
     encoded_len: usize,
+}
+
+#[derive(Debug)]
+enum HeaderInput {
+    Owned(BytesMut),
+    Fixed,
 }
 
 #[derive(Debug)]
@@ -101,6 +108,7 @@ impl<T> FramedRead<T> {
             max_header_block_size: None,
             receive_pool: None,
             goaway_pool: None,
+            header_buffer: None,
         }
     }
 
@@ -127,6 +135,13 @@ impl<T> FramedRead<T> {
     pub(crate) fn set_goaway_pool(&mut self, pool: crate::ReceiveBufferPool) {
         assert!(self.max_frame_size() <= pool.buffer_capacity_bytes());
         self.goaway_pool = Some(pool);
+    }
+
+    pub(crate) fn set_header_buffer(
+        &mut self,
+        buffer: crate::receive_header::BoundHeaderBlockBuffer,
+    ) {
+        self.header_buffer = Some(buffer);
     }
 
     /// Limit a complete encoded block and each decoded field before allocation.
@@ -218,6 +233,7 @@ impl FrameInput<'_> {
 struct DecodePools<'a> {
     data: Option<&'a crate::ReceiveBufferPool>,
     goaway: Option<&'a crate::ReceiveBufferPool>,
+    headers: Option<&'a mut crate::receive_header::BoundHeaderBlockBuffer>,
 }
 
 /// Decodes a frame.
@@ -241,6 +257,7 @@ fn decode_frame(
         DecodePools {
             data: None,
             goaway: goaway_pool,
+            headers: None,
         },
         FrameInput::Owned(bytes),
     )
@@ -252,7 +269,7 @@ fn decode_frame_input(
     max_continuation_frames: usize,
     max_header_block_size: Option<usize>,
     partial_inout: &mut Option<Partial>,
-    pools: DecodePools<'_>,
+    mut pools: DecodePools<'_>,
     bytes: FrameInput<'_>,
 ) -> Result<Option<Frame>, Error> {
     let goaway_pool = pools.goaway;
@@ -325,7 +342,7 @@ fn decode_frame_input(
                 // Defer returning the frame
                 *partial_inout = Some(Partial {
                     frame: Continuable::$frame(frame),
-                    buf: payload,
+                    buf: HeaderInput::Owned(payload),
                     continuation_frames_count: 0,
                     encoded_len,
                 });
@@ -333,6 +350,45 @@ fn decode_frame_input(
                 return Ok(None);
             }
         });
+    }
+
+    macro_rules! fixed_header_block {
+        ($frame:ident, $head:ident, $bytes:ident, $buffer:ident) => {{
+            let (mut frame, payload) =
+                match frame::$frame::load_borrowed($head, &$bytes[frame::HEADER_LEN..]) {
+                    Ok(res) => res,
+                    Err(frame::Error::InvalidDependencyId) => {
+                        return Err(Error::library_reset(
+                            $head.stream_id(),
+                            Reason::PROTOCOL_ERROR,
+                        ))
+                    }
+                    Err(_) => return Err(Error::library_go_away(Reason::PROTOCOL_ERROR)),
+                };
+            $buffer.reset();
+            let encoded_len = payload.len();
+            if max_header_block_size.is_some_and(|max| encoded_len > max)
+                || !$buffer.append(payload)
+            {
+                return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+            }
+            let is_end_headers = frame.is_end_headers();
+            let result = $buffer.decode(|src, committed| {
+                frame.load_hpack_borrowed(src, committed, max_header_list_size, hpack)
+            });
+            check_header_decode(result, is_end_headers, $head.stream_id())?;
+            if is_end_headers {
+                frame.into()
+            } else {
+                *partial_inout = Some(Partial {
+                    frame: Continuable::$frame(frame),
+                    buf: HeaderInput::Fixed,
+                    continuation_frames_count: 0,
+                    encoded_len,
+                });
+                return Ok(None);
+            }
+        }};
     }
 
     let frame = match kind {
@@ -384,10 +440,13 @@ fn decode_frame_input(
             })?
             .into()
         }
-        Kind::Headers => {
-            let mut bytes = bytes.into_owned();
-            header_block!(Headers, head, bytes)
-        }
+        Kind::Headers => match pools.headers.as_deref_mut() {
+            Some(buffer) => fixed_header_block!(Headers, head, bytes, buffer),
+            None => {
+                let mut bytes = bytes.into_owned();
+                header_block!(Headers, head, bytes)
+            }
+        },
         Kind::Reset => {
             let res = frame::Reset::load(head, &bytes[frame::HEADER_LEN..]);
             res.map_err(|e| {
@@ -418,10 +477,13 @@ fn decode_frame_input(
             })?
             .into()
         }
-        Kind::PushPromise => {
-            let mut bytes = bytes.into_owned();
-            header_block!(PushPromise, head, bytes)
-        }
+        Kind::PushPromise => match pools.headers.as_deref_mut() {
+            Some(buffer) => fixed_header_block!(PushPromise, head, bytes, buffer),
+            None => {
+                let mut bytes = bytes.into_owned();
+                header_block!(PushPromise, head, bytes)
+            }
+        },
         Kind::Priority => {
             if head.stream_id() == 0 {
                 // Invalid stream identifier
@@ -446,7 +508,6 @@ fn decode_frame_input(
             }
         }
         Kind::Continuation => {
-            let mut bytes = bytes.into_owned();
             let is_end_headers = (head.flag() & 0x4) == 0x4;
 
             let mut partial = match partial_inout.take() {
@@ -489,51 +550,56 @@ fn decode_frame_input(
                 partial.encoded_len = total;
             }
 
-            // Extend the buf
-            if partial.buf.is_empty() {
-                partial.buf = bytes.split_off(frame::HEADER_LEN);
-            } else {
-                if partial.frame.is_over_size() {
-                    // If there was left over bytes previously, they may be
-                    // needed to continue decoding, even though we will
-                    // be ignoring this frame. This is done to keep the HPACK
-                    // decoder state up-to-date.
-                    //
-                    // Still, we need to be careful, because if a malicious
-                    // attacker were to try to send a gigantic string, such
-                    // that it fits over multiple header blocks, we could
-                    // grow memory uncontrollably again, and that'd be a shame.
-                    //
-                    // Instead, we use a simple heuristic to determine if
-                    // we should continue to ignore decoding, or to tell
-                    // the attacker to go away.
-                    if partial.buf.len() + bytes.len() > max_header_list_size {
-                        proto_err!(conn: "CONTINUATION frame header block size over ignorable limit");
+            let result = match &mut partial.buf {
+                HeaderInput::Fixed => {
+                    let buffer = pools
+                        .headers
+                        .as_deref_mut()
+                        .expect("fixed partial header buffer installed");
+                    if !buffer.append(&bytes[frame::HEADER_LEN..]) {
                         return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
                     }
+                    buffer.decode(|src, committed| {
+                        partial.frame.load_hpack_borrowed(
+                            src,
+                            committed,
+                            max_header_list_size,
+                            hpack,
+                        )
+                    })
                 }
-                partial.buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);
-            }
+                HeaderInput::Owned(buf) => {
+                    let mut bytes = bytes.into_owned();
+                    // Extend the buf
+                    if buf.is_empty() {
+                        *buf = bytes.split_off(frame::HEADER_LEN);
+                    } else {
+                        if partial.frame.is_over_size() {
+                            // If there was left over bytes previously, they may be
+                            // needed to continue decoding, even though we will
+                            // be ignoring this frame. This is done to keep the HPACK
+                            // decoder state up-to-date.
+                            //
+                            // Still, we need to be careful, because if a malicious
+                            // attacker were to try to send a gigantic string, such
+                            // that it fits over multiple header blocks, we could
+                            // grow memory uncontrollably again, and that'd be a shame.
+                            //
+                            // Instead, we use a simple heuristic to determine if
+                            // we should continue to ignore decoding, or to tell
+                            // the attacker to go away.
+                            if buf.len() + bytes.len() > max_header_list_size {
+                                proto_err!(conn: "CONTINUATION frame header block size over ignorable limit");
+                                return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                            }
+                        }
+                        buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);
+                    }
 
-            match partial
-                .frame
-                .load_hpack(&mut partial.buf, max_header_list_size, hpack)
-            {
-                Ok(_) => {}
-                Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
-                Err(frame::Error::Hpack(hpack::DecoderError::HeaderFieldTooLarge)) => {
-                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                    partial.frame.load_hpack(buf, max_header_list_size, hpack)
                 }
-                Err(frame::Error::MalformedMessage) => {
-                    let id = head.stream_id();
-                    proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
-                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
-                }
-                Err(e) => {
-                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
-                }
-            }
+            };
+            check_header_decode(result, is_end_headers, head.stream_id())?;
 
             if is_end_headers {
                 partial.frame.into()
@@ -549,6 +615,24 @@ fn decode_frame_input(
     };
 
     Ok(Some(frame))
+}
+
+fn check_header_decode(
+    result: Result<(), frame::Error>,
+    end: bool,
+    id: frame::StreamId,
+) -> Result<(), Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !end => Ok(()),
+        Err(frame::Error::Hpack(hpack::DecoderError::HeaderFieldTooLarge)) => {
+            Err(Error::library_go_away(Reason::COMPRESSION_ERROR))
+        }
+        Err(frame::Error::MalformedMessage) => {
+            Err(Error::library_reset(id, Reason::PROTOCOL_ERROR))
+        }
+        Err(_) => Err(Error::library_go_away(Reason::PROTOCOL_ERROR)),
+    }
 }
 
 impl<T> Stream for FramedRead<T>
@@ -574,6 +658,7 @@ where
                 max_header_block_size,
                 goaway_pool,
                 receive_pool,
+                header_buffer,
                 ..
             } = &mut *self;
             let (decoded, needs_data_copy) = match inner {
@@ -607,6 +692,7 @@ where
                             DecodePools {
                                 data: receive_pool.as_ref(),
                                 goaway: goaway_pool.as_ref(),
+                                headers: header_buffer.as_mut(),
                             },
                             FrameInput::Borrowed(bytes),
                         )
@@ -670,6 +756,19 @@ impl Continuable {
         match *self {
             Continuable::Headers(ref h) => h.is_over_size(),
             Continuable::PushPromise(ref p) => p.is_over_size(),
+        }
+    }
+
+    fn load_hpack_borrowed(
+        &mut self,
+        src: &[u8],
+        committed: &mut usize,
+        max: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), frame::Error> {
+        match self {
+            Self::Headers(frame) => frame.load_hpack_borrowed(src, committed, max, decoder),
+            Self::PushPromise(frame) => frame.load_hpack_borrowed(src, committed, max, decoder),
         }
     }
 

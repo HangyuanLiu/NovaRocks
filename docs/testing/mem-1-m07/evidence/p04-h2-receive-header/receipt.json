@@ -1,0 +1,168 @@
+{
+  "parent_commit": "6c7752a274a0d6e72db7eea61f6dd17619a5d730",
+  "scope": "P04 original fixed encoded inbound HEADERS/CONTINUATION input; shared borrowed incremental HPACK; sticky malformed evidence",
+  "validation": {
+    "protocol": 108,
+    "native_lib": 574,
+    "worker_lib": 313,
+    "nonduplicate_workspace": 995,
+    "fixed_input_system": 9,
+    "fixed_input_miri": 9,
+    "actual_shared_hpack_system": 9,
+    "actual_shared_hpack_miri": 9,
+    "vendor_lib_strict_clippy_exit": 0,
+    "native_all_target_normal_clippy_exit": 0,
+    "new_test_clippy_diagnostics": 0,
+    "workspace_all_target_check_exit": 0,
+    "root_vendor_fmt_exit": 0,
+    "fixture_bom_exit": 0,
+    "doc_scan_exit": 1,
+    "doc_scan_matches": 0
+  },
+  "negatives": {
+    "production_classes": [
+      {
+        "name": "tonic-forward",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_tonic_connection_factory",
+          "reused_header_workspace_alone_proves_actual_factory_forwarding",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "exit": 101,
+        "runtime_failed": true,
+        "restored_sha256": "05582941a93975aff3daf3b73a2fc7b74599ff2f01e5e5264ded5bfa5334cb2f"
+      },
+      {
+        "name": "hyper-client-forward",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_tonic_connection_factory",
+          "reused_header_workspace_alone_proves_actual_factory_forwarding",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "exit": 101,
+        "runtime_failed": true,
+        "restored_sha256": "b2ef99b6bf062642aeebf1108dc5bbddc7e50f8bbfe1c5aacfd3b58a4be1af66"
+      },
+      {
+        "name": "client-codec-install",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_h2_receive_header_block",
+          "client_actual_static_decoder_consumption_has_no_independent_full_frame_allocation",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "exit": 101,
+        "runtime_failed": true,
+        "restored_sha256": "c8933e0cc2143c8547db14041a374887c2fdb091a306deeb8456d02a1513a2b6"
+      },
+      {
+        "name": "lost-malformed-state",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_h2_receive_header_block",
+          "fragmented_malformed_header_remains_sticky_in_fixed_and_default_modes",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "exit": 101,
+        "runtime_failed": true,
+        "restored_sha256": "0cb501548e5a1084b079e42b2b1eddc71e0c99450a0ae9f4e3eed3f94a43a786"
+      },
+      {
+        "name": "hyper-server-forward",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_h2_receive_header_block",
+          "cloned_hyper_server_installs_original_encoded_buffer_and_decoded_alias_is_independent",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "exit": 101,
+        "runtime_failed": true,
+        "restored_sha256": "dfecf6258b6b1abfba4b51f9b773898dc7c9ad5d1ba79b2f9d4f8f18eae90633"
+      }
+    ],
+    "production_runtime_exit": 101,
+    "private_buffer_runtime_classes": 2,
+    "private_hpack_runtime_classes": 2,
+    "private_runtime_exit": 101,
+    "safe_callback_escape_compile_exit": 101,
+    "compile_failure_is_runtime_proof": false,
+    "byte_exact_restore": true
+  },
+  "observations": {
+    "actual_codec_missing_install_copy_bytes": 16393,
+    "actual_sticky_malformed_mutant_published_path": "/must-reset",
+    "actual_shared_borrowed_static_allocations": 0,
+    "actual_shared_owned_static_allocations": 2,
+    "actual_shared_owned_static_requested_bytes": 56,
+    "compact_plain_and_huffman_each_allocations": 4,
+    "compact_plain_and_huffman_each_requested_bytes": 34,
+    "private_input_vec_core_two_allocations_within_original_bound": true
+  },
+  "source_identity": {
+    "private_buffer_sources_verified": 22,
+    "private_hpack_sources_verified": 58,
+    "private_hpack_dependency_sources_verified": 21,
+    "cached_original_source_files_verified": {
+      "h2": 66,
+      "hyper": 68,
+      "tonic": 73
+    },
+    "production_cargo_and_lock_byte_exact_unchanged": true
+  },
+  "failed_histories_preserved": [
+    "First core source edit stopped after partial application at a changed marker; recorded editor diagnostic and executed scripts preserved, not an original complete command log.",
+    "First workspace check: new Tonic config field missing initializer; corrected test config. New test-only old Decoder adapter initially dead_code; cfg(test) retained upstream fixture compatibility.",
+    "First protocol compile: helper io binding shadowed constructor at two call sites; renamed helper only.",
+    "First protocol runtime: 7 passed / 2 failed because the exhaustive split loop exhausted Tokio cooperative budget within one async fixture. Yield once at each split start; no increased pump, ignores, or product changes. Subsequent 9 and 13 tests passed.",
+    "Private HPACK helper initial public export triggered missing_docs errors; opaque helper corrected. Second harness expected wrong first assertion text although both mutants failed; corrected oracle. Final fresh copy passed.",
+    "Private buffer preliminary 8 tests passed; additional original exit-guard panic test gave 9 passes with one probe style lint, then lint fixed.",
+    "Final library build first failed at native-adapter linker with ENOSPC before tests. Removed only 51 task-owned reproducible scratch target directories (about 3.6 GiB), kept source copies and receipts/logs; identical command replay passed 574/313."
+  ],
+  "proof_limits": [
+    "Only original encoded input Vec/Core/Arc is bounded by this option; carrier metadata is separately funded. Strong handles conservatively retain credit; physical Vec/Core exit precedes original carrier. Private exit sentinel is not the Worker budget authority.",
+    "Borrowed incremental decoder commits only complete representations. Strings copied into independent compact owners; no raw or encoded workspace alias escapes. Default owned metadata loaders share exact stream/padding/priority/promised ID algorithm.",
+    "Malformed evidence now survives NeedMore in default and fixed paths. Decoder still processes following representations for HPACK table convergence before stream PROTOCOL_ERROR reset; next stream indexed field remains valid.",
+    "Actual public tests use original Worker grants separately for raw and encoded buffers; optional Hyper/Tonic forwarding and actual codec consumption have different oracles. No Native product installation claim.",
+    "Repeated table-size updates plus static status are accepted actual-decoder allocation stress input, not a canonical/RFC-valid header example. This case excludes decoded long strings and allows small stream/wrapper allocation; it does not assert all allocations are zero.",
+    "Decoded fields/Huffman output/HeaderMap/dynamic table/initial decoder scratch/Status metadata, stream/task/socket/TLS/deadline and entire 2MiB connection envelope remain separate and open. Incoming table negotiation before SETTINGS ACK was not changed.",
+    "Upstream cfg(test) fixtures were not run as a complete suite. Private normal dependency probes do not prove FramedRead or HeaderBlock wiring; actual workspace protocol tests cover those independently.",
+    "P04 executing/P05-P10 open/V1 not advertised. Full native 1FE+3BE/SQL/system/performance acceptance is open. Linux testing deferred to user; Docker desktop-linux BOM verified, no missing image/JAR, no pull/context switch; local checkpoint only, no push/PR/archive."
+  ],
+  "compressed_artifacts": {
+    "p04-h2-receive-header": 43,
+    "p04-h2-receive-header-buffer": 13,
+    "p04-h2-borrowed-hpack": 17
+  }
+}

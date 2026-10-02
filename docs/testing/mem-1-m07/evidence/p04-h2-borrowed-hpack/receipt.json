@@ -1,0 +1,111 @@
+{
+  "recorded_at": "2026-10-02T12:14:11.479133+00:00",
+  "head": "6c7752a274a0d6e72db7eea61f6dd17619a5d730",
+  "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-borrowed-hpack/reproduce.py --negative-commit --quality --miri",
+  "process_exit": 0,
+  "normal_dependency": "full actual current h2 and patched bytes source copies; upstream h2 cfg(test) fixture modules not compiled",
+  "algorithm_replacement": false,
+  "production_lock_identity_checked": true,
+  "offline_locked": true,
+  "all_h2_source_hashes_match_current": true,
+  "source_identity_count": 58,
+  "bytes_source_hashes_match_current": true,
+  "decoder_sha256": "65d187dbadfc7938d1499d8f321d0b53041c36455eed5d3281d012282444e379",
+  "headers_identity_sha256": "0cb501548e5a1084b079e42b2b1eddc71e0c99450a0ae9f4e3eed3f94a43a786",
+  "results": {
+    "ordinary": {
+      "exit": 0,
+      "passed": 9
+    },
+    "advance_commits_incomplete": {
+      "exit": 101,
+      "runtime_failed": 1,
+      "oracle": "incomplete literal must not commit name or advanced value cursor"
+    },
+    "commit_not_updated": {
+      "exit": 101,
+      "runtime_failed": 1,
+      "oracle": "complete decoder must commit entire full input"
+    },
+    "restored_ordinary": {
+      "exit": 0,
+      "passed": 9
+    },
+    "clippy": {
+      "exit": 0,
+      "warnings_denied": false,
+      "warnings": 0
+    },
+    "helper_fmt": 0,
+    "driver_fmt": 0,
+    "miri_private_driver": {
+      "exit": 0,
+      "passed": 9,
+      "seconds": 53.74
+    }
+  },
+  "restore": {
+    "before": "7124b22bf9318120564047abbeb04f465a7a9fa440fb602cb938eff30b6756aa",
+    "restored": "7124b22bf9318120564047abbeb04f465a7a9fa440fb602cb938eff30b6756aa",
+    "byte_exact": true
+  },
+  "preliminary": {
+    "v1": {
+      "process_exit": 1,
+      "cargo_exit": 101,
+      "cause": "scratch public reexport Header/Error made existing private types publicly reachable under missing_docs deny; fixed only helper via opaque wrappers"
+    },
+    "v2": {
+      "process_exit": 1,
+      "ordinary_passed": 9,
+      "actual_runtime_mutants_failed": 2,
+      "cause": "harness expected first prefix assertion text but no-commit mutant first failed final full-input commit assertion; source restored in finally"
+    },
+    "v3": {
+      "process_exit": 0,
+      "ordinary_passed": 9,
+      "restored_passed": 9,
+      "miri_passed": 9,
+      "immutable_source_snapshot": true
+    }
+  },
+  "observed": {
+    "borrowed_static_input": {
+      "allocations": 0,
+      "reallocations": 0,
+      "requested_bytes": 0
+    },
+    "owned_static_input_positive": {
+      "allocations": 2,
+      "reallocations": 0,
+      "requested_bytes": 56,
+      "input_bytes": 16
+    },
+    "plain_compact_output": {
+      "allocations": 4,
+      "reallocations": 0,
+      "requested_bytes": 34
+    },
+    "huffman_compact_output": {
+      "allocations": 4,
+      "reallocations": 0,
+      "requested_bytes": 34
+    },
+    "mixed_wire_bytes": 151,
+    "every_split_cuts": 152
+  },
+  "scope": [
+    "actual shared HPACK decode_source and actual Owned/BorrowedSource only",
+    "Header values retained in opaque inline wrappers with no new payload copy",
+    "all-static decode measured independently from fixture/decoder/wire/output formatting",
+    "decoded owners/table/HeaderMap/HTTP/funding/native transport not funded or proven by encoded-input scope",
+    "full h2 source identity includes files not exercised; no HeaderBlock/FramedRead/protocol wiring claim"
+  ],
+  "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)\nbinary: rustc\ncommit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234\ncommit-date: 2025-12-08\nhost: aarch64-apple-darwin\nrelease: 1.92.0\nLLVM version: 21.1.3",
+  "miri_rustc": "rustc 1.101.0-nightly (5c543b0b8 2026-09-29)\nbinary: rustc\ncommit-hash: 5c543b0b8c73c7b72bc8284ced4fb22ead15734d\ncommit-date: 2026-09-29\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.1",
+  "packaging": {
+    "lossless_gzip": true,
+    "compressed_artifact_count": 17,
+    "source_and_prior_evidence_manifests_verified_before_packaging": true
+  }
+}

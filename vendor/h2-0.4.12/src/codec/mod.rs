@@ -97,6 +97,13 @@ impl<T, B> Codec<T, B> {
         self.inner.set_goaway_pool(pool);
     }
 
+    pub(crate) fn set_receive_header_block_buffer(
+        &mut self,
+        buffer: crate::receive_header::BoundHeaderBlockBuffer,
+    ) {
+        self.inner.set_header_buffer(buffer);
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other

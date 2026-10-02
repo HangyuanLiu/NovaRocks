@@ -260,6 +260,7 @@ pub struct Builder {
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
+    receive_header_block_buffer: Option<crate::ReceiveHeaderBlockBuffer>,
     receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams due to protocol error across
@@ -390,6 +391,15 @@ where
         let span = tracing::trace_span!("server_handshake");
         let entered = span.enter();
 
+        if let Some(buffer) = &builder.receive_header_block_buffer {
+            let max = builder.max_receive_header_block_size;
+            if builder.receive_frame_buffer.is_none()
+                || max.is_none_or(|max| max == 0 || max > buffer.max_encoded_bytes())
+            {
+                drop(entered);
+                return Handshake { builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "encoded header buffer requires fixed raw input and a valid explicit block maximum")))), span };
+            }
+        }
         if builder.send_header_block_pool.is_some() && builder.max_send_header_table_size != Some(0)
         {
             drop(entered);
@@ -413,6 +423,28 @@ where
                 span,
             };
         }
+        let receive_header_buffer = match builder
+            .receive_header_block_buffer
+            .as_ref()
+            .map(|buffer| {
+                buffer.bind(
+                    builder
+                        .max_receive_header_block_size
+                        .expect("validated header block maximum"),
+                )
+            })
+            .transpose()
+        {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
         let send_header_pool = match builder
             .send_header_block_pool
             .as_ref()
@@ -500,6 +532,9 @@ where
             send_frame_buffer,
             builder.settings.max_frame_size().unwrap_or(16384) as usize,
         );
+        if let Some(buffer) = receive_header_buffer {
+            codec.set_receive_header_block_buffer(buffer);
+        }
         codec.set_retain_data_payloads(builder.retain_data_payloads);
         if let Some(max) = builder.max_send_header_table_size {
             codec.set_max_send_header_table_size(max as usize);
@@ -799,6 +834,7 @@ impl Builder {
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             receive_frame_buffer: None,
+            receive_header_block_buffer: None,
             receive_goaway_buffer_pool: None,
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
@@ -1215,6 +1251,16 @@ impl Builder {
     /// separate; this alone does not prove complete connection funding.
     pub fn receive_frame_buffer(&mut self, buffer: crate::ReceiveFrameBuffer) -> &mut Self {
         self.receive_frame_buffer = Some(buffer);
+        self
+    }
+
+    /// Install original fixed encoded header input. Requires fixed raw input
+    /// and an explicit encoded block maximum no larger than this capacity.
+    pub fn receive_header_block_buffer(
+        &mut self,
+        buffer: crate::ReceiveHeaderBlockBuffer,
+    ) -> &mut Self {
+        self.receive_header_block_buffer = Some(buffer);
         self
     }
 

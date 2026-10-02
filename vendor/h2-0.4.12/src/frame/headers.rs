@@ -93,6 +93,8 @@ struct HeaderBlock {
 
     /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
+    // A partial decode must retain malformed evidence through NeedMore.
+    is_malformed: bool,
 
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
@@ -122,6 +124,7 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_malformed: false,
                 pseudo,
             },
             flags: HeadersFlag::default(),
@@ -139,6 +142,7 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_malformed: false,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -149,6 +153,20 @@ impl Headers {
     ///
     /// HPACK decoding is done in the `load_hpack` step.
     pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let (frame, offset, len) = Self::load_parts(head, &src)?;
+        src.advance(offset);
+        src.truncate(len);
+        Ok((frame, src))
+    }
+
+    pub(crate) fn load_borrowed(head: Head, src: &[u8]) -> Result<(Self, &[u8]), Error> {
+        let (frame, offset, len) = Self::load_parts(head, src)?;
+        Ok((frame, &src[offset..offset + len]))
+    }
+
+    fn load_parts(head: Head, src: &[u8]) -> Result<(Self, usize, usize), Error> {
+        let mut offset = 0;
+        let mut src = src;
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
 
@@ -166,7 +184,8 @@ impl Headers {
             pad = src[0] as usize;
 
             // Drop the padding
-            src.advance(1);
+            src = &src[1..];
+            offset += 1;
         }
 
         // Read the stream dependency
@@ -181,7 +200,8 @@ impl Headers {
             }
 
             // Drop the next 5 bytes
-            src.advance(5);
+            src = &src[5..];
+            offset += 5;
 
             Some(stream_dep)
         } else {
@@ -194,7 +214,7 @@ impl Headers {
             }
 
             let len = src.len() - pad;
-            src.truncate(len);
+            src = &src[..len];
         }
 
         let headers = Headers {
@@ -204,12 +224,13 @@ impl Headers {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                is_malformed: false,
                 pseudo: Pseudo::default(),
             },
             flags,
         };
 
-        Ok((headers, src))
+        Ok((headers, offset, src.len()))
     }
 
     pub fn load_hpack(
@@ -219,6 +240,21 @@ impl Headers {
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         self.header_block.load(src, max_header_list_size, decoder)
+    }
+
+    pub(crate) fn load_hpack_borrowed(
+        &mut self,
+        src: &[u8],
+        committed: &mut usize,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
+        let mut source = hpack::BorrowedSource::new(src, *committed);
+        let result = self
+            .header_block
+            .load_source(&mut source, max_header_list_size, decoder);
+        *committed = source.committed();
+        result
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -377,6 +413,7 @@ impl PushPromise {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_malformed: false,
                 pseudo,
             },
             promised_id,
@@ -425,6 +462,20 @@ impl PushPromise {
     ///
     /// HPACK decoding is done in the `load_hpack` step.
     pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let (frame, offset, len) = Self::load_parts(head, &src)?;
+        src.advance(offset);
+        src.truncate(len);
+        Ok((frame, src))
+    }
+
+    pub(crate) fn load_borrowed(head: Head, src: &[u8]) -> Result<(Self, &[u8]), Error> {
+        let (frame, offset, len) = Self::load_parts(head, src)?;
+        Ok((frame, &src[offset..offset + len]))
+    }
+
+    fn load_parts(head: Head, src: &[u8]) -> Result<(Self, usize, usize), Error> {
+        let mut offset = 0;
+        let mut src = src;
         let flags = PushPromiseFlag(head.flag());
         let mut pad = 0;
 
@@ -442,7 +493,8 @@ impl PushPromise {
             pad = src[0] as usize;
 
             // Drop the padding
-            src.advance(1);
+            src = &src[1..];
+            offset += 1;
         }
 
         if src.len() < 5 {
@@ -451,7 +503,8 @@ impl PushPromise {
 
         let (promised_id, _) = StreamId::parse(&src[..4]);
         // Drop promised_id bytes
-        src.advance(4);
+        src = &src[4..];
+        offset += 4;
 
         if pad > 0 {
             if pad > src.len() {
@@ -459,7 +512,7 @@ impl PushPromise {
             }
 
             let len = src.len() - pad;
-            src.truncate(len);
+            src = &src[..len];
         }
 
         let frame = PushPromise {
@@ -468,12 +521,13 @@ impl PushPromise {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                is_malformed: false,
                 pseudo: Pseudo::default(),
             },
             promised_id,
             stream_id: head.stream_id(),
         };
-        Ok((frame, src))
+        Ok((frame, offset, src.len()))
     }
 
     pub fn load_hpack(
@@ -483,6 +537,21 @@ impl PushPromise {
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         self.header_block.load(src, max_header_list_size, decoder)
+    }
+
+    pub(crate) fn load_hpack_borrowed(
+        &mut self,
+        src: &[u8],
+        committed: &mut usize,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
+        let mut source = hpack::BorrowedSource::new(src, *committed);
+        let result = self
+            .header_block
+            .load_source(&mut source, max_header_list_size, decoder);
+        *committed = source.committed();
+        result
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -882,8 +951,17 @@ impl HeaderBlock {
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
+        self.load_source(&mut Cursor::new(src), max_header_list_size, decoder)
+    }
+
+    fn load_source<S: hpack::DecodeSource>(
+        &mut self,
+        src: &mut S,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
-        let mut malformed = false;
+        let mut malformed = self.is_malformed;
         let mut headers_size = self.calculate_header_list_size();
 
         macro_rules! set_pseudo {
@@ -908,13 +986,11 @@ impl HeaderBlock {
             }};
         }
 
-        let mut cursor = Cursor::new(src);
-
         // If the header frame is malformed, we still have to continue decoding
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode_source(src, |header| {
             use crate::hpack::Header::*;
 
             match header {
@@ -959,6 +1035,9 @@ impl HeaderBlock {
             }
         });
 
+        // Preserve already decoded semantic failure before NeedMore returns.
+        // HPACK still continues to maintain connection-level table state.
+        self.is_malformed = malformed;
         if let Err(e) = res {
             tracing::trace!("hpack decoding error; err={:?}", e);
             return Err(e.into());

@@ -22,3 +22,6 @@ Http2ConnectionConfig also forwards an optional max_send_header_table_size. Zero
 
 
 Http2ConnectionConfig also forwards send_header_block_pool for each physical attempt. A present pool requires explicit max_send_header_table_size=Some(0); conflicting configuration is rejected before builder mutation or connector.call. Actual Channel regressions fund this backing in the same original attempt grant and refuse an oversized block before any HEADERS/CONTINUATION reaches the wire. Reconnect creates a fresh pool; HTTP metadata and whole Native profile installation remain separate.
+
+
+Http2ConnectionConfig also carries a fresh receive_header_block_buffer per physical attempt. apply validates fixed raw input, explicit positive encoded maximum and workspace capacity before any builder mutation or connector.call, then forwards the buffer. h2 separately enforces once binding before its preface. Encoded input original ownership is separate from decoded header/HPACK metadata, incoming table settings and complete Native connection funding.

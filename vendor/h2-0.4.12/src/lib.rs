@@ -165,7 +165,9 @@ mod receive_pool;
 pub use self::receive_pool::ReceiveBufferPool;
 
 mod receive_frame;
+mod receive_header;
 pub use self::receive_frame::ReceiveFrameBuffer;
+pub use self::receive_header::ReceiveHeaderBlockBuffer;
 
 mod send_header_block;
 pub use self::send_header_block::SendHeaderBlockPool;

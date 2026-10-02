@@ -198,13 +198,18 @@ impl Decoder {
         self.max_size_update = Some(size);
     }
 
-    /// Decodes the headers found in the given buffer.
-    pub fn decode<F>(
-        &mut self,
-        src: &mut Cursor<&mut BytesMut>,
-        mut f: F,
-    ) -> Result<(), DecoderError>
+    /// Compatibility entry for existing upstream decoder tests.
+    #[cfg(test)]
+    pub fn decode<F>(&mut self, src: &mut Cursor<&mut BytesMut>, f: F) -> Result<(), DecoderError>
     where
+        F: FnMut(Header),
+    {
+        self.decode_source(src, f)
+    }
+
+    pub(crate) fn decode_source<S, F>(&mut self, src: &mut S, mut f: F) -> Result<(), DecoderError>
+    where
+        S: DecodeSource,
         F: FnMut(Header),
     {
         use self::Representation::*;
@@ -229,7 +234,7 @@ impl Decoder {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
                     can_resize = false;
                     let entry = self.decode_indexed(src)?;
-                    consume(src);
+                    src.commit();
                     f(entry);
                 }
                 LiteralWithIndexing => {
@@ -239,7 +244,7 @@ impl Decoder {
 
                     // Insert the header into the table
                     self.table.insert(entry.clone());
-                    consume(src);
+                    src.commit();
 
                     f(entry);
                 }
@@ -247,14 +252,14 @@ impl Decoder {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
                     can_resize = false;
                     let entry = self.decode_literal(src, false)?;
-                    consume(src);
+                    src.commit();
                     f(entry);
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
                     can_resize = false;
                     let entry = self.decode_literal(src, false)?;
-                    consume(src);
+                    src.commit();
 
                     // TODO: Track that this should never be indexed
 
@@ -268,7 +273,7 @@ impl Decoder {
 
                     // Handle the dynamic table size update
                     self.process_size_update(src)?;
-                    consume(src);
+                    src.commit();
                 }
             }
         }
@@ -276,7 +281,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
+    fn process_size_update<S: DecodeSource>(&mut self, buf: &mut S) -> Result<(), DecoderError> {
         let new_size = decode_int(buf, 5)?;
 
         if new_size > self.last_max_update {
@@ -294,16 +299,16 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+    fn decode_indexed<S: DecodeSource>(&self, buf: &mut S) -> Result<Header, DecoderError> {
         let index = decode_int(buf, 7)?;
         let entry = self.table.get(index)?;
         self.check_field_size(entry.name().as_slice().len(), entry.value_slice().len())?;
         Ok(entry)
     }
 
-    fn decode_literal(
+    fn decode_literal<S: DecodeSource>(
         &mut self,
-        buf: &mut Cursor<&mut BytesMut>,
+        buf: &mut S,
         index: bool,
     ) -> Result<Header, DecoderError> {
         let prefix = if index { 6 } else { 4 };
@@ -334,9 +339,9 @@ impl Decoder {
         }
     }
 
-    fn try_decode_string(
+    fn try_decode_string<S: DecodeSource>(
         &mut self,
-        buf: &mut Cursor<&mut BytesMut>,
+        buf: &mut S,
     ) -> Result<StringMarker, DecoderError> {
         let old_pos = buf.position();
         const HUFF_FLAG: u8 = 0b1000_0000;
@@ -517,30 +522,87 @@ impl StringMarker {
         self.string.as_ref().map_or(self.len, Bytes::len)
     }
 
-    fn consume(self, buf: &mut Cursor<&mut BytesMut>, compact: bool) -> Bytes {
+    fn consume<S: DecodeSource>(self, buf: &mut S, compact: bool) -> Bytes {
         buf.advance(self.offset);
         match self.string {
             Some(string) => {
                 buf.advance(self.len);
                 string
             }
-            None => {
-                let bytes = take(buf, self.len);
-                if compact {
-                    Bytes::copy_from_slice(&bytes)
-                } else {
-                    bytes
-                }
-            }
+            None => buf.take_string(self.len, compact),
         }
     }
 }
 
-fn consume(buf: &mut Cursor<&mut BytesMut>) {
-    // remove bytes from the internal BytesMut when they have been successfully
-    // decoded. This is a more permanent cursor position, which will be
-    // used to resume if decoding was only partial.
-    take(buf, 0);
+// Both inputs use the same HPACK algorithm. Only the owned compatibility
+// input can split backing; borrowed strings always acquire independent owners.
+pub(crate) trait DecodeSource: Buf {
+    fn position(&self) -> u64;
+    fn set_position(&mut self, pos: u64);
+    fn take_string(&mut self, len: usize, compact: bool) -> Bytes;
+    fn commit(&mut self);
+}
+impl DecodeSource for Cursor<&mut BytesMut> {
+    fn position(&self) -> u64 {
+        Cursor::position(self)
+    }
+    fn set_position(&mut self, pos: u64) {
+        Cursor::set_position(self, pos);
+    }
+    fn take_string(&mut self, len: usize, compact: bool) -> Bytes {
+        let value = take(self, len);
+        if compact {
+            Bytes::copy_from_slice(&value)
+        } else {
+            value
+        }
+    }
+    fn commit(&mut self) {
+        take(self, 0);
+    }
+}
+
+pub(crate) struct BorrowedSource<'a> {
+    cursor: Cursor<&'a [u8]>,
+    committed: usize,
+}
+impl<'a> BorrowedSource<'a> {
+    pub(crate) fn new(input: &'a [u8], committed: usize) -> Self {
+        assert!(committed <= input.len());
+        let mut cursor = Cursor::new(input);
+        cursor.set_position(committed as u64);
+        Self { cursor, committed }
+    }
+    pub(crate) fn committed(&self) -> usize {
+        self.committed
+    }
+}
+impl Buf for BorrowedSource<'_> {
+    fn remaining(&self) -> usize {
+        self.cursor.remaining()
+    }
+    fn chunk(&self) -> &[u8] {
+        self.cursor.chunk()
+    }
+    fn advance(&mut self, cnt: usize) {
+        self.cursor.advance(cnt);
+    }
+}
+impl DecodeSource for BorrowedSource<'_> {
+    fn position(&self) -> u64 {
+        self.cursor.position()
+    }
+    fn set_position(&mut self, pos: u64) {
+        self.cursor.set_position(pos);
+    }
+    fn take_string(&mut self, len: usize, _compact: bool) -> Bytes {
+        let value = Bytes::copy_from_slice(&self.chunk()[..len]);
+        self.advance(len);
+        value
+    }
+    fn commit(&mut self) {
+        self.committed = self.position() as usize;
+    }
 }
 
 // ===== impl Table =====

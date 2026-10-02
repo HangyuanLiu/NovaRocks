@@ -1,0 +1,60 @@
+{
+  "recorded_at": "2026-10-02T12:05:21.345638+00:00",
+  "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-receive-header-buffer/reproduce.py --negative --quality --miri",
+  "process_exit": 0,
+  "source_sha256": "b92b0ad88ffc8596ed8318d85b77ac0299e4182dc3e6c8ba23f71970ee95dc27",
+  "exact_source_and_bytes_copy": true,
+  "current_source_hashes_match": true,
+  "production_lock_checked": true,
+  "ordinary": {
+    "exit": 0,
+    "passed": 9
+  },
+  "runtime_negatives": {
+    "append_copy": 101,
+    "credit_before_vec_exit": 101,
+    "requires_runtime_assertion": true
+  },
+  "restored": {
+    "exit": 0,
+    "passed": 9,
+    "byte_exact": true
+  },
+  "slice_escape_compile_fail": {
+    "exit": 101,
+    "oracle": "lifetime may not live long enough",
+    "distinct_from_runtime_negatives": true
+  },
+  "quality": {
+    "clippy": 0,
+    "fmt": 0,
+    "warnings_denied": false,
+    "final_warnings": 0
+  },
+  "miri": {
+    "exit": 0,
+    "passed": 9,
+    "seconds": 6.1,
+    "installed_toolchain_only": true
+  },
+  "preliminary": {
+    "v1": "8 ordinary/Miri tests passed before adding original exit-panic probe",
+    "v2": "9 passed; one probe int_plus_one style warning fixed in v3"
+  },
+  "measurement": "two actual Rust-requested allocations Vec and Core/Arc within reported conservative bound; System deallocation recorded only after it returns; separately tracked Bytes exit guard wrapper",
+  "allocation_zero_scope": "clone/bind/append/decode/reset only; wire/test/Arc oracle setup outside this scope",
+  "limits": [
+    "encoded Vec/Core only, no actual HPACK decoder/HTTP/H2/Native integration claim",
+    "ExitCredit is a physical-exit sentinel, not process budget integration",
+    "ownership carrier metadata measured separately and excluded from buffer reported bound",
+    "no allocator caches/RSS or entire connection 2 MiB proof",
+    "callback commit test uses the actual generic buffer callback, not a model of HPACK retry"
+  ],
+  "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)\nbinary: rustc\ncommit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234\ncommit-date: 2025-12-08\nhost: aarch64-apple-darwin\nrelease: 1.92.0\nLLVM version: 21.1.3",
+  "miri_rustc": "rustc 1.101.0-nightly (5c543b0b8 2026-09-29)\nbinary: rustc\ncommit-hash: 5c543b0b8c73c7b72bc8284ced4fb22ead15734d\ncommit-date: 2026-09-29\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.1",
+  "packaging": {
+    "lossless_gzip": true,
+    "compressed_artifact_count": 13,
+    "source_and_prior_evidence_manifests_verified_before_packaging": true
+  }
+}
