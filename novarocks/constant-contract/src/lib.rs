@@ -251,6 +251,12 @@ impl ConstantPool {
             .0
             .pad_to_align()
     }
+    /// A non-Null flat semantic validation uses one Range frame, with no
+    /// child expansion. Its vec! allocation requests exactly this layout.
+    /// This does not authorize a stack or a general nested validation walk.
+    pub fn flat_value_validation_stack_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<RequiredFrame<'static>>()
+    }
     /// Inputs are immutable ArrayData, with no caller Array implementation to
     /// execute. Inputs already own Arrow allocations; this is not first-allocation
     /// admission. Standard Arrow validation runs only after observed resource

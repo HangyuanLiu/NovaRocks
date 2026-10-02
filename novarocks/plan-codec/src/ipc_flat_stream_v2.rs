@@ -38,6 +38,11 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileContr
 
 mod pool_resources;
 pub use pool_resources::{FlatPoolResourceError, FlatPoolResourceProjection};
+mod reader;
+mod reader_allocations;
+mod reader_diagnostics;
+mod reader_work;
+pub use reader::{FlatReaderError, FlatReaderProjectionLimits, FlatReaderResourceFacts};
 
 /// All limits originate with the admitted caller, not the stream or defaults.
 #[derive(Clone, Copy, Debug)]
@@ -224,5 +229,7 @@ fn preflight<'a, 'f>(
     })
 }
 
+#[cfg(test)]
+mod reader_tests;
 #[cfg(test)]
 mod tests;

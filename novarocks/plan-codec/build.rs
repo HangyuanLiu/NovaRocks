@@ -1,0 +1,37 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::{env, process::Command};
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
+    println!("cargo:rerun-if-changed=../../Cargo.lock");
+    let compiler = env::var_os("RUSTC").expect("Cargo must provide RUSTC");
+    let result = Command::new(compiler)
+        .arg("--version")
+        .output()
+        .expect("failed to inspect the actual plan-codec compiler");
+    // Arc allocation layout and Vec/String growth requests in the supported
+    // resource model are derived from this exact standard-library source.
+    // A +toolchain override must not silently compile an unreviewed model.
+    assert!(
+        result.status.success() && result.stdout.starts_with(b"rustc 1.92.0 "),
+        "plan-codec resource allocation model requires the audited Rust 1.92.0 compiler"
+    );
+    println!("cargo:rustc-env=NOVAROCKS_PLAN_CODEC_RESOURCE_RUST=1.92.0");
+}
