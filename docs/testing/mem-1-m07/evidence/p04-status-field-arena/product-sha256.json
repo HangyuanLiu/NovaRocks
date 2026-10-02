@@ -1,0 +1,13 @@
+{
+  "novarocks/native-adapter/tests/native_h2_header_map_pool.rs": "e36d40d486be06d3acab18612f31960ae9f995e451ca24595a8135aec5bc3002",
+  "novarocks/native-adapter/tests/native_tonic_status_field_pool.rs": "e6aa7726237504e87ca792ddf740ff93e5b2b5c09303e1db5edcfd243cc07886",
+  "vendor/h2-0.4.12/src/client.rs": "d02354f555a61968102ec1f30bea142ed58ebacc13ddef29f5ae5760654f75f4",
+  "vendor/h2-0.4.12/src/receive_header_field_pool.rs": "725aaadf2dd07f26310ddbbb809607ebc26b8210e27c5f139113ac3899e2e5cd",
+  "vendor/h2-0.4.12/src/server.rs": "14367bc9ce2d2aaeab086ffddff1ceed0232d6e5a207011dc6941ec9ab539777",
+  "vendor/http-1.4.0/src/header/field_pool.rs": "619dc289cf8192f099025497860e6a4a3935b1ccb458cb668db3d285cef817e9",
+  "vendor/http-1.4.0/src/header/map.rs": "ebc20ccf35ac44800185517aa9585466cd26c825223a0918d8295d6fb34fd22c",
+  "vendor/http-1.4.0/src/header/mod.rs": "4a3483e1058b16e21d0d562aff55f0dcb8b66a108d47b4728bfd0628a9504061",
+  "vendor/tonic-0.12.3/src/metadata/map.rs": "9a43e5abce7e90aab79623392829e3702bc16a0bdb67f2c670fed5bdd5c2730d",
+  "vendor/tonic-0.12.3/src/status.rs": "2ce0d04d72cd85a74966c00bfa08b8f5595916bb1a45126730e6442776d5bb1d",
+  "vendor/tonic-0.12.3/src/status/field.rs": "bfa1e22539a29bcf6a4167ab32767361e1ccd9e1b3eb9c668ae25e8d8aef53f7"
+}

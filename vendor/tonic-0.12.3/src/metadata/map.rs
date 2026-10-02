@@ -2762,5 +2762,8 @@ mod tests {
 }
 
 pub(crate) fn metadata_capacity_exhausted(_: http::header::MaxSizeReached) -> crate::Status {
-    crate::Status::resource_exhausted("HTTP metadata capacity exhausted")
+    crate::Status::field_error(
+        crate::Code::ResourceExhausted,
+        "HTTP metadata capacity exhausted",
+    )
 }

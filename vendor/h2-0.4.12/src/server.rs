@@ -492,7 +492,14 @@ where
             };
         }
         if let Some(pool) = &builder.receive_header_map_pool {
-            if pool.try_bind_connection().is_err() {
+            let fields = builder
+                .receive_header_field_pool
+                .as_ref()
+                .expect("validated decoded field pool");
+            if pool
+                .try_bind_connection_with_fields(fields.allocation_pool())
+                .is_err()
+            {
                 drop(entered);
                 return Handshake {
                     builder,

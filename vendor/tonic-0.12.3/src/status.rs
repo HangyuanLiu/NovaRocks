@@ -1,3 +1,5 @@
+mod field;
+
 use crate::metadata::MetadataMap;
 use crate::{body::BoxBody, metadata::GRPC_CONTENT_TYPE};
 use base64::Engine as _;
@@ -38,7 +40,7 @@ pub struct Status {
     /// The gRPC status code, found in the `grpc-status` header.
     code: Code,
     /// A relevant error message, found in the `grpc-message` header.
-    message: String,
+    message: field::Message,
     /// Binary opaque details, found in the `grpc-status-details-bin` header.
     details: Bytes,
     /// Custom metadata, found in the user-defined headers.
@@ -47,6 +49,7 @@ pub struct Status {
     metadata: MetadataMap,
     /// Optional underlying error.
     source: Option<Arc<dyn Error + Send + Sync + 'static>>,
+    field_pool: Option<http::header::HeaderFieldAllocationPool>,
 }
 
 /// gRPC status codes used by [`Status`].
@@ -161,10 +164,11 @@ impl Status {
     pub fn new(code: Code, message: impl Into<String>) -> Status {
         Status {
             code,
-            message: message.into(),
+            message: field::Message::Owned(message.into()),
             details: Bytes::new(),
             metadata: MetadataMap::new(),
             source: None,
+            field_pool: None,
         }
     }
 
@@ -310,6 +314,17 @@ impl Status {
         Self::from_error(err.into())
     }
 
+    pub(crate) fn field_error(code: Code, message: &'static str) -> Self {
+        Self {
+            code,
+            message: field::Message::Static(message),
+            details: Bytes::new(),
+            metadata: MetadataMap::new(),
+            source: None,
+            field_pool: None,
+        }
+    }
+
     /// Create a `Status` from various types of `Error`.
     ///
     /// Inspects the error source chain for recognizable errors, including statuses, HTTP2, and
@@ -448,6 +463,26 @@ impl Status {
             other_headers.remove(Self::GRPC_STATUS);
             other_headers.remove(Self::GRPC_MESSAGE);
             other_headers.remove(Self::GRPC_STATUS_DETAILS);
+            if let Some(pool) = header_map.field_allocation_pool() {
+                let (message, invalid_utf8) =
+                    match field::decode_message(pool, header_map.get(Self::GRPC_MESSAGE)) {
+                        Ok(message) => message,
+                        Err(error) => return error,
+                    };
+                let details =
+                    match field::decode_details(pool, header_map.get(Self::GRPC_STATUS_DETAILS)) {
+                        Ok(details) => details,
+                        Err(error) => return error,
+                    };
+                return Status {
+                    code: if invalid_utf8 { Code::Unknown } else { code },
+                    message,
+                    details,
+                    metadata: MetadataMap::from_headers(other_headers),
+                    source: None,
+                    field_pool: Some(pool.clone()),
+                };
+            }
             let error_message = header_map
                 .get(Self::GRPC_MESSAGE)
                 .map(|header| {
@@ -468,19 +503,22 @@ impl Status {
             match error_message {
                 Ok(message) => Status {
                     code,
-                    message,
+                    message: message.into(),
                     details,
                     metadata: MetadataMap::from_headers(other_headers),
                     source: None,
+                    field_pool: None,
                 },
                 Err(err) => {
                     warn!("Error deserializing status message header: {}", err);
                     Status {
                         code: Code::Unknown,
-                        message: format!("Error deserializing status message header: {}", err),
+                        message: format!("Error deserializing status message header: {}", err)
+                            .into(),
                         details,
                         metadata: MetadataMap::from_headers(other_headers),
                         source: None,
+                        field_pool: None,
                     }
                 }
             }
@@ -499,6 +537,7 @@ impl Status {
             details: self.details.clone(),
             metadata,
             source: self.source.clone(),
+            field_pool: self.field_pool.clone(),
         })
     }
 
@@ -544,14 +583,21 @@ impl Status {
     }
 
     fn add_status_headers(&self, header_map: &mut HeaderMap) -> Result<(), Self> {
+        let pool = header_map
+            .field_allocation_pool()
+            .cloned()
+            .or_else(|| self.field_pool.clone());
         header_map
             .try_insert(Self::GRPC_STATUS, self.code.to_header_value())
             .map_err(crate::metadata::metadata_capacity_exhausted)?;
 
         if !self.message.is_empty() {
-            let to_write = Bytes::copy_from_slice(
-                Cow::from(percent_encode(self.message().as_bytes(), ENCODING_SET)).as_bytes(),
-            );
+            let to_write = match &pool {
+                Some(pool) => field::encode_message(pool, self.message())?,
+                None => Bytes::copy_from_slice(
+                    Cow::from(percent_encode(self.message().as_bytes(), ENCODING_SET)).as_bytes(),
+                ),
+            };
 
             header_map
                 .try_insert(
@@ -562,7 +608,10 @@ impl Status {
         }
 
         if !self.details.is_empty() {
-            let details = crate::util::base64::STANDARD_NO_PAD.encode(&self.details[..]);
+            let details = match &pool {
+                Some(pool) => field::encode_details(pool, &self.details)?,
+                None => Bytes::from(crate::util::base64::STANDARD_NO_PAD.encode(&self.details[..])),
+            };
 
             header_map
                 .try_insert(
@@ -594,10 +643,11 @@ impl Status {
     ) -> Status {
         Status {
             code,
-            message: message.into(),
+            message: field::Message::Owned(message.into()),
             details,
             metadata,
             source: None,
+            field_pool: None,
         }
     }
 

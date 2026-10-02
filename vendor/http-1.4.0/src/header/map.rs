@@ -7,14 +7,14 @@ use std::iter::{FromIterator, FusedIterator};
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::{fmt, mem, ops, ptr, vec};
 
 use crate::Error;
 
 use super::name::{HdrName, HeaderName, InvalidHeaderName};
-use super::HeaderValue;
+use super::{HeaderFieldAllocationPool, HeaderValue};
 
 pub use self::as_header_name::AsHeaderName;
 pub use self::into_header_name::IntoHeaderName;
@@ -4219,6 +4219,8 @@ struct MapAllocationCore {
     max_maps: usize,
     live_maps: AtomicUsize,
     connection_bound: AtomicBool,
+    // Inline capability only; the field arena retains its independent original grant.
+    fields: OnceLock<HeaderFieldAllocationPool>,
     // The final Arc allocation exits before original ownership.
     _ownership: Bytes,
 }
@@ -4272,6 +4274,7 @@ impl HeaderMapAllocationPool {
                 max_maps,
                 live_maps: AtomicUsize::new(0),
                 connection_bound: AtomicBool::new(false),
+                fields: OnceLock::new(),
                 _ownership: ownership,
             })),
         })
@@ -4300,6 +4303,27 @@ impl HeaderMapAllocationPool {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
             .map_err(|_| MaxSizeReached::new())
+    }
+
+    /// Bind once and retain the exact original header field arena capability.
+    /// Only an existing strong handle is cloned; no new arena or Arc is allocated.
+    /// The caller validates all geometry before binding and constructs maps only
+    /// after this method returns successfully. The arena is bound independently.
+    pub fn try_bind_connection_with_fields(
+        &self,
+        fields: &HeaderFieldAllocationPool,
+    ) -> Result<(), MaxSizeReached> {
+        self.try_bind_connection()?;
+        self.core()
+            .fields
+            .set(fields.clone())
+            .map_err(|_| MaxSizeReached::new())
+    }
+
+    /// Borrow the original field arena installed by the connection binding.
+    /// No-argument bindings and ordinary maps carry no field capability.
+    pub fn field_allocation_pool(&self) -> Option<&HeaderFieldAllocationPool> {
+        self.core().fields.get()
     }
 
     /// Number of remaining metadata positions, including copies and value drains.
@@ -4364,6 +4388,12 @@ impl HeaderMap<HeaderValue> {
     /// Cloned handles share the same finite positions and original lifetime.
     pub fn allocation_pool(&self) -> Option<&HeaderMapAllocationPool> {
         self.allocation.as_ref().map(|claim| &claim.pool)
+    }
+
+    /// Borrow the exact original field arena retained by this fixed map family.
+    pub fn field_allocation_pool(&self) -> Option<&HeaderFieldAllocationPool> {
+        self.allocation_pool()
+            .and_then(HeaderMapAllocationPool::field_allocation_pool)
     }
 
     /// Allocate a fixed map from an original metadata grant.

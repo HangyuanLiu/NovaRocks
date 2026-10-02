@@ -36,10 +36,12 @@
 //!
 //! [*See also the `HeaderMap` type.*](HeaderMap)
 
+mod field_pool;
 mod map;
 mod name;
 mod value;
 
+pub use self::field_pool::{HeaderFieldAllocationPool, HeaderFieldFillError};
 pub use self::map::{
     AsHeaderName, Drain, Entry, GetAll, HeaderMap, HeaderMapAllocationPool, IntoHeaderName,
     IntoIter, Iter, IterMut, Keys, MaxSizeReached, OccupiedEntry, VacantEntry, ValueDrain,

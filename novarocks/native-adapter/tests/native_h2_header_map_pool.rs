@@ -702,6 +702,13 @@ async fn h2_both_directions_maps_clones_iterators_and_field_aliases_outlive_io()
             .await
             .unwrap();
         assert_duplicates(&received);
+        let fields = &peer.funding.as_ref().unwrap().fields;
+        assert!(
+            received
+                .field_allocation_pool()
+                .expect("actual handshake must attach the original transformation arena")
+                .same_pool(fields.allocation_pool())
+        );
         let cloned = received.try_clone().unwrap();
         assert_ne!(
             received.get("x-owned").unwrap() as *const _,
@@ -745,6 +752,13 @@ async fn hyper_both_directions_and_tonic_factory_forward_original_map_pool() {
             .await
             .unwrap();
         assert_duplicates(&received);
+        let fields = &peer.funding.as_ref().unwrap().fields;
+        assert!(
+            received
+                .field_allocation_pool()
+                .expect("actual framework must retain the original transformation arena")
+                .same_pool(fields.allocation_pool())
+        );
         let copied = received.try_clone().unwrap();
         peer.drop_public_owners();
         peer.finish(vec![received, copied]).await;

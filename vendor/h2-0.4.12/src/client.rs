@@ -1573,12 +1573,17 @@ where
             )));
         }
         if let Some(pool) = &builder.receive_header_map_pool {
-            pool.try_bind_connection().map_err(|_| {
-                crate::Error::from_io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "header map pool already bound to a connection",
-                ))
-            })?;
+            let fields = builder
+                .receive_header_field_pool
+                .as_ref()
+                .expect("validated decoded field pool");
+            pool.try_bind_connection_with_fields(fields.allocation_pool())
+                .map_err(|_| {
+                    crate::Error::from_io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "header map pool already bound to a connection",
+                    ))
+                })?;
         }
         let receive_table_buffer = builder
             .receive_header_table_buffer
