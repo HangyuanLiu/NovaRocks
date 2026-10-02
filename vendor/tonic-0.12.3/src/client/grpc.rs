@@ -243,17 +243,18 @@ impl<T> Grpc<T> {
 
         let mut body = pin!(body);
 
-        let message = body
-            .try_next()
-            .await
-            .map_err(|mut status| {
-                status.metadata_mut().merge(parts.clone());
-                status
-            })?
-            .ok_or_else(|| Status::internal("Missing response message."))?;
+        let message = match body.try_next().await {
+            Ok(message) => message,
+            Err(mut status) => {
+                // This branch returns immediately; move the original metadata instead of copying it.
+                status.metadata_mut().try_merge(parts)?;
+                return Err(status);
+            }
+        }
+        .ok_or_else(|| Status::internal("Missing response message."))?;
 
         if let Some(trailers) = body.trailers().await? {
-            parts.merge(trailers);
+            parts.try_merge(trailers)?;
         }
 
         Ok(Response::from_parts(parts, message, extensions))
@@ -305,7 +306,7 @@ impl<T> Grpc<T> {
             })
             .map(BoxBody::new);
 
-        let request = self.config.prepare_request(request, path);
+        let request = self.config.prepare_request(request, path)?;
 
         let response = self
             .inner
@@ -373,7 +374,7 @@ impl GrpcConfig {
         &self,
         request: Request<BoxBody>,
         path: PathAndQuery,
-    ) -> http::Request<BoxBody> {
+    ) -> Result<http::Request<BoxBody>, Status> {
         let mut parts = self.origin.clone().into_parts();
 
         match &parts.path_and_query {
@@ -401,32 +402,40 @@ impl GrpcConfig {
         // Add the gRPC related HTTP headers
         request
             .headers_mut()
-            .insert(TE, HeaderValue::from_static("trailers"));
+            .try_insert(TE, HeaderValue::from_static("trailers"))
+            .map_err(crate::metadata::metadata_capacity_exhausted)?;
 
         // Set the content type
         request
             .headers_mut()
-            .insert(CONTENT_TYPE, GRPC_CONTENT_TYPE);
+            .try_insert(CONTENT_TYPE, GRPC_CONTENT_TYPE)
+            .map_err(crate::metadata::metadata_capacity_exhausted)?;
 
         #[cfg(any(feature = "gzip", feature = "zstd"))]
         if let Some(encoding) = self.send_compression_encodings {
-            request.headers_mut().insert(
-                crate::codec::compression::ENCODING_HEADER,
-                encoding.into_header_value(),
-            );
+            request
+                .headers_mut()
+                .try_insert(
+                    crate::codec::compression::ENCODING_HEADER,
+                    encoding.into_header_value(),
+                )
+                .map_err(crate::metadata::metadata_capacity_exhausted)?;
         }
 
         if let Some(header_value) = self
             .accept_compression_encodings
             .into_accept_encoding_header_value()
         {
-            request.headers_mut().insert(
-                crate::codec::compression::ACCEPT_ENCODING_HEADER,
-                header_value,
-            );
+            request
+                .headers_mut()
+                .try_insert(
+                    crate::codec::compression::ACCEPT_ENCODING_HEADER,
+                    header_value,
+                )
+                .map_err(crate::metadata::metadata_capacity_exhausted)?;
         }
 
-        request
+        Ok(request)
     }
 }
 

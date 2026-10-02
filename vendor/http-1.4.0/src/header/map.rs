@@ -2179,6 +2179,104 @@ where
     }
 }
 
+impl<T> HeaderMap<T> {
+    /// Merge a consumed map, preserving its original allocation family.
+    ///
+    /// Source value groups replace matching destination groups. When only the
+    /// source is funded, its existing storage becomes the destination and only
+    /// non-conflicting old groups are inserted into it. Capacity failures leave
+    /// the applied prefix; callers must discard it before publishing a failure.
+    pub fn try_extend_map(&mut self, mut other: Self) -> Result<(), MaxSizeReached> {
+        if self.allocation.is_none() && other.allocation.is_some() {
+            // No temporary map or copy position: the original source storage
+            // already owns a fixed position. Drain the old map into that position.
+            std::mem::swap(self, &mut other);
+            let mut iter = other.into_iter();
+            let (mut key, mut value) = match iter.next() {
+                Some((Some(key), value)) => (key, value),
+                None => return Ok(()),
+                Some((None, _)) => unreachable!("map iterator starts with a named group"),
+            };
+            'outer: loop {
+                let mut entry = if self.contains_key(&key) {
+                    None
+                } else {
+                    match self.try_entry2(key)? {
+                        Entry::Vacant(entry) => Some(entry.try_insert_entry(value)?),
+                        Entry::Occupied(_) => unreachable!("absent key must be vacant"),
+                    }
+                };
+                loop {
+                    match iter.next() {
+                        Some((Some(next_key), next_value)) => {
+                            key = next_key;
+                            value = next_value;
+                            continue 'outer;
+                        }
+                        Some((None, value)) => {
+                            if let Some(entry) = &mut entry {
+                                entry.try_append(value)?;
+                            }
+                        }
+                        None => return Ok(()),
+                    }
+                }
+            }
+        } else {
+            self.try_extend(other)
+        }
+    }
+
+    /// Extend with grouped entries from a consumed map, reporting capacity exhaustion.
+    ///
+    /// A named entry replaces every previous value of that key; subsequent unnamed
+    /// entries append values to it. Fixed maps do not reserve the iterator's size
+    /// hint, since existing keys do not require additional buckets. On error the
+    /// already applied prefix remains. An unnamed first entry is rejected.
+    pub fn try_extend<I>(&mut self, iter: I) -> Result<(), MaxSizeReached>
+    where
+        I: IntoIterator<Item = (Option<HeaderName>, T)>,
+    {
+        let mut iter = iter.into_iter();
+        if self.allocation.is_none() {
+            let hint = iter.size_hint().0;
+            let reserve = if self.is_empty() {
+                hint
+            } else {
+                hint / 2 + hint % 2
+            };
+            self.try_reserve(reserve)?;
+        }
+        let (mut key, mut val) = match iter.next() {
+            Some((Some(key), val)) => (key, val),
+            Some((None, _)) => return Err(MaxSizeReached::new()),
+            None => return Ok(()),
+        };
+        'outer: loop {
+            let mut entry = match self.try_entry2(key)? {
+                Entry::Occupied(mut entry) => {
+                    entry.insert(val);
+                    entry
+                }
+                Entry::Vacant(entry) => entry.try_insert_entry(val)?,
+            };
+            loop {
+                match iter.next() {
+                    Some((Some(next_key), next_val)) => {
+                        key = next_key;
+                        val = next_val;
+                        continue 'outer;
+                    }
+                    Some((None, val)) => {
+                        entry.try_append(val)?;
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
 impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
     /// Extend a `HeaderMap` with the contents of another `HeaderMap`.
     ///
@@ -4262,6 +4360,12 @@ impl Drop for MapAllocationClaim {
 }
 
 impl HeaderMap<HeaderValue> {
+    /// The original allocation family, when this map uses fixed storage.
+    /// Cloned handles share the same finite positions and original lifetime.
+    pub fn allocation_pool(&self) -> Option<&HeaderMapAllocationPool> {
+        self.allocation.as_ref().map(|claim| &claim.pool)
+    }
+
     /// Allocate a fixed map from an original metadata grant.
     /// Payload owners remain independent; no capacity growth is permitted.
     pub fn try_from_allocation_pool(

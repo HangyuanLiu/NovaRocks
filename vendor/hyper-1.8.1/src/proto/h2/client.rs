@@ -34,6 +34,18 @@ use h2::client::ResponseFuture;
 
 type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<IncomingBody>>;
 
+fn try_set_content_length_if_missing(headers: &mut http::HeaderMap, len: u64) -> crate::Result<()> {
+    if let http::header::Entry::Vacant(entry) = headers
+        .try_entry(http::header::CONTENT_LENGTH)
+        .map_err(|_| crate::Error::new_h2(h2::Reason::INTERNAL_ERROR.into()))?
+    {
+        entry
+            .try_insert(http::HeaderValue::from(len))
+            .map_err(|_| crate::Error::new_h2(h2::Reason::INTERNAL_ERROR.into()))?;
+    }
+    Ok(())
+}
+
 ///// An mpsc channel is used to help notify the `Connection` task when *all*
 ///// other handles to it have been dropped, so that it can shutdown.
 type ConnDropRef = mpsc::Sender<Infallible>;
@@ -721,7 +733,15 @@ where
                     super::strip_connection_headers(req.headers_mut(), true);
                     if let Some(len) = body.size_hint().exact() {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
-                            headers::set_content_length_if_missing(req.headers_mut(), len);
+                            if let Err(error) =
+                                try_set_content_length_if_missing(req.headers_mut(), len)
+                            {
+                                cb.send(Err(TrySendError {
+                                    error,
+                                    message: None,
+                                }));
+                                continue;
+                            }
                         }
                     }
 

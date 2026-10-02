@@ -40,6 +40,30 @@ const DEFAULT_MAX_SEND_BUF_SIZE: usize = 1024 * 400; // 400kb
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: u32 = 1024 * 16; // 16kb
 const DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS: usize = 1024;
 
+fn try_set_content_length_if_missing(headers: &mut http::HeaderMap, len: u64) -> crate::Result<()> {
+    if let http::header::Entry::Vacant(entry) = headers
+        .try_entry(http::header::CONTENT_LENGTH)
+        .map_err(|_| crate::Error::new_user_header())?
+    {
+        entry
+            .try_insert(http::HeaderValue::from(len))
+            .map_err(|_| crate::Error::new_user_header())?;
+    }
+    Ok(())
+}
+
+fn try_set_date_header_if_missing(headers: &mut http::HeaderMap) -> crate::Result<()> {
+    if let http::header::Entry::Vacant(entry) = headers
+        .try_entry(http::header::DATE)
+        .map_err(|_| crate::Error::new_user_header())?
+    {
+        entry
+            .try_insert(date::update_and_header_value())
+            .map_err(|_| crate::Error::new_user_header())?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) adaptive_window: bool,
@@ -538,9 +562,10 @@ where
 
                     // set Date header if it isn't already set if instructed
                     if *me.date_header {
-                        res.headers_mut()
-                            .entry(::http::header::DATE)
-                            .or_insert_with(date::update_and_header_value);
+                        if let Err(error) = try_set_date_header_if_missing(res.headers_mut()) {
+                            me.reply.send_reset(error.h2_reason());
+                            return Poll::Ready(Err(error));
+                        }
                     }
 
                     if let Some(connect_parts) = connect_parts.take() {
@@ -576,7 +601,12 @@ where
                     if !body.is_end_stream() {
                         // automatically set Content-Length from body...
                         if let Some(len) = body.size_hint().exact() {
-                            headers::set_content_length_if_missing(res.headers_mut(), len);
+                            if let Err(error) =
+                                try_set_content_length_if_missing(res.headers_mut(), len)
+                            {
+                                me.reply.send_reset(error.h2_reason());
+                                return Poll::Ready(Err(error));
+                            }
                         }
 
                         let body_tx = reply!(me, res, false);

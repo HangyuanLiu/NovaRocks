@@ -3,6 +3,7 @@
 mod encoding;
 mod key;
 mod map;
+pub(crate) use self::map::metadata_capacity_exhausted;
 mod value;
 
 pub use self::encoding::Ascii;

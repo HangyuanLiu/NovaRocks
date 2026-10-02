@@ -622,3 +622,91 @@ fn colliding_keys_duplicate_links_and_removal_match_the_ordinary_map() {
     drop(bounded);
     funded.finish();
 }
+
+#[test]
+fn fallible_grouped_extend_replaces_duplicates_at_full_key_capacity_without_allocation() {
+    let funded = Funded::new(1, 1, 3);
+    let mut destination = funded.map();
+    destination.insert("x-one", HeaderValue::from_static("old-first"));
+    destination.append("x-one", HeaderValue::from_static("old-second"));
+    let mut source = HeaderMap::new();
+    source.append("x-one", HeaderValue::from_static("new-first"));
+    source.append("x-one", HeaderValue::from_static("new-second"));
+    no_allocation(|| destination.try_extend(source)).unwrap();
+    let mut values = destination.get_all("x-one").iter();
+    assert_eq!(values.next().unwrap(), "new-first");
+    assert_eq!(values.next().unwrap(), "new-second");
+    assert!(values.next().is_none());
+    assert_eq!(funded.pool.available_maps(), 0);
+    drop(destination);
+    funded.finish();
+}
+
+#[test]
+fn owned_merge_adopts_funded_source_and_keeps_unmatched_old_value_groups() {
+    let funded = Funded::new(1, 3, 4);
+    let mut source = funded.map();
+    source.insert("x-common", HeaderValue::from_static("new"));
+    source.insert("x-source", HeaderValue::from_static("source"));
+    let mut destination = HeaderMap::new();
+    destination.append("x-common", HeaderValue::from_static("old-one"));
+    destination.append("x-common", HeaderValue::from_static("old-two"));
+    destination.append("x-old", HeaderValue::from_static("keep-one"));
+    destination.append("x-old", HeaderValue::from_static("keep-two"));
+    no_allocation(|| destination.try_extend_map(source)).unwrap();
+    assert!(destination.allocation_pool().is_some());
+    assert_eq!(funded.pool.available_maps(), 0);
+    assert_eq!(destination.get_all("x-common").iter().count(), 1);
+    assert_eq!(destination["x-common"], "new");
+    let mut values = destination.get_all("x-old").iter();
+    assert_eq!(values.next().unwrap(), "keep-one");
+    assert_eq!(values.next().unwrap(), "keep-two");
+    assert!(values.next().is_none());
+    assert_eq!(destination["x-source"], "source");
+    held(&funded.budget);
+    drop(destination);
+    funded.finish();
+}
+
+#[test]
+fn owned_merge_cannot_escape_original_source_capacity_even_with_empty_ordinary_target() {
+    let funded = Funded::new(1, 1, 1);
+    let mut source = funded.map();
+    source.insert("x-source", HeaderValue::from_static("source"));
+    let mut destination = HeaderMap::new();
+    destination.insert("x-old", HeaderValue::from_static("old"));
+    assert!(no_allocation(|| destination.try_extend_map(source)).is_err());
+    assert!(destination.allocation_pool().is_some());
+    assert_eq!(destination["x-source"], "source");
+    assert!(!destination.contains_key("x-old"));
+    assert_eq!(funded.pool.available_maps(), 0);
+    drop(destination);
+    let source = funded.map();
+    let mut destination = HeaderMap::new();
+    no_allocation(|| destination.try_extend_map(source)).unwrap();
+    assert!(destination.allocation_pool().is_some());
+    assert_eq!(funded.pool.available_maps(), 0);
+    drop(destination);
+    funded.finish();
+}
+
+#[test]
+fn grouped_extend_exhaustion_drops_remaining_source_values_and_preserves_named_prefix() {
+    let funded = Funded::new(1, 1, 1);
+    let mut destination = funded.map();
+    let mut source = HeaderMap::new();
+    source.append("x-one", HeaderValue::from_static("first"));
+    source.append("x-one", HeaderValue::from_static("second"));
+    source.append("x-one", HeaderValue::from_static("third"));
+    assert!(no_allocation(|| destination.try_extend(source)).is_err());
+    let mut values = destination.get_all("x-one").iter();
+    assert_eq!(values.next().unwrap(), "first");
+    assert_eq!(values.next().unwrap(), "second");
+    assert!(values.next().is_none());
+    assert!(
+        no_allocation(|| destination.try_extend([(None, HeaderValue::from_static("bad"))]))
+            .is_err()
+    );
+    drop(destination);
+    funded.finish();
+}

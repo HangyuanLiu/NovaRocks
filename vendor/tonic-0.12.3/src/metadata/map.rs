@@ -1213,8 +1213,47 @@ impl MetadataMap {
         key.remove(self)
     }
 
-    pub(crate) fn merge(&mut self, other: MetadataMap) {
-        self.headers.extend(other.headers);
+    /// Copy metadata after acquiring another position in its original HTTP pool.
+    pub fn try_clone(&self) -> Result<Self, http::header::MaxSizeReached> {
+        self.headers.try_clone().map(Self::from_headers)
+    }
+
+    pub(crate) fn try_merge(&mut self, other: MetadataMap) -> Result<(), crate::Status> {
+        self.headers
+            .try_extend_map(other.headers)
+            .map_err(metadata_capacity_exhausted)
+    }
+
+    pub(crate) fn try_add_sanitized_headers(
+        &self,
+        headers: &mut http::HeaderMap,
+    ) -> Result<(), crate::Status> {
+        if headers.allocation_pool().is_none() && self.headers.allocation_pool().is_some() {
+            let sanitized = self
+                .try_clone()
+                .map_err(metadata_capacity_exhausted)?
+                .into_sanitized_headers();
+            return headers
+                .try_extend_map(sanitized)
+                .map_err(metadata_capacity_exhausted);
+        }
+        for key in self.headers.keys() {
+            if Self::GRPC_RESERVED_HEADERS.contains(key) {
+                continue;
+            }
+            let mut values = self.headers.get_all(key).iter();
+            if let Some(value) = values.next() {
+                headers
+                    .try_insert(key.clone(), value.clone())
+                    .map_err(metadata_capacity_exhausted)?;
+                for value in values {
+                    headers
+                        .try_append(key.clone(), value.clone())
+                        .map_err(metadata_capacity_exhausted)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2720,4 +2759,8 @@ mod tests {
         is_send_sync::<ValueIterMut<'_, Ascii>>();
         is_send_sync::<ValueIterMut<'_, Binary>>();
     }
+}
+
+pub(crate) fn metadata_capacity_exhausted(_: http::header::MaxSizeReached) -> crate::Status {
+    crate::Status::resource_exhausted("HTTP metadata capacity exhausted")
 }

@@ -251,7 +251,14 @@ impl StreamingInner {
                     return Poll::Ready(Ok(None));
                 }
 
-                let _ = std::mem::replace(&mut self.state, State::Error(Some(status.clone())));
+                let copy = match status.try_clone() {
+                    Ok(copy) => copy,
+                    Err(capacity_error) => {
+                        self.state = State::Error(None);
+                        return Poll::Ready(Err(capacity_error));
+                    }
+                };
+                self.state = State::Error(Some(copy));
                 debug!("decoder inner stream error: {:?}", status);
                 return Poll::Ready(Err(status));
             }
@@ -267,7 +274,16 @@ impl StreamingInner {
                 frame if frame.is_trailers() => {
                     match &mut self.trailers {
                         Some(trailers) => {
-                            trailers.extend(frame.into_trailers().unwrap());
+                            if let Err(error) =
+                                trailers.try_extend_map(frame.into_trailers().unwrap())
+                            {
+                                // A failed merge may have applied a prefix; never publish it as trailers.
+                                self.trailers.take();
+                                self.state = State::Error(None);
+                                return Poll::Ready(Err(
+                                    crate::metadata::metadata_capacity_exhausted(error),
+                                ));
+                            }
                         }
                         None => {
                             self.trailers = Some(frame.into_trailers().unwrap());

@@ -392,7 +392,7 @@ where
         let mut req = Request::from_http_parts(parts, message);
 
         if let Some(trailers) = stream.trailers().await? {
-            req.metadata_mut().merge(trailers);
+            req.metadata_mut().try_merge(trailers)?;
         }
 
         Ok(req)
@@ -435,17 +435,28 @@ where
         let (mut parts, body) = response.into_http().into_parts();
 
         // Set the content type
-        parts
+        if let Err(error) = parts
             .headers
-            .insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE);
+            .try_insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE)
+        {
+            return crate::status::metadata_failure_response(
+                parts.headers,
+                crate::metadata::metadata_capacity_exhausted(error),
+            );
+        }
 
         #[cfg(any(feature = "gzip", feature = "zstd"))]
         if let Some(encoding) = accept_encoding {
             // Set the content encoding
-            parts.headers.insert(
+            if let Err(error) = parts.headers.try_insert(
                 crate::codec::compression::ENCODING_HEADER,
                 encoding.into_header_value(),
-            );
+            ) {
+                return crate::status::metadata_failure_response(
+                    parts.headers,
+                    crate::metadata::metadata_capacity_exhausted(error),
+                );
+            }
         }
 
         let body = EncodeBody::new_server(

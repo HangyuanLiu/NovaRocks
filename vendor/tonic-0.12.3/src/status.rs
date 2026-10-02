@@ -440,6 +440,14 @@ impl Status {
     pub fn from_header_map(header_map: &HeaderMap) -> Option<Status> {
         header_map.get(Self::GRPC_STATUS).map(|code| {
             let code = Code::from_bytes(code.as_ref());
+            // Acquire the original copy position before allocating decoded status fields.
+            let mut other_headers = match header_map.try_clone() {
+                Ok(headers) => headers,
+                Err(err) => return crate::metadata::metadata_capacity_exhausted(err),
+            };
+            other_headers.remove(Self::GRPC_STATUS);
+            other_headers.remove(Self::GRPC_MESSAGE);
+            other_headers.remove(Self::GRPC_STATUS_DETAILS);
             let error_message = header_map
                 .get(Self::GRPC_MESSAGE)
                 .map(|header| {
@@ -449,20 +457,13 @@ impl Status {
                 })
                 .unwrap_or_else(|| Ok(String::new()));
 
-            let details = header_map
-                .get(Self::GRPC_STATUS_DETAILS)
-                .map(|h| {
-                    crate::util::base64::STANDARD
-                        .decode(h.as_bytes())
-                        .expect("Invalid status header, expected base64 encoded value")
-                })
-                .map(Bytes::from)
-                .unwrap_or_default();
-
-            let mut other_headers = header_map.clone();
-            other_headers.remove(Self::GRPC_STATUS);
-            other_headers.remove(Self::GRPC_MESSAGE);
-            other_headers.remove(Self::GRPC_STATUS_DETAILS);
+            let details = match header_map.get(Self::GRPC_STATUS_DETAILS) {
+                Some(header) => match crate::util::base64::STANDARD.decode(header.as_bytes()) {
+                    Ok(details) => Bytes::from(details),
+                    Err(_) => return Status::internal("Invalid grpc-status-details-bin header"),
+                },
+                None => Bytes::new(),
+            };
 
             match error_message {
                 Ok(message) => Status {
@@ -483,6 +484,21 @@ impl Status {
                     }
                 }
             }
+        })
+    }
+
+    /// Copy this status after acquiring its original metadata copy position.
+    pub fn try_clone(&self) -> Result<Self, Self> {
+        let metadata = self
+            .metadata
+            .try_clone()
+            .map_err(crate::metadata::metadata_capacity_exhausted)?;
+        Ok(Self {
+            code: self.code,
+            message: self.message.clone(),
+            details: self.details.clone(),
+            metadata,
+            source: self.source.clone(),
         })
     }
 
@@ -512,35 +528,48 @@ impl Status {
     }
 
     pub(crate) fn to_header_map(&self) -> Result<HeaderMap, Self> {
-        let mut header_map = HeaderMap::with_capacity(3 + self.metadata.len());
-        self.add_header(&mut header_map)?;
+        let mut header_map = self
+            .metadata
+            .try_clone()
+            .map_err(crate::metadata::metadata_capacity_exhausted)?
+            .into_sanitized_headers();
+        self.add_status_headers(&mut header_map)?;
         Ok(header_map)
     }
 
     /// Add headers from this `Status` into `header_map`.
     pub fn add_header(&self, header_map: &mut HeaderMap) -> Result<(), Self> {
-        header_map.extend(self.metadata.clone().into_sanitized_headers());
+        self.metadata.try_add_sanitized_headers(header_map)?;
+        self.add_status_headers(header_map)
+    }
 
-        header_map.insert(Self::GRPC_STATUS, self.code.to_header_value());
+    fn add_status_headers(&self, header_map: &mut HeaderMap) -> Result<(), Self> {
+        header_map
+            .try_insert(Self::GRPC_STATUS, self.code.to_header_value())
+            .map_err(crate::metadata::metadata_capacity_exhausted)?;
 
         if !self.message.is_empty() {
             let to_write = Bytes::copy_from_slice(
                 Cow::from(percent_encode(self.message().as_bytes(), ENCODING_SET)).as_bytes(),
             );
 
-            header_map.insert(
-                Self::GRPC_MESSAGE,
-                HeaderValue::from_maybe_shared(to_write).map_err(invalid_header_value_byte)?,
-            );
+            header_map
+                .try_insert(
+                    Self::GRPC_MESSAGE,
+                    HeaderValue::from_maybe_shared(to_write).map_err(invalid_header_value_byte)?,
+                )
+                .map_err(crate::metadata::metadata_capacity_exhausted)?;
         }
 
         if !self.details.is_empty() {
             let details = crate::util::base64::STANDARD_NO_PAD.encode(&self.details[..]);
 
-            header_map.insert(
-                Self::GRPC_STATUS_DETAILS,
-                HeaderValue::from_maybe_shared(details).map_err(invalid_header_value_byte)?,
-            );
+            header_map
+                .try_insert(
+                    Self::GRPC_STATUS_DETAILS,
+                    HeaderValue::from_maybe_shared(details).map_err(invalid_header_value_byte)?,
+                )
+                .map_err(crate::metadata::metadata_capacity_exhausted)?;
         }
 
         Ok(())
@@ -579,12 +608,17 @@ impl Status {
     }
 
     /// Build an `http::Response` from the given `Status`.
-    pub fn into_http(self) -> http::Response<BoxBody> {
+    pub fn into_http(mut self) -> http::Response<BoxBody> {
         let mut response = http::Response::new(crate::body::empty_body());
-        response
+        *response.headers_mut() = std::mem::take(&mut self.metadata).into_sanitized_headers();
+        let result = response
             .headers_mut()
-            .insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE);
-        self.add_header(response.headers_mut()).unwrap();
+            .try_insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE)
+            .map_err(crate::metadata::metadata_capacity_exhausted)
+            .and_then(|_| self.add_status_headers(response.headers_mut()));
+        if let Err(error) = result {
+            return metadata_failure_response(std::mem::take(response.headers_mut()), error);
+        }
         response
     }
 
@@ -596,20 +630,33 @@ impl Status {
     pub const GRPC_STATUS_DETAILS: HeaderName = HeaderName::from_static("grpc-status-details-bin");
 }
 
+/// Retain the failed response's original metadata storage until physical response exit.
+pub(crate) fn metadata_failure_response(
+    mut headers: HeaderMap,
+    error: Status,
+) -> http::Response<BoxBody> {
+    // Neither publish a partial status nor serialize the capacity error recursively.
+    headers.clear();
+    let body = http_body_util::StreamBody::new(tokio_stream::once(Err::<
+        http_body::Frame<Bytes>,
+        Status,
+    >(error)));
+    let mut response = http::Response::new(BoxBody::new(body));
+    *response.headers_mut() = headers;
+    *response.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+    response
+}
+
 fn find_status_in_source_chain(err: &(dyn Error + 'static)) -> Option<Status> {
     let mut source = Some(err);
 
     while let Some(err) = source {
         if let Some(status) = err.downcast_ref::<Status>() {
-            return Some(Status {
-                code: status.code,
-                message: status.message.clone(),
-                details: status.details.clone(),
-                metadata: status.metadata.clone(),
-                // Since `Status` is not `Clone`, any `source` on the original Status
-                // cannot be cloned so must remain with the original `Status`.
-                source: None,
-            });
+            let mut copy = status
+                .try_clone()
+                .unwrap_or_else(|capacity_error| capacity_error);
+            copy.source = None;
+            return Some(copy);
         }
 
         if let Some(timeout) = err.downcast_ref::<TimeoutExpired>() {

@@ -1,0 +1,29 @@
+{
+  "status": "verified-fallible-metadata-slice",
+  "parent": "b4edbd25108cf275f355aa351a4b85a9d0cce436",
+  "protocol_targets": 21,
+  "protocol_tests": 172,
+  "new_http_allocator_tests": 4,
+  "new_hyper_actual_wire_tests": 3,
+  "new_tonic_actual_framework_and_public_tests": 14,
+  "private_http_tests": 10,
+  "private_http_miri_tests": 10,
+  "source_runtime_negative_cases": 5,
+  "restored_related_tests": 30,
+  "final_tonic_tests": 14,
+  "feature_variants": [
+    "Hyper client/http2",
+    "Hyper server/http2",
+    "Tonic channel only"
+  ],
+  "feature_production_dependency_identities": 63,
+  "vendor_strict_lib_clippy": 0,
+  "native_three_target_clippy": 0,
+  "new_target_clippy_warnings": 0,
+  "fmt_diff_check": 0,
+  "whole_vendor_source_pins": 262,
+  "lossless_evidence_files": 32,
+  "full_native_profile_installation": false,
+  "full_native_1fe_3be_acceptance": false,
+  "linux_tests": "user-will-run-manually"
+}

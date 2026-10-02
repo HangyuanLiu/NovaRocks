@@ -104,13 +104,6 @@ pub(super) fn method_has_defined_payload_semantics(method: &Method) -> bool {
     )
 }
 
-#[cfg(feature = "http2")]
-pub(super) fn set_content_length_if_missing(headers: &mut HeaderMap, len: u64) {
-    headers
-        .entry(CONTENT_LENGTH)
-        .or_insert_with(|| HeaderValue::from(len));
-}
-
 #[cfg(all(feature = "client", feature = "http1"))]
 pub(super) fn transfer_encoding_is_chunked(headers: &HeaderMap) -> bool {
     is_chunked(headers.get_all(http::header::TRANSFER_ENCODING).into_iter())
