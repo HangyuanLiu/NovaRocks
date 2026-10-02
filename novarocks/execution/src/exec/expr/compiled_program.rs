@@ -248,6 +248,7 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::IsNull(_)
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
+                    | StaticExprKind::PreparedCast { .. }
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::Eq(..)
                     | StaticExprKind::Ne(..)
@@ -262,6 +263,11 @@ impl CompiledExpressionInstance {
                                     .ok_or_else(|| {
                                         invalid("missing mandatory arithmetic effect recipe")
                                     })?
+                                    .own_effects(invocation.context)
+                            } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
+                                program
+                                    .cast_recipe(occurrence)
+                                    .ok_or_else(|| invalid("missing mandatory cast effect recipe"))?
                                     .own_effects(invocation.context)
                             } else {
                                 ScopedExpressionEffects::pure_value(invocation.context)
@@ -322,6 +328,10 @@ impl CompiledExpressionInstance {
                 | StaticExprKind::IsNotNull(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1 => {}
+                StaticExprKind::PreparedCast { .. }
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 1
+                        && program.cast_recipe(occurrence).is_some() => {}
                 StaticExprKind::PreparedArithmetic { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2

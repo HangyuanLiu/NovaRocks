@@ -667,6 +667,21 @@ pub(super) fn evaluate_tree<'a>(
                         || work.step(),
                     )?)
                 }
+                StaticExprKind::PreparedCast { .. } => {
+                    if frame.children.len() != 1 {
+                        return Err(invalid("cast requires its exact operand"));
+                    }
+                    let child = std::mem::take(&mut frame.children)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| internal("missing cast operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let recipe = program
+                        .cast_recipe(frame.occurrence)
+                        .ok_or_else(|| invalid("missing exact cast recipe"))?;
+                    OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
+                }
                 StaticExprKind::PreparedArithmetic { .. } => {
                     if frame.children.len() != 2 {
                         return Err(invalid("arithmetic requires its exact ordered operands"));
@@ -1112,6 +1127,130 @@ fn evaluate_arithmetic<'a>(
                 "arithmetic recipe has an unsupported frozen result carrier",
             ));
         }
+    };
+    work.flush()?;
+    SelectedValues::try_new_observed(selection, ty, array, errors.into_boxed_slice(), || {
+        work.step()
+    })
+}
+
+fn evaluate_cast<'a>(
+    recipe: &novarocks_functions::PreparedCastRecipe,
+    child: &Value<'_>,
+    selection: Selection<'a>,
+    work: &mut Work<'_>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    use arrow::array::{Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array};
+    use novarocks_functions::CastRowResult as R;
+    let ty = &recipe.result_type().data_type;
+    // Checked representation and fallible reservation are not a host memory grant.
+    let bitmap = selection
+        .len()
+        .checked_add(7)
+        .map(|n| n / 8)
+        .and_then(|n| n.checked_add(63))
+        .map(|n| n / 64 * 64)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    selection
+        .len()
+        .checked_mul(
+            std::mem::size_of::<Option<i64>>()
+                + std::mem::size_of::<RowDataError>()
+                + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )
+        .and_then(|n| n.checked_add(bitmap))
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    enum Output {
+        I8(Vec<Option<i8>>),
+        I16(Vec<Option<i16>>),
+        I32(Vec<Option<i32>>),
+        I64(Vec<Option<i64>>),
+        F32(Vec<Option<f32>>),
+        F64(Vec<Option<f64>>),
+    }
+    let mut output = match ty {
+        DataType::Int8 => Output::I8(Vec::new()),
+        DataType::Int16 => Output::I16(Vec::new()),
+        DataType::Int32 => Output::I32(Vec::new()),
+        DataType::Int64 => Output::I64(Vec::new()),
+        DataType::Float32 => Output::F32(Vec::new()),
+        DataType::Float64 => Output::F64(Vec::new()),
+        _ => return Err(internal("cast recipe has a foreign frozen result carrier")),
+    };
+    match &mut output {
+        Output::I8(v) => v.try_reserve_exact(selection.len()),
+        Output::I16(v) => v.try_reserve_exact(selection.len()),
+        Output::I32(v) => v.try_reserve_exact(selection.len()),
+        Output::I64(v) => v.try_reserve_exact(selection.len()),
+        Output::F32(v) => v.try_reserve_exact(selection.len()),
+        Output::F64(v) => v.try_reserve_exact(selection.len()),
+    }
+    .map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut errors = Vec::new();
+    errors
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    let mut inherited = child.errors().iter().peekable();
+    for (ordinal, row) in selection.iter().enumerate() {
+        let value = if inherited
+            .peek()
+            .is_some_and(|e| e.selected_ordinal() == ordinal)
+        {
+            R::RowError(inherited.next().expect("checked inherited error").clone())
+        } else {
+            work.flush()?;
+            recipe.evaluate_row(child.argument(), ordinal, row, work.control)?
+        };
+        let value = match value {
+            R::RowError(error) => {
+                errors.push(RowDataError::new(ordinal, error.message()));
+                R::Null
+            }
+            other => other,
+        };
+        match (&mut output, value) {
+            (Output::I8(v), R::Signed(n)) => v.push(Some(
+                i8::try_from(n).map_err(|_| internal("cast returned an out-of-range Int8"))?,
+            )),
+            (Output::I16(v), R::Signed(n)) => {
+                v.push(Some(i16::try_from(n).map_err(|_| {
+                    internal("cast returned an out-of-range Int16")
+                })?))
+            }
+            (Output::I32(v), R::Signed(n)) => {
+                v.push(Some(i32::try_from(n).map_err(|_| {
+                    internal("cast returned an out-of-range Int32")
+                })?))
+            }
+            (Output::I64(v), R::Signed(n)) => v.push(Some(n)),
+            (Output::F32(v), R::Float32(n)) => v.push(Some(n)),
+            (Output::F64(v), R::Float64(n)) => v.push(Some(n)),
+            (Output::I8(v), R::Null) => v.push(None),
+            (Output::I16(v), R::Null) => v.push(None),
+            (Output::I32(v), R::Null) => v.push(None),
+            (Output::I64(v), R::Null) => v.push(None),
+            (Output::F32(v), R::Null) => v.push(None),
+            (Output::F64(v), R::Null) => v.push(None),
+            _ => {
+                return Err(internal(
+                    "cast body returned a foreign result representation",
+                ));
+            }
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    // Arrow construction is an opaque observed boundary, not internally cooperative allocation.
+    let array: ArrayRef = match output {
+        Output::I8(v) => Arc::new(Int8Array::from(v)),
+        Output::I16(v) => Arc::new(Int16Array::from(v)),
+        Output::I32(v) => Arc::new(Int32Array::from(v)),
+        Output::I64(v) => Arc::new(Int64Array::from(v)),
+        Output::F32(v) => Arc::new(Float32Array::from(v)),
+        Output::F64(v) => Arc::new(Float64Array::from(v)),
     };
     work.flush()?;
     SelectedValues::try_new_observed(selection, ty, array, errors.into_boxed_slice(), || {

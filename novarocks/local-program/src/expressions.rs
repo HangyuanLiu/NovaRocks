@@ -153,6 +153,13 @@ pub enum StaticExprKind {
     Cast(ProgramExprId, DecimalOverflowPolicy),
     CastTime(ProgramExprId, DecimalOverflowPolicy),
     CastTimeFromDatetime(ProgramExprId, DecimalOverflowPolicy),
+    /// Cast retaining its exact operation and admitted semantic parameter.
+    PreparedCast {
+        operation: novarocks_functions::CastOperation,
+        child: ProgramExprId,
+        decimal_overflow_policy: DecimalOverflowPolicy,
+        allow_throw_exception: bool,
+    },
     /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
     /// Legacy construction tags below confer no prepared recipe authority.
     PreparedArithmetic {
@@ -252,7 +259,11 @@ impl StaticExprKind {
 
     pub fn decimal_overflow_policy(&self) -> Option<DecimalOverflowPolicy> {
         match self {
-            Self::PreparedArithmetic {
+            Self::PreparedCast {
+                decimal_overflow_policy,
+                ..
+            }
+            | Self::PreparedArithmetic {
                 decimal_overflow_policy,
                 ..
             } => Some(*decimal_overflow_policy),
@@ -291,7 +302,8 @@ impl StaticExprKind {
                     visit(*id)?;
                 }
             }
-            Self::DictDecode { child, .. }
+            Self::PreparedCast { child, .. }
+            | Self::DictDecode { child, .. }
             | Self::Cast(child, _)
             | Self::CastTime(child, _)
             | Self::CastTimeFromDatetime(child, _)

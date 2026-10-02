@@ -39,6 +39,7 @@ pub struct LocalProgram {
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
+    casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
     comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
 }
 
@@ -129,6 +130,7 @@ impl LocalProgram {
             crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)?;
         crate::provider_links::validate_provider_links(&checked, &writes, control)?;
         let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
+        let casts = crate::primitives::compile_casts(&checked, control)?;
         let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
         // Each delegated author finishes its completed work and propagates a
         // first control refusal directly; no control object enters the product.
@@ -138,6 +140,7 @@ impl LocalProgram {
             writes,
             comparisons,
             arithmetic,
+            casts,
         })
     }
     pub const fn checked(&self) -> &ProgramLexicalBindings {
@@ -168,6 +171,12 @@ impl LocalProgram {
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedArithmeticRecipe> {
         self.arithmetic.get(&site)
+    }
+    pub fn cast_recipe(
+        &self,
+        site: crate::ProgramUseRef,
+    ) -> Option<&novarocks_functions::PreparedCastRecipe> {
+        self.casts.get(&site)
     }
     /// Borrow the exact checked implementation's lifecycle; never rebuild a
     /// second state declaration from a name or legacy expression tag.

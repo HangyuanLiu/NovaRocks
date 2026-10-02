@@ -40,6 +40,7 @@ pub enum ProgramPrimitiveError {
     Control(CompileControlError),
     Comparison(ComparisonPrepareError),
     Arithmetic(novarocks_functions::ArithmeticPrepareError),
+    Cast(novarocks_functions::CastPrepareError),
     Invalid(&'static str),
 }
 impl From<CompileControlError> for ProgramPrimitiveError {
@@ -62,6 +63,7 @@ impl fmt::Display for ProgramPrimitiveError {
             Self::Control(e) => e.fmt(f),
             Self::Comparison(e) => e.fmt(f),
             Self::Arithmetic(e) => e.fmt(f),
+            Self::Cast(e) => e.fmt(f),
             Self::Invalid(message) => f.write_str(message),
         }
     }
@@ -72,6 +74,7 @@ impl std::error::Error for ProgramPrimitiveError {
             Self::Control(e) => Some(e),
             Self::Comparison(e) => Some(e),
             Self::Arithmetic(e) => Some(e),
+            Self::Cast(e) => Some(e),
             Self::Invalid(_) => None,
         }
     }
@@ -268,6 +271,80 @@ pub(crate) fn compile_arithmetic(
                     *operator,
                     value(*left)?,
                     value(*right)?,
+                    value(invocation.definition)?,
+                    *decimal_overflow_policy,
+                    *allow_throw_exception,
+                    control,
+                )?;
+                recipes.insert(ProgramUseRef { arena, use_id }, recipe);
+                work.step()?;
+            }
+        }
+        Ok(recipes)
+    })();
+    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+impl From<novarocks_functions::CastPrepareError> for ProgramPrimitiveError {
+    fn from(value: novarocks_functions::CastPrepareError) -> Self {
+        if let Some(cause) = value.control_error() {
+            Self::Control(cause)
+        } else {
+            Self::Cast(value)
+        }
+    }
+}
+
+pub(crate) fn compile_casts(
+    checked: &ProgramLexicalBindings,
+    control: &dyn PureCompileControl,
+) -> Result<BTreeMap<ProgramUseRef, novarocks_functions::PreparedCastRecipe>, ProgramPrimitiveError>
+{
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
+        let mut recipes = BTreeMap::new();
+        for (&arena, flow) in snapshot.flows() {
+            let definitions = &snapshot.roots().arenas()[&arena];
+            let types = &typed.types()[&arena];
+            let value = |id: crate::ProgramExprId| match types.get(id.index()) {
+                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                _ => Err(ProgramPrimitiveError::Invalid(
+                    "cast requires complete value types",
+                )),
+            };
+            for (&use_id, invocation) in flow.uses() {
+                work.step()?;
+                let kind = definitions
+                    .node(invocation.definition)
+                    .ok_or(ProgramPrimitiveError::Invalid("missing cast definition"))?
+                    .kind();
+                let StaticExprKind::PreparedCast {
+                    operation,
+                    child,
+                    decimal_overflow_policy,
+                    allow_throw_exception,
+                } = kind
+                else {
+                    continue;
+                };
+                if invocation.control != ControlShape::Eager
+                    || invocation.arguments.len() != 1
+                    || flow.uses()[&invocation.arguments[0]].definition != *child
+                {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "cast differs from its actual operand occurrence",
+                    ));
+                }
+                work.flush()?;
+                let recipe = novarocks_functions::PreparedCastRecipe::try_new(
+                    *operation,
+                    value(*child)?,
                     value(invocation.definition)?,
                     *decimal_overflow_policy,
                     *allow_throw_exception,

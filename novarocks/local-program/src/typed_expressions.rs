@@ -148,6 +148,49 @@ impl ProgramTypedExpressions {
                         if let StaticExprKind::Constant(constant) = definition.kind() {
                             same_value(constant.value_type(), value, false, work)?;
                         }
+                        if let StaticExprKind::PreparedCast {
+                            operation,
+                            child,
+                            decimal_overflow_policy,
+                            ..
+                        } = definition.kind()
+                        {
+                            let Some(FunctionArgumentType::Value(source)) =
+                                entries.get(child.index())
+                            else {
+                                return Err(ProgramExpressionTypeError::WrongKind);
+                            };
+                            if source.logical_type != value.logical_type || ((source.nullable || source.data_type == arrow_schema::DataType::Null) && !value.nullable)
+                                || !novarocks_type_contract::preserves_nested_logical_identity_observed(
+                                    &source.data_type, &value.data_type, || work.step().map_err(ProgramExpressionTypeError::Control),
+                                )?
+                                || !novarocks_type_contract::decimal_error_policy_cast_supported_observed(
+                                    &source.data_type, &value.data_type, *decimal_overflow_policy,
+                                    || work.step().map_err(ProgramExpressionTypeError::Control),
+                                )? {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            // This rule describes successful NULLs of signed narrowing,
+                            // independently of the currently installed runtime subset.
+                            let signed_width = |ty: &arrow_schema::DataType| match ty {
+                                arrow_schema::DataType::Int8 => Some(8),
+                                arrow_schema::DataType::Int16 => Some(16),
+                                arrow_schema::DataType::Int32 => Some(32),
+                                arrow_schema::DataType::Int64 => Some(64),
+                                _ => None,
+                            };
+                            if *operation == novarocks_functions::CastOperation::Carrier
+                                && let (Some(source), Some(target)) = (
+                                    signed_width(&source.data_type),
+                                    signed_width(&value.data_type),
+                                )
+                                && target < source
+                                && !value.nullable
+                            {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            work.step()?;
+                        }
                         if let StaticExprKind::PreparedArithmetic {
                             operator,
                             left,

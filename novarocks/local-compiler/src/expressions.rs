@@ -63,6 +63,7 @@ pub(crate) enum ExpressionLoweringError {
     Specialization(FunctionSpecializationFailure),
     Effects(EffectContractError),
     Arithmetic(novarocks_functions::ArithmeticPrepareError),
+    Cast(novarocks_functions::CastPrepareError),
     UnsupportedExpression(ExprId),
     UnsupportedCall(PhysicalCallSite),
     Invalid(&'static str),
@@ -78,6 +79,7 @@ impl fmt::Display for ExpressionLoweringError {
             Self::Specialization(e) => e.fmt(f),
             Self::Effects(e) => e.fmt(f),
             Self::Arithmetic(e) => e.fmt(f),
+            Self::Cast(e) => e.fmt(f),
             Self::UnsupportedExpression(id) => {
                 write!(f, "unsupported physical expression {}", id.get())
             }
@@ -97,6 +99,7 @@ impl Error for ExpressionLoweringError {
             Self::Specialization(e) => Some(e),
             Self::Effects(e) => Some(e),
             Self::Arithmetic(e) => Some(e),
+            Self::Cast(e) => Some(e),
             _ => None,
         }
     }
@@ -107,6 +110,15 @@ impl From<novarocks_functions::ArithmeticPrepareError> for ExpressionLoweringErr
             Self::Control(cause)
         } else {
             Self::Arithmetic(value)
+        }
+    }
+}
+impl From<novarocks_functions::CastPrepareError> for ExpressionLoweringError {
+    fn from(value: novarocks_functions::CastPrepareError) -> Self {
+        if let Some(cause) = value.control_error() {
+            Self::Control(cause)
+        } else {
+            Self::Cast(value)
         }
     }
 }
@@ -280,7 +292,8 @@ fn lower_core(
                     op: novarocks_physical_plan::UnaryOperator::Not,
                     expr,
                 }
-                | ExprKind::IsNull { expr, .. } => (next == 0).then_some(*expr),
+                | ExprKind::IsNull { expr, .. }
+                | ExprKind::Cast { expr, .. } => (next == 0).then_some(*expr),
                 ExprKind::Binary {
                     op:
                         novarocks_physical_plan::BinaryOperator::Eq
@@ -433,6 +446,56 @@ fn lower_core(
                         ExprKind::IsNull { negated: false, .. } => StaticExprKind::IsNull(child),
                         ExprKind::IsNull { negated: true, .. } => StaticExprKind::IsNotNull(child),
                         _ => unreachable!("checked unary kind"),
+                    }
+                }
+                ExprKind::Cast {
+                    expr,
+                    target,
+                    decimal_overflow_policy,
+                    allow_throw_exception,
+                } => {
+                    let child = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "cast operand was not lowered",
+                    ))?;
+                    let authored_allow = package
+                        .parameters()
+                        .require(*allow_throw_exception)
+                        .map_err(|_| {
+                            ExpressionLoweringError::Invalid("missing cast parameter source")
+                        })?;
+                    let novarocks_type_contract::SemanticParameterValue::AllowThrowException(allow) =
+                        authored_allow
+                    else {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "cast parameter has a foreign key",
+                        ));
+                    };
+                    if !novarocks_type_contract::arrow_data_types_exact_observed::<
+                        ExpressionLoweringError,
+                    >(target, &node.ty.data_type, || {
+                        work.step().map_err(ExpressionLoweringError::Control)
+                    })? {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "cast target differs from result",
+                        ));
+                    }
+                    work.flush()?;
+                    novarocks_functions::PreparedCastRecipe::try_new(
+                        novarocks_functions::CastOperation::Carrier,
+                        &source
+                            .get(*expr)
+                            .ok_or(ExpressionLoweringError::Invalid("missing cast source"))?
+                            .ty,
+                        &node.ty,
+                        *decimal_overflow_policy,
+                        *allow,
+                        control,
+                    )?;
+                    StaticExprKind::PreparedCast {
+                        operation: novarocks_functions::CastOperation::Carrier,
+                        child,
+                        decimal_overflow_policy: *decimal_overflow_policy,
+                        allow_throw_exception: *allow,
                     }
                 }
                 ExprKind::Binary {
@@ -877,6 +940,78 @@ fn prepare_core(
                         flow,
                         0,
                     )?
+                }
+                (
+                    ExprKind::Cast {
+                        expr,
+                        target,
+                        decimal_overflow_policy,
+                        allow_throw_exception,
+                    },
+                    StaticExprKind::PreparedCast {
+                        operation,
+                        child,
+                        decimal_overflow_policy: local_policy,
+                        allow_throw_exception: local_allow,
+                    },
+                ) => {
+                    let source_allow = package
+                        .parameters()
+                        .require(*allow_throw_exception)
+                        .map_err(|_| {
+                            ExpressionLoweringError::Invalid("cast parameter source differs")
+                        })?;
+                    if *operation != novarocks_functions::CastOperation::Carrier
+                        || decimal_overflow_policy != local_policy
+                        || source_allow
+                            != &novarocks_type_contract::SemanticParameterValue::AllowThrowException(
+                                *local_allow,
+                            )
+                        || invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 1
+                        || lowered.ids.get(expr) != Some(child)
+                        || flow.uses()[&invocation.arguments[0]].definition != *expr
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "cast occurrence differs from its frozen source",
+                        ));
+                    }
+                    if !novarocks_type_contract::arrow_data_types_exact_observed::<
+                        ExpressionLoweringError,
+                    >(target, &source.ty.data_type, || {
+                        work.step().map_err(ExpressionLoweringError::Control)
+                    })? {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "cast result differs from frozen target",
+                        ));
+                    }
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedCastRecipe::try_new(
+                        *operation,
+                        &package
+                            .fragment()
+                            .expressions()
+                            .get(*expr)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing cast operand source",
+                            ))?
+                            .ty,
+                        &source.ty,
+                        *local_policy,
+                        *local_allow,
+                        control,
+                    )?;
+                    recipe
+                        .own_effects(invocation.context)
+                        .join_control_argument(
+                            *effects.get(&invocation.arguments[0]).ok_or(
+                                ExpressionLoweringError::Invalid(
+                                    "cast child effects were not prepared",
+                                ),
+                            )?,
+                            flow,
+                            0,
+                        )?
                 }
                 (
                     ExprKind::Binary {
@@ -1374,6 +1509,7 @@ fn literal_argument(
         | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
         | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
         (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
+        (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
         (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })
             if arithmetic_operator(*op) == Some(*operator) =>
         {

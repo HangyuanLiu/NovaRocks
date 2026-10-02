@@ -3155,6 +3155,10 @@ fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, Strin
     }
 }
 
+#[cfg(test)]
+#[path = "cast_numeric_oracle_tests.rs"]
+mod cast_numeric_oracle_tests;
+
 pub fn eval(
     arena: &ExprArena,
     cast_expr: ExprId,

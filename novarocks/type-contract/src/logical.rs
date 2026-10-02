@@ -208,57 +208,149 @@ pub fn validate_value_type_structure_observed<'a, E: From<ValueTypeError>>(
 /// A carrier cast has no authority to establish or erase semantic identities.
 /// Ordinary unlabelled structures may change through the existing cast rules.
 pub fn preserves_nested_logical_identity(actual: &DataType, expected: &DataType) -> bool {
-    if validate_nested_logical_types(actual).is_err()
-        || validate_nested_logical_types(expected).is_err()
-    {
-        return false;
+    preserves_nested_logical_identity_observed::<ValueTypeError>(actual, expected, || Ok(()))
+        .unwrap_or(false)
+}
+
+/// The same identity rule with a caller-owned observer. The original logical
+/// validation establishes depth/node bounds before recursive matching. This
+/// rule does not establish cast capability or authorize an allocation.
+pub fn preserves_nested_logical_identity_observed<E: From<ValueTypeError>>(
+    actual: &DataType,
+    expected: &DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    validate_nested_logical_types_observed(actual, &mut observe)?;
+    validate_nested_logical_types_observed(expected, &mut observe)?;
+
+    fn field_has<E: From<ValueTypeError>>(
+        field: &Field,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let logical = field_logical_type(field)?;
+        observe()?;
+        if logical != ValueLogicalType::Physical {
+            Ok(true)
+        } else {
+            has(field.data_type(), observe)
+        }
     }
-    fn field_has(field: &Field) -> bool {
-        field_logical_type(field) != Ok(ValueLogicalType::Physical) || has(field.data_type())
-    }
-    fn has(ty: &DataType) -> bool {
+    fn has<E: From<ValueTypeError>>(
+        ty: &DataType,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
         match ty {
             DataType::List(f)
             | DataType::LargeList(f)
             | DataType::ListView(f)
             | DataType::LargeListView(f)
             | DataType::FixedSizeList(f, _)
-            | DataType::Map(f, _) => field_has(f),
-            DataType::Struct(fields) => fields.iter().any(|f| field_has(f)),
-            DataType::Union(fields, _) => fields.iter().any(|(_, f)| field_has(f)),
-            DataType::Dictionary(key, value) => has(key) || has(value),
-            DataType::RunEndEncoded(ends, values) => field_has(ends) || field_has(values),
-            _ => false,
+            | DataType::Map(f, _) => field_has(f, observe),
+            DataType::Struct(fields) => {
+                for field in fields {
+                    observe()?;
+                    if field_has(field, observe)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            DataType::Union(fields, _) => {
+                for (_, field) in fields.iter() {
+                    observe()?;
+                    if field_has(field, observe)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            DataType::Dictionary(key, value) => {
+                if has(key, observe)? {
+                    Ok(true)
+                } else {
+                    has(value, observe)
+                }
+            }
+            DataType::RunEndEncoded(ends, values) => {
+                if field_has(ends, observe)? {
+                    Ok(true)
+                } else {
+                    field_has(values, observe)
+                }
+            }
+            _ => Ok(false),
         }
     }
-    fn field_preserves(a: &Field, e: &Field) -> bool {
-        field_logical_type(a) == field_logical_type(e) && preserves(a.data_type(), e.data_type())
+    fn field_preserves<E: From<ValueTypeError>>(
+        a: &Field,
+        e: &Field,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let equal = field_logical_type(a)? == field_logical_type(e)?;
+        observe()?;
+        if equal {
+            preserves(a.data_type(), e.data_type(), observe)
+        } else {
+            Ok(false)
+        }
     }
-    fn preserves(a: &DataType, e: &DataType) -> bool {
+    fn preserves<E: From<ValueTypeError>>(
+        a: &DataType,
+        e: &DataType,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
         match (a, e) {
             (DataType::List(a), DataType::List(e))
             | (DataType::LargeList(a), DataType::LargeList(e))
             | (DataType::ListView(a), DataType::ListView(e))
             | (DataType::LargeListView(a), DataType::LargeListView(e))
             | (DataType::FixedSizeList(a, _), DataType::FixedSizeList(e, _))
-            | (DataType::Map(a, _), DataType::Map(e, _)) => field_preserves(a, e),
+            | (DataType::Map(a, _), DataType::Map(e, _)) => field_preserves(a, e, observe),
             (DataType::Struct(a), DataType::Struct(e)) if a.len() == e.len() => {
-                a.iter().zip(e.iter()).all(|(a, e)| field_preserves(a, e))
+                for (a, e) in a.iter().zip(e.iter()) {
+                    observe()?;
+                    if !field_preserves(a, e, observe)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
-            (DataType::Union(a, _), DataType::Union(e, _)) if a.len() == e.len() => a
-                .iter()
-                .zip(e.iter())
-                .all(|((ai, af), (ei, ef))| ai == ei && field_preserves(af, ef)),
+            (DataType::Union(a, _), DataType::Union(e, _)) if a.len() == e.len() => {
+                for ((ai, af), (ei, ef)) in a.iter().zip(e.iter()) {
+                    let same_id = ai == ei;
+                    observe()?;
+                    if !same_id || !field_preserves(af, ef, observe)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             (DataType::Dictionary(ak, av), DataType::Dictionary(ek, ev)) => {
-                preserves(ak, ek) && preserves(av, ev)
+                if preserves(ak, ek, observe)? {
+                    preserves(av, ev, observe)
+                } else {
+                    Ok(false)
+                }
             }
             (DataType::RunEndEncoded(ar, av), DataType::RunEndEncoded(er, ev)) => {
-                field_preserves(ar, er) && field_preserves(av, ev)
+                if field_preserves(ar, er, observe)? {
+                    field_preserves(av, ev, observe)
+                } else {
+                    Ok(false)
+                }
             }
-            _ => !has(a) && !has(e),
+            _ => {
+                if has(a, observe)? {
+                    Ok(false)
+                } else {
+                    Ok(!has(e, observe)?)
+                }
+            }
         }
     }
-    preserves(actual, expected)
+    preserves(actual, expected, &mut observe)
 }
 
 #[cfg(test)]
@@ -447,6 +539,264 @@ mod tests {
                 let units = control.units.lock().unwrap();
                 assert_eq!(units.iter().sum::<u32>(), 601);
                 assert!(units.iter().all(|n| *n <= 256));
+            }
+        }
+    }
+
+    fn identity_field(label: Option<&str>) -> Arc<Field> {
+        let field = Field::new("item", DataType::Utf8, true)
+            .with_metadata([("provider.field.id".into(), "73".into())].into());
+        Arc::new(match label {
+            Some(label) => {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
+                field.with_metadata(metadata)
+            }
+            None => field,
+        })
+    }
+
+    fn identity_wrappers(field: Arc<Field>) -> Vec<DataType> {
+        use arrow_schema::{UnionFields, UnionMode};
+        vec![
+            DataType::List(field.clone()),
+            DataType::LargeList(field.clone()),
+            DataType::ListView(field.clone()),
+            DataType::LargeListView(field.clone()),
+            DataType::FixedSizeList(field.clone(), 2),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int64, false).into(),
+                            field.clone(),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            DataType::Struct(vec![field.clone()].into()),
+            DataType::Union(
+                UnionFields::try_new(vec![7], vec![field.clone()]).unwrap(),
+                UnionMode::Dense,
+            ),
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::List(field.clone())),
+            ),
+            DataType::RunEndEncoded(Arc::new(Field::new("ends", DataType::Int32, false)), field),
+        ]
+    }
+
+    #[test]
+    fn observed_identity_preserves_labels_in_every_original_carrier_branch() {
+        let labelled = identity_wrappers(identity_field(Some("json")));
+        let plain = identity_wrappers(identity_field(None));
+        for (labelled, plain) in labelled.iter().zip(plain.iter()) {
+            for (a, e, expected) in [
+                (labelled, labelled, true),
+                (labelled, plain, false),
+                (plain, labelled, false),
+                (plain, &DataType::Int64, true),
+                (labelled, &DataType::Int64, false),
+            ] {
+                let mut visits = 0;
+                assert_eq!(
+                    preserves_nested_logical_identity_observed::<ValueTypeError>(a, e, || {
+                        visits += 1;
+                        Ok(())
+                    }),
+                    Ok(expected),
+                );
+                assert_eq!(preserves_nested_logical_identity(a, e), expected);
+                assert!(visits > 0);
+            }
+        }
+        // Dictionary keys participate even though carrier grammar is a separate
+        // author. This helper preserves the original logical-identity rule.
+        let labelled_key = DataType::Dictionary(
+            Box::new(DataType::List(identity_field(Some("json")))),
+            Box::new(DataType::Int64),
+        );
+        let plain_key = DataType::Dictionary(
+            Box::new(DataType::List(identity_field(None))),
+            Box::new(DataType::Int64),
+        );
+        assert!(!preserves_nested_logical_identity(
+            &labelled_key,
+            &plain_key
+        ));
+        let nominal = |label: &str| {
+            DataType::List(Arc::new(
+                Field::new("item", DataType::FixedSizeBinary(16), false)
+                    .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), label.into())].into()),
+            ))
+        };
+        assert!(!preserves_nested_logical_identity(
+            &nominal("uuid"),
+            &nominal("largeint")
+        ));
+        assert!(!preserves_nested_logical_identity(
+            &nominal("largeint"),
+            &nominal("uuid")
+        ));
+    }
+
+    #[test]
+    fn observed_identity_keeps_original_shape_fallback_and_union_id_order() {
+        use arrow_schema::{UnionFields, UnionMode};
+        let labelled = identity_field(Some("json"));
+        let list = DataType::List(labelled.clone());
+        let large = DataType::LargeList(labelled.clone());
+        assert!(!preserves_nested_logical_identity(&list, &large));
+        assert!(preserves_nested_logical_identity(
+            &DataType::FixedSizeList(labelled.clone(), 1),
+            &DataType::FixedSizeList(labelled.clone(), 8),
+        ));
+        let map = identity_wrappers(labelled.clone()).remove(5);
+        let DataType::Map(entries, _) = map else {
+            unreachable!()
+        };
+        assert!(preserves_nested_logical_identity(
+            &DataType::Map(entries.clone(), false),
+            &DataType::Map(entries, true),
+        ));
+        let union = |ids: Vec<i8>, mode| {
+            DataType::Union(
+                UnionFields::try_new(ids, vec![labelled.clone(), identity_field(None)]).unwrap(),
+                mode,
+            )
+        };
+        assert!(preserves_nested_logical_identity(
+            &union(vec![7, 41], UnionMode::Dense),
+            &union(vec![7, 41], UnionMode::Sparse),
+        ));
+        assert!(!preserves_nested_logical_identity(
+            &union(vec![7, 41], UnionMode::Dense),
+            &union(vec![41, 7], UnionMode::Dense),
+        ));
+        let short = DataType::Struct(vec![labelled].into());
+        let longer =
+            DataType::Struct(vec![identity_field(Some("json")), identity_field(None)].into());
+        assert!(!preserves_nested_logical_identity(&short, &longer));
+        assert!(preserves_nested_logical_identity(
+            &DataType::Struct(vec![identity_field(None)].into()),
+            &DataType::Struct(Vec::<Arc<Field>>::new().into()),
+        ));
+        let invalid = DataType::List(identity_field(Some("unknown")));
+        assert_eq!(
+            preserves_nested_logical_identity_observed::<ValueTypeError>(
+                &invalid,
+                &invalid,
+                || Ok(())
+            ),
+            Err(ValueTypeError::UnknownLogicalMetadata),
+        );
+        assert!(!preserves_nested_logical_identity(&invalid, &invalid));
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum IdentityFailure {
+        Type(ValueTypeError),
+        Control(crate::CompileControlError),
+    }
+    impl From<ValueTypeError> for IdentityFailure {
+        fn from(error: ValueTypeError) -> Self {
+            Self::Type(error)
+        }
+    }
+    impl From<crate::CompileControlError> for IdentityFailure {
+        fn from(error: crate::CompileControlError) -> Self {
+            Self::Control(error)
+        }
+    }
+    struct IdentityControl {
+        calls: std::sync::Mutex<Vec<(crate::CompilePhase, u32)>>,
+        refusal: Option<(usize, crate::CompileControlError)>,
+    }
+    impl crate::PureCompileControl for IdentityControl {
+        fn checkpoint(
+            &self,
+            phase: crate::CompilePhase,
+            units: u32,
+        ) -> Result<(), crate::CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            let ordinal = calls.len();
+            calls.push((phase, units));
+            match self.refusal {
+                Some((at, error)) if at == ordinal => Err(error),
+                _ => Ok(()),
+            }
+        }
+    }
+    fn run_identity(
+        a: &DataType,
+        e: &DataType,
+        control: &IdentityControl,
+    ) -> Result<bool, IdentityFailure> {
+        let mut work = crate::CompileCheckpoints::try_new(control, crate::CompilePhase::Validate)?;
+        let result = preserves_nested_logical_identity_observed(a, e, || {
+            work.step().map_err(IdentityFailure::Control)
+        });
+        // The generic observer has no ownership of the caller's tail. A typed
+        // refusal returns immediately; ordinary false still completes the tail.
+        if matches!(result, Err(IdentityFailure::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+
+    #[test]
+    fn observed_identity_wide_sparse_labels_preserve_every_control_callback_prefix() {
+        let wide = |erase_last: bool| {
+            DataType::Struct(
+                (0..320)
+                    .map(|n| {
+                        let label = if n % 37 == 0 || n == 319 {
+                            Some("json")
+                        } else {
+                            None
+                        };
+                        identity_field(if erase_last && n == 319 { None } else { label })
+                    })
+                    .collect(),
+            )
+        };
+        let actual = wide(false);
+        for (expected, expected_result) in [(wide(false), true), (wide(true), false)] {
+            let success = IdentityControl {
+                calls: Default::default(),
+                refusal: None,
+            };
+            assert_eq!(
+                run_identity(&actual, &expected, &success),
+                Ok(expected_result)
+            );
+            let trace = success.calls.into_inner().unwrap();
+            assert_eq!(trace[0], (crate::CompilePhase::Validate, 0));
+            assert_eq!(trace[1], (crate::CompilePhase::Validate, 256));
+            assert!(trace.len() > 3);
+            assert!(trace.last().unwrap().1 < 256);
+            for cause in [
+                crate::CompileControlError::Cancelled,
+                crate::CompileControlError::DeadlineExceeded,
+                crate::CompileControlError::ResourceExhausted,
+            ] {
+                for at in 0..trace.len() {
+                    let control = IdentityControl {
+                        calls: Default::default(),
+                        refusal: Some((at, cause)),
+                    };
+                    assert_eq!(
+                        run_identity(&actual, &expected, &control),
+                        Err(IdentityFailure::Control(cause))
+                    );
+                    assert_eq!(control.calls.into_inner().unwrap(), trace[..=at]);
+                }
             }
         }
     }

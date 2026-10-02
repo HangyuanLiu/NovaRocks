@@ -51,8 +51,14 @@ pub fn arrow_fields_exact(left: &Field, right: &Field) -> bool {
 }
 
 pub fn arrow_data_types_exact(left: &DataType, right: &DataType) -> bool {
-    compare_types::<std::convert::Infallible>(left, right, || Ok(()), |_, _| Ok(()))
-        .unwrap_or(false)
+    compare_types::<std::convert::Infallible>(
+        left,
+        right,
+        FieldMode::Exact,
+        || Ok(()),
+        |_, _| Ok(()),
+    )
+    .unwrap_or(false)
 }
 
 /// The same exact comparison with bounded depth/node traversal and an observer
@@ -63,7 +69,7 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
     right: &DataType,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types(left, right, observe, |depth, nodes| {
+    compare_types(left, right, FieldMode::Exact, observe, |depth, nodes| {
         if depth > crate::MAX_VALUE_TYPE_DEPTH {
             Err(crate::ValueTypeError::TooDeep.into())
         } else if nodes > crate::MAX_VALUE_TYPE_NODES {
@@ -72,6 +78,32 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
             Ok(())
         }
     })
+}
+
+/// Observe Arrow schema compatibility equality. Unlike the frozen exact
+/// comparison, this deliberately ignores Field dictionary ids/order exactly
+/// as Arrow's PartialEq does; all other attributes use the same comparison
+/// engine. This is not a frozen internal-relation identity proof.
+pub fn arrow_data_types_equal_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types(
+        left,
+        right,
+        FieldMode::Compatibility,
+        observe,
+        |depth, nodes| {
+            if depth > crate::MAX_VALUE_TYPE_DEPTH {
+                Err(crate::ValueTypeError::TooDeep.into())
+            } else if nodes > crate::MAX_VALUE_TYPE_NODES {
+                Err(crate::ValueTypeError::TooManyNodes.into())
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 /// Observe exact field comparison within the caller's already validated schema
@@ -87,6 +119,7 @@ pub fn arrow_fields_exact_observed<E>(
         observe: &mut observe,
         validate: &mut |_, _| Ok(()),
         nodes: 0,
+        mode: FieldMode::Exact,
     }
     .field(left, right, 1)
 }
@@ -94,6 +127,7 @@ pub fn arrow_fields_exact_observed<E>(
 fn compare_types<E>(
     left: &DataType,
     right: &DataType,
+    mode: FieldMode,
     mut observe: impl FnMut() -> Result<(), E>,
     mut validate: impl FnMut(usize, usize) -> Result<(), E>,
 ) -> Result<bool, E> {
@@ -101,14 +135,22 @@ fn compare_types<E>(
         observe: &mut observe,
         validate: &mut validate,
         nodes: 0,
+        mode,
     }
     .ty(left, right, 1)
+}
+
+#[derive(Clone, Copy)]
+enum FieldMode {
+    Exact,
+    Compatibility,
 }
 
 struct Walk<'a, F, B> {
     observe: &'a mut F,
     validate: &'a mut B,
     nodes: usize,
+    mode: FieldMode,
 }
 impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Walk<'_, F, B> {
     fn bytes(&mut self, left: &[u8], right: &[u8]) -> Result<bool, E> {
@@ -183,12 +225,17 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
     fn field(&mut self, left: &Field, right: &Field, depth: usize) -> Result<bool, E> {
         (self.observe)()?;
         #[allow(deprecated)]
-        let ids_equal = left.dict_id() == right.dict_id();
+        let dictionary_equal = match self.mode {
+            FieldMode::Exact => {
+                left.dict_id() == right.dict_id()
+                    && left.dict_is_ordered() == right.dict_is_ordered()
+            }
+            FieldMode::Compatibility => true,
+        };
         if !self.bytes(left.name().as_bytes(), right.name().as_bytes())?
             || left.is_nullable() != right.is_nullable()
             || !self.metadata(left, right)?
-            || !ids_equal
-            || left.dict_is_ordered() != right.dict_is_ordered()
+            || !dictionary_equal
         {
             return Ok(false);
         }
@@ -501,7 +548,8 @@ mod tests {
             Walk {
                 observe: &mut observe,
                 validate: &mut |_, _| Ok(()),
-                nodes: 0
+                nodes: 0,
+                mode: FieldMode::Exact,
             }
             .metadata(&empty, &empty),
             Ok(true)
@@ -533,6 +581,7 @@ mod tests {
                 observe: &mut observe,
                 validate: &mut |_, _| Ok(()),
                 nodes: 0,
+                mode: FieldMode::Exact,
             }
             .metadata_with_key_hash(&left, right, |walk, _| {
                 (walk.observe)()?;
@@ -543,6 +592,122 @@ mod tests {
                 observed > 4,
                 "collisions still inspect actual key/value bytes"
             );
+        }
+    }
+
+    #[test]
+    fn observed_compatibility_equals_arrow_for_dictionary_bits_and_all_other_field_attributes() {
+        use arrow_schema::{UnionFields, UnionMode};
+        #[allow(deprecated)]
+        let field = |id, ordered| {
+            Arc::new(
+                Field::new_dict(
+                    "item",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                    id,
+                    ordered,
+                )
+                .with_metadata([("provider.id".into(), "7".into())].into()),
+            )
+        };
+        let wrap = |f: Arc<Field>| {
+            vec![
+                DataType::List(f.clone()),
+                DataType::LargeList(f.clone()),
+                DataType::ListView(f.clone()),
+                DataType::LargeListView(f.clone()),
+                DataType::FixedSizeList(f.clone(), 2),
+                DataType::Struct(vec![f.clone()].into()),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Int64, false)),
+                                f.clone(),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                DataType::Union(
+                    UnionFields::try_new(vec![41], vec![f.clone()]).unwrap(),
+                    UnionMode::Dense,
+                ),
+                DataType::Dictionary(
+                    Box::new(DataType::Int16),
+                    Box::new(DataType::List(f.clone())),
+                ),
+                DataType::RunEndEncoded(Arc::new(Field::new("ends", DataType::Int32, false)), f),
+            ]
+        };
+        let left = field(0, false);
+        let compatible = field(i64::MAX, true);
+        let variants = [
+            compatible.clone(),
+            Arc::new(compatible.as_ref().clone().with_name("different")),
+            Arc::new(compatible.as_ref().clone().with_nullable(false)),
+            Arc::new(
+                compatible
+                    .as_ref()
+                    .clone()
+                    .with_metadata([("provider.id".into(), "8".into())].into()),
+            ),
+            Arc::new(
+                compatible
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Dictionary(
+                        Box::new(DataType::Int16),
+                        Box::new(DataType::Utf8),
+                    )),
+            ),
+        ];
+        for right in variants {
+            for (left, right) in wrap(left.clone()).iter().zip(wrap(right).iter()) {
+                assert_eq!(
+                    arrow_data_types_equal_observed::<ValueTypeError>(left, right, || Ok(())),
+                    Ok(left == right)
+                );
+                if left == right {
+                    assert_eq!(
+                        arrow_data_types_exact_observed::<ValueTypeError>(left, right, || Ok(())),
+                        Ok(false)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_compatibility_retains_union_ids_mode_and_timestamp_timezone_equality() {
+        use arrow_schema::{TimeUnit, UnionFields, UnionMode};
+        let union = |id, mode| {
+            DataType::Union(
+                UnionFields::try_new(vec![id], vec![Field::new("v", DataType::Int64, false)])
+                    .unwrap(),
+                mode,
+            )
+        };
+        let corpus = [
+            union(7, UnionMode::Dense),
+            union(41, UnionMode::Dense),
+            union(7, UnionMode::Sparse),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        ];
+        for left in &corpus {
+            for right in &corpus {
+                assert_eq!(
+                    arrow_data_types_equal_observed::<ValueTypeError>(left, right, || Ok(())),
+                    Ok(left == right)
+                );
+            }
         }
     }
 }

@@ -66,38 +66,82 @@ pub fn is_checked_decimal_numeric_cast(source: &DataType, target: &DataType) -> 
 }
 
 /// Until recursive checked numeric casting is implemented, reject its ReportError
-/// form before execution. Identical Arrow physical types only retag metadata and
-/// need no numerical conversion. OutputNull retains the existing nested caster.
+/// form before execution. Arrow-compatible identical types need no numerical
+/// conversion. OutputNull keeps its original unconditional early acceptance;
+/// invalid or over-bound ReportError types are refused by this bool facade.
 pub fn decimal_error_policy_cast_supported(
     source: &DataType,
     target: &DataType,
     policy: DecimalOverflowPolicy,
 ) -> bool {
-    if policy == DecimalOverflowPolicy::OutputNull || source == target {
-        return true;
+    decimal_error_policy_cast_supported_observed::<crate::ValueTypeError>(
+        source,
+        target,
+        policy,
+        || Ok(()),
+    )
+    .unwrap_or(false)
+}
+
+/// The original policy classifier with a caller-owned observer. This does not
+/// establish cast capability or change logical identity. After the OutputNull
+/// early return, existing logical depth/node bounds establish safe recursion;
+/// Arrow compatibility equality deliberately ignores dictionary ids/order.
+pub fn decimal_error_policy_cast_supported_observed<E: From<crate::ValueTypeError>>(
+    source: &DataType,
+    target: &DataType,
+    policy: DecimalOverflowPolicy,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let output_null = policy == DecimalOverflowPolicy::OutputNull;
+    observe()?;
+    if output_null {
+        return Ok(true);
     }
-    fn children(dtype: &DataType) -> Vec<&DataType> {
+    crate::validate_nested_logical_types_observed(source, &mut observe)?;
+    crate::validate_nested_logical_types_observed(target, &mut observe)?;
+    if crate::schema::arrow_data_types_equal_observed(source, target, &mut observe)? {
+        return Ok(true);
+    }
+    fn child_count(dtype: &DataType) -> usize {
+        match dtype {
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(..)
+            | DataType::Map(..) => 1,
+            DataType::Struct(fields) => fields.len(),
+            _ => 0,
+        }
+    }
+    fn child(dtype: &DataType, index: usize) -> &DataType {
         match dtype {
             DataType::List(field)
             | DataType::LargeList(field)
             | DataType::FixedSizeList(field, _)
-            | DataType::Map(field, _) => vec![field.data_type()],
-            DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
-            _ => Vec::new(),
+            | DataType::Map(field, _) => field.data_type(),
+            DataType::Struct(fields) => fields[index].data_type(),
+            _ => unreachable!("policy child index follows the same carrier child count"),
         }
     }
-    fn potential_numeric_change(source: &DataType, target: &DataType) -> bool {
-        if source == target {
-            return false;
+    fn potential_numeric_change<E: From<crate::ValueTypeError>>(
+        source: &DataType,
+        target: &DataType,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        if crate::schema::arrow_data_types_equal_observed(source, target, &mut *observe)? {
+            return Ok(false);
         }
-        let source_children = children(source);
-        let target_children = children(target);
-        if source_children.is_empty() && target_children.is_empty() {
-            return is_checked_decimal_numeric_cast(source, target);
+        let source_count = child_count(source);
+        let target_count = child_count(target);
+        observe()?;
+        if source_count == 0 && target_count == 0 {
+            let changed = is_checked_decimal_numeric_cast(source, target);
+            observe()?;
+            return Ok(changed);
         }
-        // For matching layouts preserve field correspondence. For incompatible
-        // layouts use a conservative leaf relation; other cast validation still
-        // rejects unsupported shapes independently of this numeric policy.
+        // Keep original field correspondence for matching layouts. Incompatible
+        // layouts keep the conservative ordered crossproduct of borrowed leaves.
         let matching = matches!(
             (source, target),
             (DataType::List(_), DataType::List(_))
@@ -105,31 +149,58 @@ pub fn decimal_error_policy_cast_supported(
                 | (DataType::FixedSizeList(..), DataType::FixedSizeList(..))
                 | (DataType::Map(..), DataType::Map(..))
                 | (DataType::Struct(_), DataType::Struct(_))
-        ) && source_children.len() == target_children.len();
+        ) && source_count == target_count;
+        observe()?;
         if matching {
-            return source_children
-                .iter()
-                .zip(&target_children)
-                .any(|(s, t)| potential_numeric_change(s, t));
+            for index in 0..source_count {
+                let pair = (child(source, index), child(target, index));
+                observe()?;
+                if potential_numeric_change(pair.0, pair.1, observe)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
-        if source_children.is_empty() {
-            return target_children
-                .iter()
-                .any(|t| potential_numeric_change(source, t));
+        if source_count == 0 {
+            for index in 0..target_count {
+                let target = child(target, index);
+                observe()?;
+                if potential_numeric_change(source, target, observe)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
-        if target_children.is_empty() {
-            return source_children
-                .iter()
-                .any(|s| potential_numeric_change(s, target));
+        if target_count == 0 {
+            for index in 0..source_count {
+                let source = child(source, index);
+                observe()?;
+                if potential_numeric_change(source, target, observe)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
-        source_children.iter().any(|s| {
-            target_children
-                .iter()
-                .any(|t| potential_numeric_change(s, t))
-        })
+        for left in 0..source_count {
+            let source = child(source, left);
+            observe()?;
+            for right in 0..target_count {
+                let target = child(target, right);
+                observe()?;
+                if potential_numeric_change(source, target, observe)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
-    (children(source).is_empty() && children(target).is_empty())
-        || !potential_numeric_change(source, target)
+    let scalar_pair = child_count(source) == 0 && child_count(target) == 0;
+    observe()?;
+    if scalar_pair {
+        Ok(true)
+    } else {
+        Ok(!potential_numeric_change(source, target, &mut observe)?)
+    }
 }
 
 /// Computes the Decimal128 result of one binary arithmetic operation.
@@ -684,3 +755,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "arithmetic/cast_policy_tests.rs"]
+mod cast_policy_tests;

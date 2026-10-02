@@ -809,3 +809,6 @@ fn actual_arithmetic_rows_preserve_primary_controls_every_quantum_and_failed_ins
 
 #[path = "numeric_arithmetic_tests.rs"]
 mod numeric_arithmetic_tests;
+
+#[path = "cast_tests.rs"]
+mod cast_tests;

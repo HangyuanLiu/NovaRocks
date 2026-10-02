@@ -678,3 +678,90 @@ fn dead_arithmetic_definitions_require_shared_full_types_and_nullable_result() {
         }
     }
 }
+
+#[test]
+fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null() {
+    use novarocks_functions::CastOperation;
+    use novarocks_type_contract::DecimalOverflowPolicy;
+    let labelled = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    for (source, result, valid) in [
+        (
+            FunctionValueType::new(DataType::Int8, false),
+            FunctionValueType::new(DataType::Int64, false),
+            true,
+        ),
+        (
+            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(DataType::Int8, true),
+            true,
+        ),
+        (
+            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(DataType::Int8, false),
+            false,
+        ),
+        (
+            FunctionValueType::new(DataType::Int8, true),
+            FunctionValueType::new(DataType::Float32, false),
+            false,
+        ),
+        (
+            FunctionValueType::new(DataType::Null, false),
+            FunctionValueType::new(DataType::Int64, false),
+            false,
+        ),
+        (
+            FunctionValueType::new(DataType::Null, false),
+            FunctionValueType::new(DataType::Int64, true),
+            true,
+        ),
+        (
+            labelled.clone(),
+            FunctionValueType::new(DataType::FixedSizeBinary(16), true),
+            false,
+        ),
+        (labelled.clone(), labelled.clone(), true),
+        // A dead static type rule does not become the installed 24-pair runtime subset.
+        (
+            FunctionValueType::new(DataType::Utf8, true),
+            FunctionValueType::new(DataType::Int64, true),
+            true,
+        ),
+    ] {
+        let (calls, types) = assembled(
+            vec![
+                slot(0, &source),
+                StaticExprNode::new(
+                    StaticExprKind::PreparedCast {
+                        operation: CastOperation::Carrier,
+                        child: ProgramExprId::new(0),
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                        allow_throw_exception: true,
+                    },
+                    result.data_type.clone(),
+                    None,
+                ),
+                slot(2, &boolean(false)),
+            ],
+            vec![
+                FunctionArgumentType::Value(source),
+                FunctionArgumentType::Value(result),
+                FunctionArgumentType::Value(boolean(false)),
+            ],
+            ProgramExprId::new(2),
+            boolean(false),
+            EvaluationDemand::Value,
+        );
+        let typed = ProgramTypedExpressions::try_new(calls, types, &Control);
+        if valid {
+            assert!(typed.is_ok(), "{typed:?}");
+        } else {
+            assert_eq!(typed.unwrap_err(), ProgramExpressionTypeError::TypeMismatch);
+        }
+    }
+}

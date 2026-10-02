@@ -45,8 +45,8 @@ pub use type_fingerprint::arrow_data_type_fingerprint_observed;
 pub use arithmetic::{
     ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,
     arithmetic_result_type_with_op, canonical_agg_decimal_type, decimal_arithmetic_result_type,
-    decimal_error_policy_cast_supported, decimal_multiplication_requires_float64,
-    is_checked_decimal_numeric_cast,
+    decimal_error_policy_cast_supported, decimal_error_policy_cast_supported_observed,
+    decimal_multiplication_requires_float64, is_checked_decimal_numeric_cast,
 };
 pub use array_generate::array_generate_item_type;
 pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
@@ -72,8 +72,8 @@ pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use logical::{
     MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
     ValueTypeError, ValueTypeVisit, field_logical_type, preserves_nested_logical_identity,
-    validate_nested_logical_types, validate_nested_logical_types_observed,
-    validate_value_type_structure_observed,
+    preserves_nested_logical_identity_observed, validate_nested_logical_types,
+    validate_nested_logical_types_observed, validate_value_type_structure_observed,
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
@@ -82,9 +82,9 @@ pub use partition::{
 pub use schema::{
     MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
     MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, arrow_data_types_exact,
-    arrow_data_types_exact_observed, arrow_fields_exact, arrow_fields_exact_observed,
-    arrow_schemas_exact,
+    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES,
+    arrow_data_types_equal_observed, arrow_data_types_exact, arrow_data_types_exact_observed,
+    arrow_fields_exact, arrow_fields_exact_observed, arrow_schemas_exact,
 };
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,

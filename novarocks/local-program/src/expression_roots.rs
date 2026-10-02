@@ -776,6 +776,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Cast(..)
             | StaticExprKind::CastTime(..)
             | StaticExprKind::CastTimeFromDatetime(..)
+            | StaticExprKind::PreparedCast { .. }
             | StaticExprKind::PreparedArithmetic { .. }
             | StaticExprKind::Add(..)
             | StaticExprKind::Sub(..)
@@ -837,7 +838,10 @@ fn validate_intrinsic_correspondence(
                 }
                 child(*body)?;
             }
-            StaticExprKind::DictDecode {
+            StaticExprKind::PreparedCast {
+                child: definition, ..
+            }
+            | StaticExprKind::DictDecode {
                 child: definition, ..
             }
             | StaticExprKind::Cast(definition, _)

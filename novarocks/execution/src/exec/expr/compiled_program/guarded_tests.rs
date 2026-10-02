@@ -283,7 +283,8 @@ impl FlowAuthor {
                 expr,
                 op: novarocks_physical_plan::UnaryOperator::Not,
             }
-            | ExprKind::IsNull { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
             ExprKind::Case {
                 operand,
                 when_then,
