@@ -819,3 +819,114 @@ object FieldDomainAllocatorFixture {
     println("FIELD_DOMAIN_ALLOCATOR_OBSERVED")
   }
 }
+
+// Native NULL-key failures are checked against SDK metadata and exact owned
+// data-prefix listings. CTAS remains governed by the aged unanchored sweep.
+object FieldDomainNullKeyFixture {
+  import DeleteApplicabilityFixture._
+  import org.apache.iceberg.catalog.TableIdentifier
+  import org.apache.iceberg.io.SupportsPrefixOperations
+  val DomainKey="novarocks.field_domains.v1"
+  def run(action: => Unit): Unit = {
+    val executor=java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new java.util.concurrent.ThreadFactory {
+      def newThread(r: Runnable): Thread = { val t=new Thread(r,"field-domain-null-key-deadline"); t.setDaemon(true); t }
+    })
+    val deadline=executor.schedule(new Runnable {
+      def run(): Unit = { System.err.println("NULL-key SDK fixture exceeded 120-second deadline"); System.exit(124) }
+    },120,java.util.concurrent.TimeUnit.SECONDS)
+    try action finally { deadline.cancel(false); executor.shutdownNow() }
+  }
+  def catalog = Spark3Util.loadIcebergCatalog(org.apache.spark.sql.SparkSession.active,"ice_rest")
+  def load(ns: String,name: String): Table = {
+    require(ns.matches("ns_[a-zA-Z0-9_]+") && Set("null_key_guard","null_key_mv").contains(name))
+    val t=catalog.loadTable(TableIdentifier.of(ns,name)); t.refresh(); t
+  }
+  def dataObjects(t: Table): Vector[JsonNode] = {
+    require(t.io().isInstanceOf[SupportsPrefixOperations],"NULL-key oracle requires exact prefix operations")
+    val prefix=t.location().stripSuffix("/")+"/data/"
+    val out=scala.collection.mutable.ArrayBuffer.empty[JsonNode]
+    t.io().asInstanceOf[SupportsPrefixOperations].listPrefix(prefix).asScala.foreach { info =>
+      require(out.size<64 && info.location().startsWith(prefix) && info.size()>=0 && info.size()<=16L*1024*1024,"NULL-key object scope/budget exceeded")
+      out+=obj("path"->info.location(),"bytes"->info.size())
+    }
+    out.toVector.sortBy(_.get("path").asText())
+  }
+  def documents(t: Table): (JsonNode,JsonNode) = {
+    val text=t.properties().get("novarocks.documents.v1")
+    if(text==null) (mapper.getNodeFactory.nullNode(),mapper.getNodeFactory.nullNode())
+    else {
+      require(text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=256*1024,"NULL-key document manifest exceeds budget")
+      val manifest=mapper.readTree(text)
+      require(manifest.isObject && manifest.get("version").asInt()==1 && manifest.get("documents").isArray && manifest.get("documents").size()<=16,"Invalid NULL-key document manifest")
+      val stable=manifest.deepCopy[ObjectNode]()
+      val values=mapper.createArrayNode(); val eligibility=mapper.createArrayNode()
+      manifest.get("documents").elements().asScala.foreach { d =>
+        if(d.get("name").asText()=="eligibility") eligibility.add(d) else values.add(d)
+      }
+      require(eligibility.size()<=1,"Duplicate NULL-key eligibility document")
+      stable.set[JsonNode]("documents",values); (stable,eligibility)
+    }
+  }
+  def fact(t: Table): JsonNode = {
+    val domain=t.properties().get(DomainKey)
+    val expectedId=t.schema().findField("m.value").fieldId()
+    require(domain==("{\"version\":1,\"fields\":{\""+expectedId+"\":\"json\"}}"),"NULL-key target lost exact JSON value declaration")
+    require(t.schema().findType("m.key")==org.apache.iceberg.types.Types.IntegerType.get() && t.schema().findField("m.key").isRequired && t.schema().findType("m.value")==org.apache.iceberg.types.Types.StringType.get(),"NULL-key target has wrong standard key/value carrier")
+    val (stable,eligibility)=documents(t)
+    val properties=t.properties().asScala.toMap.filterNot(_._1=="novarocks.documents.v1")
+    val snapshot=Option(t.currentSnapshot())
+    val n=obj("table_uuid"->metadata(t).uuid().toString,"schema_json"->RecursiveTypeFixture.schemaJson(t),
+      "schema_id"->t.schema().schemaId(),"field_domains_json"->domain,"properties"->properties,
+      "snapshot"->snapshot.map(_.snapshotId():Any).getOrElse(null),
+      "snapshot_summary"->snapshot.map(_.summary().asScala.toMap:Any).getOrElse(null),
+      "live_files"->snapshot.map(_=>RecursiveTypeFixture.boundedScan(t).map(task=>RecursiveTypeFixture.fileFact(task.file())).sortBy(_.get("path").asText()):Any).getOrElse(Vector.empty),
+      "data_objects"->dataObjects(t),"stable_documents"->stable,"eligibility"->eligibility)
+    // Compare the same encoded numeric representation across Spark sessions.
+    val text=mapper.writeValueAsString(n)
+    require(text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=256*1024,"NULL-key table fact exceeds byte budget")
+    mapper.readTree(text)
+  }
+  def legalBag(t: Table): Unit = {
+    val reader=IcebergGenerics.read(t).useSnapshot(t.currentSnapshot().snapshotId()).project(t.schema()).build()
+    val rows=scala.collection.mutable.ArrayBuffer.empty[(Long,Vector[(Int,String)])]
+    val nullMaps=scala.collection.mutable.Set.empty[Long]
+    try reader.asScala.foreach { r =>
+      require(rows.size<16,"NULL-key bag row budget exceeded")
+      val id=r.getField("id").asInstanceOf[java.lang.Long].longValue()
+      val m=r.getField("m").asInstanceOf[java.util.Map[java.lang.Integer,CharSequence]]
+      if(m==null) {nullMaps+=id;rows+=((id,Vector.empty))}
+      else rows+=((id,m.asScala.toVector.map {case(k,v)=>require(k!=null,"SDK observed illegal key");(k.intValue(),Option(v).map(_.toString).orNull)}))
+    } finally reader.close()
+    require(rows.toVector.sortBy(_._1)==Vector((1L,Vector((1,"{\"b\":2,\"a\":1}"))),(2L,Vector.empty),(3L,Vector.empty),(4L,Vector((2,null)))) && nullMaps.toSet==Set(2L),"SDK legal map/null/empty/value bag changed")
+  }
+  def before(ns: String): Unit = {
+    require(!catalog.tableExists(TableIdentifier.of(ns,"null_key_ctas")),"Negative CTAS target already exists")
+    val guard=load(ns,"null_key_guard"); legalBag(guard)
+    val mv=load(ns,"null_key_mv")
+    val (stable,eligibility)=documents(mv)
+    require(mv.currentSnapshot()==null && eligibility.isArray && eligibility.size()==0 && stable.isObject,"Unrefreshed NULL-key MV lacks its exact bootstrap")
+    val docs=stable.get("documents").elements().asScala.toVector
+    require(docs.size==3 && docs.map(_.get("name").asText()).toSet==Set("definition","interpretation","configuration"),"Bootstrap lacks exactly D/L/C or already has P/E")
+    docs.foreach { d => require(d.get("owner").asText()=="novarocks.mv" && d.get("version").asInt()==1 &&
+      d.get("format_owner").asText()=="novarocks.mv" && d.get("format_name").asText()==d.get("name").asText() &&
+      d.get("format_version").asInt()==1 && d.get("attachment").get("kind").asText()=="table-metadata", "Bootstrap document owner/format/attachment changed") }
+    val n=obj("record"->"field_domain_null_key_before","namespace"->ns,"ordinary"->fact(guard),"mv"->fact(mv),"ctas_published"->false)
+    val text=mapper.writeValueAsString(n)
+    require(text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=256*1024,"NULL-key baseline receipt exceeds budget")
+    RecursiveTypeFixture.boundedEmit(n); println("FIELD_DOMAIN_NULL_KEY_FROZEN")
+  }
+  def after(ns: String,frozen: JsonNode): Unit = {
+    require(frozen!=null && frozen.isObject && frozen.fieldNames().asScala.toSet==Set("record","namespace","ordinary","mv","ctas_published") && frozen.get("record").asText()=="field_domain_null_key_before" && frozen.get("namespace").asText()==ns && frozen.get("ctas_published").isBoolean && !frozen.get("ctas_published").asBoolean(),"Invalid NULL-key frozen receipt")
+    val guard=load(ns,"null_key_guard"); legalBag(guard)
+    val ordinary=fact(guard); val mv=fact(load(ns,"null_key_mv"))
+    require(ordinary==frozen.get("ordinary"),"Failed ordinary NULL-key write changed metadata/snapshot/files")
+    val mvStable=mv.deepCopy[ObjectNode](); mvStable.remove("eligibility")
+    val beforeStable=frozen.get("mv").deepCopy[ObjectNode](); beforeStable.remove("eligibility")
+    require(mvStable==beforeStable,"Failed MV NULL-key write changed S/D/L/P/schema/domain or data files")
+    require(mv.get("eligibility")==frozen.get("mv").get("eligibility"),"Never-published failed MV unexpectedly changed E")
+    require(!catalog.tableExists(TableIdentifier.of(ns,"null_key_ctas")),"Failed NULL-key CTAS published a target")
+    RecursiveTypeFixture.boundedEmit(obj("record"->"field_domain_null_key_after","ordinary"->ordinary,"mv"->mv,
+      "ctas_published"->false,"ctas_cleanup_owner"->"shared aged unanchored-CTAS sweep; no immediate physical-reclamation assertion"))
+    println("FIELD_DOMAIN_NULL_KEY_UNCOMMITTED")
+  }
+}
