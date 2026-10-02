@@ -950,15 +950,15 @@ pub(crate) fn table_properties(
 
 fn logical_type(data_type: &ConnectorDataType) -> Option<String> {
     match data_type {
-        ConnectorDataType::TinyInt => Some("tinyint".to_string()),
-        ConnectorDataType::SmallInt => Some("smallint".to_string()),
+        ConnectorDataType::Int8 => Some("tinyint".to_string()),
+        ConnectorDataType::Int16 => Some("smallint".to_string()),
         ConnectorDataType::LargeInt => Some("largeint".to_string()),
-        ConnectorDataType::Date => Some("date".to_string()),
+        ConnectorDataType::Date32 => Some("date".to_string()),
         ConnectorDataType::Bitmap => Some("bitmap".to_string()),
         ConnectorDataType::Hll => Some("hll".to_string()),
-        ConnectorDataType::Decimal { precision, scale } => {
-            Some(format!("decimal({precision},{scale})"))
-        }
+        ConnectorDataType::Decimal {
+            precision, scale, ..
+        } => Some(format!("decimal({precision},{scale})")),
         _ => None,
     }
 }
@@ -1534,10 +1534,10 @@ fn scalar_integer_modify_is_noop(
         }
         let previous = integer_domains.get(&id).copied();
         let next = match data_type {
-            ConnectorDataType::TinyInt => {
+            ConnectorDataType::Int8 => {
                 Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8)
             }
-            ConnectorDataType::SmallInt => {
+            ConnectorDataType::Int16 => {
                 Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
             }
             _ => None,
@@ -1546,7 +1546,7 @@ fn scalar_integer_modify_is_noop(
             if previous == next {
                 return Ok(true);
             }
-            if next.is_some() || matches!(data_type, ConnectorDataType::Int) {
+            if next.is_some() || matches!(data_type, ConnectorDataType::Int32) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unsupported,
                     "Iceberg MODIFY cannot change a scalar integer domain without changing its physical schema",
@@ -1577,10 +1577,8 @@ fn scalar_integer_schema_updates(
             .collect::<Vec<_>>()
     };
     let narrow = |data_type: &ConnectorDataType| match data_type {
-        ConnectorDataType::TinyInt => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
-        ConnectorDataType::SmallInt => {
-            Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
-        }
+        ConnectorDataType::Int8 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
+        ConnectorDataType::Int16 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16),
         _ => None,
     };
     match change {
@@ -3778,7 +3776,7 @@ mod tests {
             &table,
             &[ConnectorColumnDefinition {
                 name: "id".into(),
-                data_type: ConnectorDataType::BigInt,
+                data_type: ConnectorDataType::Int64,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -3979,7 +3977,7 @@ mod tests {
             &table,
             &[ConnectorColumnDefinition {
                 name: "id".into(),
-                data_type: ConnectorDataType::BigInt,
+                data_type: ConnectorDataType::Int64,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -4101,7 +4099,7 @@ mod tests {
                 },
                 columns: vec![ConnectorColumnDefinition {
                     name: "id".into(),
-                    data_type: ConnectorDataType::BigInt,
+                    data_type: ConnectorDataType::Int64,
                     nullable: false,
                     aggregation: None,
                     default: None,
@@ -4679,7 +4677,7 @@ mod tests {
             &table,
             &[ConnectorColumnDefinition {
                 name: "id".into(),
-                data_type: ConnectorDataType::BigInt,
+                data_type: ConnectorDataType::Int64,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -4796,7 +4794,7 @@ mod tests {
             parent: ConnectorColumnPath { segments: vec![] },
             column: ConnectorColumnDefinition {
                 name: "name".into(),
-                data_type: ConnectorDataType::String,
+                data_type: ConnectorDataType::Utf8,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -5180,7 +5178,7 @@ mod tests {
                 parent: ConnectorColumnPath { segments: vec![] },
                 column: ConnectorColumnDefinition {
                     name: "renamed".into(),
-                    data_type: ConnectorDataType::Int,
+                    data_type: ConnectorDataType::Int32,
                     nullable: true,
                     aggregation: None,
                     default: None,
@@ -5213,11 +5211,11 @@ mod tests {
             scalar_integer_modify_is_noop(
                 metadata.current_schema(),
                 &domains,
-                &change(ConnectorDataType::TinyInt)
+                &change(ConnectorDataType::Int8)
             )
             .unwrap()
         );
-        for target in [ConnectorDataType::SmallInt, ConnectorDataType::Int] {
+        for target in [ConnectorDataType::Int16, ConnectorDataType::Int32] {
             assert_eq!(
                 scalar_integer_modify_is_noop(metadata.current_schema(), &domains, &change(target))
                     .unwrap_err()
@@ -5230,7 +5228,7 @@ mod tests {
             !scalar_integer_modify_is_noop(
                 metadata.current_schema(),
                 &std::collections::BTreeMap::new(),
-                &change(ConnectorDataType::BigInt),
+                &change(ConnectorDataType::Int64),
             )
             .unwrap(),
             "ordinary physical INT-to-LONG widening still reaches the established schema owner"
@@ -5238,7 +5236,7 @@ mod tests {
         let stale = TableRequirement::CurrentSchemaIdMatch {
             current_schema_id: metadata.current_schema_id(),
         };
-        let widened = scalar_integer_apply(metadata, &change(ConnectorDataType::BigInt));
+        let widened = scalar_integer_apply(metadata, &change(ConnectorDataType::Int64));
         assert!(
             stale.check(Some(&widened)).is_err(),
             "a parallel stale schema commit cannot pass the existing fence"
@@ -5303,11 +5301,17 @@ mod tests {
         let columns = vec![
             column(
                 "nested",
-                ConnectorDataType::Array(Box::new(ConnectorDataType::Int)),
+                ConnectorDataType::Array {
+                    element: Box::new(novarocks_types::logical_type::LogicalValue {
+                        data_type: ConnectorDataType::Int32,
+                        nullable: true,
+                    }),
+                    fixed_length: None,
+                },
             ),
-            column("tiny", ConnectorDataType::TinyInt),
-            column("age", ConnectorDataType::SmallInt),
-            column("ordinary", ConnectorDataType::Int),
+            column("tiny", ConnectorDataType::Int8),
+            column("age", ConnectorDataType::Int16),
+            column("ordinary", ConnectorDataType::Int32),
         ];
         let (_, creation) = prepare_table_creation(&table, &columns, None, &[], &[]).unwrap();
         let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
@@ -5354,7 +5358,7 @@ mod tests {
             &table,
             &[ConnectorColumnDefinition {
                 name: "t".into(),
-                data_type: ConnectorDataType::TinyInt,
+                data_type: ConnectorDataType::Int8,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -5388,16 +5392,14 @@ mod tests {
             context: context(),
         };
         assert!(matches!(
-            provider
-                .execute(request(ConnectorDataType::TinyInt))
-                .unwrap(),
+            provider.execute(request(ConnectorDataType::Int8)).unwrap(),
             ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::NoOp,
                 ..
             }
         ));
         assert!(
-            matches!(provider.execute(request(ConnectorDataType::Int)).unwrap(),ExternalMutationOutcome::KnownUncommitted {failure} if failure.kind()==ConnectorMutationFailureKind::Unsupported)
+            matches!(provider.execute(request(ConnectorDataType::Int32)).unwrap(),ExternalMutationOutcome::KnownUncommitted {failure} if failure.kind()==ConnectorMutationFailureKind::Unsupported)
         );
         assert_eq!(
             metadata_file_count(before.table.metadata().location()),

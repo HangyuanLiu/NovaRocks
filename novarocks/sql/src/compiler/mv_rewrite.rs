@@ -734,7 +734,7 @@ pub(crate) struct SqlImvOutputColumnLineage {
 pub(crate) struct SqlImvBaseField {
     pub(crate) field_id: bytes::Bytes,
     pub(crate) name_at_create: String,
-    pub(crate) data_type: arrow::datatypes::DataType,
+    pub(crate) logical_type: novarocks_types::logical_type::LogicalType,
     pub(crate) nullable: bool,
 }
 
@@ -774,7 +774,7 @@ pub(crate) enum SqlImvAggregateStateRoleContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvAggregateStateColumnContract {
     pub(crate) column_name: String,
-    pub(crate) type_signature: String,
+    pub(crate) logical_type: novarocks_types::logical_type::LogicalType,
     pub(crate) role: SqlImvAggregateStateRoleContract,
 }
 
@@ -973,17 +973,18 @@ impl SqlImvBaseFieldFacts {
     pub fn try_new(
         field_id: bytes::Bytes,
         name_at_create: String,
-        data_type: arrow::datatypes::DataType,
+        logical_type: novarocks_types::logical_type::LogicalType,
         nullable: bool,
     ) -> Result<Self, String> {
         if field_id.is_empty() || name_at_create.trim().is_empty() {
             return Err("IMV base field facts are invalid".to_string());
         }
+        logical_type.validate(novarocks_types::logical_type::LogicalTypeLimits::default())?;
         Ok(Self {
             inner: SqlImvBaseField {
                 field_id,
                 name_at_create,
-                data_type,
+                logical_type,
                 nullable,
             },
         })
@@ -1096,16 +1097,17 @@ pub struct SqlImvAggregateStateColumnFacts {
 impl SqlImvAggregateStateColumnFacts {
     pub fn try_new(
         column_name: String,
-        type_signature: String,
+        logical_type: novarocks_types::logical_type::LogicalType,
         role: SqlImvAggregateStateRoleFacts,
     ) -> Result<Self, String> {
-        if column_name.trim().is_empty() || type_signature.trim().is_empty() {
+        if column_name.trim().is_empty() {
             return Err("IMV aggregate state column facts are invalid".to_string());
         }
+        logical_type.validate(novarocks_types::logical_type::LogicalTypeLimits::default())?;
         Ok(Self {
             inner: SqlImvAggregateStateColumnContract {
                 column_name,
-                type_signature,
+                logical_type,
                 role: match role {
                     SqlImvAggregateStateRoleFacts::Single => {
                         SqlImvAggregateStateRoleContract::Single
@@ -1890,13 +1892,13 @@ pub(crate) fn test_aggregate_snapshot(
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-1"),
                     name_at_create: "k".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: false,
                 },
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-2"),
                     name_at_create: "v".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: true,
                 },
             ],
@@ -1954,7 +1956,9 @@ pub(crate) fn test_aggregate_snapshot(
                 .enumerate()
                 .map(|(index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
-                    data_type: if column.type_signature == "long" {
+                    data_type: if column.logical_type
+                        == novarocks_types::logical_type::LogicalType::Int64
+                    {
                         arrow::datatypes::DataType::Int64
                     } else {
                         arrow::datatypes::DataType::Binary
@@ -2019,7 +2023,9 @@ pub(crate) fn test_aggregate_snapshot(
             .iter()
             .map(|column| novarocks_types::schema::ColumnDef {
                 name: column.column_name.clone(),
-                data_type: if column.type_signature == "long" {
+                data_type: if column.logical_type
+                    == novarocks_types::logical_type::LogicalType::Int64
+                {
                     arrow::datatypes::DataType::Int64
                 } else {
                     arrow::datatypes::DataType::Binary
@@ -2065,13 +2071,13 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             SqlImvBaseField {
                 field_id: bytes::Bytes::from_static(b"field-1"),
                 name_at_create: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
+                logical_type: novarocks_types::logical_type::LogicalType::Int64,
                 nullable: false,
             },
             SqlImvBaseField {
                 field_id: bytes::Bytes::from_static(b"field-2"),
                 name_at_create: "v".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
+                logical_type: novarocks_types::logical_type::LogicalType::Int64,
                 nullable: true,
             },
         ],
@@ -2079,12 +2085,12 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
     let state_columns = vec![
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state_s".to_string(),
-            type_signature: "binary".to_string(),
+            logical_type: novarocks_types::logical_type::LogicalType::Binary,
             role: SqlImvAggregateStateRoleContract::Single,
         },
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state___ivm_row_count".to_string(),
-            type_signature: "long".to_string(),
+            logical_type: novarocks_types::logical_type::LogicalType::Int64,
             role: SqlImvAggregateStateRoleContract::RetractionCount,
         },
     ];
@@ -2167,7 +2173,9 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 .enumerate()
                 .map(|(aggregate_index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
-                    data_type: if column.type_signature == "long" {
+                    data_type: if column.logical_type
+                        == novarocks_types::logical_type::LogicalType::Int64
+                    {
                         arrow::datatypes::DataType::Int64
                     } else {
                         arrow::datatypes::DataType::Binary
@@ -2239,7 +2247,9 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             .iter()
             .map(|column| novarocks_types::schema::ColumnDef {
                 name: column.column_name.clone(),
-                data_type: if column.type_signature == "long" {
+                data_type: if column.logical_type
+                    == novarocks_types::logical_type::LogicalType::Int64
+                {
                     arrow::datatypes::DataType::Int64
                 } else {
                     arrow::datatypes::DataType::Binary
@@ -2312,12 +2322,12 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         vec![
             SqlImvAggregateStateColumnContract {
                 column_name: "__agg_state_s".to_string(),
-                type_signature: "binary".to_string(),
+                logical_type: novarocks_types::logical_type::LogicalType::Binary,
                 role: SqlImvAggregateStateRoleContract::Single,
             },
             SqlImvAggregateStateColumnContract {
                 column_name: "__agg_state___ivm_row_count".to_string(),
-                type_signature: "long".to_string(),
+                logical_type: novarocks_types::logical_type::LogicalType::Int64,
                 role: SqlImvAggregateStateRoleContract::RetractionCount,
             },
         ],
@@ -2336,13 +2346,13 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-1"),
                     name_at_create: "region".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: false,
                 },
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-2"),
                     name_at_create: "amount".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: false,
                 },
             ],
@@ -4282,7 +4292,7 @@ mod tests {
                 SqlImvBaseFieldFacts::try_new(
                     bytes::Bytes::from_static(b"field-1"),
                     "k".to_string(),
-                    arrow::datatypes::DataType::Int64,
+                    novarocks_types::logical_type::LogicalType::Int64,
                     false,
                 )
                 .expect("base field"),

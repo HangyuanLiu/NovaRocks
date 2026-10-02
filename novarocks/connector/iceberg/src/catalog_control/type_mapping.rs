@@ -28,6 +28,22 @@ use crate::iceberg::spec::{
 pub(crate) fn schema_fields(
     columns: &[ConnectorColumnDefinition],
 ) -> Result<Vec<Arc<NestedField>>, String> {
+    let limits = novarocks_types::logical_type::LogicalTypeLimits::default();
+    let mut nodes = 0usize;
+    let mut text = 0usize;
+    for column in columns {
+        let usage = column.data_type.validate(limits)?;
+        nodes = nodes
+            .checked_add(usage.nodes)
+            .ok_or("mutation schema node budget overflow")?;
+        text = text
+            .checked_add(usage.text_bytes)
+            .and_then(|n| n.checked_add(column.name.len()))
+            .ok_or("mutation schema text budget overflow")?;
+        if nodes > limits.max_nodes || text > limits.max_text_bytes {
+            return Err("mutation schema exceeds its complete recursive budget".into());
+        }
+    }
     let mut next_id = i32::try_from(columns.len())
         .map_err(|_| "too many Iceberg columns".to_string())?
         .checked_add(1)
@@ -48,6 +64,7 @@ pub(crate) fn column_field(
     column: &ConnectorColumnDefinition,
     next_id: &mut i32,
 ) -> Result<NestedField, String> {
+    column.data_type.validate(Default::default())?;
     let field_type = iceberg_type(&column.data_type, next_id)?;
     let mut field = NestedField::new(
         id,
@@ -69,20 +86,59 @@ pub(crate) fn iceberg_type(
     data_type: &ConnectorDataType,
     next_id: &mut i32,
 ) -> Result<Type, String> {
+    data_type.validate(Default::default())?;
+    iceberg_type_inner(data_type, next_id, true)
+}
+
+fn iceberg_type_inner(
+    data_type: &ConnectorDataType,
+    next_id: &mut i32,
+    root: bool,
+) -> Result<Type, String> {
+    if !root
+        && matches!(
+            data_type,
+            ConnectorDataType::Int8 | ConnectorDataType::Int16
+        )
+    {
+        return Err(
+            "Iceberg narrow integer domains are only supported for top-level fields".into(),
+        );
+    }
+    if !root
+        && matches!(
+            data_type,
+            ConnectorDataType::Bitmap | ConnectorDataType::Hll
+        )
+    {
+        return Err(
+            "Iceberg mutation cannot preserve nested Bitmap/Hll without an exact logical marker"
+                .into(),
+        );
+    }
     let primitive = |value| Ok(Type::Primitive(value));
     match data_type {
         ConnectorDataType::Boolean => primitive(PrimitiveType::Boolean),
-        ConnectorDataType::TinyInt | ConnectorDataType::SmallInt | ConnectorDataType::Int => {
+        ConnectorDataType::Int8 | ConnectorDataType::Int16 | ConnectorDataType::Int32 => {
             primitive(PrimitiveType::Int)
         }
-        ConnectorDataType::BigInt => primitive(PrimitiveType::Long),
+        ConnectorDataType::Int64 => primitive(PrimitiveType::Long),
         ConnectorDataType::LargeInt => primitive(PrimitiveType::Fixed(
             u64::try_from(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
                 .expect("positive LargeInt width"),
         )),
-        ConnectorDataType::Float => primitive(PrimitiveType::Float),
-        ConnectorDataType::Double => primitive(PrimitiveType::Double),
-        ConnectorDataType::Decimal { precision, scale } => {
+        ConnectorDataType::Float32 => primitive(PrimitiveType::Float),
+        ConnectorDataType::Float64 => primitive(PrimitiveType::Double),
+        ConnectorDataType::Decimal {
+            bits,
+            precision,
+            scale,
+        } => {
+            if *bits != 128 {
+                return Err(
+                    "Iceberg mutation cannot preserve requested decimal carrier width".into(),
+                );
+            }
             if *scale < 0
                 || u8::try_from(*scale)
                     .ok()
@@ -96,30 +152,67 @@ pub(crate) fn iceberg_type(
             )
             .map_err(|error| format!("invalid Iceberg DECIMAL({precision},{scale}): {error}"))
         }
-        ConnectorDataType::String | ConnectorDataType::Json => primitive(PrimitiveType::String),
+        ConnectorDataType::Utf8 => primitive(PrimitiveType::String),
+        ConnectorDataType::Json => Err("Iceberg mutation cannot preserve Json without an exact persisted logical marker".into()),
         ConnectorDataType::Binary | ConnectorDataType::Bitmap | ConnectorDataType::Hll => {
             primitive(PrimitiveType::Binary)
         }
-        ConnectorDataType::Date => primitive(PrimitiveType::Date),
-        ConnectorDataType::DateTime => primitive(PrimitiveType::Timestamp),
-        ConnectorDataType::DateTimeNs => primitive(PrimitiveType::TimestampNs),
-        ConnectorDataType::Time => primitive(PrimitiveType::Time),
+        ConnectorDataType::Date32 => primitive(PrimitiveType::Date),
+        ConnectorDataType::Timestamp { unit, timezone } => {
+            use arrow::datatypes::TimeUnit;
+            // Existing metadata-table expressions carry UTC. Iceberg stores
+            // that instant family; its declared SQL read mapping normalizes
+            // the label back to None. Other labels have no exact mapping.
+            if timezone.as_deref().is_some_and(|zone| zone != "UTC") {
+                return Err("Iceberg mutation cannot preserve a non-UTC timezone label".into());
+            }
+            match (unit, timezone.is_some()) {
+                (TimeUnit::Microsecond, false) => primitive(PrimitiveType::Timestamp),
+                (TimeUnit::Nanosecond, false) => primitive(PrimitiveType::TimestampNs),
+                (TimeUnit::Microsecond, true) => primitive(PrimitiveType::Timestamptz),
+                (TimeUnit::Nanosecond, true) => primitive(PrimitiveType::TimestamptzNs),
+                _ => Err("Iceberg cannot preserve the requested timestamp precision".into()),
+            }
+        }
+        ConnectorDataType::Time {
+            bits: 64,
+            unit: arrow::datatypes::TimeUnit::Microsecond,
+        } => primitive(PrimitiveType::Time),
+        ConnectorDataType::FixedSizeBinary(16) | ConnectorDataType::Uuid => Err(
+            "Iceberg mutation cannot preserve the requested logical domain through the existing LargeInt read mapping".into(),
+        ),
+        ConnectorDataType::FixedSizeBinary(width) => {
+            primitive(PrimitiveType::Fixed(u64::from(*width)))
+        }
         ConnectorDataType::Variant => primitive(PrimitiveType::Variant),
-        ConnectorDataType::Array(element) => {
+        ConnectorDataType::Array {
+            element,
+            fixed_length,
+        } => {
+            if fixed_length.is_some() {
+                return Err("Iceberg cannot preserve a fixed-length array constraint".into());
+            }
             let element_id = allocate_id(next_id)?;
-            let element_type = iceberg_type(element, next_id)?;
+            let element_type = iceberg_type_inner(&element.data_type, next_id, false)?;
             Ok(Type::List(ListType::new(Arc::new(
-                NestedField::list_element(element_id, element_type, false),
+                NestedField::list_element(element_id, element_type, !element.nullable),
             ))))
         }
-        ConnectorDataType::Map(key, value) => {
+        ConnectorDataType::Map { key, value } => {
+            // The existing engine read carrier widens map keys to nullable.
+            // Iceberg still owns a required key; the writer validates actual
+            // values. Keep this declared read/write adaptation explicit.
             let key_id = allocate_id(next_id)?;
             let value_id = allocate_id(next_id)?;
-            let key_type = iceberg_type(key, next_id)?;
-            let value_type = iceberg_type(value, next_id)?;
+            let key_type = iceberg_type_inner(&key.data_type, next_id, false)?;
+            let value_type = iceberg_type_inner(&value.data_type, next_id, false)?;
             Ok(Type::Map(MapType::new(
                 Arc::new(NestedField::map_key_element(key_id, key_type)),
-                Arc::new(NestedField::map_value_element(value_id, value_type, false)),
+                Arc::new(NestedField::map_value_element(
+                    value_id,
+                    value_type,
+                    !value.nullable,
+                )),
             )))
         }
         ConnectorDataType::Struct(fields) => Ok(Type::Struct(StructType::new(
@@ -128,15 +221,18 @@ pub(crate) fn iceberg_type(
                 .map(|field| struct_field(field, next_id).map(Arc::new))
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
+        other => Err(format!(
+            "Iceberg cannot preserve mutation logical type {other:?}"
+        )),
     }
 }
 
 fn struct_field(field: &ConnectorStructField, next_id: &mut i32) -> Result<NestedField, String> {
     let id = allocate_id(next_id)?;
-    let field_type = iceberg_type(&field.data_type, next_id)?;
+    let field_type = iceberg_type_inner(&field.data_type, next_id, false)?;
     Ok(NestedField::new(
         id,
-        field.name.as_ref(),
+        field.name.as_str(),
         field_type,
         !field.nullable,
     ))
@@ -241,7 +337,13 @@ mod tests {
             name: "payload".into(),
             data_type: ConnectorDataType::Struct(vec![ConnectorStructField {
                 name: "items".into(),
-                data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::LargeInt)),
+                data_type: ConnectorDataType::Array {
+                    element: Box::new(novarocks_types::logical_type::LogicalValue {
+                        data_type: ConnectorDataType::LargeInt,
+                        nullable: true,
+                    }),
+                    fixed_length: None,
+                },
                 nullable: false,
             }]),
             nullable: true,
@@ -275,9 +377,167 @@ mod tests {
         assert!(mismatch.contains("does not match"), "{mismatch}");
 
         let decimal = ConnectorDataType::Decimal {
+            bits: 128,
             precision: 10,
             scale: -1,
         };
         assert!(iceberg_type(&decimal, &mut 1).is_err());
+    }
+    #[test]
+    fn mutation_refuses_unrepresentable_constraints_and_recursive_budget() {
+        use novarocks_types::logical_type::LogicalValue;
+        let fixed = ConnectorDataType::Array {
+            element: Box::new(LogicalValue {
+                data_type: ConnectorDataType::Int64,
+                nullable: false,
+            }),
+            fixed_length: Some(2),
+        };
+        assert!(
+            iceberg_type(&fixed, &mut 1)
+                .unwrap_err()
+                .contains("fixed-length")
+        );
+        let narrow = ConnectorDataType::Array {
+            element: Box::new(LogicalValue {
+                data_type: ConnectorDataType::Int8,
+                nullable: true,
+            }),
+            fixed_length: None,
+        };
+        assert!(
+            iceberg_type(&narrow, &mut 1)
+                .unwrap_err()
+                .contains("top-level")
+        );
+        let mut deep = ConnectorDataType::Int64;
+        for _ in 0..65 {
+            deep = ConnectorDataType::Array {
+                element: Box::new(LogicalValue {
+                    data_type: deep,
+                    nullable: true,
+                }),
+                fixed_length: None,
+            };
+        }
+        assert!(iceberg_type(&deep, &mut 1).is_err());
+    }
+    #[test]
+    fn mutation_rejects_logical_domains_without_exact_provider_restore() {
+        use novarocks_types::logical_type::LogicalValue;
+        for root in [
+            ConnectorDataType::Json,
+            ConnectorDataType::Uuid,
+            ConnectorDataType::FixedSizeBinary(16),
+        ] {
+            assert!(
+                iceberg_type(&root, &mut 1)
+                    .unwrap_err()
+                    .contains("cannot preserve")
+            );
+        }
+        for nested in [
+            ConnectorDataType::Json,
+            ConnectorDataType::Bitmap,
+            ConnectorDataType::Hll,
+            ConnectorDataType::Uuid,
+            ConnectorDataType::FixedSizeBinary(16),
+        ] {
+            let wrappers = [
+                ConnectorDataType::Array {
+                    element: Box::new(LogicalValue {
+                        data_type: nested.clone(),
+                        nullable: true,
+                    }),
+                    fixed_length: None,
+                },
+                ConnectorDataType::Map {
+                    key: Box::new(LogicalValue {
+                        data_type: ConnectorDataType::Utf8,
+                        nullable: false,
+                    }),
+                    value: Box::new(LogicalValue {
+                        data_type: nested.clone(),
+                        nullable: true,
+                    }),
+                },
+                ConnectorDataType::Struct(vec![ConnectorStructField {
+                    name: "value".into(),
+                    data_type: nested,
+                    nullable: true,
+                }]),
+            ];
+            for wrapper in wrappers {
+                let columns = [ConnectorColumnDefinition {
+                    name: "payload".into(),
+                    data_type: wrapper,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                }];
+                assert!(
+                    schema_fields(&columns)
+                        .unwrap_err()
+                        .contains("cannot preserve")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_keeps_root_bitmap_hll_and_recursive_largeint_domains() {
+        for logical in [ConnectorDataType::Bitmap, ConnectorDataType::Hll] {
+            assert_eq!(
+                iceberg_type(&logical, &mut 1).unwrap(),
+                Type::Primitive(PrimitiveType::Binary)
+            );
+        }
+        assert_eq!(
+            iceberg_type(&ConnectorDataType::LargeInt, &mut 1).unwrap(),
+            Type::Primitive(PrimitiveType::Fixed(16))
+        );
+        assert_eq!(
+            iceberg_type(&ConnectorDataType::FixedSizeBinary(8), &mut 1).unwrap(),
+            Type::Primitive(PrimitiveType::Fixed(8))
+        );
+        // The recursive LargeInt preservation path is independently asserted
+        // by connector_schema_mapping_preserves_nested_nullability_and_unique_ids.
+    }
+
+    #[test]
+    fn mutation_utc_timestamp_has_explicit_provider_and_read_normalization() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        for (unit, physical) in [
+            (TimeUnit::Microsecond, PrimitiveType::Timestamptz),
+            (TimeUnit::Nanosecond, PrimitiveType::TimestamptzNs),
+        ] {
+            let frozen = ConnectorDataType::Timestamp {
+                unit,
+                timezone: Some("UTC".into()),
+            };
+            assert_eq!(
+                iceberg_type(&frozen, &mut 1).unwrap(),
+                Type::Primitive(physical)
+            );
+            let schema = crate::iceberg::spec::Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "ts",
+                    iceberg_type(&frozen, &mut 2).unwrap(),
+                ))])
+                .build()
+                .unwrap();
+            let read = crate::schema_mapping::sql_read_schema_from_iceberg(&schema).unwrap();
+            assert_eq!(read.field(0).data_type(), &DataType::Timestamp(unit, None));
+        }
+        let named = ConnectorDataType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: Some("Europe/Paris".into()),
+        };
+        assert!(
+            iceberg_type(&named, &mut 1)
+                .unwrap_err()
+                .contains("non-UTC")
+        );
     }
 }

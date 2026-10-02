@@ -420,7 +420,7 @@ pub(crate) fn decode_drop_projection(
         i64,
         crate::product::MvTarget,
         MvAcceleratorSourceRevision,
-        crate::persistence::codec::DefinitionDocument,
+        crate::persistence::documents::MvDropDefinitionFacts,
     )>,
     String,
 > {

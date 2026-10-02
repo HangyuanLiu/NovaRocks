@@ -302,11 +302,21 @@ mod refresh_property_facade_tests {
         ) -> Result<ResolvedAnalyzerTable, String> {
             let planner = TableDef {
                 name: table.to_string(),
-                columns: vec![
-                    column("id", DataType::Int64, false),
-                    column("region", DataType::Utf8, true),
-                    column("amount", DataType::Int64, true),
-                ],
+                columns: if table == "marked" {
+                    let mut json = column("j", DataType::Utf8, true);
+                    json.logical_type = Some(novarocks_types::schema::SqlType::Json);
+                    let mut bitmap = column("b", DataType::Binary, false);
+                    bitmap.logical_type = Some(novarocks_types::schema::SqlType::Bitmap);
+                    let mut hll = column("h", DataType::Binary, false);
+                    hll.logical_type = Some(novarocks_types::schema::SqlType::Hll);
+                    vec![json, bitmap, hll, column("s", DataType::Utf8, true)]
+                } else {
+                    vec![
+                        column("id", DataType::Int64, false),
+                        column("region", DataType::Utf8, true),
+                        column("amount", DataType::Int64, true),
+                    ]
+                },
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: ScanSource::Sql(SqlScanSource::new(
                     crate::compiler::mv_rewrite::test_target_binding(),
@@ -338,16 +348,32 @@ mod refresh_property_facade_tests {
 
     fn analyzed_refresh_input(sql: &str) -> SqlResolvedMvRefreshInput {
         let query = parse_query(sql);
-        let (resolved, _, _) =
+        let (resolved, _, factory) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved)
+        SqlResolvedMvRefreshInput::from_analysis((resolved, factory))
+            .expect("freeze analyzed MV outputs")
     }
 
     fn observed_schema() -> SqlMvObservedSchemaFacts {
         SqlMvObservedSchemaFacts::new(vec![
-            SqlMvObservedFieldFacts::new(10, "id".to_string(), "long".to_string(), true),
-            SqlMvObservedFieldFacts::new(11, "region".to_string(), "string".to_string(), false),
-            SqlMvObservedFieldFacts::new(12, "amount".to_string(), "long".to_string(), false),
+            SqlMvObservedFieldFacts::new(
+                10,
+                "id".to_string(),
+                novarocks_types::logical_type::LogicalType::Int64,
+                true,
+            ),
+            SqlMvObservedFieldFacts::new(
+                11,
+                "region".to_string(),
+                novarocks_types::logical_type::LogicalType::Utf8,
+                false,
+            ),
+            SqlMvObservedFieldFacts::new(
+                12,
+                "amount".to_string(),
+                novarocks_types::logical_type::LogicalType::Int64,
+                false,
+            ),
         ])
     }
 
@@ -419,6 +445,124 @@ mod refresh_property_facade_tests {
         assert!(!facts.output_columns[0].nullable);
         assert_eq!(facts.output_columns[1].name, "region");
         assert!(facts.output_columns[1].nullable);
+    }
+
+    #[test]
+    fn mv_logical_outputs_preserve_root_markers_in_both_frozen_facades() {
+        use novarocks_types::logical_type::LogicalType;
+        let input = analyzed_refresh_input("SELECT j, b, h, s FROM marked");
+        let analysis = input.analysis_facts();
+        let persistence = input.create_persistence_facts().expect("persistence facts");
+        let expected = [
+            LogicalType::Json,
+            LogicalType::Bitmap,
+            LogicalType::Hll,
+            LogicalType::Utf8,
+        ];
+        for ((output, persisted), expected) in analysis
+            .output_columns
+            .iter()
+            .zip(persistence.outputs())
+            .zip(&expected)
+        {
+            assert_eq!(output.logical_type(), expected);
+            assert_eq!(persisted.logical_type(), expected);
+            assert_eq!(output.nullable, persisted.nullable());
+        }
+        assert_eq!(
+            analysis.output_columns[0].data_type,
+            analysis.output_columns[3].data_type
+        );
+        assert_ne!(
+            analysis.output_columns[0].logical_type(),
+            analysis.output_columns[3].logical_type()
+        );
+    }
+
+    #[test]
+    fn mv_logical_outputs_use_union_output_proof_and_preserve_branch_proof() {
+        use novarocks_types::logical_type::LogicalType;
+        let homogeneous =
+            analyzed_refresh_input("SELECT j FROM marked UNION ALL SELECT j FROM marked");
+        assert_eq!(
+            homogeneous.analysis_facts().output_columns[0].logical_type(),
+            &LogicalType::Json
+        );
+        assert_eq!(
+            homogeneous.create_persistence_facts().unwrap().outputs()[0].logical_type(),
+            &LogicalType::Json
+        );
+        let mixed = analyzed_refresh_input("SELECT j FROM marked UNION ALL SELECT s FROM marked");
+        assert_eq!(
+            mixed.analysis_facts().output_columns[0].logical_type(),
+            &LogicalType::Utf8
+        );
+        assert_eq!(
+            mixed.create_persistence_facts().unwrap().outputs()[0].logical_type(),
+            &LogicalType::Utf8
+        );
+    }
+
+    #[test]
+    fn mv_logical_outputs_preserve_nested_names_nullability_and_markers() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType as Marker, field_with_logical_type};
+        use novarocks_types::logical_type::{LogicalField, LogicalType};
+        use std::sync::Arc;
+        let field = Field::new(
+            "nested",
+            DataType::Struct(
+                vec![
+                    Arc::new(field_with_logical_type(
+                        Field::new("j", DataType::Utf8, false),
+                        Marker::Json,
+                    )),
+                    Arc::new(Field::new(
+                        "items",
+                        DataType::List(Arc::new(Field::new("element", DataType::Int64, false))),
+                        true,
+                    )),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let facts = SqlMvOutputColumnFacts::from_engine_field(&field).unwrap();
+        let LogicalType::Struct(children) = facts.logical_type() else {
+            panic!("struct logical type");
+        };
+        assert_eq!(
+            children[0],
+            LogicalField {
+                name: "j".into(),
+                data_type: LogicalType::Json,
+                nullable: false
+            }
+        );
+        let LogicalType::Array { element, .. } = &children[1].data_type else {
+            panic!("array logical type");
+        };
+        assert!(!element.nullable);
+        assert!(children[1].nullable);
+        assert!(!facts.nullable);
+        let mut changed = field.clone();
+        changed = changed.with_data_type(DataType::Struct(
+            vec![
+                Arc::new(Field::new("j", DataType::Utf8, false)),
+                Arc::new(Field::new(
+                    "items",
+                    DataType::List(Arc::new(Field::new("element", DataType::Int64, true))),
+                    true,
+                )),
+            ]
+            .into(),
+        ));
+        assert_ne!(
+            facts.logical_type(),
+            SqlMvOutputColumnFacts::from_engine_field(&changed)
+                .unwrap()
+                .logical_type()
+        );
     }
 
     #[test]
@@ -499,7 +643,7 @@ mod refresh_property_facade_tests {
         let missing = SqlMvObservedSchemaFacts::new(vec![SqlMvObservedFieldFacts::new(
             10,
             "id".to_string(),
-            "long".to_string(),
+            novarocks_types::logical_type::LogicalType::Int64,
             true,
         )]);
         let error = analyzed_refresh_input("SELECT region FROM fact_east")
@@ -661,16 +805,20 @@ mod refresh_property_facade_tests {
 /// second raw-query representation.
 pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Sealed {
     #[doc(hidden)]
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput;
+    fn into_sql_resolved_mv_refresh_input(self) -> Result<SqlResolvedMvRefreshInput, String>;
 }
 
 /// Opaque analyzed-MV input. It deliberately exposes neither analyzer nodes
 /// nor mutation access; SQL planning facades consume it directly.
 #[derive(Clone, Debug)]
-pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery);
+pub struct SqlResolvedMvRefreshInput(
+    crate::analysis::ResolvedQuery,
+    crate::column_id::ColumnRefFactory,
+    Vec<SqlMvOutputColumnFacts>,
+);
 
 impl SqlResolvedMvRefreshInput {
-    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(source: T) -> Self {
+    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(source: T) -> Result<Self, String> {
         source.into_sql_resolved_mv_refresh_input()
     }
 
@@ -686,7 +834,7 @@ impl SqlResolvedMvRefreshInput {
     /// target schema. Analyzer columns remain private to the SQL crate.
     pub fn analysis_facts(&self) -> SqlMvAnalysisFacts {
         SqlMvAnalysisFacts {
-            output_columns: output_column_facts(&self.0),
+            output_columns: self.2.clone(),
         }
     }
 
@@ -698,7 +846,7 @@ impl SqlResolvedMvRefreshInput {
     /// provider object, schema, and field identities remain application-owned
     /// observations that are joined to these occurrence-qualified SQL facts.
     pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
-        super::mv_persistence::project_create_persistence_facts(&self.0)
+        super::mv_persistence::project_create_persistence_facts(&self.0, &self.2)
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and
@@ -738,7 +886,7 @@ impl SqlResolvedMvRefreshInput {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(SqlMvAggregateLayoutFacts {
             calls: aggregate_call_facts,
-            output_columns: output_column_facts(resolved),
+            output_columns: output_column_facts(resolved, &self.1)?,
             aggregate_input_types,
             group_key_source_indexes,
         })
@@ -823,19 +971,22 @@ impl SqlResolvedMvRefreshInput {
     }
 }
 
-impl resolved_mv_refresh_input_private::Sealed for crate::analysis::ResolvedQuery {}
-
-impl SqlResolvedMvRefreshInputSource for crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
-        SqlResolvedMvRefreshInput(self)
-    }
+impl resolved_mv_refresh_input_private::Sealed
+    for (
+        crate::analysis::ResolvedQuery,
+        crate::column_id::ColumnRefFactory,
+    )
+{
 }
-
-impl resolved_mv_refresh_input_private::Sealed for &crate::analysis::ResolvedQuery {}
-
-impl SqlResolvedMvRefreshInputSource for &crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
-        SqlResolvedMvRefreshInput(self.clone())
+impl SqlResolvedMvRefreshInputSource
+    for (
+        crate::analysis::ResolvedQuery,
+        crate::column_id::ColumnRefFactory,
+    )
+{
+    fn into_sql_resolved_mv_refresh_input(self) -> Result<SqlResolvedMvRefreshInput, String> {
+        let outputs = output_column_facts(&self.0, &self.1)?;
+        Ok(SqlResolvedMvRefreshInput(self.0, self.1, outputs))
     }
 }
 
@@ -851,6 +1002,41 @@ pub struct SqlMvOutputColumnFacts {
     pub name: String,
     pub data_type: arrow::datatypes::DataType,
     pub nullable: bool,
+    logical_type: novarocks_types::logical_type::LogicalType,
+}
+impl SqlMvOutputColumnFacts {
+    pub fn logical_type(&self) -> &novarocks_types::logical_type::LogicalType {
+        &self.logical_type
+    }
+    /// Freeze one complete engine field, including its explicit logical marker.
+    pub fn from_engine_field(field: &arrow::datatypes::Field) -> Result<Self, String> {
+        let value = novarocks_types::logical_type::logical_value_from_engine_arrow(field)?;
+        Ok(Self {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: value.nullable,
+            logical_type: value.data_type,
+        })
+    }
+    pub fn from_logical(
+        name: String,
+        logical_type: novarocks_types::logical_type::LogicalType,
+        nullable: bool,
+    ) -> Result<Self, String> {
+        let field = novarocks_types::logical_type::engine_arrow_field_from_logical(
+            &name,
+            &novarocks_types::logical_type::LogicalValue {
+                data_type: logical_type.clone(),
+                nullable,
+            },
+        )?;
+        Ok(Self {
+            name,
+            data_type: field.data_type().clone(),
+            nullable,
+            logical_type,
+        })
+    }
 }
 
 /// Selects the output whose aggregate layout is being derived.
@@ -959,7 +1145,7 @@ impl SqlMvObservedSchemaFacts {
 pub struct SqlMvObservedFieldFacts {
     field_id: i32,
     name_at_create: String,
-    type_signature: String,
+    logical_type: novarocks_types::logical_type::LogicalType,
     required: bool,
 }
 
@@ -967,13 +1153,13 @@ impl SqlMvObservedFieldFacts {
     pub fn new(
         field_id: i32,
         name_at_create: String,
-        type_signature: String,
+        logical_type: novarocks_types::logical_type::LogicalType,
         required: bool,
     ) -> Self {
         Self {
             field_id,
             name_at_create,
-            type_signature,
+            logical_type,
             required,
         }
     }
@@ -986,8 +1172,8 @@ impl SqlMvObservedFieldFacts {
         &self.name_at_create
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn logical_type(&self) -> &novarocks_types::logical_type::LogicalType {
+        &self.logical_type
     }
 
     pub fn required(&self) -> bool {
@@ -1294,7 +1480,7 @@ fn sql_mv_lineage_schema(
             .map(|field| crate::analyzer::mv_lineage::SqlMvLineageField {
                 field_id: field.field_id(),
                 name_at_create: field.name_at_create().to_string(),
-                type_signature: field.type_signature().to_string(),
+                logical_type: field.logical_type().clone(),
                 required: field.required(),
             })
             .collect(),
@@ -1307,7 +1493,7 @@ fn sql_mv_observed_field_facts(
     SqlMvObservedFieldFacts::new(
         field.field_id,
         field.name_at_create,
-        field.type_signature,
+        field.logical_type,
         field.required,
     )
 }
@@ -1505,31 +1691,73 @@ fn group_key_source_indexes(calls: &SqlMvAggregateCalls) -> Result<Vec<usize>, S
         .collect()
 }
 
-fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOutputColumnFacts> {
-    if resolved.output_columns.is_empty() {
+pub(crate) fn analyzed_output_field(
+    name: &str,
+    data_type: &arrow::datatypes::DataType,
+    nullable: bool,
+    column_id: crate::column_id::ColumnId,
+    factory: &crate::column_id::ColumnRefFactory,
+) -> arrow::datatypes::Field {
+    engine_output_field(name, data_type, nullable, factory.logical_type(column_id))
+}
+
+pub(crate) fn engine_output_field(
+    name: &str,
+    data_type: &arrow::datatypes::DataType,
+    nullable: bool,
+    logical_type: Option<novarocks_types::schema::SqlType>,
+) -> arrow::datatypes::Field {
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::schema::SqlType;
+    let field = arrow::datatypes::Field::new(name, data_type.clone(), nullable);
+    match logical_type {
+        Some(SqlType::Json) => field_with_logical_type(field, LogicalType::Json),
+        Some(SqlType::Bitmap) => field_with_logical_type(field, LogicalType::Bitmap),
+        Some(SqlType::Hll) => field_with_logical_type(field, LogicalType::Hll),
+        _ => field,
+    }
+}
+
+fn output_column_facts(
+    resolved: &crate::analysis::ResolvedQuery,
+    factory: &crate::column_id::ColumnRefFactory,
+) -> Result<Vec<SqlMvOutputColumnFacts>, String> {
+    let fields = if resolved.output_columns.is_empty() {
         match &resolved.body {
             crate::analysis::QueryBody::Select(select) => select
                 .projection
                 .iter()
-                .map(|item| SqlMvOutputColumnFacts {
-                    name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
+                .map(|item| {
+                    analyzed_output_field(
+                        &item.output_name,
+                        &item.expr.data_type,
+                        item.expr.nullable,
+                        item.output_column_id,
+                        factory,
+                    )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             _ => Vec::new(),
         }
     } else {
         resolved
             .output_columns
             .iter()
-            .map(|column| SqlMvOutputColumnFacts {
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
+            .map(|column| {
+                analyzed_output_field(
+                    &column.name,
+                    &column.data_type,
+                    column.nullable,
+                    column.column_id,
+                    factory,
+                )
             })
             .collect()
-    }
+    };
+    fields
+        .into_iter()
+        .map(|field| SqlMvOutputColumnFacts::from_engine_field(&field))
+        .collect()
 }
 
 fn first_union_branch_query(query: &Query) -> Result<Query, String> {

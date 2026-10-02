@@ -4264,6 +4264,7 @@ dependencies = [
  "futures",
  "novarocks-connector-contract",
  "novarocks-secret",
+ "novarocks-type-contract",
  "serde",
  "serde_json",
  "sha2",

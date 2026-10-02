@@ -11,6 +11,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+arrow-schema.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -34,7 +35,6 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-arrow-schema.workspace = true
 novarocks-catalog-application = { workspace = true, features = ["test-support"] }
 novarocks-state-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

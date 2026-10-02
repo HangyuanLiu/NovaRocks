@@ -83,7 +83,9 @@ pub struct IcebergStorageTargetObservation {
 pub struct IcebergStorageTargetField {
     pub field_id: i32,
     pub name: String,
-    pub type_signature: String,
+    pub logical_type: novarocks_types::logical_type::LogicalType,
+    pub legacy_scalar_type: Option<novarocks_types::logical_type::LogicalType>,
+    pub provider_type_binding: Bytes,
     pub nullable: bool,
 }
 
@@ -101,7 +103,9 @@ pub struct IcebergStorageCreateSourceObservation {
 pub struct IcebergStorageSourceField {
     pub provider_field_id: Bytes,
     pub name: String,
-    pub type_signature: String,
+    pub logical_type: novarocks_types::logical_type::LogicalType,
+    pub legacy_scalar_type: Option<novarocks_types::logical_type::LogicalType>,
+    pub provider_type_binding: Bytes,
     pub nullable: bool,
 }
 
@@ -596,18 +600,31 @@ fn target_observation(
         ));
     }
     let mut budget = 0_usize;
+    let logical_fields = crate::schema_mapping::exact_logical_fields(table).map_err(corrupt)?;
     let fields = schema
         .as_struct()
         .fields()
         .iter()
-        .map(|field| {
+        .zip(logical_fields)
+        .map(|(field, logical)| {
             reserve(context, &mut budget, &field.name)?;
-            let type_signature = field.field_type.to_string();
-            reserve(context, &mut budget, &type_signature)?;
+            let logical_type = logical.data_type;
+            let usage = logical_type.validate(Default::default()).map_err(corrupt)?;
+            reserve_bytes(context, &mut budget, usage.nodes * 128 + usage.text_bytes)?;
+            let provider_type_binding =
+                crate::schema_mapping::exact_provider_type_binding(field).map_err(corrupt)?;
+            reserve_bytes(context, &mut budget, provider_type_binding.len())?;
+            let legacy_scalar_type = crate::schema_mapping::legacy_scalar_type(field);
+            if let Some(legacy) = &legacy_scalar_type {
+                let usage = legacy.validate(Default::default()).map_err(corrupt)?;
+                reserve_bytes(context, &mut budget, usage.nodes * 128 + usage.text_bytes)?;
+            }
             Ok(IcebergStorageTargetField {
                 field_id: field.id,
                 name: field.name.clone(),
-                type_signature,
+                logical_type,
+                legacy_scalar_type,
+                provider_type_binding,
                 nullable: !field.required,
             })
         })
@@ -668,7 +685,9 @@ fn create_source_observation(
         .map(|field| IcebergStorageSourceField {
             provider_field_id: Bytes::copy_from_slice(&field.field_id.to_be_bytes()),
             name: field.name,
-            type_signature: field.type_signature,
+            logical_type: field.logical_type,
+            legacy_scalar_type: field.legacy_scalar_type,
+            provider_type_binding: field.provider_type_binding,
             nullable: field.nullable,
         })
         .collect();
@@ -712,14 +731,28 @@ fn exact_schema_observation(
             reserve_bytes(context, &mut budget, 32)?;
             reserve_bytes(context, &mut budget, provider_field_id.len())?;
             reserve(context, &mut budget, &field.name)?;
-            reserve(context, &mut budget, &field.type_signature)?;
+            let usage = field
+                .logical_type
+                .validate(Default::default())
+                .map_err(corrupt)?;
+            reserve_bytes(
+                context,
+                &mut budget,
+                usage.nodes * 128 + usage.text_bytes + field.provider_type_binding.len(),
+            )?;
+            if let Some(legacy) = &field.legacy_scalar_type {
+                let usage = legacy.validate(Default::default()).map_err(corrupt)?;
+                reserve_bytes(context, &mut budget, usage.nodes * 128 + usage.text_bytes)?;
+            }
             Ok((
                 u32::try_from(ordinal)
                     .map_err(|_| exhausted("MV physical field ordinal exceeds u32"))?,
                 IcebergStorageSourceField {
                     provider_field_id,
                     name: field.name,
-                    type_signature: field.type_signature,
+                    logical_type: field.logical_type,
+                    legacy_scalar_type: field.legacy_scalar_type,
+                    provider_type_binding: field.provider_type_binding,
                     nullable: field.nullable,
                 },
             ))

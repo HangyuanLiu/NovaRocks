@@ -401,6 +401,19 @@ pub(crate) fn preflight(
     })
 }
 
+fn type_payload_field(schema: Schema, number: u32) -> bool {
+    matches!(
+        (schema, number),
+        (
+            Schema::SourceFieldBinding
+                | Schema::OutputDefinition
+                | Schema::OutputBinding
+                | Schema::StateSlot,
+            3
+        ) | (Schema::PhysicalFieldBinding, 4)
+    )
+}
+
 struct MeasureState {
     expanded_items: usize,
     structural_items: usize,
@@ -468,6 +481,22 @@ fn measure_message(
                 }
                 let value = &bytes[..length];
                 bytes = &bytes[length..];
+                if type_payload_field(schema, number) {
+                    let text = std::str::from_utf8(value)
+                        .map_err(|_| malformed("type payload is not UTF-8"))?;
+                    let nodes = super::logical_type::signature_nodes(
+                        text,
+                        novarocks_type_contract::LogicalTypeLimits {
+                            max_depth: state.budget.max_depth.min(64),
+                            max_nodes: state.budget.max_items.min(4096),
+                            max_text_bytes: state.budget.max_document_bytes.min(64 * 1024),
+                        },
+                    )?;
+                    state.structural_items = state.structural_items.saturating_add(nodes);
+                    for _ in 0..nodes {
+                        record_measured_item(state)?;
+                    }
+                }
                 if field.packed_varints {
                     let mut packed = value;
                     while !packed.is_empty() {

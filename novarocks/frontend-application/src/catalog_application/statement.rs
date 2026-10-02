@@ -347,50 +347,117 @@ pub fn connector_column(column: &TableColumnDef) -> Result<ConnectorColumnDefini
 }
 
 pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataType, String> {
-    Ok(match data_type {
+    let limits = novarocks_types::logical_type::LogicalTypeLimits::default();
+    let mut pending = vec![(data_type, 1usize)];
+    let mut nodes = 0usize;
+    let mut text_bytes = 0usize;
+    while let Some((data_type, depth)) = pending.pop() {
+        if nodes >= limits.max_nodes || depth > limits.max_depth {
+            return Err("DDL type exceeds its node or depth budget".into());
+        }
+        nodes += 1;
+        let children = match data_type {
+            SqlType::Array(_) => 1,
+            SqlType::Map(_, _) => 2,
+            SqlType::Struct(fields) => fields.len(),
+            _ => 0,
+        };
+        if children > limits.max_nodes.saturating_sub(nodes + pending.len()) {
+            return Err("DDL type exceeds its node budget".into());
+        }
+        match data_type {
+            SqlType::Array(value) => pending.push((value, depth + 1)),
+            SqlType::Map(key, value) => {
+                pending.push((key, depth + 1));
+                pending.push((value, depth + 1));
+            }
+            SqlType::Struct(fields) => {
+                for (name, value) in fields {
+                    text_bytes = text_bytes
+                        .checked_add(name.len())
+                        .ok_or("DDL type text budget overflow")?;
+                    if text_bytes > limits.max_text_bytes {
+                        return Err("DDL type exceeds its text budget".into());
+                    }
+                    pending.push((value, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    let value = lower_connector_data_type(data_type)?;
+    value.validate(limits)?;
+    Ok(value)
+}
+
+fn lower_connector_data_type(data_type: &SqlType) -> Result<ConnectorDataType, String> {
+    use arrow::datatypes::TimeUnit;
+    use novarocks_types::logical_type::LogicalValue;
+    let value = match data_type {
         SqlType::Boolean => ConnectorDataType::Boolean,
-        SqlType::TinyInt => ConnectorDataType::TinyInt,
-        SqlType::SmallInt => ConnectorDataType::SmallInt,
-        SqlType::Int => ConnectorDataType::Int,
-        SqlType::BigInt => ConnectorDataType::BigInt,
+        SqlType::TinyInt => ConnectorDataType::Int8,
+        SqlType::SmallInt => ConnectorDataType::Int16,
+        SqlType::Int => ConnectorDataType::Int32,
+        SqlType::BigInt => ConnectorDataType::Int64,
         SqlType::LargeInt => ConnectorDataType::LargeInt,
-        SqlType::Float => ConnectorDataType::Float,
-        SqlType::Double => ConnectorDataType::Double,
+        SqlType::Float => ConnectorDataType::Float32,
+        SqlType::Double => ConnectorDataType::Float64,
         SqlType::Decimal { precision, scale } => ConnectorDataType::Decimal {
+            bits: 128,
             precision: *precision,
             scale: *scale,
         },
-        SqlType::String => ConnectorDataType::String,
+        SqlType::String => ConnectorDataType::Utf8,
         SqlType::Json => ConnectorDataType::Json,
         SqlType::Binary => ConnectorDataType::Binary,
         SqlType::Bitmap => ConnectorDataType::Bitmap,
         SqlType::Hll => ConnectorDataType::Hll,
-        SqlType::Date => ConnectorDataType::Date,
-        SqlType::DateTime => ConnectorDataType::DateTime,
-        SqlType::DateTimeNs => ConnectorDataType::DateTimeNs,
-        SqlType::Time => ConnectorDataType::Time,
-        SqlType::Array(element) => {
-            ConnectorDataType::Array(Box::new(connector_data_type(element)?))
-        }
-        SqlType::Map(key, value) => ConnectorDataType::Map(
-            Box::new(connector_data_type(key)?),
-            Box::new(connector_data_type(value)?),
-        ),
+        SqlType::Date => ConnectorDataType::Date32,
+        SqlType::DateTime => ConnectorDataType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: None,
+        },
+        SqlType::DateTimeNs => ConnectorDataType::Timestamp {
+            unit: TimeUnit::Nanosecond,
+            timezone: None,
+        },
+        SqlType::Time => ConnectorDataType::Time {
+            bits: 64,
+            unit: TimeUnit::Microsecond,
+        },
+        // The admitted DDL AST has no child nullability; its SQL default is nullable.
+        SqlType::Array(element) => ConnectorDataType::Array {
+            element: Box::new(LogicalValue {
+                data_type: lower_connector_data_type(element)?,
+                nullable: true,
+            }),
+            fixed_length: None,
+        },
+        SqlType::Map(key, value) => ConnectorDataType::Map {
+            key: Box::new(LogicalValue {
+                data_type: lower_connector_data_type(key)?,
+                nullable: false,
+            }),
+            value: Box::new(LogicalValue {
+                data_type: lower_connector_data_type(value)?,
+                nullable: true,
+            }),
+        },
         SqlType::Struct(fields) => ConnectorDataType::Struct(
             fields
                 .iter()
                 .map(|(name, data_type)| {
                     Ok(novarocks_spi::connector::ConnectorStructField {
-                        name: Arc::from(name.as_str()),
-                        data_type: connector_data_type(data_type)?,
-                        // SQL's current struct AST has no child-nullability bit.
+                        name: name.clone(),
+                        data_type: lower_connector_data_type(data_type)?,
                         nullable: true,
                     })
                 })
                 .collect::<Result<_, String>>()?,
         ),
         SqlType::Variant => ConnectorDataType::Variant,
-    })
+    };
+    Ok(value)
 }
 
 fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, String> {
@@ -1628,6 +1695,63 @@ mod drop_table_if_exists_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ddl_child_nullability_is_explicit_and_differs_from_analyzed_required_children() {
+        use novarocks_types::logical_type::{LogicalField, LogicalType, LogicalValue};
+        let ty = super::connector_data_type(&novarocks_types::schema::SqlType::Struct(vec![(
+            "required_by_query_only".into(),
+            novarocks_types::schema::SqlType::Array(Box::new(
+                novarocks_types::schema::SqlType::Int,
+            )),
+        )]))
+        .unwrap();
+        assert_eq!(
+            ty,
+            LogicalType::Struct(vec![LogicalField {
+                name: "required_by_query_only".into(),
+                data_type: LogicalType::Array {
+                    element: Box::new(LogicalValue {
+                        data_type: LogicalType::Int32,
+                        nullable: true
+                    }),
+                    fixed_length: None
+                },
+                nullable: true
+            }])
+        );
+        let ty = super::connector_data_type(&novarocks_types::schema::SqlType::Map(
+            Box::new(novarocks_types::schema::SqlType::String),
+            Box::new(novarocks_types::schema::SqlType::BigInt),
+        ))
+        .unwrap();
+        assert_eq!(
+            ty,
+            LogicalType::Map {
+                key: Box::new(LogicalValue {
+                    data_type: LogicalType::Utf8,
+                    nullable: false
+                }),
+                value: Box::new(LogicalValue {
+                    data_type: LogicalType::Int64,
+                    nullable: true
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn ddl_type_budget_is_checked_before_recursive_lowering() {
+        let mut ty = novarocks_types::schema::SqlType::Int;
+        for _ in 0..64 {
+            ty = novarocks_types::schema::SqlType::Array(Box::new(ty));
+        }
+        assert!(
+            super::connector_data_type(&ty)
+                .unwrap_err()
+                .contains("depth budget")
+        );
+    }
+
     #[test]
     fn semantic_create_table_lowering_materializes_catalog_request() {
         let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 8 PARTITION BY (month(id)) PROPERTIES ('format-version' = '2') COMMENT 'orders'";

@@ -148,6 +148,7 @@ pub struct SqlMvPersistenceOutputFacts {
     output_ordinal: u32,
     name: String,
     data_type: DataType,
+    logical_type: novarocks_types::logical_type::LogicalType,
     nullable: bool,
     expression: SqlMvPersistenceExpressionFacts,
 }
@@ -163,6 +164,10 @@ impl SqlMvPersistenceOutputFacts {
 
     pub fn data_type(&self) -> &DataType {
         &self.data_type
+    }
+
+    pub fn logical_type(&self) -> &novarocks_types::logical_type::LogicalType {
+        &self.logical_type
     }
 
     pub fn nullable(&self) -> bool {
@@ -270,6 +275,7 @@ struct ProjectionBuilder {
 
 pub(super) fn project_create_persistence_facts(
     query: &ResolvedQuery,
+    frozen_outputs: &[super::mv::SqlMvOutputColumnFacts],
 ) -> Result<SqlMvCreatePersistenceFacts, String> {
     let mut output_leaves = Vec::new();
     let is_root_union = collect_union_leaves(query, &mut output_leaves)?;
@@ -303,7 +309,7 @@ pub(super) fn project_create_persistence_facts(
         .collect::<Result<Vec<_>, String>>()?;
     collect_query_semantics(query, &branch_occurrences, &mut builder)?;
 
-    let output_columns = output_columns(query);
+    let output_columns = frozen_outputs;
     if leaf_expressions
         .iter()
         .any(|expressions| expressions.len() != output_columns.len())
@@ -311,18 +317,19 @@ pub(super) fn project_create_persistence_facts(
         return Err("MV CREATE persistence output arity does not match UNION branches".to_string());
     }
     let outputs = output_columns
-        .into_iter()
+        .iter()
         .enumerate()
-        .map(|(output_index, (name, data_type, nullable))| {
+        .map(|(output_index, output)| {
             let expressions = leaf_expressions
                 .iter()
                 .map(|branch| branch[output_index].clone())
                 .collect::<Vec<_>>();
             Ok(SqlMvPersistenceOutputFacts {
                 output_ordinal: u32_from_usize("MV output ordinal", output_index)?,
-                name,
-                data_type,
-                nullable,
+                name: output.name.clone(),
+                data_type: output.data_type.clone(),
+                logical_type: output.logical_type().clone(),
+                nullable: output.nullable,
                 expression: merge_branch_expression_facts(expressions),
             })
         })
@@ -1031,37 +1038,6 @@ fn unwrap_nested(mut expression: &TypedExpr) -> &TypedExpr {
     expression
 }
 
-fn output_columns(query: &ResolvedQuery) -> Vec<(String, DataType, bool)> {
-    if query.output_columns.is_empty() {
-        match &query.body {
-            QueryBody::Select(select) => select
-                .projection
-                .iter()
-                .map(|item| {
-                    (
-                        item.output_name.clone(),
-                        item.expr.data_type.clone(),
-                        item.expr.nullable,
-                    )
-                })
-                .collect(),
-            QueryBody::SetOperation(_) | QueryBody::Values(_) => Vec::new(),
-        }
-    } else {
-        query
-            .output_columns
-            .iter()
-            .map(|column| {
-                (
-                    column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect()
-    }
-}
-
 fn merge_branch_expression_facts(
     expressions: Vec<SqlMvPersistenceExpressionFacts>,
 ) -> SqlMvPersistenceExpressionFacts {
@@ -1184,9 +1160,10 @@ mod tests {
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        let (resolved, _, _) =
+        let (resolved, _, factory) =
             crate::analyzer::analyze(query, &TestCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved)
+        SqlResolvedMvRefreshInput::from_analysis((resolved, factory))
+            .expect("freeze analyzed outputs")
     }
 
     fn facts(sql: &str) -> SqlMvCreatePersistenceFacts {

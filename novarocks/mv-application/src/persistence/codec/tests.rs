@@ -49,11 +49,12 @@ identity_fixture!(aggregate_id, AggregateIdentity);
 identity_fixture!(branch_id, BranchIdentity);
 identity_fixture!(apply_key_id, ApplyKeyIdentity);
 
-fn field(id: u8, name: &str, type_signature: &str, nullable: bool) -> SourceFieldBinding {
+fn field(id: u8, name: &str, data_type: &str, nullable: bool) -> SourceFieldBinding {
     SourceFieldBinding {
         field_id: field_id(id),
         name_at_binding: name.to_string(),
-        type_signature: type_signature.to_string(),
+        data_type: crate::persistence::codec::MvLogicalType::decode_signature(data_type)
+            .expect("valid fixture type"),
         nullable,
     }
 }
@@ -89,7 +90,7 @@ fn sample_definition() -> DefinitionDocument {
         vec![OutputDefinition {
             output_id: output_id(21),
             name: "average_amount".to_string(),
-            type_signature: "decimal(18,2)".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("decimal(18,2)").expect("valid fixture type"),
             nullable: true,
             expression: ExpressionShape {
                 kind: ExpressionKind::Function,
@@ -113,13 +114,14 @@ fn sample_definition() -> DefinitionDocument {
 fn physical(
     logical_identity: PhysicalFieldLogicalIdentity,
     target_field_value: u8,
-    type_signature: &str,
+    data_type: &str,
     nullable: bool,
 ) -> PhysicalFieldBinding {
     PhysicalFieldBinding {
         logical_identity,
         target_field_id: field_id(target_field_value),
-        type_signature: type_signature.to_string(),
+        data_type: crate::persistence::codec::MvLogicalType::decode_signature(data_type)
+            .expect("valid fixture type"),
         nullable,
     }
 }
@@ -131,14 +133,16 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
         outputs: vec![OutputBinding {
             output_id: output_id(21),
             target_field_id: field_id(31),
-            type_signature: "decimal(18,2)".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("decimal(18,2)")
+                .expect("valid fixture type"),
             nullable: true,
         }],
         state_slots: vec![
             StateSlot {
                 slot_id: state_slot_id(41),
                 target_field_id: field_id(33),
-                type_signature: "bigint".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                    .expect("valid fixture type"),
                 nullable: false,
                 role: StateRole::AvgCount,
                 encoding: StateEncoding::NativeColumnV1,
@@ -146,7 +150,10 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
             StateSlot {
                 slot_id: state_slot_id(42),
                 target_field_id: field_id(32),
-                type_signature: "decimal(38,2)".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                    "decimal(38,2)",
+                )
+                .expect("valid fixture type"),
                 nullable: true,
                 role: StateRole::AvgSum,
                 encoding: StateEncoding::NativeColumnV1,
@@ -234,7 +241,8 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
         StateSlot {
             slot_id: state_slot_id(41),
             target_field_id: field_id(32),
-            type_signature: "binary".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("binary")
+                .expect("valid fixture type"),
             nullable: false,
             role: StateRole::Single,
             encoding: StateEncoding::NativeColumnV1,
@@ -242,7 +250,8 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
         StateSlot {
             slot_id: state_slot_id(42),
             target_field_id: field_id(33),
-            type_signature: "bigint".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                .expect("valid fixture type"),
             nullable: false,
             role: StateRole::RetractionCount,
             encoding: StateEncoding::NativeColumnV1,
@@ -847,7 +856,8 @@ fn automatic_retraction_count_state_requires_its_canonical_internal_owner() {
     multiple_automatic_states.state_slots.push(StateSlot {
         slot_id: state_slot_id(43),
         target_field_id: field_id(36),
-        type_signature: "bigint".to_string(),
+        data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+            .expect("valid fixture type"),
         nullable: false,
         role: StateRole::RetractionCount,
         encoding: StateEncoding::NativeColumnV1,
@@ -897,7 +907,8 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
     interpretation.state_slots = vec![StateSlot {
         slot_id: state_slot_id(41),
         target_field_id: field_id(32),
-        type_signature: "binary".to_string(),
+        data_type: crate::persistence::codec::MvLogicalType::decode_signature("binary")
+            .expect("valid fixture type"),
         nullable: false,
         role: StateRole::Single,
         encoding: StateEncoding::NativeColumnV1,
@@ -927,7 +938,7 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
         })
         .expect("normal count state binding");
     state.target_field_id = field_id(32);
-    state.type_signature = "binary".to_string();
+    state.data_type = crate::persistence::codec::MvLogicalType::decode_signature("binary").unwrap();
     state.nullable = false;
 
     encode_interpretation(&interpretation)
@@ -1227,4 +1238,371 @@ fn legacy_nonaggregate_interpretations_fail_closed_without_invalidating_aggregat
         decode_interpretation(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
         Err(PersistenceCodecError::LegacyNonAggregateInterpretation)
     ));
+}
+
+#[test]
+fn historical_scalar_documents_preserve_all_bytes_revisions_and_publication_links() {
+    let budget = PersistenceDecodeBudget::default();
+    let d = include_bytes!("fixtures/legacy-v1/definition.pb");
+    let l = include_bytes!("fixtures/legacy-v1/interpretation.pb");
+    let p = include_bytes!("fixtures/legacy-v1/publication.pb");
+    let c = include_bytes!("fixtures/legacy-v1/configuration.pb");
+    let definition = decode_definition(d, budget).unwrap();
+    let interpretation = decode_interpretation(l, budget).unwrap();
+    let publication = decode_publication(p, budget).unwrap();
+    let configuration = decode_configuration(c, budget).unwrap();
+    for (encoded, original, digest) in [
+        (
+            encode_definition(&definition).unwrap(),
+            d.as_slice(),
+            "872b83f8a9e6b230f12ca039a01d2f1c8ef5191bbda399930ec323c65d2ce47f",
+        ),
+        (
+            encode_interpretation(&interpretation).unwrap(),
+            l.as_slice(),
+            "ad4f41d24e15dff086c2badbb54ed47973486162b2cd76b355a8ed5d8ea2fa95",
+        ),
+        (
+            encode_publication(&publication).unwrap(),
+            p.as_slice(),
+            "e16ebaa14498855efe6609c724d87e81b10b1d74c3f9d404b99bddbdb3b01e59",
+        ),
+        (
+            encode_configuration(&configuration).unwrap(),
+            c.as_slice(),
+            "380a998003624af2e8b91852c5e3650aa6f749416853466260a2bd482f04504c",
+        ),
+    ] {
+        assert_eq!(encoded.as_bytes(), original);
+        assert_eq!(hex::encode(encoded.revision().as_bytes()), digest);
+    }
+    assert_eq!(
+        interpretation.computation_identity,
+        definition.computation_identity
+    );
+    assert_eq!(
+        publication.definition_revision,
+        DocumentRevision::from_canonical_bytes(d)
+    );
+    assert_eq!(
+        publication.interpretation_revision,
+        DocumentRevision::from_canonical_bytes(l)
+    );
+    validate_document_set(
+        &definition,
+        DocumentRevision::from_canonical_bytes(d),
+        &interpretation,
+        DocumentRevision::from_canonical_bytes(l),
+        &publication,
+    )
+    .unwrap();
+}
+
+#[test]
+fn recursive_schema_payloads_keep_exact_provider_bindings_and_publication_revisions() {
+    use bytes::Bytes;
+    use novarocks_type_contract::{LogicalField, LogicalType, LogicalValue};
+    let tree = LogicalType::Struct(vec![LogicalField {
+        name: "child".into(),
+        nullable: false,
+        data_type: LogicalType::Map {
+            key: Box::new(LogicalValue {
+                data_type: LogicalType::Utf8,
+                nullable: false,
+            }),
+            value: Box::new(LogicalValue {
+                data_type: LogicalType::Array {
+                    element: Box::new(LogicalValue {
+                        data_type: LogicalType::Int64,
+                        nullable: true,
+                    }),
+                    fixed_length: None,
+                },
+                nullable: true,
+            }),
+        },
+    }]);
+    let mut old = sample_definition();
+    old.relation_occurrences[0].fields[0].data_type = MvLogicalType::from_schema_type(
+        tree.clone(),
+        Bytes::from_static(b"exact-source-nested-ids"),
+    )
+    .unwrap();
+    old.outputs[0].data_type = MvLogicalType::from_logical_type(tree.clone()).unwrap();
+    let definition = build_definition(
+        old.created_at_ms,
+        old.query,
+        old.relation_occurrences,
+        old.outputs,
+    )
+    .unwrap();
+    let d = encode_definition(&definition).unwrap();
+    let decoded = decode_definition(d.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    assert_eq!(
+        encode_definition(&decoded).unwrap().as_bytes(),
+        d.as_bytes()
+    );
+    assert_eq!(
+        decoded.relation_occurrences[0].fields[0]
+            .data_type
+            .provider_type_binding()
+            .unwrap()
+            .as_ref(),
+        b"exact-source-nested-ids"
+    );
+    assert!(
+        decoded.outputs[0]
+            .data_type
+            .provider_type_binding()
+            .is_none()
+    );
+    let mut interpretation = sample_interpretation(&d);
+    interpretation.computation_identity = definition.computation_identity;
+    interpretation.outputs[0].data_type = MvLogicalType::from_logical_type(tree.clone()).unwrap();
+    let output = interpretation
+        .target
+        .fields
+        .iter_mut()
+        .find(|field| {
+            matches!(
+                field.logical_identity,
+                PhysicalFieldLogicalIdentity::Output(_)
+            )
+        })
+        .unwrap();
+    output.data_type = MvLogicalType::from_schema_type(
+        tree.clone(),
+        Bytes::from_static(b"independent-target-nested-ids"),
+    )
+    .unwrap();
+    let l = encode_interpretation(&interpretation).unwrap();
+    let decoded_l =
+        decode_interpretation(l.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    assert_eq!(
+        encode_interpretation(&decoded_l).unwrap().as_bytes(),
+        l.as_bytes()
+    );
+    let p = sample_publication(&d, &l);
+    validate_document_set(&decoded, d.revision(), &decoded_l, l.revision(), &p).unwrap();
+    let expected = &decoded.relation_occurrences[0].fields[0].data_type;
+    assert!(!expected.matches_schema(&tree, b"recreated-child-same-name-type", None));
+    let mut bad = definition;
+    bad.relation_occurrences[0].fields[0].data_type =
+        MvLogicalType::from_logical_type(tree).unwrap();
+    assert!(
+        build_definition(
+            bad.created_at_ms,
+            bad.query,
+            bad.relation_occurrences,
+            bad.outputs
+        )
+        .is_err()
+    );
+}
+
+fn visible_mapping_interpretation(
+    logical: novarocks_type_contract::LogicalType,
+    physical_type: novarocks_type_contract::LogicalType,
+) -> InterpretationDocument {
+    let encoded_d = encode_definition(&sample_definition()).unwrap();
+    let mut interpretation = sample_interpretation(&encoded_d);
+    interpretation.aggregates.clear();
+    interpretation.state_slots.clear();
+    interpretation.apply_key = None;
+    interpretation.branches.clear();
+    interpretation.outputs[0].data_type = MvLogicalType::from_logical_type(logical).unwrap();
+    interpretation.target.fields.retain(|field| {
+        matches!(
+            field.logical_identity,
+            PhysicalFieldLogicalIdentity::Output(_)
+        )
+    });
+    interpretation.target.fields[0].data_type = MvLogicalType::from_schema_type(
+        physical_type,
+        bytes::Bytes::from_static(b"exact-mapped-provider-binding"),
+    )
+    .unwrap();
+    interpretation
+}
+
+#[test]
+fn visible_type_mapping_preserves_original_tree_and_all_non_key_null_contracts() {
+    use arrow_schema::TimeUnit;
+    use novarocks_type_contract::{LogicalField, LogicalType as T, LogicalValue};
+    let logical = T::Struct(vec![LogicalField {
+        name: "items".into(),
+        nullable: false,
+        data_type: T::Array {
+            fixed_length: None,
+            element: Box::new(LogicalValue {
+                nullable: true,
+                data_type: T::Map {
+                    key: Box::new(LogicalValue {
+                        nullable: false,
+                        data_type: T::Utf8,
+                    }),
+                    value: Box::new(LogicalValue {
+                        nullable: false,
+                        data_type: T::Timestamp {
+                            unit: TimeUnit::Nanosecond,
+                            timezone: Some("UTC".into()),
+                        },
+                    }),
+                },
+            }),
+        },
+    }]);
+    let mut physical_type = logical.clone();
+    let T::Struct(fields) = &mut physical_type else {
+        unreachable!()
+    };
+    let T::Array { element, .. } = &mut fields[0].data_type else {
+        unreachable!()
+    };
+    let T::Map { key, value } = &mut element.data_type else {
+        unreachable!()
+    };
+    key.nullable = true;
+    value.data_type = T::Timestamp {
+        unit: TimeUnit::Nanosecond,
+        timezone: None,
+    };
+    assert!(
+        crate::persistence::validation::output_type_matches_iceberg_physical(
+            &logical,
+            &physical_type
+        )
+    );
+    let valid = visible_mapping_interpretation(logical.clone(), physical_type.clone());
+    let l = encode_interpretation(&valid).unwrap();
+    let decoded = decode_interpretation(l.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    assert_eq!(decoded.outputs[0].data_type.logical_type(), &logical);
+    assert_eq!(
+        decoded.target.fields[0].data_type.logical_type(),
+        &physical_type
+    );
+    assert_eq!(
+        encode_interpretation(&decoded).unwrap().as_bytes(),
+        l.as_bytes()
+    );
+    let T::Struct(fields) = &mut physical_type else {
+        unreachable!()
+    };
+    let T::Array { element, .. } = &mut fields[0].data_type else {
+        unreachable!()
+    };
+    let T::Map { value, .. } = &mut element.data_type else {
+        unreachable!()
+    };
+    value.nullable = true;
+    assert!(
+        !crate::persistence::validation::output_type_matches_iceberg_physical(
+            &logical,
+            &physical_type
+        )
+    );
+    assert!(
+        encode_interpretation(&visible_mapping_interpretation(logical, physical_type)).is_err()
+    );
+    for (logical, actual) in [
+        (
+            T::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: Some("Asia/Shanghai".into()),
+            },
+            T::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: None,
+            },
+        ),
+        (
+            T::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: Some("UTC".into()),
+            },
+            T::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: None,
+            },
+        ),
+        (T::Variant, T::Binary),
+        (T::Binary, T::Variant),
+        (T::Uuid, T::FixedSizeBinary(16)),
+    ] {
+        assert!(
+            !crate::persistence::validation::output_type_matches_iceberg_physical(
+                &logical, &actual
+            )
+        );
+        assert!(encode_interpretation(&visible_mapping_interpretation(logical, actual)).is_err());
+    }
+    let with_nullable_key = T::Map {
+        key: Box::new(LogicalValue {
+            nullable: true,
+            data_type: T::Utf8,
+        }),
+        value: Box::new(LogicalValue {
+            nullable: false,
+            data_type: T::Int64,
+        }),
+    };
+    let mut narrowed_key = with_nullable_key.clone();
+    let T::Map { key, .. } = &mut narrowed_key else {
+        unreachable!()
+    };
+    key.nullable = false;
+    assert!(
+        !crate::persistence::validation::output_type_matches_iceberg_physical(
+            &with_nullable_key,
+            &narrowed_key
+        )
+    );
+}
+
+#[test]
+fn variant_binary_bridge_requires_nonnullable_owned_opaque_algorithm_state() {
+    use novarocks_type_contract::LogicalType as T;
+    let d = encode_definition(&sample_definition()).unwrap();
+    let mut valid = sample_interpretation(&d);
+    let slot = valid
+        .state_slots
+        .iter_mut()
+        .find(|slot| slot.role == StateRole::AvgSum)
+        .unwrap();
+    let id = slot.slot_id.clone();
+    slot.data_type = MvLogicalType::from_logical_type(T::Variant).unwrap();
+    slot.nullable = false;
+    let field = valid
+        .target
+        .fields
+        .iter_mut()
+        .find(|field| field.logical_identity == PhysicalFieldLogicalIdentity::State(id.clone()))
+        .unwrap();
+    field.data_type = MvLogicalType::from_schema_type(
+        T::Binary,
+        bytes::Bytes::from_static(b"opaque-state-provider-id"),
+    )
+    .unwrap();
+    field.nullable = false;
+    let l = encode_interpretation(&valid).unwrap();
+    decode_interpretation(l.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    let mut nullable = valid.clone();
+    nullable
+        .state_slots
+        .iter_mut()
+        .find(|slot| slot.slot_id == id)
+        .unwrap()
+        .nullable = true;
+    nullable
+        .target
+        .fields
+        .iter_mut()
+        .find(|field| field.logical_identity == PhysicalFieldLogicalIdentity::State(id.clone()))
+        .unwrap()
+        .nullable = true;
+    assert!(encode_interpretation(&nullable).is_err());
+    let mut orphan = valid;
+    orphan.aggregates.clear();
+    assert!(encode_interpretation(&orphan).is_err());
+    assert!(encode_interpretation(&visible_mapping_interpretation(T::Variant, T::Binary)).is_err());
 }

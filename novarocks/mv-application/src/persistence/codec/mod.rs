@@ -18,7 +18,10 @@
 //! Canonical, bounded conversion between runtime values and private generated
 //! persistence DTOs. No function in this module performs I/O.
 
+pub mod logical_type;
 mod model;
+pub use logical_type::{MvLogicalType, TypeCodecError};
+
 pub(crate) mod wire;
 
 #[cfg(test)]
@@ -61,6 +64,7 @@ impl EncodedDocument {
 
 #[derive(Debug)]
 pub enum PersistenceCodecError {
+    LogicalType(TypeCodecError),
     ResourceBudget {
         resource: &'static str,
         maximum: usize,
@@ -85,6 +89,7 @@ pub enum PersistenceCodecError {
 impl std::fmt::Display for PersistenceCodecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::LogicalType(error) => error.fmt(formatter),
             Self::ResourceBudget {
                 resource,
                 maximum,
@@ -124,6 +129,12 @@ impl std::fmt::Display for PersistenceCodecError {
 }
 
 impl std::error::Error for PersistenceCodecError {}
+
+impl From<TypeCodecError> for PersistenceCodecError {
+    fn from(value: TypeCodecError) -> Self {
+        Self::LogicalType(value)
+    }
+}
 
 impl From<ValidationError> for PersistenceCodecError {
     fn from(value: ValidationError) -> Self {
@@ -451,14 +462,14 @@ fn preflight_definition_source(document: &DefinitionDocument) -> Result<(), Pers
             bytes = bytes
                 .saturating_add(field.field_id.as_bytes().len())
                 .saturating_add(field.name_at_binding.len())
-                .saturating_add(field.type_signature.len());
+                .saturating_add(field.data_type.encoded_len());
         }
     }
     for output in &document.outputs {
         bytes = bytes
             .saturating_add(output.output_id.as_bytes().len())
             .saturating_add(output.name.len())
-            .saturating_add(output.type_signature.len())
+            .saturating_add(output.data_type.encoded_len())
             .saturating_add(
                 output
                     .expression
@@ -494,13 +505,13 @@ fn preflight_interpretation_source(
         bytes = bytes
             .saturating_add(output.output_id.as_bytes().len())
             .saturating_add(output.target_field_id.as_bytes().len())
-            .saturating_add(output.type_signature.len());
+            .saturating_add(output.data_type.encoded_len());
     }
     for slot in &document.state_slots {
         bytes = bytes
             .saturating_add(slot.slot_id.as_bytes().len())
             .saturating_add(slot.target_field_id.as_bytes().len())
-            .saturating_add(slot.type_signature.len());
+            .saturating_add(slot.data_type.encoded_len());
     }
     for component in document.apply_key.iter().flat_map(|key| &key.components) {
         bytes = bytes
@@ -534,7 +545,7 @@ fn preflight_interpretation_source(
         bytes = bytes
             .saturating_add(field.logical_identity.as_bytes().len())
             .saturating_add(field.target_field_id.as_bytes().len())
-            .saturating_add(field.type_signature.len());
+            .saturating_add(field.data_type.encoded_len());
     }
     for field in &document.target.partition_fields {
         bytes = bytes
@@ -610,7 +621,7 @@ fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocume
                     .map(|field| proto::SourceFieldBinding {
                         field_id: Some(field.field_id.as_bytes().to_vec()),
                         name_at_binding: Some(field.name_at_binding.clone()),
-                        type_signature: Some(field.type_signature.clone()),
+                        type_signature: Some(field.data_type.encode_signature()),
                         nullable: Some(field.nullable),
                     })
                     .collect(),
@@ -622,7 +633,7 @@ fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocume
             .map(|output| proto::OutputDefinition {
                 output_id: Some(output.output_id.as_bytes().to_vec()),
                 name: Some(output.name.clone()),
-                type_signature: Some(output.type_signature.clone()),
+                type_signature: Some(output.data_type.encode_signature()),
                 nullable: Some(output.nullable),
                 expression: Some(proto::ExpressionShape {
                     kind: Some(match output.expression.kind {
@@ -731,10 +742,10 @@ fn relation_from_proto(
                         field.name_at_binding,
                         "definition.relation.field.name_at_binding",
                     )?,
-                    type_signature: required(
+                    data_type: MvLogicalType::decode_signature(&required(
                         field.type_signature,
                         "definition.relation.field.type_signature",
-                    )?,
+                    )?)?,
                     nullable: required(field.nullable, "definition.relation.field.nullable")?,
                 })
             })
@@ -752,7 +763,10 @@ fn output_from_proto(
             "definition.output.output_id",
         )?)?,
         name: required(value.name, "definition.output.name")?,
-        type_signature: required(value.type_signature, "definition.output.type_signature")?,
+        data_type: MvLogicalType::decode_signature(&required(
+            value.type_signature,
+            "definition.output.type_signature",
+        )?)?,
         nullable: required(value.nullable, "definition.output.nullable")?,
         expression: ExpressionShape {
             kind: enum_value(
@@ -801,7 +815,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
             .map(|value| proto::OutputBinding {
                 output_id: Some(value.output_id.as_bytes().to_vec()),
                 target_field_id: Some(value.target_field_id.as_bytes().to_vec()),
-                type_signature: Some(value.type_signature.clone()),
+                type_signature: Some(value.data_type.encode_signature()),
                 nullable: Some(value.nullable),
             })
             .collect(),
@@ -811,7 +825,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
             .map(|value| proto::StateSlot {
                 slot_id: Some(value.slot_id.as_bytes().to_vec()),
                 target_field_id: Some(value.target_field_id.as_bytes().to_vec()),
-                type_signature: Some(value.type_signature.clone()),
+                type_signature: Some(value.data_type.encode_signature()),
                 nullable: Some(value.nullable),
                 role: Some(match value.role {
                     StateRole::Single => 1,
@@ -891,7 +905,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                     }),
                     logical_id: Some(value.logical_identity.as_bytes().to_vec()),
                     target_field_id: Some(value.target_field_id.as_bytes().to_vec()),
-                    type_signature: Some(value.type_signature.clone()),
+                    type_signature: Some(value.data_type.encode_signature()),
                     nullable: Some(value.nullable),
                 })
                 .collect(),
@@ -966,10 +980,10 @@ fn interpretation_from_proto(
                         value.target_field_id,
                         "interpretation.output.target_field_id",
                     )?)?,
-                    type_signature: required(
+                    data_type: MvLogicalType::decode_signature(&required(
                         value.type_signature,
                         "interpretation.output.type_signature",
-                    )?,
+                    )?)?,
                     nullable: required(value.nullable, "interpretation.output.nullable")?,
                 })
             })
@@ -987,10 +1001,10 @@ fn interpretation_from_proto(
                         value.target_field_id,
                         "interpretation.state_slot.target_field_id",
                     )?)?,
-                    type_signature: required(
+                    data_type: MvLogicalType::decode_signature(&required(
                         value.type_signature,
                         "interpretation.state_slot.type_signature",
-                    )?,
+                    )?)?,
                     nullable: required(value.nullable, "interpretation.state_slot.nullable")?,
                     role: enum_value(value.role, "interpretation.state_slot.role", |value| {
                         Some(match value {
@@ -1139,10 +1153,10 @@ fn interpretation_from_proto(
                             value.target_field_id,
                             "interpretation.target.field.target_field_id",
                         )?)?,
-                        type_signature: required(
+                        data_type: MvLogicalType::decode_signature(&required(
                             value.type_signature,
                             "interpretation.target.field.type_signature",
-                        )?,
+                        )?)?,
                         nullable: required(value.nullable, "interpretation.target.field.nullable")?,
                     })
                 })

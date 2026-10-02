@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
+use novarocks_type_contract::{LogicalType, LogicalTypeLimits};
 
 use super::{
     ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
@@ -55,7 +56,9 @@ const MAX_MV_SOURCE_FIELD_ID_BYTES: usize = 1024;
 pub struct MvObservedSourceField {
     provider_field_id: Bytes,
     name: String,
-    type_signature: String,
+    logical_type: LogicalType,
+    legacy_scalar_type: Option<LogicalType>,
+    provider_type_binding: Bytes,
     nullable: bool,
 }
 
@@ -124,22 +127,29 @@ impl MvObservedSourceField {
     pub fn try_new(
         provider_field_id: Bytes,
         name: String,
-        type_signature: String,
+        logical_type: LogicalType,
+        legacy_scalar_type: Option<LogicalType>,
+        provider_type_binding: Bytes,
         nullable: bool,
     ) -> Result<Self, ConnectorError> {
         if provider_field_id.is_empty()
             || provider_field_id.len() > MAX_MV_SOURCE_FIELD_ID_BYTES
             || name.trim().is_empty()
-            || type_signature.trim().is_empty()
+            || provider_type_binding.is_empty()
+            || provider_type_binding.len() > 64 * 1024
         {
             return corrupt(
                 "MV source field observation has an empty or oversized identity or schema fact",
             );
         }
+        logical_type_bytes(&logical_type)?;
+        legacy_scalar_type_bytes(legacy_scalar_type.as_ref())?;
         Ok(Self {
             provider_field_id,
             name,
-            type_signature,
+            logical_type,
+            legacy_scalar_type,
+            provider_type_binding,
             nullable,
         })
     }
@@ -152,8 +162,18 @@ impl MvObservedSourceField {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn logical_type(&self) -> &LogicalType {
+        &self.logical_type
+    }
+
+    /// An exact provider projection of the historical scalar domain, when
+    /// available. This is a comparison fact, never durable type authority.
+    pub fn legacy_scalar_type(&self) -> Option<&LogicalType> {
+        self.legacy_scalar_type.as_ref()
+    }
+
+    pub fn provider_type_binding(&self) -> &Bytes {
+        &self.provider_type_binding
     }
 
     pub const fn nullable(&self) -> bool {
@@ -208,7 +228,11 @@ impl MvCreateSourceObservation {
                 FIELD_FIXED_BYTES
                     .saturating_add(field.provider_field_id().len())
                     .saturating_add(field.name().len())
-                    .saturating_add(field.type_signature().len()),
+                    .saturating_add(
+                        logical_type_bytes(field.logical_type())?
+                            .saturating_add(legacy_scalar_type_bytes(field.legacy_scalar_type())?)
+                            .saturating_add(field.provider_type_binding().len()),
+                    ),
                 context,
                 "MV CREATE source",
             )?;
@@ -244,16 +268,27 @@ impl MvCreateSourceObservation {
 pub struct MvObservedField {
     field_id: i32,
     name: String,
-    type_signature: String,
+    logical_type: LogicalType,
+    legacy_scalar_type: Option<LogicalType>,
+    provider_type_binding: Bytes,
     nullable: bool,
 }
 
 impl MvObservedField {
-    pub fn new(field_id: i32, name: String, type_signature: String, nullable: bool) -> Self {
+    pub fn new(
+        field_id: i32,
+        name: String,
+        logical_type: LogicalType,
+        legacy_scalar_type: Option<LogicalType>,
+        provider_type_binding: Bytes,
+        nullable: bool,
+    ) -> Self {
         Self {
             field_id,
             name,
-            type_signature,
+            logical_type,
+            legacy_scalar_type,
+            provider_type_binding,
             nullable,
         }
     }
@@ -266,8 +301,18 @@ impl MvObservedField {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn logical_type(&self) -> &LogicalType {
+        &self.logical_type
+    }
+
+    /// An exact provider projection of the historical scalar domain, when
+    /// available. This is a comparison fact, never durable type authority.
+    pub fn legacy_scalar_type(&self) -> Option<&LogicalType> {
+        self.legacy_scalar_type.as_ref()
+    }
+
+    pub fn provider_type_binding(&self) -> &Bytes {
+        &self.provider_type_binding
     }
 
     pub const fn nullable(&self) -> bool {
@@ -485,7 +530,11 @@ impl MvSchemaValidationObservation {
                 FIELD_FIXED_BYTES
                     .saturating_add(field.provider_field_id().len())
                     .saturating_add(field.name().len())
-                    .saturating_add(field.type_signature().len()),
+                    .saturating_add(
+                        logical_type_bytes(field.logical_type())?
+                            .saturating_add(legacy_scalar_type_bytes(field.legacy_scalar_type())?)
+                            .saturating_add(field.provider_type_binding().len()),
+                    ),
                 context,
                 "MV exact schema",
             )?;
@@ -1268,13 +1317,19 @@ fn validate_fields_and_partition(
     let mut names = HashSet::with_capacity(fields.len());
     for field in fields {
         require_non_empty(&field.name, "MV observed field name")?;
-        require_non_empty(&field.type_signature, "MV observed field type signature")?;
+        if field.provider_type_binding.is_empty() || field.provider_type_binding.len() > 64 * 1024 {
+            return corrupt("MV provider field binding is empty or oversized");
+        }
         if !ids.insert(field.field_id) || !names.insert(field.name.to_ascii_lowercase()) {
             return corrupt(format!("{subject} observation has duplicate schema fields"));
         }
         reserve(
             &mut used,
-            FIELD_FIXED_BYTES + field.name.len() + field.type_signature.len(),
+            FIELD_FIXED_BYTES
+                + field.name.len()
+                + logical_type_bytes(&field.logical_type)?
+                + legacy_scalar_type_bytes(field.legacy_scalar_type.as_ref())?
+                + field.provider_type_binding.len(),
             context,
             subject,
         )?;
@@ -1356,6 +1411,52 @@ fn corrupt<T>(message: impl Into<String>) -> Result<T, ConnectorError> {
     ))
 }
 
+/// Charge every logical node and semantic string, rather than only root fields.
+pub(crate) fn logical_type_bytes(ty: &LogicalType) -> Result<usize, ConnectorError> {
+    let usage = ty
+        .validate(LogicalTypeLimits::default())
+        .map_err(|e| ConnectorError::new(ConnectorErrorKind::CorruptData, e))?;
+    usage
+        .nodes
+        .checked_mul(128)
+        .and_then(|n| n.checked_add(usage.text_bytes))
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "MV logical type byte accounting overflow",
+            )
+        })
+}
+
+/// Validate the closed historical provider scalar grammar independently from
+/// normalized engine carriers (for example, Timestamptz does not qualify).
+pub(crate) fn legacy_scalar_type_bytes(ty: Option<&LogicalType>) -> Result<usize, ConnectorError> {
+    let Some(ty) = ty else { return Ok(0) };
+    let supported = matches!(
+        ty,
+        LogicalType::Boolean
+            | LogicalType::Int32
+            | LogicalType::Int64
+            | LogicalType::Float32
+            | LogicalType::Float64
+            | LogicalType::Utf8
+            | LogicalType::Binary
+            | LogicalType::Date32
+            | LogicalType::Decimal { bits: 128, .. }
+            | LogicalType::Timestamp {
+                unit: arrow::datatypes::TimeUnit::Microsecond,
+                timezone: None
+            }
+    );
+    if !supported {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "MV legacy scalar comparison fact is outside its closed domain",
+        ));
+    }
+    logical_type_bytes(ty)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1387,7 +1488,14 @@ mod tests {
             .expect("bounded target object ID")
     }
     fn fields() -> Vec<MvObservedField> {
-        vec![MvObservedField::new(1, "id".into(), "bigint".into(), false)]
+        vec![MvObservedField::new(
+            1,
+            "id".into(),
+            LogicalType::Int64,
+            None,
+            Bytes::from_static(b"exact-provider-field"),
+            false,
+        )]
     }
     fn partition() -> MvObservedPartitionSpec {
         MvObservedPartitionSpec::new(
@@ -1456,7 +1564,9 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"provider-field"),
             "id".into(),
-            "bigint".into(),
+            LogicalType::Int64,
+            None,
+            Bytes::from_static(b"exact-provider-field"),
             false,
         )
         .expect("source field");
@@ -1477,7 +1587,9 @@ mod tests {
             MvObservedSourceField::try_new(
                 Bytes::from(vec![id]),
                 name.to_owned(),
-                "long".into(),
+                LogicalType::Int64,
+                None,
+                Bytes::from_static(b"exact-provider-field"),
                 false,
             )
             .unwrap()
@@ -1515,7 +1627,9 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"source-field"),
             "id".into(),
-            "long".into(),
+            LogicalType::Int64,
+            None,
+            Bytes::from_static(b"exact-provider-field"),
             false,
         )
         .unwrap();
@@ -1672,5 +1786,90 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ConnectorErrorKind::CorruptData);
+    }
+    #[test]
+    fn legacy_scalar_comparison_fact_is_closed_and_charged() {
+        let field = |legacy| {
+            MvObservedSourceField::try_new(
+                Bytes::from_static(b"field"),
+                "value".into(),
+                LogicalType::Int64,
+                legacy,
+                Bytes::from(vec![1; 3800]),
+                false,
+            )
+        };
+        let observe = |field| {
+            MvCreateSourceObservation::try_new(
+                table(),
+                target_object_id(),
+                Bytes::from_static(b"schema"),
+                vec![field],
+                &context(),
+            )
+        };
+        assert!(observe(field(None).unwrap()).is_ok());
+        assert_eq!(
+            observe(field(Some(LogicalType::Int64)).unwrap())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        for unsupported in [
+            LogicalType::Int8,
+            LogicalType::Uuid,
+            LogicalType::Variant,
+            LogicalType::Timestamp {
+                unit: arrow::datatypes::TimeUnit::Nanosecond,
+                timezone: None,
+            },
+        ] {
+            assert_eq!(
+                field(Some(unsupported)).unwrap_err().kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
+    }
+
+    #[test]
+    fn create_source_charges_recursive_nodes_and_provider_binding_bytes() {
+        let ty = LogicalType::Struct(
+            (0..40)
+                .map(|i| novarocks_type_contract::LogicalField {
+                    name: format!("f{i}"),
+                    data_type: LogicalType::Int64,
+                    nullable: i % 2 == 0,
+                })
+                .collect(),
+        );
+        let field = MvObservedSourceField::try_new(
+            Bytes::from_static(b"field"),
+            "payload".into(),
+            ty,
+            None,
+            Bytes::from_static(b"exact-binding"),
+            false,
+        )
+        .unwrap();
+        let error = MvCreateSourceObservation::try_new(
+            table(),
+            target_object_id(),
+            Bytes::from_static(b"schema"),
+            vec![field],
+            &context(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert!(
+            MvObservedSourceField::try_new(
+                Bytes::from_static(b"field"),
+                "x".into(),
+                LogicalType::Int64,
+                None,
+                Bytes::new(),
+                false
+            )
+            .is_err()
+        );
     }
 }

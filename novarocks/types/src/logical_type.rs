@@ -79,10 +79,8 @@ fn preflight(
         bytes = bytes
             .checked_add(name.len())
             .ok_or("Arrow type text budget overflow")?;
-        if let Some(marker) = marker {
-            if marker.len() > 32 {
-                return Err("Arrow logical marker exceeds its byte budget".into());
-            }
+        if marker.is_some_and(|marker| marker.len() > 32) {
+            return Err("Arrow logical marker exceeds its byte budget".into());
         }
         let mut ty = data_type;
         let mut dictionary_depth = depth;

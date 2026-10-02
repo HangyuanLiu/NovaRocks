@@ -19,7 +19,7 @@
 //! Runtime handles stay in the caller. Provider identities are never decoded.
 
 use crate::mv::domain::refresh::planning::RefreshBaseRelationOccurrence;
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use novarocks_mv_application::persistence::{
     codec::{ApplyKeyKind, DefinitionDocument, ExpressionKind, SourceFieldReference, StateRole},
@@ -388,14 +388,30 @@ impl IcebergMvRewriteContext {
             self.target_arrow_schema
                 .fields()
                 .iter()
-                .map(|field| novarocks_types::schema::ColumnDef {
-                    name: field.name().clone(),
-                    data_type: field.data_type().clone(),
-                    nullable: field.is_nullable(),
-                    write_default: None,
-                    logical_type: None,
+                .map(|field| {
+                    use novarocks_types::logical_type::LogicalType;
+                    use novarocks_types::schema::SqlType;
+                    let value =
+                        novarocks_types::logical_type::logical_value_from_engine_arrow(field)?;
+                    let logical_type = match value.data_type {
+                        LogicalType::Json => Some(SqlType::Json),
+                        LogicalType::Bitmap => Some(SqlType::Bitmap),
+                        LogicalType::Hll => Some(SqlType::Hll),
+                        LogicalType::Object | LogicalType::Percentile => {
+                            return Err("SQL rewrite cannot represent the target logical domain"
+                                .to_string());
+                        }
+                        _ => None,
+                    };
+                    Ok(novarocks_types::schema::ColumnDef {
+                        name: field.name().clone(),
+                        data_type: field.data_type().clone(),
+                        nullable: field.is_nullable(),
+                        write_default: None,
+                        logical_type,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
         )?)?;
         builder.set_refresh_history(SqlImvRefreshHistoryFacts::try_new(
             self.previous_snapshot_ids.clone(),
@@ -515,7 +531,8 @@ fn validate_target_schema(
             let arrow = schema.field(ordinal);
             if usize::try_from(field.ordinal).ok() != Some(ordinal)
                 || arrow.name() != &field.name
-                || arrow.data_type() != &arrow_type_from_contract_signature(&field.type_signature)?
+                || novarocks_types::logical_type::logical_value_from_engine_arrow(arrow)?.data_type
+                    != *field.data_type.logical_type()
                 || arrow.is_nullable() != field.nullable
             {
                 return Err(
@@ -582,7 +599,7 @@ fn sql_schema_facts(
                         SqlImvBaseFieldFacts::try_new(
                             Bytes::copy_from_slice(field.field_id.as_bytes()),
                             field.name_at_binding.clone(),
-                            arrow_type_from_contract_signature(&field.type_signature)?,
+                            field.data_type.logical_type().clone(),
                             field.nullable,
                         )
                     })
@@ -624,7 +641,7 @@ fn sql_schema_facts(
             .map(|(_, state)| {
                 SqlImvAggregateStateColumnFacts::try_new(
                     state.physical.name.clone(),
-                    state.physical.type_signature.clone(),
+                    state.physical.data_type.logical_type().clone(),
                     state_role(state.role),
                 )
             })
@@ -693,7 +710,19 @@ fn validate_aggregate_analysis(
         return Err("MV rewrite aggregate outputs differ from D/L".into());
     }
     for (column, (_, field)) in runtime.visible_columns().iter().zip(&bindings.outputs) {
-        validate_physical_column(field, column.name(), column.data_type(), column.nullable())?;
+        let declared = aggregate
+            .layout
+            .physical_columns()
+            .iter()
+            .find(|declared| declared.column().name == column.name())
+            .ok_or("MV rewrite visible output has no complete physical declaration")?;
+        validate_physical_column(
+            field,
+            column.name(),
+            declared.logical_type(),
+            column.nullable(),
+            false,
+        )?;
     }
     let [apply_key] = bindings.apply_key.as_slice() else {
         return Err("MV rewrite aggregate requires one physical group row ID".into());
@@ -705,8 +734,10 @@ fn validate_aggregate_analysis(
         validate_physical_column(
             &state.physical,
             column.name(),
-            column.data_type(),
+            &novarocks_types::logical_type::logical_type_from_engine_arrow(column.data_type())?,
             column.nullable(),
+            state.encoding
+                == novarocks_mv_application::persistence::codec::StateEncoding::NativeColumnV1,
         )?;
     }
     Ok(())
@@ -787,39 +818,31 @@ fn aggregate_states_in_layout_order<'a>(
 fn validate_physical_column(
     field: &MvPhysicalFieldFacts,
     name: &str,
-    data_type: &DataType,
+    logical_type: &novarocks_types::logical_type::LogicalType,
     nullable: bool,
+    native_binary_state: bool,
 ) -> Result<(), String> {
-    let bound = arrow_type_from_contract_signature(&field.type_signature)?;
-    if field.name != name
-        || !denote_one_provider_type(&bound, data_type)
-        || field.nullable != nullable
-    {
+    use novarocks_types::logical_type::LogicalType;
+    let exact_type =
+        novarocks_mv_application::persistence::validation::output_type_matches_iceberg_physical(
+            logical_type,
+            field.data_type.logical_type(),
+        );
+    // Native aggregate state serializes opaque payloads through the existing
+    // binary carrier. This permission is supplied only by a validated L slot.
+    let state_carrier = native_binary_state
+        && !nullable
+        && matches!(
+            (logical_type, field.data_type.logical_type()),
+            (LogicalType::Variant, LogicalType::Binary)
+                | (LogicalType::Binary, LogicalType::Variant)
+        );
+    if field.name != name || !(exact_type || state_carrier) || field.nullable != nullable {
         return Err(format!(
-            "MV rewrite analyzed physical column differs from its L/provider binding: L has \
-             name={} type={} nullable={}; the analysis wants name={} type={:?} nullable={}",
-            field.name, field.type_signature, field.nullable, name, data_type, nullable
+            "MV rewrite analyzed physical column differs from its L/provider binding: field {name}"
         ));
     }
     Ok(())
-}
-
-/// Whether two Arrow types are the same provider type.
-///
-/// A contract type signature names the provider's type, and several Arrow
-/// layouts can carry one of them: Iceberg has a single `binary`, which the
-/// connector reads into either binary array width, and the aggregate state
-/// column is written as the large one. Comparing the Arrow variants exactly
-/// demands a coincidence of layouts the signature never promised, and the
-/// aggregate layout's own validators already accept either.
-fn denote_one_provider_type(left: &DataType, right: &DataType) -> bool {
-    match (left, right) {
-        (DataType::Binary | DataType::LargeBinary, DataType::Binary | DataType::LargeBinary) => {
-            true
-        }
-        (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8 | DataType::LargeUtf8) => true,
-        (left, right) => left == right,
-    }
 }
 
 fn state_role(role: StateRole) -> SqlImvAggregateStateRoleFacts {
@@ -928,48 +951,97 @@ pub fn first_union_branch_query(
     Ok(branch)
 }
 
-pub(crate) fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
-    let trimmed = type_signature.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    Ok(match lower.as_str() {
-        "boolean" | "bool" => DataType::Boolean,
-        "tinyint" => DataType::Int8,
-        "smallint" => DataType::Int16,
-        "int" | "integer" => DataType::Int32,
-        "long" | "bigint" => DataType::Int64,
-        "float" => DataType::Float32,
-        "double" => DataType::Float64,
-        "date" => DataType::Date32,
-        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "string" | "varchar" | "char" => DataType::Utf8,
-        "binary" | "varbinary" => DataType::Binary,
-        _ if lower.starts_with("decimal(") => {
-            let inner = trimmed
-                .strip_prefix("decimal(")
-                .or_else(|| trimmed.strip_prefix("DECIMAL("))
-                .and_then(|value| value.strip_suffix(')'))
-                .ok_or_else(|| format!("invalid decimal type signature `{type_signature}`"))?;
-            let mut parts = inner.split(',').map(str::trim);
-            let precision = parts
-                .next()
-                .and_then(|value| value.parse::<u8>().ok())
-                .ok_or_else(|| format!("invalid decimal precision in `{type_signature}`"))?;
-            let scale = parts
-                .next()
-                .and_then(|value| value.parse::<i8>().ok())
-                .ok_or_else(|| format!("invalid decimal scale in `{type_signature}`"))?;
-            DataType::Decimal128(precision, scale)
-        }
-        _ => {
-            return Err(format!(
-                "aggregate MV contract input type is unsupported: {type_signature}"
-            ));
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
+    #[test]
+    fn rewrite_checks_complete_logical_schema_across_dictionary_carriers() {
+        use novarocks_types::logical_type::LogicalType;
+        let projection = projection();
+        let field = MvPhysicalFieldFacts {
+            field_id: novarocks_mv_application::persistence::identity::FieldIdentity::try_new(
+                vec![1],
+            )
+            .unwrap(),
+            name: "value".into(),
+            ordinal: 0,
+            data_type:
+                novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                    LogicalType::Utf8,
+                    Bytes::from_static(b"exact-field"),
+                )
+                .unwrap(),
+            legacy_scalar_type: Some(LogicalType::Utf8),
+            nullable: true,
+        };
+        let exact = MvExactTargetSchemaFacts {
+            object_id: projection.facts.source_revision().target_object_id.clone(),
+            metadata_version: projection.facts.metadata_version().clone(),
+            schema_version: projection
+                .facts
+                .interpretation()
+                .target
+                .schema_version
+                .clone(),
+            partition_spec_version: projection
+                .facts
+                .interpretation()
+                .target
+                .partition_spec_version
+                .clone(),
+            fields: vec![field],
+            partition_fields: vec![],
+        };
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(
+                "value",
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::LargeUtf8)),
+                true,
+            ),
+        ]));
+        assert!(validate_target_schema(&schema, &exact).is_ok());
+        let json = arrow::datatypes::Field::new("value", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([("nr_logical_type".into(), "json".into())]),
+        );
+        assert!(
+            validate_target_schema(
+                &std::sync::Arc::new(arrow::datatypes::Schema::new(vec![json])),
+                &exact
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn visible_variant_is_not_an_opaque_aggregate_state_permission() {
+        use novarocks_types::logical_type::LogicalType;
+        let field = MvPhysicalFieldFacts {
+            field_id: novarocks_mv_application::persistence::identity::FieldIdentity::try_new(
+                vec![1],
+            )
+            .unwrap(),
+            name: "value".into(),
+            ordinal: 0,
+            data_type:
+                novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                    LogicalType::Binary,
+                    Bytes::from_static(b"exact-field"),
+                )
+                .unwrap(),
+            legacy_scalar_type: Some(LogicalType::Binary),
+            nullable: false,
+        };
+        assert!(
+            validate_physical_column(&field, "value", &LogicalType::Variant, false, false).is_err()
+        );
+        assert!(
+            validate_physical_column(&field, "value", &LogicalType::Variant, false, true).is_ok()
+        );
+        assert!(
+            validate_physical_column(&field, "value", &LogicalType::Variant, true, true).is_err()
+        );
+    }
+
     use super::*;
     use novarocks_mv_application::persistence::test_support::ProjectionFixture;
 
@@ -1052,6 +1124,11 @@ mod tests {
 
     #[test]
     fn timezone_signature_is_not_silently_downgraded() {
-        assert!(arrow_type_from_contract_signature("timestamptz").is_err());
+        assert!(
+            novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature(
+                "timestamptz"
+            )
+            .is_err()
+        );
     }
 }

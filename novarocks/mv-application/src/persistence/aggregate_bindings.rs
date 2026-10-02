@@ -57,7 +57,7 @@ pub struct MvCreateSourceFieldObservation {
     pub field_ordinal: u32,
     pub field_name: String,
     pub provider_field_id: Bytes,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -79,7 +79,7 @@ pub(crate) struct MvCreateTargetFieldObservation {
     pub request_ordinal: u32,
     pub physical_name: String,
     pub provider_field_id: Bytes,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -330,7 +330,11 @@ fn output_identities(
             aggregate_source_fields(output.expression().source_fields(), source_fields)?;
         let mut canonical = CanonicalBytes::new(OUTPUT_IDENTITY_DOMAIN);
         canonical.text(output.name());
-        canonical.text(&format!("{:?}", output.data_type()));
+        let output_type = crate::persistence::codec::MvLogicalType::from_logical_type(
+            output.logical_type().clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        canonical.text(&output_type.encode_signature());
         canonical.bool(output.nullable());
         canonical.text(&format!("{:?}", output.expression().kind()));
         canonical.optional_text(output.expression().function_identity());
@@ -422,7 +426,7 @@ fn target_field_map<'a>(
     let mut by_name = BTreeMap::new();
     let mut ordinals = BTreeSet::new();
     for observation in observations {
-        if observation.physical_name.is_empty() || observation.type_signature.trim().is_empty() {
+        if observation.physical_name.is_empty() || observation.data_type.validate().is_err() {
             return Err("CREATE target observation has an empty physical name or type".to_string());
         }
         let prepared = target
@@ -549,7 +553,7 @@ fn bind_state(
     let slot_id = state_slot_identity(&target_field_id, role);
     if let Some(existing) = state_slots.iter().find(|slot| slot.slot_id == slot_id) {
         if existing.target_field_id != target_field_id
-            || existing.type_signature != target.type_signature
+            || existing.data_type != target.data_type
             || existing.nullable != target.nullable
             || existing.role != role
         {
@@ -563,7 +567,10 @@ fn bind_state(
     state_slots.push(RuntimeStateSlotFacts {
         slot_id: slot_id.clone(),
         target_field_id: target_field_id.clone(),
-        type_signature: target.type_signature.clone(),
+        data_type: crate::persistence::codec::MvLogicalType::from_logical_type(
+            target.data_type.logical_type().clone(),
+        )
+        .map_err(|error| error.to_string())?,
         nullable: target.nullable,
         role,
         encoding: StateEncoding::NativeColumnV1,
@@ -571,7 +578,7 @@ fn bind_state(
     target_fields.push(RuntimePhysicalFieldFacts {
         logical_identity: PhysicalFieldLogicalIdentity::State(slot_id.clone()),
         target_field_id,
-        type_signature: target.type_signature.clone(),
+        data_type: target.data_type.clone(),
         nullable: target.nullable,
     });
     Ok(slot_id)
@@ -719,7 +726,8 @@ mod tests {
             request_ordinal: ordinal,
             physical_name: name.to_string(),
             provider_field_id: Bytes::from(vec![field_id]),
-            type_signature: "varbinary".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("varbinary")
+                .expect("valid fixture type"),
             nullable: false,
         }
     }
@@ -751,7 +759,9 @@ mod tests {
                         u32::try_from(ordinal).expect("small fixture ordinal"),
                         Bytes::from(vec![*field_id]),
                         format!("field_{ordinal}"),
-                        "varbinary".to_string(),
+                        novarocks_type_contract::LogicalType::Binary,
+                        Some(novarocks_type_contract::LogicalType::Binary),
+                        Bytes::from_static(b"opaque-provider-field"),
                         false,
                     )
                 })
@@ -982,13 +992,15 @@ mod tests {
             RuntimePhysicalFieldFacts {
                 logical_identity: PhysicalFieldLogicalIdentity::Output(output_id.clone()),
                 target_field_id: output_field.clone(),
-                type_signature: "double".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("double")
+                    .expect("valid fixture type"),
                 nullable: true,
             },
             RuntimePhysicalFieldFacts {
                 logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(apply_id.clone()),
                 target_field_id: apply_field.clone(),
-                type_signature: "binary".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("binary")
+                    .expect("valid fixture type"),
                 nullable: false,
             },
         ]);
@@ -998,7 +1010,8 @@ mod tests {
             output_bindings: vec![RuntimeOutputBindingFacts {
                 output_id,
                 target_field_id: output_field,
-                type_signature: "double".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("double")
+                    .expect("valid fixture type"),
                 nullable: true,
             }],
             aggregate_layout: RuntimeAggregateLayoutFacts {

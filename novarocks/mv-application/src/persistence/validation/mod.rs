@@ -177,10 +177,7 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
                 "definition.relation.field.name_at_binding",
                 &field.name_at_binding,
             )?;
-            nonempty_text(
-                "definition.relation.field.type_signature",
-                &field.type_signature,
-            )?;
+            validate_schema_type("definition.relation.field.data_type", &field.data_type)?;
         }
     }
 
@@ -193,7 +190,7 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
             ));
         }
         nonempty_text("definition.output.name", &output.name)?;
-        nonempty_text("definition.output.type_signature", &output.type_signature)?;
+        validate_type("definition.output.data_type", &output.data_type)?;
         match output.expression.kind {
             ExpressionKind::Function | ExpressionKind::Mixed
                 if output
@@ -257,10 +254,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
     }
     let mut outputs = BTreeMap::new();
     for output in &document.outputs {
-        nonempty_text(
-            "interpretation.output.type_signature",
-            &output.type_signature,
-        )?;
+        validate_type("interpretation.output.data_type", &output.data_type)?;
         if outputs.insert(&output.output_id, output).is_some() {
             return Err(ValidationError::new(
                 "interpretation.outputs",
@@ -271,10 +265,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
 
     let mut slots = BTreeMap::new();
     for slot in &document.state_slots {
-        nonempty_text(
-            "interpretation.state_slot.type_signature",
-            &slot.type_signature,
-        )?;
+        validate_type("interpretation.state_slot.data_type", &slot.data_type)?;
         if slots.insert(&slot.slot_id, slot).is_some() {
             return Err(ValidationError::new(
                 "interpretation.state_slots",
@@ -490,10 +481,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
 
     let mut physical = BTreeSet::new();
     for field in &document.target.fields {
-        nonempty_text(
-            "interpretation.target.field.type_signature",
-            &field.type_signature,
-        )?;
+        validate_schema_type("interpretation.target.field.data_type", &field.data_type)?;
         if !physical.insert(&field.logical_identity) {
             return Err(ValidationError::new(
                 "interpretation.target.fields",
@@ -574,8 +562,9 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             &document.target.fields,
             &logical_identity,
             &output.target_field_id,
-            &output.type_signature,
+            &output.data_type,
             output.nullable,
+            false,
         )?;
     }
     for slot in &document.state_slots {
@@ -584,8 +573,18 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             &document.target.fields,
             &logical_identity,
             &slot.target_field_id,
-            &slot.type_signature,
+            &slot.data_type,
             slot.nullable,
+            slot.encoding == crate::persistence::codec::StateEncoding::NativeColumnV1
+                && matches!(
+                    slot.role,
+                    StateRole::Single | StateRole::AvgSum | StateRole::AvgCount
+                )
+                && !slot.nullable
+                && document
+                    .aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.state_slot_ids.contains(&slot.slot_id)),
         )?;
     }
     for component in document.apply_key.iter().flat_map(|key| &key.components) {
@@ -782,7 +781,7 @@ pub fn validate_definition_interpretation(
                 "binds an output absent from the referenced definition",
             ));
         };
-        if defined.type_signature != output.type_signature || defined.nullable != output.nullable {
+        if defined.data_type != output.data_type || defined.nullable != output.nullable {
             return Err(ValidationError::new(
                 "interpretation.outputs",
                 "changes a definition output type or nullability",
@@ -940,8 +939,14 @@ pub fn validate_live_relation_binding(
                 "a bound stable field no longer exists",
             ));
         };
-        if expected_field.type_signature != actual_field.type_signature
-            || expected_field.nullable != actual_field.nullable
+        if !expected_field.data_type.matches_schema(
+            actual_field.data_type.logical_type(),
+            actual_field
+                .data_type
+                .provider_type_binding()
+                .map_or(&[], |bytes| bytes.as_ref()),
+            actual_field.data_type.legacy_scalar_type(),
+        ) || expected_field.nullable != actual_field.nullable
         {
             return Err(ValidationError::new(
                 "live_relation.fields",
@@ -965,12 +970,96 @@ pub(crate) fn verify_computation_identity(
     Ok(())
 }
 
+/// Check the declared Iceberg read/write mapping without weakening the frozen
+/// logical output or the independently verified provider schema identity.
+/// Both trees must satisfy the shared bounded type contract before recursion.
+pub fn output_type_matches_iceberg_physical(
+    logical: &novarocks_type_contract::LogicalType,
+    physical: &novarocks_type_contract::LogicalType,
+) -> bool {
+    let limits = novarocks_type_contract::LogicalTypeLimits::default();
+    logical.validate(limits).is_ok()
+        && physical.validate(limits).is_ok()
+        && logical_type_matches_iceberg_read(logical, physical, false)
+}
+
+/// Closed mappings already owned by Iceberg's exact read/write projection.
+/// Opaque aggregate state is admitted only by the caller's algorithm/role proof;
+/// it never changes visible Variant semantics or provider schema continuity.
+pub(crate) fn logical_type_matches_iceberg_read(
+    logical: &novarocks_type_contract::LogicalType,
+    physical: &novarocks_type_contract::LogicalType,
+    opaque_aggregate_state: bool,
+) -> bool {
+    use novarocks_type_contract::LogicalType as T;
+    if logical == physical {
+        return true;
+    }
+    if opaque_aggregate_state
+        && matches!(
+            (logical, physical),
+            (T::Binary, T::Variant) | (T::Variant, T::Binary)
+        )
+    {
+        return true;
+    }
+    match (logical, physical) {
+        (
+            T::Timestamp {
+                unit: expected,
+                timezone: Some(zone),
+            },
+            T::Timestamp {
+                unit: actual,
+                timezone: None,
+            },
+        ) => {
+            zone == "UTC"
+                && expected == actual
+                && matches!(
+                    expected,
+                    arrow_schema::TimeUnit::Microsecond | arrow_schema::TimeUnit::Nanosecond
+                )
+        }
+        (
+            T::Array {
+                element: left,
+                fixed_length: a,
+            },
+            T::Array {
+                element: right,
+                fixed_length: b,
+            },
+        ) => {
+            a == b
+                && left.nullable == right.nullable
+                && logical_type_matches_iceberg_read(&left.data_type, &right.data_type, false)
+        }
+        (T::Map { key: a, value: b }, T::Map { key: x, value: y }) => {
+            (a.nullable == x.nullable || (!a.nullable && x.nullable))
+                && b.nullable == y.nullable
+                && logical_type_matches_iceberg_read(&a.data_type, &x.data_type, false)
+                && logical_type_matches_iceberg_read(&b.data_type, &y.data_type, false)
+        }
+        (T::Struct(left), T::Struct(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(a, b)| {
+                    a.name == b.name
+                        && a.nullable == b.nullable
+                        && logical_type_matches_iceberg_read(&a.data_type, &b.data_type, false)
+                })
+        }
+        _ => false,
+    }
+}
+
 fn require_physical_binding(
     fields: &[crate::persistence::codec::PhysicalFieldBinding],
     logical_identity: &PhysicalFieldLogicalIdentity,
     target_field_id: &FieldIdentity,
-    type_signature: &str,
+    data_type: &crate::persistence::codec::MvLogicalType,
     nullable: bool,
+    opaque_aggregate_state: bool,
 ) -> Result<(), ValidationError> {
     let Some(binding) = fields
         .iter()
@@ -982,7 +1071,11 @@ fn require_physical_binding(
         ));
     };
     if &binding.target_field_id != target_field_id
-        || binding.type_signature != type_signature
+        || !logical_type_matches_iceberg_read(
+            data_type.logical_type(),
+            binding.data_type.logical_type(),
+            opaque_aggregate_state,
+        )
         || binding.nullable != nullable
     {
         return Err(ValidationError::new(
@@ -991,6 +1084,30 @@ fn require_physical_binding(
         ));
     }
     Ok(())
+}
+
+fn validate_schema_type(
+    path: &str,
+    data_type: &crate::persistence::codec::MvLogicalType,
+) -> Result<(), ValidationError> {
+    data_type
+        .validate_schema_type()
+        .map_err(|error| ValidationError::new(path, error.to_string()))
+}
+
+fn validate_type(
+    path: &str,
+    value: &crate::persistence::codec::MvLogicalType,
+) -> Result<(), ValidationError> {
+    if value.provider_type_binding().is_some() {
+        return Err(ValidationError::new(
+            path,
+            "computed logical type must not contain a provider schema binding",
+        ));
+    }
+    value
+        .validate()
+        .map_err(|error| ValidationError::new(path, error.to_string()))
 }
 
 fn nonempty_text(path: impl Into<String>, value: &str) -> Result<(), ValidationError> {

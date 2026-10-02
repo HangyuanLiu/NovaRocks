@@ -728,6 +728,7 @@ pub(crate) struct SqlAnalysisOutput {
     reason = "Optimizer metadata remains part of the compiler terminal until the lifecycle handoff consumes it."
 )]
 pub(crate) struct SqlOptimizedOutput {
+    pub(crate) analyzed_output_fields: Vec<arrow::datatypes::Field>,
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
     pub(crate) function_catalog: Arc<dyn SqlFunctionCatalog>,
     pub(crate) statistics: SqlStatisticsPlan,
@@ -806,14 +807,14 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(|error| error.to_string())?;
-    let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
+    let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
         &query,
         catalog.planner_table_provider(),
         &current_database,
         functions,
     )
     .map_err(|error| error.to_string())?;
-    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
+    crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis((resolved, factory))
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its
@@ -1267,6 +1268,19 @@ impl SqlCompiler {
             }
             _ => None,
         };
+        let analyzed_output_fields = crate::planner::plan_output_columns(&logical_plan)
+            .map_err(SqlCompileError::Compilation)?
+            .iter()
+            .map(|column| {
+                crate::planning::mv::analyzed_output_field(
+                    &column.name,
+                    &column.data_type,
+                    column.nullable,
+                    column.column_id,
+                    &factory,
+                )
+            })
+            .collect();
         let optimized_tree = match root_distribution {
             Some(root_distribution) => crate::optimizer::optimize_with_root_distribution(
                 optimizer_expr,
@@ -1297,6 +1311,7 @@ impl SqlCompiler {
         control.check()?;
 
         Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
+            analyzed_output_fields,
             optimized_tree,
             function_catalog,
             statistics,
@@ -2068,6 +2083,76 @@ mod tests {
             SqlMvRefreshAnalysisContext<'_>,
         ) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> =
             analyze_mv_refresh_input;
+    }
+
+    #[test]
+    fn ctas_logical_outputs_preserve_analyzer_root_proof_and_recursive_nullability() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_types::logical_type::LogicalType;
+        fn source(marked: bool) -> crate::planning::dml::DmlCtasSourcePlan {
+            let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            catalog.create_database("db").unwrap();
+            catalog
+                .register(
+                    "db",
+                    crate::planner::table::TableDef {
+                        name: "marked".into(),
+                        columns: vec![
+                            novarocks_types::schema::ColumnDef {
+                                name: "j".into(),
+                                data_type: DataType::Utf8,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: marked
+                                    .then_some(novarocks_types::schema::SqlType::Json),
+                            },
+                            novarocks_types::schema::ColumnDef {
+                                name: "items".into(),
+                                data_type: DataType::List(Arc::new(Field::new(
+                                    "item",
+                                    DataType::Int64,
+                                    false,
+                                ))),
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::planner::table::test_sql_scan_source(
+                            crate::planner::table::SqlScanKind::ConnectorRead,
+                        ),
+                    },
+                )
+                .unwrap();
+            let catalog = SqlPlannerTableSnapshot::new(&catalog);
+            let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
+            let cancellation = Arc::new(Cancellation::default());
+            let mut input = request(control(None, &cancellation));
+            input.statement = SqlStatementInput::sql("SELECT j, items FROM marked");
+            input.catalog = Some(&catalog);
+            input.functions = Some(&functions);
+            let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            let statistics = missing_table_statistics();
+            crate::planning::dml::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &statistics,
+                control(None, &cancellation),
+            ))
+            .unwrap()
+        }
+        let marked = source(true);
+        let plain = source(false);
+        let columns = marked.output_columns();
+        assert_eq!(columns[0].logical_type(), &LogicalType::Json);
+        assert_eq!(plain.output_columns()[0].logical_type(), &LogicalType::Utf8);
+        assert_eq!(columns[0].data_type, plain.output_columns()[0].data_type);
+        let LogicalType::Array { element, .. } = columns[1].logical_type() else {
+            panic!("array logical type");
+        };
+        assert!(!element.nullable);
+        assert!(columns[1].nullable);
+        assert_ne!(marked.capture_fingerprint(), plain.capture_fingerprint());
     }
 
     #[test]

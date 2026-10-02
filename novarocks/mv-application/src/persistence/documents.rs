@@ -205,6 +205,12 @@ impl From<novarocks_spi::connector::ConnectorError> for MvDocumentError {
     }
 }
 
+impl From<super::identity::IdentityError> for MvDocumentError {
+    fn from(error: super::identity::IdentityError) -> Self {
+        PersistenceCodecError::from(error).into()
+    }
+}
+
 impl From<ValidationError> for MvDocumentError {
     fn from(value: ValidationError) -> Self {
         Self::Validation(value)
@@ -525,9 +531,13 @@ impl MvCurrentDropDescriptor {
     pub fn configuration(&self) -> &ConfigurationDocument {
         &self.configuration
     }
-    pub fn is_legacy_nonaggregate(&self) -> bool {
+    pub fn requires_drop_recreate(&self) -> bool {
         self.legacy_nonaggregate
     }
+    pub fn is_legacy_nonaggregate(&self) -> bool {
+        self.requires_drop_recreate()
+    }
+
     pub fn management_dependencies(
         &self,
         runtime: novarocks_spi::connector::ConnectorControlRuntimeId,
@@ -536,8 +546,26 @@ impl MvCurrentDropDescriptor {
     }
 }
 
-/// Bounded decoding shared with the DROP-only Accelerator reader. Retired L
-/// contributes only its exact D/computation/object headers, never row semantics.
+/// Exact dependency facts for DROP. This value deliberately exposes neither a
+/// query definition nor outputs or a row interpretation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MvDropDefinitionFacts {
+    pub created_at_ms: u64,
+    pub computation_identity: super::identity::ComputationIdentity,
+    pub relation_occurrences: Vec<MvDropRelationFacts>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MvDropRelationFacts {
+    pub occurrence_id: u32,
+    pub catalog_at_binding: String,
+    pub namespace_at_binding: String,
+    pub relation_at_binding: String,
+    pub object_id: super::identity::ObjectIdentity,
+}
+
+/// Inspect the exact raw Current headers for DROP. Only the closed retired
+/// complex grammar and retired nonaggregate interpretation are admitted here.
+/// This never creates substitute child types or a query-ready projection.
 pub(crate) fn decode_drop_document_bodies(
     definition_bytes: &[u8],
     interpretation_bytes: &[u8],
@@ -546,13 +574,14 @@ pub(crate) fn decode_drop_document_bodies(
     budget: PersistenceDecodeBudget,
 ) -> Result<
     (
-        DefinitionDocument,
+        MvDropDefinitionFacts,
         ConfigurationDocument,
         bool,
         super::identity::ObjectIdentity,
     ),
     MvDocumentError,
 > {
+    use super::codec::{logical_type::TypeCodecError, require_version, required};
     use prost::Message;
     preflight_current_document_set(
         definition_bytes,
@@ -561,54 +590,377 @@ pub(crate) fn decode_drop_document_bodies(
         configuration_bytes,
         budget,
     )?;
-    let definition = decode_definition(definition_bytes, budget)?;
-    let configuration = decode_configuration(configuration_bytes, budget)?;
+    let raw_d = super::generated::DefinitionDocument::decode(definition_bytes)
+        .map_err(PersistenceCodecError::ProtobufDecode)?;
+    let raw_l = super::generated::InterpretationDocument::decode(interpretation_bytes)
+        .map_err(PersistenceCodecError::ProtobufDecode)?;
+    require_version("definition", raw_d.format_version)?;
+    require_version("interpretation", raw_l.format_version)?;
+    if raw_d.encode_to_vec() != definition_bytes || raw_l.encode_to_vec() != interpretation_bytes {
+        return Err(MvDocumentError::Contract(
+            "DROP D/L do not use canonical bytes".into(),
+        ));
+    }
     let d_revision = DocumentRevision::from_canonical_bytes(definition_bytes);
     let l_revision = DocumentRevision::from_canonical_bytes(interpretation_bytes);
-    let (legacy, object) = match decode_interpretation(interpretation_bytes, budget) {
-        Ok(interpretation) => {
-            if interpretation.definition_revision != d_revision
-                || interpretation.computation_identity != definition.computation_identity
-            {
-                return Err(MvDocumentError::Contract(
-                    "DROP L does not bind exact D".into(),
-                ));
+    let computation_identity = super::identity::ComputationIdentity::try_from_bytes(&required(
+        raw_d.computation_identity.clone(),
+        "definition.computation_identity",
+    )?)?;
+    let mut identity_d = raw_d.clone();
+    identity_d.format_version = None;
+    identity_d.computation_identity = None;
+    identity_d.created_at_ms = None;
+    if super::identity::ComputationIdentity::from_canonical_bytes(&identity_d.encode_to_vec())
+        != computation_identity
+    {
+        return Err(MvDocumentError::Contract(
+            "DROP D computation identity differs from its exact raw semantics".into(),
+        ));
+    }
+    if raw_l.definition_revision.as_deref() != Some(d_revision.as_bytes().as_slice())
+        || raw_l.computation_identity.as_deref() != Some(computation_identity.as_bytes().as_slice())
+    {
+        return Err(MvDocumentError::Contract(
+            "DROP L does not bind exact D/computation".into(),
+        ));
+    }
+    let mut retired_complex = false;
+    let mut inspect_type = |value: Option<&str>| -> Result<(), MvDocumentError> {
+        let value = value.ok_or(PersistenceCodecError::MissingField("type_signature"))?;
+        match super::codec::MvLogicalType::decode_signature(value) {
+            Ok(_) => Ok(()),
+            Err(TypeCodecError::RetiredComplex) => {
+                retired_complex = true;
+                Ok(())
             }
-            if let Some(bytes) = publication_bytes {
-                validate_document_set(
-                    &definition,
-                    d_revision,
-                    &interpretation,
-                    l_revision,
-                    &decode_publication(bytes, budget)?,
-                )?;
-            }
-            (false, interpretation.target.object_id)
+            Err(error) => Err(PersistenceCodecError::LogicalType(error).into()),
         }
-        Err(PersistenceCodecError::LegacyNonAggregateInterpretation) => {
-            let raw = super::generated::InterpretationDocument::decode(interpretation_bytes)
-                .map_err(PersistenceCodecError::ProtobufDecode)?;
-            if !raw.aggregates.is_empty()
-                || raw.encode_to_vec() != interpretation_bytes
-                || raw.definition_revision.as_deref() != Some(d_revision.as_bytes().as_slice())
-                || raw.computation_identity.as_deref()
-                    != Some(definition.computation_identity.as_bytes().as_slice())
-            {
-                return Err(MvDocumentError::Contract(
-                    "retired DROP L has invalid exact D/computation headers".into(),
-                ));
+    };
+    for occurrence in &raw_d.relation_occurrences {
+        for field in &occurrence.fields {
+            inspect_type(field.type_signature.as_deref())?;
+        }
+    }
+    for output in &raw_d.outputs {
+        inspect_type(output.type_signature.as_deref())?;
+    }
+    for output in &raw_l.outputs {
+        inspect_type(output.type_signature.as_deref())?;
+    }
+    for state in &raw_l.state_slots {
+        inspect_type(state.type_signature.as_deref())?;
+    }
+    let target = raw_l
+        .target
+        .as_ref()
+        .ok_or(PersistenceCodecError::MissingField("interpretation.target"))?;
+    for field in &target.fields {
+        inspect_type(field.type_signature.as_deref())?;
+    }
+    let object = super::identity::ObjectIdentity::try_new(required(
+        target.object_id.clone(),
+        "interpretation.target.object_id",
+    )?)?;
+    super::identity::SchemaVersion::try_new(required(
+        target.schema_version.clone(),
+        "interpretation.target.schema_version",
+    )?)?;
+    super::identity::PartitionSpecVersion::try_new(required(
+        target.partition_spec_version.clone(),
+        "interpretation.target.partition_spec_version",
+    )?)?;
+    if raw_l.outputs.is_empty()
+        || target.fields.is_empty()
+        || raw_l.state_slots.iter().any(|state| {
+            !matches!(state.role, Some(1..=4))
+                || state.encoding != Some(1)
+                || state.nullable.is_none()
+        })
+        || target
+            .fields
+            .iter()
+            .any(|field| !matches!(field.kind, Some(1..=4)) || field.nullable.is_none())
+        || raw_l.outputs.iter().any(|output| output.nullable.is_none())
+        || raw_l.apply_key.as_ref().is_some_and(|key| {
+            !matches!(key.kind, Some(1..=3)) || (key.kind == Some(3) && key.components.is_empty())
+        })
+    {
+        return Err(MvDocumentError::Contract(
+            "DROP L has unknown or incomplete interpretation facts".into(),
+        ));
+    }
+    // Physical schema payloads carry opaque identity, whereas logical outputs
+    // and states do not. Compare their semantic type; retirement spellings have
+    // no reconstructed tree and must instead match exactly.
+    let same_logical_type = |left: Option<&str>, right: Option<&str>, opaque_state: bool| -> bool {
+        let (Some(left), Some(right)) = (left, right) else {
+            return false;
+        };
+        match (
+            super::codec::MvLogicalType::decode_signature(left),
+            super::codec::MvLogicalType::decode_signature(right),
+        ) {
+            (Ok(left), Ok(right)) => super::validation::logical_type_matches_iceberg_read(
+                right.logical_type(),
+                left.logical_type(),
+                opaque_state,
+            ),
+            (Err(TypeCodecError::RetiredComplex), Err(TypeCodecError::RetiredComplex)) => {
+                left == right
             }
-            let object = super::identity::ObjectIdentity::try_new(
-                raw.target
-                    .and_then(|target| target.object_id)
-                    .ok_or_else(|| {
-                        MvDocumentError::Contract("retired DROP L has no target object".into())
-                    })?,
-            )
-            .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
-            (true, object)
+            _ => false,
+        }
+    };
+    let mut target_logical_ids = std::collections::BTreeSet::new();
+    for field in &target.fields {
+        super::identity::FieldIdentity::try_new(required(
+            field.target_field_id.clone(),
+            "interpretation.target.field.target_field_id",
+        )?)?;
+        let id = required(
+            field.logical_id.clone(),
+            "interpretation.target.field.logical_id",
+        )?;
+        if id.is_empty() || !target_logical_ids.insert((field.kind, id)) {
+            return Err(MvDocumentError::Contract(
+                "DROP L has empty or duplicate logical bindings".into(),
+            ));
+        }
+    }
+    for field in &raw_l.outputs {
+        super::identity::OutputIdentity::try_new(required(
+            field.output_id.clone(),
+            "interpretation.output.output_id",
+        )?)?;
+        super::identity::FieldIdentity::try_new(required(
+            field.target_field_id.clone(),
+            "interpretation.output.target_field_id",
+        )?)?;
+        if !target.fields.iter().any(|bound| {
+            bound.kind == Some(1)
+                && bound.logical_id == field.output_id
+                && bound.target_field_id == field.target_field_id
+                && bound.nullable == field.nullable
+                && same_logical_type(
+                    bound.type_signature.as_deref(),
+                    field.type_signature.as_deref(),
+                    false,
+                )
+        }) {
+            return Err(MvDocumentError::Contract(
+                "DROP L output differs from its exact physical binding".into(),
+            ));
+        }
+    }
+    for state in &raw_l.state_slots {
+        super::identity::StateSlotIdentity::try_new(required(
+            state.slot_id.clone(),
+            "interpretation.state_slot.slot_id",
+        )?)?;
+        super::identity::FieldIdentity::try_new(required(
+            state.target_field_id.clone(),
+            "interpretation.state_slot.target_field_id",
+        )?)?;
+        if !target.fields.iter().any(|bound| {
+            bound.kind == Some(2)
+                && bound.logical_id == state.slot_id
+                && bound.target_field_id == state.target_field_id
+                && bound.nullable == state.nullable
+                && same_logical_type(
+                    bound.type_signature.as_deref(),
+                    state.type_signature.as_deref(),
+                    matches!(state.role, Some(1..=3))
+                        && state.encoding == Some(1)
+                        && state.nullable == Some(false),
+                )
+        }) {
+            return Err(MvDocumentError::Contract(
+                "DROP L state differs from its exact physical binding".into(),
+            ));
+        }
+    }
+    if target
+        .partition_fields
+        .iter()
+        .any(|field| !matches!(field.transform, Some(1..=8)))
+    {
+        return Err(MvDocumentError::Contract(
+            "DROP L contains an unknown partition transform".into(),
+        ));
+    }
+    // Complete types still pass every ordinary semantic validator. A retired
+    // type can authorize DROP only, after exact raw header/dependency checks.
+    let legacy_nonaggregate = match decode_interpretation(interpretation_bytes, budget) {
+        Ok(_) => false,
+        Err(PersistenceCodecError::LegacyNonAggregateInterpretation) => true,
+        Err(PersistenceCodecError::LogicalType(TypeCodecError::RetiredComplex))
+            if retired_complex =>
+        {
+            false
         }
         Err(error) => return Err(error.into()),
+    };
+    if !retired_complex {
+        let definition = decode_definition(definition_bytes, budget)?;
+        if !legacy_nonaggregate {
+            let interpretation = decode_interpretation(interpretation_bytes, budget)?;
+            super::validation::validate_definition_interpretation(
+                &definition,
+                d_revision,
+                &interpretation,
+            )?;
+        } else if !raw_l.aggregates.is_empty() {
+            return Err(MvDocumentError::Contract(
+                "retired nonaggregate DROP L contains aggregates".into(),
+            ));
+        }
+    }
+    let query = raw_d
+        .query
+        .as_ref()
+        .ok_or(PersistenceCodecError::MissingField("definition.query"))?;
+    let resolution = query
+        .resolution
+        .as_ref()
+        .ok_or(PersistenceCodecError::MissingField(
+            "definition.query.resolution",
+        ))?;
+    if query.dialect != Some(1)
+        || query.effective_sql.as_deref().is_none_or(str::is_empty)
+        || resolution
+            .default_catalog
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || resolution
+            .default_namespace
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || raw_d.outputs.is_empty()
+        || raw_d.relation_occurrences.is_empty()
+    {
+        return Err(MvDocumentError::Contract(
+            "DROP D lacks its required exact definition headers".into(),
+        ));
+    }
+    let mut occurrences = Vec::with_capacity(raw_d.relation_occurrences.len());
+    let mut occurrence_ids = BTreeMap::new();
+    for occurrence in &raw_d.relation_occurrences {
+        let occurrence_id = required(
+            occurrence.occurrence_id,
+            "definition.relation.occurrence_id",
+        )?;
+        let object_id = super::identity::ObjectIdentity::try_new(required(
+            occurrence.object_id.clone(),
+            "definition.relation.object_id",
+        )?)?;
+        super::identity::SchemaVersion::try_new(required(
+            occurrence.schema_version.clone(),
+            "definition.relation.schema_version",
+        )?)?;
+        if occurrence_ids
+            .insert(occurrence_id, object_id.clone())
+            .is_some()
+            || occurrence.fields.is_empty()
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP D has missing or duplicate occurrence facts".into(),
+            ));
+        }
+        let mut fields = std::collections::BTreeSet::new();
+        for field in &occurrence.fields {
+            let id = super::identity::FieldIdentity::try_new(required(
+                field.field_id.clone(),
+                "definition.relation.field_id",
+            )?)?;
+            if !fields.insert(id)
+                || field.name_at_binding.as_deref().is_none_or(str::is_empty)
+                || field.nullable.is_none()
+            {
+                return Err(MvDocumentError::Contract(
+                    "DROP D has invalid exact source field facts".into(),
+                ));
+            }
+        }
+        if occurrence
+            .qualifier_at_binding
+            .as_deref()
+            .is_none_or(|value| value.is_empty() || value.contains('\0'))
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP D has an invalid frozen qualifier".into(),
+            ));
+        }
+        let text = |value: &Option<String>| -> Result<String, MvDocumentError> {
+            value
+                .as_ref()
+                .filter(|value| !value.is_empty() && !value.contains('\0'))
+                .cloned()
+                .ok_or_else(|| {
+                    MvDocumentError::Contract("DROP D has an invalid dependency locator".into())
+                })
+        };
+        occurrences.push(MvDropRelationFacts {
+            occurrence_id,
+            object_id,
+            catalog_at_binding: text(&occurrence.catalog_at_binding)?,
+            namespace_at_binding: text(&occurrence.namespace_at_binding)?,
+            relation_at_binding: text(&occurrence.relation_at_binding)?,
+        });
+    }
+    let mut output_ids = std::collections::BTreeSet::new();
+    for output in &raw_d.outputs {
+        let id = super::identity::OutputIdentity::try_new(required(
+            output.output_id.clone(),
+            "definition.output.output_id",
+        )?)?;
+        let expression = output
+            .expression
+            .as_ref()
+            .ok_or(PersistenceCodecError::MissingField(
+                "definition.output.expression",
+            ))?;
+        if !output_ids.insert(id)
+            || output.name.as_deref().is_none_or(str::is_empty)
+            || output.nullable.is_none()
+            || !matches!(expression.kind, Some(1..=5))
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP D has invalid exact output facts".into(),
+            ));
+        }
+        if (matches!(expression.kind, Some(4 | 5))
+            && expression
+                .function_identity
+                .as_deref()
+                .is_none_or(str::is_empty))
+            || (expression.kind == Some(2) && !expression.source_fields.is_empty())
+        {
+            return Err(MvDocumentError::Contract(
+                "DROP D has an incomplete expression declaration".into(),
+            ));
+        }
+        for reference in &expression.source_fields {
+            let occurrence = raw_d
+                .relation_occurrences
+                .iter()
+                .find(|occurrence| occurrence.occurrence_id == reference.occurrence_id);
+            if occurrence.is_none_or(|occurrence| {
+                !occurrence
+                    .fields
+                    .iter()
+                    .any(|field| field.field_id == reference.field_id)
+            }) {
+                return Err(MvDocumentError::Contract(
+                    "DROP D output references a missing exact source field".into(),
+                ));
+            }
+        }
+    }
+    let definition = MvDropDefinitionFacts {
+        created_at_ms: required(raw_d.created_at_ms, "definition.created_at_ms")?,
+        computation_identity,
+        relation_occurrences: occurrences,
     };
     if let Some(bytes) = publication_bytes {
         let publication = decode_publication(bytes, budget)?;
@@ -630,7 +982,12 @@ pub(crate) fn decode_drop_document_bodies(
             ));
         }
     }
-    Ok((definition, configuration, legacy, object))
+    Ok((
+        definition,
+        decode_configuration(configuration_bytes, budget)?,
+        legacy_nonaggregate || retired_complex,
+        object,
+    ))
 }
 
 /// Observe a sealed Current package for explicit DROP. This accepts the typed
@@ -1460,7 +1817,8 @@ mod tests {
                 fields: vec![SourceFieldBinding {
                     field_id: source_field.clone(),
                     name_at_binding: "order_id".to_string(),
-                    type_signature: "bigint".to_string(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                        .expect("valid fixture type"),
                     nullable: false,
                 }],
             }],
@@ -1468,7 +1826,8 @@ mod tests {
                 OutputDefinition {
                     output_id: output.clone(),
                     name: "order_id".to_string(),
-                    type_signature: "bigint".to_string(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                        .expect("valid fixture type"),
                     nullable: false,
                     expression: ExpressionShape {
                         kind: ExpressionKind::Field,
@@ -1482,7 +1841,8 @@ mod tests {
                 OutputDefinition {
                     output_id: apply_logical.clone(),
                     name: "tag".into(),
-                    type_signature: "bigint".into(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                        .expect("valid fixture type"),
                     nullable: false,
                     expression: ExpressionShape {
                         kind: ExpressionKind::Literal,
@@ -1501,13 +1861,15 @@ mod tests {
                 OutputBinding {
                     output_id: output.clone(),
                     target_field_id: target_output.clone(),
-                    type_signature: "bigint".to_string(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                        .expect("valid fixture type"),
                     nullable: false,
                 },
                 OutputBinding {
                     output_id: apply_logical.clone(),
                     target_field_id: target_apply.clone(),
-                    type_signature: "bigint".into(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                        .expect("valid fixture type"),
                     nullable: false,
                 },
             ],
@@ -1523,13 +1885,19 @@ mod tests {
                     PhysicalFieldBinding {
                         logical_identity: PhysicalFieldLogicalIdentity::Output(output),
                         target_field_id: target_output.clone(),
-                        type_signature: "bigint".to_string(),
+                        data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                            "bigint",
+                        )
+                        .expect("valid fixture type"),
                         nullable: false,
                     },
                     PhysicalFieldBinding {
                         logical_identity: PhysicalFieldLogicalIdentity::Output(apply_logical),
                         target_field_id: target_apply.clone(),
-                        type_signature: "bigint".to_string(),
+                        data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                            "bigint",
+                        )
+                        .expect("valid fixture type"),
                         nullable: false,
                     },
                 ],
@@ -1565,7 +1933,9 @@ mod tests {
                     0,
                     Bytes::copy_from_slice(target_output.as_bytes()),
                     "output".to_string(),
-                    "binary".to_string(),
+                    novarocks_type_contract::LogicalType::Binary,
+                    Some(novarocks_type_contract::LogicalType::Binary),
+                    Bytes::from_static(b"opaque-provider-field"),
                     false,
                 )
                 .unwrap(),
@@ -1573,7 +1943,9 @@ mod tests {
                     1,
                     Bytes::copy_from_slice(target_apply.as_bytes()),
                     "apply".to_string(),
-                    "binary".to_string(),
+                    novarocks_type_contract::LogicalType::Binary,
+                    Some(novarocks_type_contract::LogicalType::Binary),
+                    Bytes::from_static(b"opaque-provider-field"),
                     false,
                 )
                 .unwrap(),
@@ -1604,7 +1976,9 @@ mod tests {
                         ordinal,
                         field_id,
                         format!("field_{ordinal}"),
-                        "binary".to_string(),
+                        novarocks_type_contract::LogicalType::Binary,
+                        Some(novarocks_type_contract::LogicalType::Binary),
+                        Bytes::from_static(b"opaque-provider-field"),
                         false,
                     )
                 })
@@ -2032,13 +2406,15 @@ mod tests {
             PhysicalFieldBinding {
                 logical_identity: PhysicalFieldLogicalIdentity::Branch(first_branch),
                 target_field_id: shared_field_id.clone(),
-                type_signature: "bigint".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                    .expect("valid fixture type"),
                 nullable: false,
             },
             PhysicalFieldBinding {
                 logical_identity: PhysicalFieldLogicalIdentity::Branch(second_branch),
                 target_field_id: shared_field_id,
-                type_signature: "bigint".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                    .expect("valid fixture type"),
                 nullable: false,
             },
         ]);
@@ -2557,6 +2933,145 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn known_retired_complex_drop_preserves_exact_p_links_and_rejects_unknown_or_stale_headers() {
+        use prost::Message;
+        let budget = PersistenceDecodeBudget::default();
+        let mut d = super::super::generated::DefinitionDocument::decode(
+            include_bytes!("codec/fixtures/legacy-v1/definition.pb").as_slice(),
+        )
+        .unwrap();
+        let mut l = super::super::generated::InterpretationDocument::decode(
+            include_bytes!("codec/fixtures/legacy-v1/interpretation.pb").as_slice(),
+        )
+        .unwrap();
+        let mut p = decode_publication(
+            include_bytes!("codec/fixtures/legacy-v1/publication.pb"),
+            budget,
+        )
+        .unwrap();
+        let c = include_bytes!("codec/fixtures/legacy-v1/configuration.pb");
+        let output = d.outputs[0].output_id.clone();
+        d.outputs[0].type_signature = Some("list".into());
+        for binding in &mut l.outputs {
+            if binding.output_id == output {
+                binding.type_signature = Some("list".into());
+            }
+        }
+        for binding in &mut l.target.as_mut().unwrap().fields {
+            if binding.kind == Some(1) && binding.logical_id == output {
+                binding.type_signature = Some("list".into());
+            }
+        }
+        let mut semantics = d.clone();
+        semantics.format_version = None;
+        semantics.created_at_ms = None;
+        semantics.computation_identity = None;
+        let computation = super::super::identity::ComputationIdentity::from_canonical_bytes(
+            &semantics.encode_to_vec(),
+        );
+        d.computation_identity = Some(computation.as_bytes().to_vec());
+        let d_bytes = d.encode_to_vec();
+        let d_revision = DocumentRevision::from_canonical_bytes(&d_bytes);
+        l.definition_revision = Some(d_revision.as_bytes().to_vec());
+        l.computation_identity = Some(computation.as_bytes().to_vec());
+        let l_bytes = l.encode_to_vec();
+        p.definition_revision = d_revision;
+        p.interpretation_revision = DocumentRevision::from_canonical_bytes(&l_bytes);
+        let p_bytes = encode_publication(&p).unwrap();
+        assert!(matches!(
+            decode_definition(&d_bytes, budget),
+            Err(PersistenceCodecError::LogicalType(
+                super::super::codec::TypeCodecError::RetiredComplex
+            ))
+        ));
+        assert!(matches!(
+            decode_interpretation(&l_bytes, budget),
+            Err(PersistenceCodecError::LogicalType(
+                super::super::codec::TypeCodecError::RetiredComplex
+            ))
+        ));
+        let (drop, _, retired, object) =
+            decode_drop_document_bodies(&d_bytes, &l_bytes, Some(p_bytes.as_bytes()), c, budget)
+                .unwrap();
+        assert!(retired);
+        assert_eq!(drop.computation_identity, computation);
+        assert_eq!(object, p.output.object_id);
+        let mut unknown = d.clone();
+        unknown.outputs[0].type_signature = Some("list<unknown>".into());
+        assert!(
+            decode_drop_document_bodies(
+                &unknown.encode_to_vec(),
+                &l_bytes,
+                Some(p_bytes.as_bytes()),
+                c,
+                budget
+            )
+            .is_err()
+        );
+        let mut stale = l.clone();
+        stale.definition_revision = Some([0; 32].to_vec());
+        assert!(
+            decode_drop_document_bodies(
+                &d_bytes,
+                &stale.encode_to_vec(),
+                Some(p_bytes.as_bytes()),
+                c,
+                budget
+            )
+            .is_err()
+        );
+        let mut unknown_role = l;
+        unknown_role.target.as_mut().unwrap().fields[0].kind = Some(999);
+        assert!(
+            decode_drop_document_bodies(&d_bytes, &unknown_role.encode_to_vec(), None, c, budget)
+                .is_err()
+        );
+        assert!(
+            decode_drop_document_bodies(
+                &d_bytes,
+                &l_bytes,
+                Some(p_bytes.as_bytes()),
+                c,
+                PersistenceDecodeBudget {
+                    max_items: 1,
+                    ..budget
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn drop_complete_bound_schema_validates_semantics_without_equating_binding_bytes() {
+        use prost::Message;
+        let budget = PersistenceDecodeBudget::default();
+        let d_bytes = include_bytes!("codec/fixtures/legacy-v1/definition.pb");
+        let mut interpretation = decode_interpretation(
+            include_bytes!("codec/fixtures/legacy-v1/interpretation.pb"),
+            budget,
+        )
+        .unwrap();
+        for field in &mut interpretation.target.fields {
+            field.data_type = super::super::codec::MvLogicalType::from_schema_type(
+                field.data_type.logical_type().clone(),
+                Bytes::from_static(b"exact-physical-field-ids"),
+            )
+            .unwrap();
+        }
+        let l = encode_interpretation(&interpretation).unwrap();
+        let mut p = super::super::generated::PublicationDocument::decode(
+            include_bytes!("codec/fixtures/legacy-v1/publication.pb").as_slice(),
+        )
+        .unwrap();
+        p.interpretation_revision = Some(l.revision().as_bytes().to_vec());
+        let c = include_bytes!("codec/fixtures/legacy-v1/configuration.pb");
+        let (_, _, retired, _) =
+            decode_drop_document_bodies(d_bytes, l.as_bytes(), Some(&p.encode_to_vec()), c, budget)
+                .unwrap();
+        assert!(!retired);
+    }
+
     #[tokio::test]
     async fn legacy_drop_reservation_keeps_queries_closed_and_rejects_stale_completion() {
         let (lease, request) = legacy_drop_documents();

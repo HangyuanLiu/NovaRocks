@@ -166,7 +166,13 @@ mod tests {
             .expect("test field identity"),
             name: name.to_string(),
             ordinal: 0,
-            type_signature: "bigint".to_string(),
+            data_type:
+                novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                    novarocks_types::logical_type::LogicalType::Int64,
+                    bytes::Bytes::from_static(b"exact-provider-int64"),
+                )
+                .unwrap(),
+            legacy_scalar_type: Some(novarocks_types::logical_type::LogicalType::Int64),
             nullable: false,
         }
     }

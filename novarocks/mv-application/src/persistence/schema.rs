@@ -66,7 +66,8 @@ pub struct BaseSchemaSnapshot {
 pub struct BaseFieldRecord {
     pub field_id: i32,
     pub name_at_create: String,
-    pub type_signature: String,
+    #[serde(rename = "type_signature")]
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub required: bool,
 }
 
@@ -117,7 +118,8 @@ pub struct AggregateStateContract {
 pub struct AggregateStateColumnContract {
     pub column_name: String,
     pub target_field_id: i32,
-    pub type_signature: String,
+    #[serde(rename = "type_signature")]
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
     pub role: AggregateStateRoleContract,
 }
@@ -188,7 +190,8 @@ pub struct TargetContract {
 pub struct TargetVisibleColumn {
     pub output_name: String,
     pub target_field_id: i32,
-    pub type_signature: String,
+    #[serde(rename = "type_signature")]
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -630,20 +633,21 @@ fn validate_base_contract(base: &BaseContract) -> Result<(), ContractSelfCheckEr
             base.schema_id_at_create,
         ));
     }
-    let mut seen: std::collections::BTreeMap<i32, &str> = std::collections::BTreeMap::new();
+    let mut seen: std::collections::BTreeMap<i32, &crate::persistence::codec::MvLogicalType> =
+        std::collections::BTreeMap::new();
     for field in &base.schema_at_create.fields {
         if let Some(prev) = seen.get(&field.field_id) {
-            if *prev != field.type_signature.as_str() {
+            if *prev != &field.data_type {
                 return Err(
                     ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
                         field_id: field.field_id,
                         first: prev.to_string(),
-                        second: field.type_signature.clone(),
+                        second: field.data_type.encode_signature(),
                     },
                 );
             }
         } else {
-            seen.insert(field.field_id, &field.type_signature);
+            seen.insert(field.field_id, &field.data_type);
         }
     }
     Ok(())
@@ -755,7 +759,10 @@ mod tests {
                     fields: vec![BaseFieldRecord {
                         field_id: 1,
                         name_at_create: "id".to_string(),
-                        type_signature: "long".to_string(),
+                        data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                            "long",
+                        )
+                        .expect("valid fixture type"),
                         required: true,
                     }],
                 },
@@ -781,7 +788,8 @@ mod tests {
                 visible_columns: vec![TargetVisibleColumn {
                     output_name: "id".to_string(),
                     target_field_id: 1,
-                    type_signature: "long".to_string(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                        .expect("valid fixture type"),
                     nullable: false,
                 }],
                 hidden_apply_key: None,
@@ -808,7 +816,8 @@ mod tests {
             state_columns: vec![AggregateStateColumnContract {
                 column_name: "__agg_state_c".to_string(),
                 target_field_id: 3,
-                type_signature: "long".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                    .expect("valid fixture type"),
                 nullable: false,
                 role: AggregateStateRoleContract::Single,
             }],
@@ -1010,7 +1019,8 @@ mod tests {
         c.target.visible_columns.push(TargetVisibleColumn {
             output_name: "extra".to_string(),
             target_field_id: 99,
-            type_signature: "long".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                .expect("valid fixture type"),
             nullable: true,
         });
         match c.ensure_self_consistent() {
@@ -1113,7 +1123,8 @@ mod tests {
             state_columns: vec![AggregateStateColumnContract {
                 column_name: "__agg_state_c".to_string(),
                 target_field_id: 3,
-                type_signature: "long".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                    .expect("valid fixture type"),
                 nullable: false,
                 role: AggregateStateRoleContract::Single,
             }],
@@ -1151,7 +1162,8 @@ mod tests {
             state_columns: vec![AggregateStateColumnContract {
                 column_name: "__agg_state_c".to_string(),
                 target_field_id: 3,
-                type_signature: "long".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                    .expect("valid fixture type"),
                 nullable: false,
                 role: AggregateStateRoleContract::Single,
             }],
@@ -1176,7 +1188,8 @@ mod tests {
             state_columns: vec![AggregateStateColumnContract {
                 column_name: "__agg_state_c".to_string(),
                 target_field_id: 3,
-                type_signature: "long".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                    .expect("valid fixture type"),
                 nullable: false,
                 role: AggregateStateRoleContract::Single,
             }],
@@ -1297,7 +1310,8 @@ mod tests {
             .push(BaseFieldRecord {
                 field_id: 2,
                 name_at_create: "id_again".to_string(),
-                type_signature: "string".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("string")
+                    .expect("valid fixture type"),
                 required: true,
             });
         assert!(matches!(
@@ -1364,7 +1378,10 @@ mod tests {
                         fields: vec![BaseFieldRecord {
                             field_id: 1,
                             name_at_create: "id".to_string(),
-                            type_signature: "long".to_string(),
+                            data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                                "long",
+                            )
+                            .expect("valid fixture type"),
                             required: true,
                         }],
                     },
@@ -1378,7 +1395,10 @@ mod tests {
                         fields: vec![BaseFieldRecord {
                             field_id: 2,
                             name_at_create: "id".to_string(),
-                            type_signature: "long".to_string(),
+                            data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                                "long",
+                            )
+                            .expect("valid fixture type"),
                             required: true,
                         }],
                     },
@@ -1422,7 +1442,8 @@ mod tests {
                 visible_columns: vec![TargetVisibleColumn {
                     output_name: "id".to_string(),
                     target_field_id: 1,
-                    type_signature: "long".to_string(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                        .expect("valid fixture type"),
                     nullable: false,
                 }],
                 hidden_apply_key: None,

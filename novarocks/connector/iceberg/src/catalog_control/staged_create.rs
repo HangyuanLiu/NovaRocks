@@ -1815,20 +1815,24 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 fn prepared_document_field_bindings(
     metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<Vec<ConnectorPreparedCreateFieldBinding>, ConnectorError> {
+    let logical_fields = crate::schema_mapping::exact_logical_fields(metadata).map_err(corrupt)?;
     metadata
         .current_schema()
         .as_struct()
         .fields()
         .iter()
+        .zip(logical_fields)
         .enumerate()
-        .map(|(ordinal, field)| {
+        .map(|(ordinal, (field, logical))| {
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| invalid("Iceberg staged-create field ordinal exceeds u32"))?;
             ConnectorPreparedCreateFieldBinding::try_new(
                 ordinal,
                 Bytes::copy_from_slice(&field.id.to_be_bytes()),
                 field.name.clone(),
-                field.field_type.to_string(),
+                logical.data_type,
+                crate::schema_mapping::legacy_scalar_type(field),
+                crate::schema_mapping::exact_provider_type_binding(field).map_err(corrupt)?,
                 !field.required,
             )
         })

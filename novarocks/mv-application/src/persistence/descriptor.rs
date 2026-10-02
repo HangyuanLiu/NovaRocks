@@ -253,7 +253,10 @@ mod tests {
                     fields: vec![BaseFieldRecord {
                         field_id: 1,
                         name_at_create: "id".to_string(),
-                        type_signature: "long".to_string(),
+                        data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                            "long",
+                        )
+                        .expect("valid fixture type"),
                         required: true,
                     }],
                 },
@@ -279,7 +282,8 @@ mod tests {
                 visible_columns: vec![TargetVisibleColumn {
                     output_name: "id".to_string(),
                     target_field_id: 1,
-                    type_signature: "long".to_string(),
+                    data_type: crate::persistence::codec::MvLogicalType::decode_signature("long")
+                        .expect("valid fixture type"),
                     nullable: false,
                 }],
                 hidden_apply_key: None,

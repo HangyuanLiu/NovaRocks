@@ -15,25 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! CTAS schema derivation: turn a produced Arrow schema into declared table
-//! columns. Frontend DML owns CTAS routing and the durable staged-publication
-//! saga. The per-type Arrow -> SqlType mapping itself is owned by
-//! `novarocks_sql::literal`, next to its `sql_type_to_arrow_type` inverse.
+//! Exact analyzed Arrow fields to Connector CREATE facts for CTAS.
 
-use novarocks_sql::literal::arrow_data_type_to_sql_type;
-use novarocks_sql::semantic::TableColumnDef;
+use novarocks_spi::connector::ConnectorColumnDefinition;
 
-pub(crate) fn arrow_schema_to_table_column_defs(
+pub(crate) fn arrow_schema_to_connector_columns(
     schema: &arrow::datatypes::Schema,
-) -> Result<Vec<TableColumnDef>, String> {
+) -> Result<Vec<ConnectorColumnDefinition>, String> {
     schema
         .fields()
         .iter()
         .map(|field| {
-            let data_type = arrow_data_type_to_sql_type(field.data_type())?;
-            Ok(TableColumnDef {
-                name: field.name().clone(),
-                data_type,
+            Ok(ConnectorColumnDefinition {
+                name: std::sync::Arc::from(field.name().as_str()),
+                data_type: novarocks_types::logical_type::logical_value_from_engine_arrow(field)?
+                    .data_type,
                 nullable: field.is_nullable(),
                 aggregation: None,
                 default: None,
@@ -42,200 +38,169 @@ pub(crate) fn arrow_schema_to_table_column_defs(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
+    use super::arrow_schema_to_connector_columns;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use novarocks_types::logical_type::{LogicalField, LogicalType, LogicalValue};
     use std::sync::Arc;
 
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-
-    use super::arrow_schema_to_table_column_defs;
-    use novarocks_types::schema::SqlType;
-
-    // ---------- basic scalar types ----------
-
     #[test]
-    fn arrow_schema_to_table_column_defs_basic() {
+    fn ctas_preserves_recursive_required_children_and_order() {
         let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("amount", DataType::Decimal128(10, 2), true),
-        ]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert_eq!(cols.len(), 3);
-
-        assert_eq!(cols[0].name, "id");
-        assert!(
-            matches!(cols[0].data_type, SqlType::Int),
-            "expected Int, got {:?}",
-            cols[0].data_type
-        );
-        assert!(cols[0].nullable);
-        assert!(cols[0].aggregation.is_none());
-        assert!(cols[0].default.is_none());
-
-        assert_eq!(cols[1].name, "name");
-        assert!(
-            matches!(cols[1].data_type, SqlType::String),
-            "expected String, got {:?}",
-            cols[1].data_type
-        );
-
-        assert_eq!(cols[2].name, "amount");
-        assert!(
-            matches!(
-                cols[2].data_type,
-                SqlType::Decimal {
-                    precision: 10,
-                    scale: 2
-                }
+            Field::new(
+                "record",
+                DataType::Struct(
+                    vec![
+                        Field::new(
+                            "z",
+                            DataType::List(Arc::new(Field::new("element", DataType::Int64, false))),
+                            false,
+                        ),
+                        Field::new("a", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                false,
             ),
-            "expected Decimal(10,2), got {:?}",
-            cols[2].data_type
-        );
-    }
-
-    #[test]
-    fn arrow_schema_to_table_column_defs_nullability_propagated() {
-        let schema = Schema::new(vec![
-            Field::new("required_col", DataType::Int64, false),
-            Field::new("optional_col", DataType::Utf8, true),
-        ]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert!(
-            !cols[0].nullable,
-            "Int64 NOT NULL field should not be nullable"
-        );
-        assert!(cols[1].nullable, "Utf8 NULL field should be nullable");
-    }
-
-    #[test]
-    fn arrow_schema_to_table_column_defs_all_primitive_types() {
-        let schema = Schema::new(vec![
-            Field::new("b", DataType::Boolean, true),
-            Field::new("i8", DataType::Int8, true),
-            Field::new("i16", DataType::Int16, true),
-            Field::new("i32", DataType::Int32, true),
-            Field::new("i64", DataType::Int64, true),
-            Field::new("f32", DataType::Float32, true),
-            Field::new("f64", DataType::Float64, true),
-            Field::new("s", DataType::Utf8, true),
-            Field::new("ls", DataType::LargeUtf8, true),
-            Field::new("bin", DataType::Binary, true),
-            Field::new("lbin", DataType::LargeBinary, true),
-            Field::new("d", DataType::Date32, true),
-            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
-            Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
-        ]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert!(matches!(cols[0].data_type, SqlType::Boolean));
-        assert!(matches!(cols[1].data_type, SqlType::TinyInt));
-        assert!(matches!(cols[2].data_type, SqlType::SmallInt));
-        assert!(matches!(cols[3].data_type, SqlType::Int));
-        assert!(matches!(cols[4].data_type, SqlType::BigInt));
-        assert!(matches!(cols[5].data_type, SqlType::Float));
-        assert!(matches!(cols[6].data_type, SqlType::Double));
-        assert!(matches!(cols[7].data_type, SqlType::String));
-        assert!(matches!(cols[8].data_type, SqlType::String)); // LargeUtf8
-        assert!(matches!(cols[9].data_type, SqlType::Binary));
-        assert!(matches!(cols[10].data_type, SqlType::Binary)); // LargeBinary
-        assert!(matches!(cols[11].data_type, SqlType::Date));
-        assert!(matches!(cols[12].data_type, SqlType::DateTime));
-        assert!(matches!(cols[13].data_type, SqlType::Time));
-    }
-
-    // ---------- unsupported types ----------
-
-    #[test]
-    fn arrow_schema_to_table_column_defs_rejects_unsupported() {
-        let schema = Schema::new(vec![
-            Field::new("e", DataType::Float16, true), // unsupported
-        ]);
-        let err = arrow_schema_to_table_column_defs(&schema).unwrap_err();
-        assert!(
-            err.to_lowercase().contains("not supported"),
-            "expected 'not supported' in error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn arrow_schema_to_table_column_defs_rejects_interval() {
-        use arrow::datatypes::IntervalUnit;
-        let schema = Schema::new(vec![Field::new(
-            "iv",
-            DataType::Interval(IntervalUnit::DayTime),
-            true,
-        )]);
-        let err = arrow_schema_to_table_column_defs(&schema).unwrap_err();
-        assert!(
-            err.to_lowercase().contains("not supported"),
-            "expected 'not supported' in error, got: {err}"
-        );
-    }
-
-    // ---------- nested types ----------
-
-    #[test]
-    fn arrow_schema_to_table_column_defs_recurses_list() {
-        let elem = Field::new("item", DataType::Int64, true);
-        let schema = Schema::new(vec![Field::new(
-            "ids",
-            DataType::List(Arc::new(elem)),
-            true,
-        )]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert_eq!(cols.len(), 1);
-        assert!(
-            matches!(&cols[0].data_type, SqlType::Array(inner) if matches!(inner.as_ref(), SqlType::BigInt)),
-            "expected Array(BigInt), got {:?}",
-            cols[0].data_type
-        );
-    }
-
-    #[test]
-    fn arrow_schema_to_table_column_defs_recurses_struct_and_list() {
-        // Struct{a: Int32, b: Utf8}
-        let struct_field = Field::new(
-            "meta",
-            DataType::Struct(
-                vec![
-                    Field::new("a", DataType::Int32, true),
-                    Field::new("b", DataType::Utf8, true),
-                ]
-                .into(),
+            Field::new(
+                "map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Int32, false),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
             ),
-            true,
+        ]);
+        let fields = arrow_schema_to_connector_columns(&schema).unwrap();
+        assert!(!fields[0].nullable);
+        assert_eq!(
+            fields[0].data_type,
+            LogicalType::Struct(vec![
+                LogicalField {
+                    name: "z".into(),
+                    data_type: LogicalType::Array {
+                        element: Box::new(LogicalValue {
+                            data_type: LogicalType::Int64,
+                            nullable: false
+                        }),
+                        fixed_length: None
+                    },
+                    nullable: false
+                },
+                LogicalField {
+                    name: "a".into(),
+                    data_type: LogicalType::Utf8,
+                    nullable: true
+                },
+            ])
         );
-        // List<Int64>
-        let list_field = Field::new(
-            "tags",
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            true,
+        assert_eq!(
+            fields[1].data_type,
+            LogicalType::Map {
+                key: Box::new(LogicalValue {
+                    data_type: LogicalType::Utf8,
+                    nullable: false
+                }),
+                value: Box::new(LogicalValue {
+                    data_type: LogicalType::Int32,
+                    nullable: false
+                })
+            }
         );
-        let schema = Schema::new(vec![struct_field, list_field]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert_eq!(cols.len(), 2);
-
-        // Verify struct
-        let SqlType::Struct(fields) = &cols[0].data_type else {
-            panic!("expected Struct, got {:?}", cols[0].data_type);
-        };
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].0, "a");
-        assert!(matches!(fields[0].1, SqlType::Int));
-        assert_eq!(fields[1].0, "b");
-        assert!(matches!(fields[1].1, SqlType::String));
-
-        // Verify list
-        let SqlType::Array(inner) = &cols[1].data_type else {
-            panic!("expected Array, got {:?}", cols[1].data_type);
-        };
-        assert!(matches!(inner.as_ref(), SqlType::BigInt));
     }
 
+    #[test]
+    fn ctas_retains_proved_root_markers_and_time_parameters() {
+        let json = Field::new("json", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([("nr_logical_type".into(), "json".into())]),
+        );
+        let schema = Schema::new(vec![
+            json,
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("amount", DataType::Decimal256(45, 4), true),
+        ]);
+        let fields = arrow_schema_to_connector_columns(&schema).unwrap();
+        assert_eq!(fields[0].data_type, LogicalType::Json);
+        assert_eq!(
+            fields[1].data_type,
+            LogicalType::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: Some("UTC".into())
+            }
+        );
+        assert_eq!(
+            fields[2].data_type,
+            LogicalType::Decimal {
+                bits: 256,
+                precision: 45,
+                scale: 4
+            }
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|field| field.default.is_none() && field.aggregation.is_none())
+        );
+    }
+
+    #[test]
+    fn ctas_offset_dictionary_carriers_do_not_change_semantic_type() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "value",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::LargeUtf8)),
+                true,
+            ),
+            Field::new(
+                "list",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, false))),
+                false,
+            ),
+        ]);
+        let fields = arrow_schema_to_connector_columns(&schema).unwrap();
+        assert_eq!(fields[0].data_type, LogicalType::Utf8);
+        assert_eq!(
+            fields[1].data_type,
+            LogicalType::Array {
+                element: Box::new(LogicalValue {
+                    data_type: LogicalType::Utf8,
+                    nullable: false
+                }),
+                fixed_length: None
+            }
+        );
+    }
+
+    #[test]
+    fn ctas_rejects_unknown_semantics_before_create() {
+        let field = Field::new("bad", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([("nr_logical_type".into(), "unknown".into())]),
+        );
+        assert!(arrow_schema_to_connector_columns(&Schema::new(vec![field])).is_err());
+        assert!(
+            arrow_schema_to_connector_columns(&Schema::new(vec![Field::new(
+                "interval",
+                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+                true
+            )]))
+            .is_err()
+        );
+    }
     // ---------- IF NOT EXISTS parser test ----------
 
     #[test]

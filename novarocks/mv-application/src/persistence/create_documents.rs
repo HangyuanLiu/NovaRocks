@@ -117,16 +117,18 @@ pub fn build_mv_create_documents(
         )?
     };
     let mut target_fields = aggregate.target_fields;
-    target_fields.extend(
-        output_bindings
+    for output in &output_bindings {
+        let physical = target_observations
             .iter()
-            .map(|output| RuntimePhysicalFieldFacts {
-                logical_identity: PhysicalFieldLogicalIdentity::Output(output.output_id.clone()),
-                target_field_id: output.target_field_id.clone(),
-                type_signature: output.type_signature.clone(),
-                nullable: output.nullable,
-            }),
-    );
+            .find(|field| field.provider_field_id.as_ref() == output.target_field_id.as_bytes())
+            .ok_or("prepared target lacks an output physical field identity")?;
+        target_fields.push(RuntimePhysicalFieldFacts {
+            logical_identity: PhysicalFieldLogicalIdentity::Output(output.output_id.clone()),
+            target_field_id: output.target_field_id.clone(),
+            data_type: physical.data_type.clone(),
+            nullable: physical.nullable,
+        });
+    }
     target_fields.extend(apply_fields);
     if !branches.is_empty() {
         let branch_name = input.branch_column_name.ok_or_else(|| {
@@ -137,7 +139,7 @@ pub fn build_mv_create_documents(
         target_fields.extend(branches.iter().map(|branch| RuntimePhysicalFieldFacts {
             logical_identity: PhysicalFieldLogicalIdentity::Branch(branch.branch_id.clone()),
             target_field_id: id.clone(),
-            type_signature: target.type_signature.clone(),
+            data_type: target.data_type.clone(),
             nullable: target.nullable,
         }));
     }
@@ -190,7 +192,11 @@ fn target_observations(
                 request_ordinal: field.request_ordinal(),
                 physical_name: field.name().to_string(),
                 provider_field_id: field.provider_field_id().clone(),
-                type_signature: field.type_signature().to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::from_schema_type(
+                    field.logical_type().clone(),
+                    field.provider_type_binding().clone(),
+                )
+                .map_err(|error| error.to_string())?,
                 nullable: field.nullable(),
             })
         })
@@ -251,7 +257,7 @@ fn definition_relations(
                             .cloned()
                             .ok_or_else(|| "definition field is not SQL referenced".to_string())?,
                         name_at_binding: field.field_name.clone(),
-                        type_signature: field.type_signature.clone(),
+                        data_type: field.data_type.clone(),
                         nullable: field.nullable,
                     })
                 })
@@ -310,15 +316,18 @@ fn definition_outputs(
         .outputs()
         .iter()
         .map(|output| {
-            let target = target(targets, output.name())?;
+            target(targets, output.name())?;
             Ok(RuntimeOutputFacts {
                 output_id: ids
                     .get(&output.output_ordinal())
                     .cloned()
                     .ok_or_else(|| "SQL output has no semantic identity".to_string())?,
                 name: output.name().to_string(),
-                type_signature: target.type_signature.clone(),
-                nullable: target.nullable,
+                data_type: crate::persistence::codec::MvLogicalType::from_logical_type(
+                    output.logical_type().clone(),
+                )
+                .map_err(|error| error.to_string())?,
+                nullable: output.nullable(),
                 expression_kind: expression_kind(output.expression().kind()),
                 function_identity: output.expression().function_identity().map(str::to_string),
                 source_fields: references(output.expression().source_fields(), source)?,
@@ -343,8 +352,11 @@ fn output_bindings(
                     .cloned()
                     .ok_or_else(|| "SQL output has no semantic identity".to_string())?,
                 target_field_id: field_identity(target.provider_field_id.clone())?,
-                type_signature: target.type_signature.clone(),
-                nullable: target.nullable,
+                data_type: crate::persistence::codec::MvLogicalType::from_logical_type(
+                    output.logical_type().clone(),
+                )
+                .map_err(|error| error.to_string())?,
+                nullable: output.nullable(),
             })
         })
         .collect()
@@ -437,7 +449,7 @@ fn apply_key_bindings(
         vec![RuntimePhysicalFieldFacts {
             logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(logical_id),
             target_field_id,
-            type_signature: target.type_signature.clone(),
+            data_type: target.data_type.clone(),
             nullable: target.nullable,
         }],
     ))

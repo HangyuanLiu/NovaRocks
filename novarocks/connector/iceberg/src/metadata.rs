@@ -1968,7 +1968,9 @@ fn read_reference_facts(
     )
 }
 
-fn logical_type_columns(properties: &HashMap<String, String>) -> BTreeMap<String, String> {
+pub(crate) fn logical_type_columns(
+    properties: &HashMap<String, String>,
+) -> BTreeMap<String, String> {
     properties
         .iter()
         .filter_map(|(key, value)| {

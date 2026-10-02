@@ -164,7 +164,9 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 MvObservedSourceField::try_new(
                     field.provider_field_id,
                     field.name,
-                    field.type_signature,
+                    field.logical_type,
+                    field.legacy_scalar_type,
+                    field.provider_type_binding,
                     field.nullable,
                 )
             })
@@ -194,7 +196,9 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 MvObservedField::new(
                     field.field_id,
                     field.name,
-                    field.type_signature,
+                    field.logical_type,
+                    field.legacy_scalar_type,
+                    field.provider_type_binding,
                     field.nullable,
                 )
             })
@@ -228,7 +232,9 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     MvObservedSourceField::try_new(
                         field.provider_field_id,
                         field.name,
-                        field.type_signature,
+                        field.logical_type,
+                        field.legacy_scalar_type,
+                        field.provider_type_binding,
                         field.nullable,
                     )?,
                 ))

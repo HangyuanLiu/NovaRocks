@@ -152,8 +152,23 @@ pub(crate) fn bind_definition_occurrences(
                         .iter()
                         .filter(|column| column.name == field.name_at_create)
                         .collect::<Vec<_>>();
-                    if !matches!(matches.as_slice(), [column] if column.data_type == field.data_type && column.nullable == field.nullable)
-                    {
+                    let current = match matches.as_slice() {
+                        [column] => Some(
+                            novarocks_types::logical_type::logical_value_from_engine_arrow(
+                                &crate::planning::mv::engine_output_field(
+                                    &column.name,
+                                    &column.data_type,
+                                    column.nullable,
+                                    column.logical_type.clone(),
+                                ),
+                            )?,
+                        ),
+                        _ => None,
+                    };
+                    if !current.is_some_and(|current| {
+                        current.data_type == field.logical_type
+                            && current.nullable == field.nullable
+                    }) {
                         return Err(format!(
                             "IMV occurrence {} field {:?} differs from its admitted SQL schema",
                             base.occurrence_id.get(),
@@ -1253,7 +1268,8 @@ pub(crate) mod tests {
     #[test]
     fn definition_occurrence_binding_rejects_changed_schema_facts() {
         let mut snapshot = (*aggregate_mv_ctx()).clone();
-        Arc::make_mut(&mut snapshot.schema_contract).bases[0].fields[0].data_type = DataType::Int32;
+        Arc::make_mut(&mut snapshot.schema_contract).bases[0].fields[0].logical_type =
+            novarocks_types::logical_type::LogicalType::Int32;
         assert!(
             bind_definition_occurrences(&mut aggregate_plan(), &snapshot)
                 .unwrap_err()
@@ -1266,6 +1282,32 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("admitted SQL schema")
         );
+    }
+
+    #[test]
+    fn definition_occurrence_binding_rejects_same_carrier_wrong_logical_marker() {
+        fn mark_scan(plan: &mut LogicalPlanNode) {
+            if let LogicalPlanKind::Scan(scan) = &mut plan.kind {
+                scan.table.columns[0].data_type = DataType::Utf8;
+                scan.table.columns[0].logical_type = Some(novarocks_types::schema::SqlType::Json);
+            }
+            for child in &mut plan.children {
+                mark_scan(child);
+            }
+        }
+        let mut plan = aggregate_plan();
+        mark_scan(&mut plan);
+        let mut snapshot = (*aggregate_mv_ctx()).clone();
+        Arc::make_mut(&mut snapshot.schema_contract).bases[0].fields[0].logical_type =
+            novarocks_types::logical_type::LogicalType::Utf8;
+        assert!(
+            bind_definition_occurrences(&mut plan.clone(), &snapshot)
+                .unwrap_err()
+                .contains("admitted SQL schema")
+        );
+        Arc::make_mut(&mut snapshot.schema_contract).bases[0].fields[0].logical_type =
+            novarocks_types::logical_type::LogicalType::Json;
+        bind_definition_occurrences(&mut plan, &snapshot).expect("exact marker proof");
     }
 
     #[test]
@@ -1380,12 +1422,12 @@ pub(crate) mod tests {
             vec![
                 crate::compiler::mv_rewrite::SqlImvAggregateStateColumnContract {
                     column_name: "__agg_state_s".to_string(),
-                    type_signature: "binary".to_string(),
+                    logical_type: novarocks_types::logical_type::LogicalType::Binary,
                     role: crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::Single,
                 },
                 crate::compiler::mv_rewrite::SqlImvAggregateStateColumnContract {
                     column_name: "__agg_state___ivm_row_count".to_string(),
-                    type_signature: "long".to_string(),
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     role: crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::RetractionCount,
                 },
             ],

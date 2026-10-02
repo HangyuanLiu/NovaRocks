@@ -239,9 +239,14 @@ impl AnalyzerScope {
     ) {
         self.factory.borrow_mut().set_logical_type(
             id,
-            col.logical_type
-                .clone()
-                .filter(|logical| matches!(logical, novarocks_types::schema::SqlType::Json)),
+            col.logical_type.clone().filter(|logical| {
+                matches!(
+                    logical,
+                    novarocks_types::schema::SqlType::Json
+                        | novarocks_types::schema::SqlType::Bitmap
+                        | novarocks_types::schema::SqlType::Hll
+                )
+            }),
         );
         let json_list = matches!(&col.data_type, DataType::List(item)
             if novarocks_types::logical::logical_type_of_field(item) == Some(novarocks_types::logical::LogicalType::Json))

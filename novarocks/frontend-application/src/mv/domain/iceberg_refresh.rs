@@ -30,7 +30,7 @@ use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
 use crate::mv::domain::analysis::{
-    MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_table_column,
+    MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_connector_column,
     resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::mv::domain::analysis_adapter::{
@@ -125,7 +125,7 @@ use novarocks_sql::planning::mv::{
     SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, SqlMvJoinAliases, extract_join_aliases,
     mv_apply_key_source_from_column_name,
 };
-use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
+use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName};
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
 /// The explicit Core ports a refresh preparation may read while deriving its
@@ -319,7 +319,7 @@ struct IcebergMvCreatePreparation {
     /// physical request. Stateless shapes use the validated empty layout so
     /// D/L construction never invents an alternate aggregate carrier.
     aggregate_runtime_layout: novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout,
-    columns: Vec<TableColumnDef>,
+    columns: Vec<novarocks_spi::connector::ConnectorColumnDefinition>,
     partition_fields: Vec<IcebergPartitionFieldExpr>,
     target_properties: Vec<(String, String)>,
     /// The invisible staged target this statement holds between `stage_target`
@@ -605,12 +605,7 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
             crate::mv::domain::staged_create::StageMvCreateRequest {
                 planning_lease,
                 table,
-                columns: prepared
-                    .columns
-                    .iter()
-                    .map(crate::catalog_application::statement::connector_column)
-                    .collect::<Result<_, _>>()
-                    .map_err(engine_target_error)?,
+                columns: prepared.columns.clone(),
                 partitioning: prepared
                     .partition_fields
                     .iter()
@@ -1044,7 +1039,10 @@ fn prepare_iceberg_mv_create_with_ports(
     let mut columns =
         create_target_columns_from_property(&property, &canonical_select_query, &analysis)?;
     let branch_id_column_name = identity_needs_branch_id_column(&property.identity).then(|| {
-        columns.push(branch_id_table_column());
+        columns.push(
+            crate::catalog_application::statement::connector_column(&branch_id_table_column())
+                .expect("fixed branch ID declaration"),
+        );
         BRANCH_ID_COLUMN_NAME.to_string()
     });
     let expected_apply_key_field_id = apply_key_column_name
@@ -1136,13 +1134,16 @@ fn staged_target_write_fields(
         .fields()
         .iter()
         .map(|field| {
-            let data_type =
-                crate::mv::domain::rewrite::context::arrow_type_from_contract_signature(
-                    field.type_signature(),
-                )
-                .map_err(engine_target_error)?;
+            let arrow = novarocks_types::logical_type::engine_arrow_field_from_logical(
+                field.name(),
+                &novarocks_types::logical_type::LogicalValue {
+                    data_type: field.logical_type().clone(),
+                    nullable: field.nullable(),
+                },
+            )
+            .map_err(engine_target_error)?;
             Ok(novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                arrow::datatypes::Field::new(field.name(), data_type, field.nullable()),
+                arrow,
             ))
         })
         .collect()
@@ -1275,25 +1276,37 @@ fn base_table_descriptor_from_observation(
             .map(|field| BaseColumnDescriptor {
                 name: field.name.clone(),
                 data_type: DataType::Null,
-                sql_type: observed_iceberg_type_sql_head(&field.type_signature),
+                sql_type: observed_logical_type_sql_head(field.data_type.logical_type()),
                 nullable: field.nullable,
             })
             .collect(),
     }
 }
 
-fn observed_iceberg_type_sql_head(type_signature: &str) -> String {
-    let lower = type_signature.trim().to_ascii_lowercase();
-    let head = lower.split(['(', '<']).next().unwrap_or("").trim();
-    match head {
-        "long" => "BIGINT".to_string(),
-        "int" => "INT".to_string(),
-        "string" => "STRING".to_string(),
-        "decimal" => "DECIMAL".to_string(),
-        "date" => "DATE".to_string(),
-        "timestamp" | "timestamptz" => "DATETIME".to_string(),
-        other => other.to_ascii_uppercase(),
+fn observed_logical_type_sql_head(
+    data_type: &novarocks_types::logical_type::LogicalType,
+) -> String {
+    use novarocks_types::logical_type::LogicalType;
+    match data_type {
+        LogicalType::Int8 => "TINYINT",
+        LogicalType::Int16 => "SMALLINT",
+        LogicalType::Int32 => "INT",
+        LogicalType::Int64 => "BIGINT",
+        LogicalType::Boolean => "BOOLEAN",
+        LogicalType::Float32 => "FLOAT",
+        LogicalType::Float64 => "DOUBLE",
+        LogicalType::Decimal { .. } => "DECIMAL",
+        LogicalType::Utf8 => "STRING",
+        LogicalType::Binary => "BINARY",
+        LogicalType::Date32 => "DATE",
+        LogicalType::Timestamp { .. } => "DATETIME",
+        LogicalType::Array { .. } => "ARRAY",
+        LogicalType::Map { .. } => "MAP",
+        LogicalType::Struct(_) => "STRUCT",
+        LogicalType::LargeInt => "LARGEINT",
+        _ => "UNSUPPORTED",
     }
+    .to_string()
 }
 
 /// Validate a branch UNION ALL aggregate definition against one exact target
@@ -1390,12 +1403,12 @@ fn create_target_columns_from_property(
     property: &RefreshFragmentProperty,
     canonical_query: &ast::Query,
     analysis: &MvAnalysis,
-) -> Result<Vec<TableColumnDef>, String> {
+) -> Result<Vec<novarocks_spi::connector::ConnectorColumnDefinition>, String> {
     match representative_aggregate_layout(property, canonical_query, analysis)? {
         None => analysis
             .output_columns
             .iter()
-            .map(output_column_to_table_column)
+            .map(output_column_to_connector_column)
             .collect::<Result<Vec<_>, _>>(),
         Some(layout) => iceberg_aggregate_target_columns_from_layout(&layout),
     }
@@ -1892,14 +1905,22 @@ fn base_snapshot_status_for_refresh(
 
 fn iceberg_aggregate_target_columns_from_layout(
     layout: &novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
-) -> Result<Vec<TableColumnDef>, String> {
+) -> Result<Vec<novarocks_spi::connector::ConnectorColumnDefinition>, String> {
     novarocks_sql::planning::mv_aggregate_layout::validate_unique_aggregate_physical_column_names(
         layout.physical_columns(),
     )?;
     Ok(layout
         .physical_columns()
         .iter()
-        .map(|column| column.column().clone())
+        .map(
+            |column| novarocks_spi::connector::ConnectorColumnDefinition {
+                name: Arc::from(column.column().name.as_str()),
+                data_type: column.logical_type().clone(),
+                nullable: column.column().nullable,
+                aggregation: None,
+                default: None,
+            },
+        )
         .collect())
 }
 
