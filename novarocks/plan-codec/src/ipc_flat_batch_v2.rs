@@ -169,12 +169,48 @@ fn preflight(
         "IPC batch body envelope exceeded",
         work,
     )?;
+    let layout = source_layout(expected, work)?;
+    let message = verified_message_observed(metadata, verifier, work)?;
+    preflight_message(message, body, limits, layout, work)
+}
+
+fn source_layout(
+    expected: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Layout, TypeCodecError> {
     validate_field(expected, work)?;
     novarocks_type_contract::field_logical_type(expected)?;
     validate_type(expected.data_type(), work)?;
     let layout = layout(expected.data_type())?;
     work.step()?;
-    let message = verified_message_observed(metadata, verifier, work)?;
+    Ok(layout)
+}
+
+/// The stream owner has already verified this borrowed Message and checked
+/// metadata admission. Reuse that exact parse, without a second opaque call.
+pub(crate) fn preflight_verified_flat_record_batch(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &Field,
+    limits: FlatBatchProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    require(
+        body.len() <= limits.max_body_bytes,
+        "IPC batch body envelope exceeded",
+        work,
+    )?;
+    let layout = source_layout(expected, work)?;
+    preflight_message(message, body, limits, layout, work)
+}
+
+fn preflight_message(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    limits: FlatBatchProjectionLimits,
+    layout: Layout,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
     require(
         message.version() == arrow::ipc::MetadataVersion::V5
             && message.header_type() == arrow::ipc::MessageHeader::RecordBatch

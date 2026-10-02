@@ -1084,3 +1084,48 @@ fn present_empty_schema_message_metadata_and_features_have_no_properties() {
         0..baseline.len(),
     );
 }
+
+#[test]
+fn decode_metadata_byte_cap_does_not_require_encoder_backing_reservation() {
+    let expected = Field::new("s", DataType::Int32, true);
+    let bytes = encode_single_field_schema(&expected, envelope(), &Control::good()).unwrap();
+    let exact = IpcSchemaProjectionLimits {
+        max_flatbuffer_bytes: bytes.len(),
+        ..envelope()
+    };
+    // The writer needs a conservative builder backing cover larger than its
+    // finished message. Decode has no builder and admits the actual extent.
+    assert!(matches!(
+        encode_single_field_schema(&expected, exact, &Control::good()),
+        Err(TypeCodecError::InvalidShape(_))
+    ));
+    let control = Control::good();
+    verify_single_field_schema_message(&bytes, &expected, exact, &verifier(), &control).unwrap();
+    let baseline = control.trace();
+    assert_prefixes(
+        &bytes,
+        &expected,
+        exact,
+        &verifier(),
+        &baseline,
+        0..baseline.len(),
+    );
+    let over = IpcSchemaProjectionLimits {
+        max_flatbuffer_bytes: bytes.len() - 1,
+        ..exact
+    };
+    let control = Control::good();
+    assert!(matches!(
+        verify_single_field_schema_message(&bytes, &expected, over, &verifier(), &control),
+        Err(TypeCodecError::InvalidShape(_))
+    ));
+    let baseline = control.trace();
+    assert_prefixes(
+        &bytes,
+        &expected,
+        over,
+        &verifier(),
+        &baseline,
+        0..baseline.len(),
+    );
+}

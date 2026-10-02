@@ -136,11 +136,11 @@ impl Counts {
     }
 }
 
-fn preflight(
+fn preflight_source(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<SchemaPreflight, TypeCodecError> {
+) -> Result<Counts, TypeCodecError> {
     validate_field(field, work)?;
     novarocks_type_contract::field_logical_type(field)?;
     validate_type(field.data_type(), work)?;
@@ -173,6 +173,15 @@ fn preflight(
         }
         Ok(())
     })?;
+    Ok(counts)
+}
+
+fn preflight_writer(
+    field: &Field,
+    limits: IpcSchemaProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaPreflight, TypeCodecError> {
+    let counts = preflight_source(field, limits, work)?;
     let backing = counts.backing_upper()?;
     if backing > limits.max_flatbuffer_bytes || backing >= (1usize << 31) {
         return Err(TypeCodecError::InvalidShape(
@@ -196,7 +205,7 @@ pub fn encode_single_field_schema(
 ) -> Result<Vec<u8>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
-        let facts = preflight(field, limits, &mut work)?;
+        let facts = preflight_writer(field, limits, &mut work)?;
         let capacity = facts.backing;
         work.flush()?;
         let mut backing = Vec::new();
@@ -284,20 +293,32 @@ pub fn verify_single_field_schema_message(
     control: &dyn PureCompileControl,
 ) -> Result<(), TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = (|| {
-        if metadata.len() > limits.max_flatbuffer_bytes {
-            return Err(TypeCodecError::InvalidShape(
-                "IPC schema metadata envelope exceeded",
-            ));
-        }
-        preflight(expected, limits, &mut work)?;
-        verify_message(metadata, expected, verifier, &mut work)
-    })();
+    let result =
+        verify_single_field_schema_with_work(metadata, expected, limits, verifier, &mut work);
     if matches!(&result, Err(TypeCodecError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
+}
+
+pub(crate) fn verify_single_field_schema_with_work(
+    metadata: &[u8],
+    expected: &Field,
+    limits: IpcSchemaProjectionLimits,
+    verifier: &novarocks_arrow_ipc_frame::VerifierOptions,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if metadata.len() > limits.max_flatbuffer_bytes {
+        return Err(TypeCodecError::InvalidShape(
+            "IPC schema metadata envelope exceeded",
+        ));
+    }
+    // Decode owns no FlatBufferBuilder. Its byte cap applies to the actual
+    // borrowed metadata, independently of the encoder's conservative backing
+    // cover. Reuse only common source grammar/count/string admission here.
+    preflight_source(expected, limits, work)?;
+    verify_message(metadata, expected, verifier, work)
 }
 
 #[cfg(test)]
