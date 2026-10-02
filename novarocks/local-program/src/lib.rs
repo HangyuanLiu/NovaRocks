@@ -59,9 +59,9 @@ pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,
     LocalProgram, LocalProgramError, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
-    MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramNode, ProgramNodeKind, ProjectExpressionSlot,
-    RowAssertion, SetOpKind, SortExpression, SortTopNType, StaticAggregateCall,
-    StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
+    MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramCompileError, ProgramNode, ProgramNodeKind,
+    ProjectExpressionSlot, RowAssertion, SetOpKind, SortExpression, SortTopNType,
+    StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
     StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
     UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
     WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
@@ -80,8 +80,10 @@ pub use runtime_filter::{
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
-    StaticSinkError, StaticSinkProgram, StaticStreamBranch,
+    SinkCompileError, StaticSinkError, StaticSinkProgram, StaticStreamBranch,
 };
 pub use typed_channels::*;
 pub use typed_expressions::*;
-pub use values::{MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesError};
+pub use values::{
+    MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesError, ValuesCompileError,
+};

@@ -27,12 +27,16 @@ use std::time::Duration;
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::{ConnectorRowMutationEffect, WriteTargetOrdinal};
 use novarocks_functions::ResolvedAggregateSignature;
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use novarocks_types::SlotId;
 
 use crate::{
-    BindingRequirement, BindingRequirements, CompileProfile, ImmutableExpressions, ProgramExprId,
-    ProgramNodeId, ScanSourceKind, StaticConnectorScan, StaticFieldSchema, StaticFilterConsumer,
-    StaticFilterProducer, StaticLayout, StaticSinkProgram, StaticValues,
+    BindingRequirement, BindingRequirements, CompileProfile, ImmutableExpressions,
+    LayoutCompileError, ProgramExprId, ProgramNodeId, ScanSourceKind, SinkCompileError,
+    StaticConnectorScan, StaticFieldSchema, StaticFilterConsumer, StaticFilterProducer,
+    StaticLayout, StaticSinkProgram, StaticValues,
 };
 
 /// Matches the native task-codec preflight, which runs before protobuf decode.
@@ -505,9 +509,12 @@ pub enum ProgramNodeKind {
 }
 
 impl ProgramNodeKind {
-    fn children(&self) -> Vec<ProgramNodeId> {
+    fn try_for_each_child<E>(
+        &self,
+        mut visit: impl FnMut(ProgramNodeId) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
-            Self::Values { .. } | Self::Scan { .. } | Self::ExchangeSource { .. } => Vec::new(),
+            Self::Values { .. } | Self::Scan { .. } | Self::ExchangeSource { .. } => {}
             Self::AssertNumRows { input, .. }
             | Self::Project { input, .. }
             | Self::Unpivot { input, .. }
@@ -520,17 +527,27 @@ impl ProgramNodeKind {
             | Self::Aggregate { input, .. }
             | Self::Analytic { input, .. }
             | Self::RuntimeFilterConsumer { input, .. }
-            | Self::TableWriter { input, .. } => vec![*input],
+            | Self::TableWriter { input, .. } => visit(*input)?,
             Self::UnionAll { inputs }
             | Self::SetOp { inputs, .. }
-            | Self::TableFinish { inputs, .. } => inputs.clone(),
+            | Self::TableFinish { inputs, .. } => {
+                for child in inputs {
+                    visit(*child)?;
+                }
+            }
             Self::Join { left, right, .. } | Self::NestedLoopJoin { left, right, .. } => {
-                vec![*left, *right]
+                visit(*left)?;
+                visit(*right)?;
             }
         }
+        Ok(())
     }
-
-    fn expression_ids(&self) -> Vec<ProgramExprId> {
+    // None observes a real container/constant/assignment inspection that emits
+    // no expression edge; wide empty containers still perform bounded work.
+    fn try_for_each_expression<E>(
+        &self,
+        mut visit: impl FnMut(Option<ProgramExprId>) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
             Self::Values { .. }
             | Self::AssertNumRows { .. }
@@ -538,114 +555,149 @@ impl ProgramNodeKind {
             | Self::UnionAll { .. }
             | Self::Limit { .. }
             | Self::TableFunction { .. }
-            | Self::SetOp { .. } => Vec::new(),
-            Self::Project { exprs, .. } => exprs.clone(),
-            Self::Unpivot { value_mappings, .. } => value_mappings
-                .iter()
-                .flat_map(|mapping| &mapping.constants)
-                .filter_map(|value| match value {
-                    UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
-                    _ => None,
-                })
-                .collect(),
-            Self::Filter { predicate, .. } => vec![*predicate],
+            | Self::SetOp { .. }
+            | Self::TableWriter { .. } => {}
+            Self::Project { exprs, .. } => {
+                for id in exprs {
+                    visit(Some(*id))?;
+                }
+            }
+            Self::Unpivot { value_mappings, .. } => {
+                for mapping in value_mappings {
+                    visit(None)?;
+                    for value in &mapping.constants {
+                        visit(match value {
+                            UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
+                            _ => None,
+                        })?;
+                    }
+                }
+            }
+            Self::Filter { predicate, .. } => visit(Some(*predicate))?,
             Self::Scan {
                 runtime_filters,
                 conjunct_predicate,
                 ..
-            } => conjunct_predicate
-                .iter()
-                .copied()
-                .chain(runtime_filters.iter().map(|binding| binding.expr_id))
-                .collect(),
+            } => {
+                if let Some(id) = conjunct_predicate {
+                    visit(Some(*id))?;
+                }
+                for binding in runtime_filters {
+                    visit(Some(binding.expr_id))?;
+                }
+            }
             Self::ExchangeSource {
                 runtime_filters,
                 hash_partition_exprs,
                 ..
-            } => hash_partition_exprs
-                .iter()
-                .copied()
-                .chain(runtime_filters.iter().map(|binding| binding.expr_id))
-                .collect(),
+            } => {
+                for id in hash_partition_exprs {
+                    visit(Some(*id))?;
+                }
+                for binding in runtime_filters {
+                    visit(Some(binding.expr_id))?;
+                }
+            }
             Self::Aggregate {
                 group_by,
                 functions,
                 topn_filters,
                 ..
-            } => group_by
-                .iter()
-                .copied()
-                .chain(
-                    functions
-                        .iter()
-                        .flat_map(|function| function.inputs.iter().copied()),
-                )
-                .chain(topn_filters.iter().map(|filter| filter.group_key_expr))
-                .collect(),
+            } => {
+                for id in group_by {
+                    visit(Some(*id))?;
+                }
+                for function in functions {
+                    visit(None)?;
+                    for id in &function.inputs {
+                        visit(Some(*id))?;
+                    }
+                }
+                for filter in topn_filters {
+                    visit(Some(filter.group_key_expr))?;
+                }
+            }
             Self::Join {
                 probe_keys,
                 build_keys,
                 residual_predicate,
                 runtime_filters,
                 ..
-            } => probe_keys
-                .iter()
-                .chain(build_keys)
-                .copied()
-                .chain(residual_predicate.iter().copied())
-                .chain(runtime_filters.iter().map(|filter| filter.expr_id))
-                .collect(),
-            Self::NestedLoopJoin { join_conjunct, .. } => join_conjunct.iter().copied().collect(),
+            } => {
+                for id in probe_keys
+                    .iter()
+                    .chain(build_keys)
+                    .chain(residual_predicate)
+                {
+                    visit(Some(*id))?;
+                }
+                for filter in runtime_filters {
+                    visit(Some(filter.expr_id))?;
+                }
+            }
+            Self::NestedLoopJoin { join_conjunct, .. } => {
+                if let Some(id) = join_conjunct {
+                    visit(Some(*id))?;
+                }
+            }
             Self::Analytic {
                 partition_exprs,
                 order_by_exprs,
                 functions,
                 ..
-            } => partition_exprs
-                .iter()
-                .chain(order_by_exprs)
-                .copied()
-                .chain(
-                    functions
-                        .iter()
-                        .flat_map(|function| function.args.iter().copied()),
-                )
-                .collect(),
-            Self::RuntimeFilterConsumer { bindings, .. } => {
-                bindings.iter().map(|binding| binding.expr_id).collect()
+            } => {
+                for id in partition_exprs.iter().chain(order_by_exprs) {
+                    visit(Some(*id))?;
+                }
+                for function in functions {
+                    visit(None)?;
+                    for id in &function.args {
+                        visit(Some(*id))?;
+                    }
+                }
             }
-            Self::TableWriter { .. } => Vec::new(),
+            Self::RuntimeFilterConsumer { bindings, .. } => {
+                for binding in bindings {
+                    visit(Some(binding.expr_id))?;
+                }
+            }
             Self::TableFinish {
                 final_aggregates, ..
-            } => final_aggregates
-                .unpivot
-                .iter()
-                .flat_map(|unpivot| &unpivot.mappings)
-                .flat_map(|mapping| &mapping.constants)
-                .filter_map(|value| match value {
-                    UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
-                    _ => None,
-                })
-                .collect(),
-            Self::ChangeEventExpand { events, .. } => events
-                .iter()
-                .flat_map(|event| {
-                    event
-                        .predicate
-                        .into_iter()
-                        .chain(event.assignments.iter().filter_map(|output| output.expr))
-                })
-                .collect(),
+            } => {
+                if let Some(unpivot) = &final_aggregates.unpivot {
+                    for mapping in &unpivot.mappings {
+                        visit(None)?;
+                        for value in &mapping.constants {
+                            visit(match value {
+                                UnpivotConstant::Scalar { expr_id, .. } => Some(*expr_id),
+                                _ => None,
+                            })?;
+                        }
+                    }
+                }
+            }
+            Self::ChangeEventExpand { events, .. } => {
+                for event in events {
+                    visit(None)?;
+                    if let Some(id) = event.predicate {
+                        visit(Some(id))?;
+                    }
+                    for assignment in &event.assignments {
+                        visit(assignment.expr)?;
+                    }
+                }
+            }
             Self::Sort {
                 order_by,
                 partition_exprs,
                 ..
-            } => order_by
-                .iter()
-                .chain(partition_exprs)
-                .map(|sort| sort.expr)
-                .collect(),
+            } => {
+                for sort in order_by.iter().chain(partition_exprs) {
+                    visit(Some(sort.expr))?;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -714,6 +766,130 @@ impl fmt::Display for LocalProgramError {
 
 impl std::error::Error for LocalProgramError {}
 
+/// A graph compilation failure preserves the original request-control cause.
+/// No control capability or allocation grant enters the completed graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramCompileError {
+    Program(LocalProgramError),
+    Control(CompileControlError),
+}
+impl From<LocalProgramError> for ProgramCompileError {
+    fn from(error: LocalProgramError) -> Self {
+        Self::Program(error)
+    }
+}
+impl From<CompileControlError> for ProgramCompileError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl fmt::Display for ProgramCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Program(error) => error.fmt(formatter),
+            Self::Control(error) => error.fmt(formatter),
+        }
+    }
+}
+impl std::error::Error for ProgramCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Program(error) => Some(error),
+            Self::Control(error) => Some(error),
+        }
+    }
+}
+struct ProgramWork<'a>(Option<CompileCheckpoints<'a>>);
+impl ProgramWork<'_> {
+    fn step(&mut self) -> Result<(), ProgramCompileError> {
+        if let Some(work) = &mut self.0 {
+            work.step()?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), ProgramCompileError> {
+        if let Some(work) = &mut self.0 {
+            work.flush()?;
+        }
+        Ok(())
+    }
+    // Only external header comparison and Arc allocation are opaque here.
+    // Own graph traversal is observed inside its actual loops below.
+    fn opaque<T>(&mut self, operation: impl FnOnce() -> T) -> Result<T, ProgramCompileError> {
+        self.flush()?;
+        let result = operation();
+        self.flush()?;
+        Ok(result)
+    }
+    fn identity(
+        &mut self,
+        layout: &StaticLayout,
+        ordinary: LocalProgramError,
+    ) -> Result<crate::LayoutIdentity, ProgramCompileError> {
+        self.flush()?;
+        let result = if let Some(work) = &self.0 {
+            layout
+                .identity_for_compile(work.control())
+                .map_err(|error| match error {
+                    LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
+                    LayoutCompileError::Layout(_) => ProgramCompileError::Program(ordinary),
+                })
+        } else {
+            layout.identity().map_err(|_| ordinary.into())
+        };
+        if matches!(&result, Err(ProgramCompileError::Control(_))) {
+            return result;
+        }
+        self.flush()?;
+        result
+    }
+    fn project(
+        &mut self,
+        layout: &StaticLayout,
+        columns: &[SlotId],
+    ) -> Result<StaticLayout, ProgramCompileError> {
+        self.flush()?;
+        let result = if let Some(work) = &self.0 {
+            layout
+                .project_by_slots_for_compile(columns, work.control())
+                .map_err(|error| match error {
+                    LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
+                    LayoutCompileError::Layout(_) => {
+                        ProgramCompileError::Program(LocalProgramError::InvalidSink)
+                    }
+                })
+        } else {
+            layout
+                .project_by_slots(columns)
+                .map_err(|_| LocalProgramError::InvalidSink.into())
+        };
+        if matches!(&result, Err(ProgramCompileError::Control(_))) {
+            return result;
+        }
+        self.flush()?;
+        result
+    }
+    fn sink(&mut self, sink: &StaticSinkProgram) -> Result<(), ProgramCompileError> {
+        self.flush()?;
+        let result = if let Some(work) = &self.0 {
+            sink.validate_for_compile(work.control())
+                .map_err(|error| match error {
+                    SinkCompileError::Control(cause) => ProgramCompileError::Control(cause),
+                    SinkCompileError::Sink(_) => {
+                        ProgramCompileError::Program(LocalProgramError::InvalidSink)
+                    }
+                })
+        } else {
+            sink.validate()
+                .map_err(|_| LocalProgramError::InvalidSink.into())
+        };
+        if matches!(&result, Err(ProgramCompileError::Control(_))) {
+            return result;
+        }
+        self.flush()?;
+        result
+    }
+}
 impl LocalProgram {
     pub fn try_new(
         nodes: Vec<ProgramNode>,
@@ -724,7 +900,6 @@ impl LocalProgram {
     ) -> Result<Self, LocalProgramError> {
         Self::try_new_with_sink(nodes, root, expressions, profile, requirements, None)
     }
-
     pub fn try_new_with_sink(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
@@ -733,83 +908,178 @@ impl LocalProgram {
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
     ) -> Result<Self, LocalProgramError> {
-        if profile.kernel_abi() != crate::KernelAbiVersion::CURRENT {
-            return Err(LocalProgramError::UnsupportedKernelAbi);
+        match Self::try_new_core(
+            nodes,
+            root,
+            expressions,
+            profile,
+            requirements,
+            sink,
+            &mut ProgramWork(None),
+        ) {
+            Ok(program) => Ok(program),
+            Err(ProgramCompileError::Program(error)) => Err(error),
+            Err(ProgramCompileError::Control(_)) => {
+                unreachable!("legacy graph has no compile observer")
+            }
         }
-        if nodes.is_empty() {
-            return Err(LocalProgramError::Empty);
+    }
+    pub fn try_new_for_compile(
+        nodes: Vec<ProgramNode>,
+        root: ProgramNodeId,
+        expressions: Arc<ImmutableExpressions>,
+        profile: CompileProfile,
+        requirements: BindingRequirements,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCompileError> {
+        Self::try_new_with_sink_for_compile(
+            nodes,
+            root,
+            expressions,
+            profile,
+            requirements,
+            None,
+            control,
+        )
+    }
+    pub fn try_new_with_sink_for_compile(
+        nodes: Vec<ProgramNode>,
+        root: ProgramNodeId,
+        expressions: Arc<ImmutableExpressions>,
+        profile: CompileProfile,
+        requirements: BindingRequirements,
+        sink: Option<StaticSinkProgram>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCompileError> {
+        let mut work = ProgramWork(Some(CompileCheckpoints::try_new(
+            control,
+            CompilePhase::LowerProgram,
+        )?));
+        let result = Self::try_new_core(
+            nodes,
+            root,
+            expressions,
+            profile,
+            requirements,
+            sink,
+            &mut work,
+        );
+        if matches!(&result, Err(ProgramCompileError::Control(_))) {
+            return result;
         }
-        if nodes.len() > MAX_PROGRAM_NODES {
-            return Err(LocalProgramError::TooManyNodes);
+        work.flush()?;
+        result
+    }
+    fn try_new_core(
+        nodes: Vec<ProgramNode>,
+        root: ProgramNodeId,
+        expressions: Arc<ImmutableExpressions>,
+        profile: CompileProfile,
+        requirements: BindingRequirements,
+        sink: Option<StaticSinkProgram>,
+        work: &mut ProgramWork<'_>,
+    ) -> Result<Self, ProgramCompileError> {
+        let bad_abi = profile.kernel_abi() != crate::KernelAbiVersion::CURRENT;
+        work.step()?;
+        if bad_abi {
+            return Err(LocalProgramError::UnsupportedKernelAbi.into());
         }
-        if root.index() >= nodes.len() {
-            return Err(LocalProgramError::InvalidRoot);
+        let empty = nodes.is_empty();
+        work.step()?;
+        if empty {
+            return Err(LocalProgramError::Empty.into());
+        }
+        let too_many = nodes.len() > MAX_PROGRAM_NODES;
+        work.step()?;
+        if too_many {
+            return Err(LocalProgramError::TooManyNodes.into());
+        }
+        let bad_root = root.index() >= nodes.len();
+        work.step()?;
+        if bad_root {
+            return Err(LocalProgramError::InvalidRoot.into());
         }
         let mut depths = Vec::with_capacity(nodes.len());
         let mut expansions = Vec::with_capacity(nodes.len());
         let mut native_ids = BTreeSet::new();
         for (index, node) in nodes.iter().enumerate() {
-            // Native lowering may insert a wrapper with the same wire node ID
-            // as its input. Only nodes addressed by per-Task sidecars require
-            // unique native IDs; ProgramNodeId identifies every arena entry.
-            if matches!(
+            // Only per-Task sidecar nodes require unique native IDs; wrappers
+            // retain the original allowance to share a diagnostic wire ID.
+            let duplicate = matches!(
                 node.kind,
                 ProgramNodeKind::Scan { .. }
                     | ProgramNodeKind::ExchangeSource { .. }
                     | ProgramNodeKind::TableWriter { .. }
                     | ProgramNodeKind::TableFinish { .. }
-            ) && !native_ids.insert(node.native_node_id)
-            {
-                return Err(LocalProgramError::DuplicateNativeNode);
+            ) && !native_ids.insert(node.native_node_id);
+            work.step()?;
+            if duplicate {
+                return Err(LocalProgramError::DuplicateNativeNode.into());
             }
-            let mut depth = 1_usize;
-            let mut expanded = 1_usize;
-            for child in node.kind.children() {
-                if child.index() >= index {
-                    return Err(LocalProgramError::InvalidChild);
+            let mut depth = 1usize;
+            let mut expanded = 1usize;
+            node.kind.try_for_each_child(|child| {
+                let valid = child.index() < index;
+                work.step()?;
+                if !valid {
+                    return Err(LocalProgramError::InvalidChild.into());
                 }
                 depth = depth.max(depths[child.index()] + 1);
-                expanded = expanded
-                    .checked_add(expansions[child.index()])
-                    .ok_or(LocalProgramError::ExpandedLimit)?;
+                let next = expanded.checked_add(expansions[child.index()]);
+                work.step()?;
+                expanded = next.ok_or(LocalProgramError::ExpandedLimit)?;
+                Ok::<(), ProgramCompileError>(())
+            })?;
+            let too_deep = depth > MAX_PROGRAM_NODE_DEPTH;
+            work.step()?;
+            if too_deep {
+                return Err(LocalProgramError::TooDeep.into());
             }
-            if depth > MAX_PROGRAM_NODE_DEPTH {
-                return Err(LocalProgramError::TooDeep);
-            }
-            if expanded > MAX_PROGRAM_EXPANDED_OCCURRENCES {
-                return Err(LocalProgramError::ExpandedLimit);
+            let too_expanded = expanded > MAX_PROGRAM_EXPANDED_OCCURRENCES;
+            work.step()?;
+            if too_expanded {
+                return Err(LocalProgramError::ExpandedLimit.into());
             }
             depths.push(depth);
             expansions.push(expanded);
-            if node
-                .kind
-                .expression_ids()
-                .iter()
-                .any(|expr| expressions.node(*expr).is_none())
-            {
-                return Err(LocalProgramError::InvalidExpression);
-            }
-            validate_shape(node)?;
-            validate_relationships(node, &nodes)?;
+            work.step()?;
+            node.kind.try_for_each_expression(|expr| {
+                let valid = expr.is_none_or(|id| expressions.node(id).is_some());
+                work.step()?;
+                if !valid {
+                    return Err(LocalProgramError::InvalidExpression.into());
+                }
+                Ok::<(), ProgramCompileError>(())
+            })?;
+            validate_shape(node, work)?;
+            validate_relationships(node, &nodes, work)?;
         }
         let mut reachable = vec![false; nodes.len()];
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
-            if std::mem::replace(&mut reachable[node.index()], true) {
+            let seen = std::mem::replace(&mut reachable[node.index()], true);
+            work.step()?;
+            if seen {
                 continue;
             }
-            pending.extend(nodes[node.index()].kind.children());
+            nodes[node.index()].kind.try_for_each_child(|child| {
+                pending.push(child);
+                work.step()
+            })?;
         }
-        if reachable.iter().any(|seen| !seen) {
-            return Err(LocalProgramError::UnreachableNode);
+        for seen in &reachable {
+            let seen = *seen;
+            work.step()?;
+            if !seen {
+                return Err(LocalProgramError::UnreachableNode.into());
+            }
         }
-        if nodes[root.index()]
-            .output_layout
-            .identity()
-            .map_err(|_| LocalProgramError::LayoutMismatch)?
-            != profile.layout()
+        if work.identity(
+            &nodes[root.index()].output_layout,
+            LocalProgramError::LayoutMismatch,
+        )? != profile.layout()
         {
-            return Err(LocalProgramError::LayoutMismatch);
+            return Err(LocalProgramError::LayoutMismatch.into());
         }
         let mut required_scans = BTreeSet::new();
         let mut required_exchanges = BTreeSet::new();
@@ -817,63 +1087,82 @@ impl LocalProgram {
         let mut required_finishes = BTreeSet::new();
         let mut required_filters = BTreeSet::new();
         for requirement in requirements.entries() {
+            // The iterator yielded this exact requirement. Its lookup,
+            // comparison and insertion work is observed separately below.
+            work.step()?;
             match requirement {
-                BindingRequirement::ResultSink { layout }
-                    if layout
-                        .identity()
-                        .map_err(|_| LocalProgramError::LayoutMismatch)?
-                        == profile.layout() => {}
+                BindingRequirement::ResultSink { layout } => {
+                    if work.identity(layout, LocalProgramError::LayoutMismatch)? != profile.layout()
+                    {
+                        return Err(LocalProgramError::InvalidRequirement.into());
+                    }
+                }
                 BindingRequirement::Scan { node, kind, layout } => {
+                    let found = nodes.get(node.index());
+                    work.step()?;
                     let Some(ProgramNode {
                         kind: ProgramNodeKind::Scan { source, .. },
                         output_layout,
                         ..
-                    }) = nodes.get(node.index())
+                    }) = found
                     else {
-                        return Err(LocalProgramError::InvalidRequirement);
+                        return Err(LocalProgramError::InvalidRequirement.into());
                     };
                     let ScanSourceKind::TypedConnector { relation } = kind else {
-                        return Err(LocalProgramError::InvalidRequirement);
+                        return Err(LocalProgramError::InvalidRequirement.into());
                     };
-                    if relation != source.recipe().draft().relation().table().header()
-                        || layout
-                            .identity()
-                            .map_err(|_| LocalProgramError::LayoutMismatch)?
-                            != output_layout
-                                .identity()
-                                .map_err(|_| LocalProgramError::LayoutMismatch)?
+                    let same_header = work.opaque(|| {
+                        relation == source.recipe().draft().relation().table().header()
+                    })?;
+                    if !same_header
+                        || work.identity(layout, LocalProgramError::LayoutMismatch)?
+                            != work.identity(output_layout, LocalProgramError::LayoutMismatch)?
                     {
-                        return Err(LocalProgramError::InvalidRequirement);
+                        return Err(LocalProgramError::InvalidRequirement.into());
                     }
                     required_scans.insert(node.index());
+                    work.step()?;
                 }
                 BindingRequirement::RuntimeFilter { binding_id } => {
                     required_filters.insert(*binding_id);
+                    work.step()?;
                 }
                 BindingRequirement::ExchangeInput { node, layout } => {
-                    check_node_layout(&nodes, *node, layout, |kind| {
-                        matches!(kind, ProgramNodeKind::ExchangeSource { .. })
-                    })?;
+                    check_node_layout(
+                        &nodes,
+                        *node,
+                        layout,
+                        |kind| matches!(kind, ProgramNodeKind::ExchangeSource { .. }),
+                        work,
+                    )?;
                     required_exchanges.insert(node.index());
+                    work.step()?;
                 }
                 BindingRequirement::TableWriter { node, layout } => {
-                    check_node_layout(&nodes, *node, layout, |kind| {
-                        matches!(kind, ProgramNodeKind::TableWriter { .. })
-                    })?;
+                    check_node_layout(
+                        &nodes,
+                        *node,
+                        layout,
+                        |kind| matches!(kind, ProgramNodeKind::TableWriter { .. }),
+                        work,
+                    )?;
                     required_writers.insert(node.index());
+                    work.step()?;
                 }
                 BindingRequirement::TableFinish { node, layout } => {
-                    check_node_layout(&nodes, *node, layout, |kind| {
-                        matches!(kind, ProgramNodeKind::TableFinish { .. })
-                    })?;
+                    check_node_layout(
+                        &nodes,
+                        *node,
+                        layout,
+                        |kind| matches!(kind, ProgramNodeKind::TableFinish { .. }),
+                        work,
+                    )?;
                     required_finishes.insert(node.index());
+                    work.step()?;
                 }
-                BindingRequirement::ExchangeOutput { branch: _, layout } => {
-                    layout
-                        .identity()
-                        .map_err(|_| LocalProgramError::LayoutMismatch)?;
+                BindingRequirement::ExchangeOutput { layout, .. } => {
+                    work.identity(layout, LocalProgramError::LayoutMismatch)?;
                 }
-                _ => return Err(LocalProgramError::InvalidRequirement),
             }
         }
         for (index, node) in nodes.iter().enumerate() {
@@ -884,70 +1173,78 @@ impl LocalProgram {
                 ProgramNodeKind::TableFinish { .. } => required_finishes.contains(&index),
                 _ => true,
             };
-            if !required
-                || node_filter_ids(&node.kind)?
-                    .iter()
-                    .any(|id| !required_filters.contains(id))
-            {
-                return Err(LocalProgramError::InvalidRequirement);
+            work.step()?;
+            if !required {
+                return Err(LocalProgramError::InvalidRequirement.into());
+            }
+            for id in node_filter_ids(&node.kind, work)? {
+                let present = required_filters.contains(&id);
+                work.step()?;
+                if !present {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                }
             }
         }
         if let Some(sink) = &sink {
-            sink.validate()
-                .map_err(|_| LocalProgramError::InvalidSink)?;
-            let result_count = requirements
-                .entries()
-                .iter()
-                .filter(|requirement| matches!(requirement, BindingRequirement::ResultSink { .. }))
-                .count();
-            let outputs = requirements
-                .entries()
-                .iter()
-                .filter_map(|requirement| match requirement {
-                    BindingRequirement::ExchangeOutput { branch, .. } => Some(*branch),
-                    _ => None,
-                })
-                .collect::<BTreeSet<_>>();
+            work.sink(sink)?;
+            let mut result_count = 0usize;
+            for requirement in requirements.entries() {
+                if matches!(requirement, BindingRequirement::ResultSink { .. }) {
+                    result_count += 1;
+                }
+                work.step()?;
+            }
+            let mut outputs = BTreeSet::new();
+            for requirement in requirements.entries() {
+                if let BindingRequirement::ExchangeOutput { branch, .. } = requirement {
+                    outputs.insert(*branch);
+                }
+                work.step()?;
+            }
             match sink {
                 StaticSinkProgram::Result if result_count != 1 || !outputs.is_empty() => {
-                    return Err(LocalProgramError::InvalidSink);
+                    return Err(LocalProgramError::InvalidSink.into());
                 }
                 StaticSinkProgram::Noop if result_count != 0 || !outputs.is_empty() => {
-                    return Err(LocalProgramError::InvalidSink);
+                    return Err(LocalProgramError::InvalidSink.into());
                 }
                 StaticSinkProgram::DataStream { .. }
                 | StaticSinkProgram::MultiCastDataStream { .. }
-                | StaticSinkProgram::SplitDataStream { .. }
-                    if result_count != 0 || outputs != (0..sink.branches().len()).collect() =>
-                {
-                    return Err(LocalProgramError::InvalidSink);
+                | StaticSinkProgram::SplitDataStream { .. } => {
+                    if result_count != 0 {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                    let mut expected = BTreeSet::new();
+                    for branch in 0..sink.branches().len() {
+                        expected.insert(branch);
+                        work.step()?;
+                    }
+                    if !same_set(&outputs, &expected, work)? {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
                 }
                 _ => {}
             }
             for requirement in requirements.entries() {
+                // Account the completed iteration before optional field work.
+                work.step()?;
                 if let BindingRequirement::ExchangeOutput { branch, layout } = requirement {
-                    let branch = sink
-                        .branches()
-                        .get(*branch)
-                        .ok_or(LocalProgramError::InvalidSink)?;
-                    let projected = nodes[root.index()]
-                        .output_layout
-                        .project_by_slots(branch.output_columns())
-                        .map_err(|_| LocalProgramError::InvalidSink)?;
-                    if projected
-                        .identity()
-                        .map_err(|_| LocalProgramError::InvalidSink)?
-                        != layout
-                            .identity()
-                            .map_err(|_| LocalProgramError::InvalidSink)?
+                    let branch = sink.branches().get(*branch);
+                    work.step()?;
+                    let branch = branch.ok_or(LocalProgramError::InvalidSink)?;
+                    let projected =
+                        work.project(&nodes[root.index()].output_layout, branch.output_columns())?;
+                    if work.identity(&projected, LocalProgramError::InvalidSink)?
+                        != work.identity(layout, LocalProgramError::InvalidSink)?
                     {
-                        return Err(LocalProgramError::InvalidSink);
+                        return Err(LocalProgramError::InvalidSink.into());
                     }
                 }
             }
         }
+        let nodes = work.opaque(|| Arc::from(nodes))?;
         Ok(Self {
-            nodes: Arc::from(nodes),
+            nodes,
             root,
             expressions,
             profile,
@@ -986,33 +1283,32 @@ fn check_node_layout(
     node: ProgramNodeId,
     layout: &StaticLayout,
     expected_kind: impl FnOnce(&ProgramNodeKind) -> bool,
-) -> Result<(), LocalProgramError> {
-    let Some(found) = nodes.get(node.index()) else {
-        return Err(LocalProgramError::InvalidRequirement);
-    };
-    if !expected_kind(&found.kind)
-        || layout
-            .identity()
-            .map_err(|_| LocalProgramError::LayoutMismatch)?
-            != found
-                .output_layout
-                .identity()
-                .map_err(|_| LocalProgramError::LayoutMismatch)?
+    work: &mut ProgramWork<'_>,
+) -> Result<(), ProgramCompileError> {
+    let found = nodes.get(node.index());
+    work.step()?;
+    let found = found.ok_or(LocalProgramError::InvalidRequirement)?;
+    let correct_kind = expected_kind(&found.kind);
+    work.step()?;
+    if !correct_kind
+        || work.identity(layout, LocalProgramError::LayoutMismatch)?
+            != work.identity(&found.output_layout, LocalProgramError::LayoutMismatch)?
     {
-        return Err(LocalProgramError::InvalidRequirement);
+        return Err(LocalProgramError::InvalidRequirement.into());
     }
     Ok(())
 }
-
-fn node_filter_ids(kind: &ProgramNodeKind) -> Result<Vec<i32>, LocalProgramError> {
-    let consumer_ids = |bindings: &[FilterConsumerAtExpr]| {
-        bindings
-            .iter()
-            .map(|binding| {
-                i32::try_from(binding.consumer.binding_id())
-                    .map_err(|_| LocalProgramError::InvalidRequirement)
-            })
-            .collect::<Result<Vec<_>, _>>()
+fn node_filter_ids(
+    kind: &ProgramNodeKind,
+    work: &mut ProgramWork<'_>,
+) -> Result<Vec<i32>, ProgramCompileError> {
+    let mut ids = Vec::new();
+    let mut add = |id: u32| -> Result<(), ProgramCompileError> {
+        let id = i32::try_from(id);
+        work.step()?;
+        ids.push(id.map_err(|_| LocalProgramError::InvalidRequirement)?);
+        work.step()?;
+        Ok(())
     };
     match kind {
         ProgramNodeKind::Scan {
@@ -1020,43 +1316,67 @@ fn node_filter_ids(kind: &ProgramNodeKind) -> Result<Vec<i32>, LocalProgramError
         }
         | ProgramNodeKind::ExchangeSource {
             runtime_filters, ..
-        } => consumer_ids(runtime_filters),
-        ProgramNodeKind::RuntimeFilterConsumer { bindings, .. } => consumer_ids(bindings),
-        ProgramNodeKind::Aggregate { topn_filters, .. } => topn_filters
-            .iter()
-            .map(|filter| {
-                i32::try_from(filter.producer.binding_id())
-                    .map_err(|_| LocalProgramError::InvalidRequirement)
-            })
-            .collect(),
+        } => {
+            for binding in runtime_filters {
+                add(binding.consumer.binding_id())?;
+            }
+        }
+        ProgramNodeKind::RuntimeFilterConsumer { bindings, .. } => {
+            for binding in bindings {
+                add(binding.consumer.binding_id())?;
+            }
+        }
+        ProgramNodeKind::Aggregate { topn_filters, .. } => {
+            for filter in topn_filters {
+                add(filter.producer.binding_id())?;
+            }
+        }
         ProgramNodeKind::Join {
             runtime_filters, ..
-        } => runtime_filters
-            .iter()
-            .map(|filter| {
-                i32::try_from(filter.producer.binding_id())
-                    .map_err(|_| LocalProgramError::InvalidRequirement)
-            })
-            .collect(),
-        _ => Ok(Vec::new()),
+        } => {
+            for filter in runtime_filters {
+                add(filter.producer.binding_id())?;
+            }
+        }
+        _ => {}
     }
+    Ok(ids)
 }
-
+fn same_set(
+    left: &BTreeSet<usize>,
+    right: &BTreeSet<usize>,
+    work: &mut ProgramWork<'_>,
+) -> Result<bool, ProgramCompileError> {
+    let same_length = left.len() == right.len();
+    work.step()?;
+    if !same_length {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        let same = left == right;
+        work.step()?;
+        if !same {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+fn layout_matches(
+    nodes: &[ProgramNode],
+    child: ProgramNodeId,
+    expected: &StaticLayout,
+    work: &mut ProgramWork<'_>,
+) -> Result<bool, ProgramCompileError> {
+    Ok(work.identity(
+        &nodes[child.index()].output_layout,
+        LocalProgramError::LayoutMismatch,
+    )? == work.identity(expected, LocalProgramError::LayoutMismatch)?)
+}
 fn validate_relationships(
     node: &ProgramNode,
     nodes: &[ProgramNode],
-) -> Result<(), LocalProgramError> {
-    let layout_matches = |child: ProgramNodeId, expected: &StaticLayout| {
-        Ok::<bool, LocalProgramError>(
-            nodes[child.index()]
-                .output_layout
-                .identity()
-                .map_err(|_| LocalProgramError::LayoutMismatch)?
-                == expected
-                    .identity()
-                    .map_err(|_| LocalProgramError::LayoutMismatch)?,
-        )
-    };
+    work: &mut ProgramWork<'_>,
+) -> Result<(), ProgramCompileError> {
     match &node.kind {
         ProgramNodeKind::Join {
             left,
@@ -1072,13 +1392,15 @@ fn validate_relationships(
             right_layout,
             ..
         } => {
-            if !layout_matches(*left, left_layout)? || !layout_matches(*right, right_layout)? {
-                return Err(LocalProgramError::LayoutMismatch);
+            if !layout_matches(nodes, *left, left_layout, work)?
+                || !layout_matches(nodes, *right, right_layout, work)?
+            {
+                return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
         ProgramNodeKind::RuntimeFilterConsumer { input, .. } => {
-            if !layout_matches(*input, &node.output_layout)? {
-                return Err(LocalProgramError::LayoutMismatch);
+            if !layout_matches(nodes, *input, &node.output_layout, work)? {
+                return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
         ProgramNodeKind::TableFinish {
@@ -1088,39 +1410,32 @@ fn validate_relationships(
             ..
         } => {
             for input in inputs {
-                if !layout_matches(*input, writer_multiplex_layout)? {
-                    return Err(LocalProgramError::LayoutMismatch);
+                let matches = layout_matches(nodes, *input, writer_multiplex_layout, work)?;
+                work.step()?;
+                if !matches {
+                    return Err(LocalProgramError::LayoutMismatch.into());
                 }
             }
-            if node
-                .output_layout
-                .identity()
-                .map_err(|_| LocalProgramError::LayoutMismatch)?
-                != root_result_layout
-                    .identity()
-                    .map_err(|_| LocalProgramError::LayoutMismatch)?
+            if work.identity(&node.output_layout, LocalProgramError::LayoutMismatch)?
+                != work.identity(root_result_layout, LocalProgramError::LayoutMismatch)?
             {
-                return Err(LocalProgramError::LayoutMismatch);
+                return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
         _ => {}
     }
     Ok(())
 }
-
-fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
+fn validate_shape(
+    node: &ProgramNode,
+    work: &mut ProgramWork<'_>,
+) -> Result<(), ProgramCompileError> {
     match &node.kind {
         ProgramNodeKind::Values { values } => {
-            if values
-                .layout()
-                .identity()
-                .map_err(|_| LocalProgramError::LayoutMismatch)?
-                != node
-                    .output_layout
-                    .identity()
-                    .map_err(|_| LocalProgramError::LayoutMismatch)?
+            if work.identity(values.layout(), LocalProgramError::LayoutMismatch)?
+                != work.identity(&node.output_layout, LocalProgramError::LayoutMismatch)?
             {
-                return Err(LocalProgramError::LayoutMismatch);
+                return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
         ProgramNodeKind::Project {
@@ -1130,15 +1445,22 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             output_indices,
             ..
         } => {
-            if exprs.len() != expr_slot_ids.len()
+            let wrong_arity = exprs.len() != expr_slot_ids.len()
                 || expr_slot_schemas
                     .as_ref()
-                    .is_some_and(|slots| slots.len() != exprs.len())
-                || output_indices
-                    .as_ref()
-                    .is_some_and(|indices| indices.iter().any(|index| *index >= exprs.len()))
-            {
-                return Err(LocalProgramError::InvalidNodeShape);
+                    .is_some_and(|slots| slots.len() != exprs.len());
+            work.step()?;
+            if wrong_arity {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            if let Some(indices) = output_indices {
+                for index in indices {
+                    let valid = *index < exprs.len();
+                    work.step()?;
+                    if !valid {
+                        return Err(LocalProgramError::InvalidNodeShape.into());
+                    }
+                }
             }
         }
         ProgramNodeKind::Unpivot {
@@ -1146,7 +1468,7 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             max_output_bytes,
             ..
         } if *max_output_rows == 0 || *max_output_bytes == 0 => {
-            return Err(LocalProgramError::InvalidNodeShape);
+            return Err(LocalProgramError::InvalidNodeShape.into());
         }
         ProgramNodeKind::Repeat {
             null_slot_ids,
@@ -1154,27 +1476,34 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             grouping_list,
             repeat_times,
             ..
-        } if *repeat_times == 0
-            || null_slot_ids.len() != *repeat_times
-            || grouping_list.len() != grouping_slot_ids.len()
-            || grouping_list
-                .iter()
-                .any(|values| values.len() != *repeat_times) =>
-        {
-            return Err(LocalProgramError::InvalidNodeShape);
+        } => {
+            let bad = *repeat_times == 0
+                || null_slot_ids.len() != *repeat_times
+                || grouping_list.len() != grouping_slot_ids.len();
+            work.step()?;
+            if bad {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for values in grouping_list {
+                let bad = values.len() != *repeat_times;
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
         }
         ProgramNodeKind::SetOp { inputs, .. } if inputs.len() < 2 => {
-            return Err(LocalProgramError::InvalidNodeShape);
+            return Err(LocalProgramError::InvalidNodeShape.into());
         }
         ProgramNodeKind::Sort {
             order_by,
             partition_exprs,
             ..
         } if order_by.is_empty() && partition_exprs.is_empty() => {
-            return Err(LocalProgramError::InvalidNodeShape);
+            return Err(LocalProgramError::InvalidNodeShape.into());
         }
         ProgramNodeKind::TableFunction { function_name, .. } if function_name.is_empty() => {
-            return Err(LocalProgramError::InvalidNodeShape);
+            return Err(LocalProgramError::InvalidNodeShape.into());
         }
         ProgramNodeKind::Aggregate {
             group_by,
@@ -1182,14 +1511,20 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             topn_filters,
             ..
         } => {
-            if functions.iter().any(|function| {
-                function.name.is_empty()
-                    || function.order.is_asc_order.len() != function.order.nulls_first.len()
-            }) || topn_filters.iter().any(|filter| {
-                group_by.get(filter.group_key_ordinal) != Some(&filter.group_key_expr)
-            })
-            {
-                return Err(LocalProgramError::InvalidNodeShape);
+            for function in functions {
+                let bad = function.name.is_empty()
+                    || function.order.is_asc_order.len() != function.order.nulls_first.len();
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+            for filter in topn_filters {
+                let bad = group_by.get(filter.group_key_ordinal) != Some(&filter.group_key_expr);
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
             }
         }
         ProgramNodeKind::Join {
@@ -1199,13 +1534,18 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             runtime_filters,
             ..
         } => {
-            if probe_keys.len() != build_keys.len()
-                || probe_keys.len() != eq_null_safe.len()
-                || runtime_filters
-                    .iter()
-                    .any(|filter| build_keys.get(filter.key_ordinal) != Some(&filter.expr_id))
-            {
-                return Err(LocalProgramError::InvalidNodeShape);
+            let bad =
+                probe_keys.len() != build_keys.len() || probe_keys.len() != eq_null_safe.len();
+            work.step()?;
+            if bad {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for filter in runtime_filters {
+                let bad = build_keys.get(filter.key_ordinal) != Some(&filter.expr_id);
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
             }
         }
         ProgramNodeKind::Analytic {
@@ -1213,12 +1553,17 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             output_columns,
             ..
         } => {
-            if output_columns.len() != node.output_layout.slots().len()
-                || output_columns.iter().any(|column| {
-                    matches!(column, AnalyticOutputColumn::Window(index) if *index >= functions.len())
-                })
-            {
-                return Err(LocalProgramError::InvalidNodeShape);
+            let bad = output_columns.len() != node.output_layout.slots().len();
+            work.step()?;
+            if bad {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for column in output_columns {
+                let bad = matches!(column, AnalyticOutputColumn::Window(index) if *index >= functions.len());
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
             }
         }
         ProgramNodeKind::TableWriter {
@@ -1226,21 +1571,23 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             expected_layout,
             ..
         } => {
-            if projection.expressions.is_empty()
-                || projection.expressions.len() != projection.layout.slots().len()
-                || projection
-                    .expressions
-                    .iter()
-                    .any(|expr| projection.arena.node(*expr).is_none())
-                || projection
-                    .layout
-                    .identity()
-                    .map_err(|_| LocalProgramError::LayoutMismatch)?
-                    != expected_layout
-                        .identity()
-                        .map_err(|_| LocalProgramError::LayoutMismatch)?
+            let bad = projection.expressions.is_empty()
+                || projection.expressions.len() != projection.layout.slots().len();
+            work.step()?;
+            if bad {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for expr in &projection.expressions {
+                let bad = projection.arena.node(*expr).is_none();
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+            if work.identity(&projection.layout, LocalProgramError::LayoutMismatch)?
+                != work.identity(expected_layout, LocalProgramError::LayoutMismatch)?
             {
-                return Err(LocalProgramError::InvalidNodeShape);
+                return Err(LocalProgramError::InvalidNodeShape.into());
             }
         }
         ProgramNodeKind::TableFinish {
@@ -1249,15 +1596,20 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
             final_aggregates,
             ..
         } => {
-            let unique_targets: BTreeSet<_> = expected_targets.iter().copied().collect();
-            if inputs.is_empty()
+            let mut unique_targets = BTreeSet::new();
+            for target in expected_targets {
+                unique_targets.insert(*target);
+                work.step()?;
+            }
+            let bad = inputs.is_empty()
                 || expected_targets.is_empty()
                 || unique_targets.len() != expected_targets.len()
                 || final_aggregates.unpivot.as_ref().is_some_and(|unpivot| {
                     unpivot.max_output_rows == 0 || unpivot.max_output_bytes == 0
-                })
-            {
-                return Err(LocalProgramError::InvalidNodeShape);
+                });
+            work.step()?;
+            if bad {
+                return Err(LocalProgramError::InvalidNodeShape.into());
             }
         }
         _ => {}
@@ -1724,5 +2076,375 @@ mod tests {
             Err(LocalProgramError::Empty)
         ));
         assert_eq!(KernelAbiVersion::CURRENT.get(), 2);
+    }
+
+    #[derive(Default)]
+    struct OriginalControl {
+        trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+        stop: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for OriginalControl {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut trace = self.trace.lock().unwrap();
+            let index = trace.len();
+            trace.push((phase, units));
+            if let Some((at, cause)) = self.stop
+                && at == index
+            {
+                return Err(cause);
+            }
+            Ok(())
+        }
+    }
+    fn causes() -> [CompileControlError; 3] {
+        [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ]
+    }
+    fn exchange_fixture(edges: usize, children: bool) -> LocalProgram {
+        let (_, layout) = values();
+        let expressions = Arc::new(
+            ImmutableExpressions::try_new(
+                vec![StaticExprNode::new(
+                    StaticExprKind::SlotId(SlotId::new(1)),
+                    DataType::Int64,
+                    None,
+                )],
+                false,
+                HashMap::new(),
+                None,
+            )
+            .unwrap(),
+        );
+        let mut nodes = vec![ProgramNode::new(
+            7,
+            ProgramNodeKind::ExchangeSource {
+                timeout: Duration::from_secs(1),
+                runtime_filters: vec![],
+                hash_partition_exprs: if children {
+                    vec![]
+                } else {
+                    vec![ProgramExprId::new(0); edges]
+                },
+            },
+            layout.clone(),
+        )];
+        if children {
+            nodes.push(ProgramNode::new(
+                8,
+                ProgramNodeKind::UnionAll {
+                    inputs: vec![ProgramNodeId::new(0); edges],
+                },
+                layout.clone(),
+            ));
+        }
+        let root = ProgramNodeId::new(nodes.len() - 1);
+        LocalProgram::try_new_with_sink(
+            nodes,
+            root,
+            expressions,
+            profile(&layout),
+            BindingRequirements::try_new(vec![
+                BindingRequirement::ExchangeInput {
+                    node: ProgramNodeId::new(0),
+                    layout: layout.clone(),
+                },
+                BindingRequirement::ResultSink { layout },
+            ])
+            .unwrap(),
+            Some(StaticSinkProgram::Result),
+        )
+        .unwrap()
+    }
+    fn compile_fixture(
+        source: &LocalProgram,
+        control: &dyn PureCompileControl,
+    ) -> Result<LocalProgram, ProgramCompileError> {
+        LocalProgram::try_new_with_sink_for_compile(
+            source.nodes().to_vec(),
+            source.root(),
+            source.expressions().clone(),
+            source.profile(),
+            source.requirements().clone(),
+            source.sink().cloned(),
+            control,
+        )
+    }
+
+    #[test]
+    fn compile_program_preserves_real_child_and_expression_edges_and_owned_backing() {
+        for children in [false, true] {
+            let source = exchange_fixture(320, children);
+            let control = OriginalControl::default();
+            let actual = compile_fixture(&source, &control).unwrap();
+            assert_eq!(actual.root(), source.root());
+            assert_eq!(actual.nodes().len(), source.nodes().len());
+            assert_eq!(actual.profile(), source.profile());
+            assert!(Arc::ptr_eq(actual.expressions(), source.expressions()));
+            assert_eq!(
+                actual.nodes()[actual.root().index()]
+                    .output_layout()
+                    .identity()
+                    .unwrap(),
+                source.profile().layout()
+            );
+            if children {
+                let ProgramNodeKind::UnionAll { inputs } = actual.nodes()[1].kind() else {
+                    panic!("expected exact union graph");
+                };
+                assert_eq!(inputs, &vec![ProgramNodeId::new(0); 320]);
+            } else {
+                let ProgramNodeKind::ExchangeSource {
+                    hash_partition_exprs,
+                    ..
+                } = actual.nodes()[0].kind()
+                else {
+                    panic!("expected exact exchange graph");
+                };
+                assert_eq!(hash_partition_exprs, &vec![ProgramExprId::new(0); 320]);
+            }
+            let trace = control.trace.lock().unwrap();
+            assert!(trace.iter().any(|(_, units)| *units == 256));
+            assert!(
+                trace
+                    .iter()
+                    .all(|(phase, units)| *phase == CompilePhase::LowerProgram && *units <= 256)
+            );
+        }
+    }
+
+    #[test]
+    fn compile_program_original_control_refuses_entry_quantum_delegate_and_final_tail() {
+        for children in [false, true] {
+            let source = exchange_fixture(320, children);
+            let baseline = OriginalControl::default();
+            compile_fixture(&source, &baseline).unwrap();
+            let trace = baseline.trace.lock().unwrap().clone();
+            let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
+            let delegate = trace
+                .iter()
+                .enumerate()
+                .skip(quantum + 1)
+                .find(|(_, (_, units))| *units == 0)
+                .unwrap()
+                .0;
+            for cause in causes() {
+                for at in [0, quantum, delegate, trace.len() - 1] {
+                    let control = OriginalControl {
+                        trace: Default::default(),
+                        stop: Some((at, cause)),
+                    };
+                    assert!(
+                        matches!(compile_fixture(&source, &control), Err(ProgramCompileError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compile_program_empty_error_observes_tail_and_keeps_typed_cause() {
+        use std::error::Error;
+        let source = exchange_fixture(0, false);
+        let baseline = OriginalControl::default();
+        let run = |control: &dyn PureCompileControl| {
+            LocalProgram::try_new_for_compile(
+                vec![],
+                ProgramNodeId::new(0),
+                source.expressions().clone(),
+                source.profile(),
+                BindingRequirements::try_new(vec![]).unwrap(),
+                control,
+            )
+        };
+        assert!(matches!(
+            run(&baseline),
+            Err(ProgramCompileError::Program(LocalProgramError::Empty))
+        ));
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert_eq!(
+            trace,
+            vec![
+                (CompilePhase::LowerProgram, 0),
+                (CompilePhase::LowerProgram, 2)
+            ]
+        );
+        for cause in causes() {
+            let control = OriginalControl {
+                trace: Default::default(),
+                stop: Some((1, cause)),
+            };
+            let error = run(&control).unwrap_err();
+            assert_eq!(error, ProgramCompileError::Control(cause));
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
+
+    #[test]
+    fn compile_program_preserves_shape_layout_requirement_and_reference_error_order() {
+        let source = exchange_fixture(0, false);
+        let layout = source.nodes()[0].output_layout().clone();
+        for (kind, expected) in [
+            (
+                ProgramNodeKind::Filter {
+                    input: ProgramNodeId::new(1),
+                    predicate: ProgramExprId::new(999),
+                },
+                LocalProgramError::InvalidChild,
+            ),
+            (
+                ProgramNodeKind::Filter {
+                    input: ProgramNodeId::new(0),
+                    predicate: ProgramExprId::new(999),
+                },
+                LocalProgramError::InvalidExpression,
+            ),
+            (
+                ProgramNodeKind::Project {
+                    input: ProgramNodeId::new(0),
+                    is_subordinate: false,
+                    exprs: vec![ProgramExprId::new(0)],
+                    expr_slot_ids: vec![],
+                    expr_slot_schemas: None,
+                    output_indices: None,
+                },
+                LocalProgramError::InvalidNodeShape,
+            ),
+        ] {
+            let nodes = vec![
+                source.nodes()[0].clone(),
+                ProgramNode::new(8, kind, layout.clone()),
+            ];
+            assert!(
+                matches!(LocalProgram::try_new(nodes.clone(), ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone()), Err(actual) if actual == expected)
+            );
+            let control = OriginalControl::default();
+            assert!(
+                matches!(LocalProgram::try_new_for_compile(nodes, ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone(), &control), Err(ProgramCompileError::Program(actual)) if actual == expected)
+            );
+        }
+        let bad_profile = CompileProfile::new(
+            NonZeroUsize::new(1).unwrap(),
+            None,
+            LayoutIdentity::from_sha256([9; 32]),
+            KernelAbiVersion::CURRENT,
+        );
+        assert!(matches!(
+            LocalProgram::try_new_for_compile(
+                source.nodes().to_vec(),
+                source.root(),
+                source.expressions().clone(),
+                bad_profile,
+                BindingRequirements::try_new(vec![]).unwrap(),
+                &OriginalControl::default()
+            ),
+            Err(ProgramCompileError::Program(
+                LocalProgramError::LayoutMismatch
+            ))
+        ));
+        assert!(matches!(
+            LocalProgram::try_new_for_compile(
+                source.nodes().to_vec(),
+                source.root(),
+                source.expressions().clone(),
+                source.profile(),
+                BindingRequirements::try_new(vec![]).unwrap(),
+                &OriginalControl::default()
+            ),
+            Err(ProgramCompileError::Program(
+                LocalProgramError::InvalidRequirement
+            ))
+        ));
+    }
+
+    #[test]
+    fn compile_program_stream_sink_uses_same_control_and_exact_projected_layout() {
+        let source = exchange_fixture(0, false);
+        let layout = source.nodes()[0].output_layout().clone();
+        let sink = StaticSinkProgram::try_data_stream(
+            crate::StaticStreamBranch::try_new(
+                9,
+                novarocks_execution_contract::DataStreamPartitionType::Random,
+                vec![],
+                vec![SlotId::new(1)],
+                None,
+            )
+            .unwrap(),
+            source.expressions().clone(),
+        )
+        .unwrap();
+        let requirements = BindingRequirements::try_new(vec![
+            BindingRequirement::ExchangeInput {
+                node: ProgramNodeId::new(0),
+                layout: layout.clone(),
+            },
+            BindingRequirement::ExchangeOutput { branch: 0, layout },
+        ])
+        .unwrap();
+        let control = OriginalControl::default();
+        let actual = LocalProgram::try_new_with_sink_for_compile(
+            source.nodes().to_vec(),
+            source.root(),
+            source.expressions().clone(),
+            source.profile(),
+            requirements.clone(),
+            Some(sink.clone()),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(
+            actual.sink().unwrap().branches()[0].output_columns(),
+            &[SlotId::new(1)]
+        );
+        LocalProgram::try_new_with_sink(
+            source.nodes().to_vec(),
+            source.root(),
+            source.expressions().clone(),
+            source.profile(),
+            requirements,
+            Some(sink.clone()),
+        )
+        .unwrap();
+        let run = |control: &dyn PureCompileControl| {
+            LocalProgram::try_new_with_sink_for_compile(
+                source.nodes().to_vec(),
+                source.root(),
+                source.expressions().clone(),
+                source.profile(),
+                BindingRequirements::try_new(vec![BindingRequirement::ExchangeInput {
+                    node: ProgramNodeId::new(0),
+                    layout: source.nodes()[0].output_layout().clone(),
+                }])
+                .unwrap(),
+                Some(sink.clone()),
+                control,
+            )
+        };
+        let ordinary = OriginalControl::default();
+        assert!(matches!(
+            run(&ordinary),
+            Err(ProgramCompileError::Program(LocalProgramError::InvalidSink))
+        ));
+        let trace = ordinary.trace.lock().unwrap().clone();
+        for cause in causes() {
+            let control = OriginalControl {
+                trace: Default::default(),
+                stop: Some((trace.len() - 1, cause)),
+            };
+            assert!(
+                matches!(run(&control), Err(ProgramCompileError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
     }
 }
