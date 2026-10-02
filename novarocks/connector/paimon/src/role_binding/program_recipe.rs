@@ -413,8 +413,10 @@ mod tests {
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
         ConnectorReadInputVersion, ConnectorReadProgramCompileError, ConnectorReadProgramRecipe,
         ConnectorReadProperties, ConnectorReadPublicFacts, ConnectorReadStaticFacts,
-        ConnectorValue, ConnectorValueType, Domain, FrozenConnectorScan, ScanColumnId,
-        StaticScanAssignment, StaticScanDynamicFilter, TupleDomain, connector_type_for_arrow,
+        ConnectorValue, ConnectorValueType, Domain, FrozenConnectorScan, PureProviderCatalogError,
+        PureProviderManifestEntry, PureProviderProgramCatalog, PureProviderProgramDefinition,
+        PureProviderProgramError, ScanColumnId, StaticScanAssignment, StaticScanDynamicFilter,
+        TupleDomain, connector_type_for_arrow,
     };
     use novarocks_spi::connector::read_stack::SchemaTableName;
     use novarocks_type_contract::{CompileControlError, arrow_fields_exact};
@@ -697,6 +699,87 @@ mod tests {
             compile(&fixture.frozen(), &Control::default()),
             Err(ConnectorReadProgramCompileError::Provider(_))
         ));
+    }
+
+    fn pure_catalog() -> PureProviderProgramCatalog<ConnectorCodecError> {
+        // This is a read-only Paimon fixture manifest, not the Server manifest.
+        let provider = ConnectorProviderId::parse(PROVIDER_ID).unwrap();
+        PureProviderProgramCatalog::try_new(
+            &[PureProviderManifestEntry::new(
+                provider.clone(),
+                true,
+                false,
+            )],
+            vec![PureProviderProgramDefinition::new(
+                provider,
+                Some(Arc::new(PaimonReadRecipeCompiler)),
+                None,
+            )],
+            &Control::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn installed_pure_catalog_dispatches_full_paimon_facts_and_keeps_provider_rejection() {
+        let catalog = pure_catalog();
+        let mut fixture = Fixture::projected();
+        fixture.residual = TupleDomain::none();
+        fixture.remaining = Some(ConnectorExpression::Constant {
+            value: Some(ConnectorValue::Boolean(false)),
+            value_type: ConnectorValueType::Boolean,
+        });
+        fixture
+            .filters
+            .push(StaticScanDynamicFilter::new(37, Arc::from("alias_0")));
+        let frozen = fixture.frozen();
+        let recipe = catalog.compile_read(&frozen, &Control::default()).unwrap();
+        assert_eq!(recipe.frozen(), &frozen);
+        assert_eq!(catalog.provider_count(), 1);
+
+        fixture.fields[0] = fixture.fields[0].clone().with_name("alias_0");
+        let error = catalog
+            .compile_read(&fixture.frozen(), &Control::default())
+            .unwrap_err();
+        assert!(matches!(error, PureProviderProgramError::Provider(_)));
+    }
+
+    #[test]
+    fn installed_pure_catalog_uses_provider_identity_before_private_decode() {
+        let catalog = pure_catalog();
+        let mut fixture = Fixture::projected();
+        let unknown = ConnectorProviderId::parse("unknown-provider").unwrap();
+        fixture.binding = ConnectorReadBinding::new(
+            ConnectorInstanceDescriptor {
+                provider_id: unknown.clone(),
+                instance_id: fixture.binding.descriptor().instance_id.clone(),
+            },
+            fixture.binding.catalog_handle().clone(),
+        );
+        assert!(matches!(
+            catalog.compile_read(&fixture.frozen(), &Control::default()),
+            Err(PureProviderProgramError::Catalog(PureProviderCatalogError::MissingProvider(id)))
+                if id == unknown
+        ));
+    }
+
+    #[test]
+    fn installed_pure_catalog_preserves_each_original_control_cause() {
+        let catalog = pure_catalog();
+        let frozen = Fixture::projected().frozen();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                calls: Mutex::default(),
+                fail: Some((cause, Stop::Entry)),
+            };
+            assert!(matches!(catalog.compile_read(&frozen, &control),
+                Err(PureProviderProgramError::Control(actual)) if actual == cause));
+            assert_eq!(control.calls.lock().unwrap().as_slice(), &[0]);
+        }
     }
 
     #[test]

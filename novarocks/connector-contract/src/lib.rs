@@ -27,6 +27,7 @@ mod error;
 mod identity;
 mod mutation;
 mod predicate;
+mod pure_catalogue;
 mod pure_compile;
 mod read;
 mod read_facts;
@@ -102,3 +103,8 @@ pub use scan::{
 };
 
 pub use pure_compile::PureProviderCompileError;
+
+pub use pure_catalogue::{
+    PureProviderCatalogError, PureProviderManifestEntry, PureProviderProgramCatalog,
+    PureProviderProgramDefinition, PureProviderProgramError,
+};
