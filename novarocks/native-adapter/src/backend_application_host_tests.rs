@@ -71,7 +71,8 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         ),
         result_retained_limits: WorkerResultRetainedLimits::try_new(
             16 * 1024 * 1024,
-            32 * 1024 * 1024,
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                .root_joint_retained_bytes_per_process as usize,
         )
         .expect("valid test result retained-byte limits"),
         root_producer_limits: crate::root_result_session::RootProducerLimits::try_new(

@@ -22,6 +22,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
+use std::time::Duration;
+
+#[cfg(test)]
+#[path = "native_server_capacity_tests.rs"]
+mod capacity_tests;
 
 use axum::Router;
 use hyper::server::conn::http2;
@@ -38,6 +43,9 @@ use tower::ServiceExt;
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::native_ingress::NativeIngressService;
 use crate::native_response::respond_from_request;
+use crate::native_transport_capacity::{
+    NativeTransportCapacityFactory, TransportClass, configure_server,
+};
 
 /// How long a stopping listener lets its already-accepted connections finish.
 ///
@@ -127,6 +135,80 @@ impl NativeRpcServerHandle {
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
         ingress_config: NativeIngressConfig,
+    ) -> Result<Self, String>
+    where
+        S: NovaRocksGrpc + Clone + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        Self::start_inner(
+            host,
+            port,
+            service,
+            native_trust,
+            incoming_adapter,
+            role_label,
+            thread_name,
+            on_authentication_failure,
+            on_transport_handshake_failure,
+            ingress_config,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "role identity and its authentication metric remain explicit composition inputs"
+    )]
+    pub(crate) fn start_with_transport_capacity<S, F, H>(
+        host: &str,
+        port: u16,
+        service: S,
+        native_trust: Arc<NativeTrust>,
+        incoming_adapter: NativeIncomingAdapter,
+        role_label: &'static str,
+        thread_name: &'static str,
+        on_authentication_failure: F,
+        on_transport_handshake_failure: H,
+        ingress_config: NativeIngressConfig,
+        transport_capacity: NativeTransportCapacityFactory,
+    ) -> Result<Self, String>
+    where
+        S: NovaRocksGrpc + Clone + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        Self::start_inner(
+            host,
+            port,
+            service,
+            native_trust,
+            incoming_adapter,
+            role_label,
+            thread_name,
+            on_authentication_failure,
+            on_transport_handshake_failure,
+            ingress_config,
+            Some(transport_capacity),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "role identity and its authentication metric remain explicit composition inputs"
+    )]
+    fn start_inner<S, F, H>(
+        host: &str,
+        port: u16,
+        service: S,
+        native_trust: Arc<NativeTrust>,
+        incoming_adapter: NativeIncomingAdapter,
+        role_label: &'static str,
+        thread_name: &'static str,
+        on_authentication_failure: F,
+        on_transport_handshake_failure: H,
+        ingress_config: NativeIngressConfig,
+        transport_capacity: Option<NativeTransportCapacityFactory>,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -226,6 +308,7 @@ impl NativeRpcServerHandle {
                             shutdown_rx,
                             transport_handshake_failure,
                             role_label,
+                            transport_capacity,
                         )
                         .await
                     });
@@ -300,6 +383,7 @@ async fn serve_native_listener<S>(
     mut shutdown_rx: watch::Receiver<bool>,
     on_transport_handshake_failure: Arc<dyn Fn() + Send + Sync>,
     role_label: &'static str,
+    transport_capacity: Option<NativeTransportCapacityFactory>,
 ) -> Result<(), String>
 where
     S: Service<
@@ -356,6 +440,7 @@ where
                     }
                     Ok(accepted) => accepted,
                 };
+                let accepted_at = tokio::time::Instant::now();
                 consecutive_accept_errors = 0;
                 let app = app.clone();
                 let incoming = incoming.clone();
@@ -366,10 +451,45 @@ where
                     &next_connection_id,
                     &live_connections,
                 );
+                // Actual pool grants and geometry precede the first TLS I/O.
+                // Binding remains the subsequent Hyper/H2 connection's owner.
+                let mut served = served;
+                let mut builder = http2::Builder::new(TokioExecutor::new());
+                let capacity = match &transport_capacity {
+                    Some(factory) => match factory.try_config(TransportClass::Data) {
+                        Ok(config) => {
+                            if let Err(error) = configure_server(&mut builder, &config) {
+                                served.close("transport_geometry", &error.to_string());
+                                continue;
+                            }
+                            Some(config)
+                        }
+                        Err(error) => {
+                            served.close("transport_capacity", &error.to_string());
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let mut drain = drain_rx.clone();
                 tokio::spawn(async move {
-                    let mut served = served;
-                    let stream = match incoming.accept(stream).await {
+                    let handshake = incoming.accept(stream);
+                    let accepted = if capacity.is_some() {
+                        let deadline = accepted_at + Duration::from_millis(
+                            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
+                        );
+                        match tokio::time::timeout_at(deadline, handshake).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                served.close("transport_handshake", "Native TLS handshake deadline elapsed");
+                                on_transport_handshake_failure();
+                                return;
+                            }
+                        }
+                    } else {
+                        handshake.await
+                    };
+                    let stream = match accepted {
                         Ok(stream) => stream,
                         Err(error) => {
                             served.close("transport_handshake", &format!("{error:?}"));
@@ -388,8 +508,7 @@ where
                         }
                     });
                     let mut connection = std::pin::pin!(
-                        http2::Builder::new(TokioExecutor::new())
-                            .serve_connection(TokioIo::new(stream), service)
+                        builder.serve_connection(TokioIo::new(stream), service)
                     );
                     let mut winding_down = false;
                     let outcome = loop {
@@ -406,6 +525,9 @@ where
                             }
                         }
                     };
+                    // The serving future still holds the actual transport;
+                    // these construction handles may retire independently.
+                    drop(capacity);
                     served.close(
                         "http2",
                         &match outcome {
@@ -842,6 +964,7 @@ mod tests {
             shutdown_rx,
             Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             "test",
+            None,
         ));
 
         let stream = tokio::net::TcpStream::connect(address)

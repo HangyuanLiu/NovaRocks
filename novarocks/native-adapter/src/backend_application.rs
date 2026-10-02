@@ -22,6 +22,7 @@ use crate::backend_metrics::BackendMetricsRegistry;
 use crate::backend_rpc_service::BackendRpcService;
 use crate::fragment_result_writer::native_result_writer;
 use crate::management_http::MetricsHttpServer;
+use crate::native_transport_capacity::NativeTransportCapacityFactory;
 use crate::root_result_session::{RootProducerLimits, RootProducerPool};
 use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
@@ -335,12 +336,17 @@ impl BackendExecutionRuntimeInput {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Role composition keeps the original retained budget and independent runtime inputs explicit."
+)]
 fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution: BackendExecutionRuntimeInput,
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
+    result_retained_budget: Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
     root_producer_limits: RootProducerLimits,
     inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
     preparation_limits: novarocks_worker::TaskPreparationLimits,
@@ -406,9 +412,6 @@ fn compose_backend_application_services(
     ));
     let inbound_capabilities =
         novarocks_worker::TaskInboundCapabilities::with_capacity_limits(inbound_capability_limits);
-    let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
-        result_retained_limits.per_process(),
-    );
     let root_producer_pool = RootProducerPool::try_new(
         root_producer_limits.threads(),
         root_producer_limits.positions(),
@@ -639,6 +642,34 @@ impl BackendApplicationHost {
                 format!("invalid advertised Native readiness endpoint: {error}"),
             )
         })?;
+        // Reserve Native connection stock before any root producer can grow.
+        // All application owners receive this one existing process budget.
+        let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
+            result_retained_limits.per_process(),
+        );
+        let transport_capacity = NativeTransportCapacityFactory::try_new(Arc::clone(
+            &result_retained_budget,
+        ))
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("compose original Native transport capacity: {error}"),
+            )
+        })?;
+        tracing::debug!(
+            reserved_bytes = transport_capacity.reserved_bytes(),
+            connection_pool_bytes = transport_capacity.connection_capacity_bytes(),
+            data_positions = transport_capacity
+                .positions(crate::native_transport_capacity::TransportClass::Data),
+            control_positions = transport_capacity
+                .positions(crate::native_transport_capacity::TransportClass::Control),
+            available_data_positions = transport_capacity
+                .available_positions(crate::native_transport_capacity::TransportClass::Data),
+            available_control_positions = transport_capacity
+                .available_positions(crate::native_transport_capacity::TransportClass::Control),
+            "Prepaid original Native HTTP/2 pool stock"
+        );
+        let data_runtime = data_runtime.with_transport_capacity(transport_capacity.clone());
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
@@ -650,6 +681,7 @@ impl BackendApplicationHost {
             native_compatibility_id,
             write_commit_evidence_limits,
             result_retained_limits,
+            result_retained_budget,
             root_producer_limits,
             inbound_capability_limits,
             preparation_limits,
@@ -742,7 +774,7 @@ impl BackendApplicationHost {
             control_queue_capacity,
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
-        let mut grpc_server = match NativeRpcServerHandle::start(
+        let mut grpc_server = match NativeRpcServerHandle::start_with_transport_capacity(
             &bind_host,
             grpc_port,
             BackendRpcService::new(
@@ -766,6 +798,7 @@ impl BackendApplicationHost {
             novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
             novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
             native_ingress,
+            transport_capacity,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -1044,7 +1077,8 @@ mod tests {
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             result_retained_limits: WorkerResultRetainedLimits::try_new(
                 16 * 1024 * 1024,
-                32 * 1024 * 1024,
+                novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                    .root_joint_retained_bytes_per_process as usize,
             )
             .expect("valid test result retained-byte limits"),
             root_producer_limits: super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
@@ -1066,6 +1100,58 @@ mod tests {
             execution_role_binding_factories: Vec::new(),
             process_memory: novarocks_native_adapter::backend_test_support::test_process_memory(),
         }
+    }
+
+    #[test]
+    fn short_original_transport_budget_refuses_before_binding_either_listener() {
+        let _serial = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let port = unused_port();
+        let mut config = backend_config(port, port);
+        let metrics_port = config.metrics_http_port;
+        config.result_retained_limits =
+            WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
+                .expect("valid deliberately short original budget");
+        let error = BackendApplicationHost::open(config, test_data_runtime())
+            .expect_err("startup must refuse an unfunded original transport stock");
+        assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);
+        assert!(
+            error
+                .to_string()
+                .contains("compose original Native transport capacity")
+        );
+        let _native = TcpListener::bind(("127.0.0.1", port))
+            .expect("capacity refusal must precede Native listener bind");
+        let _metrics = TcpListener::bind(("127.0.0.1", metrics_port))
+            .expect("capacity refusal must precede management listener bind");
+    }
+
+    #[test]
+    fn installing_original_capacity_creates_a_new_channel_cache_generation() {
+        let original = test_data_runtime();
+        let endpoint = NativeEndpoint::from_host_port("127.0.0.1", unused_port()).unwrap();
+        let channel = original.block_on(async {
+            tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))
+                .unwrap()
+                .connect_lazy()
+        });
+        original
+            .channels()
+            .lock()
+            .unwrap()
+            .insert(endpoint.clone(), channel);
+        let bytes = crate::native_transport_capacity::NativeTransportCapacityFactory::allocation_capacity_bound().unwrap();
+        let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
+            std::num::NonZeroUsize::new(bytes).unwrap(),
+        );
+        let capacity =
+            crate::native_transport_capacity::NativeTransportCapacityFactory::try_new(budget)
+                .unwrap();
+        let funded = original.with_transport_capacity(capacity);
+        assert!(original.channels().lock().unwrap().contains_key(&endpoint));
+        assert!(!funded.channels().lock().unwrap().contains_key(&endpoint));
+        assert!(!Arc::ptr_eq(original.channels(), funded.channels()));
+        assert!(funded.transport_capacity().is_some());
+        original.channels().lock().unwrap().remove(&endpoint);
     }
 
     async fn connect_live_channel(grpc_port: u16) -> tonic::transport::Channel {
@@ -1117,6 +1203,9 @@ mod tests {
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
+            novarocks_worker::result_buffer::ResultRetainedBudget::new(
+                std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap(),
+            ),
             super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
                 .expect("finite root producer limits"),
             novarocks_worker::TaskInboundCapabilityLimits::default(),

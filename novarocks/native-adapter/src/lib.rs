@@ -76,6 +76,7 @@ mod native_fragment_query_tests;
 pub mod native_ingress;
 mod native_response;
 pub mod native_server;
+mod native_transport_capacity;
 #[cfg(test)]
 mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
@@ -292,6 +293,7 @@ pub struct BackendDataRuntime {
     native_trust: Arc<NativeTrust>,
     native_transport: BackendNativeTransport,
     channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
+    transport_capacity: Option<native_transport_capacity::NativeTransportCapacityFactory>,
 }
 
 impl BackendDataRuntime {
@@ -305,8 +307,30 @@ impl BackendDataRuntime {
             native_trust,
             native_transport,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            transport_capacity: None,
         }
     }
+    /// A BE host gets its own channel generation and the same original stock.
+    /// Never install capacity over channels from an earlier unfunded runtime.
+    pub(crate) fn with_transport_capacity(
+        &self,
+        capacity: native_transport_capacity::NativeTransportCapacityFactory,
+    ) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            native_trust: Arc::clone(&self.native_trust),
+            native_transport: self.native_transport.clone(),
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            transport_capacity: Some(capacity),
+        }
+    }
+
+    pub(crate) fn transport_capacity(
+        &self,
+    ) -> Option<&native_transport_capacity::NativeTransportCapacityFactory> {
+        self.transport_capacity.as_ref()
+    }
+
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future + Send,

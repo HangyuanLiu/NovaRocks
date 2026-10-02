@@ -37,6 +37,7 @@ arrow-buffer.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
+h2.workspace = true
 hyper.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
 prost.workspace = true
@@ -55,7 +56,6 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
-h2.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-sql.workspace = true
 novarocks-worker = { workspace = true, features = ["test-support"] }
