@@ -321,7 +321,8 @@ object RecursiveTypeFixture {
     require(text.matches("0|[1-9][0-9]{0,18}"),"Invalid exact snapshot count: "+key)
     val count=java.lang.Long.parseLong(text); require(count>=0,"Negative exact snapshot count"); count
   }
-  val Visible = "label,payload,ordered"
+  val Visible = "label,payload,ordered,js,smalls"
+  val VisibleNames = Vector("label","payload","ordered","js","smalls")
   val Source = "recursive_source"
   val Target = "recursive_mv"
   val Ddl = "recursive_ddl"
@@ -340,12 +341,36 @@ object RecursiveTypeFixture {
     Types.NestedField.required(100,"id",Types.LongType.get()),
     Types.NestedField.optional(101,"label",Types.StringType.get()),
     Types.NestedField.optional(200,"payload",Types.StructType.of(
-      Types.NestedField.required(201,"items",Types.ListType.ofOptional(202,Types.LongType.get())),
-      Types.NestedField.required(203,"attrs",Types.MapType.ofRequired(204,205,Types.StringType.get(),Types.LongType.get())),
+      Types.NestedField.required(201,"items",Types.ListType.ofOptional(202,Types.IntegerType.get())),
+      Types.NestedField.required(203,"attrs",Types.MapType.ofRequired(204,205,Types.StringType.get(),Types.IntegerType.get())),
       Types.NestedField.optional(206,"detail",Types.StructType.of(
-        Types.NestedField.required(207,"code",Types.LongType.get()),
-        Types.NestedField.optional(208,"note",Types.StringType.get()))))),
-    Types.NestedField.optional(300,"ordered",Types.MapType.ofOptional(301,302,Types.StringType.get(),Types.LongType.get())))
+        Types.NestedField.required(207,"code",Types.IntegerType.get()),
+        Types.NestedField.optional(208,"note",Types.StringType.get()))),
+      Types.NestedField.optional(209,"jsonitems",Types.ListType.ofOptional(210,Types.StringType.get())))),
+    Types.NestedField.optional(300,"ordered",Types.MapType.ofOptional(301,302,Types.StringType.get(),Types.LongType.get())),
+    Types.NestedField.optional(400,"js",Types.StringType.get()),
+    Types.NestedField.optional(500,"smalls",Types.ListType.ofOptional(501,Types.IntegerType.get())))
+  val FieldDomainProperty = "novarocks.field_domains.v1"
+  val DomainPaths = Map("payload.items.element"->"tinyint","payload.attrs.value"->"smallint",
+    "payload.detail.code"->"tinyint","payload.detail.note"->"json",
+    "payload.jsonitems.element"->"json","js"->"json","smalls.element"->"smallint")
+  def domainProperty(schema: Schema): String = {
+    val fields=mapper.createObjectNode()
+    DomainPaths.toVector.map { case(path,domain) =>
+      val field=schema.findField(path)
+      require(field!=null && field.fieldId()>0,"Domain path is absent from the actual SDK schema: "+path)
+      val expected=if(domain=="json") Types.StringType.get() else Types.IntegerType.get()
+      require(field.`type`()==expected,"Declared domain has a wrong physical carrier: "+path)
+      (field.fieldId(),domain)
+    }.sortBy(_._1).foreach { case(id,domain) => fields.put(id.toString,domain) }
+    mapper.writeValueAsString(obj("version"->1,"fields"->fields))
+  }
+  def assertDomains(t: Table): String = {
+    val expected=domainProperty(t.schema())
+    require(t.properties().get(FieldDomainProperty)==expected,"Actual field-domain property differs from exact SDK IDs/paths")
+    require(t.properties().keySet().asScala.filter(_.startsWith("novarocks.field_domains.")).toSet==Set(FieldDomainProperty),"Unexpected field-domain namespace member")
+    expected
+  }
   case class FieldFact(path: String,id: Int,required: Boolean,kind: String)
   def facts(schema: Schema): Vector[FieldFact] = {
     var visited=0
@@ -364,7 +389,7 @@ object RecursiveTypeFixture {
   }
   def assertSchema(t: Table,isTarget: Boolean): Vector[FieldFact] = {
     require(metadata(t).formatVersion()==3,"Recursive table no longer has the exact format-v3 contract")
-    schemaJson(t)
+    schemaJson(t); assertDomains(t)
     val actual = facts(t.schema()); val expected = facts(sourceSchema).filter(_.path != "id")
     val selected = if (isTarget) actual else actual.filter(_.path != "id")
     require(selected.map(f => (f.path,f.required,f.kind)) == expected.map(f => (f.path,f.required,f.kind)),"Exact recursive required/type/path contract changed")
@@ -378,14 +403,22 @@ object RecursiveTypeFixture {
     if(kind == "null") return r
     r.setField("label","same")
     val p=GenericRecord.create(schema.findType("payload").asStructType())
-    val items=new ArrayList[java.lang.Long](); val attrs=new LinkedHashMap[String,java.lang.Long]()
-    if(kind != "empty") { items.add(Long.box(1)); items.add(null); attrs.put("a",Long.box(1)) }
+    val items=new ArrayList[java.lang.Integer](); val attrs=new LinkedHashMap[String,java.lang.Integer]()
+    if(kind != "empty") { items.add(Int.box(-128)); items.add(null); items.add(Int.box(127)); attrs.put("a",Int.box(-32768)) }
     p.setField("items",items); p.setField("attrs",attrs)
     if(kind != "empty") {
       val d=GenericRecord.create(schema.findType("payload.detail").asStructType())
-      d.setField("code",Long.box(if(kind == "changed") 9 else 7))
-      d.setField("note",if(kind == "note-null") null else "nested"); p.setField("detail",d)
+      d.setField("code",Int.box(if(kind == "changed") 127 else -128))
+      d.setField("note",if(kind == "note-null") null else "{\"b\":2,\"a\":1}"); p.setField("detail",d)
     }
+    val jsonitems=new ArrayList[String](); val smalls=new ArrayList[java.lang.Integer]()
+    if(kind!="empty") {
+      jsonitems.add("{\"b\":2,\"a\":1}"); jsonitems.add(null); jsonitems.add("{}")
+      smalls.add(Int.box(-32768)); smalls.add(null); smalls.add(Int.box(32767))
+    }
+    p.setField("jsonitems",jsonitems)
+    r.setField("js",if(kind=="empty") "{}" else if(kind=="changed") "{\"b\":9,\"a\":1}" else "{\"b\":2,\"a\":1}")
+    r.setField("smalls",smalls)
     val m=new LinkedHashMap[String,java.lang.Long]()
     if(kind != "empty") {
       if(kind == "reverse") { m.put("b",null); m.put("a",Long.box(1)) }
@@ -424,7 +457,7 @@ object RecursiveTypeFixture {
     try reader.asScala.foreach { r =>
       require(rows.size < 1000,"SDK fixture row budget exceeded")
       val n=mapper.createObjectNode()
-      Vector("label","payload","ordered").foreach(name => n.set[JsonNode](name,value(t.schema().findType(name),r.getField(name))))
+      VisibleNames.foreach(name => n.set[JsonNode](name,value(t.schema().findType(name),r.getField(name))))
       val content=mapper.writeValueAsString(n)
       require(content.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=16*1024,"SDK recursive row-content byte budget exceeded")
       rows += content
@@ -432,7 +465,7 @@ object RecursiveTypeFixture {
     rows.groupBy(identity).map { case(k,v) => k->v.size }.toMap
   }
   def sparkBag(ns: String,name: String): Map[String,Int] = {
-    val rows=session.sql(s"SELECT to_json(named_struct('label',label,'payload',payload,'ordered',ordered),map('ignoreNullFields','false')) FROM ice_rest.$ns.$name").take(1001)
+    val rows=session.sql(s"SELECT to_json(named_struct('label',label,'payload',payload,'ordered',ordered,'js',js,'smalls',smalls),map('ignoreNullFields','false')) FROM ice_rest.$ns.$name").take(1001)
     require(rows.length <= 1000,"Spark fixture row budget exceeded")
     rows.toVector.map { r =>
       val content=r.getString(0); require(content!=null && content.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=16*1024,"Spark recursive row-content byte budget exceeded"); content
@@ -440,7 +473,7 @@ object RecursiveTypeFixture {
   }
   def content(schema: Schema,r: Record): String = {
     val n=mapper.createObjectNode()
-    Vector("label","payload","ordered").foreach(name => n.set[JsonNode](name,value(schema.findType(name),r.getField(name))))
+    VisibleNames.foreach(name => n.set[JsonNode](name,value(schema.findType(name),r.getField(name))))
     mapper.writeValueAsString(n)
   }
   def expected(stage: String): Map[String,Int] = {
@@ -471,7 +504,8 @@ object RecursiveTypeFixture {
               require(rawIds.size<MaxFields && currentPath().length<=64,"Raw Parquet semantic-node budget exceeded")
               require(t.getId()!=null,"Raw Parquet semantic field lacks a real ID")
               val id=t.getId().intValue(); require(id>0 && seen.add(id),"Raw Parquet semantic field ID invalid or duplicate")
-              rawIds+=obj("path"->currentPath().mkString("."),"id"->id,"repetition"->t.getRepetition().toString)
+              rawIds+=obj("path"->currentPath().mkString("."),"id"->id,"repetition"->t.getRepetition().toString,
+                "primitive_type"->(if(t.isPrimitive) t.asPrimitiveType().getPrimitiveTypeName().toString else null))
               java.lang.Integer.valueOf(0)
             }
             override def message(t: MessageType,fields: java.util.List[java.lang.Integer]): java.lang.Integer = java.lang.Integer.valueOf(0)
@@ -484,6 +518,12 @@ object RecursiveTypeFixture {
           org.apache.iceberg.parquet.ParquetTypeVisitor.visit(raw,visitor)
           require(rawIds.nonEmpty,"No raw Parquet semantic field IDs observed")
           val rawById=rawIds.map(n=>n.get("id").asInt()->n).toMap
+          DomainPaths.foreach { case(path,domain) =>
+            val id=t.schema().findField(path).fieldId()
+            val primitive=if(domain=="json") "BINARY" else "INT32"
+            require(rawById.get(id).exists(n=>n.get("primitive_type").asText()==primitive),
+              "Declared domain has a wrong raw Parquet physical primitive: "+path)
+          }
           val requirednessMismatches=expected.flatMap { f =>
             val actual=rawById.get(f.id).map(n=>n.get("repetition").asText()).getOrElse("MISSING")
             if(actual==(if(f.required) "REQUIRED" else "OPTIONAL")) Vector.empty[String]
@@ -503,8 +543,15 @@ object RecursiveTypeFixture {
     require(ns.length<=64 && ns.matches("[a-zA-Z0-9_]+"))
     session.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns")
     val catalog=Spark3Util.loadIcebergCatalog(session,"ice_rest")
-    val t=catalog.createTable(TableIdentifier.of(ns,Source),sourceSchema,PartitionSpec.unpartitioned(),
-      Map("format-version"->"3","write.row-lineage"->"true").asJava)
+    // Use Iceberg's own fresh-ID allocator before the single CREATE, then
+    // verify the returned SDK tree/property before any data is written.
+    val ids=new java.util.concurrent.atomic.AtomicInteger(0)
+    val allocated=org.apache.iceberg.types.TypeUtil.assignFreshIds(sourceSchema,
+      new org.apache.iceberg.types.TypeUtil.NextID { override def get(): Int = ids.incrementAndGet() })
+    val t=catalog.createTable(TableIdentifier.of(ns,Source),allocated,PartitionSpec.unpartitioned(),
+      Map("format-version"->"3","write.row-lineage"->"true",FieldDomainProperty->domainProperty(allocated)).asJava)
+    require(facts(t.schema())==facts(allocated),"CREATE response changed SDK-allocated field identities")
+    assertDomains(t)
     val before=Option(t.currentSnapshot()).map(_.snapshotId())
     require(before.isEmpty,"New recursive source unexpectedly has a prior snapshot")
     val file=write(t,Vector("same","same","reverse","null","empty","note-null").zipWithIndex.map { case(k,i) => row(t,i+1,k) },"initial")
@@ -514,7 +561,7 @@ object RecursiveTypeFixture {
     require(sdk.keys.exists(_.contains("\"ordered\":{\"a\":1,\"b\":null}")) && sdk.keys.exists(_.contains("\"ordered\":{\"b\":null,\"a\":1}")),"Actual SDK/Spark read path did not preserve both Map orders")
     val tasks=boundedScan(t); require(tasks.size==1 && tasks.head.file().location()==file.location() && deletes(tasks).isEmpty,"Initial committed source files differ from the exact append")
     require(t.currentSnapshot().snapshotId()>0 && countSummary(t,"total-data-files")==1 && countSummary(t,"total-records")==6,"Initial source snapshot totals differ")
-    boundedEmit(obj("record"->"recursive_source_initial","source_uuid"->metadata(t).uuid().toString,"schema_id"->t.schema().schemaId(),"schema_json"->schemaJson(t),"from_snapshot"->null,"to_snapshot"->t.currentSnapshot().snapshotId(),"snapshot"->t.currentSnapshot().snapshotId(),"fields"->assertSchema(t,false).map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"added_files"->tasks.map(task=>fileFact(task.file())),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->Vector.empty[JsonNode],"summary"->summary(t),"bag"->sdk.toVector.sortBy(_._1).map { case(k,v) => obj("content"->k,"count"->v) }))
+    boundedEmit(obj("record"->"recursive_source_initial","source_uuid"->metadata(t).uuid().toString,"schema_id"->t.schema().schemaId(),"schema_json"->schemaJson(t),"field_domains_json"->assertDomains(t),"from_snapshot"->null,"to_snapshot"->t.currentSnapshot().snapshotId(),"snapshot"->t.currentSnapshot().snapshotId(),"fields"->assertSchema(t,false).map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"added_files"->tasks.map(task=>fileFact(task.file())),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->Vector.empty[JsonNode],"summary"->summary(t),"bag"->sdk.toVector.sortBy(_._1).map { case(k,v) => obj("content"->k,"count"->v) }))
     println("RECURSIVE_SOURCE_READY")
   }
   def mutate(ns: String): Unit = {
@@ -533,7 +580,7 @@ object RecursiveTypeFixture {
     assertParquetIds(t)
     val tasks=boundedScan(t); val liveDeletes=deletes(tasks); val actualAdded=tasks.filter(_.file().location()==added.location())
     require(actualAdded.size==1 && actualAdded.head.file().recordCount()==2 && liveDeletes.size==1 && liveDeletes.head.location()==dvs.head.location() && liveDeletes.head.referencedDataFile()==files.head.location(),"Actual source delta files do not match exact committed additions/DV")
-    boundedEmit(obj("record"->"recursive_source_changed","source_uuid"->sourceUuid,"schema_id"->schemaId,"from_snapshot"->from,"to_snapshot"->t.currentSnapshot().snapshotId(),"snapshot"->t.currentSnapshot().snapshotId(),"schema_json"->schemaJson(t),"fields"->assertSchema(t,false).map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"added_files"->actualAdded.map(task=>fileFact(task.file())),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->liveDeletes.map(fileFact),"summary"->summary(t),"bag"->sdkBag(t).toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
+    boundedEmit(obj("record"->"recursive_source_changed","source_uuid"->sourceUuid,"schema_id"->schemaId,"from_snapshot"->from,"to_snapshot"->t.currentSnapshot().snapshotId(),"snapshot"->t.currentSnapshot().snapshotId(),"schema_json"->schemaJson(t),"field_domains_json"->assertDomains(t),"fields"->assertSchema(t,false).map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"added_files"->actualAdded.map(task=>fileFact(task.file())),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->liveDeletes.map(fileFact),"summary"->summary(t),"bag"->sdkBag(t).toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
     println("RECURSIVE_SOURCE_CHANGED")
   }
   def observe(ns: String,stage: String): Unit = {
@@ -557,14 +604,14 @@ object RecursiveTypeFixture {
       require(countSummary(t,"total-records")==expected("delta").values.map(_.toLong).sum,"FULL physical records differ from complete independent bag")
     }
     require(t.currentSnapshot().snapshotId()>0 && s.currentSnapshot().snapshotId()>0,"Observation lacks exact positive snapshot")
-    boundedEmit(obj("record"->"recursive_mv_observed","stage"->stage,"table_uuid"->metadata(t).uuid().toString,"source_uuid"->metadata(s).uuid().toString,"source_schema_json"->schemaJson(s),"source_schema_id"->s.schema().schemaId(),"source_snapshot"->s.currentSnapshot().snapshotId(),"source_fields"->sourceFields.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"schema_json"->schemaJson(t),"schema_id"->t.schema().schemaId(),"snapshot"->t.currentSnapshot().snapshotId(),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->liveDeletes.map(fileFact),"summary"->summary(t),"fields"->bound.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"bag"->sdkTarget.toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
+    boundedEmit(obj("record"->"recursive_mv_observed","stage"->stage,"table_uuid"->metadata(t).uuid().toString,"source_uuid"->metadata(s).uuid().toString,"source_schema_json"->schemaJson(s),"source_field_domains_json"->assertDomains(s),"field_domains_json"->assertDomains(t),"source_schema_id"->s.schema().schemaId(),"source_snapshot"->s.currentSnapshot().snapshotId(),"source_fields"->sourceFields.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"schema_json"->schemaJson(t),"schema_id"->t.schema().schemaId(),"snapshot"->t.currentSnapshot().snapshotId(),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->liveDeletes.map(fileFact),"summary"->summary(t),"fields"->bound.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"bag"->sdkTarget.toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
     println("RECURSIVE_MV_OBSERVED")
   }
   // Ordinary DDL defaults each child to optional except the required Map key.
   // CTAS instead freezes the already-proved source children without widening.
   def assertDdlCtasSchema(t: Table,isCtas: Boolean): Vector[FieldFact] = {
     require(metadata(t).formatVersion()==3,"DDL/CTAS fixture requires format-v3")
-    schemaJson(t)
+    schemaJson(t); assertDomains(t)
     val actual=facts(t.schema())
     val expected=facts(sourceSchema).filter(_.path!="id").map(f =>
       if(isCtas) f else f.copy(required=f.path.endsWith(".key")))
@@ -581,7 +628,7 @@ object RecursiveTypeFixture {
     val fs=facts(t.schema())
     val tasks=if(current.isEmpty) Vector.empty[FileScanTask] else boundedScan(t)
     obj("table_uuid"->metadata(t).uuid().toString,"schema_id"->t.schema().schemaId(),
-      "schema_json"->schemaJson(t),"snapshot"->current.map(s=>s.snapshotId():Any).getOrElse(null),
+      "schema_json"->schemaJson(t),"field_domains_json"->assertDomains(t),"snapshot"->current.map(s=>s.snapshotId():Any).getOrElse(null),
       "fields"->fs.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),
       "data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->deletes(tasks).map(fileFact),
       "summary"->current.map(_=>summary(t)).getOrElse(obj()),
@@ -624,7 +671,7 @@ object RecursiveTypeFixture {
     require(text(frozen,"record")=="recursive_ddl_ctas_prepared" && text(frozen,"namespace")==ns,"Frozen DDL/CTAS receipt belongs to another stage/namespace")
     Vector("source","ddl").foreach { k=>
       val prior=member(frozen,k)
-      require(prior.isObject && prior.fieldNames().asScala.toSet==Set("table_uuid","schema_id","schema_json","snapshot","fields","data_files","delete_files","summary","bag"),"Unexpected frozen DDL/CTAS table-fact shape")
+      require(prior.isObject && prior.fieldNames().asScala.toSet==Set("table_uuid","schema_id","schema_json","field_domains_json","snapshot","fields","data_files","delete_files","summary","bag"),"Unexpected frozen DDL/CTAS table-fact shape")
     }
     val s=table(ns,Source); val d=table(ns,Ddl); val c=table(ns,Ctas)
     assertSchema(s,false); val df=assertDdlCtasSchema(d,false); val cf=assertDdlCtasSchema(c,true)
@@ -633,6 +680,7 @@ object RecursiveTypeFixture {
     Vector((s,member(frozen,"source")),(d,member(frozen,"ddl"))).foreach { case(t,prior)=>
       val u=java.util.UUID.fromString(text(prior,"table_uuid")); require(u.toString==text(prior,"table_uuid") && u!=new java.util.UUID(0L,0L) && u.toString==metadata(t).uuid().toString,"DDL/CTAS frozen UUID changed")
       require(integer(prior,"schema_id",false)==t.schema().schemaId() && text(prior,"schema_json")==schemaJson(t),"DDL/CTAS frozen schema changed")
+      require(text(prior,"field_domains_json")==assertDomains(t),"DDL/CTAS frozen domain declaration changed")
       val observed=parsedTableFacts(t)
       require(member(prior,"fields").isArray && member(prior,"fields")==member(observed,"fields"),"DDL/CTAS frozen field bindings changed")
     }

@@ -88,14 +88,16 @@ PY_RECEIPT
 printf 'RECURSIVE_SOURCE_READY\n'
 
 -- query 3
-SELECT label,payload,ordered FROM recursive_source;
+SELECT label,payload,ordered,js,smalls FROM recursive_source;
 
 -- query 4
 -- @skip_result_check=true
 CREATE TABLE recursive_ddl (
   label STRING,
-  payload STRUCT<items ARRAY<BIGINT>,attrs MAP<STRING,BIGINT>,detail STRUCT<code BIGINT,note STRING>>,
-  ordered MAP<STRING,BIGINT>
+  payload STRUCT<items ARRAY<TINYINT>,attrs MAP<STRING,SMALLINT>,detail STRUCT<code TINYINT,note JSON>,jsonitems ARRAY<JSON>>,
+  ordered MAP<STRING,BIGINT>,
+  js JSON,
+  smalls ARRAY<SMALLINT>
 ) TBLPROPERTIES ("format-version"="3","write.row-lineage"="true");
 
 -- query 5
@@ -139,20 +141,20 @@ printf 'RECURSIVE_DDL_CTAS_PREPARED\n'
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO recursive_ddl (label,payload,ordered)
-SELECT label,payload,ordered FROM recursive_source;
+INSERT INTO recursive_ddl (label,payload,ordered,js,smalls)
+SELECT label,payload,ordered,js,smalls FROM recursive_source;
 
 -- query 7
-SELECT label,payload,ordered FROM recursive_ddl;
+SELECT label,payload,ordered,js,smalls FROM recursive_ddl;
 
 -- query 8
 -- @skip_result_check=true
 CREATE TABLE recursive_ctas
 TBLPROPERTIES ("format-version"="3","write.row-lineage"="true") AS
-SELECT label,payload,ordered FROM recursive_source;
+SELECT label,payload,ordered,js,smalls FROM recursive_source;
 
 -- query 9
-SELECT label,payload,ordered FROM recursive_ctas;
+SELECT label,payload,ordered,js,smalls FROM recursive_ctas;
 
 -- query 10
 -- @skip_result_check=true

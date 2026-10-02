@@ -2968,8 +2968,8 @@ fn statistics_carrier_matches(
             DataType::Timestamp(left_unit, input_zone),
             DataType::Timestamp(right_unit, Some(zone)),
         ) => {
-            // SQL metadata emits UTC; the SDK emits +00:00. Both denote the
-            // existing canonical UTC role. Plain provider timestamps have no
+            // SQL read uses no timezone; planned write input can use UTC. The
+            // SDK emits +00:00 for that same UTC role. Plain timestamps have no
             // bridge in the opposite direction.
             let canonical_utc = |value: &str| matches!(value, "UTC" | "+00:00");
             left_unit == right_unit

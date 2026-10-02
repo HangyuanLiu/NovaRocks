@@ -73,9 +73,9 @@ printf 'RECURSIVE_SOURCE_READY\n'
 -- query 3
 -- @order_sensitive=false
 -- @imv_equivalence_check=recursive_mv
-CREATE MATERIALIZED VIEW recursive_mv DISTRIBUTED BY HASH(label) BUCKETS 3 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT label,payload,ordered FROM recursive_source;
+CREATE MATERIALIZED VIEW recursive_mv DISTRIBUTED BY HASH(label) BUCKETS 3 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT label,payload,ordered,js,smalls FROM recursive_source;
 REFRESH MATERIALIZED VIEW recursive_mv WITH SYNC MODE;
-SELECT label,payload,ordered FROM recursive_mv;
+SELECT label,payload,ordered,js,smalls FROM recursive_mv;
 
 -- query 4
 -- @skip_result_check=true
@@ -125,7 +125,7 @@ printf 'RECURSIVE_SOURCE_CHANGED\n'
 -- @order_sensitive=false
 -- @imv_equivalence_check=recursive_mv
 REFRESH MATERIALIZED VIEW recursive_mv WITH SYNC MODE;
-SELECT label,payload,ordered FROM recursive_mv;
+SELECT label,payload,ordered,js,smalls FROM recursive_mv;
 
 -- query 7
 -- @skip_result_check=true
@@ -153,7 +153,7 @@ printf 'RECURSIVE_MV_OBSERVED\n'
 -- @order_sensitive=false
 -- @imv_equivalence_check=recursive_mv
 REFRESH MATERIALIZED VIEW recursive_mv FULL WITH SYNC MODE;
-SELECT label,payload,ordered FROM recursive_mv;
+SELECT label,payload,ordered,js,smalls FROM recursive_mv;
 
 -- query 9
 -- @skip_result_check=true

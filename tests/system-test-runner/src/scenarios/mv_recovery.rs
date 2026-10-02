@@ -3424,7 +3424,7 @@ impl Scenario for MvRecursiveTypeRestart {
             context,
             &mut conn,
             "create recursive output MV",
-            "CREATE MATERIALIZED VIEW recursive_mv DISTRIBUTED BY HASH(label) BUCKETS 3 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT label,payload,ordered FROM recursive_source",
+            "CREATE MATERIALIZED VIEW recursive_mv DISTRIBUTED BY HASH(label) BUCKETS 3 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT label,payload,ordered,js,smalls FROM recursive_source",
         )?;
         refresh(context, &mut conn, "recursive_mv")?;
         let initial = call_spark(
@@ -3437,6 +3437,7 @@ impl Scenario for MvRecursiveTypeRestart {
             ("source_uuid", "source_uuid"),
             ("schema_id", "source_schema_id"),
             ("schema_json", "source_schema_json"),
+            ("field_domains_json", "source_field_domains_json"),
             ("snapshot", "source_snapshot"),
             ("fields", "source_fields"),
         ] {
@@ -3449,7 +3450,7 @@ impl Scenario for MvRecursiveTypeRestart {
         let initial_native: Vec<Row> = query(
             context,
             &mut conn,
-            "SELECT label,payload,ordered FROM recursive_mv",
+            "SELECT label,payload,ordered,js,smalls FROM recursive_mv",
             "freeze complete native recursive result before FE replacement",
         )?;
         if initial_native.len() != 6 {
@@ -3478,6 +3479,8 @@ impl Scenario for MvRecursiveTypeRestart {
             || recursive_required(&before, "schema_id")?
                 != recursive_required(&initial, "schema_id")?
             || recursive_required(&before, "schema")? != &sdk_schema
+            || recursive_required(&before, "field_domains_json")?
+                != recursive_required(&initial, "field_domains_json")?
         {
             bail!("REST lake baseline differs from exact SDK snapshot/schema binding");
         }
@@ -3525,7 +3528,7 @@ impl Scenario for MvRecursiveTypeRestart {
         let rows: Vec<Row> = query(
             context,
             &mut conn,
-            "SELECT label,payload,ordered FROM recursive_mv",
+            "SELECT label,payload,ordered,js,smalls FROM recursive_mv",
             "read recursive restored MV through native FE/BE",
         )?;
         if rows.len() != 6 {
@@ -3557,10 +3560,12 @@ impl Scenario for MvRecursiveTypeRestart {
             "table_uuid",
             "source_uuid",
             "source_schema_json",
+            "source_field_domains_json",
             "source_schema_id",
             "source_snapshot",
             "source_fields",
             "schema_json",
+            "field_domains_json",
             "schema_id",
             "fields",
             "snapshot",
@@ -3576,7 +3581,13 @@ impl Scenario for MvRecursiveTypeRestart {
         resume_management_after_fe_restart(context, &mut conn, catalog, "recursive_mv")?;
         let changed = call_spark(context, "mutate", "RecursiveTypeFixture.mutate(\"ns\")")?;
         validate_recursive_receipt(&changed, "mutate")?;
-        for key in ["source_uuid", "schema_id", "schema_json", "fields"] {
+        for key in [
+            "source_uuid",
+            "schema_id",
+            "schema_json",
+            "field_domains_json",
+            "fields",
+        ] {
             if recursive_required(&initialized, key)? != recursive_required(&changed, key)? {
                 bail!("source mutation replaced its exact schema/object");
             }
@@ -3610,9 +3621,11 @@ impl Scenario for MvRecursiveTypeRestart {
                 "table_uuid",
                 "source_uuid",
                 "source_schema_json",
+                "source_field_domains_json",
                 "source_schema_id",
                 "source_fields",
                 "schema_json",
+                "field_domains_json",
                 "schema_id",
                 "fields",
             ] {
@@ -3721,9 +3734,22 @@ fn recursive_lake_binding(
     recursive_json_budget(schema)?;
     let location = recursive_string(m, "location", 4096)?;
     let table_properties = recursive_required(m, "properties")?;
+    let properties = table_properties
+        .as_object()
+        .context("recursive table properties are not an object")?;
+    if properties
+        .keys()
+        .filter(|k| k.starts_with("novarocks.field_domains."))
+        .count()
+        != 1
+    {
+        bail!("recursive field-domain namespace has an unexpected member count");
+    }
+    let field_domains =
+        recursive_string(table_properties, "novarocks.field_domains.v1", 16 * 1024)?;
     let summary = recursive_required(current, "summary")?;
     Ok(
-        serde_json::json!({"table_uuid":uuid,"snapshot":snapshot,"schema_id":schema_id,"schema":schema,
+        serde_json::json!({"table_uuid":uuid,"snapshot":snapshot,"schema_id":schema_id,"schema":schema,"field_domains_json":field_domains,
         "definition":recursive_document(table_properties,"definition","table-metadata",snapshot,location)?,
         "interpretation":recursive_document(table_properties,"interpretation","table-metadata",snapshot,location)?,
         "eligibility":recursive_document(table_properties,"eligibility","table-metadata",snapshot,location)?,
@@ -4029,6 +4055,126 @@ mod recursive_file_receipt_tests {
         }
     }
 }
+// Fixture-only oracle: derive the declaration independently from actual SDK
+// field identities. Exact canonical comparison also rejects duplicate keys,
+// unknown members/domains/versions, extra IDs and reordered declarations.
+fn recursive_field_domains(
+    value: &serde_json::Value,
+    fields_key: &str,
+    property_key: &str,
+) -> Result<()> {
+    recursive_fields(value, fields_key)?;
+    let paths = [
+        ("payload.items.element", "INTEGER", "tinyint"),
+        ("payload.attrs.value", "INTEGER", "smallint"),
+        ("payload.detail.code", "INTEGER", "tinyint"),
+        ("payload.detail.note", "STRING", "json"),
+        ("payload.jsonitems.element", "STRING", "json"),
+        ("js", "STRING", "json"),
+        ("smalls.element", "INTEGER", "smallint"),
+    ];
+    let fields = recursive_required(value, fields_key)?.as_array().unwrap();
+    let mut declarations = std::collections::BTreeMap::new();
+    for (path, kind, domain) in paths {
+        let field = fields
+            .iter()
+            .find(|f| f.get("path").and_then(serde_json::Value::as_str) == Some(path))
+            .with_context(|| format!("recursive domain path {path} is absent"))?;
+        if recursive_string(field, "kind", 64)? != kind {
+            bail!("recursive domain path {path} has the wrong physical carrier");
+        }
+        declarations.insert(recursive_positive(field, "id")?, domain);
+    }
+    let body = declarations
+        .into_iter()
+        .map(|(id, domain)| format!("\"{id}\":\"{domain}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let expected = format!("{{\"version\":1,\"fields\":{{{body}}}}}");
+    if recursive_string(value, property_key, 16 * 1024)? != expected {
+        bail!("recursive field domains differ from exact SDK IDs/paths/canonical grammar");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recursive_domain_receipt_tests {
+    use super::recursive_field_domains;
+    use serde_json::{Value, json};
+
+    fn receipt() -> Value {
+        let entries = [
+            (2, "payload.items.element", "INTEGER"),
+            (10, "payload.attrs.value", "INTEGER"),
+            (11, "payload.detail.code", "INTEGER"),
+            (12, "payload.detail.note", "STRING"),
+            (13, "payload.jsonitems.element", "STRING"),
+            (14, "js", "STRING"),
+            (15, "smalls.element", "INTEGER"),
+        ];
+        json!({"fields":entries.into_iter().map(|(id,path,kind)| json!({"id":id,"path":path,"kind":kind,"required":false})).collect::<Vec<_>>(),
+            "domains":"{\"version\":1,\"fields\":{\"2\":\"tinyint\",\"10\":\"smallint\",\"11\":\"tinyint\",\"12\":\"json\",\"13\":\"json\",\"14\":\"json\",\"15\":\"smallint\"}}"})
+    }
+    fn validate(value: &Value) -> anyhow::Result<()> {
+        recursive_field_domains(value, "fields", "domains")
+    }
+    #[test]
+    fn actual_sdk_ids_and_numeric_canonical_order_are_required() {
+        let value = receipt();
+        validate(&value).unwrap();
+        let mut moved = value.clone();
+        moved["fields"][0]["id"] = json!(3);
+        assert!(validate(&moved).is_err());
+        moved["domains"] = json!(
+            value["domains"]
+                .as_str()
+                .unwrap()
+                .replace("\"2\":", "\"3\":")
+        );
+        validate(&moved).unwrap();
+    }
+    #[test]
+    fn missing_duplicate_and_wrong_physical_field_facts_are_rejected() {
+        for ordinal in 0..7 {
+            let mut missing = receipt();
+            missing["fields"].as_array_mut().unwrap().remove(ordinal);
+            assert!(validate(&missing).is_err());
+            let mut wrong = receipt();
+            wrong["fields"][ordinal]["kind"] = json!("LONG");
+            assert!(validate(&wrong).is_err());
+        }
+        let mut duplicate = receipt();
+        let repeated = duplicate["fields"][0].clone();
+        duplicate["fields"].as_array_mut().unwrap().push(repeated);
+        assert!(validate(&duplicate).is_err());
+    }
+    #[test]
+    fn absent_unknown_duplicate_noncanonical_and_oversized_declarations_are_rejected() {
+        let value = receipt();
+        let canonical = value["domains"].as_str().unwrap();
+        let mut absent = value.clone();
+        absent.as_object_mut().unwrap().remove("domains");
+        assert!(validate(&absent).is_err());
+        for body in [
+            String::new(),
+            "x".repeat(16 * 1024 + 1),
+            canonical.replace("\"version\":1", "\"version\":2"),
+            canonical.replace("\"json\"", "\"string\""),
+            canonical.replace("\"fields\":{", "\"unknown\":1,\"fields\":{"),
+            canonical.replace("\"2\":\"tinyint\"", "\"2\":\"tinyint\",\"2\":\"tinyint\""),
+            canonical.replace(
+                "\"2\":\"tinyint\",\"10\":\"smallint\"",
+                "\"10\":\"smallint\",\"2\":\"tinyint\"",
+            ),
+            canonical.replace("\"2\":\"tinyint\"", "\"02\":\"tinyint\""),
+        ] {
+            let mut wrong = value.clone();
+            wrong["domains"] = json!(body);
+            assert!(validate(&wrong).is_err());
+        }
+    }
+}
+
 fn validate_recursive_receipt(value: &serde_json::Value, stage: &str) -> Result<()> {
     if serde_json::to_vec(value)?.len() > 256 * 1024 {
         bail!("recursive receipt exceeds byte budget");
@@ -4052,7 +4198,7 @@ fn validate_recursive_receipt(value: &serde_json::Value, stage: &str) -> Result<
     schema
         .as_object()
         .context("recursive schema is not an object")?;
-    recursive_fields(value, "fields")?;
+    recursive_field_domains(value, "fields", "field_domains_json")?;
     recursive_files(value, "data_files", false)?;
     recursive_files(value, "delete_files", true)?;
     recursive_required(value, "summary")?
@@ -4107,7 +4253,7 @@ fn validate_recursive_receipt(value: &serde_json::Value, stage: &str) -> Result<
         recursive_uuid(value, "table_uuid")?;
         recursive_schema_id(value, "source_schema_id")?;
         recursive_positive(value, "source_snapshot")?;
-        recursive_fields(value, "source_fields")?;
+        recursive_field_domains(value, "source_fields", "source_field_domains_json")?;
         let source: serde_json::Value =
             serde_json::from_str(recursive_string(value, "source_schema_json", 256 * 1024)?)?;
         recursive_json_budget(&source)?;
