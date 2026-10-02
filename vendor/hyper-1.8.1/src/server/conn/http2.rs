@@ -278,6 +278,21 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Limits complete compressed header blocks across HEADERS/CONTINUATION.
+    /// Also prechecks decoded fields/Huffman output against max_header_list_size
+    /// and compacts pseudo-header backing. Excess decode limits close the H2
+    /// connection. Default None preserves upstream behavior. Raw I/O and HTTP
+    /// metadata/ownership still require separate bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` is zero or exceeds u32::MAX.
+    pub fn max_receive_header_block_size(&mut self, max: usize) -> &mut Self {
+        assert!(max > 0 && max <= u32::MAX as usize);
+        self.h2_builder.max_receive_header_block_size = Some(max);
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

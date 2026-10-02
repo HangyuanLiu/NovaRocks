@@ -19,6 +19,8 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    max_field_size: Option<usize>,
+    max_encoded_string_size: Option<usize>,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -34,6 +36,7 @@ pub enum DecoderError {
     InvalidPseudoheader,
     InvalidMaxDynamicSize,
     IntegerOverflow,
+    HeaderFieldTooLarge,
     NeedMore(NeedMore),
 }
 
@@ -158,7 +161,30 @@ impl Decoder {
             last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            max_field_size: None,
+            max_encoded_string_size: None,
         }
+    }
+
+    /// Enable pre-allocation field limits and compact string backing.
+    pub fn set_max_field_size(&mut self, max: usize, max_encoded: usize) {
+        self.max_field_size = Some(max);
+        self.max_encoded_string_size = Some(max_encoded);
+        // Bounded Huffman decoding uses exact validated output capacity.
+        self.buffer = BytesMut::new();
+    }
+
+    fn check_field_size(&self, name: usize, value: usize) -> Result<(), DecoderError> {
+        if let Some(max) = self.max_field_size {
+            if name
+                .checked_add(value)
+                .and_then(|n| n.checked_add(32))
+                .is_none_or(|n| n > max)
+            {
+                return Err(DecoderError::HeaderFieldTooLarge);
+            }
+        }
+        Ok(())
     }
 
     /// Queues a potential size update
@@ -270,7 +296,9 @@ impl Decoder {
 
     fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
         let index = decode_int(buf, 7)?;
-        self.table.get(index)
+        let entry = self.table.get(index)?;
+        self.check_field_size(entry.name().as_slice().len(), entry.value_slice().len())?;
+        Ok(entry)
     }
 
     fn decode_literal(
@@ -288,14 +316,19 @@ impl Decoder {
             let old_pos = buf.position();
             let name_marker = self.try_decode_string(buf)?;
             let value_marker = self.try_decode_string(buf)?;
+            self.check_field_size(name_marker.decoded_len(), value_marker.decoded_len())?;
             buf.set_position(old_pos);
             // Read the name as a literal
-            let name = name_marker.consume(buf);
-            let value = value_marker.consume(buf);
+            let name = name_marker.consume(buf, self.max_field_size.is_some());
+            let value = value_marker.consume(buf, self.max_field_size.is_some());
             Header::new(name, value)
         } else {
             let e = self.table.get(table_idx)?;
-            let value = self.decode_string(buf)?;
+            let old_pos = buf.position();
+            let value_marker = self.try_decode_string(buf)?;
+            self.check_field_size(e.name().as_slice().len(), value_marker.decoded_len())?;
+            buf.set_position(old_pos);
+            let value = value_marker.consume(buf, self.max_field_size.is_some());
 
             e.name().into_entry(value)
         }
@@ -317,6 +350,16 @@ impl Decoder {
         // Decode the string length using 7 bit prefix
         let len = decode_int(buf, 7)?;
 
+        // Refuse a declared literal before retaining incomplete continuation bytes.
+        if self.max_encoded_string_size.is_some_and(|max| len > max)
+            || (!huff
+                && self
+                    .max_field_size
+                    .is_some_and(|max| len > max.saturating_sub(32)))
+        {
+            return Err(DecoderError::HeaderFieldTooLarge);
+        }
+
         if len > buf.remaining() {
             tracing::trace!(len, remaining = buf.remaining(), "decode_string underflow",);
             return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
@@ -326,10 +369,15 @@ impl Decoder {
         if huff {
             let ret = {
                 let raw = &buf.chunk()[..len];
-                huffman::decode(raw, &mut self.buffer).map(|buf| StringMarker {
+                let string = if let Some(max) = self.max_field_size {
+                    huffman::decode_bounded(raw, max.saturating_sub(32))
+                } else {
+                    huffman::decode(raw, &mut self.buffer).map(BytesMut::freeze)
+                };
+                string.map(|string| StringMarker {
                     offset,
                     len,
-                    string: Some(BytesMut::freeze(buf)),
+                    string: Some(string),
                 })
             };
 
@@ -345,11 +393,12 @@ impl Decoder {
         }
     }
 
+    #[cfg(test)]
     fn decode_string(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<Bytes, DecoderError> {
         let old_pos = buf.position();
         let marker = self.try_decode_string(buf)?;
         buf.set_position(old_pos);
-        Ok(marker.consume(buf))
+        Ok(marker.consume(buf, self.max_field_size.is_some()))
     }
 }
 
@@ -464,14 +513,25 @@ fn take(buf: &mut Cursor<&mut BytesMut>, n: usize) -> Bytes {
 }
 
 impl StringMarker {
-    fn consume(self, buf: &mut Cursor<&mut BytesMut>) -> Bytes {
+    fn decoded_len(&self) -> usize {
+        self.string.as_ref().map_or(self.len, Bytes::len)
+    }
+
+    fn consume(self, buf: &mut Cursor<&mut BytesMut>, compact: bool) -> Bytes {
         buf.advance(self.offset);
         match self.string {
             Some(string) => {
                 buf.advance(self.len);
                 string
             }
-            None => take(buf, self.len),
+            None => {
+                let bytes = take(buf, self.len);
+                if compact {
+                    Bytes::copy_from_slice(&bytes)
+                } else {
+                    bytes
+                }
+            }
         }
     }
 }

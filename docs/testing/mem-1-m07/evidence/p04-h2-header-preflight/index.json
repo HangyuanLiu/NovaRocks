@@ -1,0 +1,244 @@
+{
+  "parent_commit": "084a5283352332d1e33c487646dba302bc553ca7",
+  "platform": "macOS arm64; Rust 1.92.0",
+  "commands": [
+    {
+      "path": "logs/compile-tests-first.log.gz",
+      "command": "cargo check -p novarocks-native-adapter --tests --offline",
+      "exit_code": 0,
+      "raw_sha256": "baf38e235a2a87f855679d550c385736f7fedac8b81374e07f7ae57fbcaf7e59",
+      "gzip_sha256": "0fb2967ddb555bebfeea48710be63666cc741eaeb6775434804b599ed07ac2c6"
+    },
+    {
+      "path": "logs/protocol-first.log.gz",
+      "command": "cargo test -p novarocks-native-adapter --test native_h2_header_preflight --offline -- --test-threads=1",
+      "exit_code": 0,
+      "raw_sha256": "7ab21d0224d5be85ffa4e159c5177b19a8ad0cbd662df1b5c3536b7646060e83",
+      "gzip_sha256": "4cdbfab6e19f718ac3b12df4e88559056c732576f3643d91e7d3a89e8bbbce99"
+    },
+    {
+      "path": "logs/private-probe-first.log.gz",
+      "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/reproduce.py (six probes, before final huffman cases)",
+      "exit_code": 0,
+      "raw_sha256": "e4ac861f0887ee5d64cc53619346174cdec69f781eeae990a37ce8290594e418",
+      "gzip_sha256": "513a38fc212cb342a2fd16030c8538b5065c5e8cc3bf4cf3ff746af565b7de1f"
+    },
+    {
+      "path": "logs/private-probe-encoded-expansion.log.gz",
+      "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/reproduce.py (six probes, encoded expansion case corrected to 180 characters)",
+      "exit_code": 0,
+      "raw_sha256": "1973430783e391cf3d54d84a79735f9d5f67676f270be9fc0281959a895d9b40",
+      "gzip_sha256": "1ef482088b13ac48211b58228c08064ade6ae3bfa79256da35d86a99073f87b5"
+    },
+    {
+      "path": "logs/private-probe-miri-first.log.gz",
+      "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/reproduce.py --miri (six probes)",
+      "exit_code": 0,
+      "raw_sha256": "8d30d95f9f47d52277718dd05b58d5ed279473ca8b6b3cdd25116ceed06f4148",
+      "gzip_sha256": "12e9463911c10f65a448b883a15bbbefe695208c2b9c0f13d8f976a4232e1e7f"
+    },
+    {
+      "path": "logs/private-probe-restored.log.gz",
+      "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/reproduce.py --miri (final seven probes)",
+      "exit_code": 0,
+      "raw_sha256": "1c2a4bafe3ba7fc688a2c946cef9e82b81acdf3a73a18bf55b554b71dec36e23",
+      "gzip_sha256": "39e1e1b2ce729c548a37bbb03faf1a0fe1e63b237fc0c4f8a5ff3b5d7d56bacc"
+    },
+    {
+      "path": "logs/protocol-restored.log.gz",
+      "command": "cargo test -p novarocks-native-adapter --test native_h2_header_preflight --test native_h2_retained_backing --test native_h2_bounded_receive --test native_h2_retained_send --test native_hyper_bounded_receive --offline -- --test-threads=1",
+      "exit_code": 0,
+      "raw_sha256": "68c7dedd82d7968b31305e07cd4d226c0a916b5917b10087ca0a8cb3dfde8a9d",
+      "gzip_sha256": "d4ca668f9624551b5e70ebd457a75c8c5ba66d7ac32254c66d5975b1b9a53d40"
+    },
+    {
+      "path": "logs/native-worker-lib.log.gz",
+      "command": "cargo test -p novarocks-native-adapter -p novarocks-worker --lib --offline -- --test-threads=1",
+      "exit_code": 0,
+      "raw_sha256": "b1d04ca7915cb1b0c02f2183e7759801638bba166a6c13152d224f2a8f6e1ecf",
+      "gzip_sha256": "5b5aa977301b1360b091520a7291c2d8231959960525c46e92bc966bccc39ed1"
+    },
+    {
+      "path": "logs/vendor-clippy.log.gz",
+      "command": "cargo clippy -p h2 -p hyper --lib --offline -- -D warnings",
+      "exit_code": 0,
+      "raw_sha256": "baaf41daafd25a9e1484bdea52d014c3b88973905b8dca99861428ddb980689b",
+      "gzip_sha256": "f91f705207cff83cc4dc2121b6954d0bf57658f2320e55bd5a64ec95456d6226"
+    },
+    {
+      "path": "logs/native-clippy.log.gz",
+      "command": "cargo clippy -p novarocks-native-adapter --all-targets --offline",
+      "exit_code": 0,
+      "raw_sha256": "8ef52fe583d3f576b03f56823d00421dbc7dde45e6105535f80f50242cf35884",
+      "gzip_sha256": "ce88629c2a2112f7d4fdedd96ff8df5431c38482076ff6cfcfb1e2149f102785"
+    },
+    {
+      "path": "logs/workspace-check.log.gz",
+      "command": "cargo check --workspace --all-targets --offline",
+      "exit_code": 0,
+      "raw_sha256": "4a4a9deb97e95c7fdd4513ea3126593c6ed3c955371bc721db61515d75c3b0d2",
+      "gzip_sha256": "47f67849e620f8a590cc23fc0525389cf8eb07329f1d8c8f2a6671e0fea6af18"
+    },
+    {
+      "path": "logs/root-fmt.log.gz",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "logs/vendor-fmt.log.gz",
+      "command": "rustfmt --check --edition 2021 --config skip_children=true (ten changed vendor files plus probe-tests.rs)",
+      "exit_code": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "logs/fixture-bom.log.gz",
+      "command": "DOCKER_CONTEXT=desktop-linux docker/fixture-inputs/verify.sh",
+      "exit_code": 0,
+      "raw_sha256": "e1c1af09ee2f617bd909384c2f1c2ac946b29a5997b1dacef656b6e61e1a7bda",
+      "gzip_sha256": "bedaace6d0e1942256e3a895325fc84dcb2d83d8ee6476915b32621f0eff250d"
+    },
+    {
+      "path": "logs/diff-check.log.gz",
+      "command": "git diff --check",
+      "exit_code": 0,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "logs/docs-reference-check.log.gz",
+      "command": "rg -n 'docs/superpowers|docs/design/(notes/|spikes/|[^/]+\\.md)' docs novarocks tests -g '!docs/AGENTS.md'",
+      "exit_code": 1,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    }
+  ],
+  "mutants": [
+    {
+      "name": "declared-limit",
+      "exit": 1,
+      "restored_sha256": "029d4af4047d32badba34cacd5f9f07f55237fd036ce649398d7bfd92bd1b946",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/declared-limit.log.gz",
+      "diff": "mutants/declared-limit.diff.gz"
+    },
+    {
+      "name": "combined-limit",
+      "exit": 1,
+      "restored_sha256": "029d4af4047d32badba34cacd5f9f07f55237fd036ce649398d7bfd92bd1b946",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/combined-limit.log.gz",
+      "diff": "mutants/combined-limit.diff.gz"
+    },
+    {
+      "name": "huffman-allocation",
+      "exit": 1,
+      "restored_sha256": "029d4af4047d32badba34cacd5f9f07f55237fd036ce649398d7bfd92bd1b946",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/huffman-allocation.log.gz",
+      "diff": "mutants/huffman-allocation.diff.gz"
+    },
+    {
+      "name": "compact-raw-alias",
+      "exit": 1,
+      "restored_sha256": "029d4af4047d32badba34cacd5f9f07f55237fd036ce649398d7bfd92bd1b946",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/compact-raw-alias.log.gz",
+      "diff": "mutants/compact-raw-alias.diff.gz"
+    },
+    {
+      "name": "continuation-total",
+      "exit": 101,
+      "restored_sha256": "62e47a05ec2ace771baac4eaa20ab8153f63b0260121bc0f1292c5a5b0365621",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/continuation-total.log.gz",
+      "diff": "mutants/continuation-total.diff.gz"
+    },
+    {
+      "name": "initial-block",
+      "exit": 101,
+      "restored_sha256": "62e47a05ec2ace771baac4eaa20ab8153f63b0260121bc0f1292c5a5b0365621",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/initial-block.log.gz",
+      "diff": "mutants/initial-block.diff.gz"
+    },
+    {
+      "name": "hyper-client-forward",
+      "exit": 101,
+      "restored_sha256": "32e15b20ed88ba7cbd355ffba9a5d2257ee1b4080c855a02334960304b9b7bb9",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/hyper-client-forward.log.gz",
+      "diff": "mutants/hyper-client-forward.diff.gz"
+    },
+    {
+      "name": "hyper-server-forward",
+      "exit": 101,
+      "restored_sha256": "c13cbf517d9dd72c259f9acfd5353e0c2392fe61cf22d7e480eac88c219635b4",
+      "cargo_runtime_exit_code": 101,
+      "log": "mutants/hyper-server-forward.log.gz",
+      "diff": "mutants/hyper-server-forward.diff.gz"
+    }
+  ],
+  "upstream": [
+    {
+      "package": "h2-0.4.12",
+      "registry_files_verified": 66,
+      "modified_original_files": [
+        "src/client.rs",
+        "src/codec/framed_read.rs",
+        "src/codec/framed_write.rs",
+        "src/codec/mod.rs",
+        "src/hpack/decoder.rs",
+        "src/hpack/huffman/mod.rs",
+        "src/lib.rs",
+        "src/proto/connection.rs",
+        "src/proto/streams/buffer.rs",
+        "src/proto/streams/mod.rs",
+        "src/proto/streams/recv.rs",
+        "src/proto/streams/streams.rs",
+        "src/server.rs"
+      ],
+      "registry_checksum": "f3c0b69cfcb4e1b9f1bf2f53f95f766e4661169728ec61cd3fe5a0166f2d1386"
+    },
+    {
+      "package": "hyper-1.8.1",
+      "registry_files_verified": 68,
+      "modified_original_files": [
+        "src/client/conn/http2.rs",
+        "src/proto/h2/client.rs",
+        "src/proto/h2/server.rs",
+        "src/server/conn/http2.rs"
+      ],
+      "registry_checksum": "2ab2d4f250c3d7b1c9fcdff1cece94ea4e2dfbec68614f7b87cb205f24ca9d11"
+    }
+  ],
+  "source_sha256": {
+    "vendor/h2-0.4.12/src/client.rs": "365aa635c45b2f6d7f7e4cf3b13096a1528ff977bfddfeb94aaed6bc089f513e",
+    "vendor/h2-0.4.12/src/server.rs": "5d2156103e5c6840cd4086bd9ebb4625f0d81f3d7ec9a25ac8e208948115fe97",
+    "vendor/h2-0.4.12/src/codec/mod.rs": "6707ba47bb7fa4cd3aa7da7f8673a8c9b239c72378bf43ce7a50a014139272d8",
+    "vendor/h2-0.4.12/src/codec/framed_read.rs": "62e47a05ec2ace771baac4eaa20ab8153f63b0260121bc0f1292c5a5b0365621",
+    "vendor/h2-0.4.12/src/hpack/decoder.rs": "029d4af4047d32badba34cacd5f9f07f55237fd036ce649398d7bfd92bd1b946",
+    "vendor/h2-0.4.12/src/hpack/header.rs": "b41158784403037c347bfecb7de41b63acb46c825a9c15c4011859c418dc540d",
+    "vendor/h2-0.4.12/src/hpack/huffman/mod.rs": "3f81b224893477ae6bd7f133b05c97960a24bf77ad6a503391c4500ac5932125",
+    "vendor/h2-0.4.12/src/hpack/huffman/table.rs": "6b7f94af0bb5d236d4e671eff4afe5dc254a20eaddd2d57dd6e8f53e2a60c337",
+    "vendor/h2-0.4.12/src/ext.rs": "2fb968f754829fc50392b6ccb4b90cc4c8b88657a5e3a7259f53916e13dc1c91",
+    "vendor/hyper-1.8.1/src/client/conn/http2.rs": "d278495ec849bab61073d06de789aa05507aea4ac40337ebdf5f4bcda0bffdef",
+    "vendor/hyper-1.8.1/src/server/conn/http2.rs": "1b7dace21d081c73e8f60fc61e19780b02b899c3d149db76992740f8f5475779",
+    "vendor/hyper-1.8.1/src/proto/h2/client.rs": "32e15b20ed88ba7cbd355ffba9a5d2257ee1b4080c855a02334960304b9b7bb9",
+    "vendor/hyper-1.8.1/src/proto/h2/server.rs": "c13cbf517d9dd72c259f9acfd5353e0c2392fe61cf22d7e480eac88c219635b4",
+    "vendor/h2-0.4.12/PATCH.md": "fe64e5bcdd87c7411ae5b3808c93ff361a6899717d69bbd7b35871a724f6fc5c",
+    "vendor/hyper-1.8.1/PATCH.md": "b504c4a31c91ae0ecaaf41ea9f924600e7558b7eef3bebe1f2445f83e16ffd13",
+    "novarocks/native-adapter/tests/native_h2_header_preflight.rs": "e2159602206424a36afc7bcb8db4d034560759b61eb3ca63474ac7ba893c27a1",
+    "Cargo.lock": "dce7f79d1119b4acf1e0b8a5fd8b5c6d3af7014bfb92fc87245ea5122bd761ff",
+    "docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/probe-tests.rs": "6acbe44803299289e8b746e57bd7ce3e2ae8dfb1c629cf794b62802682b068fd",
+    "docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/reproduce.py": "04e3264e8089c01468b89f8a8d43ab37d73f5c9d7f0e7460744b71aadcc35ce8",
+    "docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/probe-Cargo.lock": "4ec0b28731e843aaaac5721ae1803003504a5aaa6b2ed96587f0256e2f9af315"
+  },
+  "workspace_distinct_tests": 923,
+  "isolated_private_tests": 18,
+  "isolated_miri_probes": 7,
+  "scope": "opt-in header decoding allocation prechecks; complete Native connection ownership not established",
+  "documentation_check_note": "docs/design and root src do not exist; template literal checks were inapplicable. Resolved external DOC_ROOT is used; no docs/superpowers directory; reference scan over actual docs/novarocks/tests had no matches (rg exit 1)."
+}

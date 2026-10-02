@@ -114,6 +114,11 @@ impl<T, B> Codec<T, B> {
         self.inner.set_max_header_list_size(val);
     }
 
+    /// Limit encoded header blocks and pre-allocation field decoding.
+    pub fn set_max_recv_header_block_size(&mut self, val: usize) {
+        self.inner.set_max_header_block_size(val);
+    }
+
     /// Get a reference to the inner stream.
     #[cfg(feature = "unstable")]
     pub fn get_ref(&self) -> &T {

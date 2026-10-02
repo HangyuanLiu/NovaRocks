@@ -253,6 +253,7 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
     retain_data_payloads: bool,
+    max_receive_header_block_size: Option<usize>,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
 
@@ -425,6 +426,10 @@ where
 
         if let Some(max) = builder.settings.max_header_list_size() {
             codec.set_max_recv_header_list_size(max as usize);
+        }
+
+        if let Some(max) = builder.max_receive_header_block_size {
+            codec.set_max_recv_header_block_size(max);
         }
 
         // Send initial settings frame.
@@ -692,6 +697,7 @@ impl Builder {
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             retain_data_payloads: false,
+            max_receive_header_block_size: None,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
 
@@ -1037,6 +1043,24 @@ impl Builder {
     /// their original owner. Codec headers/TLS/task backing remain separate.
     pub fn retain_data_payloads(&mut self, retain: bool) -> &mut Self {
         self.retain_data_payloads = retain;
+        self
+    }
+
+    /// Limit complete HPACK block bytes across HEADERS/CONTINUATION before
+    /// accumulating them. Also checks each decoded field (name + value + 32)
+    /// against the local max_header_list_size before HTTP copies/table insert.
+    /// Huffman validity/output length are checked before output allocation.
+    /// Pseudo headers use compact backing, so dynamic table/URI aliases cannot
+    /// pin raw codec blocks. Exceeding these decode limits closes the connection.
+    /// Default None preserves upstream decoding. This is not a complete
+    /// connection allocation/ownership bound; HTTP metadata and raw I/O remain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` is zero or exceeds u32::MAX.
+    pub fn max_receive_header_block_size(&mut self, max: usize) -> &mut Self {
+        assert!(max > 0 && max <= u32::MAX as usize);
+        self.max_receive_header_block_size = Some(max);
         self
     }
 

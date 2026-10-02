@@ -40,6 +40,38 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
     Ok(buf.split())
 }
 
+/// Validate and count the complete Huffman string before allocating output.
+/// The bounded path never reserves from the compressed length heuristic.
+pub fn decode_bounded(src: &[u8], max: usize) -> Result<bytes::Bytes, DecoderError> {
+    let mut decoder = Decoder::new();
+    let mut len = 0usize;
+    for &b in src {
+        for nibble in [b >> 4, b & 0xf] {
+            if decoder.decode4(nibble)?.is_some() {
+                if len == max {
+                    return Err(DecoderError::HeaderFieldTooLarge);
+                }
+                len += 1;
+            }
+        }
+    }
+    if !decoder.is_final() {
+        return Err(DecoderError::InvalidHuffmanCode);
+    }
+    let mut output = Vec::with_capacity(len);
+    let mut decoder = Decoder::new();
+    for &b in src {
+        for nibble in [b >> 4, b & 0xf] {
+            if let Some(byte) = decoder.decode4(nibble)? {
+                output.push(byte);
+            }
+        }
+    }
+    debug_assert_eq!(output.len(), len);
+    debug_assert_eq!(output.capacity(), len);
+    Ok(bytes::Bytes::from(output))
+}
+
 pub fn encode(src: &[u8], dst: &mut BytesMut) {
     let mut bits: u64 = 0;
     let mut bits_left = 40;

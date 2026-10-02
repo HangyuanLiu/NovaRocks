@@ -33,6 +33,7 @@ pub struct FramedRead<T> {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+    max_header_block_size: Option<usize>,
     receive_pool: Option<crate::ReceiveBufferPool>,
 }
 
@@ -46,6 +47,7 @@ struct Partial {
     buf: BytesMut,
 
     continuation_frames_count: usize,
+    encoded_len: usize,
 }
 
 #[derive(Debug)]
@@ -65,6 +67,7 @@ impl<T> FramedRead<T> {
             max_header_list_size,
             max_continuation_frames,
             partial: None,
+            max_header_block_size: None,
             receive_pool: None,
         }
     }
@@ -81,6 +84,13 @@ impl<T> FramedRead<T> {
     pub fn set_receive_pool(&mut self, pool: crate::ReceiveBufferPool) {
         assert!(self.max_frame_size() <= pool.buffer_capacity_bytes());
         self.receive_pool = Some(pool);
+    }
+
+    /// Limit a complete encoded block and each decoded field before allocation.
+    pub fn set_max_header_block_size(&mut self, max: usize) {
+        self.max_header_block_size = Some(max);
+        self.hpack
+            .set_max_field_size(self.max_header_list_size, max);
     }
 
     /// Returns the current max frame size setting
@@ -107,6 +117,9 @@ impl<T> FramedRead<T> {
     #[inline]
     pub fn set_max_header_list_size(&mut self, val: usize) {
         self.max_header_list_size = val;
+        if let Some(max) = self.max_header_block_size {
+            self.hpack.set_max_field_size(val, max);
+        }
         // Update max CONTINUATION frames too, since its based on this
         self.max_continuation_frames = calc_max_continuation_frames(val, self.max_frame_size());
     }
@@ -134,6 +147,7 @@ fn decode_frame(
     hpack: &mut hpack::Decoder,
     max_header_list_size: usize,
     max_continuation_frames: usize,
+    max_header_block_size: Option<usize>,
     partial_inout: &mut Option<Partial>,
     mut bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
@@ -175,12 +189,19 @@ fn decode_frame(
                 }
             };
 
+            let encoded_len = payload.len();
+            if max_header_block_size.is_some_and(|max| encoded_len > max) {
+                return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+            }
             let is_end_headers = frame.is_end_headers();
 
             // Load the HPACK encoded headers
             match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
+                Err(frame::Error::Hpack(hpack::DecoderError::HeaderFieldTooLarge)) => {
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                },
                 Err(frame::Error::MalformedMessage) => {
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
@@ -201,6 +222,7 @@ fn decode_frame(
                     frame: Continuable::$frame(frame),
                     buf: payload,
                     continuation_frames_count: 0,
+                    encoded_len,
                 });
 
                 return Ok(None);
@@ -321,6 +343,16 @@ fn decode_frame(
                 }
             }
 
+            if let Some(max) = max_header_block_size {
+                let added = bytes.len() - frame::HEADER_LEN;
+                let Some(total) = partial.encoded_len.checked_add(added).filter(|n| *n <= max)
+                else {
+                    // Refuse before extending even when previous fields fit the list.
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                };
+                partial.encoded_len = total;
+            }
+
             // Extend the buf
             if partial.buf.is_empty() {
                 partial.buf = bytes.split_off(frame::HEADER_LEN);
@@ -353,6 +385,9 @@ fn decode_frame(
             {
                 Ok(_) => {}
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
+                Err(frame::Error::Hpack(hpack::DecoderError::HeaderFieldTooLarge)) => {
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                }
                 Err(frame::Error::MalformedMessage) => {
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
@@ -406,12 +441,14 @@ where
                 max_header_list_size,
                 ref mut partial,
                 max_continuation_frames,
+                max_header_block_size,
                 ..
             } = *self;
             if let Some(mut frame) = decode_frame(
                 hpack,
                 max_header_list_size,
                 max_continuation_frames,
+                max_header_block_size,
                 partial,
                 bytes,
             )? {

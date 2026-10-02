@@ -17,3 +17,8 @@ Real Hyper Incoming tests release flow credit when returning a DATA frame, retai
 ## Original DATA send owner forwarding
 
 Client/server connection builders forward retain_data_payloads(bool), default false, through the cloned H2 Config. The paired h2 mode skips payload/prefix copying and retains original DATA objects through successful upstream flush. Actual partial-write pointer and credit probes cover both Hyper directions; Native SendBuf<Bytes> preserves the original owner on advance. Header/TLS/task backing, queued Body count and Native profile installation remain separate. No product listener default changes or performance claims are made.
+
+
+## Optional header allocation precheck forwarding
+
+Client/server connection builders expose max_receive_header_block_size(max), preserving the default None and cloned private Config before forwarding to h2. The paired decoder counts complete compressed HPACK blocks and prechecks declared literals, Huffman output and combined fields before HTTP copies/table insertion; pseudo backing is compacted. Oversized decode limits close the connection. Actual cloned Hyper tests refuse incomplete oversized request/response literals before a service/body can run. Raw I/O, HTTP metadata/carrier lifetime, complete connection funding and Native setup remain separate; no production default or performance acceptance changes.
