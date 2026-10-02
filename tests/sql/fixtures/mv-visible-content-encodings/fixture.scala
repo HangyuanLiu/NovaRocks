@@ -603,6 +603,13 @@ object RecursiveTypeFixture {
     require(frozenInputJson.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=MaxSchemaBytes,"Frozen DDL/CTAS input exceeds budget")
     val reader=mapper.copy().enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
     val frozen=reader.readTree(frozenInputJson)
+    // Compare two parsed JSON values: SDK Long nodes otherwise differ from
+    // the Int nodes chosen when the same bounded integer is read from JSON.
+    def parsedTableFacts(t: Table): JsonNode = {
+      val bytes=mapper.writeValueAsBytes(ddlCtasTableFacts(t))
+      require(bytes.length<=MaxSchemaBytes,"Observed DDL/CTAS table facts exceed budget")
+      reader.readTree(bytes)
+    }
     def member(n: JsonNode,key: String): JsonNode = {
       require(n!=null && n.isObject && n.has(key),"Missing frozen DDL/CTAS member: "+key); n.get(key)
     }
@@ -626,13 +633,13 @@ object RecursiveTypeFixture {
     Vector((s,member(frozen,"source")),(d,member(frozen,"ddl"))).foreach { case(t,prior)=>
       val u=java.util.UUID.fromString(text(prior,"table_uuid")); require(u.toString==text(prior,"table_uuid") && u!=new java.util.UUID(0L,0L) && u.toString==metadata(t).uuid().toString,"DDL/CTAS frozen UUID changed")
       require(integer(prior,"schema_id",false)==t.schema().schemaId() && text(prior,"schema_json")==schemaJson(t),"DDL/CTAS frozen schema changed")
-      val observed=ddlCtasTableFacts(t)
+      val observed=parsedTableFacts(t)
       require(member(prior,"fields").isArray && member(prior,"fields")==member(observed,"fields"),"DDL/CTAS frozen field bindings changed")
     }
     val priorSource=member(frozen,"source"); val priorDdl=member(frozen,"ddl")
     require(s.currentSnapshot()!=null && integer(priorSource,"snapshot",true)==s.currentSnapshot().snapshotId(),"DDL/CTAS source frontier changed")
     require(member(priorDdl,"snapshot").isNull && member(priorDdl,"data_files").isArray && member(priorDdl,"data_files").size()==0 && member(priorDdl,"delete_files").isArray && member(priorDdl,"delete_files").size()==0 && member(priorDdl,"bag").isArray && member(priorDdl,"bag").size()==0,"Prepared DDL was not empty")
-    val sourceFact=ddlCtasTableFacts(s)
+    val sourceFact=parsedTableFacts(s)
     Vector("data_files","delete_files","summary","bag").foreach(k=>require(member(priorSource,k)==member(sourceFact,k),"DDL/CTAS source fact changed: "+k))
     val sourceByPath=sf.map(f=>f.path->f.id).toMap
     require(cf.forall(f=>sourceByPath(f.path)!=f.id),"This CTAS fixture copied source IDs instead of allocating its own bindings")
