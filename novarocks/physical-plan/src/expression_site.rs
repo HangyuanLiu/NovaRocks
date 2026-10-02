@@ -252,274 +252,247 @@ impl PhysicalExpressionRoots {
             sites: BTreeMap::new(),
             work: CompileCheckpoints::try_new(control, CompilePhase::Validate)?,
         };
-        for node in fragment.nodes().values() {
-            let id = node.id;
-            match &node.kind {
-                NodeKind::Scan {
-                    residuals,
-                    derived_values,
-                    ..
-                } => {
-                    for (predicate, expr) in residuals.iter().enumerate() {
-                        collector.add(
-                            id,
-                            ScanResidual {
-                                predicate: ordinal(predicate)?,
-                            },
-                            *expr,
-                            TruthOnly,
-                        )?;
-                    }
-                    for (derived, value) in derived_values.iter().enumerate() {
-                        let Some(crate::ValueDef {
-                            origin: ValueOrigin::Expr { node: owner, expr },
-                            ..
-                        }) = fragment.values().get(value)
-                        else {
-                            return Err(ExpressionRootError::InvalidDerivedValue);
-                        };
-                        if *owner != id {
-                            return Err(ExpressionRootError::InvalidDerivedValue);
+        let collected = (|| {
+            for node in fragment.nodes().values() {
+                let id = node.id;
+                match &node.kind {
+                    NodeKind::Scan {
+                        residuals,
+                        derived_values,
+                        ..
+                    } => {
+                        for (predicate, expr) in residuals.iter().enumerate() {
+                            collector.add(
+                                id,
+                                ScanResidual {
+                                    predicate: ordinal(predicate)?,
+                                },
+                                *expr,
+                                TruthOnly,
+                            )?;
                         }
-                        collector.add(
-                            id,
-                            ScanDerived {
-                                derived: ordinal(derived)?,
-                            },
-                            *expr,
-                            Value,
-                        )?;
-                    }
-                }
-                NodeKind::Filter { predicates } => {
-                    for (predicate, expr) in predicates.iter().enumerate() {
-                        collector.add(
-                            id,
-                            FilterPredicate {
-                                predicate: ordinal(predicate)?,
-                            },
-                            *expr,
-                            TruthOnly,
-                        )?;
-                    }
-                }
-                NodeKind::Project { expressions } => {
-                    for (expression, (expr, _)) in expressions.iter().enumerate() {
-                        collector.add(
-                            id,
-                            ProjectOutput {
-                                expression: ordinal(expression)?,
-                            },
-                            *expr,
-                            Value,
-                        )?;
-                    }
-                }
-                NodeKind::Aggregate {
-                    group_by, calls, ..
-                } => {
-                    for (group, (expr, _)) in group_by.iter().enumerate() {
-                        collector.add(
-                            id,
-                            AggregateGroup {
-                                group: ordinal(group)?,
-                            },
-                            *expr,
-                            Value,
-                        )?;
-                    }
-                    collector.calls(id, calls, false)?;
-                }
-                NodeKind::HashJoin {
-                    kind,
-                    keys,
-                    residual,
-                    ..
-                } => {
-                    for (key, definition) in keys.iter().enumerate() {
-                        let key = ordinal(key)?;
-                        collector.add(
-                            id,
-                            JoinKey {
-                                key,
-                                side: JoinSide::Left,
-                            },
-                            definition.left,
-                            Value,
-                        )?;
-                        collector.add(
-                            id,
-                            JoinKey {
-                                key,
-                                side: JoinSide::Right,
-                            },
-                            definition.right,
-                            Value,
-                        )?;
-                    }
-                    if let Some(expr) = residual {
-                        collector.add(id, HashJoinResidual, *expr, join_demand(*kind))?;
-                    }
-                }
-                NodeKind::NestLoopJoin {
-                    kind, predicate, ..
-                } => {
-                    if let Some(expr) = predicate {
-                        collector.add(id, NestLoopPredicate, *expr, join_demand(*kind))?;
-                    }
-                }
-                NodeKind::Sort { order_by, mode } => {
-                    for (key, item) in order_by.iter().enumerate() {
-                        collector.add(id, SortOrder { key: ordinal(key)? }, item.expr, Value)?;
-                    }
-                    match mode {
-                        SortMode::Global => {}
-                        SortMode::Analytic { partition_by }
-                        | SortMode::PartitionTopN { partition_by, .. } => {
-                            for (key, item) in partition_by.iter().enumerate() {
-                                collector.add(
-                                    id,
-                                    SortPartition { key: ordinal(key)? },
-                                    item.expr,
-                                    Value,
-                                )?;
+                        for (derived, value) in derived_values.iter().enumerate() {
+                            let Some(crate::ValueDef {
+                                origin: ValueOrigin::Expr { node: owner, expr },
+                                ..
+                            }) = fragment.values().get(value)
+                            else {
+                                return Err(ExpressionRootError::InvalidDerivedValue);
+                            };
+                            if *owner != id {
+                                return Err(ExpressionRootError::InvalidDerivedValue);
                             }
+                            collector.add(
+                                id,
+                                ScanDerived {
+                                    derived: ordinal(derived)?,
+                                },
+                                *expr,
+                                Value,
+                            )?;
                         }
                     }
-                }
-                NodeKind::TopN {
-                    order_by,
-                    reduction,
-                    ..
-                } => {
-                    for (key, item) in order_by.iter().enumerate() {
-                        collector.add(id, TopNOrder { key: ordinal(key)? }, item.expr, Value)?;
+                    NodeKind::Filter { predicates } => {
+                        for (predicate, expr) in predicates.iter().enumerate() {
+                            collector.add(
+                                id,
+                                FilterPredicate {
+                                    predicate: ordinal(predicate)?,
+                                },
+                                *expr,
+                                TruthOnly,
+                            )?;
+                        }
                     }
-                    if let TopNReduction::GroupedStates {
+                    NodeKind::Project { expressions } => {
+                        for (expression, (expr, _)) in expressions.iter().enumerate() {
+                            collector.add(
+                                id,
+                                ProjectOutput {
+                                    expression: ordinal(expression)?,
+                                },
+                                *expr,
+                                Value,
+                            )?;
+                        }
+                    }
+                    NodeKind::Aggregate {
                         group_by, calls, ..
-                    } = reduction
-                    {
+                    } => {
                         for (group, (expr, _)) in group_by.iter().enumerate() {
                             collector.add(
                                 id,
-                                TopNGroup {
+                                AggregateGroup {
                                     group: ordinal(group)?,
                                 },
                                 *expr,
                                 Value,
                             )?;
                         }
-                        collector.calls(id, calls, true)?;
+                        collector.calls(id, calls, false)?;
                     }
-                }
-                NodeKind::Window(spec) => {
-                    for (key, item) in spec.partition_by.iter().enumerate() {
-                        collector.add(
-                            id,
-                            WindowPartition { key: ordinal(key)? },
-                            item.expr,
-                            Value,
-                        )?;
-                    }
-                    for (key, item) in spec.order_by.iter().enumerate() {
-                        collector.add(id, WindowOrder { key: ordinal(key)? }, item.expr, Value)?;
-                    }
-                    for (call, item) in spec.expressions.iter().enumerate() {
-                        collector.add(
-                            id,
-                            WindowCall {
-                                call: ordinal(call)?,
-                            },
-                            item.expression,
-                            Value,
-                        )?;
-                    }
-                }
-                NodeKind::Values { rows } => {
-                    for (row, cells) in rows.iter().enumerate() {
-                        for (column, expr) in cells.iter().enumerate() {
+                    NodeKind::HashJoin {
+                        kind,
+                        keys,
+                        residual,
+                        ..
+                    } => {
+                        for (key, definition) in keys.iter().enumerate() {
+                            let key = ordinal(key)?;
                             collector.add(
                                 id,
-                                ValuesCell {
-                                    row: ordinal(row)?,
-                                    column: ordinal(column)?,
+                                JoinKey {
+                                    key,
+                                    side: JoinSide::Left,
+                                },
+                                definition.left,
+                                Value,
+                            )?;
+                            collector.add(
+                                id,
+                                JoinKey {
+                                    key,
+                                    side: JoinSide::Right,
+                                },
+                                definition.right,
+                                Value,
+                            )?;
+                        }
+                        if let Some(expr) = residual {
+                            collector.add(id, HashJoinResidual, *expr, join_demand(*kind))?;
+                        }
+                    }
+                    NodeKind::NestLoopJoin {
+                        kind, predicate, ..
+                    } => {
+                        if let Some(expr) = predicate {
+                            collector.add(id, NestLoopPredicate, *expr, join_demand(*kind))?;
+                        }
+                    }
+                    NodeKind::Sort { order_by, mode } => {
+                        for (key, item) in order_by.iter().enumerate() {
+                            collector.add(
+                                id,
+                                SortOrder { key: ordinal(key)? },
+                                item.expr,
+                                Value,
+                            )?;
+                        }
+                        match mode {
+                            SortMode::Global => {}
+                            SortMode::Analytic { partition_by }
+                            | SortMode::PartitionTopN { partition_by, .. } => {
+                                for (key, item) in partition_by.iter().enumerate() {
+                                    collector.add(
+                                        id,
+                                        SortPartition { key: ordinal(key)? },
+                                        item.expr,
+                                        Value,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    NodeKind::TopN {
+                        order_by,
+                        reduction,
+                        ..
+                    } => {
+                        for (key, item) in order_by.iter().enumerate() {
+                            collector.add(
+                                id,
+                                TopNOrder { key: ordinal(key)? },
+                                item.expr,
+                                Value,
+                            )?;
+                        }
+                        if let TopNReduction::GroupedStates {
+                            group_by, calls, ..
+                        } = reduction
+                        {
+                            for (group, (expr, _)) in group_by.iter().enumerate() {
+                                collector.add(
+                                    id,
+                                    TopNGroup {
+                                        group: ordinal(group)?,
+                                    },
+                                    *expr,
+                                    Value,
+                                )?;
+                            }
+                            collector.calls(id, calls, true)?;
+                        }
+                    }
+                    NodeKind::Window(spec) => {
+                        for (key, item) in spec.partition_by.iter().enumerate() {
+                            collector.add(
+                                id,
+                                WindowPartition { key: ordinal(key)? },
+                                item.expr,
+                                Value,
+                            )?;
+                        }
+                        for (key, item) in spec.order_by.iter().enumerate() {
+                            collector.add(
+                                id,
+                                WindowOrder { key: ordinal(key)? },
+                                item.expr,
+                                Value,
+                            )?;
+                        }
+                        for (call, item) in spec.expressions.iter().enumerate() {
+                            collector.add(
+                                id,
+                                WindowCall {
+                                    call: ordinal(call)?,
+                                },
+                                item.expression,
+                                Value,
+                            )?;
+                        }
+                    }
+                    NodeKind::Values { rows } => {
+                        for (row, cells) in rows.iter().enumerate() {
+                            for (column, expr) in cells.iter().enumerate() {
+                                collector.add(
+                                    id,
+                                    ValuesCell {
+                                        row: ordinal(row)?,
+                                        column: ordinal(column)?,
+                                    },
+                                    *expr,
+                                    Value,
+                                )?;
+                            }
+                            collector.work.step()?;
+                        }
+                    }
+                    NodeKind::GenerateSeries { start, stop, step } => {
+                        collector.add(id, SeriesStart, *start, Value)?;
+                        collector.add(id, SeriesStop, *stop, Value)?;
+                        if let Some(expr) = step {
+                            collector.add(id, SeriesStep, *expr, Value)?;
+                        }
+                    }
+                    NodeKind::TableFunction { arguments, .. } => {
+                        for (argument, expr) in arguments.iter().enumerate() {
+                            collector.add(
+                                id,
+                                TableFunctionArgument {
+                                    argument: ordinal(argument)?,
                                 },
                                 *expr,
                                 Value,
                             )?;
                         }
-                        collector.work.step()?;
                     }
-                }
-                NodeKind::GenerateSeries { start, stop, step } => {
-                    collector.add(id, SeriesStart, *start, Value)?;
-                    collector.add(id, SeriesStop, *stop, Value)?;
-                    if let Some(expr) = step {
-                        collector.add(id, SeriesStep, *expr, Value)?;
-                    }
-                }
-                NodeKind::TableFunction { arguments, .. } => {
-                    for (argument, expr) in arguments.iter().enumerate() {
-                        collector.add(
-                            id,
-                            TableFunctionArgument {
-                                argument: ordinal(argument)?,
-                            },
-                            *expr,
-                            Value,
-                        )?;
-                    }
-                }
-                NodeKind::Unpivot { spec } => {
-                    for (mapping, item) in spec.mappings.iter().enumerate() {
-                        for (constant, item) in item.constants.iter().enumerate() {
-                            if let crate::UnpivotConstant::Scalar(expr) = item {
-                                collector.add(
-                                    id,
-                                    ExpressionRootRole::UnpivotConstant {
-                                        mapping: ordinal(mapping)?,
-                                        constant: ordinal(constant)?,
-                                    },
-                                    *expr,
-                                    Value,
-                                )?;
-                            }
-                            collector.work.step()?;
-                        }
-                        collector.work.step()?;
-                    }
-                }
-                NodeKind::ChangeEventExpand { events, .. } => {
-                    for (event, item) in events.iter().enumerate() {
-                        let event = ordinal(event)?;
-                        if let Some(expr) = item.predicate {
-                            collector.add(id, ChangePredicate { event }, expr, TruthOnly)?;
-                        }
-                        for (assignment, (_, expr)) in item.assignments.iter().enumerate() {
-                            if let Some(expr) = expr {
-                                collector.add(
-                                    id,
-                                    ChangeAssignment {
-                                        event,
-                                        assignment: ordinal(assignment)?,
-                                    },
-                                    *expr,
-                                    Value,
-                                )?;
-                            }
-                            collector.work.step()?;
-                        }
-                        collector.work.step()?;
-                    }
-                }
-                NodeKind::TableFinish(spec) => {
-                    if let Some(unpivot) = &spec.grouped_unpivot {
-                        for (mapping, item) in unpivot.mappings.iter().enumerate() {
+                    NodeKind::Unpivot { spec } => {
+                        for (mapping, item) in spec.mappings.iter().enumerate() {
                             for (constant, item) in item.constants.iter().enumerate() {
                                 if let crate::UnpivotConstant::Scalar(expr) = item {
                                     collector.add(
                                         id,
-                                        FinishUnpivotConstant {
+                                        ExpressionRootRole::UnpivotConstant {
                                             mapping: ordinal(mapping)?,
                                             constant: ordinal(constant)?,
                                         },
@@ -532,17 +505,66 @@ impl PhysicalExpressionRoots {
                             collector.work.step()?;
                         }
                     }
+                    NodeKind::ChangeEventExpand { events, .. } => {
+                        for (event, item) in events.iter().enumerate() {
+                            let event = ordinal(event)?;
+                            if let Some(expr) = item.predicate {
+                                collector.add(id, ChangePredicate { event }, expr, TruthOnly)?;
+                            }
+                            for (assignment, (_, expr)) in item.assignments.iter().enumerate() {
+                                if let Some(expr) = expr {
+                                    collector.add(
+                                        id,
+                                        ChangeAssignment {
+                                            event,
+                                            assignment: ordinal(assignment)?,
+                                        },
+                                        *expr,
+                                        Value,
+                                    )?;
+                                }
+                                collector.work.step()?;
+                            }
+                            collector.work.step()?;
+                        }
+                    }
+                    NodeKind::TableFinish(spec) => {
+                        if let Some(unpivot) = &spec.grouped_unpivot {
+                            for (mapping, item) in unpivot.mappings.iter().enumerate() {
+                                for (constant, item) in item.constants.iter().enumerate() {
+                                    if let crate::UnpivotConstant::Scalar(expr) = item {
+                                        collector.add(
+                                            id,
+                                            FinishUnpivotConstant {
+                                                mapping: ordinal(mapping)?,
+                                                constant: ordinal(constant)?,
+                                            },
+                                            *expr,
+                                            Value,
+                                        )?;
+                                    }
+                                    collector.work.step()?;
+                                }
+                                collector.work.step()?;
+                            }
+                        }
+                    }
+                    NodeKind::Limit { .. }
+                    | NodeKind::SetOp { .. }
+                    | NodeKind::Repeat { .. }
+                    | NodeKind::AssertOneRow(_)
+                    | NodeKind::ExchangeSource { .. }
+                    | NodeKind::TableWriter { .. } => {}
                 }
-                NodeKind::Limit { .. }
-                | NodeKind::SetOp { .. }
-                | NodeKind::Repeat { .. }
-                | NodeKind::AssertOneRow(_)
-                | NodeKind::ExchangeSource { .. }
-                | NodeKind::TableWriter { .. } => {}
+                collector.work.step()?;
             }
-            collector.work.step()?;
+            Ok(())
+        })();
+        if let Err(ExpressionRootError::Control(error)) = &collected {
+            return Err(ExpressionRootError::Control(*error));
         }
         collector.work.finish()?;
+        collected?;
         Ok(Self {
             fragment: fragment.id(),
             sites: Arc::new(collector.sites),
@@ -607,26 +629,34 @@ impl PhysicalRootUses {
         control: &dyn PureCompileControl,
     ) -> Result<(), RootUseBindingError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        if self.roots.fragment != fragment.id() {
-            return Err(RootUseBindingError::WrongFragment);
-        }
-        let roots =
-            PhysicalExpressionRoots::try_new(fragment, control).map_err(|error| match error {
-                ExpressionRootError::Control(error) => RootUseBindingError::Control(error),
-                error => RootUseBindingError::Roots(error),
-            })?;
-        if roots.sites.len() != self.roots.sites.len() {
-            return Err(RootUseBindingError::ChangedRoots);
-        }
-        for (actual, checked) in roots.sites.iter().zip(self.roots.sites.iter()) {
-            if actual != checked {
+        let checked = (|| {
+            if self.roots.fragment != fragment.id() {
+                return Err(RootUseBindingError::WrongFragment);
+            }
+            let roots =
+                PhysicalExpressionRoots::try_new(fragment, control).map_err(
+                    |error| match error {
+                        ExpressionRootError::Control(error) => RootUseBindingError::Control(error),
+                        error => RootUseBindingError::Roots(error),
+                    },
+                )?;
+            if roots.sites.len() != self.roots.sites.len() {
                 return Err(RootUseBindingError::ChangedRoots);
             }
-            work.step()?;
+            for (actual, checked) in roots.sites.iter().zip(self.roots.sites.iter()) {
+                if actual != checked {
+                    return Err(RootUseBindingError::ChangedRoots);
+                }
+                work.step()?;
+            }
+            validate_definition_correspondence(fragment, &self.flow, &mut work)?;
+            Ok(())
+        })();
+        if let Err(RootUseBindingError::Control(error)) = &checked {
+            return Err(RootUseBindingError::Control(*error));
         }
-        validate_definition_correspondence(fragment, &self.flow, &mut work)?;
         work.finish()?;
-        Ok(())
+        checked
     }
     pub fn try_new(
         fragment: &Fragment,
@@ -635,45 +665,54 @@ impl PhysicalRootUses {
         control: &dyn PureCompileControl,
     ) -> Result<Self, RootUseBindingError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let roots =
-            PhysicalExpressionRoots::try_new(fragment, control).map_err(|error| match error {
-                ExpressionRootError::Control(error) => RootUseBindingError::Control(error),
-                error => RootUseBindingError::Roots(error),
-            })?;
-        if bindings.len() != roots.sites.len() || bindings.len() != flow.root_use_ids().len() {
-            return Err(RootUseBindingError::IncompleteCoverage);
+        let checked = (|| {
+            let roots =
+                PhysicalExpressionRoots::try_new(fragment, control).map_err(
+                    |error| match error {
+                        ExpressionRootError::Control(error) => RootUseBindingError::Control(error),
+                        error => RootUseBindingError::Roots(error),
+                    },
+                )?;
+            if bindings.len() != roots.sites.len() || bindings.len() != flow.root_use_ids().len() {
+                return Err(RootUseBindingError::IncompleteCoverage);
+            }
+            let mut sites = BTreeMap::new();
+            let mut use_ids = std::collections::BTreeSet::new();
+            for (site, id) in bindings {
+                let root = roots
+                    .sites
+                    .get(&site)
+                    .ok_or(RootUseBindingError::InvalidSite)?;
+                if flow.root_use_ids().binary_search(&id).is_err() {
+                    return Err(RootUseBindingError::InvalidUse);
+                }
+                let invocation = &flow.uses()[&id];
+                if root.expr != invocation.definition {
+                    return Err(RootUseBindingError::WrongDefinition);
+                }
+                if root.demand != invocation.context.demand {
+                    return Err(RootUseBindingError::WrongDemand);
+                }
+                let domain = &flow.domains()[&invocation.context.domain];
+                if domain.parent.is_some() || domain.guard.is_some() {
+                    return Err(RootUseBindingError::GuardedRoot);
+                }
+                if sites.insert(site, id).is_some() {
+                    return Err(RootUseBindingError::DuplicateSite);
+                }
+                if !use_ids.insert(id) {
+                    return Err(RootUseBindingError::SharedUse);
+                }
+                work.step()?;
+            }
+            validate_definition_correspondence(fragment, &flow, &mut work)?;
+            Ok((roots, sites))
+        })();
+        if let Err(RootUseBindingError::Control(error)) = &checked {
+            return Err(RootUseBindingError::Control(*error));
         }
-        let mut sites = BTreeMap::new();
-        let mut use_ids = std::collections::BTreeSet::new();
-        for (site, id) in bindings {
-            let root = roots
-                .sites
-                .get(&site)
-                .ok_or(RootUseBindingError::InvalidSite)?;
-            if flow.root_use_ids().binary_search(&id).is_err() {
-                return Err(RootUseBindingError::InvalidUse);
-            }
-            let invocation = &flow.uses()[&id];
-            if root.expr != invocation.definition {
-                return Err(RootUseBindingError::WrongDefinition);
-            }
-            if root.demand != invocation.context.demand {
-                return Err(RootUseBindingError::WrongDemand);
-            }
-            let domain = &flow.domains()[&invocation.context.domain];
-            if domain.parent.is_some() || domain.guard.is_some() {
-                return Err(RootUseBindingError::GuardedRoot);
-            }
-            if sites.insert(site, id).is_some() {
-                return Err(RootUseBindingError::DuplicateSite);
-            }
-            if !use_ids.insert(id) {
-                return Err(RootUseBindingError::SharedUse);
-            }
-            work.step()?;
-        }
-        validate_definition_correspondence(fragment, &flow, &mut work)?;
         work.finish()?;
+        let (roots, sites) = checked?;
         Ok(Self {
             roots,
             flow,

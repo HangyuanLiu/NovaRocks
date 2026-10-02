@@ -149,21 +149,28 @@ impl ConstantPool {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let metadata_bytes = validate_type(&field, &value_type, policy, &mut work)?;
-        if !novarocks_type_contract::arrow_data_types_exact_observed::<ConstantError>(
-            field.data_type(),
-            data.data_type(),
-            || {
-                work.step()?;
-                Ok(())
-            },
-        )? {
-            return Err(ConstantError::Invalid(
-                "constant ArrayData differs from exact field carrier",
-            ));
+        let checked = (|| {
+            let metadata_bytes = validate_type(&field, &value_type, policy, &mut work)?;
+            if !novarocks_type_contract::arrow_data_types_exact_observed::<ConstantError>(
+                field.data_type(),
+                data.data_type(),
+                || {
+                    work.step()?;
+                    Ok(())
+                },
+            )? {
+                return Err(ConstantError::Invalid(
+                    "constant ArrayData differs from exact field carrier",
+                ));
+            }
+            let facts = preflight(&data, metadata_bytes, policy, &mut work)?;
+            Ok(facts)
+        })();
+        if let Err(ConstantError::Control(error)) = &checked {
+            return Err(ConstantError::Control(*error));
         }
-        let facts = preflight(&data, metadata_bytes, policy, &mut work)?;
         work.finish()?;
+        let facts = checked?;
         control.checkpoint(phase, 0)?;
         let validated = data
             .validate_full()
@@ -175,8 +182,12 @@ impl ConstantPool {
         // Standard Arrow canonicalization applies parent offsets to Struct and
         // FixedSizeList children. All semantic reads use that same backing.
         let data = canonical.to_data();
-        validate_values(&data, field.is_nullable(), &mut work)?;
+        let validated = validate_values(&data, field.is_nullable(), &mut work);
+        if let Err(ConstantError::Control(error)) = &validated {
+            return Err(ConstantError::Control(*error));
+        }
         work.finish()?;
+        validated?;
         Ok(Self(Arc::new(PoolBacking {
             field,
             value_type,
@@ -2140,3 +2151,7 @@ fn validate_decimal_value(row: Row<'_>) -> Result<(), ConstantError> {
     };
     result.map_err(|e| ConstantError::Arrow(e.to_string()))
 }
+
+#[cfg(test)]
+#[path = "failure_tail_tests.rs"]
+mod failure_tail_tests;

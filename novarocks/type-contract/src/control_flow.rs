@@ -138,167 +138,174 @@ impl<D: Copy> ExpressionControlFlow<D> {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ExpressionControlFlowError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let definition_count = definitions.definition_count();
-        if domains.len() > MAX_CONTROL_DEFINITIONS
-            || uses.len() > MAX_CONTROL_DEFINITIONS
-            || definition_count > MAX_CONTROL_DEFINITIONS
-        {
-            return Err(ExpressionControlFlowError::TooManyItems);
-        }
-        let mut domain_index = BTreeMap::new();
-        for domain in domains {
-            if domain_index.insert(domain.id, domain).is_some() {
-                return Err(ExpressionControlFlowError::DuplicateIdentity);
+        let checked = (|| {
+            let definition_count = definitions.definition_count();
+            if domains.len() > MAX_CONTROL_DEFINITIONS
+                || uses.len() > MAX_CONTROL_DEFINITIONS
+                || definition_count > MAX_CONTROL_DEFINITIONS
+            {
+                return Err(ExpressionControlFlowError::TooManyItems);
             }
-            work.step()?;
-        }
-        let mut use_index = BTreeMap::new();
-        let mut references = uses.len();
-        if references > MAX_CONTROL_USE_REFERENCES {
-            return Err(ExpressionControlFlowError::TooManyItems);
-        }
-        for value in uses {
-            references = references
-                .checked_add(value.arguments.len())
-                .ok_or(ExpressionControlFlowError::TooManyItems)?;
+            let mut domain_index = BTreeMap::new();
+            for domain in domains {
+                if domain_index.insert(domain.id, domain).is_some() {
+                    return Err(ExpressionControlFlowError::DuplicateIdentity);
+                }
+                work.step()?;
+            }
+            let mut use_index = BTreeMap::new();
+            let mut references = uses.len();
             if references > MAX_CONTROL_USE_REFERENCES {
                 return Err(ExpressionControlFlowError::TooManyItems);
             }
-            if !definitions.contains_definition(value.definition)
-                || !domain_index.contains_key(&value.context.domain)
-            {
-                return Err(ExpressionControlFlowError::InvalidReference);
-            }
-            if use_index.insert(value.context.use_id, value).is_some() {
-                return Err(ExpressionControlFlowError::DuplicateIdentity);
-            }
-            work.step()?;
-        }
-        let mut children: BTreeMap<EvaluationDomainId, Vec<_>> = BTreeMap::new();
-        let mut ready = VecDeque::new();
-        let mut depths = BTreeMap::new();
-        for domain in domain_index.values() {
-            match (domain.parent, domain.guard) {
-                (None, None) => {
-                    depths.insert(domain.id, 1usize);
-                    ready.push_back(domain.id);
+            for value in uses {
+                references = references
+                    .checked_add(value.arguments.len())
+                    .ok_or(ExpressionControlFlowError::TooManyItems)?;
+                if references > MAX_CONTROL_USE_REFERENCES {
+                    return Err(ExpressionControlFlowError::TooManyItems);
                 }
-                (Some(parent), Some(guard)) => {
-                    let owner = use_index
-                        .get(&guard.owner)
-                        .ok_or(ExpressionControlFlowError::InvalidReference)?;
-                    if parent != owner.context.domain || !domain_index.contains_key(&parent) {
-                        return Err(ExpressionControlFlowError::InvalidGuard);
-                    }
-                    children.entry(parent).or_default().push(domain.id);
+                if !definitions.contains_definition(value.definition)
+                    || !domain_index.contains_key(&value.context.domain)
+                {
+                    return Err(ExpressionControlFlowError::InvalidReference);
                 }
-                _ => return Err(ExpressionControlFlowError::InvalidGuard),
-            }
-            work.step()?;
-        }
-        let mut visited = 0usize;
-        while let Some(parent) = ready.pop_front() {
-            visited += 1;
-            let depth = depths[&parent];
-            if depth > MAX_CONTROL_DEPTH {
-                return Err(ExpressionControlFlowError::TooDeep);
-            }
-            for child in children.get(&parent).into_iter().flatten() {
-                depths.insert(*child, depth + 1);
-                ready.push_back(*child);
+                if use_index.insert(value.context.use_id, value).is_some() {
+                    return Err(ExpressionControlFlowError::DuplicateIdentity);
+                }
                 work.step()?;
             }
-            work.step()?;
-        }
-        if visited != domain_index.len() {
-            return Err(ExpressionControlFlowError::Cycle);
-        }
-        let mut indegrees: BTreeMap<ExpressionUseId, usize> = BTreeMap::new();
-        for id in use_index.keys() {
-            indegrees.insert(*id, 0);
-            work.step()?;
-        }
-        let mut used_guards = BTreeMap::new();
-        for owner in use_index.values() {
-            validate_arity(owner.control, owner.arguments.len())?;
-            for (ordinal, argument) in owner.arguments.iter().enumerate() {
-                let child = use_index
-                    .get(argument)
-                    .ok_or(ExpressionControlFlowError::InvalidReference)?;
-                if child.context.demand
-                    != control_argument_demand(
-                        owner.control,
-                        owner.arguments.len(),
-                        ordinal,
-                        owner.context.demand,
-                    )
-                {
-                    return Err(ExpressionControlFlowError::InvalidDemand);
-                }
-                let expected = control_argument_guard(owner.control, ordinal);
-                let domain = &domain_index[&child.context.domain];
-                match expected {
-                    None if child.context.domain == owner.context.domain => {}
-                    Some(kind)
-                        if domain.parent == Some(owner.context.domain)
-                            && domain.guard
-                                == Some(DomainGuard {
-                                    owner: owner.context.use_id,
-                                    kind,
-                                }) =>
-                    {
-                        used_guards.insert(domain.id, ());
+            let mut children: BTreeMap<EvaluationDomainId, Vec<_>> = BTreeMap::new();
+            let mut ready = VecDeque::new();
+            let mut depths = BTreeMap::new();
+            for domain in domain_index.values() {
+                match (domain.parent, domain.guard) {
+                    (None, None) => {
+                        depths.insert(domain.id, 1usize);
+                        ready.push_back(domain.id);
+                    }
+                    (Some(parent), Some(guard)) => {
+                        let owner = use_index
+                            .get(&guard.owner)
+                            .ok_or(ExpressionControlFlowError::InvalidReference)?;
+                        if parent != owner.context.domain || !domain_index.contains_key(&parent) {
+                            return Err(ExpressionControlFlowError::InvalidGuard);
+                        }
+                        children.entry(parent).or_default().push(domain.id);
                     }
                     _ => return Err(ExpressionControlFlowError::InvalidGuard),
                 }
-                let degree = indegrees.get_mut(argument).unwrap();
-                *degree += 1;
-                if *degree > 1 {
-                    return Err(ExpressionControlFlowError::SharedUse);
-                }
                 work.step()?;
             }
-            work.step()?;
-        }
-        for domain in domain_index.values() {
-            if domain.guard.is_some() && !used_guards.contains_key(&domain.id) {
-                return Err(ExpressionControlFlowError::InvalidGuard);
-            }
-            work.step()?;
-        }
-        let mut ready = VecDeque::new();
-        let mut use_depths = BTreeMap::new();
-        let mut roots = Vec::new();
-        for (id, degree) in &indegrees {
-            if *degree == 0 {
-                roots.push(*id);
-                ready.push_back(*id);
-                use_depths.insert(*id, 1usize);
-            }
-            work.step()?;
-        }
-        let mut visited = 0usize;
-        while let Some(id) = ready.pop_front() {
-            visited += 1;
-            let depth = use_depths[&id];
-            if depth > MAX_CONTROL_DEPTH {
-                return Err(ExpressionControlFlowError::TooDeep);
-            }
-            for child in &use_index[&id].arguments {
-                let degree = indegrees.get_mut(child).unwrap();
-                *degree -= 1;
-                if *degree == 0 {
+            let mut visited = 0usize;
+            while let Some(parent) = ready.pop_front() {
+                visited += 1;
+                let depth = depths[&parent];
+                if depth > MAX_CONTROL_DEPTH {
+                    return Err(ExpressionControlFlowError::TooDeep);
+                }
+                for child in children.get(&parent).into_iter().flatten() {
+                    depths.insert(*child, depth + 1);
                     ready.push_back(*child);
-                    use_depths.insert(*child, depth + 1);
+                    work.step()?;
                 }
                 work.step()?;
             }
-            work.step()?;
-        }
-        if visited != use_index.len() {
-            return Err(ExpressionControlFlowError::Cycle);
+            if visited != domain_index.len() {
+                return Err(ExpressionControlFlowError::Cycle);
+            }
+            let mut indegrees: BTreeMap<ExpressionUseId, usize> = BTreeMap::new();
+            for id in use_index.keys() {
+                indegrees.insert(*id, 0);
+                work.step()?;
+            }
+            let mut used_guards = BTreeMap::new();
+            for owner in use_index.values() {
+                validate_arity(owner.control, owner.arguments.len())?;
+                for (ordinal, argument) in owner.arguments.iter().enumerate() {
+                    let child = use_index
+                        .get(argument)
+                        .ok_or(ExpressionControlFlowError::InvalidReference)?;
+                    if child.context.demand
+                        != control_argument_demand(
+                            owner.control,
+                            owner.arguments.len(),
+                            ordinal,
+                            owner.context.demand,
+                        )
+                    {
+                        return Err(ExpressionControlFlowError::InvalidDemand);
+                    }
+                    let expected = control_argument_guard(owner.control, ordinal);
+                    let domain = &domain_index[&child.context.domain];
+                    match expected {
+                        None if child.context.domain == owner.context.domain => {}
+                        Some(kind)
+                            if domain.parent == Some(owner.context.domain)
+                                && domain.guard
+                                    == Some(DomainGuard {
+                                        owner: owner.context.use_id,
+                                        kind,
+                                    }) =>
+                        {
+                            used_guards.insert(domain.id, ());
+                        }
+                        _ => return Err(ExpressionControlFlowError::InvalidGuard),
+                    }
+                    let degree = indegrees.get_mut(argument).unwrap();
+                    *degree += 1;
+                    if *degree > 1 {
+                        return Err(ExpressionControlFlowError::SharedUse);
+                    }
+                    work.step()?;
+                }
+                work.step()?;
+            }
+            for domain in domain_index.values() {
+                if domain.guard.is_some() && !used_guards.contains_key(&domain.id) {
+                    return Err(ExpressionControlFlowError::InvalidGuard);
+                }
+                work.step()?;
+            }
+            let mut ready = VecDeque::new();
+            let mut use_depths = BTreeMap::new();
+            let mut roots = Vec::new();
+            for (id, degree) in &indegrees {
+                if *degree == 0 {
+                    roots.push(*id);
+                    ready.push_back(*id);
+                    use_depths.insert(*id, 1usize);
+                }
+                work.step()?;
+            }
+            let mut visited = 0usize;
+            while let Some(id) = ready.pop_front() {
+                visited += 1;
+                let depth = use_depths[&id];
+                if depth > MAX_CONTROL_DEPTH {
+                    return Err(ExpressionControlFlowError::TooDeep);
+                }
+                for child in &use_index[&id].arguments {
+                    let degree = indegrees.get_mut(child).unwrap();
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push_back(*child);
+                        use_depths.insert(*child, depth + 1);
+                    }
+                    work.step()?;
+                }
+                work.step()?;
+            }
+            if visited != use_index.len() {
+                return Err(ExpressionControlFlowError::Cycle);
+            }
+            Ok((domain_index, use_index, roots, references))
+        })();
+        if let Err(ExpressionControlFlowError::Control(error)) = &checked {
+            return Err(ExpressionControlFlowError::Control(*error));
         }
         work.finish()?;
+        let (domain_index, use_index, roots, references) = checked?;
         Ok(Self {
             domains: Arc::new(domain_index),
             uses: Arc::new(use_index),
@@ -698,4 +705,7 @@ mod tests {
             Err(ExpressionControlFlowError::InvalidControlShape)
         );
     }
+
+    #[path = "failure_tail_tests.rs"]
+    mod failure_tail_tests;
 }

@@ -1051,3 +1051,6 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
         );
     }
 }
+
+#[path = "../expression_site/failure_tail_tests.rs"]
+mod failure_tail_tests;
