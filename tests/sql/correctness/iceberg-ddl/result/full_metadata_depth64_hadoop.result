@@ -1,0 +1,22 @@
+-- query 4
+id	deep
+1	NULL
+1	NULL
+2	NULL
+
+-- query 5
+leaf_type	row_count
+int	3
+
+-- query 7
+id
+1
+1
+2
+3
+
+-- query 8
+id
+1
+1
+2
