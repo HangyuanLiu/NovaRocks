@@ -26,6 +26,9 @@ fn model(f: impl Fn() + Send + Sync + 'static) {
     builder.max_threads = 4;
     builder.preemption_bound = Some(2);
     builder.max_branches = 20_000;
+    builder.max_permutations = None;
+    builder.max_duration = None;
+    builder.checkpoint_file = None;
     builder.check(f);
 }
 #[test]
