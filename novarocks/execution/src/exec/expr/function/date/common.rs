@@ -89,7 +89,7 @@ fn numeric_datetime_literal_to_naive(value: i64) -> Option<NaiveDateTime> {
 }
 
 pub fn date32_to_naive(days: i32) -> Option<NaiveDate> {
-    NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
+    NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET.checked_add(days)?)
 }
 
 pub fn naive_to_date32(date: NaiveDate) -> i32 {
@@ -738,4 +738,58 @@ pub fn convert_tz_fixed(
     let dt_from = from.from_local_datetime(&dt).unwrap();
     let utc = dt_from.with_timezone(&Utc);
     utc.with_timezone(&to).naive_local()
+}
+
+#[cfg(test)]
+mod date32_checked_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn date32_rejects_unrepresentable_dates_without_overflowing_epoch_translation() {
+        for days in [i32::MIN, i32::MAX, i32::MAX - UNIX_EPOCH_DAY_OFFSET + 1] {
+            assert_eq!(date32_to_naive(days), None);
+        }
+        assert_eq!(date32_to_naive(0), NaiveDate::from_ymd_opt(1970, 1, 1));
+        assert_eq!(date32_to_naive(-1), NaiveDate::from_ymd_opt(1969, 12, 31));
+        assert_eq!(date32_to_naive(1), NaiveDate::from_ymd_opt(1970, 1, 2));
+        for date in [NaiveDate::MIN, NaiveDate::MAX] {
+            let days = naive_to_date32(date);
+            assert_eq!(date32_to_naive(days), Some(date));
+            let outside = if date == NaiveDate::MIN {
+                days - 1
+            } else {
+                days + 1
+            };
+            assert_eq!(date32_to_naive(outside), None);
+        }
+    }
+
+    #[test]
+    fn datetime_extraction_keeps_nulls_for_invalid_date32_and_valid_epoch_rows() {
+        use arrow::array::Date32Array;
+        let input: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(i32::MAX),
+            Some(0),
+            None,
+            Some(i32::MIN),
+            Some(-1),
+        ]));
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let before = NaiveDate::from_ymd_opt(1969, 12, 31)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        assert_eq!(
+            extract_datetime_array(&input).unwrap(),
+            [None, Some(epoch), None, None, Some(before)]
+        );
+        assert_eq!(
+            extract_datetime_array(&input.slice(1, 3)).unwrap(),
+            [Some(epoch), None, None]
+        );
+    }
 }
