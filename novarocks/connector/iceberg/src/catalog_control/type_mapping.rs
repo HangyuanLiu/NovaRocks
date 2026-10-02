@@ -98,16 +98,6 @@ fn iceberg_type_inner(
     if !root
         && matches!(
             data_type,
-            ConnectorDataType::Int8 | ConnectorDataType::Int16
-        )
-    {
-        return Err(
-            "Iceberg narrow integer domains are only supported for top-level fields".into(),
-        );
-    }
-    if !root
-        && matches!(
-            data_type,
             ConnectorDataType::Bitmap | ConnectorDataType::Hll
         )
     {
@@ -152,8 +142,7 @@ fn iceberg_type_inner(
             )
             .map_err(|error| format!("invalid Iceberg DECIMAL({precision},{scale}): {error}"))
         }
-        ConnectorDataType::Utf8 => primitive(PrimitiveType::String),
-        ConnectorDataType::Json => Err("Iceberg mutation cannot preserve Json without an exact persisted logical marker".into()),
+        ConnectorDataType::Utf8 | ConnectorDataType::Json => primitive(PrimitiveType::String),
         ConnectorDataType::Binary | ConnectorDataType::Bitmap | ConnectorDataType::Hll => {
             primitive(PrimitiveType::Binary)
         }
@@ -405,11 +394,7 @@ mod tests {
             }),
             fixed_length: None,
         };
-        assert!(
-            iceberg_type(&narrow, &mut 1)
-                .unwrap_err()
-                .contains("top-level")
-        );
+        assert!(iceberg_type(&narrow, &mut 1).is_ok());
         let mut deep = ConnectorDataType::Int64;
         for _ in 0..65 {
             deep = ConnectorDataType::Array {
@@ -426,7 +411,6 @@ mod tests {
     fn mutation_rejects_logical_domains_without_exact_provider_restore() {
         use novarocks_types::logical_type::LogicalValue;
         for root in [
-            ConnectorDataType::Json,
             ConnectorDataType::Uuid,
             ConnectorDataType::FixedSizeBinary(16),
         ] {
@@ -437,7 +421,6 @@ mod tests {
             );
         }
         for nested in [
-            ConnectorDataType::Json,
             ConnectorDataType::Bitmap,
             ConnectorDataType::Hll,
             ConnectorDataType::Uuid,
@@ -540,4 +523,64 @@ mod tests {
                 .contains("non-UTC")
         );
     }
+}
+
+/// Obtain the same fresh field IDs the SDK will assign during table creation.
+/// This is a local metadata construction, before any catalog effect; using the
+/// SDK allocator avoids a second traversal order becoming an identity authority.
+pub(crate) fn creation_schema(
+    columns: &[ConnectorColumnDefinition],
+) -> Result<crate::iceberg::spec::Schema, String> {
+    use crate::iceberg::spec::{
+        FormatVersion, PartitionSpec, Schema, SortOrder, TableMetadataBuilder,
+    };
+    let schema = Schema::builder()
+        .with_fields(schema_fields(columns)?)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let metadata = TableMetadataBuilder::new(
+        schema,
+        PartitionSpec::unpartition_spec(),
+        SortOrder::unsorted_order(),
+        "memory://schema-allocation".into(),
+        FormatVersion::V3,
+        Default::default(),
+    )
+    .map_err(|e| e.to_string())?
+    .build()
+    .map_err(|e| e.to_string())?
+    .metadata;
+    Ok(metadata.current_schema().as_ref().clone())
+}
+pub(crate) fn creation_domains(
+    schema: &crate::iceberg::spec::Schema,
+    columns: &[ConnectorColumnDefinition],
+) -> Result<crate::field_domain::FieldDomains, String> {
+    if schema.as_struct().fields().len() != columns.len() {
+        return Err("creation schema arity differs".into());
+    }
+    let mut domains = crate::field_domain::FieldDomains::new();
+    for (field, column) in schema.as_struct().fields().iter().zip(columns) {
+        domains.extend(
+            crate::field_domain::requested_field_domains(field, &column.data_type)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(domains)
+}
+
+pub(crate) fn validate_creation_metadata(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    requested_schema: &crate::iceberg::spec::Schema,
+    requested_domains: &crate::field_domain::FieldDomains,
+) -> Result<(), String> {
+    if metadata.current_schema().as_struct() != requested_schema.as_struct() {
+        return Err("created Iceberg schema differs from the exact requested field tree".into());
+    }
+    let observed =
+        crate::field_domain::metadata_declarations(metadata).map_err(|e| e.to_string())?;
+    if observed.fields() != requested_domains {
+        return Err("created Iceberg logical domains differ from the requested field IDs".into());
+    }
+    Ok(())
 }
