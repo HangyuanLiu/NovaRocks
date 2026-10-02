@@ -276,9 +276,10 @@ fn original_controls_refuse_entry_quantum_and_completed_tail_without_retry() {
         |_, _, _| Ok(()),
     )
     .unwrap();
-    assert_eq!(*baseline.checks.lock().unwrap(), [0, 256, 1]);
+    let trace = [0, 256, 256, 2];
+    assert_eq!(*baseline.checks.lock().unwrap(), trace);
     for failure in refusals() {
-        for (check, expected_visits) in [(0, 0), (1, 255), (2, 257)] {
+        for (check, expected_visits) in [(0, 0), (1, 128), (2, 256), (3, 257)] {
             let control = Control {
                 checks: Mutex::default(),
                 refusal: Some((check, failure.clone())),
@@ -295,7 +296,7 @@ fn original_controls_refuse_entry_quantum_and_completed_tail_without_retry() {
             );
             assert_eq!(result, Err(failure.clone()));
             assert_eq!(visits, expected_visits);
-            assert_eq!(control.checks.lock().unwrap().len(), check + 1);
+            assert_eq!(*control.checks.lock().unwrap(), trace[..=check]);
         }
     }
 }
@@ -408,4 +409,49 @@ fn ordinary_length_rejection_observes_zero_completed_tail() {
         Err(KernelFailure::DeadlineExceeded)
     );
     assert_eq!(*control.checks.lock().unwrap(), [0, 0]);
+}
+
+#[test]
+fn bounded_row_projection_shares_null_traversal_observation_instead_of_a_parallel_counter() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Default)]
+    struct ProjectionControl {
+        visited: AtomicUsize,
+        positions: Mutex<Vec<usize>>,
+    }
+    impl KernelEvaluationControl for ProjectionControl {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= crate::MAX_UNOBSERVED_KERNEL_WORK);
+            self.positions
+                .lock()
+                .unwrap()
+                .push(self.visited.load(Ordering::Relaxed));
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("NULL projection must not wait");
+        }
+    }
+    let array: ArrayRef = Arc::new(Int64Array::from(vec![Some(17); 320]));
+    let control = ProjectionControl::default();
+    visit_selected_nulls(
+        EvaluatedArgument::Column(&array),
+        Selection::all(320),
+        &control,
+        |_, _, null| {
+            assert!(!null);
+            control.visited.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(control.visited.load(Ordering::Relaxed), 320);
+    let mut previous = 0;
+    for &position in control.positions.lock().unwrap().iter() {
+        // Each shallow source visit and its completed projection share the
+        // 256-unit limit. A separate 256-row counter would exceed this gap.
+        assert!(position - previous <= crate::MAX_UNOBSERVED_KERNEL_WORK as usize / 2);
+        previous = position;
+    }
+    assert_eq!(previous, 320);
 }

@@ -125,6 +125,10 @@ pub fn validate_argument_observed(
 /// Inspect selected SQL NULLs through the original carrier-addressing owner.
 /// The expression controller may inspect error placeholders while forming a
 /// call mask. This does not authorize passing unresolved errors to a kernel.
+/// Each successful bounded row callback is charged in this same work scope;
+/// callers flush their outer scope first and do not keep a concurrent counter
+/// for the callback's row work. Additional callback traversal needs its own
+/// explicit control boundary.
 pub fn visit_selected_nulls(
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,
@@ -159,6 +163,7 @@ pub fn visit_selected_nulls(
                 visitor_refused = true;
                 return Err(refusal);
             }
+            work.step()?;
         }
         Ok(())
     })();

@@ -243,7 +243,10 @@ impl CompiledExpressionInstance {
                     StaticExprKind::Constant(_)
                     | StaticExprKind::SlotId(_)
                     | StaticExprKind::NaryAnd { .. }
-                    | StaticExprKind::NaryOr { .. } => {
+                    | StaticExprKind::NaryOr { .. }
+                    | StaticExprKind::Not(_)
+                    | StaticExprKind::IsNull(_)
+                    | StaticExprKind::IsNotNull(_) => {
                         let mut summary = ScopedExpressionEffects::pure_value(invocation.context);
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
                             let child = *effects
@@ -296,6 +299,11 @@ impl CompiledExpressionInstance {
                         } else {
                             ControlShape::Disjunction
                         }) => {}
+                StaticExprKind::Not(_)
+                | StaticExprKind::IsNull(_)
+                | StaticExprKind::IsNotNull(_)
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 1 => {}
                 StaticExprKind::BoundCall { .. } => {
                     let call = checked
                         .channels()
@@ -701,6 +709,8 @@ mod guarded;
 mod guarded_tests;
 
 mod boolean_region;
+
+mod unary;
 
 #[cfg(test)]
 mod nary_tests;

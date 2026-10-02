@@ -163,3 +163,6 @@ mod control_call_tests;
 
 #[cfg(test)]
 mod nary_lowering_tests;
+
+#[cfg(test)]
+mod unary_lowering_tests;

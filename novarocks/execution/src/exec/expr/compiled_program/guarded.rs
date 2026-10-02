@@ -474,6 +474,24 @@ pub(super) fn evaluate_tree<'a>(
                         || work.step(),
                     )?)
                 }
+                StaticExprKind::Not(_)
+                | StaticExprKind::IsNull(_)
+                | StaticExprKind::IsNotNull(_) => {
+                    if frame.children.len() != 1 {
+                        return Err(invalid("unary occurrence requires its exact operand"));
+                    }
+                    let child = frame
+                        .children
+                        .pop()
+                        .ok_or_else(|| internal("missing actual unary operand"))?;
+                    let value = child.value.into_value(local_selection, work)?;
+                    OwnedValue::from_selected(super::unary::evaluate(
+                        definition.kind(),
+                        &value,
+                        local_selection,
+                        work,
+                    )?)
+                }
                 StaticExprKind::BoundCall { .. } => {
                     let call = &resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)];
                     match call.specialization().prepared() {

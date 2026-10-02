@@ -272,6 +272,13 @@ impl FlowAuthor {
         let (shape, args) = match &definition.kind {
             ExprKind::FunctionCall { args, .. } => (authors[&expr].shape, args.as_ref()),
             ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
+            ExprKind::Conjunction { args } => (ControlShape::Conjunction, args.as_ref()),
+            ExprKind::Disjunction { args } => (ControlShape::Disjunction, args.as_ref()),
+            ExprKind::Unary {
+                expr,
+                op: novarocks_physical_plan::UnaryOperator::Not,
+            }
+            | ExprKind::IsNull { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
             other => panic!("fixture lacks exact control author for {other:?}"),
         };
         let mut children = vec![];
@@ -515,13 +522,33 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             },
         )
         .unwrap();
+    let result = ResultPort {
+        fragment: fragment_id,
+        output: fragment.nodes()[&output].output.clone(),
+        fields: Box::from([ResultField {
+            name: "guarded_result".into(),
+            alias: None,
+            value: result_value,
+            ty: result_type,
+        }]),
+    };
+    compile_checked_fragment(&functions, fragment, &authors, result)
+}
+
+fn compile_checked_fragment(
+    functions: &PureEngineFunctionCatalog,
+    fragment: Fragment,
+    authors: &BTreeMap<ExprId, Author>,
+    result: ResultPort,
+) -> Arc<LocalProgram> {
+    let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut flow_author = FlowAuthor::new();
     let mut bindings = vec![];
     for (&site, root) in roots.sites() {
         let id = flow_author.visit(
             &fragment,
-            &authors,
+            authors,
             root.expr,
             EvaluationDomainId::new(u32::MAX),
             root.demand,
@@ -595,21 +622,17 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             });
             token.effects()
         } else {
-            ScopedExpressionEffects::pure_value(context)
+            let mut joined = ScopedExpressionEffects::pure_value(context);
+            for (ordinal, child) in invocation.arguments.iter().enumerate() {
+                joined = joined
+                    .join_control_argument(summaries[child], &flow, ordinal)
+                    .unwrap();
+            }
+            joined
         };
         summaries.insert(context.use_id, scoped);
     }
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, frozen, &Control).unwrap();
-    let result = ResultPort {
-        fragment: fragment_id,
-        output: fragment.nodes()[&output].output.clone(),
-        fields: Box::from([ResultField {
-            name: "guarded_result".into(),
-            alias: None,
-            value: result_value,
-            ty: result_type,
-        }]),
-    };
     let package = Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
@@ -635,7 +658,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     Arc::new(
         compile_fragment(
             validate_fragment_providers(package, &providers, &Control).unwrap(),
-            &functions,
+            functions,
             options(),
             &Control,
         )
@@ -999,3 +1022,6 @@ fn every_guarded_evaluation_callback_preserves_primary_failure_and_never_replays
         }
     }
 }
+
+#[path = "unary_tests.rs"]
+mod unary_tests;

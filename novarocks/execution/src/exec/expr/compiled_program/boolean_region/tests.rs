@@ -39,9 +39,8 @@ fn operand<'a>(selection: Selection<'a>, cells: &[Cell], message: &str) -> Selec
     let errors = cells
         .iter()
         .enumerate()
-        .filter_map(|(ordinal, cell)| {
-            matches!(cell, Cell::Error).then(|| RowDataError::new(ordinal, message))
-        })
+        .filter(|(_, cell)| matches!(cell, Cell::Error))
+        .map(|(ordinal, _)| RowDataError::new(ordinal, message))
         .collect::<Vec<_>>();
     SelectedValues::try_new(
         selection,
@@ -175,7 +174,7 @@ fn exhaustive_pure_and_or_value_and_truth_only_use_actual_sparse_results() {
                 let mut state = BooleanRows::new(pairs.len(), work)?;
                 let mut terminal = BTreeMap::new();
                 let mut remaining = (0..pairs.len()).collect::<Vec<_>>();
-                for argument in 0..2 {
+                for argument in [0, 1] {
                     let rows = remaining.iter().map(|&i| outer_rows[i]).collect::<Vec<_>>();
                     let selection = Selection::try_sparse(64, &rows).unwrap();
                     let selected = remaining

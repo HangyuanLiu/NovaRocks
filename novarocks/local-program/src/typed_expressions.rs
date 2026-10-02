@@ -136,6 +136,32 @@ impl ProgramTypedExpressions {
                         if let StaticExprKind::Constant(constant) = definition.kind() {
                             same_value(constant.value_type(), value, false, &mut work)?;
                         }
+                        if let StaticExprKind::Not(argument)
+                        | StaticExprKind::IsNull(argument)
+                        | StaticExprKind::IsNotNull(argument) = definition.kind()
+                        {
+                            if value.data_type != arrow_schema::DataType::Boolean
+                                || value.logical_type != ValueLogicalType::Physical
+                            {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            let Some(FunctionArgumentType::Value(operand)) =
+                                entries.get(argument.index())
+                            else {
+                                return Err(ProgramExpressionTypeError::WrongKind);
+                            };
+                            if matches!(definition.kind(), StaticExprKind::Not(_)) {
+                                if operand.data_type != arrow_schema::DataType::Boolean
+                                    || operand.logical_type != ValueLogicalType::Physical
+                                    || (!value.nullable && operand.nullable)
+                                {
+                                    return Err(ProgramExpressionTypeError::TypeMismatch);
+                                }
+                            } else if value.nullable {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            work.step()?;
+                        }
                         if let StaticExprKind::NaryAnd { args } | StaticExprKind::NaryOr { args } =
                             definition.kind()
                         {

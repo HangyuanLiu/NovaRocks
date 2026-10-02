@@ -224,6 +224,11 @@ fn lower_core(
                 ExprKind::FunctionCall { args, .. }
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args,
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::Not,
+                    expr,
+                }
+                | ExprKind::IsNull { expr, .. } => std::slice::from_ref(expr),
                 _ => return Err(ExpressionLoweringError::UnsupportedExpression(id)),
             };
             if let Some(&child) = args.get(next) {
@@ -333,6 +338,21 @@ fn lower_core(
                         StaticExprKind::NaryAnd { args: local_args }
                     } else {
                         StaticExprKind::NaryOr { args: local_args }
+                    }
+                }
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::Not,
+                    expr,
+                }
+                | ExprKind::IsNull { expr, .. } => {
+                    let child = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "unary operand was not lowered",
+                    ))?;
+                    match &node.kind {
+                        ExprKind::Unary { .. } => StaticExprKind::Not(child),
+                        ExprKind::IsNull { negated: false, .. } => StaticExprKind::IsNull(child),
+                        ExprKind::IsNull { negated: true, .. } => StaticExprKind::IsNotNull(child),
+                        _ => unreachable!("checked unary kind"),
                     }
                 }
                 ExprKind::FunctionCall { args, .. } => {
@@ -627,6 +647,49 @@ fn prepare_core(
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
                 }
+                (
+                    ExprKind::Unary {
+                        op: novarocks_physical_plan::UnaryOperator::Not,
+                        expr,
+                    },
+                    StaticExprKind::Not(local_child),
+                )
+                | (
+                    ExprKind::IsNull {
+                        expr,
+                        negated: false,
+                    },
+                    StaticExprKind::IsNull(local_child),
+                )
+                | (
+                    ExprKind::IsNull {
+                        expr,
+                        negated: true,
+                    },
+                    StaticExprKind::IsNotNull(local_child),
+                ) => {
+                    if invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 1
+                        || lowered.ids.get(expr) != Some(local_child)
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "actual unary control or operand differs",
+                        ));
+                    }
+                    let child = invocation.arguments[0];
+                    if flow.uses()[&child].definition != *expr {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "actual unary operand occurrence differs",
+                        ));
+                    }
+                    ScopedExpressionEffects::pure_value(invocation.context).join_control_argument(
+                        *effects.get(&child).ok_or(ExpressionLoweringError::Invalid(
+                            "unary operand effects were not prepared",
+                        ))?,
+                        flow,
+                        0,
+                    )?
+                }
                 (ExprKind::Conjunction { args }, StaticExprKind::NaryAnd { args: local_args })
                 | (ExprKind::Disjunction { args }, StaticExprKind::NaryOr { args: local_args }) => {
                     let expected = if matches!(source.kind, ExprKind::Conjunction { .. }) {
@@ -862,6 +925,15 @@ fn literal_argument(
         (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
         (ExprKind::Conjunction { .. }, StaticExprKind::NaryAnd { .. })
         | (ExprKind::Disjunction { .. }, StaticExprKind::NaryOr { .. }) => Ok(None),
+        (
+            ExprKind::Unary {
+                op: novarocks_physical_plan::UnaryOperator::Not,
+                ..
+            },
+            StaticExprKind::Not(_),
+        )
+        | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
+        | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
         _ => Err(ExpressionLoweringError::Invalid(
             "unsupported call argument projection",
         )),

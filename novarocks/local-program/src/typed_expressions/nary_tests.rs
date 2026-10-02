@@ -256,6 +256,9 @@ fn add_use(
         StaticExprKind::NaryAnd { args } => (ControlShape::Conjunction, args.clone()),
         StaticExprKind::NaryOr { args } => (ControlShape::Disjunction, args.clone()),
         StaticExprKind::LambdaFunction { body, .. } => (ControlShape::LambdaBody, vec![*body]),
+        StaticExprKind::Not(child)
+        | StaticExprKind::IsNull(child)
+        | StaticExprKind::IsNotNull(child) => (ControlShape::Eager, vec![*child]),
         _ => (ControlShape::Eager, vec![]),
     };
     uses.push(ProgramExpressionUse {
@@ -270,11 +273,25 @@ fn add_use(
     });
     let children = arguments
         .into_iter()
-        .map(|child| add_use(child, demand, arena, uses))
+        .map(|child| {
+            add_use(
+                child,
+                if control == ControlShape::Eager {
+                    EvaluationDemand::Value
+                } else {
+                    demand
+                },
+                arena,
+                uses,
+            )
+        })
         .collect();
     uses[id.get() as usize].arguments = children;
     id
 }
+
+#[path = "unary_tests.rs"]
+mod unary_tests;
 
 #[test]
 fn nary_boolean_value_and_truth_only_preserve_full_nullable_types_and_constant_metadata() {
