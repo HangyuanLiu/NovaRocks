@@ -37,6 +37,8 @@ use crate::provider_types::{IcebergReadTypes, IcebergReadView};
 
 use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation};
 
+mod program_fields;
+mod program_recipe;
 mod recipe;
 pub use recipe::IcebergReadRecipeCompiler;
 

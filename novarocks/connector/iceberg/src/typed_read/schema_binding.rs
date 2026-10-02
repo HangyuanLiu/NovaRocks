@@ -813,11 +813,10 @@ fn bind_one_column(
     )))
 }
 
-fn bind_metadata_column(
+pub(crate) fn metadata_target_field(
     handle: &IcebergColumnHandle,
     metadata: IcebergMetadataColumn,
-    stored_row_lineage: StoredRowLineageIndices,
-) -> Result<IcebergBoundColumn, ConnectorError> {
+) -> Result<FieldRef, ConnectorError> {
     if handle.base_column_identity().name() != metadata.column_name() {
         return Err(corrupt(format!(
             "iceberg metadata field id {} is named {} rather than {}",
@@ -857,6 +856,15 @@ fn bind_metadata_column(
             .collect(),
         ),
     );
+    Ok(field)
+}
+
+fn bind_metadata_column(
+    handle: &IcebergColumnHandle,
+    metadata: IcebergMetadataColumn,
+    stored_row_lineage: StoredRowLineageIndices,
+) -> Result<IcebergBoundColumn, ConnectorError> {
+    let field = metadata_target_field(handle, metadata)?;
     // A rewritten v3 file materializes the row-lineage columns it carries
     // forward. Reading them is what keeps a row's history from being rewritten
     // into the rewriting snapshot's own sequence; only a file that stores
@@ -895,7 +903,7 @@ fn expect_primitive(
 ///
 /// iceberg-rust's Arrow conversion drops initial defaults, so a file written
 /// before `ADD COLUMN ... DEFAULT` would otherwise read back as null.
-fn annotated_read_schema(table_schema: &Schema) -> Result<SchemaRef, ConnectorError> {
+pub(crate) fn annotated_read_schema(table_schema: &Schema) -> Result<SchemaRef, ConnectorError> {
     let read_schema = sql_read_schema_from_iceberg(table_schema)
         .map_err(|error| invalid(format!("iceberg frozen table schema: {error}")))?;
     let frozen = table_schema.as_struct().fields();
@@ -1008,7 +1016,7 @@ fn annotate_data_type(field: &Field, frozen: &NestedField) -> Result<DataType, C
 }
 
 /// Walk a dereference path through Arrow struct children by field ID.
-fn dereference_target_field(
+pub(crate) fn dereference_target_field(
     base: &FieldRef,
     field_id_path: &[i32],
 ) -> Result<FieldRef, ConnectorError> {

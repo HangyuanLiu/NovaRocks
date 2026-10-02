@@ -115,7 +115,15 @@ impl<E: Error> fmt::Display for ConnectorReadProgramCompileError<E> {
         }
     }
 }
-impl<E: Error> Error for ConnectorReadProgramCompileError<E> {}
+impl<E: Error + 'static> Error for ConnectorReadProgramCompileError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Contract(error) => Some(error),
+            Self::Provider(error) => Some(error),
+            Self::Control(error) => Some(error),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorReadProgramRecipe(FrozenConnectorRead);
@@ -127,79 +135,82 @@ impl ConnectorReadProgramRecipe {
         compiler: &C,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConnectorReadProgramCompileError<C::Error>> {
-        control
-            .checkpoint(CompilePhase::ProviderValidation, 0)
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)
             .map_err(ConnectorReadProgramCompileError::Control)?;
-        let canonical =
-            compiler
-                .compile_private(frozen, control)
-                .map_err(|failure| match failure {
+        let result = (|| {
+            work.flush()
+                .map_err(ConnectorReadProgramCompileError::Control)?;
+            let canonical = compiler.compile_private(frozen, work.control()).map_err(
+                |failure| match failure {
                     PureProviderCompileError::Provider(error) => {
                         ConnectorReadProgramCompileError::Provider(error)
                     }
                     PureProviderCompileError::Control(error) => {
                         ConnectorReadProgramCompileError::Control(error)
                     }
-                })?;
-        let mut checkpoints =
-            CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)
+                },
+            )?;
+            let header_shape = ConnectorReadRelationRecipe::validate_canonical_header_shape(
+                frozen.scan.recipe(),
+                &canonical,
+            );
+            work.step()
                 .map_err(ConnectorReadProgramCompileError::Control)?;
-        ConnectorReadRelationRecipe::validate_canonical_header_shape(
-            frozen.scan.recipe(),
-            &canonical,
-        )
-        .map_err(|error| ConnectorReadProgramCompileError::Contract(invalid(error.to_string())))?;
-        checkpoints
-            .step()
-            .map_err(ConnectorReadProgramCompileError::Control)?;
-        for (original, canonical) in frozen
-            .scan
-            .recipe()
-            .columns()
-            .iter()
-            .zip(canonical.columns())
-        {
-            if original.header() != canonical.header() {
-                return Err(ConnectorReadProgramCompileError::Contract(invalid(
-                    "canonical read column header differs from its frozen ordinal",
-                )));
-            }
-            checkpoints
-                .step()
-                .map_err(ConnectorReadProgramCompileError::Control)?;
-        }
-        let scan = frozen
-            .scan
-            .try_replace_private_recipe(canonical)
-            .map_err(|error| {
-                ConnectorReadProgramCompileError::Contract(match error {
-                    StaticConnectorScanError::TooManyRetainedBytes => exhausted(),
-                    _ => invalid(error.to_string()),
-                })
+            header_shape.map_err(|error| {
+                ConnectorReadProgramCompileError::Contract(invalid(error.to_string()))
             })?;
-        // Public facts were validated before provider compilation. Sharing them
-        // cannot alter any assignment, predicate, schema or source identity.
-        let retained_bytes = scan
-            .retained_bytes()
-            .checked_add(frozen.public.charged_bytes())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<FrozenConnectorRead>()))
-            .ok_or_else(|| ConnectorReadProgramCompileError::Contract(exhausted()))?;
-        if retained_bytes > MAX_STATIC_SCAN_RETAINED_BYTES {
-            return Err(ConnectorReadProgramCompileError::Contract(exhausted()));
+            for (original, canonical) in frozen
+                .scan
+                .recipe()
+                .columns()
+                .iter()
+                .zip(canonical.columns())
+            {
+                let same_header = original.header() == canonical.header();
+                work.step()
+                    .map_err(ConnectorReadProgramCompileError::Control)?;
+                if !same_header {
+                    return Err(ConnectorReadProgramCompileError::Contract(invalid(
+                        "canonical read column header differs from its frozen ordinal",
+                    )));
+                }
+            }
+            let scan = frozen
+                .scan
+                .try_replace_private_recipe(canonical)
+                .map_err(|error| {
+                    ConnectorReadProgramCompileError::Contract(match error {
+                        StaticConnectorScanError::TooManyRetainedBytes => exhausted(),
+                        _ => invalid(error.to_string()),
+                    })
+                })?;
+            // Public facts were validated before provider compilation. Sharing them
+            // cannot alter any assignment, predicate, schema or source identity.
+            let retained_bytes = scan
+                .retained_bytes()
+                .checked_add(frozen.public.charged_bytes())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<FrozenConnectorRead>()))
+                .ok_or_else(|| ConnectorReadProgramCompileError::Contract(exhausted()))?;
+            if retained_bytes > MAX_STATIC_SCAN_RETAINED_BYTES {
+                return Err(ConnectorReadProgramCompileError::Contract(exhausted()));
+            }
+            let canonical = FrozenConnectorRead {
+                scan,
+                public: frozen.public.clone(),
+                retained_bytes,
+            };
+            work.step()
+                .map_err(ConnectorReadProgramCompileError::Control)?;
+            Ok(Self(canonical))
+        })();
+        if matches!(&result, Err(ConnectorReadProgramCompileError::Control(_))) {
+            return result;
         }
-        let canonical = FrozenConnectorRead {
-            scan,
-            public: frozen.public.clone(),
-            retained_bytes,
-        };
-        checkpoints
-            .step()
+        work.finish()
             .map_err(ConnectorReadProgramCompileError::Control)?;
-        checkpoints
-            .finish()
-            .map_err(ConnectorReadProgramCompileError::Control)?;
-        Ok(Self(canonical))
+        result
     }
+
     pub const fn frozen(&self) -> &FrozenConnectorRead {
         &self.0
     }
@@ -492,5 +503,92 @@ mod tests {
                 CompileControlError::Cancelled
             ))
         ));
+    }
+    #[test]
+    fn ordinary_provider_and_contract_failures_observe_the_original_tail() {
+        struct Refusing;
+        impl ConnectorReadProgramCompiler for Refusing {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                _: &FrozenConnectorRead,
+                _: &dyn PureCompileControl,
+            ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<Self::Error>>
+            {
+                Err(PureProviderCompileError::Provider(invalid(
+                    "provider refusal",
+                )))
+            }
+        }
+        struct Tail(std::sync::Mutex<usize>);
+        impl PureCompileControl for Tail {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                let mut count = self.0.lock().unwrap();
+                *count += 1;
+                if *count == 3 {
+                    Err(CompileControlError::DeadlineExceeded)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let frozen =
+            FrozenConnectorRead::try_new(scan(), crate::read_public::tests::public()).unwrap();
+        let tail = Tail(std::sync::Mutex::new(0));
+        assert!(matches!(
+            ConnectorReadProgramRecipe::try_compile_with_provider(&frozen, &Refusing, &tail),
+            Err(ConnectorReadProgramCompileError::Control(
+                CompileControlError::DeadlineExceeded
+            ))
+        ));
+        assert_eq!(*tail.0.lock().unwrap(), 3);
+        let tail = Tail(std::sync::Mutex::new(0));
+        assert!(matches!(
+            ConnectorReadProgramRecipe::try_compile_with_provider(&frozen, &Compiler(true), &tail),
+            Err(ConnectorReadProgramCompileError::Control(
+                CompileControlError::DeadlineExceeded
+            ))
+        ));
+        assert_eq!(*tail.0.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn primary_provider_control_returns_without_another_callback_and_preserves_source() {
+        struct Interrupted;
+        impl ConnectorReadProgramCompiler for Interrupted {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                _: &FrozenConnectorRead,
+                _: &dyn PureCompileControl,
+            ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<Self::Error>>
+            {
+                Err(PureProviderCompileError::Control(
+                    CompileControlError::Cancelled,
+                ))
+            }
+        }
+        struct Count(std::sync::Mutex<usize>);
+        impl PureCompileControl for Count {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                *self.0.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        let frozen =
+            FrozenConnectorRead::try_new(scan(), crate::read_public::tests::public()).unwrap();
+        let count = Count(std::sync::Mutex::new(0));
+        let error =
+            ConnectorReadProgramRecipe::try_compile_with_provider(&frozen, &Interrupted, &count)
+                .unwrap_err();
+        assert!(matches!(
+            &error,
+            ConnectorReadProgramCompileError::Control(CompileControlError::Cancelled)
+        ));
+        assert_eq!(*count.0.lock().unwrap(), 2);
+        assert!(error.source().unwrap().is::<CompileControlError>());
+        let provider: ConnectorReadProgramCompileError<ConnectorError> =
+            ConnectorReadProgramCompileError::Provider(invalid("source"));
+        assert!(provider.source().unwrap().is::<ConnectorError>());
     }
 }

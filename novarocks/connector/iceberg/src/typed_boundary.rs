@@ -49,25 +49,21 @@ use novarocks_spi::connector::read_stack::adapter::{
 };
 use novarocks_spi::connector::read_stack::{
     Assignment, Bound, ConnectorExpression, ConnectorMvPartitionValue,
-    ConnectorMvTargetPartitionSelection, ConnectorReadArtifactCoverage,
-    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
-    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
-    ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadDistribution,
-    ConnectorReadInputVersion, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
-    ConnectorReadProperties, ConnectorReadRelationVersion, ConnectorReadRequestControl,
-    ConnectorReadRequestControlFactory, ConnectorReadStaticFacts, ConnectorReadTableHandle,
-    ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource, ConnectorTableHandle as _,
-    ConnectorValue, ConnectorValueType, Constraint, Domain, DynamicFilterSnapshot,
-    OrderedAssignments, Range, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
-    ValueSet,
+    ConnectorMvTargetPartitionSelection, ConnectorReadAttemptAccessMint,
+    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
+    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
+    ConnectorReadMetadataRequest, ConnectorReadMetadataVersion, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadStaticFacts,
+    ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
+    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
+    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
+    SystemTableDistribution, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
     ConnectorPinnedFileSet, ConnectorRequestContext, MvExactPartitionTransform,
     ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
-use prost::Message;
-use sha2::{Digest, Sha256};
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
 #[cfg(test)]
@@ -88,6 +84,9 @@ use crate::scan_model::{
 };
 use crate::schema_facts::row_lineage_enabled;
 use crate::typed_read::column_handle::{corrupt, invalid, unsupported};
+#[cfg(test)]
+use crate::typed_read::read_static_facts::decode_sha256_hex;
+use crate::typed_read::read_static_facts::iceberg_final_static_facts;
 use crate::typed_read::{
     ALWAYS_BOUND_METADATA_COLUMNS, FilesTableSplit, FilesTableSplitSource,
     FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
@@ -103,6 +102,10 @@ use crate::typed_read::{
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
     bounds_row_type, change_op_column_handle, derived_row_type_json, files_relation_schema_json,
     partition_row_type, plan_change_window_splits, system_relation_columns,
+};
+#[cfg(test)]
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadArtifactCoverage, ConnectorReadDistribution,
 };
 
 /// The Iceberg table property carrying the default name mapping.
@@ -1267,145 +1270,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
     }
 }
 
-/// Publish the immutable facts of an already negotiated Iceberg relation.
-///
-/// This is deliberately a pure projection of the frozen handle. In
-/// particular, it neither reopens catalog metadata nor walks a manifest list:
-/// those would make a final plan depend on mutable provider state and turn a
-/// static-facts request into hidden split enumeration.
-fn iceberg_final_static_facts(
-    relation: &crate::typed_read::IcebergRuntimeRelation,
-) -> Result<ConnectorReadStaticFacts<IcebergColumnHandle>, ConnectorError> {
-    match relation {
-        crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
-            let mut input = handle.to_proto();
-            // The input version is the frozen source identity. Predicate,
-            // projection, and limit are selection facts and therefore belong
-            // only to the selection digest below.
-            input.unenforced_predicate = None;
-            input.enforced_predicate = None;
-            input.limit = None;
-            input.projected_columns.clear();
-            static_facts_from_bytes(
-                b"iceberg-final-static-table-v1",
-                input.encode_to_vec(),
-                handle.to_proto().encode_to_vec(),
-                unconstrained_read_properties()?,
-                ConnectorReadArtifactCoverage::NoArtifactInputs,
-            )
-        }
-        crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
-            let frozen = reference.to_proto().encode_to_vec();
-            let properties = match reference.system_table_type().distribution() {
-                SystemTableDistribution::AllNodes => unconstrained_read_properties()?,
-                SystemTableDistribution::SingleCoordinator => ConnectorReadProperties::try_new(
-                    ConnectorReadDistribution::Singleton,
-                    Vec::new(),
-                )?,
-            };
-            // A metadata relation is opened whole rather than enumerated into
-            // splits, so nothing downstream carries what it covers except
-            // this. The frozen reference is that evidence: it names the
-            // immutable metadata file this relation was pinned to, and it is
-            // the same immutable bytes the selection digest is taken over.
-            ConnectorReadStaticFacts::try_new(
-                ConnectorReadInputVersion::try_new(
-                    static_digest(b"iceberg-final-static-system-table-v1", &frozen).as_slice(),
-                )?,
-                static_digest(b"iceberg-final-static-system-table-v1", &frozen),
-                properties,
-                ConnectorReadArtifactCoverage::NoArtifactInputs,
-                frozen,
-            )
-        }
-        crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {
-            let frozen = handle.to_proto().encode_to_vec();
-            static_facts_from_bytes(
-                b"iceberg-final-static-change-window-v1",
-                frozen.clone(),
-                frozen,
-                unconstrained_read_properties()?,
-                ConnectorReadArtifactCoverage::NoArtifactInputs,
-            )
-        }
-        crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
-            let frozen = handle.to_proto().encode_to_vec();
-            let selection_digest = static_digest(b"iceberg-final-static-table-execute-v1", &frozen);
-            let artifact_coverage = match handle.procedure_handle() {
-                Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
-                    ConnectorReadArtifactCoverage::exact(
-                        selection_digest,
-                        decode_sha256_hex(rewrite.artifact().artifact_digest_hex())?,
-                        rewrite.artifact().artifact_location().as_bytes().to_vec(),
-                    )?
-                }
-                Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
-                    ConnectorReadArtifactCoverage::NoArtifactInputs
-                }
-            };
-            ConnectorReadStaticFacts::try_new(
-                ConnectorReadInputVersion::try_new(
-                    static_digest(b"iceberg-final-static-table-execute-input-v1", &frozen)
-                        .as_slice(),
-                )?,
-                selection_digest,
-                unconstrained_read_properties()?,
-                artifact_coverage,
-                Vec::new(),
-            )
-        }
-        crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
-            "iceberg table-function relations do not publish final static read facts",
-        )),
-        crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => Err(unsupported(
-            "iceberg merge relations do not publish final static read facts",
-        )),
-    }
-}
-
-fn static_facts_from_bytes(
-    domain: &[u8],
-    input_identity: Vec<u8>,
-    selection: Vec<u8>,
-    properties: ConnectorReadProperties<IcebergColumnHandle>,
-    artifact_coverage: ConnectorReadArtifactCoverage,
-) -> Result<ConnectorReadStaticFacts<IcebergColumnHandle>, ConnectorError> {
-    ConnectorReadStaticFacts::try_new(
-        ConnectorReadInputVersion::try_new(static_digest(domain, &input_identity).as_slice())?,
-        static_digest(domain, &selection),
-        properties,
-        artifact_coverage,
-        Vec::new(),
-    )
-}
-
-fn unconstrained_read_properties()
--> Result<ConnectorReadProperties<IcebergColumnHandle>, ConnectorError> {
-    ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, Vec::new())
-}
-
-fn static_digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(domain);
-    digest.update((bytes.len() as u64).to_be_bytes());
-    digest.update(bytes);
-    digest.finalize().into()
-}
-
-fn decode_sha256_hex(value: &str) -> Result<[u8; 32], ConnectorError> {
-    if value.len() != 64 {
-        return Err(invalid(
-            "iceberg artifact digest is not a SHA-256 hex value",
-        ));
-    }
-    let mut digest = [0_u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| invalid("iceberg artifact digest is not valid hexadecimal"))?;
-    }
-    Ok(digest)
-}
-
 /// Check every identity fence the frozen rewrite artifact carries before the
 /// TableExecute relation can admit split dispatch or any writer side effect.
 fn validate_rewrite_position_delete_artifact(
@@ -2453,11 +2317,7 @@ fn rewrite_position_delete_pseudo_column(
     name: &str,
     metadata: IcebergMetadataColumn,
 ) -> Result<IcebergColumnHandle, ConnectorError> {
-    IcebergColumnHandle::base_column(&NestedField::optional(
-        metadata.field_id(),
-        name,
-        Type::Primitive(metadata.declared_type()),
-    ))
+    crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -3334,13 +3194,13 @@ mod mv_target_selection_tests {
 }
 
 #[cfg(test)]
-mod final_static_facts_tests {
+pub(crate) mod final_static_facts_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use super::*;
 
-    fn table_handle() -> IcebergTableHandle {
+    pub(crate) fn table_handle() -> IcebergTableHandle {
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
