@@ -170,7 +170,7 @@ impl Shard {
 /// [`CountingAllocator::snapshot`] sums all shards, so the totals are
 /// unaffected.
 #[inline]
-fn shard_index() -> usize {
+pub(crate) fn shard_index() -> usize {
     let probe = 0u8;
     let region = (ptr::from_ref(&probe).addr() >> STACK_REGION_SHIFT) as u64;
     let mixed = region.wrapping_mul(PROBE_MIX);
@@ -200,7 +200,7 @@ fn shard_index() -> usize {
 /// counted from the caller's `Layout` rather than from a remembered size.
 pub struct CountingAllocator<A: GlobalAlloc> {
     inner: A,
-    shards: [Shard; SHARD_COUNT],
+    counters: ProcessCounters,
 }
 
 impl<A: GlobalAlloc> CountingAllocator<A> {
@@ -212,7 +212,7 @@ impl<A: GlobalAlloc> CountingAllocator<A> {
     pub const fn new(inner: A) -> Self {
         Self {
             inner,
-            shards: [const { Shard::new() }; SHARD_COUNT],
+            counters: ProcessCounters::new(),
         }
     }
 
@@ -251,6 +251,36 @@ impl<A: GlobalAlloc> CountingAllocator<A> {
     /// Allocation-free and lock-free, so it is safe to call from a diagnostic
     /// path at any time.
     pub fn snapshot(&self) -> AllocatorSnapshot {
+        self.counters.snapshot()
+    }
+}
+
+/// Shared inline counting storage. Each success/release preserves the existing
+/// CountingAllocator cost and event semantics; no TLS or heap storage is used.
+#[derive(Debug)]
+pub(crate) struct ProcessCounters {
+    shards: [Shard; SHARD_COUNT],
+}
+impl ProcessCounters {
+    pub(crate) const fn new() -> Self {
+        Self {
+            shards: [const { Shard::new() }; SHARD_COUNT],
+        }
+    }
+    #[inline]
+    pub(crate) fn record_failure(&self) {
+        self.shard().failures.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Band migration is a realloc, not an allocation event.
+    #[inline]
+    pub(crate) fn record_migration_in(&self, size: usize) {
+        let shard = self.shard();
+        shard
+            .allocated_bytes
+            .fetch_add(size as u64, Ordering::Relaxed);
+        shard.reallocations.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn snapshot(&self) -> AllocatorSnapshot {
         let mut allocated_total_bytes = 0u64;
         let mut deallocated_total_bytes = 0u64;
         let mut allocations = 0u64;
@@ -296,7 +326,7 @@ impl<A: GlobalAlloc> CountingAllocator<A> {
     /// it was and only the failure counter moves, because no memory came into
     /// existence.
     #[inline]
-    fn record_allocation(&self, pointer: *mut u8, size: usize) {
+    pub(crate) fn record_allocation(&self, pointer: *mut u8, size: usize) {
         let shard = self.shard();
         if pointer.is_null() {
             shard.failures.fetch_add(1, Ordering::Relaxed);
@@ -310,7 +340,7 @@ impl<A: GlobalAlloc> CountingAllocator<A> {
 
     /// Records a release of `size` bytes.
     #[inline]
-    fn record_release(&self, size: usize) {
+    pub(crate) fn record_release(&self, size: usize) {
         self.shard()
             .deallocated_bytes
             .fetch_add(size as u64, Ordering::Relaxed);
@@ -324,7 +354,12 @@ impl<A: GlobalAlloc> CountingAllocator<A> {
     /// double-count a resize as two events and, for the reader of a
     /// mid-transition snapshot, invent bytes that never coexisted.
     #[inline]
-    fn record_reallocation(&self, new_pointer: *mut u8, old_size: usize, new_size: usize) {
+    pub(crate) fn record_reallocation(
+        &self,
+        new_pointer: *mut u8,
+        old_size: usize,
+        new_size: usize,
+    ) {
         let shard = self.shard();
         if new_pointer.is_null() {
             // A refused `realloc` leaves the original block alive and
@@ -372,7 +407,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
         // SAFETY: `layout` is forwarded unchanged, so this call inherits the
         // caller's guarantee that it is a valid non-zero-size layout.
         let pointer = unsafe { self.inner.alloc(layout) };
-        self.record_allocation(pointer, layout.size());
+        self.counters.record_allocation(pointer, layout.size());
         pointer
     }
 
@@ -381,7 +416,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
         // SAFETY: as `alloc`; forwarded so the inner allocator keeps whatever
         // zeroing shortcut it has instead of falling back to alloc + memset.
         let pointer = unsafe { self.inner.alloc_zeroed(layout) };
-        self.record_allocation(pointer, layout.size());
+        self.counters.record_allocation(pointer, layout.size());
         pointer
     }
 
@@ -392,7 +427,8 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
         // allocator with `layout`, and that `new_size` is a valid size for
         // `layout.align()`.
         let new_pointer = unsafe { self.inner.realloc(pointer, layout, new_size) };
-        self.record_reallocation(new_pointer, layout.size(), new_size);
+        self.counters
+            .record_reallocation(new_pointer, layout.size(), new_size);
         new_pointer
     }
 
@@ -407,7 +443,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
         // bytes as still live. Over-reporting live memory for a few
         // instructions is the safe direction for a capacity authority;
         // under-reporting is not.
-        self.record_release(layout.size());
+        self.counters.record_release(layout.size());
     }
 }
 
@@ -571,7 +607,7 @@ mod tests {
         // one at a time, so a release can be visible while the matching
         // allocation is not. The reading must be low, never enormous.
         let allocator = wrapper();
-        allocator.shards[0]
+        allocator.counters.shards[0]
             .deallocated_bytes
             .fetch_add(4_096, Ordering::Relaxed);
         let snapshot = allocator.snapshot();

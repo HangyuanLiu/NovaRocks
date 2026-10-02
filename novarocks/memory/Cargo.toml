@@ -42,3 +42,7 @@ sha2.workspace = true
 [[bench]]
 name = "stock_cost"
 harness = false
+
+[[test]]
+name = "attribution_reconcile"
+harness = false

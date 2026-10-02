@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Size-banded allocation attribution, separate from funding and SQL policy.
-pub mod band;
-pub mod binding;
-pub mod counters;
-pub mod explicit;
-pub mod future;
-pub mod hook;
-pub mod readout;
-pub mod scope;
-mod tls;
-pub use band::{ATTRIBUTION_THRESHOLD_BYTES, ATTRIBUTION_TOKEN_BYTES};
-pub use counters::BandSnapshot;
-pub use hook::AttributingAllocator;
+//! Frozen layout format, shared by the global wrapper and explicit owners.
+pub use crate::lane::ATTRIBUTION_THRESHOLD_BYTES;
+use std::alloc::Layout;
+pub const ATTRIBUTION_TOKEN_BYTES: usize = 8;
+pub const fn is_tagged(size: usize) -> bool {
+    size >= ATTRIBUTION_THRESHOLD_BYTES
+}
+/// Preserves user alignment. The token occupies requested bytes, never usable-size slack.
+pub fn tagged_layout(layout: Layout) -> Option<Layout> {
+    let size = layout.size().checked_add(ATTRIBUTION_TOKEN_BYTES)?;
+    Layout::from_size_align(size, layout.align()).ok()
+}

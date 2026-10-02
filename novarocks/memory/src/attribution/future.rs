@@ -15,16 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Size-banded allocation attribution, separate from funding and SQL policy.
-pub mod band;
-pub mod binding;
-pub mod counters;
-pub mod explicit;
-pub mod future;
-pub mod hook;
-pub mod readout;
-pub mod scope;
-mod tls;
-pub use band::{ATTRIBUTION_THRESHOLD_BYTES, ATTRIBUTION_TOKEN_BYTES};
-pub use counters::BandSnapshot;
-pub use hook::AttributingAllocator;
+//! Reserved for the next approved implementation stage.
