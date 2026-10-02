@@ -63,6 +63,7 @@ pub(crate) struct Config {
     pub(crate) receive_header_block_buffer: Option<h2::ReceiveHeaderBlockBuffer>,
     pub(crate) receive_header_field_pool: Option<h2::ReceiveHeaderFieldPool>,
     pub(crate) receive_header_table_buffer: Option<h2::ReceiveHeaderTableBuffer>,
+    pub(crate) receive_header_map_pool: Option<http::header::HeaderMapAllocationPool>,
     pub(crate) header_table_size: Option<u32>,
     pub(crate) send_frame_buffer: Option<h2::SendFrameBuffer>,
     pub(crate) receive_goaway_buffer_pool: Option<h2::ReceiveBufferPool>,
@@ -94,6 +95,7 @@ impl Default for Config {
             receive_header_block_buffer: None,
             receive_header_field_pool: None,
             receive_header_table_buffer: None,
+            receive_header_map_pool: None,
             header_table_size: None,
             send_frame_buffer: None,
             receive_goaway_buffer_pool: None,
@@ -180,6 +182,9 @@ where
         }
         if let Some(buffer) = &config.receive_header_table_buffer {
             builder.receive_header_table_buffer(buffer.clone());
+        }
+        if let Some(pool) = &config.receive_header_map_pool {
+            builder.receive_header_map_pool(pool.clone());
         }
         if let Some(size) = config.header_table_size {
             builder.header_table_size(size);

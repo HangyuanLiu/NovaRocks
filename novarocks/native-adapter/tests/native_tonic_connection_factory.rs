@@ -231,6 +231,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
         )?),
         receive_header_field_pool: None,
         receive_header_table_buffer: None,
+        receive_header_map_pool: None,
         send_frame_buffer: Some(SendFrameBuffer::new(65536, FRAME_BYTES, owner.clone())?),
         receive_goaway_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner)?),
     })

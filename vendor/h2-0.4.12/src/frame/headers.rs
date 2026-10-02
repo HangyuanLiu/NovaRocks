@@ -233,6 +233,17 @@ impl Headers {
         Ok((headers, offset, src.len()))
     }
 
+    pub(crate) fn initialize_header_map(
+        &mut self,
+        pool: Option<&http::header::HeaderMapAllocationPool>,
+    ) -> Result<(), Error> {
+        if let Some(pool) = pool {
+            self.header_block.fields = HeaderMap::try_from_allocation_pool(pool)
+                .map_err(|_| Error::HeaderMapCapacityExhausted)?;
+        }
+        Ok(())
+    }
+
     pub fn load_hpack(
         &mut self,
         src: &mut BytesMut,
@@ -528,6 +539,17 @@ impl PushPromise {
             stream_id: head.stream_id(),
         };
         Ok((frame, offset, src.len()))
+    }
+
+    pub(crate) fn initialize_header_map(
+        &mut self,
+        pool: Option<&http::header::HeaderMapAllocationPool>,
+    ) -> Result<(), Error> {
+        if let Some(pool) = pool {
+            self.header_block.fields = HeaderMap::try_from_allocation_pool(pool)
+                .map_err(|_| Error::HeaderMapCapacityExhausted)?;
+        }
+        Ok(())
     }
 
     pub fn load_hpack(
@@ -962,6 +984,7 @@ impl HeaderBlock {
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
         let mut malformed = self.is_malformed;
+        let mut metadata_exhausted = false;
         let mut headers_size = self.calculate_header_list_size();
 
         macro_rules! set_pseudo {
@@ -1019,7 +1042,9 @@ impl HeaderBlock {
                         if headers_size < max_header_list_size {
                             self.field_size +=
                                 decoded_header_size(name.as_str().len(), value.len());
-                            self.fields.append(name, value);
+                            if !metadata_exhausted && self.fields.try_append(name, value).is_err() {
+                                metadata_exhausted = true;
+                            }
                         } else if !self.is_over_size {
                             tracing::trace!("load_hpack; header list size over max");
                             self.is_over_size = true;
@@ -1039,8 +1064,16 @@ impl HeaderBlock {
         // HPACK still continues to maintain connection-level table state.
         self.is_malformed = malformed;
         if let Err(e) = res {
+            // Preserve a complete HPACK failure. A local metadata shortage
+            // need not wait for a fragmented representation to finish.
+            if metadata_exhausted && matches!(&e, hpack::DecoderError::NeedMore(_)) {
+                return Err(Error::HeaderMapCapacityExhausted);
+            }
             tracing::trace!("hpack decoding error; err={:?}", e);
             return Err(e.into());
+        }
+        if metadata_exhausted {
+            return Err(Error::HeaderMapCapacityExhausted);
         }
 
         if malformed {

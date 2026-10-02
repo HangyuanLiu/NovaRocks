@@ -383,6 +383,19 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Install originally funded fixed HeaderMap metadata backings.
+    ///
+    /// Requires the decoded field pool. The pool binds once to one connection;
+    /// cloned builders retain the same pool. Header payload owners remain
+    /// separate. Default None preserves upstream behavior.
+    pub fn receive_header_map_pool(
+        &mut self,
+        pool: http::header::HeaderMapAllocationPool,
+    ) -> &mut Self {
+        self.h2_builder.receive_header_map_pool = Some(pool);
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

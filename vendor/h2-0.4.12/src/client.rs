@@ -334,6 +334,7 @@ pub struct Builder {
     receive_header_block_buffer: Option<crate::ReceiveHeaderBlockBuffer>,
     receive_header_field_pool: Option<crate::ReceiveHeaderFieldPool>,
     receive_header_table_buffer: Option<crate::ReceiveHeaderTableBuffer>,
+    receive_header_map_pool: Option<http::header::HeaderMapAllocationPool>,
     receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams to keep at a time.
@@ -678,6 +679,7 @@ impl Builder {
             receive_header_block_buffer: None,
             receive_header_field_pool: None,
             receive_header_table_buffer: None,
+            receive_header_map_pool: None,
             receive_goaway_buffer_pool: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
@@ -1220,6 +1222,19 @@ impl Builder {
         self
     }
 
+    /// Install originally funded fixed incoming HeaderMap metadata storage.
+    /// Requires a decoded field pool. Binds once before handshake I/O; each
+    /// HEADERS/PUSH block claims one map and CONTINUATION keeps that same map.
+    /// Local metadata exhaustion closes with INTERNAL_ERROR, without waiting,
+    /// panic or heap fallback. Payloads and other connection owners are separate.
+    pub fn receive_header_map_pool(
+        &mut self,
+        pool: http::header::HeaderMapAllocationPool,
+    ) -> &mut Self {
+        self.receive_header_map_pool = Some(pool);
+        self
+    }
+
     /// Install original typed incoming HPACK table backing. Requires a fixed
     /// field pool and capacity covering both the initial 4096-byte table and
     /// the advertised incoming ceiling. Binds once before handshake I/O.
@@ -1472,6 +1487,13 @@ where
         mut io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
+        if builder.receive_header_map_pool.is_some() && builder.receive_header_field_pool.is_none()
+        {
+            return Err(crate::Error::from_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "header map pool requires a decoded field pool",
+            )));
+        }
         if let Some(buffer) = &builder.receive_header_table_buffer {
             if builder.receive_header_field_pool.is_none()
                 || buffer.max_table_bytes()
@@ -1521,6 +1543,42 @@ where
                 std::io::ErrorKind::InvalidInput,
                 "receive pool requires an explicit buffered event limit",
             )));
+        }
+        let frame_max = builder.settings.max_frame_size().unwrap_or(16384) as usize;
+        // Validate every backing before consuming any once-only binding.
+        // Preserve the existing DATA/GOAWAY then raw diagnostic precedence.
+        let geometry_error = if builder
+            .receive_buffer_pool
+            .as_ref()
+            .is_some_and(|pool| pool.buffer_capacity_bytes() < frame_max)
+            || builder
+                .receive_goaway_buffer_pool
+                .as_ref()
+                .is_some_and(|pool| pool.buffer_capacity_bytes() < frame_max)
+        {
+            Some("receive frame maximum exceeds pool buffer capacity")
+        } else if builder
+            .receive_frame_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.max_payload_bytes() < frame_max)
+        {
+            Some("local frame maximum exceeds raw receive buffer")
+        } else {
+            None
+        };
+        if let Some(message) = geometry_error {
+            return Err(crate::Error::from_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            )));
+        }
+        if let Some(pool) = &builder.receive_header_map_pool {
+            pool.try_bind_connection().map_err(|_| {
+                crate::Error::from_io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "header map pool already bound to a connection",
+                ))
+            })?;
         }
         let receive_table_buffer = builder
             .receive_header_table_buffer
@@ -1588,6 +1646,7 @@ where
                 encoded,
                 fields: receive_field_pool,
                 table: receive_table_buffer,
+                maps: builder.receive_header_map_pool.clone(),
                 max_list: builder.settings.max_header_list_size().unwrap_or(16 << 20) as usize,
                 max_encoded: builder
                     .max_receive_header_block_size

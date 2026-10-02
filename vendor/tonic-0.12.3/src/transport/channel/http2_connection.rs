@@ -44,6 +44,9 @@ pub struct Http2ConnectionConfig {
     /// Fresh fixed incoming HPACK slots, requiring the decoded field pool.
     /// Capacity covers the initial table and the advertised incoming limit.
     pub receive_header_table_buffer: Option<h2::ReceiveHeaderTableBuffer>,
+    /// Fresh fixed HeaderMap metadata backings, requiring the decoded field pool.
+    /// Header name/value payload owners remain separate. One pool binds once.
+    pub receive_header_map_pool: Option<http::header::HeaderMapAllocationPool>,
     /// Fresh fixed outbound storage and local frame cap; HPACK is separate.
     pub send_frame_buffer: Option<h2::SendFrameBuffer>,
     /// Fresh independent GOAWAY debug backing through the last error alias.
@@ -95,6 +98,11 @@ impl Http2ConnectionConfig {
             {
                 return Err(invalid("per-connection header table buffer requires a decoded field pool and fitting advertised incoming table size"));
             }
+        }
+        if self.receive_header_map_pool.is_some() && self.receive_header_field_pool.is_none() {
+            return Err(invalid(
+                "per-connection header map pool requires a decoded field pool",
+            ));
         }
         let max_frame = self.max_frame_size.unwrap_or(16384) as usize;
         if !(16384..=16777215).contains(&max_frame) {
@@ -181,6 +189,9 @@ impl Http2ConnectionConfig {
         }
         if let Some(buffer) = self.receive_header_table_buffer {
             builder.receive_header_table_buffer(buffer);
+        }
+        if let Some(pool) = self.receive_header_map_pool {
+            builder.receive_header_map_pool(pool);
         }
         if let Some(raw) = self.receive_frame_buffer {
             builder.receive_frame_buffer(raw);

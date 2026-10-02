@@ -6,7 +6,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::{FromIterator, FusedIterator};
 use std::marker::PhantomData;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::{fmt, mem, ops, ptr, vec};
@@ -4120,6 +4120,7 @@ struct MapAllocationCore {
     extra_capacity: usize,
     max_maps: usize,
     live_maps: AtomicUsize,
+    connection_bound: AtomicBool,
     // The final Arc allocation exits before original ownership.
     _ownership: Bytes,
 }
@@ -4172,6 +4173,7 @@ impl HeaderMapAllocationPool {
                 extra_capacity: extra,
                 max_maps,
                 live_maps: AtomicUsize::new(0),
+                connection_bound: AtomicBool::new(false),
                 _ownership: ownership,
             })),
         })
@@ -4188,6 +4190,18 @@ impl HeaderMapAllocationPool {
             return Err(MaxSizeReached::new());
         }
         Ok(raw)
+    }
+
+    /// Bind this original pool to one physical connection, once across aliases.
+    /// No rebinding is permitted after cancellation or connection exit. Ordinary
+    /// map construction does not bind a connection; transport owners call this
+    /// before their first handshake I/O.
+    pub fn try_bind_connection(&self) -> Result<(), MaxSizeReached> {
+        self.core()
+            .connection_bound
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| MaxSizeReached::new())
     }
 
     /// Number of remaining metadata positions, including copies and value drains.

@@ -37,6 +37,7 @@ pub struct FramedRead<T> {
     receive_pool: Option<crate::ReceiveBufferPool>,
     goaway_pool: Option<crate::ReceiveBufferPool>,
     header_buffer: Option<crate::receive_header::BoundHeaderBlockBuffer>,
+    header_map_pool: Option<http::header::HeaderMapAllocationPool>,
 }
 
 enum ReadKind<T> {
@@ -81,6 +82,7 @@ pub(crate) struct HeaderBuffers {
     pub(crate) encoded: crate::receive_header::BoundHeaderBlockBuffer,
     pub(crate) fields: Option<crate::ReceiveHeaderFieldPool>,
     pub(crate) table: Option<crate::receive_header_table::BoundHeaderTableBuffer>,
+    pub(crate) maps: Option<http::header::HeaderMapAllocationPool>,
     pub(crate) max_list: usize,
     pub(crate) max_encoded: usize,
 }
@@ -115,26 +117,29 @@ impl<T> FramedRead<T> {
     }
 
     fn with_reader(inner: ReadKind<T>, max_frame: usize, headers: Option<HeaderBuffers>) -> Self {
-        let (hpack, header_buffer, max_header_list_size, max_header_block_size) = match headers {
-            Some(headers) => (
-                hpack::Decoder::new_bounded_with_table(
-                    DEFAULT_SETTINGS_HEADER_TABLE_SIZE,
+        let (hpack, header_buffer, max_header_list_size, max_header_block_size, header_map_pool) =
+            match headers {
+                Some(headers) => (
+                    hpack::Decoder::new_bounded_with_table(
+                        DEFAULT_SETTINGS_HEADER_TABLE_SIZE,
+                        headers.max_list,
+                        headers.max_encoded,
+                        headers.fields,
+                        headers.table,
+                    ),
+                    Some(headers.encoded),
                     headers.max_list,
-                    headers.max_encoded,
-                    headers.fields,
-                    headers.table,
+                    Some(headers.max_encoded),
+                    headers.maps,
                 ),
-                Some(headers.encoded),
-                headers.max_list,
-                Some(headers.max_encoded),
-            ),
-            None => (
-                hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
-                None,
-                DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
-                None,
-            ),
-        };
+                None => (
+                    hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
+                    None,
+                    DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
+                    None,
+                    None,
+                ),
+            };
         let max_continuation_frames = calc_max_continuation_frames(max_header_list_size, max_frame);
         FramedRead {
             inner,
@@ -146,6 +151,7 @@ impl<T> FramedRead<T> {
             receive_pool: None,
             goaway_pool: None,
             header_buffer,
+            header_map_pool,
         }
     }
 
@@ -264,6 +270,7 @@ struct DecodePools<'a> {
     data: Option<&'a crate::ReceiveBufferPool>,
     goaway: Option<&'a crate::ReceiveBufferPool>,
     headers: Option<&'a mut crate::receive_header::BoundHeaderBlockBuffer>,
+    maps: Option<&'a http::header::HeaderMapAllocationPool>,
 }
 
 /// Decodes a frame.
@@ -288,6 +295,7 @@ fn decode_frame(
             data: None,
             goaway: goaway_pool,
             headers: None,
+            maps: None,
         },
         FrameInput::Owned(bytes),
     )
@@ -347,6 +355,8 @@ fn decode_frame_input(
             }
             let is_end_headers = frame.is_end_headers();
 
+            frame.initialize_header_map(pools.maps)
+                .map_err(|_| Error::library_go_away(Reason::INTERNAL_ERROR))?;
             hpack.begin_block();
             // Load the HPACK encoded headers
             let result = frame.load_hpack(&mut payload, max_header_list_size, hpack);
@@ -393,6 +403,9 @@ fn decode_frame_input(
                 return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
             }
             let is_end_headers = frame.is_end_headers();
+            frame
+                .initialize_header_map(pools.maps)
+                .map_err(|_| Error::library_go_away(Reason::INTERNAL_ERROR))?;
             hpack.begin_block();
             let result = $buffer.decode(|src, committed| {
                 frame.load_hpack_borrowed(src, committed, max_header_list_size, hpack)
@@ -661,6 +674,9 @@ fn check_header_decode(
         )) => Err(Error::library_go_away(Reason::COMPRESSION_ERROR)),
         // A semantic stream failure cannot end the connection's HPACK block.
         // Keep decoding CONTINUATIONs and table insertions until END_HEADERS.
+        Err(frame::Error::HeaderMapCapacityExhausted) => {
+            Err(Error::library_go_away(Reason::INTERNAL_ERROR))
+        }
         Err(frame::Error::MalformedMessage) if !end => Ok(()),
         Err(frame::Error::MalformedMessage) => {
             Err(Error::library_reset(id, Reason::PROTOCOL_ERROR))
@@ -693,6 +709,7 @@ where
                 goaway_pool,
                 receive_pool,
                 header_buffer,
+                header_map_pool,
                 ..
             } = &mut *self;
             let (decoded, needs_data_copy) = match inner {
@@ -727,6 +744,7 @@ where
                                 data: receive_pool.as_ref(),
                                 goaway: goaway_pool.as_ref(),
                                 headers: header_buffer.as_mut(),
+                                maps: header_map_pool.as_ref(),
                             },
                             FrameInput::Borrowed(bytes),
                         )

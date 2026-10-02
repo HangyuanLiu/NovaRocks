@@ -166,6 +166,9 @@ pub enum Error {
     /// invalid stream identifier.
     InvalidDependencyId,
 
+    /// Local original HeaderMap metadata capacity was exhausted.
+    HeaderMapCapacityExhausted,
+
     /// Failed to perform HPACK decoding
     Hpack(hpack::DecoderError),
 }
