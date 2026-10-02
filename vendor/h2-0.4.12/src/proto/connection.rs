@@ -76,8 +76,9 @@ struct DynConnection<'a, B: Buf = Bytes> {
     ping_pong: &'a mut PingPong,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Config {
+    pub stream_store: Option<streams::FixedStreamStore>,
     pub next_stream_id: StreamId,
     pub initial_max_send_streams: usize,
     pub max_send_buffer_size: usize,
@@ -108,9 +109,10 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+    pub fn new(codec: Codec<T, Prioritized<B>>, mut config: Config) -> Connection<T, P, B> {
         fn streams_config(config: &Config) -> streams::Config {
             streams::Config {
+                stream_store: None,
                 initial_max_send_streams: config.initial_max_send_streams,
                 local_max_buffer_size: config.max_send_buffer_size,
                 local_max_receive_events: config.max_receive_buffered_events,
@@ -131,7 +133,9 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let mut local_config = streams_config(&config);
+        local_config.stream_store = config.stream_store.take();
+        let streams = Streams::new(local_config);
         Connection {
             codec,
             initial_settings_deadline: config.initial_settings_deadline,

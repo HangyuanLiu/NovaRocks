@@ -5,6 +5,8 @@ mod peer;
 mod ping_pong;
 mod settings;
 mod streams;
+pub(crate) use self::streams::FixedStreamStore;
+pub use self::streams::StreamStoreBuffer;
 
 pub(crate) use self::connection::{Config, Connection};
 pub use self::error::{Error, Initiator};

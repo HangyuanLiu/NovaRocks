@@ -133,6 +133,8 @@ mod share;
 #[cfg_attr(feature = "unstable", allow(missing_docs))]
 pub mod fuzz_bridge;
 
+pub use self::proto::StreamStoreBuffer;
+
 pub use crate::error::{Error, Reason};
 pub use crate::share::{FlowControl, Ping, PingPong, Pong, RecvStream, SendStream, StreamId};
 

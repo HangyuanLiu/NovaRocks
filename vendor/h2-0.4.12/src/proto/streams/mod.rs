@@ -7,6 +7,9 @@ mod send;
 mod state;
 mod store;
 mod stream;
+mod stream_store;
+pub(crate) use self::stream_store::FixedStreamStore;
+pub use self::stream_store::StreamStoreBuffer;
 #[allow(clippy::module_inception)]
 mod streams;
 
@@ -33,6 +36,7 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Config {
+    pub(crate) stream_store: Option<FixedStreamStore>,
     /// Initial maximum number of locally initiated streams.
     /// After receiving a Settings frame from the remote peer,
     /// the connection will overwrite this value with the

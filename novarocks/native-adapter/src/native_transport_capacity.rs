@@ -282,6 +282,10 @@ impl Dimensions {
             bound,
             Bytes::owner_with_exit_guard_metadata_size::<Bytes, SlotExit>(),
         )?;
+        bound = add(
+            bound,
+            h2::StreamStoreBuffer::allocation_capacity_bound(streams, streams)?,
+        )?;
         let stream_extra = add(
             add(
                 value(g.transport_stream_bookkeeping_bytes)?,
@@ -404,7 +408,7 @@ impl NativeTransportCapacityFactory {
         Err(io::ErrorKind::WouldBlock.into())
     }
 
-    /// Claim one prepaid original position and construct nine fresh capabilities.
+    /// Claim one prepaid original position and construct ten fresh capabilities.
     /// Reconnect must call this again. No exhausted class, map, field, or buffer
     /// obtains spare budget or falls back to ordinary unowned storage.
     /// Endpoint windows/adaptive mode/pending queue must be set by its caller.
@@ -412,6 +416,11 @@ impl NativeTransportCapacityFactory {
         let d = self.core().dimensions;
         let owner = self.claim(class)?;
         Ok(Http2ConnectionConfig {
+            stream_store_buffer: Some(h2::StreamStoreBuffer::new(
+                d.streams,
+                d.streams,
+                owner.clone(),
+            )?),
             initial_settings_timeout: Some(std::time::Duration::from_millis(
                 NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
             )),
@@ -512,6 +521,9 @@ pub fn configure_server<E>(
         || config.receive_goaway_buffer_pool.as_ref().is_none_or(|p| {
             p.buffer_positions() != d.goaway_buffers || p.buffer_capacity_bytes() != d.frame
         })
+        || config.stream_store_buffer.as_ref().is_none_or(|buffer| {
+            buffer.max_resident_streams() != d.streams || buffer.max_waiters() != d.streams
+        })
         || config.receive_header_map_pool.is_none()
     {
         return Err(invalid());
@@ -531,6 +543,7 @@ pub fn configure_server<E>(
         .max_receive_buffered_events(d.events)
         .max_send_buf_size(d.writer)
         .retain_data_payloads(true);
+    builder.stream_store_buffer(config.stream_store_buffer.as_ref().unwrap().clone());
     builder.receive_frame_buffer(config.receive_frame_buffer.as_ref().unwrap().clone());
     builder
         .receive_header_block_buffer(config.receive_header_block_buffer.as_ref().unwrap().clone());

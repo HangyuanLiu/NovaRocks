@@ -18,6 +18,8 @@ pub struct Http2ConnectionConfig {
     /// TCP/TLS, preface, applied peer initial SETTINGS and actual initial flush.
     /// None preserves legacy acquisition. This never times application streams.
     pub initial_settings_timeout: Option<std::time::Duration>,
+    /// Original fixed resident stream and readiness storage for this attempt.
+    pub stream_store_buffer: Option<h2::StreamStoreBuffer>,
     /// Local maximum inbound frame payload. This is not an outbound ceiling.
     pub max_frame_size: Option<u32>,
     /// Local maximum inbound decoded header list; overrides the Endpoint value.
@@ -162,6 +164,9 @@ impl Http2ConnectionConfig {
         }
         // Validate every scalar/geometry before changing the builder or calling
         // the connector. Reuse is checked by h2 bind before its handshake I/O.
+        if let Some(buffer) = self.stream_store_buffer {
+            builder.stream_store_buffer(buffer);
+        }
         if let Some(max) = self.max_frame_size {
             builder.max_frame_size(max);
         }

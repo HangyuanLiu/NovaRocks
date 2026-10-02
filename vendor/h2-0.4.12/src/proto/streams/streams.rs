@@ -12,7 +12,8 @@ use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
-use std::sync::{Arc, Mutex};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
 use std::{fmt, io};
 
 #[derive(Debug)]
@@ -22,7 +23,7 @@ where
 {
     /// Holds most of the connection and stream related state for processing
     /// HTTP/2 frames associated with streams.
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<SharedInner>,
 
     /// This is the queue of frames to be written to the wire. This is split out
     /// to avoid requiring a `B` generic on all public API types even if `B` is
@@ -41,7 +42,7 @@ where
 // Ensures that the methods only get one instantiation, instead of two (client and server)
 #[derive(Debug)]
 pub(crate) struct DynStreams<'a, B> {
-    inner: &'a Mutex<Inner>,
+    inner: &'a SharedInner,
 
     send_buffer: &'a SendBuffer<B>,
 
@@ -57,7 +58,7 @@ pub(crate) struct StreamRef<B> {
 
 /// Reference to the stream state that hides the send data chunk generic
 pub(crate) struct OpaqueStreamRef {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<SharedInner>,
     key: store::Key,
 }
 
@@ -78,6 +79,68 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
+}
+
+/// The original connection mutex, with deferred resident notifications. No
+/// additional backing is allocated. A callback may drop or reenter a stream.
+#[derive(Debug)]
+struct SharedInner {
+    mutex: Mutex<Inner>,
+    fixed_store: bool,
+}
+
+struct InnerGuard<'a> {
+    mutex: &'a Mutex<Inner>,
+    guard: Option<MutexGuard<'a, Inner>>,
+}
+
+impl SharedInner {
+    fn lock(&self) -> LockResult<InnerGuard<'_>> {
+        match self.mutex.lock() {
+            Ok(guard) => Ok(InnerGuard {
+                mutex: &self.mutex,
+                guard: Some(guard),
+            }),
+            Err(error) => Err(PoisonError::new(InnerGuard {
+                mutex: &self.mutex,
+                guard: Some(error.into_inner()),
+            })),
+        }
+    }
+}
+impl Deref for InnerGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        self.guard.as_deref().expect("live inner guard")
+    }
+}
+impl DerefMut for InnerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        self.guard.as_deref_mut().expect("live inner guard")
+    }
+}
+impl Drop for InnerGuard<'_> {
+    fn drop(&mut self) {
+        let count = self
+            .guard
+            .as_mut()
+            .expect("live inner guard")
+            .store
+            .resident_notification_count();
+        drop(self.guard.take());
+        // Scan each original position once. Fresh registration has no notify
+        // flag; callbacks and Waker destruction hold neither connection mutex
+        // nor send-buffer mutex, and can safely cancel another handle.
+        for index in 0..count {
+            let waker = {
+                let mut guard = self.mutex.lock().unwrap_or_else(PoisonError::into_inner);
+                guard.store.take_resident_notification(index)
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -260,6 +323,9 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
+        if !me.store.has_capacity() {
+            return Err(UserError::Rejected.into());
+        }
         let stream_id = me.actions.send.open()?;
 
         let mut stream = Stream::new(
@@ -276,7 +342,7 @@ where
         let headers =
             client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
 
-        let mut stream = me.store.insert(stream.id, stream);
+        let mut stream = me.store.insert(stream.id, stream)?;
 
         let sent = me.actions.send.send_headers(
             headers,
@@ -404,18 +470,22 @@ impl<B> DynStreams<'_, B> {
 }
 
 impl Inner {
-    fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Inner {
-            counts: Counts::new(peer, &config),
-            actions: Actions {
-                recv: Recv::new(peer, &config),
-                send: Send::new(&config),
-                task: None,
-                conn_error: None,
-            },
-            store: Store::new(),
-            refs: 1,
-        }))
+    fn new(peer: peer::Dyn, config: Config) -> Arc<SharedInner> {
+        let fixed_store = config.stream_store.is_some();
+        Arc::new(SharedInner {
+            mutex: Mutex::new(Inner {
+                counts: Counts::new(peer, &config),
+                actions: Actions {
+                    recv: Recv::new(peer, &config),
+                    send: Send::new(&config),
+                    task: None,
+                    conn_error: None,
+                },
+                store: Store::new(config.stream_store),
+                refs: 1,
+            }),
+            fixed_store,
+        })
     }
 
     fn recv_headers<B>(
@@ -463,6 +533,10 @@ impl Inner {
                     .open(id, Open::Headers, &mut self.counts)?
                 {
                     Some(stream_id) => {
+                        if !e.has_capacity() {
+                            self.actions.recv.refuse_stream(stream_id);
+                            return Ok(());
+                        }
                         let stream = Stream::new(
                             stream_id,
                             self.actions.send.init_window_sz(),
@@ -470,6 +544,7 @@ impl Inner {
                         );
 
                         e.insert(stream)
+                            .map_err(|_| Error::library_reset(stream_id, Reason::REFUSED_STREAM))?
                     }
                     None => return Ok(()),
                 }
@@ -707,6 +782,7 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        self.store.wake_resident_waiters();
 
         last_processed_id
     }
@@ -737,6 +813,7 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        self.store.wake_resident_waiters();
 
         Ok(())
     }
@@ -777,9 +854,8 @@ impl Inner {
             }
         };
 
-        // TODO: Streams in the reserved states do not count towards the concurrency
-        // limit. However, it seems like there should be a cap otherwise this
-        // could grow in memory indefinitely.
+        // Reserved streams do not count towards the peer wire concurrency
+        // limit, but installed original resident storage counts them as well.
 
         // Ensure that we can reserve streams
         self.actions.recv.ensure_can_reserve()?;
@@ -797,17 +873,25 @@ impl Inner {
             return Ok(());
         }
 
+        if !self.store.has_capacity() {
+            self.actions.recv.refuse_stream(promised_id);
+            return Ok(());
+        }
+
         // Try to handle the frame and create a corresponding key for the pushed stream
         // this requires a bit of indirection to make the borrow checker happy.
         let child_key: Option<store::Key> = {
             // Create state for the stream
-            let stream = self.store.insert(promised_id, {
-                Stream::new(
-                    promised_id,
-                    self.actions.send.init_window_sz(),
-                    self.actions.recv.init_window_sz(),
-                )
-            });
+            let stream = self
+                .store
+                .insert(promised_id, {
+                    Stream::new(
+                        promised_id,
+                        self.actions.send.init_window_sz(),
+                        self.actions.recv.init_window_sz(),
+                    )
+                })
+                .map_err(|_| Error::library_reset(promised_id, Reason::REFUSED_STREAM))?;
 
             let actions = &mut self.actions;
 
@@ -862,6 +946,8 @@ impl Inner {
                 .into(),
             );
         }
+
+        self.store.wake_resident_waiters();
 
         tracing::trace!("Streams::recv_eof");
 
@@ -947,9 +1033,19 @@ impl Inner {
                     self.actions.recv.maybe_reset_next_stream_id(id);
                 }
 
+                if !e.has_capacity() {
+                    return Err(crate::proto::error::GoAway {
+                        debug_data: Bytes::new(),
+                        reason: Reason::ENHANCE_YOUR_CALM,
+                    });
+                }
+
                 let stream = Stream::new(id, 0, 0);
 
-                e.insert(stream)
+                e.insert(stream).map_err(|_| crate::proto::error::GoAway {
+                    debug_data: Bytes::new(),
+                    reason: Reason::ENHANCE_YOUR_CALM,
+                })?
             }
         };
 
@@ -970,16 +1066,48 @@ impl<B> Streams<B, client::Peer>
 where
     B: Buf,
 {
+    pub fn unregister_resident_waiter(&self, registration: &mut Option<usize>) {
+        if registration.is_none() {
+            return;
+        }
+        let retired = {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.store.unregister_resident_waiter(registration)
+        };
+        drop(retired);
+    }
+
     pub fn poll_pending_open(
         &mut self,
         cx: &Context,
         pending: Option<&OpaqueStreamRef>,
+        registration: &mut Option<usize>,
     ) -> Poll<Result<(), crate::Error>> {
-        let mut me = self.inner.lock().unwrap();
-        let me = &mut *me;
-
-        me.actions.ensure_no_conn_error()?;
-        me.actions.send.ensure_next_stream_id()?;
+        // Clone and retire arbitrary user wakers outside the inner guard.
+        let mut new_waker = self.inner.fixed_store.then(|| cx.waker().clone());
+        let mut retired = None;
+        let mut guard = self.inner.lock().unwrap();
+        let me = &mut *guard;
+        let error = me
+            .actions
+            .ensure_no_conn_error()
+            .map_err(crate::Error::from)
+            .and_then(|()| {
+                me.actions
+                    .send
+                    .ensure_next_stream_id()
+                    .map_err(crate::Error::from)
+            });
+        if let Err(error) = error {
+            retired = me.store.unregister_resident_waiter(registration);
+            drop(guard);
+            drop(retired);
+            return Poll::Ready(Err(error.into()));
+        }
+        ready!(me
+            .store
+            .poll_resident_ready(registration, &mut new_waker, &mut retired))
+        .map_err(crate::Error::from)?;
 
         if let Some(pending) = pending {
             let mut stream = me.store.resolve(pending.key);
@@ -1196,8 +1324,19 @@ impl<B> StreamRef<B> {
         let mut send_buffer = self.send_buffer.inner.lock().unwrap();
         let send_buffer = &mut *send_buffer;
 
+        if !me.store.has_capacity() {
+            return Err(UserError::Rejected);
+        }
         let actions = &mut me.actions;
         let promised_id = actions.send.reserve_local()?;
+        // Validate the pushed request before constructing a resident child.
+        // The stream ID still advances on malformed input as before, but no
+        // handle-less reserved state can permanently consume an original slot.
+        let frame = crate::server::Peer::convert_push_message(
+            me.store[self.opaque.key].id,
+            promised_id,
+            request,
+        )?;
 
         let child_key = {
             let mut child_stream = me.store.insert(
@@ -1207,7 +1346,7 @@ impl<B> StreamRef<B> {
                     actions.send.init_window_sz(),
                     actions.recv.init_window_sz(),
                 ),
-            );
+            )?;
             child_stream.state.reserve_local()?;
             child_stream.is_pending_push = true;
             child_stream.key()
@@ -1215,8 +1354,6 @@ impl<B> StreamRef<B> {
 
         let pushed = {
             let mut stream = me.store.resolve(self.opaque.key);
-
-            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
 
             actions
                 .send
@@ -1328,7 +1465,7 @@ impl<B> Clone for StreamRef<B> {
 // ===== impl OpaqueStreamRef =====
 
 impl OpaqueStreamRef {
-    fn new(inner: Arc<Mutex<Inner>>, stream: &mut store::Ptr) -> OpaqueStreamRef {
+    fn new(inner: Arc<SharedInner>, stream: &mut store::Ptr) -> OpaqueStreamRef {
         stream.ref_inc();
         OpaqueStreamRef {
             inner,
@@ -1439,7 +1576,7 @@ impl fmt::Debug for OpaqueStreamRef {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         use std::sync::TryLockError::*;
 
-        match self.inner.try_lock() {
+        match self.inner.mutex.try_lock() {
             Ok(me) => {
                 let stream = &me.store[self.key];
                 fmt.debug_struct("OpaqueStreamRef")
@@ -1480,7 +1617,7 @@ impl Drop for OpaqueStreamRef {
 }
 
 // TODO: Move back in fn above
-fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
+fn drop_stream_ref(inner: &SharedInner, key: store::Key) {
     let mut me = match inner.lock() {
         Ok(inner) => inner,
         Err(_) => {

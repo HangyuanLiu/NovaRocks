@@ -1,6 +1,9 @@
 use super::*;
 
-use indexmap::{self, IndexMap};
+use super::stream_store::FixedStreamStore;
+use crate::codec::UserError;
+use indexmap::IndexMap;
+use std::task::Poll;
 
 use std::convert::Infallible;
 use std::fmt;
@@ -10,8 +13,17 @@ use std::ops;
 /// Storage for streams
 #[derive(Debug)]
 pub(super) struct Store {
-    slab: slab::Slab<Stream>,
-    ids: IndexMap<StreamId, SlabIndex>,
+    storage: Storage,
+    resident_notifications_pending: bool,
+}
+
+#[derive(Debug)]
+enum Storage {
+    Default {
+        slab: slab::Slab<Stream>,
+        ids: IndexMap<StreamId, SlabIndex>,
+    },
+    Fixed(FixedStreamStore),
 }
 
 /// "Pointer" to an entry in the store
@@ -64,12 +76,13 @@ pub(super) enum Entry<'a> {
 }
 
 pub(super) struct OccupiedEntry<'a> {
-    ids: indexmap::map::OccupiedEntry<'a, StreamId, SlabIndex>,
+    key: Key,
+    _store: PhantomData<&'a mut Store>,
 }
 
 pub(super) struct VacantEntry<'a> {
-    ids: indexmap::map::VacantEntry<'a, StreamId, SlabIndex>,
-    slab: &'a mut slab::Slab<Stream>,
+    store: &'a mut Store,
+    id: StreamId,
 }
 
 pub(super) trait Resolve {
@@ -79,19 +92,159 @@ pub(super) trait Resolve {
 // ===== impl Store =====
 
 impl Store {
-    pub fn new() -> Self {
-        Store {
-            slab: slab::Slab::new(),
-            ids: IndexMap::new(),
+    pub fn new(fixed: Option<FixedStreamStore>) -> Self {
+        Self {
+            resident_notifications_pending: false,
+            storage: match fixed {
+                Some(storage) => Storage::Fixed(storage),
+                None => Storage::Default {
+                    slab: slab::Slab::new(),
+                    ids: IndexMap::new(),
+                },
+            },
         }
     }
 
-    pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
-        let index = match self.ids.get(id) {
-            Some(key) => *key,
-            None => return None,
-        };
+    fn linked_index(&self, id: StreamId) -> Option<SlabIndex> {
+        match &self.storage {
+            Storage::Default { ids, .. } => ids.get(&id).copied(),
+            Storage::Fixed(storage) => storage
+                .slots
+                .iter()
+                .position(|slot| {
+                    slot.linked && slot.value.as_ref().is_some_and(|stream| stream.id == id)
+                })
+                .map(|index| SlabIndex(index as u32)),
+        }
+    }
 
+    fn linked_len(&self) -> usize {
+        match &self.storage {
+            Storage::Default { ids, .. } => ids.len(),
+            Storage::Fixed(storage) => storage.slots.iter().filter(|slot| slot.linked).count(),
+        }
+    }
+
+    #[cfg(feature = "unstable")]
+    fn resident_len(&self) -> usize {
+        match &self.storage {
+            Storage::Default { slab, .. } => slab.len(),
+            Storage::Fixed(storage) => storage
+                .slots
+                .iter()
+                .filter(|slot| slot.value.is_some())
+                .count(),
+        }
+    }
+
+    fn linked_at(&self, ordinal: usize) -> Option<Key> {
+        match &self.storage {
+            Storage::Default { ids, .. } => ids
+                .get_index(ordinal)
+                .map(|(&stream_id, &index)| Key { index, stream_id }),
+            Storage::Fixed(storage) => storage
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.linked)
+                .nth(ordinal)
+                .map(|(index, slot)| Key {
+                    index: SlabIndex(index as u32),
+                    stream_id: slot.value.as_ref().expect("linked slot owns a stream").id,
+                }),
+        }
+    }
+
+    /// A closed wire stream retains its position until its actual state exits.
+    pub fn has_capacity(&self) -> bool {
+        match &self.storage {
+            Storage::Default { .. } => true,
+            Storage::Fixed(storage) => storage.slots.iter().any(|slot| slot.value.is_none()),
+        }
+    }
+
+    /// Registration belongs to one SendRequest handle, so repolls and canceled
+    /// handles cannot accumulate stale positions. Waker callbacks run outside
+    /// the connection lock; return the previous waker to the caller for drop.
+    pub fn poll_resident_ready(
+        &mut self,
+        registration: &mut Option<usize>,
+        new_waker: &mut Option<std::task::Waker>,
+        retired: &mut Option<std::task::Waker>,
+    ) -> Poll<Result<(), UserError>> {
+        if self.has_capacity() {
+            *retired = self.unregister_resident_waiter(registration);
+            return Poll::Ready(Ok(()));
+        }
+        let Storage::Fixed(storage) = &mut self.storage else {
+            unreachable!()
+        };
+        let index = match *registration {
+            Some(index) => index,
+            None => {
+                let Some(index) = storage.waiters.iter().position(|waiter| !waiter.leased) else {
+                    return Poll::Ready(Err(UserError::Rejected));
+                };
+                storage.waiters[index].leased = true;
+                *registration = Some(index);
+                index
+            }
+        };
+        let waiter = &mut storage.waiters[index];
+        *retired = std::mem::replace(&mut waiter.waker, new_waker.take());
+        Poll::Pending
+    }
+
+    pub fn unregister_resident_waiter(
+        &mut self,
+        registration: &mut Option<usize>,
+    ) -> Option<std::task::Waker> {
+        let index = registration.take()?;
+        let Storage::Fixed(storage) = &mut self.storage else {
+            unreachable!()
+        };
+        let waiter = &mut storage.waiters[index];
+        assert!(waiter.leased);
+        waiter.leased = false;
+        waiter.notify = false;
+        waiter.waker.take()
+    }
+
+    pub fn wake_resident_waiters(&mut self) {
+        if let Storage::Fixed(storage) = &mut self.storage {
+            for waiter in &mut storage.waiters {
+                if waiter.waker.is_some() {
+                    waiter.notify = true;
+                    self.resident_notifications_pending = true;
+                }
+            }
+        }
+    }
+
+    pub fn resident_notification_count(&mut self) -> usize {
+        if !std::mem::take(&mut self.resident_notifications_pending) {
+            return 0;
+        }
+        match &self.storage {
+            Storage::Fixed(storage) => storage.waiters.len(),
+            Storage::Default { .. } => 0,
+        }
+    }
+
+    pub fn take_resident_notification(&mut self, index: usize) -> Option<std::task::Waker> {
+        let Storage::Fixed(storage) = &mut self.storage else {
+            return None;
+        };
+        let waiter = &mut storage.waiters[index];
+        if !waiter.notify {
+            return None;
+        }
+        waiter.notify = false;
+        waiter.waker.take()
+    }
+
+    pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
+        let index = self.linked_index(*id)?;
         Some(Ptr {
             key: Key {
                 index,
@@ -101,29 +254,85 @@ impl Store {
         })
     }
 
-    pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr<'_> {
-        let index = SlabIndex(self.slab.insert(val) as u32);
-        assert!(self.ids.insert(id, index).is_none());
+    pub fn insert(&mut self, id: StreamId, value: Stream) -> Result<Ptr<'_>, UserError> {
+        let key = self.insert_key(id, value)?;
+        Ok(Ptr { key, store: self })
+    }
 
-        Ptr {
-            key: Key {
-                index,
-                stream_id: id,
-            },
-            store: self,
+    fn insert_key(&mut self, id: StreamId, value: Stream) -> Result<Key, UserError> {
+        if !self.has_capacity() {
+            return Err(UserError::Rejected);
         }
+        assert_eq!(value.id, id);
+        assert!(self.linked_index(id).is_none());
+        let index = match &mut self.storage {
+            Storage::Default { slab, ids } => {
+                let index = SlabIndex(slab.insert(value) as u32);
+                assert!(ids.insert(id, index).is_none());
+                index
+            }
+            Storage::Fixed(storage) => {
+                let index = storage
+                    .slots
+                    .iter()
+                    .position(|slot| slot.value.is_none())
+                    .expect("capacity checked under the connection lock");
+                storage.slots[index].value = Some(value);
+                storage.slots[index].linked = true;
+                SlabIndex(index as u32)
+            }
+        };
+        Ok(Key {
+            index,
+            stream_id: id,
+        })
     }
 
     pub fn find_entry(&mut self, id: StreamId) -> Entry<'_> {
-        use self::indexmap::map::Entry::*;
-
-        match self.ids.entry(id) {
-            Occupied(e) => Entry::Occupied(OccupiedEntry { ids: e }),
-            Vacant(e) => Entry::Vacant(VacantEntry {
-                ids: e,
-                slab: &mut self.slab,
+        match self.linked_index(id) {
+            Some(index) => Entry::Occupied(OccupiedEntry {
+                key: Key {
+                    index,
+                    stream_id: id,
+                },
+                _store: PhantomData,
             }),
+            None => Entry::Vacant(VacantEntry { store: self, id }),
         }
+    }
+
+    fn unlink(&mut self, key: Key) {
+        match &mut self.storage {
+            Storage::Default { ids, .. } => {
+                ids.swap_remove(&key.stream_id);
+            }
+            Storage::Fixed(storage) => {
+                let slot = &mut storage.slots[key.index.0 as usize];
+                assert_eq!(
+                    slot.value.as_ref().expect("live store key").id,
+                    key.stream_id
+                );
+                slot.linked = false;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: Key) -> StreamId {
+        debug_assert!(self.linked_index(key.stream_id).is_none());
+        let stream = match &mut self.storage {
+            Storage::Default { slab, .. } => slab.remove(key.index.0 as usize),
+            Storage::Fixed(storage) => storage.slots[key.index.0 as usize]
+                .value
+                .take()
+                .expect("live store key"),
+        };
+        assert_eq!(stream.id, key.stream_id);
+        let id = stream.id;
+        // Destruct the state and its remaining fields before notifying anyone
+        // that a new resident can occupy the original fixed position.
+        drop(stream);
+        self.wake_resident_waiters();
+        id
     }
 
     #[allow(clippy::blocks_in_conditions)]
@@ -145,23 +354,16 @@ impl Store {
     where
         F: FnMut(Ptr) -> Result<(), E>,
     {
-        let mut len = self.ids.len();
+        let mut len = self.linked_len();
         let mut i = 0;
 
         while i < len {
             // Get the key by index, this makes the borrow checker happy
-            let (stream_id, index) = {
-                let entry = self.ids.get_index(i).unwrap();
-                (*entry.0, *entry.1)
-            };
-
-            f(Ptr {
-                key: Key { index, stream_id },
-                store: self,
-            })?;
+            let key = self.linked_at(i).expect("linked traversal index");
+            f(Ptr { key, store: self })?;
 
             // TODO: This logic probably could be better...
-            let new_len = self.ids.len();
+            let new_len = self.linked_len();
 
             if new_len < len {
                 debug_assert!(new_len == len - 1);
@@ -185,35 +387,43 @@ impl ops::Index<Key> for Store {
     type Output = Stream;
 
     fn index(&self, key: Key) -> &Self::Output {
-        self.slab
-            .get(key.index.0 as usize)
-            .filter(|s| s.id == key.stream_id)
-            .unwrap_or_else(|| {
-                panic!("dangling store key for stream_id={:?}", key.stream_id);
-            })
+        let stream = match &self.storage {
+            Storage::Default { slab, .. } => slab.get(key.index.0 as usize),
+            Storage::Fixed(storage) => storage
+                .slots
+                .get(key.index.0 as usize)
+                .and_then(|slot| slot.value.as_ref()),
+        };
+        stream
+            .filter(|stream| stream.id == key.stream_id)
+            .unwrap_or_else(|| panic!("dangling store key for stream_id={:?}", key.stream_id))
     }
 }
 
 impl ops::IndexMut<Key> for Store {
-    fn index_mut(&mut self, key: Key) -> &mut Self::Output {
-        self.slab
-            .get_mut(key.index.0 as usize)
-            .filter(|s| s.id == key.stream_id)
-            .unwrap_or_else(|| {
-                panic!("dangling store key for stream_id={:?}", key.stream_id);
-            })
+    fn index_mut(&mut self, key: Key) -> &mut Stream {
+        let stream = match &mut self.storage {
+            Storage::Default { slab, .. } => slab.get_mut(key.index.0 as usize),
+            Storage::Fixed(storage) => storage
+                .slots
+                .get_mut(key.index.0 as usize)
+                .and_then(|slot| slot.value.as_mut()),
+        };
+        stream
+            .filter(|stream| stream.id == key.stream_id)
+            .unwrap_or_else(|| panic!("dangling store key for stream_id={:?}", key.stream_id))
     }
 }
 
 impl Store {
     #[cfg(feature = "unstable")]
     pub fn num_active_streams(&self) -> usize {
-        self.ids.len()
+        self.linked_len()
     }
 
     #[cfg(feature = "unstable")]
     pub fn num_wired_streams(&self) -> usize {
-        self.slab.len()
+        self.resident_len()
     }
 }
 
@@ -228,7 +438,7 @@ impl Drop for Store {
         use std::thread;
 
         if !thread::panicking() {
-            debug_assert!(self.slab.is_empty());
+            debug_assert_eq!(self.resident_len(), 0);
         }
     }
 }
@@ -400,22 +610,12 @@ impl<'a> Ptr<'a> {
 
     /// Remove the stream from the store
     pub fn remove(self) -> StreamId {
-        // The stream must have been unlinked before this point
-        debug_assert!(!self.store.ids.contains_key(&self.key.stream_id));
-
-        // Remove the stream state
-        let stream = self.store.slab.remove(self.key.index.0 as usize);
-        assert_eq!(stream.id, self.key.stream_id);
-        stream.id
+        self.store.remove(self.key)
     }
 
-    /// Remove the StreamId -> stream state association.
-    ///
-    /// This will effectively remove the stream as far as the H2 protocol is
-    /// concerned.
+    /// Remove only the wire association; the original resident remains.
     pub fn unlink(&mut self) {
-        let id = self.key.stream_id;
-        self.store.ids.swap_remove(&id);
+        self.store.unlink(self.key);
     }
 }
 
@@ -452,23 +652,18 @@ impl<'a> fmt::Debug for Ptr<'a> {
 
 impl<'a> OccupiedEntry<'a> {
     pub fn key(&self) -> Key {
-        let stream_id = *self.ids.key();
-        let index = *self.ids.get();
-        Key { index, stream_id }
+        self.key
     }
 }
 
 // ===== impl VacantEntry =====
 
 impl<'a> VacantEntry<'a> {
-    pub fn insert(self, value: Stream) -> Key {
-        // Insert the value in the slab
-        let stream_id = value.id;
-        let index = SlabIndex(self.slab.insert(value) as u32);
+    pub fn has_capacity(&self) -> bool {
+        self.store.has_capacity()
+    }
 
-        // Insert the handle in the ID map
-        self.ids.insert(index);
-
-        Key { index, stream_id }
+    pub fn insert(self, value: Stream) -> Result<Key, UserError> {
+        self.store.insert_key(self.id, value)
     }
 }

@@ -934,6 +934,13 @@ impl Recv {
         }
     }
 
+    /// Refuse one new resident before creating a stream state. The connection
+    /// flushes this single original refusal before polling another input frame.
+    pub fn refuse_stream(&mut self, id: StreamId) {
+        assert!(self.refused.is_none());
+        self.refused = Some(id);
+    }
+
     /// Send any pending refusals.
     pub fn send_pending_refusal<T, B>(
         &mut self,

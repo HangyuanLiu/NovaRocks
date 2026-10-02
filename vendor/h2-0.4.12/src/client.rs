@@ -175,6 +175,7 @@ use tracing::Instrument;
 pub struct SendRequest<B: Buf> {
     inner: proto::Streams<B, Peer>,
     pending: Option<proto::OpaqueStreamRef>,
+    resident_registration: Option<usize>,
 }
 
 /// Returns a `SendRequest` instance once it is ready to send at least one
@@ -308,6 +309,7 @@ pub struct PushPromises {
 #[derive(Clone, Debug)]
 pub struct Builder {
     initial_settings_deadline: Option<Instant>,
+    stream_store_buffer: Option<crate::StreamStoreBuffer>,
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -379,7 +381,11 @@ where
     ///
     /// [module]: index.html
     pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), crate::Error>> {
-        ready!(self.inner.poll_pending_open(cx, self.pending.as_ref()))?;
+        ready!(self.inner.poll_pending_open(
+            cx,
+            self.pending.as_ref(),
+            &mut self.resident_registration
+        ))?;
         self.pending = None;
         Poll::Ready(Ok(()))
     }
@@ -590,7 +596,15 @@ where
         SendRequest {
             inner: self.inner.clone(),
             pending: None,
+            resident_registration: None,
         }
+    }
+}
+
+impl<B: Buf> Drop for SendRequest<B> {
+    fn drop(&mut self) {
+        self.inner
+            .unregister_resident_waiter(&mut self.resident_registration);
     }
 }
 
@@ -669,6 +683,7 @@ impl Builder {
     pub fn new() -> Builder {
         Builder {
             initial_settings_deadline: None,
+            stream_store_buffer: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             retain_data_payloads: false,
             send_frame_buffer: None,
@@ -692,6 +707,13 @@ impl Builder {
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
+    }
+
+    /// Install original fixed resident storage, independent of peer SETTINGS.
+    /// Closed states retain their slots until the last stream handle exits.
+    pub fn stream_store_buffer(&mut self, buffer: crate::StreamStoreBuffer) -> &mut Self {
+        self.stream_store_buffer = Some(buffer);
+        self
     }
 
     /// Set an absolute deadline for the opt-in initial SETTINGS phase.
@@ -1684,6 +1706,12 @@ where
             .transpose()
             .map_err(crate::Error::from_io)?;
         check_initial_settings_deadline(builder.initial_settings_deadline)?;
+        let stream_store = builder
+            .stream_store_buffer
+            .as_ref()
+            .map(crate::StreamStoreBuffer::bind)
+            .transpose()
+            .map_err(crate::Error::from_io)?;
         bind_connection(&mut io, builder.initial_settings_deadline).await?;
         check_initial_settings_deadline(builder.initial_settings_deadline)?;
 
@@ -1740,6 +1768,7 @@ where
         let inner = proto::Connection::new(
             codec,
             proto::Config {
+                stream_store,
                 next_stream_id: builder.stream_id,
                 initial_max_send_streams: builder.initial_max_send_streams,
                 max_send_buffer_size: builder.max_send_buffer_size,
@@ -1755,6 +1784,7 @@ where
         let send_request = SendRequest {
             inner: inner.streams().clone(),
             pending: None,
+            resident_registration: None,
         };
 
         let mut connection = Connection { inner };

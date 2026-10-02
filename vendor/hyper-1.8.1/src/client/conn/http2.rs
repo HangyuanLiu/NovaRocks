@@ -266,6 +266,13 @@ where
         }
     }
 
+    /// Install originally funded resident stream storage and bounded waiters.
+    /// Its persistent local limit is independent of peer SETTINGS.
+    pub fn stream_store_buffer(&mut self, buffer: h2::StreamStoreBuffer) -> &mut Self {
+        self.h2_builder.stream_store_buffer = Some(buffer);
+        self
+    }
+
     /// Require the peer's initial SETTINGS and the initial output flush before
     /// this absolute deadline, before returning a usable connection.
     ///
