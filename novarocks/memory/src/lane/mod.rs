@@ -17,12 +17,16 @@
 
 //! Stable allocation facts independent of funding and query lifetime.
 pub mod faults;
+pub mod handle;
 pub mod owner;
 pub mod record;
 pub mod slot;
 pub mod store;
 pub mod token;
+pub use handle::{FactToken, LaneHandle};
 pub use owner::RecordOwner;
+/// Frozen requested-size boundary, shared by wrappers, helpers and fact routing.
+pub const ATTRIBUTION_THRESHOLD_BYTES: usize = 512;
 pub use record::{LaneRecord, LifetimeState, ProductionState, RecordSnapshot, ResponsibilityClass};
 pub use slot::{SLOT_QUANTUM_BYTES, SlotCore};
 #[cfg(not(loom))]

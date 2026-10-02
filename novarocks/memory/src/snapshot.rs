@@ -332,9 +332,9 @@ fn capture_locked(
                 pressure.query_committed += total;
             }
         }
-        let before = domain.owner.sequence.load(Ordering::Acquire);
-        let live = domain.owner.live();
-        let after = domain.owner.sequence.load(Ordering::Acquire);
+        let before = domain.lane.record().sequence.load(Ordering::Acquire);
+        let live = domain.lane.live_bytes();
+        let after = domain.lane.record().sequence.load(Ordering::Acquire);
         let current_obligation = live.saturating_add(state.external);
         let domain_settled_debt = state.committed.saturating_sub(state.authorized);
         let domain_sampled_debt = current_obligation.saturating_sub(state.authorized);

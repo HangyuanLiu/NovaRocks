@@ -181,7 +181,7 @@ impl FundingDomain {
                 return (0, 0, 0);
             }
             let mut states = path.locks();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             crate::settlement::adjust_commitment(&path, &mut states, s.committed, live);
             let idle = s.authorized.saturating_sub(live);
             s.authorized = s.authorized.min(live);
@@ -203,6 +203,7 @@ impl FundingDomain {
                 node_publish(path.node(i), state.committed);
             }
             s.account = path.node(receiver).clone();
+            self.0.lane.set_affiliation(s.account.clone());
             let was_residual = s.residual;
             s.residual = true;
             s.sealed = true;
@@ -236,7 +237,7 @@ impl FundingDomain {
                 return Err(TeardownError::ExternalResponsibility);
             }
             let mut states = path.locks();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             let retained_backing = s.authorized.min(live);
             let idle = s.authorized - retained_backing;
             if account.0.control.load(crate::sync::Ordering::Acquire) != 0 {

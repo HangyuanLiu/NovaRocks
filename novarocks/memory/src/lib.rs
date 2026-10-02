@@ -28,7 +28,6 @@ pub mod error;
 pub mod ids;
 pub mod lane;
 pub mod observe;
-pub mod owner;
 pub mod policy;
 pub mod snapshot;
 mod sync;
@@ -37,8 +36,8 @@ pub use authority::{AuthorityConfig, CapacityWriter, MemoryAuthority};
 pub use domain::{DomainSnapshot, FundingDomain, OWNER_METADATA_BYTES};
 pub use error::{CapacityError, ConfigError, ConstraintKind, MetadataRegistryLabel, Refusal};
 pub use ids::{AccountId, AccountKind, ConfigVersion, ExternalRef, PolicyVersion};
+pub use lane::FactToken;
 pub use observe::{AllocatorSnapshot, CountingAllocator, CoverageDescriptor};
-pub use owner::AllocationOrigin;
 pub use policy::{LimitDimension, LimitUnit, PolicyInstallOutcome, PolicyLimit};
 pub use snapshot::{AccountSnapshot, AuthoritySnapshot};
 

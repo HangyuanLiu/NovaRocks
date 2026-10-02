@@ -68,7 +68,7 @@ fn exited() -> TeardownEvidence<'static> {
     }
 }
 
-fn retain_one(domain: &FundingDomain) -> crate::AllocationOrigin {
+fn retain_one(domain: &FundingDomain) -> crate::FactToken {
     let mut scope = domain.activate(1, 0).unwrap();
     let origin = scope.record_allocation(1);
     scope.finish();
@@ -189,18 +189,7 @@ fn seal_and_activation_share_the_production_local_handshake() {
         assert!(snapshot.sealed);
         assert!(!snapshot.active);
         assert_eq!(snapshot.live, 0);
-        assert_eq!(
-            domain.0.owner.scopes.load(crate::sync::Ordering::Acquire),
-            0
-        );
-        assert_eq!(
-            domain
-                .0
-                .owner
-                .allocations
-                .load(crate::sync::Ordering::Acquire),
-            0
-        );
+        assert_eq!(domain.0.lane.record().lifetime().outstanding(), 0);
         assert!(domain.activate(0, 0).is_err());
         assert!(domain.settle().next_step.is_err());
         assert_eq!(authority.root().committed_bytes(), before);

@@ -90,6 +90,11 @@ pub struct RecordSnapshot {
     pub generation: u32,
     pub flags: u32,
 }
+impl RecordSnapshot {
+    pub const fn is_draining(&self) -> bool {
+        self.flags & DRAINING != 0
+    }
+}
 macro_rules! record_initializer {
     ($state:expr, $flags:expr, $generation:expr) => {
         Self {

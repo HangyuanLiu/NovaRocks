@@ -36,7 +36,7 @@ impl FundingDomain {
     pub fn settle(&self) -> StepReceipt {
         {
             let mut s = self.0.state.lock().unwrap();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             let desired = s
                 .authorized
                 .max(live.checked_add(s.external).expect("valid live+external"));
@@ -65,7 +65,7 @@ impl FundingDomain {
                 continue;
             }
             let mut states = path.locks();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             let desired = s
                 .authorized
                 .max(live.checked_add(s.external).expect("valid live+external"));
@@ -112,7 +112,7 @@ impl FundingDomain {
                 continue;
             }
             let mut states = path.locks();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             let desired = s
                 .authorized
                 .max(live.checked_add(s.external).expect("valid live+external"));
@@ -123,7 +123,11 @@ impl FundingDomain {
             let amount = debt.min(states[0].as_ref().unwrap().slack);
             s.authorized += amount;
             if amount != 0 {
-                self.0.owner.sequence.fetch_add(1, Ordering::Release);
+                self.0
+                    .lane
+                    .record()
+                    .sequence
+                    .fetch_add(1, Ordering::Release);
             }
             states[0].as_mut().unwrap().slack -= amount;
             // The domain's existing commitment is unchanged; revoking account
@@ -168,7 +172,11 @@ impl FundingDomain {
                 .expect("validated authorized growth");
             s.committed += bytes;
             if bytes != 0 {
-                self.0.owner.sequence.fetch_add(1, Ordering::Release);
+                self.0
+                    .lane
+                    .record()
+                    .sequence
+                    .fetch_add(1, Ordering::Release);
             }
             return Ok(());
         }
@@ -221,7 +229,7 @@ impl FundingDomain {
             }
             let free = s
                 .authorized
-                .saturating_sub(self.0.owner.live().saturating_add(s.external));
+                .saturating_sub(self.0.lane.live_bytes().saturating_add(s.external));
             if free >= required_free {
                 return Ok(());
             }

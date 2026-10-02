@@ -46,7 +46,7 @@ pub struct RecordStore {
     segments: [AtomicPtr<Segment>; SEGMENTS],
     unattributed: [LaneRecord; UNATTRIBUTED_SHARDS as usize],
     free: Mutex<Vec<u32>>,
-    draining: Mutex<VecDeque<u32>>,
+    draining: Mutex<VecDeque<RecordRef>>,
     high_water: AtomicU32,
     capacity: u32,
     pub faults: FaultCounters,
@@ -180,7 +180,67 @@ impl RecordStore {
     pub(crate) fn drain(&self, reference: RecordRef) {
         let record = self.resolve(reference).expect("live record owner");
         record.flags.fetch_or(DRAINING, Ordering::Release);
-        self.draining.lock().unwrap().push_back(reference.index);
+        self.draining.lock().unwrap().push_back(reference);
+    }
+    /// Confirms reclamation of this exact, previously owner-dropped generation.
+    /// A collector may already have reclaimed and reused it. Queue serialization
+    /// ensures a claimed record is fully reclaimed before this returns true.
+    pub(crate) fn reclaim_exact(&self, reference: RecordRef) -> bool {
+        let _draining = self.draining.lock().unwrap();
+        !matches!(self.reclaim_reference(reference), ReclaimResult::Pending)
+    }
+    // The draining lock serializes claim, generation advancement and reuse
+    // publication with exact acknowledgements. Stale entries touch no new owner.
+    fn reclaim_reference(&self, reference: RecordRef) -> ReclaimResult {
+        let Some(record) = self.record_at(reference.index) else {
+            return ReclaimResult::Pending;
+        };
+        let generation = record.generation.load(Ordering::Acquire);
+        if generation > reference.generation {
+            return ReclaimResult::AlreadyReclaimed;
+        }
+        if generation != reference.generation {
+            return ReclaimResult::Pending;
+        }
+        if record.lifetime().claimed() {
+            // With the draining lock held, a same-generation claim is the
+            // completed quarantine of an exhausted generation, never an
+            // in-progress reset. It cannot acquire another owner.
+            return ReclaimResult::AlreadyReclaimed;
+        }
+        if record.flags.load(Ordering::Acquire) & DRAINING == 0
+            || record
+                .state
+                .compare_exchange(
+                    ZERO_STATE,
+                    ZERO_STATE | CLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return ReclaimResult::Pending;
+        }
+        if record.tagged.load(Ordering::Acquire) != 0
+            || record.r1_small.load(Ordering::Acquire) != 0
+        {
+            self.faults.reclaim_nonzero();
+        }
+        if generation == u32::MAX {
+            // Permanently quarantine this index rather than wrap into an ABA.
+            self.faults.generation_exhausted();
+            return ReclaimResult::AlreadyReclaimed;
+        }
+        // Reuse resets atomic fields only. Observers may still borrow the
+        // stable storage, so replacing the complete record would be a race.
+        record.tagged.store(0, Ordering::Release);
+        record.r1_small.store(0, Ordering::Release);
+        record.sequence.store(0, Ordering::Release);
+        record.flags.store(0, Ordering::Release);
+        record.origin.store(0, Ordering::Release);
+        record.generation.store(generation + 1, Ordering::Release);
+        self.free.lock().unwrap().push(reference.index);
+        ReclaimResult::Reclaimed
     }
     /// Bounded queue visits. Hooks never call this function or acquire its locks.
     pub fn reclaim(&self, budget: usize) -> usize {
@@ -188,43 +248,12 @@ impl RecordStore {
         let visits = budget.min(draining.len());
         let mut reclaimed = 0;
         for _ in 0..visits {
-            let index = draining.pop_front().expect("bounded drain visit");
-            let record = self.record_at(index).expect("draining record");
-            if record.flags.load(Ordering::Acquire) & DRAINING == 0
-                || record
-                    .state
-                    .compare_exchange(
-                        ZERO_STATE,
-                        ZERO_STATE | CLAIMED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-            {
-                draining.push_back(index);
-                continue;
+            let reference = draining.pop_front().expect("bounded drain visit");
+            match self.reclaim_reference(reference) {
+                ReclaimResult::Pending => draining.push_back(reference),
+                ReclaimResult::Reclaimed => reclaimed += 1,
+                ReclaimResult::AlreadyReclaimed => {}
             }
-            if record.tagged.load(Ordering::Acquire) != 0
-                || record.r1_small.load(Ordering::Acquire) != 0
-            {
-                self.faults.reclaim_nonzero();
-            }
-            let generation = record.generation.load(Ordering::Relaxed);
-            if generation == u32::MAX {
-                // Permanently quarantine this index rather than wrap into an ABA.
-                self.faults.generation_exhausted();
-                continue;
-            }
-            // Reuse resets atomic fields only. Observers may still borrow the
-            // stable storage, so replacing the complete record would be a race.
-            record.tagged.store(0, Ordering::Release);
-            record.r1_small.store(0, Ordering::Release);
-            record.sequence.store(0, Ordering::Release);
-            record.flags.store(0, Ordering::Release);
-            record.origin.store(0, Ordering::Release);
-            record.generation.store(generation + 1, Ordering::Release);
-            self.free.lock().unwrap().push(index);
-            reclaimed += 1;
         }
         reclaimed
     }
@@ -260,6 +289,11 @@ impl RecordStore {
             ))
         })
     }
+}
+enum ReclaimResult {
+    Pending,
+    Reclaimed,
+    AlreadyReclaimed,
 }
 impl Drop for RecordStore {
     fn drop(&mut self) {
@@ -319,5 +353,83 @@ impl StoreHandle {
             store: self.clone(),
             reference,
         })
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod exact_reclaim_tests {
+    use super::*;
+    use crate::lane::SlotCore;
+
+    #[test]
+    fn exact_reclaim_requires_owner_drop_and_final_real_count() {
+        let handle = StoreHandle::owned(32);
+        let store = handle.store();
+        let owner = handle.acquire(1, ResponsibilityClass::Query).unwrap();
+        let reference = owner.reference();
+        assert!(!store.reclaim_exact(reference));
+        // SAFETY: owner protects one simulated successful allocation fact.
+        unsafe { SlotCore::direct(store, reference, 1, 0, 1) };
+        drop(owner);
+        assert!(!store.reclaim_exact(reference));
+        assert!(store.resolve(reference).is_some());
+        // SAFETY: this is the matching simulated final free, exactly once.
+        unsafe { SlotCore::direct(store, reference, -1, 0, -1) };
+        assert!(store.reclaim_exact(reference));
+        assert!(store.resolve(reference).is_none());
+        assert!(store.reclaim_exact(reference));
+        assert_eq!(store.reclaim(1), 0);
+        assert!(store.draining.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_reclaim_accepts_a_completed_collector_reclaim() {
+        let handle = StoreHandle::owned(32);
+        let store = handle.store();
+        let owner = handle.acquire(1, ResponsibilityClass::Query).unwrap();
+        let reference = owner.reference();
+        drop(owner);
+        assert_eq!(store.reclaim(1), 1);
+        assert!(store.reclaim_exact(reference));
+        let replacement = handle.acquire(2, ResponsibilityClass::Service).unwrap();
+        assert_eq!(replacement.reference().index, reference.index);
+        assert!(store.reclaim_exact(reference));
+        assert_eq!(replacement.record().origin.load(Ordering::Acquire), 2);
+        drop(replacement);
+        assert_eq!(store.reclaim(1), 1);
+    }
+
+    #[test]
+    fn stale_queue_visit_never_reclaims_a_reused_generation() {
+        let handle = StoreHandle::owned(64);
+        let store = handle.store();
+        let mut blockers = Vec::new();
+        for origin in 1..=16 {
+            let owner = handle.acquire(origin, ResponsibilityClass::Query).unwrap();
+            let reference = owner.reference();
+            // SAFETY: owner protects one simulated outstanding allocation.
+            unsafe { SlotCore::direct(store, reference, 1, 0, 1) };
+            blockers.push(reference);
+            drop(owner);
+        }
+        let owner = handle.acquire(17, ResponsibilityClass::Query).unwrap();
+        let reference = owner.reference();
+        drop(owner);
+        assert!(store.reclaim_exact(reference));
+        // acquire's sixteen bounded visits cannot reach the stale tail entry.
+        let replacement = handle.acquire(18, ResponsibilityClass::Service).unwrap();
+        let replacement_ref = replacement.reference();
+        assert_eq!(replacement_ref.index, reference.index);
+        assert!(replacement_ref.generation > reference.generation);
+        drop(replacement);
+        assert_eq!(store.reclaim(1), 0);
+        assert!(store.resolve(replacement_ref).is_some());
+        assert!(store.reclaim_exact(replacement_ref));
+        for reference in blockers {
+            // SAFETY: release each simulated outstanding allocation once.
+            unsafe { SlotCore::direct(store, reference, -1, 0, -1) };
+        }
+        assert_eq!(store.reclaim(32), 16);
+        assert!(store.draining.lock().unwrap().is_empty());
     }
 }

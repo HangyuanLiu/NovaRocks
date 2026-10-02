@@ -16,12 +16,12 @@
 // under the License.
 
 //! One independently redeemable authorization domain.
-use crate::sync::{Arc, Mutex, Ordering};
+use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
 use crate::{
     account::{AccountHandle, Path, grow_locked, qualify},
     error::{CapacityError, MetadataRegistryLabel},
     ids::AccountKind,
-    owner::{AllocationOrigin, OwnerRecord},
+    lane::LaneHandle,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +56,9 @@ pub(crate) struct DomainState {
 #[derive(Debug)]
 pub(crate) struct Domain {
     pub id: u64,
-    pub owner: OwnerRecord,
+    pub lane: LaneHandle,
+    pub covered_sequence: AtomicU64,
+    pub covered_epoch: AtomicU64,
     pub state: Mutex<DomainState>,
     pub metadata: u64,
 }
@@ -65,8 +67,10 @@ pub(crate) struct Domain {
 pub struct FundingDomain(pub(crate) Arc<Domain>);
 /// Storage fee includes stable state and both Arc counters. Registry backing
 /// is charged separately at assembly, so its slot is not counted twice here.
-pub const OWNER_METADATA_BYTES: u64 =
-    (std::mem::size_of::<Domain>() + 2 * std::mem::size_of::<usize>()) as u64;
+pub const OWNER_METADATA_BYTES: u64 = (std::mem::size_of::<Domain>()
+    + std::mem::size_of::<crate::lane::handle::LaneShared>()
+    + 4 * std::mem::size_of::<usize>()
+    + 64) as u64;
 
 impl AccountHandle {
     pub fn create_domain(&self, authorized: u64) -> Result<FundingDomain, CapacityError> {
@@ -81,7 +85,11 @@ impl AccountHandle {
         let shared = &self.0.shared;
         let record = Arc::new(Domain {
             id: shared.next_identity()?,
-            owner: OwnerRecord::new(self.id()),
+            lane: LaneHandle::new(self).map_err(|_| CapacityError::Invalid {
+                detail: "lane record storage unavailable",
+            })?,
+            covered_sequence: AtomicU64::new(0),
+            covered_epoch: AtomicU64::new(0),
             metadata: OWNER_METADATA_BYTES,
             state: Mutex::new(DomainState {
                 account: self.clone(),
@@ -112,9 +120,14 @@ impl AccountHandle {
                     detail: "split requires an inactive open source in this account",
                 });
             }
-            let free = s
-                .authorized
-                .saturating_sub(source.unwrap().0.owner.live().saturating_add(s.external));
+            let free = s.authorized.saturating_sub(
+                source
+                    .unwrap()
+                    .0
+                    .lane
+                    .live_bytes()
+                    .saturating_add(s.external),
+            );
             if authorized > free {
                 return Err(CapacityError::Invalid {
                     detail: "split exceeds source free authorization",
@@ -165,12 +178,7 @@ impl AccountHandle {
             // allocation or external bound is moved by this free-only operation.
             s.authorized -= authorized;
             s.committed -= authorized;
-            source
-                .unwrap()
-                .0
-                .owner
-                .sequence
-                .fetch_add(1, Ordering::Release);
+            source.unwrap().0.lane.bump_sequence();
         }
         registry.metadata += OWNER_METADATA_BYTES;
         registry.active += 1;
@@ -198,7 +206,7 @@ impl FundingDomain {
     }
     pub fn snapshot(&self) -> DomainSnapshot {
         let s = self.0.state.lock().unwrap();
-        let live = self.0.owner.live();
+        let live = self.0.lane.live_bytes();
         let obligation = live.checked_add(s.external).expect("valid domain facts");
         DomainSnapshot {
             authorized: s.authorized,
@@ -216,13 +224,17 @@ impl FundingDomain {
     pub fn seal(&self) {
         let mut s = self.0.state.lock().unwrap();
         s.sealed = true;
-        self.0.owner.sequence.fetch_add(1, Ordering::Release);
+        self.0
+            .lane
+            .record()
+            .sequence
+            .fetch_add(1, Ordering::Release);
     }
     pub(crate) fn affiliation(&self) -> AccountHandle {
         self.0.state.lock().unwrap().account.clone()
     }
-    pub(crate) fn origin(&self) -> AllocationOrigin {
-        AllocationOrigin::new(&self.0.owner)
+    pub fn lane(&self) -> &LaneHandle {
+        &self.0.lane
     }
 }
 #[derive(Debug)]

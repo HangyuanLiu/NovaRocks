@@ -17,7 +17,7 @@
 
 //! Explicit external upper bounds share one domain's backing, and conversion
 //! subtracts O before publishing the matching L under the same local gate.
-use crate::{domain::FundingDomain, error::CapacityError, owner::AllocationOrigin};
+use crate::{domain::FundingDomain, error::CapacityError, lane::FactToken};
 #[derive(Debug)]
 pub struct ExternalBound {
     domain: FundingDomain,
@@ -38,7 +38,7 @@ impl FundingDomain {
         }
         if bytes
             > s.authorized
-                .saturating_sub(self.0.owner.live().saturating_add(s.external))
+                .saturating_sub(self.0.lane.live_bytes().saturating_add(s.external))
         {
             return Err(CapacityError::Invalid {
                 detail: "external bound exceeds local backing",
@@ -48,7 +48,8 @@ impl FundingDomain {
         // Even a zero-byte bound can publish an allocation origin later.
         s.external_handles += 1;
         self.0
-            .owner
+            .lane
+            .record()
             .sequence
             .fetch_add(1, crate::sync::Ordering::Release);
         Ok(ExternalBound {
@@ -63,7 +64,7 @@ impl ExternalBound {
     }
     /// Establishes proven successful allocation in place of exactly these
     /// external bytes. It does not establish a second commitment.
-    pub fn convert_to_live(&mut self, bytes: u64) -> Result<AllocationOrigin, CapacityError> {
+    pub fn convert_to_live(&mut self, bytes: u64) -> Result<FactToken, CapacityError> {
         if bytes > self.remaining {
             return Err(CapacityError::Invalid {
                 detail: "conversion exceeds external bound",
@@ -72,14 +73,14 @@ impl ExternalBound {
         let mut s = self.domain.0.state.lock().unwrap();
         s.external -= bytes;
         self.remaining -= bytes;
-        self.domain.0.owner.publish(bytes);
+        let token = self.domain.0.lane.publish_fact(bytes);
         // Accept this exact O -> L conversion only. Other unpublished scope
         // debt remains dirty until the common settlement boundary accepts it.
         s.settled_live = s
             .settled_live
             .checked_add(bytes)
             .expect("valid converted bytes");
-        Ok(self.domain.origin())
+        Ok(token)
     }
 }
 impl Drop for ExternalBound {
@@ -89,7 +90,8 @@ impl Drop for ExternalBound {
         state.external_handles -= 1;
         self.domain
             .0
-            .owner
+            .lane
+            .record()
             .sequence
             .fetch_add(1, crate::sync::Ordering::Release);
     }

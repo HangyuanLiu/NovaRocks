@@ -83,6 +83,7 @@ impl AuthorityConfig {
 }
 #[derive(Debug)]
 pub(crate) struct Shared {
+    pub record_store: crate::lane::StoreHandle,
     pub ceiling: u64,
     pub top_up: TopUpPolicy,
     pub target: AtomicU64,
@@ -100,13 +101,10 @@ pub(crate) struct Shared {
     pub maintenance: Mutex<crate::maintenance::MaintenanceState>,
 }
 #[derive(Debug)]
-/// Process-local ownership of the allocation-origin registry.
-///
-/// This authority must outlive every active allocation scope, external bound
-/// and outstanding allocation origin issued by it. Shutdown closes admission and detaches
-/// empty records; it is not evidence of executor or I/O teardown. A record
-/// with publishing or allocation responsibility remains pinned rather than
-/// invalidating a raw origin if this lifetime contract is violated.
+/// Process-local funding assembly. Allocation facts live in the independent
+/// process store, so real late frees remain safe after this authority drops.
+/// Shutdown closes production and detaches funding cycles; it is not executor
+/// or I/O teardown evidence and does not revoke outstanding allocation facts.
 pub struct MemoryAuthority {
     config: AuthorityConfig,
     pub(crate) shared: Arc<Shared>,
@@ -117,6 +115,10 @@ impl MemoryAuthority {
     pub fn new(config: AuthorityConfig) -> Result<Self, ConfigError> {
         config.validate()?;
         let shared = Arc::new(Shared {
+            #[cfg(not(loom))]
+            record_store: crate::lane::StoreHandle::Global,
+            #[cfg(loom)]
+            record_store: crate::lane::StoreHandle::owned(256),
             ceiling: config.capacity_bytes,
             top_up: config.top_up,
             target: AtomicU64::new(config.capacity_bytes),
@@ -342,6 +344,17 @@ impl Drop for MemoryAuthority {
         // teardown receipt and does not revoke an active scope's real facts.
         self.root.close_to_growth();
         self.detach_empty_records();
+        // Tokens retain access through the process store, not funding cycles.
+        let detached = {
+            let mut registry = self.shared.domains.lock().unwrap();
+            let records = std::mem::take(&mut registry.records);
+            registry.active = 0;
+            registry.metadata = 0;
+            registry.upper = 0;
+            records
+        };
+        drop(detached);
+        self.shared.record_store.store().reclaim(usize::MAX);
     }
 }
 impl MemoryAuthority {
@@ -351,7 +364,7 @@ impl MemoryAuthority {
             let record = self.shared.domains.lock().unwrap().records[index].clone();
             let Some(record) = record else { continue };
             let state = record.state.lock().unwrap();
-            if state.active || state.external_handles != 0 || !record.owner.reclaimable() {
+            if state.active || state.external_handles != 0 || !record.lane.reclaimable() {
                 continue;
             }
             let detached = {
