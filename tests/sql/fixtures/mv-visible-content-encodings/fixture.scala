@@ -708,3 +708,114 @@ object RecursiveTypeFixture {
     println("RECURSIVE_DDL_CTAS_OBSERVED")
   }
 }
+
+// A separate ordered-entry oracle is required for non-string Map keys.
+// No SQL map() constructor or string-key oracle participates in this fixture.
+object FieldDomainAllocatorFixture {
+  import DeleteApplicabilityFixture._
+  val Names=Set("domain_allocator","domain_allocator_ctas","domain_allocator_insert")
+  val DomainProperty="novarocks.field_domains.v1"
+  val DomainText="{\"version\":1,\"fields\":{\"3\":\"smallint\",\"4\":\"tinyint\"}}"
+  def load(ns: String,name: String): Table = {
+    require(ns.length<=64 && ns.matches("ns_[a-zA-Z0-9_]+") && Names.contains(name))
+    val t=Spark3Util.loadIcebergTable(org.apache.spark.sql.SparkSession.active,s"ice_rest.$ns.$name")
+    t.refresh(); t
+  }
+  def assertShape(t: Table): Unit = {
+    require(metadata(t).formatVersion()==3,"Allocator fixture requires format-v3")
+    val actual=RecursiveTypeFixture.facts(t.schema())
+    val expected=Vector(RecursiveTypeFixture.FieldFact("m",1,false,"MAP"),
+      RecursiveTypeFixture.FieldFact("m.key",2,true,"STRUCT"),
+      RecursiveTypeFixture.FieldFact("m.key.k",4,false,"INTEGER"),
+      RecursiveTypeFixture.FieldFact("m.value",3,false,"INTEGER"))
+    require(actual==expected,"Actual Java SDK schema differs from fresh Map key/value-before-child IDs")
+    require(t.properties().get(DomainProperty)==DomainText,"Allocator swapped or lost the narrow domains")
+    require(t.properties().keySet().asScala.filter(_.startsWith("novarocks.field_domains.")).toSet==Set(DomainProperty),"Unexpected field-domain property")
+  }
+  def row(schema: Schema,kind: String): Record = {
+    val r=GenericRecord.create(schema)
+    if(kind=="null") return r
+    val m=new java.util.LinkedHashMap[Record,java.lang.Integer]()
+    if(kind!="empty") {
+      val key=GenericRecord.create(schema.findType("m").asMapType().keyType().asStructType())
+      key.setField("k",if(kind=="child-null") null else Int.box(if(kind=="negative") -128 else 127))
+      m.put(key,Int.box(if(kind=="negative") -32768 else if(kind=="child-null") -1 else 32767))
+    }
+    r.setField("m",m); r
+  }
+  val Kinds=Vector("positive","positive","negative","child-null","null","empty")
+  def content(r: Record): String = {
+    val m=r.getField("m")
+    val visible=if(m==null) json(null) else json(m.asInstanceOf[java.util.Map[Record,java.lang.Integer]].entrySet().asScala.toVector.map { e =>
+      val k=e.getKey.getField("k")
+      val keyValue: Any=if(k==null) null else k.asInstanceOf[java.lang.Integer].intValue()
+      obj("key"->obj("k"->keyValue),"value"->e.getValue.intValue())
+    })
+    mapper.writeValueAsString(obj("m"->visible))
+  }
+  def bag(t: Table): Map[String,Int] = {
+    val reader=IcebergGenerics.read(t).useSnapshot(t.currentSnapshot().snapshotId()).project(t.schema()).build()
+    val rows=scala.collection.mutable.ArrayBuffer.empty[String]
+    try reader.asScala.foreach { r => require(rows.size<6,"Allocator row budget exceeded"); rows+=content(r) } finally reader.close()
+    require(rows.size==6,"Allocator complete bag cardinality changed")
+    rows.groupBy(identity).map { case(k,v)=>k->v.size }.toMap
+  }
+  def assertFiles(t: Table): Vector[JsonNode] = {
+    val tasks=RecursiveTypeFixture.boundedScan(t)
+    require(tasks.size<=3 && tasks.forall(_.deletes().isEmpty),"Allocator expected only bounded data files")
+    tasks.foreach { task =>
+      val local=java.nio.file.Files.createTempFile("uea7b3-allocator-",".parquet")
+      try {
+        java.nio.file.Files.write(local,RecursiveTypeFixture.boundedBytes(t,task.file().location()))
+        val input=org.apache.iceberg.shaded.org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(new org.apache.hadoop.fs.Path(local.toUri()),new org.apache.hadoop.conf.Configuration())
+        val reader=org.apache.iceberg.shaded.org.apache.parquet.hadoop.ParquetFileReader.open(input)
+        try {
+          val raw=reader.getFooter().getFileMetaData().getSchema()
+          val primitives=scala.collection.mutable.Map.empty[Int,String]
+          val seen=scala.collection.mutable.Set.empty[Int]
+          val visitor=new org.apache.iceberg.parquet.ParquetTypeVisitor[java.lang.Integer]() {
+            import org.apache.iceberg.shaded.org.apache.parquet.schema.{Type=>PType,GroupType,PrimitiveType,MessageType}
+            def check(t: PType): java.lang.Integer = {
+              require(t.getId()!=null && t.getId().intValue()>0 && seen.add(t.getId().intValue()),"Allocator Parquet field ID absent/duplicate")
+              if(t.isPrimitive) primitives.put(t.getId().intValue(),t.asPrimitiveType().getPrimitiveTypeName().toString())
+              java.lang.Integer.valueOf(0)
+            }
+            override def message(t: MessageType,fields: java.util.List[java.lang.Integer]): java.lang.Integer = java.lang.Integer.valueOf(0)
+            override def struct(t: GroupType,fields: java.util.List[java.lang.Integer]): java.lang.Integer = check(t)
+            override def list(t: GroupType,element: java.lang.Integer): java.lang.Integer = check(t)
+            override def map(t: GroupType,key: java.lang.Integer,value: java.lang.Integer): java.lang.Integer = check(t)
+            override def primitive(t: PrimitiveType): java.lang.Integer = check(t)
+          }
+          org.apache.iceberg.parquet.ParquetTypeVisitor.visit(raw,visitor)
+          require(primitives.get(3).contains("INT32") && primitives.get(4).contains("INT32"),"Allocator Parquet narrow physical carriers changed")
+          val converted=org.apache.iceberg.parquet.ParquetSchemaUtil.convertAndPrune(raw)
+          val physical=RecursiveTypeFixture.facts(converted).map(f=>f.id->f).toMap
+          require(RecursiveTypeFixture.facts(t.schema()).forall(f=>physical.get(f.id).contains(f)),"Allocator Parquet fields/IDs/required/type changed")
+        } finally reader.close()
+      } finally java.nio.file.Files.deleteIfExists(local)
+    }
+    tasks.map(task=>RecursiveTypeFixture.fileFact(task.file()))
+  }
+  def initialize(ns: String): Unit = {
+    val t=load(ns,"domain_allocator"); assertShape(t)
+    require(t.currentSnapshot()==null,"Allocator table is not a clean CREATE response")
+    val file=RecursiveTypeFixture.write(t,Kinds.map(row(t.schema(),_)),"allocator")
+    t.newAppend().appendFile(file).commit(); t.refresh(); assertShape(t)
+    require(bag(t)==Kinds.map(row(t.schema(),_)).map(content).groupBy(identity).map { case(k,v)=>k->v.size },"Allocator SDK write/read complete bag changed")
+    val files=assertFiles(t)
+    RecursiveTypeFixture.boundedEmit(obj("record"->"field_domain_allocator_initialized","table_uuid"->metadata(t).uuid().toString,
+      "schema_json"->SchemaParser.toJson(t.schema()),"field_domains_json"->DomainText,"snapshot"->t.currentSnapshot().snapshotId(),"files"->files,
+      "bag"->bag(t).toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
+    println("FIELD_DOMAIN_ALLOCATOR_READY")
+  }
+  def observe(ns: String): Unit = {
+    val tables=Vector("domain_allocator","domain_allocator_ctas","domain_allocator_insert").map(load(ns,_))
+    require(tables.map(t=>metadata(t).uuid()).distinct.size==3,"Allocator targets reused provider UUID")
+    val expected=Kinds.map(row(tables.head.schema(),_)).map(content).groupBy(identity).map { case(k,v)=>k->v.size }
+    tables.foreach { t => assertShape(t); require(bag(t)==expected,"Allocator source/target complete ordered-entry bags differ"); assertFiles(t) }
+    RecursiveTypeFixture.boundedEmit(obj("record"->"field_domain_allocator_observed","tables"->tables.map { t => obj("table_uuid"->metadata(t).uuid().toString,
+      "schema_json"->SchemaParser.toJson(t.schema()),"field_domains_json"->DomainText,"snapshot"->t.currentSnapshot().snapshotId(),"files"->assertFiles(t),
+      "bag"->bag(t).toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }) }))
+    println("FIELD_DOMAIN_ALLOCATOR_OBSERVED")
+  }
+}
