@@ -136,6 +136,7 @@ fn fixture_calls(fragment: &Fragment, uses: &PhysicalRootUses) -> FrozenFragment
                 panic!("the parameter fixture requires its selected timezone reference");
             };
             calls.push(FrozenPhysicalCall {
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(*id),
                 context: invocation.context,
                 effects: parameter_fixture_effects(*reference),
@@ -1531,6 +1532,7 @@ fn parameter_calls_with_references(
             assert!(function.argument_types.is_empty());
             assert!(args.is_empty());
             FrozenPhysicalCall {
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(*id),
                 context: invocation.context,
                 effects: parameter_fixture_effects(*reference),
@@ -1983,4 +1985,50 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
             );
         }
     }
+}
+
+#[test]
+fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identity() {
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    let reference = SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let fragment = parameter_occurrences_fragment(reference, 2);
+    let uses = fixture_expression_uses(&fragment);
+    let original = parameter_calls_with_references(&fragment, &uses, &[reference, reference]);
+    let mut entries = original.entries().values().cloned().collect::<Vec<_>>();
+    entries[0].decimal_overflow_policy = ReportError;
+    entries[1].decimal_overflow_policy = OutputNull;
+    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, entries, &Control).unwrap();
+    let parameters = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::TimeZone("UTC".into()),
+    )])
+    .unwrap();
+    let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
+    input.parameters = parameters.clone();
+    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    assert_eq!(checked.calls(), &calls);
+    let mut changed = input;
+    changed.calls = original;
+    let changed = FragmentPackage::try_new(changed, &Control).unwrap();
+    assert_ne!(checked, changed);
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    let plan = builder.finish().unwrap();
+    let packages = extract_fragment_packages(
+        &plan,
+        &BTreeMap::new(),
+        &parameters,
+        &BTreeMap::new(),
+        &BTreeMap::from([(fragment.id(), uses)]),
+        &BTreeMap::from([(fragment.id(), calls.clone())]),
+        &fixture_pruning_tables(&plan),
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(packages[&fragment.id()].calls(), &calls);
+    assert_eq!(packages[&fragment.id()], checked);
 }

@@ -331,7 +331,7 @@ message BinaryExpression {
   optional uint32 left_expr_id = 1;
   BinaryOperator op = 2;
   optional uint32 right_expr_id = 3;
-  DecimalOverflowPolicy decimal_overflow_policy = 4;
+  novarocks.physical_semantics_v2.DecimalOverflowPolicy decimal_overflow_policy = 4;
 }
 enum BinaryOperator {
   BINARY_OPERATOR_UNSPECIFIED = 0;
@@ -351,11 +351,6 @@ enum BinaryOperator {
   BINARY_OPERATOR_BIT_OR = 14;
   BINARY_OPERATOR_BIT_XOR = 15;
 }
-enum DecimalOverflowPolicy {
-  DECIMAL_OVERFLOW_POLICY_UNSPECIFIED = 0;
-  DECIMAL_OVERFLOW_POLICY_OUTPUT_NULL = 1;
-  DECIMAL_OVERFLOW_POLICY_REPORT_ERROR = 2;
-}
 message FunctionCall {
   optional uint32 function_binding_id = 1;
   repeated uint32 argument_expr_ids = 2;
@@ -367,7 +362,7 @@ message LambdaExpression {
 message CastExpression {
   optional uint32 expr_id = 1;
   optional uint32 target_carrier_type_id = 2;
-  DecimalOverflowPolicy decimal_overflow_policy = 3;
+  novarocks.physical_semantics_v2.DecimalOverflowPolicy decimal_overflow_policy = 3;
 }
 message IsNullExpression {
   optional uint32 expr_id = 1;

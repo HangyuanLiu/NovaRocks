@@ -249,6 +249,7 @@ fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
         .uses()
         .values()
         .map(|invocation| FrozenPhysicalCall {
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Expression(invocation.context.use_id),
             context: invocation.context,
             effects: effects(FunctionKind::Scalar, invocation.context.domain),
@@ -545,6 +546,7 @@ fn case_fixture() -> Fixture {
         .map(|id| {
             let context = uses.flow().uses()[&ExpressionUseId::new(id)].context;
             FrozenPhysicalCall {
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 site: PhysicalCallSite::Expression(context.use_id),
                 context,
                 effects: effects(FunctionKind::Scalar, context.domain),
@@ -719,6 +721,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
     for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
         let context = context(use_id, 0, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             site: PhysicalCallSite::Aggregate {
                 node: aggregate,
                 call,
@@ -735,12 +738,14 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         .unwrap()
         .context;
     calls.push(FrozenPhysicalCall {
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Expression(window_use.use_id),
         context: window_use,
         effects: effects(FunctionKind::Window, window_use.domain),
     });
     let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
     calls.push(FrozenPhysicalCall {
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Table { node: table },
         context,
         effects: effects(FunctionKind::Table, context.domain),
@@ -1037,6 +1042,7 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
     let mut claimed = effects(FunctionKind::Scalar, current.domain);
     claimed.argument_control = ArgumentControl::TypeOnly;
     let parent_call = FrozenPhysicalCall {
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         site: PhysicalCallSite::Expression(current.use_id),
         context: current,
         effects: claimed,
@@ -1081,4 +1087,110 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
         ),
         Err(FrozenCallError::InvalidSite),
     );
+}
+
+#[test]
+fn decimal_policy_is_independent_of_equal_effects_and_call_context() {
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    let mut fixture = scalar_fixture(1, 83);
+    let output_null = fixture.checked().unwrap();
+    let site = fixture.calls[0].site;
+    fixture.calls[0].decimal_overflow_policy = ReportError;
+    let report_error = fixture.checked().unwrap();
+    let before = &output_null.entries()[&site];
+    let after = &report_error.entries()[&site];
+    assert_eq!(before.context, after.context);
+    assert_eq!(before.effects, after.effects);
+    assert_eq!(before.decimal_overflow_policy, OutputNull);
+    assert_eq!(after.decimal_overflow_policy, ReportError);
+    assert_ne!(before, after);
+    assert_ne!(output_null, report_error);
+    // Rechecking this exact snapshot validates shape, not an invented policy
+    // derived from the selected signature or its unchanged NoRowError claim.
+    report_error
+        .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
+        .unwrap();
+    assert_eq!(report_error.entries()[&site], fixture.calls[0]);
+}
+
+#[test]
+fn shared_definition_occurrences_keep_distinct_decimal_policies_in_one_table() {
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    let mut fixture = scalar_fixture(2, 84);
+    for call in &mut fixture.calls {
+        call.effects.proof_scope = CallProofScope::Unconditional;
+    }
+    fixture.calls[0].decimal_overflow_policy = ReportError;
+    fixture.calls[1].decimal_overflow_policy = OutputNull;
+    assert_eq!(fixture.calls[0].effects, fixture.calls[1].effects);
+    let checked = fixture.checked().unwrap();
+    let first = fixture.uses.flow().uses()[&fixture.calls[0].context.use_id].definition;
+    let second = fixture.uses.flow().uses()[&fixture.calls[1].context.use_id].definition;
+    assert_eq!(first, second);
+    let Some(PhysicalCallBinding::Scalar(first_binding)) =
+        checked.binding(&fixture.fragment, &fixture.uses, fixture.calls[0].site)
+    else {
+        panic!("missing first exact scalar binding")
+    };
+    let Some(PhysicalCallBinding::Scalar(second_binding)) =
+        checked.binding(&fixture.fragment, &fixture.uses, fixture.calls[1].site)
+    else {
+        panic!("missing second exact scalar binding")
+    };
+    assert!(std::ptr::eq(first_binding, second_binding));
+    for (call, policy) in fixture.calls.iter().zip([ReportError, OutputNull]) {
+        assert_eq!(
+            checked.entries()[&call.site].decimal_overflow_policy,
+            policy
+        );
+    }
+    checked
+        .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
+        .unwrap();
+    assert_eq!(checked, fixture.checked().unwrap());
+}
+
+#[test]
+fn relational_and_window_sites_preserve_their_own_explicit_decimal_policy() {
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    let mut fixture = special_fixture();
+    let policies = [ReportError, OutputNull, ReportError, OutputNull];
+    for (call, policy) in fixture.calls.iter_mut().zip(policies) {
+        call.decimal_overflow_policy = policy;
+    }
+    let checked = fixture.checked().unwrap();
+    assert!(matches!(
+        fixture.calls[0].site,
+        PhysicalCallSite::Aggregate { call: 0, .. }
+    ));
+    assert!(matches!(
+        fixture.calls[1].site,
+        PhysicalCallSite::Aggregate { call: 1, .. }
+    ));
+    assert!(matches!(
+        fixture.calls[2].site,
+        PhysicalCallSite::Expression(_)
+    ));
+    assert!(matches!(
+        fixture.calls[3].site,
+        PhysicalCallSite::Table { .. }
+    ));
+    for (call, policy) in fixture.calls.iter().zip(policies) {
+        assert_eq!(
+            checked.entries()[&call.site].decimal_overflow_policy,
+            policy
+        );
+        assert!(
+            checked
+                .binding(&fixture.fragment, &fixture.uses, call.site)
+                .is_some()
+        );
+    }
+    checked
+        .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
+        .unwrap();
+    assert_eq!(checked, fixture.checked().unwrap());
 }

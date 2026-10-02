@@ -27,9 +27,9 @@ use crate::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    CompilePhase, EffectContractError, EvaluationDemand, ExpressionEffectContext, ExpressionUseId,
-    FunctionEffectDeclaration, FunctionKind, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
-    SemanticParameterRef,
+    CompilePhase, DecimalOverflowPolicy, EffectContractError, EvaluationDemand,
+    ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration, FunctionKind,
+    MAX_CONTROL_USE_REFERENCES, PureCompileControl, SemanticParameterRef,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,6 +58,9 @@ pub struct FrozenPhysicalCall {
     pub site: PhysicalCallSite,
     pub context: ExpressionEffectContext,
     pub effects: CallEffects,
+    /// Authored by this call's SQL scope, independently of effect claims and
+    /// environment parameters. Compilation must not infer a package default.
+    pub decimal_overflow_policy: DecimalOverflowPolicy,
 }
 
 /// Borrow the real binding; this table never copies a second signature DSL.

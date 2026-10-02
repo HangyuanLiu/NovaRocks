@@ -61,7 +61,20 @@ message FrozenCall {
   CallSite site = 1;
   EffectContext context = 2;
   CallEffects effects = 3;
+  // Required for every real call. It belongs to the original SQL scope, not
+  // to CallEffects, ALLOW_THROW_EXCEPTION or DecimalOverflowToDouble. Typed
+  // decode rejects absence, UNSPECIFIED and unknown values without a default.
+  optional DecimalOverflowPolicy decimal_overflow_policy = 4;
 }
+
+// One shared semantic policy for actual function calls and Binary/Cast nodes.
+// The numeric wire values remain identical across both use sites.
+enum DecimalOverflowPolicy {
+  DECIMAL_OVERFLOW_POLICY_UNSPECIFIED = 0;
+  DECIMAL_OVERFLOW_POLICY_OUTPUT_NULL = 1;
+  DECIMAL_OVERFLOW_POLICY_REPORT_ERROR = 2;
+}
+
 message NodeCallSite {
   optional uint32 node_id = 1;
   // This is an actual field ordinal, not an AggregateCallId or a signature ID.

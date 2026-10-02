@@ -216,6 +216,11 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
                 effects: Some(effects(v2::proof_scope::Kind::Unconditional(
                     control::Empty {},
                 ))),
+                decimal_overflow_policy: Some(if ordinal % 2 == 0 {
+                    v2::DecimalOverflowPolicy::OutputNull
+                } else {
+                    v2::DecimalOverflowPolicy::ReportError
+                } as i32),
             })
             .collect(),
     };
@@ -686,4 +691,70 @@ fn pruning_descriptor_exposes_only_exact_references_and_flat_path_fields() {
             (2, "PRUNING_DOMAIN_FIELD_UNENFORCED".into()),
         ]
     );
+}
+
+#[test]
+fn call_policy_presence_preserves_absent_unspecified_and_unknown_for_typed_decode() {
+    // Independent canonical wire fixtures: FrozenCall field 4 is a varint.
+    // Prost intentionally retains all distinctions for the later typed codec.
+    assert_eq!(
+        v2::FrozenCall::decode(&b""[..])
+            .unwrap()
+            .decimal_overflow_policy,
+        None
+    );
+    for (bytes, value) in [
+        ([0x20, 0x00], 0),
+        ([0x20, 0x01], 1),
+        ([0x20, 0x02], 2),
+        ([0x20, 0x63], 99),
+    ] {
+        let decoded = v2::FrozenCall::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.decimal_overflow_policy, Some(value));
+        assert_eq!(decoded.encode_to_vec(), bytes);
+    }
+    assert_eq!(v2::DecimalOverflowPolicy::OutputNull as i32, 1);
+    assert_eq!(v2::DecimalOverflowPolicy::ReportError as i32, 2);
+    assert!(v2::DecimalOverflowPolicy::try_from(99).is_err());
+    // These are representation checks. None/0/99 must be refused by the future
+    // typed semantic decoder; this test does not claim that decoder exists.
+}
+
+#[test]
+fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_values() {
+    let pool = pool();
+    for (message, tag, presence) in [
+        ("novarocks.physical_semantics_v2.FrozenCall", 4, true),
+        ("novarocks.physical_package_v2.BinaryExpression", 4, false),
+        ("novarocks.physical_package_v2.CastExpression", 3, false),
+    ] {
+        let descriptor = pool.get_message_by_name(message).unwrap();
+        let field = descriptor
+            .get_field_by_name("decimal_overflow_policy")
+            .unwrap();
+        assert_eq!(field.number(), tag);
+        assert_eq!(field.supports_presence(), presence);
+        let Kind::Enum(policy) = field.kind() else {
+            panic!("policy is one closed semantic enum")
+        };
+        assert_eq!(
+            policy.full_name(),
+            "novarocks.physical_semantics_v2.DecimalOverflowPolicy"
+        );
+        assert_eq!(
+            policy.values().map(|v| v.number()).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+    for value in [1, 2] {
+        let binary = novarocks_proto_models::physical_package_v2::BinaryExpression::decode(
+            &[0x20, value][..],
+        )
+        .unwrap();
+        let cast =
+            novarocks_proto_models::physical_package_v2::CastExpression::decode(&[0x18, value][..])
+                .unwrap();
+        assert_eq!(binary.decimal_overflow_policy, i32::from(value));
+        assert_eq!(cast.decimal_overflow_policy, i32::from(value));
+    }
 }
