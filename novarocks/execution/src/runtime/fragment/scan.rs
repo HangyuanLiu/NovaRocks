@@ -17,7 +17,7 @@
 
 //! Instance-local scan materialization.
 //!
-//! The pure LocalProgram names scan requirements. A FragmentSubmission owns
+//! The pure LocalProgramGraph names scan requirements. A FragmentSubmission owns
 //! the exact Task-local ScanSource capabilities and enriched scan ranges. At
 //! launch this module binds the latter to per-instance ScanOps keyed by native
 //! node ID. A shared FragmentProgram retains no provider runtime capability.
@@ -54,17 +54,21 @@ pub(crate) fn materialize_scan_bindings(
                     ),
                 )
             })?;
+        let native_id = node.legacy_native_node_id().ok_or_else(|| {
+            FragmentLaunchError::new(
+                FragmentLaunchStage::Materialize,
+                FragmentLaunchErrorKind::Materialization,
+                "compiled local nodes cannot enter the legacy scan bridge",
+            )
+        })?;
         if !matches!(node.kind(), ProgramNodeKind::Scan { .. }) {
             return Err(FragmentLaunchError::new(
                 FragmentLaunchStage::Materialize,
                 FragmentLaunchErrorKind::Materialization,
-                format!(
-                    "runtime scan binding targets non-scan node {}",
-                    node.native_node_id()
-                ),
+                format!("runtime scan binding targets non-scan node {}", native_id),
             ));
         }
-        bind_scan(source, node.native_node_id(), instance, &mut bindings)?;
+        bind_scan(source, native_id, instance, &mut bindings)?;
     }
     Ok(bindings)
 }

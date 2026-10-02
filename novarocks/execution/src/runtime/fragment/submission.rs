@@ -29,7 +29,9 @@ use crate::exec::fragment::program::{
 };
 use crate::exec::node::LocalRuntimeBindings;
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
-use novarocks_local_program::{BindingRequirement, LocalProgram, ProgramNodeKind, StaticLayout};
+use novarocks_local_program::{
+    BindingRequirement, LocalProgramGraph, ProgramNodeKind, StaticLayout,
+};
 
 pub struct FragmentSubmission {
     program: Arc<FragmentProgram>,
@@ -134,7 +136,7 @@ impl FragmentSubmission {
 }
 
 struct ProgramInventory {
-    /// All pure scan nodes in the frozen LocalProgram.
+    /// All pure scan nodes in the frozen LocalProgramGraph.
     /// Used to cross-check the static `scan_sources` contracts.
     scan_nodes: BTreeSet<FragmentNodeId>,
     /// Pure scan nodes are materialized by `materialize_scan_bindings` and
@@ -144,14 +146,20 @@ struct ProgramInventory {
 }
 
 impl ProgramInventory {
-    fn try_collect(plan: &LocalProgram) -> Result<Self, FragmentBindingError> {
+    fn try_collect(plan: &LocalProgramGraph) -> Result<Self, FragmentBindingError> {
         let mut inventory = Self {
             scan_nodes: BTreeSet::new(),
             materializable_scan_nodes: BTreeSet::new(),
             exchange_nodes: BTreeMap::new(),
         };
         for node in plan.nodes() {
-            let id = FragmentNodeId::new(node.native_node_id());
+            let id = FragmentNodeId::new(node.legacy_native_node_id().ok_or_else(|| {
+                FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    "compiled local nodes cannot enter the legacy fragment bridge",
+                )
+            })?);
             match node.kind() {
                 ProgramNodeKind::ExchangeSource { .. } => {
                     if inventory
@@ -189,7 +197,7 @@ impl ProgramInventory {
 }
 
 fn validate_runtime_bindings(
-    program: &LocalProgram,
+    program: &LocalProgramGraph,
     runtime: &LocalRuntimeBindings,
 ) -> Result<(), FragmentBindingError> {
     let mut scans = BTreeSet::new();
@@ -466,7 +474,7 @@ fn validate_exchange_contracts(
     Ok(())
 }
 
-/// Presence-only cross-check between the LocalProgram scan nodes and the
+/// Presence-only cross-check between the LocalProgramGraph scan nodes and the
 /// instance's scan assignments (mirrors
 /// `validate_exchange_assignments`).
 ///
@@ -840,6 +848,65 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn compiled_scan_contract_for_test()
+    -> novarocks_connector_contract::ConnectorReadProgramRecipe {
+        use novarocks_connector_contract::*;
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+        };
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+        struct Fixture;
+        impl ConnectorReadProgramCompiler for Fixture {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                frozen: &FrozenConnectorRead,
+                _: &dyn PureCompileControl,
+            ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<ConnectorError>>
+            {
+                Ok(frozen.scan().recipe().clone())
+            }
+        }
+        // Reuse fixture atoms only. Full source facts go through a separate
+        // complete-input contract seal; this is not a production conversion.
+        let atoms = static_scan_for_test();
+        let scan = FrozenConnectorScan::try_new(
+            atoms.recipe().draft().clone(),
+            atoms.assignments().to_vec(),
+            TupleDomain::all(),
+            TupleDomain::all(),
+            None,
+            vec![],
+            NonZeroU64::new(1024).unwrap(),
+            NonZeroU64::new(1024 * 1024).unwrap(),
+            ConnectorReadWorkSource::RuntimeSplits,
+        )
+        .unwrap();
+        let facts = ConnectorReadStaticFacts::try_new(
+            ConnectorReadInputVersion::try_new([9]).unwrap(),
+            [7; 32],
+            ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, vec![])
+                .unwrap(),
+            ConnectorReadArtifactCoverage::NoArtifactInputs,
+            vec![],
+        )
+        .unwrap();
+        let public = ConnectorReadPublicFacts::try_new(
+            facts,
+            None,
+            Schema::new(vec![Field::new("v", DataType::Int64, false)]),
+            vec![ValueLogicalType::Physical],
+        )
+        .unwrap();
+        let frozen = FrozenConnectorRead::try_new(scan, public).unwrap();
+        ConnectorReadProgramRecipe::try_compile_with_provider(&frozen, &Fixture, &Control).unwrap()
+    }
+
     pub(crate) fn static_scan_for_test() -> StaticConnectorScan {
         let instance = ConnectorInstanceId::try_from_canonical("test_lake").unwrap();
         let binding = ConnectorReadBinding::new(
@@ -927,8 +994,10 @@ pub(crate) mod tests {
 
     fn lower_result_for_test(
         plan: ExecPlan,
-    ) -> Result<(LocalProgram, LocalRuntimeBindings), crate::exec::node::LocalProgramLoweringError>
-    {
+    ) -> Result<
+        (LocalProgramGraph, LocalRuntimeBindings),
+        crate::exec::node::LocalProgramLoweringError,
+    > {
         let mut ids = Vec::new();
         scan_ids(&plan.root, &mut ids);
         let static_scans = ids

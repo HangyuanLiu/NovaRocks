@@ -100,7 +100,7 @@ fn profile(layout: &StaticLayout) -> CompileProfile {
 fn metadata_source_program(
     join: bool,
     wrong_definition: bool,
-) -> Result<LocalProgram, LocalProgramError> {
+) -> Result<LocalProgramGraph, LocalProgramError> {
     let (source, layout) = values(1);
     let definitions = arena(vec![
         StaticExprNode::new(
@@ -200,7 +200,7 @@ fn metadata_source_program(
         ));
         ProgramNodeId::new(1)
     };
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         nodes,
         root,
         definitions,
@@ -243,7 +243,7 @@ fn branch(index: usize, keys: usize, columns: usize) -> StaticStreamBranch {
     )
     .unwrap()
 }
-fn scoped_program(shared: bool) -> LocalProgram {
+fn scoped_program(shared: bool) -> LocalProgramGraph {
     let (values, layout) = values(2);
     let main = integer_arena(7);
     let writer = if shared {
@@ -314,7 +314,7 @@ fn scoped_program(shared: bool) -> LocalProgram {
         },
     ])
     .unwrap();
-    LocalProgram::try_new_with_sink(
+    LocalProgramGraph::try_new_with_sink(
         nodes,
         ProgramNodeId::new(2),
         main,
@@ -440,7 +440,7 @@ fn shared_arc_backing_does_not_merge_arena_scope_or_root_occurrences() {
         2
     );
 }
-fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgram {
+fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgramGraph {
     let (values, layout) = values(1);
     let expressions = integer_arena(7);
     let unpivot = WriterGroupedUnpivotPlan {
@@ -461,7 +461,7 @@ fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgram {
         max_output_rows: 16,
         max_output_bytes: 1024,
     };
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         vec![
             ProgramNode::new(0, ProgramNodeKind::Values { values }, layout.clone()),
             ProgramNode::new(
@@ -518,7 +518,7 @@ fn finish_grouped_unpivot_mixed_constants_keep_scalar_mapping_and_constant_ordin
     }
     assert_eq!(roots.arenas().len(), 1);
 }
-fn sink_budget_program(extra_partition: bool, main_root: bool) -> LocalProgram {
+fn sink_budget_program(extra_partition: bool, main_root: bool) -> LocalProgramGraph {
     let (values, layout) = values(1);
     let expressions = integer_arena(7);
     let mut nodes = vec![ProgramNode::new(
@@ -557,7 +557,7 @@ fn sink_budget_program(extra_partition: bool, main_root: bool) -> LocalProgram {
     .unwrap();
     let sink = StaticSinkProgram::try_multicast(branches, integer_arena(8)).unwrap();
     let root = ProgramNodeId::new(nodes.len() - 1);
-    LocalProgram::try_new_with_sink(
+    LocalProgramGraph::try_new_with_sink(
         nodes,
         root,
         expressions,
@@ -651,7 +651,7 @@ fn non_expression_constants_and_zero_expression_nodes_still_observe_work() {
         },
         layout.clone(),
     ));
-    let zero = LocalProgram::try_new(
+    let zero = LocalProgramGraph::try_new(
         nodes,
         ProgramNodeId::new(300),
         arena(vec![]),

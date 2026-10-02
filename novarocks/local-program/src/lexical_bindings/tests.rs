@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::{
-    BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgram,
+    BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgramGraph,
     ProgramControlFlow, ProgramEvaluationDomain, ProgramExpressionArena, ProgramExpressionUse,
     ProgramNode, ProgramNodeId, ProgramRootControlBindings, ProgramRootUseBinding,
     ProgramTypedExpressions, StaticExprNode, StaticFunctionKind, StaticLayout, StaticLiteral,
@@ -470,7 +470,7 @@ fn build_project(
         output.identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    let program = LocalProgram::try_new(
+    let program = LocalProgramGraph::try_new(
         vec![
             ProgramNode::new(1, ProgramNodeKind::Values { values }, source_layout),
             ProgramNode::new(

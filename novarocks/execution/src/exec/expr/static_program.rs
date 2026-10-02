@@ -63,7 +63,7 @@ impl ExprArena {
         )
     }
 
-    /// Build the existing expression kernel ABI for one LocalProgram instance.
+    /// Build the existing expression kernel ABI for one LocalProgramGraph instance.
     /// The source remains the only retained static expression graph; dictionary
     /// bytes stay behind shared Arcs.
     pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Self {

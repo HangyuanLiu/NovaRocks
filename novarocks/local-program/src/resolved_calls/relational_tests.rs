@@ -842,7 +842,7 @@ fn program(
     nodes: Vec<ProgramNode>,
     arena: Arc<ImmutableExpressions>,
     requirements: Vec<BindingRequirement>,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let root = ProgramNodeId::new(nodes.len() - 1);
     let output = nodes[root.index()].output_layout();
     let profile = CompileProfile::new(
@@ -851,7 +851,7 @@ fn program(
         output.identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         nodes,
         root,
         arena,
@@ -860,7 +860,7 @@ fn program(
     )
     .unwrap()
 }
-pub(crate) fn snapshot(program: LocalProgram) -> ProgramRootControlBindings {
+pub(crate) fn snapshot(program: LocalProgramGraph) -> ProgramRootControlBindings {
     let roots = ProgramExpressionRoots::collect(&program, &COMPILE).unwrap();
     let mut flows = BTreeMap::new();
     let mut bindings = Vec::new();
@@ -927,7 +927,7 @@ pub(crate) fn aggregate_node(
     finalize: bool,
     order: StaticAggregateOrder,
     group_roots: usize,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let output = layout(1, DataType::Int64);
     program(
         vec![
@@ -1099,7 +1099,7 @@ pub(crate) fn window_program(
     aggregate: bool,
     frame: Option<WindowFrame>,
     ignore_nulls: bool,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let output = layout(1, DataType::Int64);
     program(
         vec![
@@ -1251,7 +1251,7 @@ pub(crate) fn table_program(
     param_type: DataType,
     result_type: DataType,
     param_slot: u32,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let input = layout(1, DataType::Int64);
     let output = layout(2, result_type.clone());
     program(
@@ -1378,7 +1378,7 @@ pub(crate) fn writer_program(
     owner: &Owner,
     partial_input_slot: u32,
     final_input_slot: u32,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let data = layout(1, DataType::Int64);
     let intermediate = layout(2, DataType::Int64);
     let final_layout = layout(999, DataType::Int64);

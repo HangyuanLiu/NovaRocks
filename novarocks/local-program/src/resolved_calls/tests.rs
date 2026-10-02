@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::{
-    BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgram,
+    BindingRequirements, CompileProfile, ImmutableExpressions, KernelAbiVersion, LocalProgramGraph,
     ProgramControlFlow, ProgramEvaluationDomain, ProgramExpressionUse, ProgramNode,
     ProgramRootUseBinding, StaticExprNode, StaticFunctionKind, StaticLiteral, StaticValues,
 };
@@ -655,7 +655,7 @@ fn scalar_arena() -> Arc<ImmutableExpressions> {
         ),
     ])
 }
-fn project_program(arena: Arc<ImmutableExpressions>, definitions: &[usize]) -> LocalProgram {
+fn project_program(arena: Arc<ImmutableExpressions>, definitions: &[usize]) -> LocalProgramGraph {
     let source_schema = Arc::new(Schema::new(vec![Field::new(
         "source",
         DataType::Int64,
@@ -686,7 +686,7 @@ fn project_program(arena: Arc<ImmutableExpressions>, definitions: &[usize]) -> L
         layout.identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         vec![
             ProgramNode::new(10, ProgramNodeKind::Values { values }, source_layout),
             ProgramNode::new(
@@ -725,7 +725,7 @@ fn scope(use_id: u32) -> ProgramCallSite {
     })
 }
 fn snapshot(
-    program: LocalProgram,
+    program: LocalProgramGraph,
     uses: Vec<ProgramExpressionUse>,
     roots: Vec<(ProgramExpressionRootSite, u32)>,
     domains: Vec<ProgramEvaluationDomain>,
@@ -1603,7 +1603,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
                 output_layout.identity().unwrap(),
                 KernelAbiVersion::CURRENT,
             );
-            let program = LocalProgram::try_new(
+            let program = LocalProgramGraph::try_new(
                 vec![
                     ProgramNode::new(10, ProgramNodeKind::Values { values }, source_layout),
                     ProgramNode::new(20, output_kind, output_layout),

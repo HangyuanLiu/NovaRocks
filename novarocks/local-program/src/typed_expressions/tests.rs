@@ -18,7 +18,7 @@
 use super::*;
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, ControlShape, ImmutableExpressions,
-    KernelAbiVersion, LocalProgram, ProgramControlFlow, ProgramEvaluationDomain,
+    KernelAbiVersion, LocalProgramGraph, ProgramControlFlow, ProgramEvaluationDomain,
     ProgramExpressionRootSite, ProgramExpressionUse, ProgramNode, ProgramNodeExpressionRole,
     ProgramNodeId, ProgramNodeKind, ProgramRootControlBindings, ProgramRootUseBinding,
     StaticExprNode, StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch,
@@ -64,7 +64,7 @@ fn shared_truth_value_fixture(ty: DataType) -> ProgramResolvedCalls {
         Arc::from([SlotId::new(2)]),
     )
     .unwrap();
-    let program = LocalProgram::try_new(
+    let program = LocalProgramGraph::try_new(
         vec![
             ProgramNode::new(0, ProgramNodeKind::Values { values }, source_layout.clone()),
             ProgramNode::new(
@@ -268,7 +268,7 @@ fn resolved(
         }
         None => (vec![], None),
     };
-    let program = LocalProgram::try_new_with_sink(
+    let program = LocalProgramGraph::try_new_with_sink(
         vec![ProgramNode::new(
             0,
             ProgramNodeKind::Values { values },

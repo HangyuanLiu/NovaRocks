@@ -60,7 +60,7 @@ pub enum ExternalSinkRequirement {
 }
 
 /// The exact runtime capabilities removed while a decoded plan is frozen.
-/// They are keyed by local node identity and never enter LocalProgram.
+/// They are keyed by local node identity and never enter LocalProgramGraph.
 pub struct LocalRuntimeBindings {
     pub(crate) scans: BTreeMap<lp::ProgramNodeId, Arc<dyn super::scan::ScanSource>>,
     pub(crate) writers: BTreeMap<lp::ProgramNodeId, super::table_writer::TableWriterRuntimeBinding>,
@@ -117,7 +117,7 @@ impl ExecPlan {
         profile: lp::CompileProfile,
         scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
-    ) -> Result<lp::LocalProgram> {
+    ) -> Result<lp::LocalProgramGraph> {
         self.lower_with_optional_sink(profile, scan_sources, sink_requirements, None)
             .map(|(program, _runtime)| program)
     }
@@ -131,7 +131,7 @@ impl ExecPlan {
         scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
         sink: lp::StaticSinkProgram,
-    ) -> Result<(lp::LocalProgram, LocalRuntimeBindings)> {
+    ) -> Result<(lp::LocalProgramGraph, LocalRuntimeBindings)> {
         self.lower_with_optional_sink(profile, scan_sources, sink_requirements, Some(sink))
     }
 
@@ -141,7 +141,7 @@ impl ExecPlan {
         mut scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
         sink: Option<lp::StaticSinkProgram>,
-    ) -> Result<(lp::LocalProgram, LocalRuntimeBindings)> {
+    ) -> Result<(lp::LocalProgramGraph, LocalRuntimeBindings)> {
         preflight(&self.root)?;
         let ExecPlan { arena, root } = self;
         let expressions = Arc::new(arena.into_immutable().map_err(|error| {
@@ -195,7 +195,7 @@ impl ExecPlan {
         }
         let requirements = lp::BindingRequirements::try_new(lowering.requirements)
             .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
-        let program = lp::LocalProgram::try_new_with_sink(
+        let program = lp::LocalProgramGraph::try_new_with_sink(
             lowering.nodes,
             root,
             expressions,
@@ -532,7 +532,7 @@ impl Lowering<'_> {
                 (
                     node_id,
                     P::Scan {
-                        source,
+                        source: source.into(),
                         runtime_filters,
                         conjunct_predicate: conjunct_predicate.map(expr),
                         limit,

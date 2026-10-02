@@ -25,7 +25,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_schema::{DataType, Field};
-use novarocks_connector_contract::{ConnectorRowMutationEffect, WriteTargetOrdinal};
+use novarocks_connector_contract::{
+    ConnectorEnvelopeHeader, ConnectorReadProgramRecipe, ConnectorRowMutationEffect,
+    WriteTargetOrdinal,
+};
 use novarocks_functions::ResolvedAggregateSignature;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -33,10 +36,10 @@ use novarocks_type_contract::{
 use novarocks_types::SlotId;
 
 use crate::{
-    BindingRequirement, BindingRequirements, CompileProfile, ImmutableExpressions,
-    LayoutCompileError, ProgramExprId, ProgramNodeId, ScanSourceKind, SinkCompileError,
-    StaticConnectorScan, StaticFieldSchema, StaticFilterConsumer, StaticFilterProducer,
-    StaticLayout, StaticSinkProgram, StaticValues,
+    BindingRequirement, BindingRequirements, CompileProfile, DiagnosticSourceNodeId,
+    ImmutableExpressions, LayoutCompileError, ProgramExprId, ProgramNodeId, ScanSourceKind,
+    SinkCompileError, StaticConnectorScan, StaticFieldSchema, StaticFilterConsumer,
+    StaticFilterProducer, StaticLayout, StaticSinkProgram, StaticValues,
 };
 
 /// Matches the native task-codec preflight, which runs before protobuf decode.
@@ -409,7 +412,7 @@ pub enum ProgramNodeKind {
         offset: usize,
     },
     Scan {
-        source: StaticConnectorScan,
+        source: ProgramScanSource,
         runtime_filters: Vec<FilterConsumerAtExpr>,
         conjunct_predicate: Option<ProgramExprId>,
         limit: Option<usize>,
@@ -701,24 +704,91 @@ impl ProgramNodeKind {
     }
 }
 
+/// Migration input only. A final compiled program accepts the complete-input
+/// seal; the payload-only legacy branch is retired with the Execution bridge.
+#[derive(Clone, Debug)]
+pub enum ProgramScanSource {
+    Legacy(Arc<StaticConnectorScan>),
+    Compiled(Arc<ConnectorReadProgramRecipe>),
+}
+impl From<StaticConnectorScan> for ProgramScanSource {
+    fn from(source: StaticConnectorScan) -> Self {
+        Self::Legacy(Arc::new(source))
+    }
+}
+impl From<ConnectorReadProgramRecipe> for ProgramScanSource {
+    fn from(source: ConnectorReadProgramRecipe) -> Self {
+        Self::Compiled(Arc::new(source))
+    }
+}
+impl ProgramScanSource {
+    pub fn compiled(&self) -> Option<&ConnectorReadProgramRecipe> {
+        match self {
+            Self::Compiled(recipe) => Some(recipe),
+            Self::Legacy(_) => None,
+        }
+    }
+    pub fn relation_header(&self) -> &ConnectorEnvelopeHeader {
+        match self {
+            Self::Legacy(scan) => scan.recipe().draft().relation().table().header(),
+            Self::Compiled(recipe) => recipe.frozen().scan().recipe().relation().table().header(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProgramNodeIdentity {
+    LegacyNative(i32),
+    Local(ProgramNodeId),
+}
+
 #[derive(Clone, Debug)]
 pub struct ProgramNode {
-    native_node_id: i32,
+    identity: ProgramNodeIdentity,
+    physical_sources: Arc<[DiagnosticSourceNodeId]>,
     kind: ProgramNodeKind,
     output_layout: StaticLayout,
 }
 
 impl ProgramNode {
+    /// Existing construction bridge only; it is not a compiled node identity.
     pub fn new(native_node_id: i32, kind: ProgramNodeKind, output_layout: StaticLayout) -> Self {
         Self {
-            native_node_id,
+            identity: ProgramNodeIdentity::LegacyNative(native_node_id),
+            physical_sources: Arc::from([]),
             kind,
             output_layout,
         }
     }
-
-    pub const fn native_node_id(&self) -> i32 {
-        self.native_node_id
+    /// Exact local binding identity and diagnostic physical sources occupy
+    /// separate namespaces. A sparse u32 source is never cast to a legacy ID.
+    pub fn new_local(
+        id: ProgramNodeId,
+        sources: Vec<DiagnosticSourceNodeId>,
+        kind: ProgramNodeKind,
+        output_layout: StaticLayout,
+    ) -> Self {
+        Self {
+            identity: ProgramNodeIdentity::Local(id),
+            physical_sources: Arc::from(sources),
+            kind,
+            output_layout,
+        }
+    }
+    pub const fn local_id(&self) -> Option<ProgramNodeId> {
+        match self.identity {
+            ProgramNodeIdentity::Local(id) => Some(id),
+            ProgramNodeIdentity::LegacyNative(_) => None,
+        }
+    }
+    pub const fn legacy_native_node_id(&self) -> Option<i32> {
+        match self.identity {
+            ProgramNodeIdentity::LegacyNative(id) => Some(id),
+            ProgramNodeIdentity::Local(_) => None,
+        }
+    }
+    pub fn physical_sources(&self) -> &[DiagnosticSourceNodeId] {
+        &self.physical_sources
     }
 
     pub const fn kind(&self) -> &ProgramNodeKind {
@@ -731,7 +801,7 @@ impl ProgramNode {
 }
 
 #[derive(Clone, Debug)]
-pub struct LocalProgram {
+pub struct LocalProgramGraph {
     nodes: Arc<[ProgramNode]>,
     root: ProgramNodeId,
     expressions: Arc<ImmutableExpressions>,
@@ -890,7 +960,7 @@ impl ProgramWork<'_> {
         result
     }
 }
-impl LocalProgram {
+impl LocalProgramGraph {
     pub fn try_new(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
@@ -1005,13 +1075,18 @@ impl LocalProgram {
         for (index, node) in nodes.iter().enumerate() {
             // Only per-Task sidecar nodes require unique native IDs; wrappers
             // retain the original allowance to share a diagnostic wire ID.
+            if node.local_id().is_some_and(|id| id.index() != index) {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
             let duplicate = matches!(
                 node.kind,
                 ProgramNodeKind::Scan { .. }
                     | ProgramNodeKind::ExchangeSource { .. }
                     | ProgramNodeKind::TableWriter { .. }
                     | ProgramNodeKind::TableFinish { .. }
-            ) && !native_ids.insert(node.native_node_id);
+            ) && node
+                .legacy_native_node_id()
+                .is_some_and(|id| !native_ids.insert(id));
             work.step()?;
             if duplicate {
                 return Err(LocalProgramError::DuplicateNativeNode.into());
@@ -1111,9 +1186,7 @@ impl LocalProgram {
                     let ScanSourceKind::TypedConnector { relation } = kind else {
                         return Err(LocalProgramError::InvalidRequirement.into());
                     };
-                    let same_header = work.opaque(|| {
-                        relation == source.recipe().draft().relation().table().header()
-                    })?;
+                    let same_header = work.opaque(|| relation == source.relation_header())?;
                     if !same_header
                         || work.identity(layout, LocalProgramError::LayoutMismatch)?
                             != work.identity(output_layout, LocalProgramError::LayoutMismatch)?
@@ -1697,7 +1770,7 @@ mod tests {
                 max_output_rows: 16,
                 max_output_bytes: 1024,
             };
-            LocalProgram::try_new(
+            LocalProgramGraph::try_new(
                 vec![
                     ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
                     ProgramNode::new(
@@ -1762,7 +1835,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            LocalProgram::try_new(
+            LocalProgramGraph::try_new(
                 vec![
                     ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
                     ProgramNode::new(
@@ -1832,7 +1905,7 @@ mod tests {
                 layout.clone(),
             ),
         ];
-        let program = LocalProgram::try_new(
+        let program = LocalProgramGraph::try_new(
             nodes,
             ProgramNodeId::new(1),
             exprs,
@@ -1866,7 +1939,7 @@ mod tests {
             ),
         ];
         assert!(matches!(
-            LocalProgram::try_new(
+            LocalProgramGraph::try_new(
                 nodes,
                 ProgramNodeId::new(1),
                 exprs,
@@ -1880,7 +1953,7 @@ mod tests {
     #[test]
     fn validates_profile_layout_identity() {
         let (values, layout) = values();
-        let program = LocalProgram::try_new(
+        let program = LocalProgramGraph::try_new(
             vec![ProgramNode::new(
                 1,
                 ProgramNodeKind::Values { values },
@@ -1916,7 +1989,7 @@ mod tests {
                 layout.clone(),
             ));
         }
-        let program = LocalProgram::try_new(
+        let program = LocalProgramGraph::try_new(
             nodes,
             ProgramNodeId::new(17),
             Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
@@ -1927,12 +2000,43 @@ mod tests {
     }
 
     #[test]
+    fn local_identity_matches_actual_dense_position_independently_of_sparse_source() {
+        for id in [0usize, 1, usize::MAX] {
+            let (values, layout) = values();
+            let result = LocalProgramGraph::try_new(
+                vec![ProgramNode::new_local(
+                    ProgramNodeId::new(id),
+                    vec![DiagnosticSourceNodeId::new(u32::MAX)],
+                    ProgramNodeKind::Values { values },
+                    layout.clone(),
+                )],
+                ProgramNodeId::new(0),
+                Arc::new(
+                    ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
+                ),
+                profile(&layout),
+                BindingRequirements::try_new(vec![]).unwrap(),
+            );
+            if id == 0 {
+                let graph = result.unwrap();
+                assert_eq!(graph.nodes()[0].local_id(), Some(ProgramNodeId::new(0)));
+                assert_eq!(
+                    graph.nodes()[0].physical_sources(),
+                    &[DiagnosticSourceNodeId::new(u32::MAX)]
+                );
+            } else {
+                assert_eq!(result.unwrap_err(), LocalProgramError::InvalidNodeShape);
+            }
+        }
+    }
+
+    #[test]
     fn rejects_unreachable_nodes_and_unbound_exchange_source() {
         let (values, layout) = values();
         let empty_expressions = || {
             Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap())
         };
-        let unreachable = LocalProgram::try_new(
+        let unreachable = LocalProgramGraph::try_new(
             vec![
                 ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
                 ProgramNode::new(
@@ -1955,7 +2059,7 @@ mod tests {
             Err(LocalProgramError::UnreachableNode)
         ));
 
-        let unbound = LocalProgram::try_new(
+        let unbound = LocalProgramGraph::try_new(
             vec![ProgramNode::new(
                 2,
                 ProgramNodeKind::ExchangeSource {
@@ -1996,7 +2100,7 @@ mod tests {
                     layout.clone(),
                 ));
             }
-            let program = LocalProgram::try_new(
+            let program = LocalProgramGraph::try_new(
                 nodes,
                 ProgramNodeId::new(width),
                 Arc::new(
@@ -2028,7 +2132,7 @@ mod tests {
             Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
         )
         .unwrap();
-        let result = LocalProgram::try_new_with_sink(
+        let result = LocalProgramGraph::try_new_with_sink(
             vec![ProgramNode::new(
                 1,
                 ProgramNodeKind::Values { values },
@@ -2056,7 +2160,7 @@ mod tests {
             KernelAbiVersion::new(NonZeroU32::new(1).unwrap()),
         );
         assert!(matches!(
-            LocalProgram::try_new(
+            LocalProgramGraph::try_new(
                 vec![],
                 ProgramNodeId::new(0),
                 expressions.clone(),
@@ -2066,7 +2170,7 @@ mod tests {
             Err(LocalProgramError::UnsupportedKernelAbi)
         ));
         assert!(matches!(
-            LocalProgram::try_new(
+            LocalProgramGraph::try_new(
                 vec![],
                 ProgramNodeId::new(0),
                 expressions,
@@ -2103,7 +2207,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ]
     }
-    fn exchange_fixture(edges: usize, children: bool) -> LocalProgram {
+    fn exchange_fixture(edges: usize, children: bool) -> LocalProgramGraph {
         let (_, layout) = values();
         let expressions = Arc::new(
             ImmutableExpressions::try_new(
@@ -2141,7 +2245,7 @@ mod tests {
             ));
         }
         let root = ProgramNodeId::new(nodes.len() - 1);
-        LocalProgram::try_new_with_sink(
+        LocalProgramGraph::try_new_with_sink(
             nodes,
             root,
             expressions,
@@ -2159,10 +2263,10 @@ mod tests {
         .unwrap()
     }
     fn compile_fixture(
-        source: &LocalProgram,
+        source: &LocalProgramGraph,
         control: &dyn PureCompileControl,
-    ) -> Result<LocalProgram, ProgramCompileError> {
-        LocalProgram::try_new_with_sink_for_compile(
+    ) -> Result<LocalProgramGraph, ProgramCompileError> {
+        LocalProgramGraph::try_new_with_sink_for_compile(
             source.nodes().to_vec(),
             source.root(),
             source.expressions().clone(),
@@ -2251,7 +2355,7 @@ mod tests {
         let source = exchange_fixture(0, false);
         let baseline = OriginalControl::default();
         let run = |control: &dyn PureCompileControl| {
-            LocalProgram::try_new_for_compile(
+            LocalProgramGraph::try_new_for_compile(
                 vec![],
                 ProgramNodeId::new(0),
                 source.expressions().clone(),
@@ -2326,11 +2430,11 @@ mod tests {
                 ProgramNode::new(8, kind, layout.clone()),
             ];
             assert!(
-                matches!(LocalProgram::try_new(nodes.clone(), ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone()), Err(actual) if actual == expected)
+                matches!(LocalProgramGraph::try_new(nodes.clone(), ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone()), Err(actual) if actual == expected)
             );
             let control = OriginalControl::default();
             assert!(
-                matches!(LocalProgram::try_new_for_compile(nodes, ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone(), &control), Err(ProgramCompileError::Program(actual)) if actual == expected)
+                matches!(LocalProgramGraph::try_new_for_compile(nodes, ProgramNodeId::new(1), source.expressions().clone(), source.profile(), source.requirements().clone(), &control), Err(ProgramCompileError::Program(actual)) if actual == expected)
             );
         }
         let bad_profile = CompileProfile::new(
@@ -2340,7 +2444,7 @@ mod tests {
             KernelAbiVersion::CURRENT,
         );
         assert!(matches!(
-            LocalProgram::try_new_for_compile(
+            LocalProgramGraph::try_new_for_compile(
                 source.nodes().to_vec(),
                 source.root(),
                 source.expressions().clone(),
@@ -2353,7 +2457,7 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            LocalProgram::try_new_for_compile(
+            LocalProgramGraph::try_new_for_compile(
                 source.nodes().to_vec(),
                 source.root(),
                 source.expressions().clone(),
@@ -2392,7 +2496,7 @@ mod tests {
         ])
         .unwrap();
         let control = OriginalControl::default();
-        let actual = LocalProgram::try_new_with_sink_for_compile(
+        let actual = LocalProgramGraph::try_new_with_sink_for_compile(
             source.nodes().to_vec(),
             source.root(),
             source.expressions().clone(),
@@ -2406,7 +2510,7 @@ mod tests {
             actual.sink().unwrap().branches()[0].output_columns(),
             &[SlotId::new(1)]
         );
-        LocalProgram::try_new_with_sink(
+        LocalProgramGraph::try_new_with_sink(
             source.nodes().to_vec(),
             source.root(),
             source.expressions().clone(),
@@ -2416,7 +2520,7 @@ mod tests {
         )
         .unwrap();
         let run = |control: &dyn PureCompileControl| {
-            LocalProgram::try_new_with_sink_for_compile(
+            LocalProgramGraph::try_new_with_sink_for_compile(
                 source.nodes().to_vec(),
                 source.root(),
                 source.expressions().clone(),

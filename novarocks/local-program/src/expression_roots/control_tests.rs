@@ -162,11 +162,11 @@ fn project_program(
     arena: Arc<ImmutableExpressions>,
     definitions: Vec<usize>,
     ty: DataType,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let (values, source_layout) = bool_values();
     let layout = output_layout(definitions.len(), ty);
     let slots = layout.slots().to_vec();
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         vec![
             ProgramNode::new(10, ProgramNodeKind::Values { values }, source_layout),
             ProgramNode::new(
@@ -189,9 +189,9 @@ fn project_program(
     )
     .unwrap()
 }
-fn mixed_program(arena: Arc<ImmutableExpressions>, predicate: usize) -> LocalProgram {
+fn mixed_program(arena: Arc<ImmutableExpressions>, predicate: usize) -> LocalProgramGraph {
     let (values, layout) = bool_values();
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         vec![
             ProgramNode::new(10, ProgramNodeKind::Values { values }, layout.clone()),
             ProgramNode::new(
@@ -778,7 +778,7 @@ fn three_scope_program(
     arenas: [Arc<ImmutableExpressions>; 3],
     definition: usize,
     ty: DataType,
-) -> LocalProgram {
+) -> LocalProgramGraph {
     let (values, source_layout) = bool_values();
     let layout = output_layout(1, ty);
     let branch = StaticStreamBranch::try_new(
@@ -790,7 +790,7 @@ fn three_scope_program(
     )
     .unwrap();
     let sink = StaticSinkProgram::try_data_stream(branch, arenas[2].clone()).unwrap();
-    LocalProgram::try_new_with_sink(
+    LocalProgramGraph::try_new_with_sink(
         vec![
             ProgramNode::new(10, ProgramNodeKind::Values { values }, source_layout),
             ProgramNode::new(
@@ -971,7 +971,7 @@ fn two_scope_array_program(
     main_children: usize,
     writer_children: usize,
 ) -> (
-    LocalProgram,
+    LocalProgramGraph,
     BTreeMap<ProgramExpressionArena, ProgramControlFlow>,
 ) {
     let (main, ty) = array_arena(main_children);
@@ -979,7 +979,7 @@ fn two_scope_array_program(
     assert_eq!(ty, writer_ty);
     let source = three_scope_program([main, writer.clone(), writer], 1, ty);
     let writer_layout = source.nodes()[2].output_layout().clone();
-    let program = LocalProgram::try_new(
+    let program = LocalProgramGraph::try_new(
         source.nodes().to_vec(),
         source.root(),
         source.expressions().clone(),

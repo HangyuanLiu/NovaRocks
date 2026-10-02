@@ -21,7 +21,7 @@
 //! operator/driver instances; a shared node/site cannot own one global state.
 
 use crate::{
-    ImmutableExpressions, JoinType, LocalProgram, NestedLoopJoinType, ProgramControlFlow,
+    ImmutableExpressions, JoinType, LocalProgramGraph, NestedLoopJoinType, ProgramControlFlow,
     ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant,
 };
 use novarocks_type_contract::{
@@ -165,7 +165,7 @@ pub struct ProgramExpressionRoots {
 }
 impl ProgramExpressionRoots {
     pub fn collect(
-        program: &LocalProgram,
+        program: &LocalProgramGraph,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramExpressionRootError> {
         let mut builder = RootCollector {
@@ -637,14 +637,14 @@ impl std::error::Error for ProgramRootBindingError {}
 /// arena scopes; root-field references have their own common bounded table.
 #[derive(Clone, Debug)]
 pub struct ProgramRootControlBindings {
-    program: LocalProgram,
+    program: LocalProgramGraph,
     roots: ProgramExpressionRoots,
     flows: Arc<BTreeMap<ProgramExpressionArena, ProgramControlFlow>>,
     bindings: Arc<BTreeMap<ProgramExpressionRootSite, ExpressionUseId>>,
 }
 impl ProgramRootControlBindings {
     pub fn try_new(
-        program: LocalProgram,
+        program: LocalProgramGraph,
         flows: BTreeMap<ProgramExpressionArena, ProgramControlFlow>,
         bindings: Vec<ProgramRootUseBinding>,
         control: &dyn PureCompileControl,
@@ -718,7 +718,7 @@ impl ProgramRootControlBindings {
             bindings: Arc::new(sites),
         })
     }
-    pub const fn program(&self) -> &LocalProgram {
+    pub const fn program(&self) -> &LocalProgramGraph {
         &self.program
     }
     pub const fn roots(&self) -> &ProgramExpressionRoots {

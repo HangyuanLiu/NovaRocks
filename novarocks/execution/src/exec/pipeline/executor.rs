@@ -48,7 +48,7 @@ use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::io::FragmentEventSink;
-use novarocks_local_program::{KernelAbiVersion, LocalProgram};
+use novarocks_local_program::{KernelAbiVersion, LocalProgramGraph};
 
 use crate::runtime::profile::{Profiler, ScopedTimer};
 
@@ -457,14 +457,14 @@ fn prepare_pipeline_execution_inner(
     )
 }
 
-/// Prepare drivers from one frozen LocalProgram and its exact Task capabilities.
+/// Prepare drivers from one frozen LocalProgramGraph and its exact Task capabilities.
 /// The program profile is authoritative for graph DOP and root sink placement.
 #[expect(
     clippy::too_many_arguments,
     reason = "Native runtime dependencies are explicit"
 )]
 pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
-    program: &LocalProgram,
+    program: &LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     debug: bool,
     time_slice: Duration,

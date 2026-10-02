@@ -21,6 +21,8 @@
 //! or async runtime dependency. A program's static representation moves here
 //! as its node and expression types are separated from task-owned bindings.
 
+mod compiled;
+mod compiled_origins;
 mod contract;
 mod control_flow;
 mod expression_roots;
@@ -29,6 +31,7 @@ mod layout;
 mod lexical_bindings;
 mod program;
 mod provenance;
+mod provider_links;
 mod requirements;
 mod resolved_calls;
 mod runtime_filter;
@@ -37,6 +40,8 @@ mod typed_channels;
 mod typed_expressions;
 mod values;
 
+pub use compiled::{LocalProgram, LocalProgramCompileError};
+pub use compiled_origins::CompiledOriginsError;
 pub use contract::{
     CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,
     FragmentSinkAssignmentRequirement, KernelAbiVersion, LayoutIdentity, RuntimeFilterContract,
@@ -58,16 +63,18 @@ pub use novarocks_connector_contract::{
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,
-    LocalProgram, LocalProgramError, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
+    LocalProgramError, LocalProgramGraph, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
     MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramCompileError, ProgramNode, ProgramNodeKind,
-    ProjectExpressionSlot, RowAssertion, SetOpKind, SortExpression, SortTopNType,
-    StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
-    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
-    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
-    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
-    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
+    ProgramScanSource, ProjectExpressionSlot, RowAssertion, SetOpKind, SortExpression,
+    SortTopNType, StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature,
+    StaticWindowFunction, StaticWriterProjection, StreamingPreaggregationMode,
+    TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping, UnpivotPassthrough, WindowBoundary,
+    WindowFrame, WindowFunctionKind, WindowType, WriterFinalAggregateCall,
+    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
+    WriterPartialAggregateCall,
 };
 pub use provenance::*;
+pub use provider_links::ProviderLinkError;
 pub use requirements::{
     BindingRequirement, BindingRequirements, BindingRequirementsCompileError,
     BindingRequirementsError, ProgramNodeId, ScanSourceKind,

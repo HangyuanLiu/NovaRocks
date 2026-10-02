@@ -71,7 +71,7 @@ use crate::exec::node::unpivot::{
     reason = "Native runtime dependencies are explicit"
 )]
 pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_settings(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     _debug: bool,
     dep_manager: DependencyManager,
@@ -118,8 +118,12 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
         {
             let layout = program.nodes()[input.index()].output_layout();
             let keys = keyed_assert_distribution_keys_from_layout(&mut ctx, layout, key_slots)?;
-            ctx.precomputed_keyed_assert_keys
-                .insert(node.native_node_id(), keys);
+            ctx.precomputed_keyed_assert_keys.insert(
+                node.legacy_native_node_id().ok_or_else(|| {
+                    "compiled local nodes cannot enter the legacy pipeline bridge".to_string()
+                })?,
+                keys,
+            );
         }
     }
     let mut build = build_pipeline_for_program_node(program, bindings, program.root(), &mut ctx)?;
@@ -142,9 +146,21 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
 }
 
 fn validate_runtime_binding_shape(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
 ) -> Result<(), String> {
+    if program.nodes().iter().any(|node| {
+        node.legacy_native_node_id().is_none()
+            || matches!(
+                node.kind(),
+                lp::ProgramNodeKind::Scan {
+                    source: lp::ProgramScanSource::Compiled(_),
+                    ..
+                }
+            )
+    }) {
+        return Err("compiled local nodes cannot enter the legacy pipeline bridge".to_string());
+    }
     let mut expected_scans = BTreeSet::new();
     let mut expected_writers = BTreeSet::new();
     let mut expected_finishers = BTreeSet::new();
@@ -184,7 +200,9 @@ fn validate_runtime_binding_shape(
         if effectful && !seen_effectful.insert(id) {
             return Err(format!(
                 "local program reuses runtime-capability node {} in its expanded execution graph",
-                node.native_node_id()
+                node.legacy_native_node_id().ok_or_else(|| {
+                    "compiled local nodes cannot enter the legacy pipeline bridge".to_string()
+                })?
             ));
         }
         match node.kind() {
@@ -619,7 +637,7 @@ fn keyed_assert_distribution_keys_from_layout(
     reason = "Typed set operators share physical stage construction"
 )]
 fn build_distinct_set_op_pipeline_for_program<S, MakeShared, MakeSink, MakeSource>(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     inputs: &[lp::ProgramNodeId],
     node_id: i32,
@@ -672,7 +690,7 @@ where
 }
 
 fn build_pipeline_for_program_node(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     id: lp::ProgramNodeId,
     ctx: &mut PipelineBuildContext,
@@ -681,7 +699,9 @@ fn build_pipeline_for_program_node(
         .nodes()
         .get(id.index())
         .ok_or_else(|| format!("missing local program node {}", id.index()))?;
-    let node_id = node.native_node_id();
+    let node_id = node.legacy_native_node_id().ok_or_else(|| {
+        "compiled local nodes cannot enter the legacy pipeline bridge".to_string()
+    })?;
     match node.kind() {
         lp::ProgramNodeKind::RuntimeFilterConsumer {
             input,
@@ -1488,7 +1508,7 @@ fn build_pipeline_for_program_node(
     reason = "Aggregate kernel receives its complete frozen static and runtime contract"
 )]
 fn build_aggregate_pipeline(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     input: lp::ProgramNodeId,
     node_id: i32,
@@ -1879,7 +1899,7 @@ fn build_aggregate_pipeline(
     reason = "Join kernel receives the complete frozen node contract"
 )]
 fn build_join_pipeline(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     left: lp::ProgramNodeId,
     right: lp::ProgramNodeId,
@@ -2283,6 +2303,105 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pipeline_bridge_rejects_compiled_read_before_runtime_binding_shape() {
+        let recipe = crate::runtime::fragment::submission::tests::compiled_scan_contract_for_test();
+        let layout = lp::StaticLayout::try_new(
+            Arc::new(recipe.frozen().public_facts().schema().clone()),
+            Arc::from([SlotId::new(1)]),
+        )
+        .unwrap();
+        let relation = recipe
+            .frozen()
+            .scan()
+            .recipe()
+            .relation()
+            .table()
+            .header()
+            .clone();
+        let graph = lp::LocalProgramGraph::try_new(
+            vec![lp::ProgramNode::new(
+                7,
+                lp::ProgramNodeKind::Scan {
+                    source: recipe.into(),
+                    runtime_filters: vec![],
+                    conjunct_predicate: None,
+                    limit: None,
+                },
+                layout.clone(),
+            )],
+            lp::ProgramNodeId::new(0),
+            Arc::new(
+                lp::ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
+            ),
+            lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            ),
+            lp::BindingRequirements::try_new(vec![lp::BindingRequirement::Scan {
+                node: lp::ProgramNodeId::new(0),
+                kind: lp::ScanSourceKind::TypedConnector { relation },
+                layout,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let bindings = LocalRuntimeBindings {
+            scans: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        assert_eq!(
+            validate_runtime_binding_shape(&graph, &bindings).unwrap_err(),
+            "compiled local nodes cannot enter the legacy pipeline bridge"
+        );
+    }
+
+    #[test]
+    fn legacy_pipeline_bridge_rejects_local_identity_before_runtime_binding_shape() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let layout = lp::StaticLayout::try_new(schema, Arc::from([SlotId::new(1)])).unwrap();
+        let graph = lp::LocalProgramGraph::try_new(
+            vec![lp::ProgramNode::new_local(
+                lp::ProgramNodeId::new(0),
+                vec![lp::DiagnosticSourceNodeId::new(u32::MAX)],
+                lp::ProgramNodeKind::ExchangeSource {
+                    timeout: Duration::from_secs(1),
+                    runtime_filters: vec![],
+                    hash_partition_exprs: vec![],
+                },
+                layout.clone(),
+            )],
+            lp::ProgramNodeId::new(0),
+            Arc::new(
+                lp::ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
+            ),
+            lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            ),
+            lp::BindingRequirements::try_new(vec![lp::BindingRequirement::ExchangeInput {
+                node: lp::ProgramNodeId::new(0),
+                layout,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let bindings = LocalRuntimeBindings {
+            scans: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        assert_eq!(
+            validate_runtime_binding_shape(&graph, &bindings).unwrap_err(),
+            "compiled local nodes cannot enter the legacy pipeline bridge"
+        );
+    }
+
+    #[test]
     fn shared_exchange_source_is_rejected_before_binding_a_receiver() {
         let slot = SlotId::new(1);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -2294,7 +2413,7 @@ mod tests {
         .unwrap();
         let source_id = lp::ProgramNodeId::new(0);
         let root_id = lp::ProgramNodeId::new(1);
-        let program = lp::LocalProgram::try_new(
+        let program = lp::LocalProgramGraph::try_new(
             vec![
                 lp::ProgramNode::new(
                     10,
@@ -2359,7 +2478,7 @@ mod tests {
         .unwrap();
         let values = lp::StaticValues::try_new(batch, layout.clone()).unwrap();
         let values_id = lp::ProgramNodeId::new(0);
-        let program = lp::LocalProgram::try_new(
+        let program = lp::LocalProgramGraph::try_new(
             vec![
                 lp::ProgramNode::new(10, lp::ProgramNodeKind::Values { values }, layout.clone()),
                 lp::ProgramNode::new(

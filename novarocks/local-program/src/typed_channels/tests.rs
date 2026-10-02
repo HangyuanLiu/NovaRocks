@@ -159,7 +159,7 @@ fn table_channels() -> Vec<(ProgramChannelSite, FunctionValueType)> {
         ),
     ]
 }
-fn rebuild(original: &LocalProgram, nodes: Vec<ProgramNode>) -> LocalProgram {
+fn rebuild(original: &LocalProgramGraph, nodes: Vec<ProgramNode>) -> LocalProgramGraph {
     let root = original.root();
     let profile = CompileProfile::new(
         NonZeroUsize::new(1).unwrap(),
@@ -167,7 +167,7 @@ fn rebuild(original: &LocalProgram, nodes: Vec<ProgramNode>) -> LocalProgram {
         nodes[root.index()].output_layout().identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    LocalProgram::try_new(
+    LocalProgramGraph::try_new(
         nodes,
         root,
         original.expressions().clone(),
@@ -190,7 +190,11 @@ fn retyped_table(
             if index == 1 {
                 change(&mut kind, &mut layout)
             }
-            ProgramNode::new(node.native_node_id(), kind, layout)
+            ProgramNode::new(
+                node.legacy_native_node_id().expect("legacy fixture node"),
+                kind,
+                layout,
+            )
         })
         .collect();
     let p = rebuild(&original, nodes);
@@ -447,7 +451,7 @@ fn values_program(fields: Vec<Field>) -> ProgramTypedExpressions {
         )
         .unwrap(),
     );
-    let program = LocalProgram::try_new(
+    let program = LocalProgramGraph::try_new(
         vec![ProgramNode::new(
             10,
             ProgramNodeKind::Values {
@@ -764,7 +768,7 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
         joined.identity().unwrap(),
         KernelAbiVersion::CURRENT,
     );
-    let program = LocalProgram::try_new(
+    let program = LocalProgramGraph::try_new(
         nodes,
         ProgramNodeId::new(2),
         arena,
@@ -1116,10 +1120,14 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         )
         .unwrap(),
     );
-    let program = LocalProgram::try_new(
+    let program = LocalProgramGraph::try_new(
         vec![
             original.nodes()[0].clone(),
-            ProgramNode::new(node.native_node_id(), kind, node.output_layout().clone()),
+            ProgramNode::new(
+                node.legacy_native_node_id().expect("legacy fixture node"),
+                kind,
+                node.output_layout().clone(),
+            ),
         ],
         original.root(),
         arena,

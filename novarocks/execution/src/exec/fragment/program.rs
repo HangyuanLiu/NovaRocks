@@ -33,7 +33,7 @@ pub use novarocks_local_program::{
     FragmentSinkAssignmentRequirement, RuntimeFilterContract, RuntimeFilterId, ScanAssignmentKind,
     ScanSourceContract,
 };
-use novarocks_local_program::{LocalProgram, StaticSinkProgram};
+use novarocks_local_program::{LocalProgramGraph, StaticSinkProgram};
 
 #[derive(Clone, Debug)]
 pub struct ExchangeInputContract {
@@ -142,7 +142,7 @@ fn non_empty_group_count(
 
 pub struct FragmentProgram {
     root_plan_node_id: FragmentNodeId,
-    local_program: Arc<LocalProgram>,
+    local_program: Arc<LocalProgramGraph>,
     sink_kind: FragmentSinkKind,
     sink_assignment_requirement: FragmentSinkAssignmentRequirement,
     program_options: FragmentProgramOptions,
@@ -165,12 +165,28 @@ impl std::fmt::Debug for FragmentProgram {
 
 impl FragmentProgram {
     pub fn try_new(
-        local_program: Arc<LocalProgram>,
+        local_program: Arc<LocalProgramGraph>,
         program_options: FragmentProgramOptions,
         scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
         exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
         runtime_filters: RuntimeFilterContract,
     ) -> Result<Self, FragmentBindingError> {
+        if local_program.nodes().iter().any(|node| {
+            node.legacy_native_node_id().is_none()
+                || matches!(
+                    node.kind(),
+                    novarocks_local_program::ProgramNodeKind::Scan {
+                        source: novarocks_local_program::ProgramScanSource::Compiled(_),
+                        ..
+                    }
+                )
+        }) {
+            return Err(FragmentBindingError::new(
+                FragmentBindingTarget::Program,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "compiled local nodes cannot enter the legacy fragment bridge",
+            ));
+        }
         let sink = local_program.sink().ok_or_else(|| {
             FragmentBindingError::new(
                 FragmentBindingTarget::Sink,
@@ -180,7 +196,15 @@ impl FragmentProgram {
         })?;
         let (sink_kind, sink_assignment_requirement) = static_sink_spec(sink)?;
         let root_plan_node_id = FragmentNodeId::new(
-            local_program.nodes()[local_program.root().index()].native_node_id(),
+            local_program.nodes()[local_program.root().index()]
+                .legacy_native_node_id()
+                .ok_or_else(|| {
+                    FragmentBindingError::new(
+                        FragmentBindingTarget::Program,
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        "compiled local nodes cannot enter the legacy fragment bridge",
+                    )
+                })?,
         );
         if root_plan_node_id.get() < 0 {
             return Err(FragmentBindingError::new(
@@ -205,7 +229,7 @@ impl FragmentProgram {
         self.root_plan_node_id
     }
 
-    pub fn local_program(&self) -> &Arc<LocalProgram> {
+    pub fn local_program(&self) -> &Arc<LocalProgramGraph> {
         &self.local_program
     }
 
@@ -319,7 +343,7 @@ mod tests {
         }
     }
 
-    fn frozen(plan: ExecPlan, sink: StaticSinkProgram) -> Arc<LocalProgram> {
+    fn frozen(plan: ExecPlan, sink: StaticSinkProgram) -> Arc<LocalProgramGraph> {
         let profile = plan
             .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
             .unwrap();
@@ -333,6 +357,115 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.scan_count(), 0);
         Arc::new(program)
+    }
+
+    #[test]
+    fn legacy_fragment_bridge_rejects_compiled_read_with_legacy_identity() {
+        use novarocks_local_program as lp;
+        let recipe = crate::runtime::fragment::submission::tests::compiled_scan_contract_for_test();
+        let layout = lp::StaticLayout::try_new(
+            Arc::new(recipe.frozen().public_facts().schema().clone()),
+            Arc::from([SlotId::new(1)]),
+        )
+        .unwrap();
+        let relation = recipe
+            .frozen()
+            .scan()
+            .recipe()
+            .relation()
+            .table()
+            .header()
+            .clone();
+        let graph = lp::LocalProgramGraph::try_new_with_sink(
+            vec![lp::ProgramNode::new(
+                7,
+                lp::ProgramNodeKind::Scan {
+                    source: recipe.into(),
+                    runtime_filters: vec![],
+                    conjunct_predicate: None,
+                    limit: None,
+                },
+                layout.clone(),
+            )],
+            lp::ProgramNodeId::new(0),
+            Arc::new(
+                lp::ImmutableExpressions::try_new(
+                    vec![],
+                    false,
+                    std::collections::HashMap::new(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            ),
+            lp::BindingRequirements::try_new(vec![lp::BindingRequirement::Scan {
+                node: lp::ProgramNodeId::new(0),
+                kind: lp::ScanSourceKind::TypedConnector { relation },
+                layout,
+            }])
+            .unwrap(),
+            Some(lp::StaticSinkProgram::Noop),
+        )
+        .unwrap();
+        let error = FragmentProgram::try_new(
+            Arc::new(graph),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.target(), FragmentBindingTarget::Program);
+        assert!(error.to_string().contains("legacy fragment bridge"));
+    }
+
+    #[test]
+    fn legacy_fragment_bridge_rejects_local_child_before_sink_projection() {
+        let old = frozen(root_not_minimum_node_id_plan(), StaticSinkProgram::Noop);
+        let nodes = old
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                if index == 0 {
+                    novarocks_local_program::ProgramNode::new_local(
+                        novarocks_local_program::ProgramNodeId::new(index),
+                        vec![novarocks_local_program::DiagnosticSourceNodeId::new(
+                            u32::MAX,
+                        )],
+                        node.kind().clone(),
+                        node.output_layout().clone(),
+                    )
+                } else {
+                    node.clone()
+                }
+            })
+            .collect();
+        let graph = LocalProgramGraph::try_new_with_sink(
+            nodes,
+            old.root(),
+            old.expressions().clone(),
+            old.profile(),
+            old.requirements().clone(),
+            old.sink().cloned(),
+        )
+        .unwrap();
+        let error = FragmentProgram::try_new(
+            Arc::new(graph),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.target(), FragmentBindingTarget::Program);
+        assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
+        assert!(error.to_string().contains("legacy fragment bridge"));
     }
 
     #[test]
