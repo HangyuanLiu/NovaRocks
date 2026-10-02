@@ -172,6 +172,21 @@ impl Status {
         }
     }
 
+    /// Create a status whose static message needs no owned String allocation.
+    ///
+    /// This does not acquire header storage or capacity. Callers can supply
+    /// already-claimed headers when consuming the status into a response.
+    pub fn from_static(code: Code, message: &'static str) -> Status {
+        Status {
+            code,
+            message: field::Message::Static(message),
+            details: Bytes::new(),
+            metadata: MetadataMap::new(),
+            source: None,
+            field_pool: None,
+        }
+    }
+
     /// The operation completed successfully.
     pub fn ok(message: impl Into<String>) -> Status {
         Status::new(Code::Ok, message)
@@ -315,14 +330,7 @@ impl Status {
     }
 
     pub(crate) fn field_error(code: Code, message: &'static str) -> Self {
-        Self {
-            code,
-            message: field::Message::Static(message),
-            details: Bytes::new(),
-            metadata: MetadataMap::new(),
-            source: None,
-            field_pool: None,
-        }
+        Self::from_static(code, message)
     }
 
     /// Create a `Status` from various types of `Error`.
@@ -670,6 +678,62 @@ impl Status {
             return metadata_failure_response(std::mem::take(response.headers_mut()), error);
         }
         response
+    }
+
+    /// Consume this status into caller-supplied, already-claimed trailer storage.
+    ///
+    /// Metadata is moved and merged without cloning a map or acquiring another
+    /// capacity position. The supplied map's original field arena is used for
+    /// status transformations when present. On failure no partial trailers are
+    /// published: the error retains the cleared map in its metadata until the
+    /// error's last owner exits. Payload and body ownership remain the caller's
+    /// responsibility; ordinary unfunded maps retain their existing behavior.
+    pub fn into_trailers_with_headers(
+        mut self,
+        mut headers: HeaderMap,
+    ) -> Result<HeaderMap, Status> {
+        let result = self
+            .move_metadata_into(&mut headers)
+            .and_then(|_| self.add_status_headers(&mut headers));
+        match result {
+            Ok(()) => Ok(headers),
+            Err(mut error) => {
+                headers.clear();
+                error.metadata = MetadataMap::from_headers(headers);
+                Err(error)
+            }
+        }
+    }
+
+    /// Consume this status into caller-supplied, already-claimed response headers.
+    ///
+    /// No map copy or new capacity position is acquired. Serialization uses the
+    /// original field arena attached to the supplied map when present. A failure
+    /// clears partial headers and returns HTTP 500 with one body error, keeping
+    /// the supplied map alive through physical response exit. The body Box and
+    /// any already-owned message/detail backing require independent coverage.
+    pub fn into_http_with_headers(mut self, mut headers: HeaderMap) -> http::Response<BoxBody> {
+        let result = self
+            .move_metadata_into(&mut headers)
+            .and_then(|_| {
+                headers
+                    .try_insert(http::header::CONTENT_TYPE, GRPC_CONTENT_TYPE)
+                    .map_err(crate::metadata::metadata_capacity_exhausted)
+            })
+            .and_then(|_| self.add_status_headers(&mut headers));
+        if let Err(error) = result {
+            return metadata_failure_response(headers, error);
+        }
+        let mut response = http::Response::new(crate::body::empty_body());
+        *response.headers_mut() = headers;
+        response
+    }
+
+    fn move_metadata_into(&mut self, headers: &mut HeaderMap) -> Result<(), Status> {
+        let metadata = std::mem::take(&mut self.metadata).into_sanitized_headers();
+        headers
+            .try_extend_map(metadata)
+            .map_err(crate::metadata::metadata_capacity_exhausted)
     }
 
     #[doc(hidden)]

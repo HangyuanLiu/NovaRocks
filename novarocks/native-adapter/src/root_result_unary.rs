@@ -42,7 +42,7 @@ use prost::Message;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBody, EncodeBuf, Encoder};
 use tonic::codegen::http;
 use tonic::server::UnaryService;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::root_result_reader::{
     NativeRootReadRefusal, NativeRootReadResponse, NativeRootResultReader, NativeRootSendOwnership,
@@ -81,9 +81,12 @@ pub fn native_root_unary_metadata_bytes() -> usize {
 /// concrete body handoff. No await can expose the intermediate BoxBody after
 /// the admitted service returns. The finite lane owner is supplied by the
 /// eventual listener, not manufactured from a late root admission here.
+/// Both response maps must be acquired from the original connection before
+/// request decode; this helper consumes them on success and refusal paths.
 pub async fn root_result_unary<B>(
     reader: &NativeRootResultReader,
     request: http::Request<B>,
+    headers: tonic::server::ResponseHeaderMaps,
 ) -> http::Response<NativeRootUnaryBody>
 where
     B: Body<Data = Bytes> + Send + 'static,
@@ -103,7 +106,9 @@ where
     let mut grpc = tonic::server::Grpc::new(codec)
         .max_decoding_message_size(RootProfileV1::ENVELOPE_BYTES)
         .max_encoding_message_size(PAYLOAD_CAPACITY - GRPC_PREFIX);
-    let response = grpc.unary(service, request).await;
+    let response = grpc
+        .unary_with_response_headers(service, request, headers)
+        .await;
     let ownership = handoff.lock().expect("root unary handoff lock").take();
     let (parts, inner) = response.into_parts();
     http::Response::from_parts(
@@ -131,16 +136,19 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
         let reader = self.reader;
         let handoff = self.handoff;
         Box::pin(async move {
-            let read = decode_read(request.get_ref(), FieldPath::root("root_read"))
-                .map_err(|_| Status::invalid_argument("invalid frozen root read"))?;
+            let read =
+                decode_read(request.get_ref(), FieldPath::root("root_read")).map_err(|_| {
+                    Status::from_static(Code::InvalidArgument, "invalid frozen root read")
+                })?;
             let (message, ownership) = match reader
                 .read_with_transport_metadata(&read, native_root_unary_metadata_bytes())
                 .await
             {
                 NativeRootReadResponse::Owned(reply) => {
                     let ownership = reply.ownership();
-                    let message = encode_reply(reply.reply())
-                        .map_err(|_| Status::internal("invalid owned root reply"))?;
+                    let message = encode_reply(reply.reply()).map_err(|_| {
+                        Status::from_static(Code::Internal, "invalid owned root reply")
+                    })?;
                     (message, Some(ownership))
                 }
                 NativeRootReadResponse::AwaitTerminalControl { accepted_consumed } => {
@@ -151,7 +159,9 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
                         accepted_consumed,
                         outcome: RootReadOutcome::AwaitTerminalControl,
                     })
-                    .map_err(|_| Status::internal("invalid sealed root reply"))?;
+                    .map_err(|_| {
+                        Status::from_static(Code::Internal, "invalid sealed root reply")
+                    })?;
                     (message, None)
                 }
                 NativeRootReadResponse::Refused(reason) => return Err(refusal_status(reason)),
@@ -205,7 +215,7 @@ impl Decoder for RootDecoder {
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
         Message::decode(src)
             .map(Some)
-            .map_err(|_| Status::invalid_argument("invalid root read protobuf"))
+            .map_err(|_| Status::from_static(Code::InvalidArgument, "invalid root read protobuf"))
     }
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::new(RootProfileV1::ENVELOPE_BYTES, RootProfileV1::ENVELOPE_BYTES)
@@ -224,7 +234,8 @@ impl Encoder for RootEncoder {
             .checked_add(GRPC_PREFIX)
             .is_none_or(|n| n > self.capacity)
         {
-            return Err(Status::resource_exhausted(
+            return Err(Status::from_static(
+                Code::ResourceExhausted,
                 "root reply exceeds fixed send envelope",
             ));
         }
@@ -232,13 +243,14 @@ impl Encoder for RootEncoder {
         // The single unary item has already consumed the five-byte prefix;
         // chunk_mut exposes the actual preallocated contiguous remainder.
         if dst.chunk_mut().len() < length {
-            return Err(Status::internal(
+            return Err(Status::from_static(
+                Code::Internal,
                 "root encoder lost its preallocated backing",
             ));
         }
         item.message
             .encode(dst)
-            .map_err(|_| Status::internal("root protobuf encoding failed"))
+            .map_err(|_| Status::from_static(Code::Internal, "root protobuf encoding failed"))
     }
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::new(self.capacity, self.capacity)
@@ -265,7 +277,8 @@ impl Body for NativeRootUnaryBody {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
                     if this.emitted_data {
-                        return Poll::Ready(Some(Err(Status::internal(
+                        return Poll::Ready(Some(Err(Status::from_static(
+                            Code::Internal,
                             "root unary emitted multiple DATA backings",
                         ))));
                     }
@@ -292,18 +305,26 @@ impl Body for NativeRootUnaryBody {
 
 fn refusal_status(reason: NativeRootReadRefusal) -> Status {
     match reason {
-        NativeRootReadRefusal::UnknownRoot => Status::not_found("unknown context root"),
-        NativeRootReadRefusal::Mismatch => Status::failed_precondition("frozen root read mismatch"),
-        NativeRootReadRefusal::Preparing => Status::unavailable("root installation in progress"),
-        NativeRootReadRefusal::Busy => Status::resource_exhausted("root read holder capacity"),
+        NativeRootReadRefusal::UnknownRoot => {
+            Status::from_static(Code::NotFound, "unknown context root")
+        }
+        NativeRootReadRefusal::Mismatch => {
+            Status::from_static(Code::FailedPrecondition, "frozen root read mismatch")
+        }
+        NativeRootReadRefusal::Preparing => {
+            Status::from_static(Code::Unavailable, "root installation in progress")
+        }
+        NativeRootReadRefusal::Busy => {
+            Status::from_static(Code::ResourceExhausted, "root read holder capacity")
+        }
         NativeRootReadRefusal::BackingCapacity => {
-            Status::resource_exhausted("root send backing capacity")
+            Status::from_static(Code::ResourceExhausted, "root send backing capacity")
         }
         NativeRootReadRefusal::MetadataCapacity => {
-            Status::resource_exhausted("root send metadata capacity")
+            Status::from_static(Code::ResourceExhausted, "root send metadata capacity")
         }
         NativeRootReadRefusal::Channel(_) => {
-            Status::failed_precondition("root channel read refused")
+            Status::from_static(Code::FailedPrecondition, "root channel read refused")
         }
     }
 }

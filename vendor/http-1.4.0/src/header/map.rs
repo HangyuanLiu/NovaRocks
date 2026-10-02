@@ -4326,6 +4326,12 @@ impl HeaderMapAllocationPool {
         self.core().fields.get()
     }
 
+    /// Whether both handles retain the same originally funded map family.
+    /// This identity check acquires no capacity and allocates no metadata.
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.core.as_ref().unwrap(), other.core.as_ref().unwrap())
+    }
+
     /// Number of remaining metadata positions, including copies and value drains.
     pub fn available_maps(&self) -> usize {
         let core = self.core();

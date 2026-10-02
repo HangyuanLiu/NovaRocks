@@ -226,6 +226,7 @@ struct EncodeState {
     error: Option<Status>,
     role: Role,
     is_end_stream: bool,
+    trailers: Option<HeaderMap>,
 }
 
 impl<T: Encoder, U: Stream> EncodeBody<T, U> {
@@ -249,6 +250,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 error: None,
                 role: Role::Client,
                 is_end_stream: false,
+                trailers: None,
             },
         }
     }
@@ -274,8 +276,35 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 error: None,
                 role: Role::Server,
                 is_end_stream: false,
+                trailers: None,
             },
         }
+    }
+
+    /// Encode server messages using one caller-preallocated trailer map.
+    ///
+    /// The caller obtains the complete original map and field grants before
+    /// constructing this body. EOF and errors consume this same map without
+    /// obtaining another map or falling back to ordinary header allocation.
+    /// An unpolled or canceled body retains the map until its actual drop.
+    /// Message/compression buffers and body/source metadata are separate owners.
+    pub fn new_server_with_trailers(
+        encoder: T,
+        source: U,
+        compression_encoding: Option<CompressionEncoding>,
+        compression_override: SingleMessageCompressionOverride,
+        max_message_size: Option<usize>,
+        trailers: HeaderMap,
+    ) -> Self {
+        let mut body = Self::new_server(
+            encoder,
+            source,
+            compression_encoding,
+            compression_override,
+            max_message_size,
+        );
+        body.state.trailers = Some(trailers);
+        body
     }
 }
 
@@ -291,11 +320,20 @@ impl EncodeState {
                 self.is_end_stream = true;
                 let status = if let Some(status) = self.error.take() {
                     status
+                } else if self.trailers.is_some() {
+                    Status::from_static(crate::Code::Ok, "")
                 } else {
                     Status::ok("")
                 };
-                Some(status.to_header_map())
+                Some(self.encode_trailers(status))
             }
+        }
+    }
+
+    fn encode_trailers(&mut self, status: Status) -> Result<HeaderMap, Status> {
+        match self.trailers.take() {
+            Some(trailers) => status.into_trailers_with_headers(trailers),
+            None => status.to_header_map(),
         }
     }
 }
@@ -316,14 +354,23 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let self_proj = self.project();
-        match ready!(self_proj.inner.poll_next(cx)) {
+        let mut self_proj = self.project();
+        if self_proj.state.is_end_stream {
+            return Poll::Ready(None);
+        }
+        match ready!(self_proj.inner.as_mut().poll_next(cx)) {
             Some(Ok(d)) => Some(Ok(Frame::data(d))).into(),
             Some(Err(status)) => match self_proj.state.role {
                 Role::Client => Some(Err(status)).into(),
                 Role::Server => {
                     self_proj.state.is_end_stream = true;
-                    Some(Ok(Frame::trailers(status.to_header_map()?))).into()
+                    // Encoder failure may leave a partial message in the fixed
+                    // codec staging buffers. Never publish it on a later poll.
+                    let inner = self_proj.inner.project();
+                    inner.buf.clear();
+                    inner.uncompression_buf.clear();
+                    *inner.error = None;
+                    Some(self_proj.state.encode_trailers(status).map(Frame::trailers)).into()
                 }
             },
             None => self_proj

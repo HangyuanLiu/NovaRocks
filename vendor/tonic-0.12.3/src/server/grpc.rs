@@ -22,6 +22,41 @@ macro_rules! t {
     };
 }
 
+/// Two already-claimed response maps from the same original field arena.
+///
+/// Prepare this value before decoding or awaiting a service. Each call consumes
+/// its initial and terminal positions; no pool checkout occurs at response or
+/// trailer publication. Map/carrier/body layouts and field storage still require
+/// their complete original capacity bounds from the caller.
+#[derive(Debug)]
+pub struct ResponseHeaderMaps {
+    initial: http::HeaderMap,
+    trailers: http::HeaderMap,
+}
+
+impl ResponseHeaderMaps {
+    /// Validate originally funded maps without cloning or acquiring capacity.
+    /// Both maps must retain the same installed field capability.
+    pub fn new(initial: http::HeaderMap, trailers: http::HeaderMap) -> Result<Self, Status> {
+        match (
+            initial.allocation_pool(),
+            trailers.allocation_pool(),
+            initial.field_allocation_pool(),
+            trailers.field_allocation_pool(),
+        ) {
+            (Some(first_map), Some(last_map), Some(first), Some(last))
+                if first_map.same_pool(last_map) && first.same_pool(last) =>
+            {
+                Ok(Self { initial, trailers })
+            }
+            _ => Err(Status::from_static(
+                crate::Code::InvalidArgument,
+                "response maps require the same original map and field families",
+            )),
+        }
+    }
+}
+
 /// A gRPC Server handler.
 ///
 /// This will wrap some inner [`Codec`] and provide utilities to handle
@@ -222,8 +257,40 @@ where
     /// Handle a single unary gRPC request.
     pub async fn unary<S, B>(
         &mut self,
+        service: S,
+        req: http::Request<B>,
+    ) -> http::Response<BoxBody>
+    where
+        S: UnaryService<T::Decode, Response = T::Encode>,
+        B: Body + Send + 'static,
+        B::Error: Into<crate::Error> + Send,
+    {
+        self.unary_inner(service, req, None).await
+    }
+
+    /// Handle one unary request with its already-claimed initial/trailer maps.
+    /// The maps are retained before the first decode or service await and are
+    /// consumed on every success, decode/service failure and body cancellation.
+    /// This does not bound the caller's message/error/body or future allocations.
+    pub async fn unary_with_response_headers<S, B>(
+        &mut self,
+        service: S,
+        req: http::Request<B>,
+        headers: ResponseHeaderMaps,
+    ) -> http::Response<BoxBody>
+    where
+        S: UnaryService<T::Decode, Response = T::Encode>,
+        B: Body + Send + 'static,
+        B::Error: Into<crate::Error> + Send,
+    {
+        self.unary_inner(service, req, Some(headers)).await
+    }
+
+    async fn unary_inner<S, B>(
+        &mut self,
         mut service: S,
         req: http::Request<B>,
+        headers: Option<ResponseHeaderMaps>,
     ) -> http::Response<BoxBody>
     where
         S: UnaryService<T::Decode, Response = T::Encode>,
@@ -238,12 +305,14 @@ where
         let request = match self.map_request_unary(req).await {
             Ok(r) => r,
             Err(status) => {
-                return self.map_response::<tokio_stream::Once<Result<T::Encode, Status>>>(
-                    Err(status),
-                    accept_encoding,
-                    SingleMessageCompressionOverride::default(),
-                    self.max_encoding_message_size,
-                );
+                return self
+                    .map_response_with_headers::<tokio_stream::Once<Result<T::Encode, Status>>>(
+                        Err(status),
+                        accept_encoding,
+                        SingleMessageCompressionOverride::default(),
+                        self.max_encoding_message_size,
+                        headers,
+                    );
             }
         };
 
@@ -254,11 +323,12 @@ where
 
         let compression_override = compression_override_from_response(&response);
 
-        self.map_response(
+        self.map_response_with_headers(
             response,
             accept_encoding,
             compression_override,
             self.max_encoding_message_size,
+            headers,
         )
     }
 
@@ -430,9 +500,50 @@ where
     where
         B: Stream<Item = Result<T::Encode, Status>> + Send + 'static,
     {
-        let response = t!(response);
+        self.map_response_with_headers(
+            response,
+            accept_encoding,
+            compression_override,
+            max_message_size,
+            None,
+        )
+    }
+
+    fn map_response_with_headers<B>(
+        &mut self,
+        response: Result<crate::Response<B>, Status>,
+        accept_encoding: Option<CompressionEncoding>,
+        compression_override: SingleMessageCompressionOverride,
+        max_message_size: Option<usize>,
+        headers: Option<ResponseHeaderMaps>,
+    ) -> http::Response<BoxBody>
+    where
+        B: Stream<Item = Result<T::Encode, Status>> + Send + 'static,
+    {
+        let (initial, trailers) = match headers {
+            Some(headers) => (Some(headers.initial), Some(headers.trailers)),
+            None => (None, None),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(status) => {
+                return match initial {
+                    Some(initial) => status.into_http_with_headers(initial),
+                    None => status.into_http(),
+                };
+            }
+        };
 
         let (mut parts, body) = response.into_http().into_parts();
+        if let Some(mut initial) = initial {
+            if let Err(error) = initial.try_extend_map(parts.headers) {
+                return crate::status::metadata_failure_response(
+                    initial,
+                    crate::metadata::metadata_capacity_exhausted(error),
+                );
+            }
+            parts.headers = initial;
+        }
 
         // Set the content type
         if let Err(error) = parts
@@ -459,13 +570,23 @@ where
             }
         }
 
-        let body = EncodeBody::new_server(
-            self.codec.encoder(),
-            body,
-            accept_encoding,
-            compression_override,
-            max_message_size,
-        );
+        let body = match trailers {
+            Some(trailers) => EncodeBody::new_server_with_trailers(
+                self.codec.encoder(),
+                body,
+                accept_encoding,
+                compression_override,
+                max_message_size,
+                trailers,
+            ),
+            None => EncodeBody::new_server(
+                self.codec.encoder(),
+                body,
+                accept_encoding,
+                compression_override,
+                max_message_size,
+            ),
+        };
 
         http::Response::from_parts(parts, BoxBody::new(body))
     }
