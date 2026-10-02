@@ -4,7 +4,7 @@ The exact pinned registry source is vendored. UPSTREAM.json records its crate ch
 
 ## Fresh HTTP/2 configuration per physical attempt
 
-Endpoint::http2_connection_factory accepts a shared synchronous factory. Endpoint clones, lazy connections, balanced endpoints and reconnect retain the factory, while every MakeSendRequestService::call obtains a fresh Http2ConnectionConfig. The result is deliberately not Clone. It forwards frame/header/event/send bounds, original DATA retention and fresh DATA/raw-input/GOAWAY backings to the paired patched Hyper builder.
+Endpoint::http2_connection_factory accepts a shared synchronous factory. Endpoint clones, lazy connections, balanced endpoints and reconnect retain the factory, while every MakeSendRequestService::call obtains a fresh Http2ConnectionConfig. The result is deliberately not Clone. It forwards frame/header/event/send bounds, original DATA retention and fresh DATA/raw-input/GOAWAY/fixed-writer backings to the paired patched Hyper builder.
 
 Scalar and independent backing geometry are validated before builder mutation and connector.call. Factory or configuration refusal creates no dial future. The returned builder moves into the actual attempt future; dial failure or cancellation drops its owners, and a successful handshake transfers their retention to the connection and escaped DATA/error aliases. Once-bound pool reuse is refused by h2 after dial but before its first handshake I/O. A reused pool is not silently replaced.
 
@@ -15,3 +15,5 @@ Custom connector.poll_ready can run before the factory and requires its own owne
 ## Source preservation
 
 The upstream benchmark README contains trailing spaces and a final blank line. Its bytes remain identical to UPSTREAM.json. A file-specific .gitattributes whitespace setting preserves that original source without disabling checks for patched code. Evidence diffs are stored as lossless gzip files so their unified-diff context prefixes are not interpreted as documentation whitespace.
+
+The per-attempt configuration also forwards an optional original-funded send_frame_buffer. Its constructor validates independent capacity/frame geometry before the factory returns it; h2 binds once before handshake I/O. Actual Channel tests include this writer in the same original attempt grant. Header/HPACK/queue owners remain outside that scope.

@@ -36,13 +36,28 @@ where
         Self::with_max_recv_frame_size(io, frame::DEFAULT_MAX_FRAME_SIZE as usize)
     }
 
-    pub(crate) fn with_receive_frame_buffer(
+    pub(crate) fn with_frame_buffers(
         io: T,
-        buffer: crate::receive_frame::BoundFrameBuffer,
+        receive: Option<crate::receive_frame::BoundFrameBuffer>,
+        send: Option<crate::send_frame_buffer::BoundSendFrameBuffer>,
         max_frame: usize,
     ) -> Self {
-        let framed_write = FramedWrite::new(io);
-        let inner = FramedRead::with_receive_frame_buffer(framed_write, buffer, max_frame);
+        // Construct the selected writer directly: no ungranted temporary
+        // default write Vec precedes the fixed buffer.
+        let framed_write = FramedWrite::with_send_frame_buffer(io, send);
+        let inner = match receive {
+            Some(buffer) => FramedRead::with_receive_frame_buffer(framed_write, buffer, max_frame),
+            None => {
+                let delimited = length_delimited::Builder::new()
+                    .big_endian()
+                    .length_field_length(3)
+                    .length_adjustment(9)
+                    .num_skip(0)
+                    .max_frame_length(max_frame)
+                    .new_read(framed_write);
+                FramedRead::new(delimited)
+            }
+        };
         Codec { inner }
     }
 

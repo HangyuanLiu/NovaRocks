@@ -18,11 +18,11 @@
 //! Real Tonic Channel attempts with per-attempt owners and a custom connector.
 //! These are HTTP/2 Service<BoxBody> fixtures, not a Native deployment or a
 //! complete connection/allocator/deadline proof. Pool/raw/carrier original
-//! backing is funded through one real Worker wallet; tasks, IO, decoded frames,
+//! and fixed writer backing is funded through one real Worker wallet; tasks, IO, decoded frames,
 //! HPACK and Tonic/Hyper/error metadata are separate. Watchdogs only fail hangs.
 
 use bytes::Bytes;
-use h2::{ReceiveBufferPool, ReceiveFrameBuffer};
+use h2::{ReceiveBufferPool, ReceiveFrameBuffer, SendFrameBuffer};
 use hyper::body::Body;
 use hyper::http::{Request, Response, Uri};
 use hyper::rt::Executor;
@@ -184,6 +184,7 @@ fn connector(
 }
 fn attempt_bytes() -> usize {
     ReceiveFrameBuffer::allocation_capacity_bound(FRAME_BYTES).unwrap()
+        + SendFrameBuffer::allocation_capacity_bound(65536, FRAME_BYTES).unwrap()
         + 2 * ReceiveBufferPool::allocation_capacity_bound(2, FRAME_BYTES).unwrap()
         + Bytes::owner_with_exit_guard_metadata_size::<Bytes, ResultWriteCredit>()
 }
@@ -207,6 +208,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
         retain_data_payloads: true,
         receive_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner.clone())?),
         receive_frame_buffer: Some(ReceiveFrameBuffer::new(FRAME_BYTES, owner.clone())?),
+        send_frame_buffer: Some(SendFrameBuffer::new(65536, FRAME_BYTES, owner.clone())?),
         receive_goaway_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner)?),
     })
 }

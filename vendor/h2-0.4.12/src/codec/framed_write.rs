@@ -26,6 +26,9 @@ pub struct FramedWrite<T, B> {
     final_flush_done: bool,
 
     encoder: Encoder<B>,
+    // Encoder's actual private Vec drops before this original owner. The
+    // buffer is never split/frozen/cloned into an escaped allocation.
+    _send_frame_owner: Option<crate::send_frame_buffer::BoundSendFrameBuffer>,
 }
 
 #[derive(Debug)]
@@ -46,6 +49,7 @@ struct Encoder<B> {
 
     /// Max frame size, this is specified by the peer
     max_frame_size: FrameSize,
+    local_max_frame_size: Option<usize>,
 
     /// Chain payloads bigger than this.
     chain_threshold: usize,
@@ -86,24 +90,45 @@ where
     B: Buf,
 {
     pub fn new(inner: T) -> FramedWrite<T, B> {
+        Self::with_send_frame_buffer(inner, None)
+    }
+
+    pub(crate) fn with_send_frame_buffer(
+        inner: T,
+        owner: Option<crate::send_frame_buffer::BoundSendFrameBuffer>,
+    ) -> FramedWrite<T, B> {
         let chain_threshold = if inner.is_write_vectored() {
             CHAIN_THRESHOLD
         } else {
             CHAIN_THRESHOLD_WITHOUT_VECTORED_IO
         };
+        let capacity = owner
+            .as_ref()
+            .map_or(DEFAULT_BUFFER_CAPACITY, |owner| owner.capacity_bytes());
+        let local_max = owner.as_ref().map(|owner| owner.max_payload_bytes());
+        let buffer = BytesMut::with_capacity(capacity);
+        if owner.is_some() {
+            assert_eq!(buffer.capacity(), capacity);
+        }
         FramedWrite {
             inner,
             final_flush_done: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
-                buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
+                buf: Cursor::new(buffer),
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+                local_max_frame_size: local_max,
                 chain_threshold,
                 retain_data_payloads: false,
-                min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                // Every frame family can now append up to this whole frame
+                // without growing the fixed Vec. Clear/flush reuses it.
+                min_buffer_capacity: local_max.map_or(chain_threshold + frame::HEADER_LEN, |max| {
+                    max + frame::HEADER_LEN
+                }),
             },
+            _send_frame_owner: owner,
         }
     }
 
@@ -293,6 +318,16 @@ where
                 tracing::trace!(rem = self.buf.remaining(), "encoded settings");
             }
             Frame::GoAway(v) => {
+                if self.local_max_frame_size.is_some()
+                    && v.debug_data()
+                        .len()
+                        .checked_add(8)
+                        .is_none_or(|len| len > self.max_frame_size())
+                {
+                    // Refuse the original diagnostic before copying it into
+                    // fixed write storage; do not truncate its wire meaning.
+                    return Err(PayloadTooBig);
+                }
                 v.encode(self.buf.get_mut());
                 tracing::trace!(rem = self.buf.remaining(), "encoded go_away");
             }
@@ -339,7 +374,10 @@ where
 
 impl<B> Encoder<B> {
     fn max_frame_size(&self) -> usize {
-        self.max_frame_size as usize
+        self.local_max_frame_size
+            .map_or(self.max_frame_size as usize, |local| {
+                local.min(self.max_frame_size as usize)
+            })
     }
 }
 

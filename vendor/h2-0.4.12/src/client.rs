@@ -324,6 +324,7 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
     retain_data_payloads: bool,
+    send_frame_buffer: Option<crate::SendFrameBuffer>,
     max_receive_header_block_size: Option<usize>,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
@@ -662,6 +663,7 @@ impl Builder {
         Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             retain_data_payloads: false,
+            send_frame_buffer: None,
             max_receive_header_block_size: None,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
@@ -1108,6 +1110,16 @@ impl Builder {
         self
     }
 
+    /// Install an original-funded, once-bound fixed outbound frame buffer.
+    ///
+    /// Its local payload maximum caps the effective peer frame maximum. The
+    /// writer reserves a complete next frame before appending; HPACK/table,
+    /// queued headers/DATA, stream/task/socket backing remain separate.
+    pub fn send_frame_buffer(&mut self, buffer: crate::SendFrameBuffer) -> &mut Self {
+        self.send_frame_buffer = Some(buffer);
+        self
+    }
+
     /// Keep original DATA Buf objects through successful upstream flush.
     /// Payloads and prefixes are not copied into the codec write buffer.
     /// Default false preserves upstream batching. Generic Buf implementations
@@ -1434,17 +1446,21 @@ where
             .map(|buffer| buffer.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
             .transpose()
             .map_err(crate::Error::from_io)?;
+        let send_frame_buffer = builder
+            .send_frame_buffer
+            .as_ref()
+            .map(crate::SendFrameBuffer::bind)
+            .transpose()
+            .map_err(crate::Error::from_io)?;
         bind_connection(&mut io).await?;
 
         // Create the codec
-        let mut codec = match receive_frame_buffer {
-            Some(buffer) => Codec::with_receive_frame_buffer(
-                io,
-                buffer,
-                builder.settings.max_frame_size().unwrap_or(16384) as usize,
-            ),
-            None => Codec::new(io),
-        };
+        let mut codec = Codec::with_frame_buffers(
+            io,
+            receive_frame_buffer,
+            send_frame_buffer,
+            builder.settings.max_frame_size().unwrap_or(16384) as usize,
+        );
         codec.set_retain_data_payloads(builder.retain_data_payloads);
 
         if let Some(max) = builder.settings.max_frame_size() {

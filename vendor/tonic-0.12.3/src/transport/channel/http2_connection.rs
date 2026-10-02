@@ -30,6 +30,8 @@ pub struct Http2ConnectionConfig {
     pub receive_buffer_pool: Option<h2::ReceiveBufferPool>,
     /// Fresh fixed raw frame input, independent of decoded frame copies.
     pub receive_frame_buffer: Option<h2::ReceiveFrameBuffer>,
+    /// Fresh fixed outbound storage and local frame cap; HPACK is separate.
+    pub send_frame_buffer: Option<h2::SendFrameBuffer>,
     /// Fresh independent GOAWAY debug backing through the last error alias.
     pub receive_goaway_buffer_pool: Option<h2::ReceiveBufferPool>,
 }
@@ -106,6 +108,9 @@ impl Http2ConnectionConfig {
         }
         if let Some(raw) = self.receive_frame_buffer {
             builder.receive_frame_buffer(raw);
+        }
+        if let Some(buffer) = self.send_frame_buffer {
+            builder.send_frame_buffer(buffer);
         }
         if let Some(pool) = self.receive_goaway_buffer_pool {
             builder.receive_goaway_buffer_pool(pool);

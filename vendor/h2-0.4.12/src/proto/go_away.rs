@@ -133,7 +133,11 @@ impl GoAway {
             }
 
             let reason = frame.reason();
-            dst.buffer(frame.into()).expect("invalid GOAWAY frame");
+            // Fixed write storage can refuse an oversized original diagnostic.
+            // Propagate the failure through the actual connection future rather
+            // than panicking or truncating the peer-visible error bytes.
+            dst.buffer(frame.into())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
             return Poll::Ready(Some(Ok(reason)));
         } else if self.should_close_now() {

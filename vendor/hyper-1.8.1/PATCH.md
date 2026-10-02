@@ -32,3 +32,8 @@ Client/server connection builders expose receive_frame_buffer(h2::ReceiveFrameBu
 ## GOAWAY debug pool forwarding
 
 Client/server connection builders expose receive_goaway_buffer_pool(h2::ReceiveBufferPool), default None, forwarding the exact original pool through cloned Config before handshake. A fresh pool is required for each physical reconnect. Real cloned Hyper tests retain the h2 error source after connection/executor/builder/pool exit, and confirm the original Worker grant remains held through the last error alias. Debug bytes are preserved; underlying h2 error precedence is unchanged. Pool refusal does not prove bounded flush or physical connection exit, and this API does not bound error-box/task metadata or install the complete Native profile.
+
+
+## Fixed writer forwarding
+
+Client/server connection builders expose send_frame_buffer(h2::SendFrameBuffer), default None. Private Config clone retains the exact original handle and forwards it before h2 handshake. Actual cloned Hyper connections process a large peer frame setting before DATA, retain the local 16 KiB send maximum, and hold the original Worker grant through actual connection future Drop. The separate h2 allocator probe proves writer Vec/Core physical exit. One buffer binds once; reconnect requires a fresh originally funded buffer. HPACK/queued headers, socket/task/TLS and complete connection ownership remain separate. Native defaults and product/performance acceptance are unchanged.

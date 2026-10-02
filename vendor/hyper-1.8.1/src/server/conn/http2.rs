@@ -302,6 +302,15 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Install fresh original-funded fixed outbound frame storage.
+    ///
+    /// The local payload maximum caps peer SETTINGS; whole-frame reservation
+    /// prevents write Vec growth. HPACK/table/queued-header backing is separate.
+    pub fn send_frame_buffer(&mut self, buffer: h2::SendFrameBuffer) -> &mut Self {
+        self.h2_builder.send_frame_buffer = Some(buffer);
+        self
+    }
+
     /// Supplies fixed raw frame input backing through its original owner.
     /// One buffer binds once to a connection and must cover its local frame
     /// maximum. Decoded copies, headers/continuations and other transport

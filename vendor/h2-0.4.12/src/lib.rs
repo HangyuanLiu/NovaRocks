@@ -166,3 +166,6 @@ pub use self::receive_pool::ReceiveBufferPool;
 
 mod receive_frame;
 pub use self::receive_frame::ReceiveFrameBuffer;
+
+mod send_frame_buffer;
+pub use self::send_frame_buffer::SendFrameBuffer;
