@@ -59,3 +59,5 @@ P04 seal/ACK 竞态端口已准确携带实际接受水位，codec 仅允许 clo
 P04 StatisticsArtifactV1 独立流式 codec 已完成模块切片，main 通过真实 library consumer 的12项定向测试/目标Clippy/Native all-target check/fmt/diff；[收据](evidence/p04-statistics-codec/README.md)。STA1准确声明先验、逐turn工作及实际零分配已证明；Session/SQL/FE/源头32MiB增长防护仍继续，未开启该domain产品路径。
 
 P04 Native reader 的同一 admission ACK/完整发送 pregrant 与 strong-only owner 已保存模块切片，401 项相关测试和两包 all-target Clippy/fmt/diff 通过；[收据](evidence/p04-native-reader/README.md)。包括满池 ACK、真实 alias、回调 seal、task horizon 后 replay；真实 HTTP/H2 仍未接线，P04 继续、V1 未 advertise。统计源头的 Unpivot→Project→Root permit 缝隙已准确定位，见 [增长审计](statistics-source-growth-audit.md)。
+
+P04 Bytes wrapper 的真实 allocator exit 已接原 segment/offered/read owner，negative mutant、normal/两类 panic、Barrier alias 和 Miri 通过；[收据](evidence/p04-bytes-physical-exit/README.md)。vendor 全 suite 1,250、consumer 490 项及 workspace all-target check 通过；既有 Clippy/依赖解析失败保留。真实 Tonic/HTTP/H2 与 lane 接线仍继续，P04 未完成。

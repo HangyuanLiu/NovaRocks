@@ -61,7 +61,7 @@ pub struct NativeRootSendOwnership {
 struct NativeRootSendResources {
     // Physical wire backings live in the caller's wrapper, before this owner.
     // Credit and delivery exit precede the fixed wrapper metadata reservation.
-    _delivery: Arc<RootDeliveryOwner>,
+    _delivery: RootDeliveryOwner,
     backing: NativeRootSendBacking,
     _metadata: Option<RootMetadataReservation>,
 }

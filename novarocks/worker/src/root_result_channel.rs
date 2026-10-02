@@ -189,13 +189,24 @@ impl RootSegmentBuilder {
     }
     fn into_body(mut self, bytes: usize) -> Bytes {
         self.backing.truncate(bytes);
-        Bytes::from_owner(self)
+        Bytes::from_owner_with_exit_guard(
+            self.backing,
+            RootSegmentExit {
+                _credit: self._credit,
+                _position: self.position,
+                _active: self.active,
+            },
+        )
     }
 }
-impl AsRef<[u8]> for RootSegmentBuilder {
-    fn as_ref(&self) -> &[u8] {
-        &self.backing
-    }
+
+// The vector and its Bytes wrapper allocation exit before these original
+// grants. Keeping them as a separate guard closes the wrapper's allocator
+// tail, including a last remote body alias after logical ACK or context seal.
+struct RootSegmentExit {
+    _credit: ResultWriteCredit,
+    _position: PhysicalSegmentPosition,
+    _active: ActiveBuilderPosition,
 }
 struct ActiveBuilderPosition(Option<Weak<RootResultChannel>>);
 impl Drop for ActiveBuilderPosition {
@@ -288,6 +299,17 @@ impl RootResultChannel {
                 .size();
         bytes
     }
+    fn bytes_owner_metadata_bytes() -> usize {
+        let geometry = NativeResultSupportGeometry::V1;
+        let segments = (geometry.root_active_segment_positions
+            + geometry.root_queued_segment_positions
+            + geometry.root_retired_segment_tail_positions) as usize;
+        let sends = geometry.root_live_send_holders as usize;
+        segments * Bytes::owner_with_exit_guard_metadata_size::<Vec<u8>, RootSegmentExit>()
+            + sends
+                * (Bytes::owner_with_exit_guard_metadata_size::<Bytes, RootDeliveryOwner>()
+                    + RootDeliveryOwner::backing_metadata_bytes())
+    }
     pub fn try_open(
         spec: RootResultWriteSpec,
         budget: Arc<ResultRetainedBudget>,
@@ -339,6 +361,7 @@ impl RootResultChannel {
             + Observable::bounded_backing_bytes(Self::WRITABLE_CALLBACK_CAPACITY)
                 .map_err(|_| RootChannelError::Capacity)?
             + Self::credit_control_backing_bytes(spec.task)
+            + Self::bytes_owner_metadata_bytes()
             + 32 * std::mem::size_of::<usize>();
         if core_bytes > Self::CORE_METADATA_CAPACITY {
             return Err(RootChannelError::Capacity);
@@ -744,10 +767,11 @@ impl RootResultChannel {
                 (n < limit).then_some(n + 1)
             })
             .map_err(|_| RootChannelError::Capacity)?;
-        let guard = Arc::new(RootDeliveryOwner {
-            physical: Arc::clone(&self.physical),
-            registered: true,
-        });
+        let guard = RootDeliveryOwner {
+            position: Some(Arc::new(RootDeliveryPosition {
+                physical: Arc::clone(&self.physical),
+            })),
+        };
         Ok(RootChannelRead {
             channel: Arc::clone(self),
             request: read.clone(),
@@ -770,10 +794,7 @@ impl RootResultChannel {
                     .consumed_through;
                 Ok(RootResultDelivery {
                     reply: self.reply(consumed, RootReadOutcome::AwaitTerminalControl),
-                    guard: Arc::new(RootDeliveryOwner {
-                        physical: Arc::clone(&self.physical),
-                        registered: false,
-                    }),
+                    guard: RootDeliveryOwner { position: None },
                 })
             }
             Err(error) => Err(error),
@@ -782,7 +803,7 @@ impl RootResultChannel {
     async fn read_admitted(
         &self,
         read: &RootResultRead,
-        guard: Arc<RootDeliveryOwner>,
+        guard: RootDeliveryOwner,
     ) -> Result<RootResultDelivery, RootChannelError> {
         let deadline = tokio::time::Instant::now() + read.max_wait();
         loop {
@@ -803,7 +824,7 @@ impl RootResultChannel {
     fn read_once(
         &self,
         read: &RootResultRead,
-        guard: &Arc<RootDeliveryOwner>,
+        guard: &RootDeliveryOwner,
     ) -> Result<RootResultReply, RootChannelError> {
         let (reply, retired) = {
             let mut state = self.state.lock().unwrap();
@@ -833,10 +854,10 @@ impl RootResultChannel {
                                     .iter()
                                     .find(|data| data.sequence().get() == item.sequence)
                                     .ok_or(RootChannelError::Payload)?;
-                                let body = Bytes::from_owner(OfferedPayload {
-                                    backing: data.body().clone(),
-                                    _delivery: Arc::clone(guard),
-                                });
+                                let body = Bytes::from_owner_with_exit_guard(
+                                    data.body().clone(),
+                                    guard.clone(),
+                                );
                                 RootReadOutcome::Data(
                                     RootResultData::try_new(
                                         data.kind(),
@@ -924,32 +945,49 @@ impl Drop for RootProducerExit {
         self.channel.physical.wake();
     }
 }
+/// Strong-only read ownership. The last handle frees its private Arc before
+/// publishing physical position exit; no Weak/raw Arc can prolong that heap.
 pub struct RootDeliveryOwner {
+    position: Option<Arc<RootDeliveryPosition>>,
+}
+struct RootDeliveryPosition {
     physical: Arc<PhysicalOwners>,
-    registered: bool,
 }
-struct OfferedPayload {
-    // Even a caller that retains only a Bytes alias keeps this delivery slot.
-    backing: Bytes,
-    _delivery: Arc<RootDeliveryOwner>,
+impl RootDeliveryOwner {
+    fn backing_metadata_bytes() -> usize {
+        std::alloc::Layout::new::<[AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<RootDeliveryPosition>())
+            .expect("fixed root delivery Arc layout fits usize")
+            .0
+            .pad_to_align()
+            .size()
+    }
 }
-impl AsRef<[u8]> for OfferedPayload {
-    fn as_ref(&self) -> &[u8] {
-        &self.backing
+impl Clone for RootDeliveryOwner {
+    fn clone(&self) -> Self {
+        Self {
+            position: self.position.as_ref().map(Arc::clone),
+        }
     }
 }
 impl Drop for RootDeliveryOwner {
     fn drop(&mut self) {
-        if self.registered {
-            self.physical.deliveries.fetch_sub(1, Ordering::AcqRel);
-            self.physical.wake();
+        if let Some(position) = self.position.take() {
+            drop(Arc::into_inner(position));
         }
     }
 }
+impl Drop for RootDeliveryPosition {
+    fn drop(&mut self) {
+        self.physical.deliveries.fetch_sub(1, Ordering::AcqRel);
+        self.physical.wake();
+    }
+}
+
 pub struct RootChannelRead {
     channel: Arc<RootResultChannel>,
     request: RootResultRead,
-    guard: Arc<RootDeliveryOwner>,
+    guard: RootDeliveryOwner,
 }
 impl RootChannelRead {
     /// Apply this original admission's ACK before reserving native copy space.
@@ -996,13 +1034,13 @@ impl RootChannelRead {
 /// a handler or serializing a protobuf is not a physical send-exit receipt.
 pub struct RootResultDelivery {
     reply: RootResultReply,
-    guard: Arc<RootDeliveryOwner>,
+    guard: RootDeliveryOwner,
 }
 impl RootResultDelivery {
     pub fn reply(&self) -> &RootResultReply {
         &self.reply
     }
-    pub fn into_parts(self) -> (RootResultReply, Arc<RootDeliveryOwner>) {
+    pub fn into_parts(self) -> (RootResultReply, RootDeliveryOwner) {
         (self.reply, self.guard)
     }
 }
