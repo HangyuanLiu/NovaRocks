@@ -4190,6 +4190,7 @@ dependencies = [
  "arrow-buffer",
  "flatbuffers",
  "hex",
+ "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-functions",
  "novarocks-physical-plan",

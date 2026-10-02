@@ -32,6 +32,12 @@ use novarocks_type_contract::{
 };
 
 mod emit;
+mod verify;
+
+// A supported Field chain has at most 64 value-type levels. The standard
+// Message -> Schema -> Field framing adds three verifier table levels;
+// dictionary/type payloads fit within the same source-derived cover.
+const MAX_SCHEMA_VERIFIER_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 3;
 
 /// Caller-resolved admission, with no implicit application policy.
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +46,11 @@ pub struct IpcSchemaProjectionLimits {
     pub max_type_occurrences: usize,
     pub max_string_bytes: usize,
     pub max_flatbuffer_bytes: usize,
+}
+
+struct SchemaPreflight {
+    backing: usize,
+    tables: usize,
 }
 
 #[derive(Default)]
@@ -129,7 +140,7 @@ fn preflight(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<usize, TypeCodecError> {
+) -> Result<SchemaPreflight, TypeCodecError> {
     validate_field(field, work)?;
     novarocks_type_contract::field_logical_type(field)?;
     validate_type(field.data_type(), work)?;
@@ -168,7 +179,11 @@ fn preflight(
             "IPC schema FlatBuffer envelope exceeded",
         ));
     }
-    Ok(backing)
+    let tables = checked_add(
+        checked_add(counts.fields, counts.types)?,
+        checked_add(counts.metadata_entries, 2)?,
+    )?;
+    Ok(SchemaPreflight { backing, tables })
 }
 
 /// Emits a V5 schema message, without stream framing or array-buffer encoding.
@@ -181,7 +196,8 @@ pub fn encode_single_field_schema(
 ) -> Result<Vec<u8>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
-        let capacity = preflight(field, limits, &mut work)?;
+        let facts = preflight(field, limits, &mut work)?;
+        let capacity = facts.backing;
         work.flush()?;
         let mut backing = Vec::new();
         backing.try_reserve_exact(capacity).map_err(|_| {
@@ -198,9 +214,9 @@ pub fn encode_single_field_schema(
         work.flush()?;
         let mut builder = FlatBufferBuilder::from_vec(backing);
         work.flush()?;
-        let field = emit::emit_field(field, &mut builder, &mut work)?;
+        let field_offset = emit::emit_field(field, &mut builder, &mut work)?;
         work.flush()?;
-        let fields = builder.create_vector(&[field]);
+        let fields = builder.create_vector(&[field_offset]);
         let schema = arrow::ipc::Schema::create(
             &mut builder,
             &arrow::ipc::SchemaArgs {
@@ -229,6 +245,16 @@ pub fn encode_single_field_schema(
                 "IPC schema exceeded its proven backing cover",
             ));
         }
+        // These are source-derived bounds for this exact writer: every
+        // emitted table is counted, and the backing cover also bounds the
+        // official verifier's apparent visits, including reused vtables.
+        let verifier = novarocks_arrow_ipc_frame::VerifierOptions {
+            max_depth: MAX_SCHEMA_VERIFIER_DEPTH,
+            max_tables: facts.tables,
+            max_apparent_size: capacity,
+            ignore_missing_null_terminator: false,
+        };
+        verify_message(builder.finished_data(), field, &verifier, &mut work)?;
         work.flush()?;
         let output = builder.finished_data().to_vec();
         work.flush()?;
@@ -243,3 +269,97 @@ pub fn encode_single_field_schema(
 
 #[cfg(test)]
 mod tests;
+
+/// Validates the borrowed schema before any Arrow schema-object conversion.
+/// The official verifier's envelope is mandatory and caller-authored. This
+/// entry checks one V5 single-field schema message, not an IPC value stream.
+/// A depth envelope wider than the supported schema grammar is refused;
+/// smaller caller limits remain unchanged. Apparent-size arithmetic must
+/// also cover one attempted in-buffer visit without overflowing usize.
+pub fn verify_single_field_schema_message(
+    metadata: &[u8],
+    expected: &Field,
+    limits: IpcSchemaProjectionLimits,
+    verifier: &novarocks_arrow_ipc_frame::VerifierOptions,
+    control: &dyn PureCompileControl,
+) -> Result<(), TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = (|| {
+        if metadata.len() > limits.max_flatbuffer_bytes {
+            return Err(TypeCodecError::InvalidShape(
+                "IPC schema metadata envelope exceeded",
+            ));
+        }
+        preflight(expected, limits, &mut work)?;
+        verify_message(metadata, expected, verifier, &mut work)
+    })();
+    if matches!(&result, Err(TypeCodecError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+#[cfg(test)]
+mod verify_tests;
+
+fn verify_message(
+    metadata: &[u8],
+    expected: &Field,
+    verifier: &novarocks_arrow_ipc_frame::VerifierOptions,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if verifier.max_depth > MAX_SCHEMA_VERIFIER_DEPTH {
+        return Err(TypeCodecError::InvalidShape(
+            "IPC schema verifier depth envelope exceeds supported grammar",
+        ));
+    }
+    // The official verifier adds each in-buffer visit before comparing its
+    // apparent limit. A visit cannot exceed the metadata slice, so this sum
+    // proves that even the first over-limit visit cannot overflow usize.
+    checked_add(verifier.max_apparent_size, metadata.len())?;
+    work.flush()?;
+    let parsed = novarocks_arrow_ipc_frame::verified_message(metadata, verifier);
+    // Observe the opaque verifier even on its ordinary malformed outcome.
+    work.flush()?;
+    let message =
+        parsed.map_err(|_| TypeCodecError::InvalidShape("invalid Arrow IPC schema metadata"))?;
+    work.step()?;
+    if message.version() != arrow::ipc::MetadataVersion::V5
+        || message.header_type() != arrow::ipc::MessageHeader::Schema
+        || message.bodyLength() != 0
+        || message
+            .custom_metadata()
+            .is_some_and(|entries| !entries.is_empty())
+    {
+        return Err(TypeCodecError::InvalidShape(
+            "unsupported Arrow IPC schema message profile",
+        ));
+    }
+    let schema = message
+        .header_as_schema()
+        .ok_or(TypeCodecError::InvalidShape(
+            "Arrow IPC schema payload is missing",
+        ))?;
+    work.step()?;
+    if schema.endianness() != arrow::ipc::Endianness::Little
+        || schema.features().is_some_and(|entries| !entries.is_empty())
+        || schema
+            .custom_metadata()
+            .is_some_and(|entries| !entries.is_empty())
+    {
+        return Err(TypeCodecError::InvalidShape(
+            "unsupported Arrow IPC schema root profile",
+        ));
+    }
+    let fields = schema.fields().ok_or(TypeCodecError::InvalidShape(
+        "Arrow IPC schema fields are missing",
+    ))?;
+    work.step()?;
+    if fields.len() != 1 {
+        return Err(TypeCodecError::InvalidShape(
+            "constant IPC schema must contain exactly one field",
+        ));
+    }
+    verify::verify_field(expected, fields.get(0), work)
+}
