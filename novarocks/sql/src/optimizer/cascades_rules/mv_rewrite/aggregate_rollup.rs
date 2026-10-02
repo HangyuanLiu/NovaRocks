@@ -25,7 +25,7 @@ use crate::column_id::ColumnId;
 use crate::optimizer::operator::ScalarAggregateSpec;
 use crate::optimizer::scalar::{ScalarArena, ScalarId};
 
-use super::column_mapping::{NormExpr, normalize};
+use super::column_mapping::{NormExpr, NormSortKey, normalize};
 use super::descriptor::{SpjgAggregate, SpjgOutput, SpjgOutputExpr};
 
 #[derive(Debug)]
@@ -61,15 +61,24 @@ fn norm_agg(
     call: &ScalarAggregateSpec,
     base_names: &HashMap<ColumnId, String>,
 ) -> Option<NormExpr> {
-    // `order_by` is intentionally NOT part of the key: every aggregate on the
-    // current whitelist (sum/min/max/count) is order-insensitive, and SPJG-MV
-    // aggregate calls carry no order_by. If an order-sensitive aggregate
-    // (e.g. group_concat / array_agg) is ever whitelisted, order_by MUST be
-    // folded into this key, or two differently-ordered calls would wrongly
-    // match.
+    // The whitelist remains unchanged; matching still retains every authored
+    // call fact so future or separately constructed ordering cannot collide.
     Some(NormExpr::Call {
         name: format!("agg:{}", call.name.to_ascii_lowercase()),
         distinct: call.distinct,
+        binding: Some(call.resolved.clone()),
+        decimal_overflow_policy: None,
+        order_by: call
+            .order_by
+            .iter()
+            .map(|key| {
+                Some(NormSortKey {
+                    expr: normalize(arena, key.expr, base_names)?,
+                    asc: key.asc,
+                    nulls_first: key.nulls_first,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
         args: call
             .args
             .iter()

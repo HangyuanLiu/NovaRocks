@@ -22,7 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 use arrow::datatypes::DataType;
-use novarocks_functions::{FunctionArgumentType, FunctionResultType, ResolvedFunctionBinding};
+use novarocks_functions::{FunctionArgumentType, FunctionResultType};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
 };
@@ -31,6 +31,7 @@ use super::{
     ColumnDisplay, FunctionValueType, HashableLiteral, LiteralValue, ScalarArena, ScalarId,
     ScalarNode, SortKey,
 };
+use crate::binding::SqlFunctionBinding;
 use crate::common::{WindowBound, WindowFrame};
 use crate::compiler::SqlCompileError;
 
@@ -150,7 +151,8 @@ impl<'a> Fields<'a, '_, '_> {
         }
         Ok(())
     }
-    fn binding(&mut self, binding: &'a ResolvedFunctionBinding) -> Result<(), InternerError> {
+    fn binding(&mut self, binding: &'a SqlFunctionBinding) -> Result<(), InternerError> {
+        self.number(binding.decimal_overflow_policy() as u128)?;
         self.text(binding.function_id.as_str())?;
         self.number(binding.kind as u128)?;
         self.number(binding.semantics.volatility as u128)?;
@@ -292,7 +294,7 @@ fn node_fields<'a>(
             f.text(name)?;
             f.ids(args)?;
             f.boolean(*distinct)?;
-            f.binding(binding.resolved())?;
+            f.binding(binding)?;
             f.number(*volatility as u128)?;
         }
         ScalarNode::LambdaFunction { params, body } => {
@@ -317,7 +319,7 @@ fn node_fields<'a>(
             f.ids(args)?;
             f.boolean(*distinct)?;
             f.sort_keys(order_by)?;
-            f.binding(resolved.resolved())?;
+            f.binding(resolved)?;
         }
         ScalarNode::Cast {
             child,
@@ -410,11 +412,11 @@ fn node_fields<'a>(
             f.text(name)?;
             f.ids(args)?;
             f.boolean(*distinct)?;
-            f.binding(binding.resolved())?;
+            f.binding(binding)?;
             f.sort_keys(function_order_by)?;
             f.boolean(aggregate_binding.is_some())?;
             if let Some(binding) = aggregate_binding {
-                f.binding(binding.resolved())?;
+                f.binding(binding)?;
             }
             f.ids(partition_by)?;
             f.sort_keys(order_by)?;

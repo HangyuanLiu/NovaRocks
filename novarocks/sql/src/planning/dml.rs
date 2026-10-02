@@ -599,6 +599,7 @@ pub fn build_final_frozen_connector_write_plan(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     let scan_occurrence = final_write
@@ -621,6 +622,7 @@ pub fn build_final_frozen_connector_write_plan(
             },
         ],
         functions,
+        decimal_overflow_policy,
         control,
     )?;
     complete_connector_write_plan(
@@ -659,6 +661,7 @@ pub fn begin_final_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> Result<
     (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
     crate::compiler::SqlCompileError,
@@ -679,6 +682,7 @@ pub fn begin_final_connector_write_plan(
             },
         ],
         compiled.function_catalog.as_ref(),
+        decimal_overflow_policy,
         &control,
     )?;
     // Runtime filters are placed before the reads are stated, because a filter
@@ -747,6 +751,7 @@ pub fn compile_final_connector_write_plan(
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
@@ -764,6 +769,7 @@ pub fn compile_final_connector_write_plan(
             },
         ],
         compiled.function_catalog.as_ref(),
+        decimal_overflow_policy,
         &control,
     )?;
     complete_connector_write_plan(
@@ -966,6 +972,7 @@ pub fn begin_final_ctas_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
@@ -983,6 +990,7 @@ pub fn begin_final_ctas_connector_write_plan(
             },
         ],
         source.function_catalog.as_ref(),
+        decimal_overflow_policy,
         control,
     )?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -1187,6 +1195,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1214,6 +1223,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         &routes,
         statistics_targets,
         functions.as_ref(),
+        decimal_overflow_policy,
         control,
     )?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
@@ -1281,6 +1291,7 @@ impl DmlFinalChangeStreamPlan {
 /// its writer graph is lowered against the frozen provider facts.
 pub fn begin_final_dml_change_stream(
     request: DmlChangeStreamCompileRequest<'_>,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> Result<
     (
         DmlChangeStreamCompletion,
@@ -1332,6 +1343,7 @@ pub fn begin_final_dml_change_stream(
         compiled.function_catalog,
         request.pre_expand_keyed_assert,
         request.shape,
+        decimal_overflow_policy,
         &control,
     )
 }
@@ -1339,6 +1351,7 @@ pub fn begin_final_dml_change_stream(
 /// Compile a generated change stream into the staged final physical contract.
 pub fn compile_final_dml_change_stream(
     request: DmlFinalChangeStreamCompileRequest<'_>,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let control = request.optimize_request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
@@ -1381,10 +1394,15 @@ pub fn compile_final_dml_change_stream(
             shape: request.shape,
             final_write: request.final_write,
         },
+        decimal_overflow_policy,
         &control,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The producer, signed routes, statistics, authored policy and request control are distinct compiler inputs."
+)]
 pub(crate) fn seal_final_change_stream_producer(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1392,6 +1410,7 @@ pub(crate) fn seal_final_change_stream_producer(
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     context: DmlFinalChangeStreamSealContext,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
@@ -1422,6 +1441,7 @@ pub(crate) fn seal_final_change_stream_producer(
         effect_output_ordinal,
         functions,
         context,
+        decimal_overflow_policy,
         control,
     )
 }
@@ -1435,6 +1455,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     effect_output_ordinal: usize,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     context: DmlFinalChangeStreamSealContext,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
@@ -1454,8 +1475,13 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
             "change-stream effect output ordinal does not identify the native ChangeEventExpand effect"
                 .to_string().into());
     }
-    let auxiliary =
-        plan_change_stream_writer_statistics(&routes, statistics_targets, functions, control)?;
+    let auxiliary = plan_change_stream_writer_statistics(
+        &routes,
+        statistics_targets,
+        functions,
+        decimal_overflow_policy,
+        control,
+    )?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
     let keyed_assert = context.pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
@@ -1541,6 +1567,7 @@ fn plan_change_stream_writer_statistics(
     routes: &[DmlChangeStreamRoute],
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<
     crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
@@ -1617,7 +1644,10 @@ fn plan_change_stream_writer_statistics(
         })
         .collect::<Result<Vec<_>, String>>()?;
     crate::planner::distributed::write::auxiliary::plan_writer_statistics(
-        &inputs, functions, control,
+        &inputs,
+        functions,
+        decimal_overflow_policy,
+        control,
     )
 }
 
@@ -2219,6 +2249,7 @@ pub fn build_final_statistics_connector_plan(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_context: DmlFinalPlanContext,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     if required.is_empty() {
@@ -2235,8 +2266,14 @@ pub fn build_final_statistics_connector_plan(
     let scan_occurrence = reads
         .single_occurrence()
         .map_err(|error| error.to_string())?;
-    let mut physical =
-        build_statistics_connector_physical(scan, required, functions, scan_occurrence, control)?;
+    let mut physical = build_statistics_connector_physical(
+        scan,
+        required,
+        functions,
+        scan_occurrence,
+        decimal_overflow_policy,
+        control,
+    )?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
@@ -2256,6 +2293,7 @@ fn build_statistics_connector_physical(
     required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     scan_occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::planner::physical::PhysicalPlanNode, crate::compiler::SqlCompileError> {
     if required.is_empty() {
@@ -2415,6 +2453,7 @@ fn build_statistics_connector_physical(
                 requirement.input().data_type()
             )),
         })?;
+        let resolved = crate::binding::SqlFunctionBinding::new(resolved, decimal_overflow_policy);
         let result_type = crate::functions::aggregate_result_type(&resolved);
         if result_type.logical_type != novarocks_type_contract::ValueLogicalType::Physical
             || result_type.data_type != arrow::datatypes::DataType::Binary
@@ -2463,7 +2502,7 @@ fn build_statistics_connector_physical(
                 .clone(),
             order_by: Vec::new(),
             output_column_id: partial_output_id,
-            resolved: resolved.clone().into(),
+            resolved: resolved.clone(),
         });
         global_calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
@@ -2483,7 +2522,7 @@ fn build_statistics_connector_physical(
                 .clone(),
             order_by: Vec::new(),
             output_column_id: final_output_id,
-            resolved: resolved.into(),
+            resolved,
         });
     }
 
@@ -2776,6 +2815,7 @@ mod tests {
             &[requirement],
             &functions,
             novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap_err();
@@ -2944,6 +2984,7 @@ mod tests {
             &functions,
             &SessionOptimizerSettings::default(),
             statistics_final_context(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("ANALYZE plan");
@@ -3348,6 +3389,7 @@ mod tests {
             &[statistics_route(0), statistics_route(1)],
             vec![empty_statistics_target(0)],
             functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("missing target must fail");
@@ -3360,6 +3402,7 @@ mod tests {
             &[statistics_route(0)],
             vec![empty_statistics_target(0), empty_statistics_target(0)],
             functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("duplicate target must fail");
@@ -3372,6 +3415,7 @@ mod tests {
             &[statistics_route(0)],
             vec![empty_statistics_target(0), empty_statistics_target(1)],
             functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("extraneous target must fail");
@@ -3389,6 +3433,7 @@ mod tests {
             &[statistics_route(0), statistics_route(1)],
             vec![empty_statistics_target(0), empty_statistics_target(1)],
             crate::functions::builtin_sql_function_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("exact empty requirements are a valid ordinary mutation plan");
@@ -3465,6 +3510,7 @@ mod tests {
                 },
             ],
             &functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production helper plans routed statistics");

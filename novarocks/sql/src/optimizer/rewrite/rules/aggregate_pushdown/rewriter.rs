@@ -290,6 +290,7 @@ pub(crate) fn rewrite(
                     &[arg_id],
                     &orig_spec.order_by,
                     true,
+                    orig_spec.resolved.decimal_overflow_policy(),
                     control,
                 )
                 .map_err(|error| match error {
@@ -734,13 +735,17 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_count_to_sum_at_final() {
+    fn rewrites_count_to_sum_at_final_preserving_original_decimal_policy() {
         let mut arena = ScalarArena::new();
         let a = scan_opt("a", &[("k", DataType::Int64), ("v", DataType::Int64)]);
         let b = scan_opt("b", &[("k", DataType::Int64)]);
         let join = join_opt(a.clone(), b, Some(eq_typed("k", "k")), &mut arena);
 
-        let count = count_spec("v", &mut arena);
+        let mut count = count_spec("v", &mut arena);
+        count.resolved = crate::binding::SqlFunctionBinding::new(
+            count.resolved.resolved().clone(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        );
         let original = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
             vec![count.clone()],
@@ -792,6 +797,10 @@ mod tests {
         };
         assert!(top.is_split);
         assert_eq!(top.aggregates[0].name, "sum");
+        assert_eq!(
+            top.aggregates[0].resolved.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
         let join_plan = top_plan.children.first().expect("final agg child");
         assert!(matches!(&join_plan.op, Operator::LogicalJoin(_)));
         let partial_plan = join_plan.children.first().expect("join left child");
@@ -800,6 +809,10 @@ mod tests {
         };
         assert!(!partial.is_split);
         assert_eq!(partial.aggregates[0].name, "count");
+        assert_eq!(
+            partial.aggregates[0].resolved.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
     }
 
     #[test]
@@ -880,6 +893,7 @@ mod tests {
                 &[arg],
                 &[],
                 false,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();

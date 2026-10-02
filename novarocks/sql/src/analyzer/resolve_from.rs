@@ -770,7 +770,10 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((
             Relation::Unnest(UnnestRelation {
                 args,
-                binding: binding.into(),
+                binding: crate::binding::SqlFunctionBinding::new(
+                    binding,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                ),
                 output_columns,
                 alias: alias_name,
             }),

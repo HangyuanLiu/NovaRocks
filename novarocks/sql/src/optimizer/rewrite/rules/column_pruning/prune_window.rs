@@ -216,6 +216,7 @@ mod tests {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }

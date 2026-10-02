@@ -527,7 +527,11 @@ mod tests {
                     stop_at,
                     error,
                 };
-                let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+                let mut ctx = RewriteContext::for_query_with_settings(
+                    Default::default(),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    &control,
+                );
                 let pipeline = RewritePipeline::from_stages(vec![]);
                 assert_eq!(
                     pipeline.rewrite(empty_values_plan(), &mut ctx).unwrap_err(),
@@ -587,7 +591,11 @@ mod tests {
                 stopped: Default::default(),
                 error,
             };
-            let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &owner);
+            let mut ctx = RewriteContext::for_query_with_settings(
+                Default::default(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &owner,
+            );
             // Direct invocation borrows the real rule owner; pipeline boxes are
             // static by contract and need no capability-bearing test shim.
             let failure = crate::optimizer::rewrite::tree::rewrite_with_rule(

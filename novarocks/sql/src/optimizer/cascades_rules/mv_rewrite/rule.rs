@@ -498,6 +498,9 @@ fn try_rewrite(
                                         &[arg],
                                         &[],
                                         true,
+                                        original_agg.aggregates[idx]
+                                            .resolved
+                                            .decimal_overflow_policy(),
                                         control,
                                     )
                                 );
@@ -555,8 +558,7 @@ fn try_rewrite(
                         children: vec![child_group],
                     });
                     let function_catalog = memo.function_catalog().snapshot();
-                    let items: Vec<ScalarProjectItem> =
-                        candidate!(
+                    let items: Vec<ScalarProjectItem> = candidate!(
                         original_agg
                             .output_columns
                             .iter()
@@ -568,18 +570,23 @@ fn try_rewrite(
                                     AggregateOutputPosition::GroupKey(idx) => column_ref(
                                         &mut memo.scalars,
                                         &output_layout.group_key_columns[idx],
-                                     control)?,
+                                        control,
+                                    )?,
                                     AggregateOutputPosition::Aggregate(idx) => {
                                         let inner = column_ref(
                                             &mut memo.scalars,
                                             &output_layout.aggregate_columns[idx],
-                                         control)?;
+                                            control,
+                                        )?;
                                         if plan.items[idx].needs_coalesce {
                                             binding_candidate!(coalesce_zero(
                                                 function_catalog.as_ref(),
                                                 &mut memo.scalars,
                                                 inner,
                                                 oc,
+                                                original_agg.aggregates[idx]
+                                                    .resolved
+                                                    .decimal_overflow_policy(),
                                                 control,
                                             ))
                                         } else {
@@ -779,6 +786,7 @@ fn coalesce_zero(
     arena: &mut ScalarArena,
     value: ScalarId,
     output: &OutputColumn,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let zero = arena.intern_observed(
@@ -795,6 +803,7 @@ fn coalesce_zero(
         arena,
         "coalesce",
         &args,
+        policy,
         control,
     )?;
     arena.intern_observed(
@@ -2049,14 +2058,14 @@ mod tests {
     }
 
     #[test]
-    fn scalar_count_rollup_wraps_with_coalesce() {
+    fn scalar_count_rollup_and_coalesce_keep_original_decimal_policy() {
         // MV:    SELECT a, count(*) c FROM t WHERE a >= 0 GROUP BY a.
         // Query: SELECT count(*) FROM t WHERE a >= 0  (scalar, no group-by).
         // {} ⊂ {a} -> Rollup; count -> SUM over MV `c`; scalar count over an
         // empty MV result is NULL where COUNT must be 0 -> COALESCE(sum, 0).
         let mv_a = col(100, "a");
         let mv_c = col(110, "c");
-        let mv_plan = LogicalPlanNode::new(
+        let mut mv_plan = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&mv_a)],
                 aggregates: vec![count_star(&mv_c)],
@@ -2072,23 +2081,42 @@ mod tests {
             )],
             None,
         );
-        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
-        let candidate = MvRewriteCandidate {
-            mv_name: "cnt_mv".to_string(),
-            mv,
-            mv_scalars,
-            target_database: "ns".to_string(),
-            target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
-            target_stats_ref: stats_ref_for_test(702),
-            selection: Some(selection_facts()),
+        // Freeze the negative descriptor from the actual OutputNull call
+        // before authoring the matching ReportError candidate.
+        let candidate_for = |plan: &LogicalPlanNode| {
+            let (mv, mv_scalars) = spjg_descriptor_for_test(plan);
+            MvRewriteCandidate {
+                mv_name: "cnt_mv".to_string(),
+                mv,
+                mv_scalars,
+                target_database: "ns".to_string(),
+                target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
+                target_stats_ref: stats_ref_for_test(702),
+                selection: Some(selection_facts()),
+            }
         };
+        let cross_policy_candidate = candidate_for(&mv_plan);
+        let LogicalPlanKind::Aggregate(mv_aggregate) = &mut mv_plan.kind else {
+            panic!("expected MV aggregate");
+        };
+        let mv_count = &mut mv_aggregate.aggregates[0];
+        mv_count.resolved = crate::binding::SqlFunctionBinding::new(
+            mv_count.resolved.resolved().clone(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        );
+        let candidate = candidate_for(&mv_plan);
 
         let a = col(1, "a");
         let cnt = col(3, "cnt"); // original scalar count output id
+        let mut count = count_star(&cnt);
+        count.resolved = crate::binding::SqlFunctionBinding::new(
+            count.resolved.resolved().clone(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        );
         let query_plan = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![],
-                aggregates: vec![count_star(&cnt)],
+                aggregates: vec![count],
                 output_columns: vec![cnt.clone()],
                 already_pushed: false,
             }),
@@ -2101,6 +2129,22 @@ mod tests {
             )],
             None,
         );
+
+        // Whole-rule matching must refuse the same COUNT shape when the MV
+        // call retains OutputNull and the query call requires ReportError.
+        let mut cross_policy_memo = test_memo();
+        let cross_policy_root = logical_plan_to_memo_for_test(&query_plan, &mut cross_policy_memo);
+        advance_factory(&mut cross_policy_memo, 200);
+        let cross_policy_expr =
+            cross_policy_memo.groups[cross_policy_root].logical_exprs[0].clone();
+        let cross_policy_alts = MvRewriteRule::new(vec![cross_policy_candidate])
+            .apply(
+                &cross_policy_expr,
+                &mut cross_policy_memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+        assert!(cross_policy_alts.is_empty());
 
         let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
@@ -2125,10 +2169,20 @@ mod tests {
         assert_eq!(p.items.len(), 1);
         assert_eq!(p.items[0].output_column_id, cnt.column_id);
         let project_expr = materialize(&memo.scalars, p.items[0].expr);
-        let ExprKind::FunctionCall { name, args, .. } = &project_expr.kind else {
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &project_expr.kind
+        else {
             panic!("expected coalesce call, got {:?}", project_expr.kind);
         };
         assert_eq!(name, "coalesce");
+        assert_eq!(
+            binding.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
         assert_eq!(args.len(), 2);
         // arg0 references the inner aggregate output (a freshly-minted id, NOT
         // the original cnt id — the original id is reused only at the project).
@@ -2150,6 +2204,10 @@ mod tests {
         assert!(inner.group_by.is_empty());
         assert_eq!(inner.aggregates.len(), 1);
         assert_eq!(inner.aggregates[0].name, "sum");
+        assert_eq!(
+            inner.aggregates[0].resolved.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
         // The inner aggregate's output id is the freshly-minted one used by the
         // coalesce arg, confirming the original id is not duplicated mid-tree.
         assert_eq!(inner.output_columns[0].column_id, *column_id);

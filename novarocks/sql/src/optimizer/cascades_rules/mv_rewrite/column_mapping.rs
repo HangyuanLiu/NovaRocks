@@ -36,7 +36,19 @@ pub(crate) enum NormExpr {
         name: String,
         distinct: bool,
         args: Vec<NormExpr>,
+        binding: Option<crate::binding::SqlFunctionBinding>,
+        decimal_overflow_policy: Option<novarocks_type_contract::DecimalOverflowPolicy>,
+        order_by: Vec<NormSortKey>,
     },
+}
+
+/// Aggregate ordering keeps its authored order, direction and NULL placement.
+/// Display labels are presentation facts, rather than expression identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct NormSortKey {
+    pub(crate) expr: NormExpr,
+    pub(crate) asc: bool,
+    pub(crate) nulls_first: bool,
 }
 
 /// Returns None for unsupported expression kinds (window calls, subqueries,
@@ -51,6 +63,9 @@ pub(crate) fn normalize(
         name: name.to_string(),
         distinct: false,
         args,
+        binding: None,
+        decimal_overflow_policy: None,
+        order_by: vec![],
     };
     Some(match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) => NormExpr::Column(base_names.get(column_id)?.clone()),
@@ -61,7 +76,10 @@ pub(crate) fn normalize(
         // produce a wrong one.
         ScalarNode::Literal(HashableLiteral(value)) => NormExpr::Literal(format!("{value:?}")),
         ScalarNode::BinaryOp {
-            left, op, right, ..
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
         } => {
             let mut l = normalize(arena, *left, base_names)?;
             let mut r = normalize(arena, *right, base_names)?;
@@ -92,7 +110,14 @@ pub(crate) fn normalize(
             if commutative {
                 args.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
             }
-            call(name, args)
+            NormExpr::Call {
+                name: name.to_string(),
+                distinct: false,
+                args,
+                binding: None,
+                decimal_overflow_policy: Some(*decimal_overflow_policy),
+                order_by: vec![],
+            }
         }
         ScalarNode::UnaryOp { op, child } => {
             let name = match op {
@@ -106,11 +131,14 @@ pub(crate) fn normalize(
             name,
             args,
             distinct,
-            binding: _,
+            binding,
             volatility,
         } => NormExpr::Call {
             name: format!("fn:{}", name.to_ascii_lowercase()),
             distinct: *distinct || volatility.is_volatile(),
+            binding: Some(binding.clone()),
+            decimal_overflow_policy: None,
+            order_by: vec![],
             args: args
                 .iter()
                 .map(|arg| normalize(arena, *arg, base_names))
@@ -120,19 +148,40 @@ pub(crate) fn normalize(
             name,
             args,
             distinct,
-            ..
+            resolved,
+            order_by,
         } => NormExpr::Call {
             name: format!("agg:{}", name.to_ascii_lowercase()),
             distinct: *distinct,
+            binding: Some(resolved.clone()),
+            decimal_overflow_policy: None,
+            order_by: order_by
+                .iter()
+                .map(|key| {
+                    Some(NormSortKey {
+                        expr: normalize(arena, key.expr, base_names)?,
+                        asc: key.asc,
+                        nulls_first: key.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             args: args
                 .iter()
                 .map(|arg| normalize(arena, *arg, base_names))
                 .collect::<Option<Vec<_>>>()?,
         },
-        ScalarNode::Cast { child, target, .. } => call(
-            &format!("cast:{target:?}"),
-            vec![normalize(arena, *child, base_names)?],
-        ),
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => NormExpr::Call {
+            name: format!("cast:{target:?}"),
+            distinct: false,
+            args: vec![normalize(arena, *child, base_names)?],
+            binding: None,
+            decimal_overflow_policy: Some(*decimal_overflow_policy),
+            order_by: vec![],
+        },
         ScalarNode::IsNull { child, negated } => call(
             if *negated { "is_not_null" } else { "is_null" },
             vec![normalize(arena, *child, base_names)?],
@@ -320,19 +369,31 @@ fn rewrite_children(
             distinct,
             order_by,
             resolved,
-        } => ScalarNode::AggregateCall {
-            name,
-            args: mapped!(
+        } => {
+            let args = mapped!(
                 args.into_iter()
                     .map(|arg| rewrite(arena, arg))
                     .map(Result::transpose)
                     .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
                     .transpose()
-            ),
-            distinct,
-            order_by,
-            resolved,
-        },
+            );
+            let mut mapped_order_by = Vec::with_capacity(order_by.len());
+            for mut key in order_by {
+                key.expr = mapped!(rewrite(arena, key.expr));
+                key.display = match arena.node(key.expr) {
+                    ScalarNode::ColumnRef(column) => arena.column_display(*column).cloned(),
+                    _ => None,
+                };
+                mapped_order_by.push(key);
+            }
+            ScalarNode::AggregateCall {
+                name,
+                args,
+                distinct,
+                order_by: mapped_order_by,
+                resolved,
+            }
+        }
         ScalarNode::Cast {
             child,
             target,
@@ -853,6 +914,350 @@ mod tests {
             control.0.load(Ordering::Relaxed),
             0,
             "a miss must not evaluate the mapped suffix"
+        );
+    }
+
+    fn resolved_scalar_call(
+        source: &OutputColumn,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> TypedExpr {
+        let args = vec![col_ref(source)];
+        let binding = crate::analysis::resolve_function_binding(
+            crate::functions::builtin_sql_function_catalog(),
+            "abs",
+            &args,
+            policy,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let novarocks_functions::FunctionResultType::Scalar(value_type) =
+            &binding.selected.result_type
+        else {
+            panic!("scalar result");
+        };
+        TypedExpr {
+            value_type: value_type.clone(),
+            kind: ExprKind::FunctionCall {
+                name: "abs".into(),
+                args,
+                distinct: false,
+                volatility: binding.semantics.volatility,
+                binding,
+            },
+        }
+    }
+
+    fn resolved_ordered_aggregate(
+        source: &OutputColumn,
+        order_by: Vec<crate::analysis::SortItem>,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> TypedExpr {
+        let args = vec![col_ref(source)];
+        let resolved = crate::functions::resolve_sql_aggregate_binding(
+            crate::functions::builtin_sql_function_catalog(),
+            "array_agg",
+            &args,
+            &order_by,
+            false,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let novarocks_functions::FunctionResultType::Scalar(value_type) =
+            &resolved.selected.result_type
+        else {
+            panic!("scalar aggregate result");
+        };
+        TypedExpr {
+            value_type: value_type.clone(),
+            kind: ExprKind::AggregateCall {
+                name: "array_agg".into(),
+                args,
+                distinct: false,
+                order_by,
+                resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
+            },
+        }
+    }
+
+    fn assert_rewritten_column(expression: TypedExpr, column: &OutputColumn) {
+        let ExprKind::ColumnRef { column_id, .. } = expression.kind else {
+            panic!("expected materialized MV column");
+        };
+        assert_eq!(column_id, column.column_id);
+        assert_eq!(expression.value_type, column.value_type);
+    }
+
+    #[test]
+    fn mv_mapping_preserves_actual_scalar_selection_and_call_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let mv_source = col(1, "a");
+        let query_source = col(9, "a");
+        let mv_names = names(&[(1, "a")]);
+        let query_names = names(&[(9, "a")]);
+        for policy in [OutputNull, ReportError] {
+            let mv = resolved_scalar_call(&mv_source, policy);
+            let output = OutputColumn {
+                value_type: mv.value_type.clone(),
+                ..col(101, "mv_abs")
+            };
+            let map = MvColumnMap::new(vec![(normalize(&mv, &mv_names).unwrap(), output.clone())]);
+            assert_rewritten_column(
+                rewrite_typed(
+                    &map,
+                    &resolved_scalar_call(&query_source, policy),
+                    &query_names,
+                )
+                .unwrap(),
+                &output,
+            );
+            let foreign_policy = if policy == OutputNull {
+                ReportError
+            } else {
+                OutputNull
+            };
+            assert!(
+                rewrite_typed(
+                    &map,
+                    &resolved_scalar_call(&query_source, foreign_policy),
+                    &query_names
+                )
+                .is_none()
+            );
+            let floating_source = OutputColumn {
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Float64,
+                    true,
+                ),
+                ..query_source.clone()
+            };
+            let floating = resolved_scalar_call(&floating_source, policy);
+            let ExprKind::FunctionCall {
+                binding: mv_binding,
+                ..
+            } = &mv.kind
+            else {
+                panic!("ABS");
+            };
+            let ExprKind::FunctionCall {
+                binding: float_binding,
+                ..
+            } = &floating.kind
+            else {
+                panic!("ABS");
+            };
+            assert_eq!(mv_binding.function_id, float_binding.function_id);
+            assert_ne!(mv_binding.selected, float_binding.selected);
+            assert!(
+                rewrite_typed(&map, &floating, &query_names).is_none(),
+                "same display name cannot replace a different actual overload"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_mapping_binary_and_cast_policy_are_exact_and_commutation_is_preserved() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let mv_a = col(1, "a");
+        let mv_b = col(2, "b");
+        let query_a = col(9, "a");
+        let query_b = col(8, "b");
+        let mv_names = names(&[(1, "a"), (2, "b")]);
+        let query_names = names(&[(9, "a"), (8, "b")]);
+        for policy in [OutputNull, ReportError] {
+            let binary = |a: &OutputColumn, b: &OutputColumn, policy| {
+                let mut expression = bin(col_ref(a), BinOp::Add, col_ref(b));
+                let ExprKind::BinaryOp {
+                    decimal_overflow_policy,
+                    ..
+                } = &mut expression.kind
+                else {
+                    panic!("binary");
+                };
+                *decimal_overflow_policy = policy;
+                expression
+            };
+            let cast = |a: &OutputColumn, policy| TypedExpr {
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Decimal128(3, 0),
+                    true,
+                ),
+                kind: ExprKind::Cast {
+                    expr: Box::new(col_ref(a)),
+                    target: DataType::Decimal128(3, 0),
+                    decimal_overflow_policy: policy,
+                },
+            };
+            let mv_binary = binary(&mv_a, &mv_b, policy);
+            let output = col(101, "mv_sum");
+            let map = MvColumnMap::new(vec![(
+                normalize(&mv_binary, &mv_names).unwrap(),
+                output.clone(),
+            )]);
+            assert_rewritten_column(
+                rewrite_typed(&map, &binary(&query_b, &query_a, policy), &query_names).unwrap(),
+                &output,
+            );
+            let foreign_policy = if policy == OutputNull {
+                ReportError
+            } else {
+                OutputNull
+            };
+            assert!(
+                rewrite_typed(
+                    &map,
+                    &binary(&query_b, &query_a, foreign_policy),
+                    &query_names
+                )
+                .is_none()
+            );
+            let mv_cast = cast(&mv_a, policy);
+            let output = OutputColumn {
+                value_type: mv_cast.value_type.clone(),
+                ..col(102, "mv_cast")
+            };
+            let map = MvColumnMap::new(vec![(
+                normalize(&mv_cast, &mv_names).unwrap(),
+                output.clone(),
+            )]);
+            assert_rewritten_column(
+                rewrite_typed(&map, &cast(&query_a, policy), &query_names).unwrap(),
+                &output,
+            );
+            assert!(rewrite_typed(&map, &cast(&query_a, foreign_policy), &query_names).is_none());
+        }
+    }
+
+    #[test]
+    fn mv_mapping_ordered_aggregate_preserves_actual_binding_policy_and_all_sort_facts() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let mv_a = col(1, "a");
+        let mv_b = col(2, "b");
+        let mv_c = col(3, "c");
+        let query_a = col(9, "a");
+        let query_b = col(8, "b");
+        let query_c = col(7, "c");
+        let mv_names = names(&[(1, "a"), (2, "b"), (3, "c")]);
+        let query_names = names(&[(9, "a"), (8, "b"), (7, "c")]);
+        let sort = |column: &OutputColumn, asc, nulls_first| crate::analysis::SortItem {
+            expr: col_ref(column),
+            asc,
+            nulls_first,
+        };
+        for policy in [OutputNull, ReportError] {
+            let mv = resolved_ordered_aggregate(
+                &mv_a,
+                vec![sort(&mv_b, true, false), sort(&mv_c, false, true)],
+                policy,
+            );
+            let output = OutputColumn {
+                value_type: mv.value_type.clone(),
+                ..col(101, "mv_array")
+            };
+            let map = MvColumnMap::new(vec![(normalize(&mv, &mv_names).unwrap(), output.clone())]);
+            let same = resolved_ordered_aggregate(
+                &query_a,
+                vec![sort(&query_b, true, false), sort(&query_c, false, true)],
+                policy,
+            );
+            assert_rewritten_column(rewrite_typed(&map, &same, &query_names).unwrap(), &output);
+            let foreign_policy = if policy == OutputNull {
+                ReportError
+            } else {
+                OutputNull
+            };
+            for query in [
+                resolved_ordered_aggregate(
+                    &query_a,
+                    vec![sort(&query_b, true, false), sort(&query_c, false, true)],
+                    foreign_policy,
+                ),
+                resolved_ordered_aggregate(
+                    &query_a,
+                    vec![sort(&query_c, false, true), sort(&query_b, true, false)],
+                    policy,
+                ),
+                resolved_ordered_aggregate(
+                    &query_a,
+                    vec![sort(&query_b, false, false), sort(&query_c, false, true)],
+                    policy,
+                ),
+                resolved_ordered_aggregate(
+                    &query_a,
+                    vec![sort(&query_b, true, true), sort(&query_c, false, true)],
+                    policy,
+                ),
+            ] {
+                assert!(rewrite_typed(&map, &query, &query_names).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mv_mapping_rewrites_actual_aggregate_order_channels_and_rejects_missing_sort_source() {
+        use novarocks_type_contract::DecimalOverflowPolicy::ReportError;
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let c = col(3, "c");
+        let base_names = names(&[(1, "a"), (2, "b"), (3, "c")]);
+        let expression = resolved_ordered_aggregate(
+            &a,
+            vec![
+                crate::analysis::SortItem {
+                    expr: col_ref(&b),
+                    asc: false,
+                    nulls_first: true,
+                },
+                crate::analysis::SortItem {
+                    expr: col_ref(&c),
+                    asc: true,
+                    nulls_first: false,
+                },
+            ],
+            ReportError,
+        );
+        let outputs = [col(101, "mv_a"), col(102, "mv_b"), col(103, "mv_c")];
+        let dims =
+            [(&a, &outputs[0]), (&b, &outputs[1]), (&c, &outputs[2])].map(|(source, output)| {
+                (
+                    normalize(&col_ref(source), &base_names).unwrap(),
+                    output.clone(),
+                )
+            });
+        let map = MvColumnMap::new(dims.to_vec());
+        let rewritten = rewrite_typed(&map, &expression, &base_names).unwrap();
+        let ExprKind::AggregateCall {
+            args,
+            order_by,
+            resolved,
+            ..
+        } = &rewritten.kind
+        else {
+            panic!("aggregate");
+        };
+        let ExprKind::AggregateCall {
+            resolved: original_binding,
+            ..
+        } = &expression.kind
+        else {
+            panic!("original aggregate");
+        };
+        assert!(std::ptr::eq(
+            resolved.resolved(),
+            original_binding.resolved()
+        ));
+        assert_rewritten_column(args[0].clone(), &outputs[0]);
+        for (key, output, asc, nulls_first) in [
+            (&order_by[0], &outputs[1], false, true),
+            (&order_by[1], &outputs[2], true, false),
+        ] {
+            assert_rewritten_column(key.expr.clone(), output);
+            assert_eq!(key.asc, asc);
+            assert_eq!(key.nulls_first, nulls_first);
+        }
+        let map = MvColumnMap::new(dims[..2].to_vec());
+        assert!(
+            rewrite_typed(&map, &expression, &base_names).is_none(),
+            "an unmapped ordering expression cannot retain the base ScalarId"
         );
     }
 }

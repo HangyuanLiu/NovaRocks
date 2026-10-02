@@ -703,7 +703,11 @@ mod tests {
                 fired: AtomicBool::new(false),
                 successful_after_failure: AtomicUsize::new(0),
             };
-            let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+            let mut ctx = RewriteContext::for_query_with_settings(
+                Default::default(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &control,
+            );
             let input = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
                 rows: vec![vec![]],
                 columns: vec![],
@@ -762,7 +766,11 @@ mod tests {
             units: Default::default(),
             stop: None,
         };
-        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+        let mut ctx = RewriteContext::for_query_with_settings(
+            Default::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            &control,
+        );
         let rule = NeverMatches {
             visits: Default::default(),
         };
@@ -785,7 +793,11 @@ mod tests {
                     units: Default::default(),
                     stop: Some((point, error)),
                 };
-                let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+                let mut ctx = RewriteContext::for_query_with_settings(
+                    Default::default(),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    &control,
+                );
                 let rule = NeverMatches {
                     visits: Default::default(),
                 };
@@ -817,7 +829,11 @@ mod tests {
             stop: None,
         });
         let weak = std::sync::Arc::downgrade(&owner);
-        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), owner.as_ref());
+        let mut ctx = RewriteContext::for_query_with_settings(
+            Default::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            owner.as_ref(),
+        );
         let cloned = ctx.clone();
         let rule = NeverMatches {
             visits: Default::default(),
@@ -897,7 +913,11 @@ mod tests {
                 fired: AtomicBool::new(false),
                 units: Default::default(),
             };
-            let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+            let mut ctx = RewriteContext::for_query_with_settings(
+                Default::default(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &control,
+            );
             let rule = StructuralRule {
                 matches: AtomicUsize::new(0),
                 applies: AtomicUsize::new(0),

@@ -412,6 +412,7 @@ pub(crate) fn resolve_function_binding(
     arena: &ScalarArena,
     name: &str,
     args: &[ScalarId],
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -421,7 +422,7 @@ pub(crate) fn resolve_function_binding(
         .collect::<Vec<_>>();
     catalog
         .resolve_scalar_binding(name, &arguments, control)
-        .map(crate::binding::SqlFunctionBinding::new)
+        .map(|resolved| crate::binding::SqlFunctionBinding::new(resolved, policy))
         .map_err(crate::compiler::SqlCompileError::from)
 }
 
@@ -482,6 +483,7 @@ pub(crate) fn resolve_aggregate_binding(
     args: &[ScalarId],
     order_by: &[SortKey],
     trusted: bool,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -497,7 +499,7 @@ pub(crate) fn resolve_aggregate_binding(
         catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
     }
     .map_err(crate::compiler::SqlCompileError::from)?;
-    Ok(crate::binding::SqlFunctionBinding::new(exact))
+    Ok(crate::binding::SqlFunctionBinding::new(exact, policy))
 }
 
 #[cfg(test)]
@@ -532,28 +534,31 @@ pub(crate) fn test_function_binding(
             ),
         })
         .collect();
-    crate::binding::SqlFunctionBinding::new(ResolvedFunctionBinding {
-        function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
-            .expect("test function identity"),
-        kind: FunctionKind::Scalar,
-        semantics: FunctionSemantics {
-            volatility,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+    crate::binding::SqlFunctionBinding::new(
+        ResolvedFunctionBinding {
+            function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
+                .expect("test function identity"),
+            kind: FunctionKind::Scalar,
+            semantics: FunctionSemantics {
+                volatility,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+            },
+            logical_argument_count: args.len(),
+            selected: novarocks_functions::FunctionBindingSelection {
+                overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
+                    .expect("test function overload identity"),
+                argument_types: selected_arguments,
+                result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                    result_type,
+                    result_nullable,
+                )),
+                aggregate: None,
+            },
         },
-        logical_argument_count: args.len(),
-        selected: novarocks_functions::FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
-                .expect("test function overload identity"),
-            argument_types: selected_arguments,
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                result_type,
-                result_nullable,
-            )),
-            aggregate: None,
-        },
-    })
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[cfg(test)]
@@ -584,7 +589,10 @@ pub(crate) fn test_window_binding(
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
-    crate::binding::SqlFunctionBinding::new(binding)
+    crate::binding::SqlFunctionBinding::new(
+        binding,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[cfg(test)]
@@ -613,7 +621,10 @@ pub(crate) fn test_table_binding(
         FunctionOverloadId::try_new(format!("test.table/{name}/overload-v1"))
             .expect("test table function overload identity");
     binding.selected.result_type = FunctionResultType::Relation(result_columns.into());
-    crate::binding::SqlFunctionBinding::new(binding)
+    crate::binding::SqlFunctionBinding::new(
+        binding,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 fn should_replace_column_display(
@@ -1626,5 +1637,101 @@ mod intrinsic_binding_helper_tests {
                     .is_valid_for_kind(binding.kind)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod call_policy_tests {
+    use super::*;
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    #[test]
+    fn real_scalar_rebinding_preserves_requested_policy_and_prevents_cross_policy_cse() {
+        let mut arena = ScalarArena::new();
+        let value_type = FunctionValueType::new(DataType::Int64, false);
+        let argument = arena.intern(ScalarNode::ColumnRef(ColumnId(911)), value_type);
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let control = crate::optimizer::test_optimizer_control();
+        let binding =
+            resolve_function_binding(catalog, &arena, "abs", &[argument], ReportError, control)
+                .unwrap();
+        let rebound = resolve_function_binding(
+            catalog,
+            &arena,
+            "abs",
+            &[argument],
+            binding.decimal_overflow_policy(),
+            control,
+        )
+        .unwrap();
+        assert_eq!(binding, rebound);
+        let null_binding =
+            resolve_function_binding(catalog, &arena, "abs", &[argument], OutputNull, control)
+                .unwrap();
+        assert_eq!(binding.resolved(), null_binding.resolved());
+        assert_ne!(binding, null_binding);
+        let result_type = match &binding.selected.result_type {
+            novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
+            _ => panic!("abs must have its real scalar result"),
+        };
+        let node = |binding: crate::binding::SqlFunctionBinding| ScalarNode::FunctionCall {
+            name: "abs".into(),
+            args: vec![argument],
+            distinct: false,
+            volatility: binding.semantics.volatility,
+            binding,
+        };
+        let report = arena.intern(node(binding), result_type.clone());
+        let repeated = arena.intern(node(rebound), result_type.clone());
+        let output_null = arena.intern(node(null_binding), result_type);
+        assert_eq!(report, repeated);
+        assert_ne!(report, output_null);
+    }
+
+    #[test]
+    fn real_aggregate_rebinding_keeps_original_call_policy_with_equal_selection() {
+        let mut arena = ScalarArena::new();
+        let argument = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(912)),
+            FunctionValueType::new(DataType::Int32, false),
+        );
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let control = crate::optimizer::test_optimizer_control();
+        let original = resolve_aggregate_binding(
+            catalog,
+            &arena,
+            "sum",
+            &[argument],
+            &[],
+            false,
+            ReportError,
+            control,
+        )
+        .unwrap();
+        let rebound = resolve_aggregate_binding(
+            catalog,
+            &arena,
+            "sum",
+            &[argument],
+            &[],
+            true,
+            original.decimal_overflow_policy(),
+            control,
+        )
+        .unwrap();
+        assert_eq!(original, rebound);
+        let other = resolve_aggregate_binding(
+            catalog,
+            &arena,
+            "sum",
+            &[argument],
+            &[],
+            true,
+            OutputNull,
+            control,
+        )
+        .unwrap();
+        assert_eq!(original.resolved(), other.resolved());
+        assert_ne!(original, other);
     }
 }

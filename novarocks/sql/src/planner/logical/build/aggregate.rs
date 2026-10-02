@@ -560,11 +560,11 @@ pub(super) fn rewrite_agg_calls_to_refs(
         args,
         distinct,
         order_by,
-        ..
+        resolved,
     } = &expr.kind
         && let Some(call) = agg_calls
             .iter()
-            .find(|call| aggregate_call_matches(call, name, args, *distinct, order_by))
+            .find(|call| aggregate_call_matches(call, name, args, *distinct, order_by, resolved))
     {
         let display = agg_call_display_name_from_parts(name, args, *distinct, order_by);
         return TypedExpr {
@@ -765,8 +765,10 @@ fn aggregate_call_matches(
     args: &[TypedExpr],
     distinct: bool,
     order_by: &[SortItem],
+    resolved: &crate::binding::SqlFunctionBinding,
 ) -> bool {
-    call.name == name
+    call.resolved == *resolved
+        && call.name == name
         && call.distinct == distinct
         && call.args.len() == args.len()
         && call.order_by.len() == order_by.len()
@@ -885,17 +887,18 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 args: left_args,
                 distinct: left_distinct,
                 order_by: left_order_by,
-                ..
+                resolved: left_resolved,
             },
             ExprKind::AggregateCall {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
                 order_by: right_order_by,
-                ..
+                resolved: right_resolved,
             },
         ) => {
-            left_name.eq_ignore_ascii_case(right_name)
+            left_resolved == right_resolved
+                && left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
                 && typed_expr_slices_semantically_eq(left_args, right_args)
                 && sort_item_slices_semantically_eq(left_order_by, right_order_by)
@@ -1136,7 +1139,8 @@ pub(super) fn collect_aggregates(
             // ORDER BY metadata for ordered aggregates like
             // `array_agg(distinct x order by y desc)`.
             let already = out.iter().any(|a| {
-                a.name == *name
+                a.resolved == *resolved
+                    && a.name == *name
                     && a.distinct == *distinct
                     && a.args.len() == args.len()
                     && a.order_by.len() == order_by.len()
@@ -1331,5 +1335,66 @@ fn collect_non_agg_column_refs_inner(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod call_policy_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+
+    #[test]
+    fn aggregate_collection_and_reference_rewrite_preserve_distinct_call_policies() {
+        let args = vec![TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            value_type: FunctionValueType::new(DataType::Int64, false),
+        }];
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let selected = crate::functions::resolve_sql_aggregate_binding(
+            crate::functions::builtin_sql_function_catalog(),
+            "sum",
+            &args,
+            &[],
+            false,
+            &control,
+        )
+        .unwrap();
+        let result_type = crate::functions::aggregate_result_type(&selected).clone();
+        let expression = |policy| TypedExpr {
+            kind: ExprKind::AggregateCall {
+                name: "sum".into(),
+                args: args.clone(),
+                distinct: false,
+                order_by: vec![],
+                resolved: crate::binding::SqlFunctionBinding::new(selected.clone(), policy),
+            },
+            value_type: result_type.clone(),
+        };
+        let output_null = expression(DecimalOverflowPolicy::OutputNull);
+        let report_error = expression(DecimalOverflowPolicy::ReportError);
+        assert!(!typed_expr_semantically_eq(&output_null, &report_error));
+        let mut factory = ColumnRefFactory::new();
+        let mut calls = Vec::new();
+        collect_aggregates(&output_null, &mut calls, &mut factory);
+        collect_aggregates(&report_error, &mut calls, &mut factory);
+        collect_aggregates(&output_null, &mut calls, &mut factory);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].resolved.decimal_overflow_policy(),
+            DecimalOverflowPolicy::OutputNull
+        );
+        assert_eq!(
+            calls[1].resolved.decimal_overflow_policy(),
+            DecimalOverflowPolicy::ReportError
+        );
+        for (expression, call) in [output_null, report_error].iter().zip(&calls) {
+            let rewritten = rewrite_agg_calls_to_refs(expression, &calls);
+            let ExprKind::ColumnRef { column_id, .. } = rewritten.kind else {
+                panic!("actual aggregate occurrence must be rewritten to its own output")
+            };
+            assert_eq!(column_id, call.output_column_id);
+            assert_eq!(rewritten.value_type, result_type);
+        }
     }
 }

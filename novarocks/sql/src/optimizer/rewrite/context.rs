@@ -68,6 +68,7 @@ pub(crate) struct RewriteContext<'a> {
     consumer: RewriteConsumer,
     disabled_rules: HashSet<String>,
     session_settings: SessionOptimizerSettings,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     policy: RewritePolicy,
     trace: RewriteTrace,
     extension: Option<Arc<dyn Any + Send + Sync>>,
@@ -89,6 +90,7 @@ impl<'a> RewriteContext<'a> {
     pub(crate) fn new(
         consumer: RewriteConsumer,
         session_settings: SessionOptimizerSettings,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         control: &'a dyn PureCompileControl,
     ) -> Self {
         Self {
@@ -96,6 +98,7 @@ impl<'a> RewriteContext<'a> {
             consumer,
             disabled_rules: session_settings.disabled_rules.iter().cloned().collect(),
             session_settings,
+            decimal_overflow_policy,
             policy: RewritePolicy::default(),
             trace: RewriteTrace::default(),
             extension: None,
@@ -110,18 +113,26 @@ impl<'a> RewriteContext<'a> {
 
     pub(crate) fn for_query_with_settings(
         session_settings: SessionOptimizerSettings,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         control: &'a dyn PureCompileControl,
     ) -> Self {
-        Self::new(RewriteConsumer::Query, session_settings, control)
+        Self::new(
+            RewriteConsumer::Query,
+            session_settings,
+            decimal_overflow_policy,
+            control,
+        )
     }
 
     pub(crate) fn for_mv_refresh_with_settings(
         session_settings: SessionOptimizerSettings,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         control: &'a dyn PureCompileControl,
     ) -> Self {
         let mut ctx = Self::new(
             RewriteConsumer::MaterializedViewRefresh,
             session_settings,
+            decimal_overflow_policy,
             control,
         );
         ctx.policy.failure_policy = RewriteFailurePolicy::FailFast;
@@ -135,6 +146,7 @@ impl<'a> RewriteContext<'a> {
                 disabled_rules: disabled_rules.into_iter().collect(),
                 ..Default::default()
             },
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             unbounded_rewrite_test_control(),
         )
     }
@@ -146,6 +158,7 @@ impl<'a> RewriteContext<'a> {
                 disabled_rules: disabled_rules.into_iter().collect(),
                 ..Default::default()
             },
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             unbounded_rewrite_test_control(),
         )
     }
@@ -172,6 +185,10 @@ impl<'a> RewriteContext<'a> {
 
     pub(crate) fn session_settings(&self) -> &SessionOptimizerSettings {
         &self.session_settings
+    }
+
+    pub(crate) fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.decimal_overflow_policy
     }
 
     pub(crate) fn trace(&self) -> &RewriteTrace {
@@ -387,7 +404,11 @@ mod tests {
     #[test]
     fn existing_optimizer_deadline_is_typed_and_clone_borrows_same_request() {
         let control = crate::compiler::SqlCompileControl::unbounded();
-        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), &control);
+        let mut ctx = RewriteContext::for_query_with_settings(
+            Default::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            &control,
+        );
         ctx.set_deadline(Instant::now() - std::time::Duration::from_millis(1));
         let cloned = ctx.clone();
         assert!(std::ptr::eq(ctx.control, cloned.control));

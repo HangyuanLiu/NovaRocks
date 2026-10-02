@@ -257,6 +257,7 @@ mod tests {
                 let ctx = RewriteContext::new(
                     RewriteConsumer::MaterializedViewRefresh,
                     Default::default(),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     &stop,
                 );
                 assert_eq!(

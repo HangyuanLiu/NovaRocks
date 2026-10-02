@@ -759,16 +759,18 @@ mod tests {
                 value_type: source.clone(),
                 constant: None,
             }];
-            let resolved: crate::binding::SqlFunctionBinding =
-                crate::functions::builtin_sql_function_catalog()
-                    .resolve_aggregate_binding(
-                        name,
-                        1,
-                        &arguments,
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .unwrap()
-                    .into();
+            let resolved = crate::functions::builtin_sql_function_catalog()
+                .resolve_aggregate_binding(
+                    name,
+                    1,
+                    &arguments,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            let resolved = crate::binding::SqlFunctionBinding::new(
+                resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            );
             let result = crate::functions::aggregate_result_type(&resolved).clone();
             let mut state = crate::functions::aggregate_selection(&resolved)
                 .intermediate_type

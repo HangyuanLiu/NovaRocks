@@ -367,6 +367,10 @@ pub fn prepare_completed_statistics_collection(
             ])
             .map_err(contract_violation)?,
         ),
+        execution
+            .sql_semantics()
+            .sql_mode()
+            .decimal_overflow_policy(),
         &completion_control,
     )
     .map_err(DistributedQueryError::from_compile)?;

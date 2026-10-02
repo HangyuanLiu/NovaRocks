@@ -349,6 +349,7 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
@@ -447,6 +448,7 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));

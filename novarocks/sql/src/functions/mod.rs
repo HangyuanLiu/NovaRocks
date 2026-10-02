@@ -430,7 +430,10 @@ pub(crate) fn test_resolved_aggregate(
         .unwrap_or_else(|error| {
             panic!("test aggregate `{executable_name}` must resolve exactly: {error}")
         });
-    exact.into()
+    crate::binding::SqlFunctionBinding::new(
+        exact,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]

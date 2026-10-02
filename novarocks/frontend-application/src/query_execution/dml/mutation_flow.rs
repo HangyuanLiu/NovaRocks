@@ -457,13 +457,12 @@ fn compile_dml_change_stream_write(
         connector_context,
     )?;
     let completion_control = compile_control.clone();
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
         DmlChangeStreamCompileRequest {
-            optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
-                analyzed,
-                &statistics,
-                compile_control,
-            ),
+            optimize_request,
             kind,
             routes,
             statistics_targets,
@@ -473,6 +472,7 @@ fn compile_dml_change_stream_write(
             // the commit.
             shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
         },
+        decimal_overflow_policy,
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -3042,8 +3042,10 @@ fn execute_exact_cow_match_query(
             connector_context,
         )?;
     let completion_control = compile_control.clone();
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
+        optimize_request,
         execution.optimizer_settings(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;

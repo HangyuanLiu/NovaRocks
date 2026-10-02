@@ -580,6 +580,7 @@ impl<'a> AnalyzerContext<'a> {
             "max",
             std::slice::from_ref(&marker_argument),
             novarocks_parser::Span::new(0, 0),
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
             self.control,
         )?;
         let marker_query = match null_source_col {
@@ -2242,6 +2243,7 @@ impl<'a> AnalyzerContext<'a> {
             "array_agg",
             std::slice::from_ref(&argument),
             span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
             self.control,
         )?;
         let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
@@ -2514,6 +2516,7 @@ impl<'a> AnalyzerContext<'a> {
                         "coalesce",
                         &args,
                         subquery_span,
+                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
                         self.control,
                     )?;
                     Ok(TypedExpr {

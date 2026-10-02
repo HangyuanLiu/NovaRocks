@@ -333,6 +333,7 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
@@ -340,6 +341,7 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
         required_aggregations,
         &analyzed.settings,
         final_write,
+        decimal_overflow_policy,
     )
 }
 
@@ -356,12 +358,14 @@ pub fn begin_final_mv_first_refresh_connector_write_plan(
     ),
     crate::compiler::SqlCompileError,
 > {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::begin_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
+        decimal_overflow_policy,
     )
 }
 
@@ -412,6 +416,10 @@ pub fn analyze_join_first_refresh_connector_write(
     let settings = context.optimizer_settings.clone();
     let mut query = *context.canonical_query;
     crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
+    let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
+        .map_err(crate::compiler::SqlCompileError::from)?;
+    let decimal_overflow_policy = sql_semantics.sql_mode().decimal_overflow_policy();
     let request = plain_join_first_refresh_logical_request(
         query,
         context.current_catalog.clone(),
@@ -421,6 +429,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.catalog,
         context.functions,
         context.constant_evaluator,
+        sql_semantics.clone(),
         context.control.clone(),
     );
     let logical_output = crate::compiler::SqlCompiler::analyze(request)?
@@ -436,6 +445,7 @@ pub fn analyze_join_first_refresh_connector_write(
         logical_output.factory,
         snapshot,
         context.functions,
+        decimal_overflow_policy,
         &context.control,
     )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
@@ -447,7 +457,7 @@ pub fn analyze_join_first_refresh_connector_write(
             ),
         },
         crate::compiler::SqlSessionContext {
-            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
+            sql_semantics,
             current_catalog: context.current_catalog,
             current_database: context.current_database,
             optimizer_settings: context.optimizer_settings,
@@ -473,6 +483,7 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
@@ -480,6 +491,7 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
         required_aggregations,
         &analyzed.settings,
         final_write,
+        decimal_overflow_policy,
     )
 }
 
@@ -496,12 +508,14 @@ pub fn begin_final_join_first_refresh_connector_write_plan(
     ),
     crate::compiler::SqlCompileError,
 > {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::begin_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
+        decimal_overflow_policy,
     )
 }
 
@@ -563,6 +577,10 @@ pub fn analyze_join_incremental_refresh_change_stream(
     validate_join_incremental_snapshot(snapshot)?;
     let mut query = *context.canonical_query;
     crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
+    let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
+        .map_err(crate::compiler::SqlCompileError::from)?;
+    let decimal_overflow_policy = sql_semantics.sql_mode().decimal_overflow_policy();
     let request = plain_join_first_refresh_logical_request(
         query,
         context.current_catalog,
@@ -572,6 +590,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.catalog,
         context.functions,
         context.constant_evaluator,
+        sql_semantics.clone(),
         context.control.clone(),
     );
     let logical_output = crate::compiler::SqlCompiler::analyze(request)?
@@ -589,6 +608,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         logical,
         logical_output.factory,
         context.functions,
+        decimal_overflow_policy,
         &context.control,
     )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
@@ -596,7 +616,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         factory,
         crate::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::compiler::SqlSessionContext {
-            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
+            sql_semantics,
             current_catalog: None,
             current_database: String::new(),
             optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
@@ -623,6 +643,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )?
@@ -638,6 +659,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &change_stream,
         analyzed.write_mode,
+        decimal_overflow_policy,
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -659,6 +681,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
             shape,
             final_write,
         },
+        decimal_overflow_policy,
         &control,
     )
 }
@@ -676,6 +699,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
     ),
     crate::compiler::SqlCompileError,
 > {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )?
@@ -690,6 +714,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &change_stream,
         analyzed.write_mode,
+        decimal_overflow_policy,
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -708,6 +733,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         compiled.function_catalog,
         None,
         shape,
+        decimal_overflow_policy,
         &control,
     )
 }
@@ -784,6 +810,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )?
@@ -796,6 +823,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &compiled.change_stream,
         analyzed.write_mode,
+        decimal_overflow_policy,
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -815,6 +843,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
             shape,
             final_write,
         },
+        decimal_overflow_policy,
         &control,
     )
 }
@@ -832,6 +861,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
     ),
     crate::compiler::SqlCompileError,
 > {
+    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
     )?
@@ -843,6 +873,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         compiled.optimized_tree,
         &compiled.change_stream,
         analyzed.write_mode,
+        decimal_overflow_policy,
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -859,6 +890,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         compiled.function_catalog,
         None,
         shape,
+        decimal_overflow_policy,
         &control,
     )
 }
@@ -1038,6 +1070,7 @@ fn build_join_incremental_refresh_logical_plan(
     plan: crate::planner::logical::LogicalPlanNode,
     factory: crate::column_id::ColumnRefFactory,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1054,6 +1087,7 @@ fn build_join_incremental_refresh_logical_plan(
             plan,
             snapshot: Arc::clone(snapshot),
             disabled_rules: join_incremental_disabled_rules(is_aggregate_refresh),
+            decimal_overflow_policy,
             control,
             column_ref_factory: Rc::clone(&factory_cell),
             #[cfg(not(test))]
@@ -1118,6 +1152,7 @@ fn build_join_incremental_refresh_logical_plan(
                 locator_columns.last_updated_sequence_number,
                 #[cfg(not(test))]
                 functions,
+                decimal_overflow_policy,
                 control,
             )
             .map_err(|error| match error {
@@ -1233,6 +1268,7 @@ fn add_join_incremental_change_stream_effect(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     write_mode: SqlMvIncrementalWriteMode,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -1349,8 +1385,7 @@ fn add_join_incremental_change_stream_effect(
                     op: BinOp::Eq,
                     left: action_ref,
                     right: delete,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    decimal_overflow_policy,
                 },
                 novarocks_type_contract::FunctionValueType::new(
                     arrow::datatypes::DataType::Boolean,
@@ -1421,12 +1456,24 @@ fn add_join_incremental_change_stream_effect(
                 control,
             )?;
             events.push(ChangeEventSpec {
-                predicate: Some(conjoin(&mut arena, surviving, is_fresh, control)?),
+                predicate: Some(conjoin(
+                    &mut arena,
+                    surviving,
+                    is_fresh,
+                    decimal_overflow_policy,
+                    control,
+                )?),
                 effect: ConnectorRowMutationEffect::Insert,
                 assignments: assignments.clone(),
             });
             events.push(ChangeEventSpec {
-                predicate: Some(conjoin(&mut arena, surviving, is_existing, control)?),
+                predicate: Some(conjoin(
+                    &mut arena,
+                    surviving,
+                    is_existing,
+                    decimal_overflow_policy,
+                    control,
+                )?),
                 effect: ConnectorRowMutationEffect::Replace,
                 assignments,
             });
@@ -1461,6 +1508,7 @@ fn conjoin(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     left: Option<crate::optimizer::scalar::ScalarId>,
     right: crate::optimizer::scalar::ScalarId,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
     match left {
@@ -1470,7 +1518,7 @@ fn conjoin(
                 op: crate::common::BinOp::And,
                 left,
                 right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                decimal_overflow_policy,
             },
             novarocks_type_contract::FunctionValueType::new(
                 arrow::datatypes::DataType::Boolean,
@@ -1568,13 +1616,14 @@ fn plain_join_first_refresh_logical_request<'a>(
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+    sql_semantics: crate::sql_mode::SqlSemanticSettings,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
         crate::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         crate::compiler::SqlCompileIntent::LogicalOnly,
         crate::compiler::SqlSessionContext {
-            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
+            sql_semantics,
             current_catalog,
             current_database,
             optimizer_settings,
@@ -1593,6 +1642,7 @@ fn build_join_first_refresh_append_logical_plan(
     mut factory: crate::column_id::ColumnRefFactory,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1696,6 +1746,7 @@ fn build_join_first_refresh_append_logical_plan(
             &left.table_object_id,
             &right.table_object_id,
             join_apply_key_id.0,
+            decimal_overflow_policy,
             control,
         )
         .map_err(|error| match error {
@@ -3019,6 +3070,7 @@ mod tests {
             &catalog,
             &functions,
             crate::compiler::noop_constant_evaluator(),
+            crate::sql_mode::SqlSemanticSettings::default(),
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_none());
@@ -3044,6 +3096,7 @@ mod tests {
             &catalog,
             &functions,
             crate::compiler::noop_constant_evaluator(),
+            crate::sql_mode::SqlSemanticSettings::default(),
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_none());
@@ -3158,6 +3211,7 @@ mod tests {
             incremental_producer(vec![incremental_column(1, "k")]),
             &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
             SqlMvIncrementalWriteMode::FastAppend,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             crate::optimizer::test_optimizer_control(),
         )
         .expect("an append-only producer expands");
@@ -3198,6 +3252,7 @@ mod tests {
             ]),
             &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
             SqlMvIncrementalWriteMode::RowDelta,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             crate::optimizer::test_optimizer_control(),
         )
         .expect("a row-delta producer expands");
@@ -3825,6 +3880,7 @@ mod tests {
                     &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(
                     ),
                     SqlMvIncrementalWriteMode::FastAppend,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     &control,
                 );
                 assert!(
@@ -3846,5 +3902,65 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn join_two_phase_analysis_keeps_root_decimal_policy_in_the_consumed_request() {
+        use novarocks_type_contract::DecimalOverflowPolicy;
+
+        let query = parse_query("SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1");
+        let base = crate::sql_mode::SqlSemanticSettings::default();
+        assert_eq!(
+            base.sql_mode().decimal_overflow_policy(),
+            DecimalOverflowPolicy::OutputNull
+        );
+        let effective = crate::sql_mode::query_sql_semantics(&base, &query).unwrap();
+        let policy = effective.sql_mode().decimal_overflow_policy();
+        assert_eq!(policy, DecimalOverflowPolicy::ReportError);
+        let tables = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = crate::compiler::SqlPlannerTableSnapshot::new(&tables);
+        let functions = crate::functions::builtin_sql_function_catalog();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let request = plain_join_first_refresh_logical_request(
+            query,
+            None,
+            "db".into(),
+            crate::compiler::SessionOptimizerSettings::default(),
+            crate::compiler::SqlPlanningEnvironment::Distributed,
+            &catalog,
+            functions,
+            crate::compiler::noop_constant_evaluator(),
+            effective.clone(),
+            control.clone(),
+        );
+        let logical = crate::compiler::SqlCompiler::analyze(request)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .into_logical_output()
+            .unwrap();
+        let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
+            logical.logical_plan,
+            logical.factory,
+            crate::compiler::SqlCompileIntent::ChangeStreamWrite,
+            crate::compiler::SqlSessionContext {
+                sql_semantics: effective,
+                current_catalog: None,
+                current_database: "db".into(),
+                optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
+            },
+            crate::compiler::SqlPlanningEnvironment::NotApplicable,
+            Some(crate::compiler::noop_constant_evaluator()),
+            control.clone(),
+        )
+        .with_function_catalog(functions.snapshot());
+        let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
+            .unwrap()
+            .into_pending()
+            .unwrap();
+        assert_eq!(analyzed.decimal_overflow_policy(), policy);
+        let statistics = crate::planning::dml::DmlStatisticsSnapshot::empty();
+        let optimize = crate::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control);
+        assert_eq!(optimize.decimal_overflow_policy(), policy);
     }
 }

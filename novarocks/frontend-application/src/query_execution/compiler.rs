@@ -1467,12 +1467,14 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     // Optimize the write, then freeze the reads it states. The plan addresses
     // each scan by the occurrence its read was accounted for under, so the
     // reads are frozen before the plan is lowered rather than after.
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
         optimize_request,
         sink,
         ordinal,
         statistics_requirements,
         &optimizer_settings,
+        decimal_overflow_policy,
     )?;
     let connector_session = typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();

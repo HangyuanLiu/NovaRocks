@@ -36,15 +36,33 @@ use std::{
 /// Sharing keeps expression nodes compact while preserving one exact binding
 /// from analysis through optimization and physical lowering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SqlFunctionBinding(Arc<novarocks_functions::ResolvedFunctionBinding>);
+pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
+
+/// One call's exact selection and authored semantic policy. The selected
+/// overload remains catalog-owned; a SQL scope does not redefine its identity.
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct SqlFunctionCallFacts {
+    resolved: novarocks_functions::ResolvedFunctionBinding,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+}
 
 impl SqlFunctionBinding {
-    pub(crate) fn new(binding: novarocks_functions::ResolvedFunctionBinding) -> Self {
-        Self(Arc::new(binding))
+    pub(crate) fn new(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+        }))
     }
 
     pub fn resolved(&self) -> &novarocks_functions::ResolvedFunctionBinding {
-        self.0.as_ref()
+        &self.0.resolved
+    }
+
+    pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.0.decimal_overflow_policy
     }
 }
 
@@ -59,12 +77,6 @@ impl Deref for SqlFunctionBinding {
 
     fn deref(&self) -> &Self::Target {
         self.resolved()
-    }
-}
-
-impl From<novarocks_functions::ResolvedFunctionBinding> for SqlFunctionBinding {
-    fn from(binding: novarocks_functions::ResolvedFunctionBinding) -> Self {
-        Self::new(binding)
     }
 }
 

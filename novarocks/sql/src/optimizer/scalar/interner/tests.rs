@@ -330,23 +330,159 @@ fn exact_selected_binding_facts_participate_even_with_identical_call_spelling() 
     let mut different = binding.resolved().clone();
     different.logical_argument_count = 1;
     assert_ne!(
-        forced(&mut arena, node(different.into()), ty(), &control).unwrap(),
+        forced(
+            &mut arena,
+            node(crate::binding::SqlFunctionBinding::new(
+                different,
+                binding.decimal_overflow_policy()
+            )),
+            ty(),
+            &control
+        )
+        .unwrap(),
         first
     );
     let mut different = binding.resolved().clone();
     different.semantics.failure_behavior =
         novarocks_functions::FunctionFailureBehavior::ReturnsNull;
     assert_ne!(
-        forced(&mut arena, node(different.into()), ty(), &control).unwrap(),
+        forced(
+            &mut arena,
+            node(crate::binding::SqlFunctionBinding::new(
+                different,
+                binding.decimal_overflow_policy()
+            )),
+            ty(),
+            &control
+        )
+        .unwrap(),
         first
     );
     let mut different = binding.resolved().clone();
     different.selected.result_type =
         FunctionResultType::Scalar(FunctionValueType::new(DataType::Int32, false));
     assert_ne!(
-        forced(&mut arena, node(different.into()), ty(), &control).unwrap(),
+        forced(
+            &mut arena,
+            node(crate::binding::SqlFunctionBinding::new(
+                different,
+                binding.decimal_overflow_policy()
+            )),
+            ty(),
+            &control
+        )
+        .unwrap(),
         first
     );
+}
+
+#[test]
+fn forced_collisions_preserve_scalar_aggregate_and_window_call_policies() {
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+    let control = Control::good();
+    let mut arena = ScalarArena::new();
+    let argument = arena
+        .intern_observed(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            ty(),
+            &control,
+        )
+        .unwrap();
+    let scalar = super::super::test_function_binding(
+        &arena,
+        "call",
+        &[argument],
+        DataType::Int64,
+        false,
+        super::super::FunctionVolatility::Immutable,
+    );
+    let aggregate = crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false);
+    for kind in 0..3 {
+        let selected = if kind == 0 { &scalar } else { &aggregate };
+        let node = |policy| {
+            let binding =
+                crate::binding::SqlFunctionBinding::new(selected.resolved().clone(), policy);
+            match kind {
+                0 => ScalarNode::FunctionCall {
+                    name: "call".into(),
+                    args: vec![argument],
+                    distinct: false,
+                    binding,
+                    volatility: super::super::FunctionVolatility::Immutable,
+                },
+                1 => ScalarNode::AggregateCall {
+                    name: "sum".into(),
+                    args: vec![argument],
+                    distinct: false,
+                    order_by: vec![],
+                    resolved: binding,
+                },
+                _ => ScalarNode::WindowCall {
+                    name: "sum".into(),
+                    args: vec![argument],
+                    distinct: false,
+                    aggregate_binding: Some(binding.clone()),
+                    binding,
+                    function_order_by: vec![],
+                    partition_by: vec![],
+                    order_by: vec![],
+                    window_frame: None,
+                    ignore_nulls: false,
+                },
+            }
+        };
+        let nullable = FunctionValueType::new(DataType::Int64, true);
+        let null = forced(&mut arena, node(OutputNull), nullable.clone(), &control).unwrap();
+        let error = forced(&mut arena, node(ReportError), nullable.clone(), &control).unwrap();
+        assert_ne!(
+            null, error,
+            "different policies must survive one forced collision bucket"
+        );
+        assert_eq!(
+            forced(&mut arena, node(OutputNull), nullable.clone(), &control).unwrap(),
+            null
+        );
+        assert_eq!(
+            forced(&mut arena, node(ReportError), nullable.clone(), &control).unwrap(),
+            error
+        );
+        if kind == 2 {
+            let mut primary_only = node(OutputNull);
+            let ScalarNode::WindowCall { binding, .. } = &mut primary_only else {
+                unreachable!()
+            };
+            *binding =
+                crate::binding::SqlFunctionBinding::new(binding.resolved().clone(), ReportError);
+            let primary =
+                forced(&mut arena, primary_only.clone(), nullable.clone(), &control).unwrap();
+            let mut aggregate_only = node(OutputNull);
+            let ScalarNode::WindowCall {
+                aggregate_binding, ..
+            } = &mut aggregate_only
+            else {
+                unreachable!()
+            };
+            let original = aggregate_binding.as_ref().unwrap();
+            *aggregate_binding = Some(crate::binding::SqlFunctionBinding::new(
+                original.resolved().clone(),
+                ReportError,
+            ));
+            let aggregate_id =
+                forced(&mut arena, aggregate_only, nullable.clone(), &control).unwrap();
+            assert_ne!(primary, null);
+            assert_ne!(aggregate_id, null);
+            assert_ne!(
+                primary, aggregate_id,
+                "each window binding is a separate identity channel"
+            );
+            assert_ne!(primary, error);
+            assert_ne!(aggregate_id, error);
+            assert_eq!(
+                forced(&mut arena, primary_only, nullable, &control).unwrap(),
+                primary
+            );
+        }
+    }
 }
 
 #[test]

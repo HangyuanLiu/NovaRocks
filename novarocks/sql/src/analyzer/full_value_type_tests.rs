@@ -918,7 +918,11 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
         for at_entry in [true, false] {
             let control = StopAt { error, at_entry };
             let failure = crate::analysis::resolve_function_binding(
-                catalog, "coalesce", &arguments, &control,
+                catalog,
+                "coalesce",
+                &arguments,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &control,
             )
             .unwrap_err();
             assert!(
@@ -947,6 +951,7 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
         catalog,
         "coalesce",
         &arguments,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         &crate::compiler::SqlCompileControl::unbounded(),
     )
     .unwrap();
@@ -1036,6 +1041,7 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
             "sum",
             &control_binding_arguments(1),
             novarocks_parser::Span::new(2, 8),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &control,
         )
         .unwrap_err();
@@ -1049,5 +1055,44 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
         )
         .unwrap_err();
         assert_eq!(failure.control_error(), Some(error));
+    }
+}
+
+#[test]
+fn exact_value_conversion_call_preserves_nested_sql_mode_policy() {
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+    let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
+    let relaxed = "/*+ SET_VAR(sql_mode=32) */";
+    for (outer, inner, outer_policy, inner_policy) in [
+        (strict, relaxed, ReportError, OutputNull),
+        (relaxed, strict, OutputNull, ReportError),
+    ] {
+        let sql = format!(
+            "SELECT {outer} CAST(q.j AS VARCHAR) AS x FROM (SELECT {inner} j,CAST(j AS VARCHAR) AS y FROM source) q"
+        );
+        let query = analyze(&sql);
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select");
+        };
+        let ExprKind::FunctionCall { binding: outer, .. } = &select.projection[0].expr.kind else {
+            panic!("exact conversion");
+        };
+        let Some(crate::analysis::Relation::Subquery { query: inner, .. }) = &select.from else {
+            panic!("derived query");
+        };
+        let QueryBody::Select(inner) = &inner.body else {
+            panic!("inner select");
+        };
+        let ExprKind::FunctionCall { binding: inner, .. } = &inner.projection[1].expr.kind else {
+            panic!("inner exact conversion");
+        };
+        assert_eq!(
+            outer.function_id.as_str(),
+            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+        );
+        assert_eq!(outer.function_id, inner.function_id);
+        assert_eq!(outer.selected, inner.selected);
+        assert_eq!(outer.decimal_overflow_policy(), outer_policy, "{sql}");
+        assert_eq!(inner.decimal_overflow_policy(), inner_policy, "{sql}");
     }
 }

@@ -4015,7 +4015,10 @@ mod intrinsic_eligibility_tests {
                     name: name.into(),
                     args: vec![child],
                     distinct: false,
-                    binding: binding.into(),
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        binding,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
                     volatility,
                 },
                 novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),

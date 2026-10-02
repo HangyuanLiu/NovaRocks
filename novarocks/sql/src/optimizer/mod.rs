@@ -94,6 +94,7 @@ pub(crate) struct OptimizerEnvironment<'a> {
     control: &'a dyn PureCompileControl,
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 }
 
 impl<'a> OptimizerEnvironment<'a> {
@@ -101,12 +102,14 @@ impl<'a> OptimizerEnvironment<'a> {
         settings: &'a options::SessionOptimizerSettings,
         constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
         function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         control: &'a dyn PureCompileControl,
     ) -> Self {
         Self {
             settings,
             constant_evaluator,
             function_catalog,
+            decimal_overflow_policy,
             control,
         }
     }
@@ -192,6 +195,7 @@ pub(crate) fn optimize_with_test_table_statistics(
             settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             test_optimizer_control(),
         ),
     )
@@ -224,6 +228,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
             settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             test_optimizer_control(),
         ),
     )
@@ -243,6 +248,7 @@ fn optimize_with_root_property(
         settings: session_settings,
         constant_evaluator,
         function_catalog,
+        decimal_overflow_policy,
         control,
     } = environment;
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
@@ -265,6 +271,7 @@ fn optimize_with_root_property(
     let options = options::OptimizerOptions::from_session(session_settings);
     let mut rewrite_ctx = rewrite::context::RewriteContext::for_query_with_settings(
         session_settings.clone(),
+        decimal_overflow_policy,
         control,
     );
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
@@ -1537,6 +1544,7 @@ mod is_known_rule_name_tests {
                 &crate::optimizer::options::SessionOptimizerSettings::default(),
                 None,
                 crate::functions::test_function_catalog_snapshot(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 test_optimizer_control(),
             ),
         )

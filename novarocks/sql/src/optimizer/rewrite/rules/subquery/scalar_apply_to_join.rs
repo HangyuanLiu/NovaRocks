@@ -133,6 +133,7 @@ fn apply_opt(
             &right,
             a.inner_output_column_id,
             &a.output_column,
+            ctx.decimal_overflow_policy(),
             &ctx.control_view(),
         )?;
 
@@ -174,6 +175,7 @@ fn apply_opt(
             &right,
             a.inner_output_column_id,
             &a.output_column,
+            ctx.decimal_overflow_policy(),
             &ctx.control_view(),
         )?;
 
@@ -269,6 +271,7 @@ fn apply_opt(
         &[count_argument],
         &[],
         true,
+        ctx.decimal_overflow_policy(),
         &ctx.control_view(),
     )?;
     let any_value_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
@@ -278,6 +281,7 @@ fn apply_opt(
         &[inner_scalar_ref],
         &[],
         true,
+        ctx.decimal_overflow_policy(),
         &ctx.control_view(),
     )?;
     if let Some(inner_column) =
@@ -391,6 +395,7 @@ fn apply_opt(
         arena,
         assert_cond,
         "correlate scalar subquery result must 1 row",
+        ctx.decimal_overflow_policy(),
         &ctx.control_view(),
     )?;
     items.push(ScalarProjectItem {
@@ -431,6 +436,7 @@ fn build_output_project_items(
     right: &OptExpr,
     inner_output_column_id: ColumnId,
     output_col: &OutputColumn,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<ScalarProjectItem>, SqlCompileError> {
     let mut items = scalar_utils::left_project_items(left, arena, control)?;
@@ -459,6 +465,7 @@ fn build_output_project_items(
                 arena,
                 inner_col_ref,
                 inner_out_type,
+                policy,
                 control,
             )?
         } else {

@@ -544,6 +544,7 @@ fn build_relational_aggregate_change_stream(
         ctx.function_catalog(),
         "state_all_zero",
         &state_all_zero_args,
+        ctx.decimal_overflow_policy(),
         &ctx.control_view(),
     )?;
     let insert_predicate = bool_and(
@@ -696,6 +697,7 @@ fn delta_state_with_row_id(
         ctx.function_catalog(),
         "mv_group_row_id",
         &row_id_args,
+        ctx.decimal_overflow_policy(),
         &ctx.control_view(),
     )?;
     items.push(ProjectItem {
@@ -751,6 +753,7 @@ fn merged_state_expr(
                 ctx.function_catalog(),
                 name,
                 &args,
+                ctx.decimal_overflow_policy(),
                 &ctx.control_view(),
             )?;
             Ok(TypedExpr {
@@ -982,6 +985,7 @@ fn aggregate_insert_expr_for_output(
             ctx.function_catalog(),
             name,
             &args,
+            ctx.decimal_overflow_policy(),
             &ctx.control_view(),
         )?;
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -1749,6 +1753,7 @@ fn signed_aggregate(
         signed_calls.push(retraction_count_aggregate_call(
             action_column,
             ctx.function_catalog(),
+            ctx.decimal_overflow_policy(),
             &ctx.control_view(),
         )?);
     }
@@ -2301,6 +2306,7 @@ fn state_shaped_state_value_type(
 fn retraction_count_aggregate_call(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let args = vec![TypedExpr {
@@ -2337,7 +2343,7 @@ fn retraction_count_aggregate_call(
         result_type: DataType::Int64,
         order_by: Vec::new(),
         output_column_id: ColumnId::UNSET,
-        resolved: resolved.into(),
+        resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
     })
 }
 
@@ -2360,7 +2366,13 @@ fn signed_aggregate_call(
         }
     };
     let value = signed_value_arg(call)?;
-    let input = signed_state_input(value, action_column, function_catalog, control)?;
+    let input = signed_state_input(
+        value,
+        action_column,
+        function_catalog,
+        call.resolved.decimal_overflow_policy(),
+        control,
+    )?;
     let resolved = crate::functions::resolve_sql_aggregate_binding(
         function_catalog,
         signed_name,
@@ -2387,7 +2399,10 @@ fn signed_aggregate_call(
         result_type: DataType::Binary,
         order_by: call.order_by.clone(),
         output_column_id: ColumnId::UNSET,
-        resolved: resolved.into(),
+        resolved: crate::binding::SqlFunctionBinding::new(
+            resolved,
+            call.resolved.decimal_overflow_policy(),
+        ),
     })
 }
 
@@ -2413,6 +2428,7 @@ fn signed_state_input(
     value: TypedExpr,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
@@ -2432,6 +2448,7 @@ fn signed_state_input(
         function_catalog,
         "named_struct",
         &args,
+        policy,
         control,
     )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type

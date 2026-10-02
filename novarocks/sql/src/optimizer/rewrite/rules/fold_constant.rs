@@ -1123,7 +1123,11 @@ mod tests {
         evaluator: Option<&'static dyn SqlConstantEvaluator>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<RewriteResult, SqlCompileError> {
-        let mut ctx = RewriteContext::for_query_with_settings(Default::default(), control);
+        let mut ctx = RewriteContext::for_query_with_settings(
+            Default::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            control,
+        );
         ctx.set_scalar_arena(Rc::clone(&fixture.arena));
         if let Some(evaluator) = evaluator {
             ctx.set_constant_evaluator(evaluator);

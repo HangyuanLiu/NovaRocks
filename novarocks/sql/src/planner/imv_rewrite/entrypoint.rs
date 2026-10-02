@@ -41,6 +41,7 @@ pub(crate) struct ImvRewriteInput<'a> {
     pub plan: LogicalPlanNode,
     pub snapshot: Arc<SqlImvRewriteSnapshot>,
     pub disabled_rules: Vec<String>,
+    pub decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     pub control: &'a dyn PureCompileControl,
     pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
     #[cfg(not(test))]
@@ -61,6 +62,7 @@ pub(crate) fn run_imv_rewrite(
         mut plan,
         snapshot,
         disabled_rules,
+        decimal_overflow_policy,
         control,
         column_ref_factory,
         #[cfg(not(test))]
@@ -83,6 +85,7 @@ pub(crate) fn run_imv_rewrite(
             disabled_rules,
             ..Default::default()
         },
+        decimal_overflow_policy,
         control,
     );
     ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
@@ -1173,6 +1176,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
             snapshot: repeated_source_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -1238,6 +1242,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: Arc::new(snapshot),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -1857,6 +1862,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: std::rc::Rc::clone(&factory),
@@ -1875,6 +1881,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -1899,6 +1906,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2020,6 +2028,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2130,6 +2139,7 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2152,6 +2162,7 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2172,6 +2183,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2187,6 +2199,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2226,6 +2239,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
@@ -2269,6 +2283,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2305,6 +2320,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2333,6 +2349,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
@@ -2389,6 +2406,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2446,6 +2464,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(100),
@@ -2527,6 +2546,7 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(100),
@@ -2545,6 +2565,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
             snapshot: repeated_source_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2621,6 +2642,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: partitioned_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2654,6 +2676,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2686,6 +2709,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: ctx,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2721,6 +2745,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2734,6 +2759,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2790,6 +2816,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2832,6 +2859,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -2847,6 +2875,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(30),
@@ -2920,6 +2949,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(30),
@@ -2957,6 +2987,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: Rc::clone(&factory_cell),
@@ -2984,7 +3015,8 @@ pub(crate) mod tests {
                 202,
                 203,
                 204,
-             &crate::compiler::SqlCompileControl::unbounded())
+             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+&crate::compiler::SqlCompileControl::unbounded())
         }
         .expect("join projection coalesce plan");
 
@@ -3001,6 +3033,7 @@ pub(crate) mod tests {
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
@@ -3028,7 +3061,8 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                     &crate::compiler::SqlCompileControl::unbounded())
+                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+&crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3050,6 +3084,7 @@ pub(crate) mod tests {
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_filter_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
@@ -3077,7 +3112,8 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                     &crate::compiler::SqlCompileControl::unbounded())
+                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+&crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection/filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3103,6 +3139,7 @@ pub(crate) mod tests {
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_left_filter_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
@@ -3130,7 +3167,8 @@ pub(crate) mod tests {
                         202,
                         203,
                         204,
-                     &crate::compiler::SqlCompileControl::unbounded())
+                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+&crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join side-filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3186,6 +3224,7 @@ pub(crate) mod tests {
             let outcome = run_imv_rewrite(ImvRewriteInput {
                 plan,
                 snapshot: Arc::clone(&snapshot),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                 control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                 column_ref_factory: Rc::clone(&factory_cell),
@@ -3213,7 +3252,8 @@ pub(crate) mod tests {
                     204,
                     #[cfg(not(test))]
                     crate::functions::builtin_sql_function_catalog(),
-                 &crate::compiler::SqlCompileControl::unbounded())
+                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+&crate::compiler::SqlCompileControl::unbounded())
             }
             .expect("join projection coalesce plan");
             optimize_logical_for_test(coalesce)
@@ -3268,6 +3308,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: ctx,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -3292,6 +3333,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: ctx,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -3366,6 +3408,7 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
@@ -3891,6 +3934,7 @@ pub(crate) mod tests {
             let failure = run_imv_rewrite(ImvRewriteInput {
                 plan: empty_values_plan(),
                 snapshot: empty_mv_ctx(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 disabled_rules: vec![],
                 control: &control,
                 column_ref_factory: test_column_ref_factory(),

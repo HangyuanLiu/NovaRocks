@@ -586,6 +586,7 @@ pub(crate) struct CtasSourceExecutionGate {
 /// scan bindings produced by analysis so target preparation cannot trigger a
 /// second SQL compilation or a current-generation metadata lookup.
 pub(crate) struct PlannedCtasSourceQuery {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
@@ -667,11 +668,13 @@ fn plan_query_for_ctas_source(
             connector_context,
         )
         .map_err(internal_failure)?;
-    let source = novarocks_sql::planning::dml::compile_ctas_source(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
-    )
-    .map_err(CtasFailure::from_compile)?;
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
+    let source = novarocks_sql::planning::dml::compile_ctas_source(optimize_request)
+        .map_err(CtasFailure::from_compile)?;
     Ok(PlannedCtasSourceQuery {
+        decimal_overflow_policy,
         source,
         table_bindings,
         optimizer_settings: execution.optimizer_settings().clone(),
@@ -735,6 +738,7 @@ fn prepare_planned_ctas_connector_write(
             .statistics_requirements(write_target_ordinal)
             .map_err(|error| error.to_string())?,
         &planned.optimizer_settings,
+        planned.decimal_overflow_policy,
         &completion_control,
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;

@@ -11222,6 +11222,7 @@ mod tests {
                 requirements: &[requirement],
             }],
             &functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();

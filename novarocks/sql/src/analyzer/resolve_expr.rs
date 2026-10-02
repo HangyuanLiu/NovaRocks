@@ -1355,7 +1355,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 kind: ExprKind::FunctionCall {
                     volatility: binding.semantics.volatility,
                     name: "__array_literal".to_string(),
-                    binding: binding.into(),
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        binding,
+                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    ),
                     args,
                     distinct: false,
                 },
@@ -2068,6 +2071,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         function_name,
                         &args,
                         func.span,
+                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
                         self.control,
                     )?,
                     args,
@@ -2582,6 +2586,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &args_typed,
                     &func_order_by,
                     func.span,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.control,
                 )?)
             };
@@ -2646,8 +2651,8 @@ impl<'a> super::AnalyzerContext<'a> {
                             ),
                             func.span,
                         )
-                    })?
-                    .into()
+                    })
+                    .map(|binding| crate::binding::SqlFunctionBinding::new(binding, self.sql_semantics.sql_mode().decimal_overflow_policy()))?
             };
             let result = match &binding.selected.result_type {
                 novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
@@ -2823,6 +2828,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 &args_typed,
                 &func_order_by,
                 func.span,
+                self.sql_semantics.sql_mode().decimal_overflow_policy(),
                 self.control,
             )?);
         } else if !aggregate_macro {
@@ -2928,6 +2934,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_union",
                     std::slice::from_ref(&state_expr),
                     func.span,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.control,
                 )?;
                 return Ok(TypedExpr {
@@ -2953,6 +2960,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_union",
                     &args_typed,
                     func.span,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.control,
                 )?;
                 return Ok(TypedExpr {
@@ -2978,6 +2986,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_merge",
                     &args_typed,
                     func.span,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
                     self.control,
                 )?;
                 return Ok(TypedExpr {
@@ -5108,10 +5117,17 @@ fn resolve_scalar_binding(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    crate::analysis::resolve_function_binding(function_catalog, name, args, control)
-        .map_err(AnalyzeError::function_binding)
+    crate::analysis::resolve_function_binding(
+        function_catalog,
+        name,
+        args,
+        decimal_overflow_policy,
+        control,
+    )
+    .map_err(AnalyzeError::function_binding)
 }
 
 pub(super) fn resolve_scalar_binding_at(
@@ -5119,10 +5135,17 @@ pub(super) fn resolve_scalar_binding_at(
     name: &str,
     args: &[TypedExpr],
     span: Span,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    resolve_scalar_binding(function_catalog, name, args, control)
-        .map_err(|error| error.at_type_mismatch(span))
+    resolve_scalar_binding(
+        function_catalog,
+        name,
+        args,
+        decimal_overflow_policy,
+        control,
+    )
+    .map_err(|error| error.at_type_mismatch(span))
 }
 
 pub(super) fn resolved_scalar_call_at(
@@ -5133,7 +5156,14 @@ pub(super) fn resolved_scalar_call_at(
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
-    let binding = resolve_scalar_binding_at(function_catalog, name, &args, span, control)?;
+    let binding = resolve_scalar_binding_at(
+        function_catalog,
+        name,
+        &args,
+        span,
+        decimal_overflow_policy,
+        control,
+    )?;
     let args = args
         .into_iter()
         .zip(binding.selected.argument_types.iter())
@@ -5172,7 +5202,14 @@ pub(super) fn resolved_scalar_call_at(
         })
         .collect::<Result<Vec<_>, AnalyzeError>>()
         .map_err(|error| error.at_type_mismatch(span))?;
-    let exact = resolve_scalar_binding_at(function_catalog, name, &args, span, control)?;
+    let exact = resolve_scalar_binding_at(
+        function_catalog,
+        name,
+        &args,
+        span,
+        decimal_overflow_policy,
+        control,
+    )?;
     if exact.function_id != binding.function_id
         || exact.selected.overload != binding.selected.overload
     {
@@ -5481,7 +5518,13 @@ pub(super) fn bind_scalar_function_call_with_catalog(
         .map(|arg| arg.value_type.data_type.clone())
         .collect::<Vec<_>>();
 
-    match resolve_scalar_binding(function_catalog, name, &args, control) {
+    match resolve_scalar_binding(
+        function_catalog,
+        name,
+        &args,
+        decimal_overflow_policy,
+        control,
+    ) {
         Ok(binding) => {
             let args = args
                 .into_iter()
@@ -5509,7 +5552,13 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             validate_scalar_function_call_typed(name, &args).map_err(AnalyzeError::internal)?;
-            let exact = resolve_scalar_binding(function_catalog, name, &args, control)?;
+            let exact = resolve_scalar_binding(
+                function_catalog,
+                name,
+                &args,
+                decimal_overflow_policy,
+                control,
+            )?;
             if exact.function_id != binding.function_id
                 || exact.selected.overload != binding.selected.overload
             {
@@ -5534,9 +5583,18 @@ pub(super) fn resolve_aggregate_function_call(
     name: &str,
     args: &[TypedExpr],
     span: Span,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
-    resolve_aggregate_function_call_with_order(function_catalog, name, args, &[], span, control)
+    resolve_aggregate_function_call_with_order(
+        function_catalog,
+        name,
+        args,
+        &[],
+        span,
+        decimal_overflow_policy,
+        control,
+    )
 }
 
 fn resolve_aggregate_function_call_with_order(
@@ -5545,6 +5603,7 @@ fn resolve_aggregate_function_call_with_order(
     args: &[TypedExpr],
     function_order_by: &[SortItem],
     span: Span,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     let arg_types = args
@@ -5559,7 +5618,7 @@ fn resolve_aggregate_function_call_with_order(
         false,
         control,
     )
-    .map(crate::binding::SqlFunctionBinding::new)
+    .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
     .map_err(|error| {
         if let novarocks_functions::FunctionBindingError::Control(error) = error {
             return AnalyzeError::control(error);
@@ -9827,6 +9886,7 @@ mod tests {
                 panic!("expected FIELD: {sql}")
             };
             assert_eq!(args.len(), 2);
+            assert_eq!(binding.decimal_overflow_policy(), expected, "{sql}");
             assert_eq!(typed.value_type.data_type, DataType::Int32);
             assert!(
                 binding
@@ -9903,6 +9963,134 @@ mod tests {
             assert_eq!(expr.value_type.data_type, DataType::Int64);
             assert_eq!(*target, DataType::Decimal128(3, 0));
             assert_eq!(*decimal_overflow_policy, expected, "{sql}");
+        }
+    }
+
+    fn resolve_call_policy_query(sql: &str) -> crate::analysis::ResolvedQuery {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+        super::super::analyze_with_function_catalog_and_sql_semantics(
+            query,
+            &EmptyCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_or_else(|error| panic!("{sql}: {error}"))
+        .0
+    }
+
+    fn expression_call_binding(expression: &TypedExpr) -> &crate::binding::SqlFunctionBinding {
+        match &expression.kind {
+            ExprKind::FunctionCall { binding, .. } => binding,
+            ExprKind::AggregateCall { resolved, .. } => resolved,
+            ExprKind::WindowCall {
+                binding,
+                aggregate_binding,
+                ..
+            } => {
+                if let Some(aggregate) = aggregate_binding {
+                    assert!(std::ptr::eq(binding.resolved(), aggregate.resolved()));
+                    assert_eq!(
+                        binding.decimal_overflow_policy(),
+                        aggregate.decimal_overflow_policy()
+                    );
+                }
+                binding
+            }
+            ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => expression_call_binding(expr),
+            other => panic!("expected an actual resolved call: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_call_policy_is_frozen_at_nested_scalar_aggregate_window_and_empty_array_scopes() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
+        let relaxed = "/*+ SET_VAR(sql_mode=32) */";
+        for expression in [
+            "abs(1)",
+            "max(1)",
+            "row_number() OVER ()",
+            "sum(1) OVER ()",
+            "CAST([] AS ARRAY<INT>)",
+        ] {
+            for (outer, inner, outer_policy, inner_policy) in [
+                (strict, relaxed, ReportError, OutputNull),
+                (relaxed, strict, OutputNull, ReportError),
+            ] {
+                let sql = format!(
+                    "SELECT {outer} {expression} AS x FROM (SELECT {inner} {expression} AS y) q"
+                );
+                let query = resolve_call_policy_query(&sql);
+                let QueryBody::Select(select) = &query.body else {
+                    panic!("select");
+                };
+                let Some(crate::analysis::Relation::Subquery { query: inner, .. }) = &select.from
+                else {
+                    panic!("derived query");
+                };
+                let QueryBody::Select(inner) = &inner.body else {
+                    panic!("inner select");
+                };
+                let outer = expression_call_binding(&select.projection[0].expr);
+                let inner = expression_call_binding(&inner.projection[0].expr);
+                assert_eq!(outer.decimal_overflow_policy(), outer_policy, "{sql}");
+                assert_eq!(inner.decimal_overflow_policy(), inner_policy, "{sql}");
+                assert_eq!(outer.function_id, inner.function_id, "{sql}");
+                assert_eq!(outer.selected, inner.selected, "{sql}");
+                // Equal selections are distinct calls with their own lexical policy.
+                assert_ne!(outer, inner, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn unnest_call_policy_uses_join_scope_after_nested_array_scope_exits() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
+        let relaxed = "/*+ SET_VAR(sql_mode=32) */";
+        for (outer, inner, outer_policy, inner_policy) in [
+            (strict, relaxed, ReportError, OutputNull),
+            (relaxed, strict, OutputNull, ReportError),
+        ] {
+            let sql = format!(
+                "SELECT {outer} abs(u.x) AS x FROM (SELECT {inner} [1] AS a) q CROSS JOIN LATERAL UNNEST(q.a) AS u(x)"
+            );
+            let query = resolve_call_policy_query(&sql);
+            let QueryBody::Select(select) = &query.body else {
+                panic!("select");
+            };
+            let Some(crate::analysis::Relation::Join(join)) = &select.from else {
+                panic!("join");
+            };
+            let crate::analysis::Relation::Unnest(unnest) = &join.right else {
+                panic!("unnest");
+            };
+            assert_eq!(
+                unnest.binding.decimal_overflow_policy(),
+                outer_policy,
+                "{sql}"
+            );
+            assert_eq!(
+                expression_call_binding(&select.projection[0].expr).decimal_overflow_policy(),
+                outer_policy,
+                "{sql}"
+            );
+            let crate::analysis::Relation::Subquery { query: inner, .. } = &join.left else {
+                panic!("derived query");
+            };
+            let QueryBody::Select(inner) = &inner.body else {
+                panic!("inner select");
+            };
+            assert_eq!(
+                expression_call_binding(&inner.projection[0].expr).decimal_overflow_policy(),
+                inner_policy,
+                "{sql}"
+            );
         }
     }
 }

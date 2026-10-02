@@ -269,6 +269,7 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));

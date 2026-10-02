@@ -1007,7 +1007,10 @@ mod tests {
                     name: name.into(),
                     args: vec![input],
                     distinct: false,
-                    binding: bound.into(),
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        bound,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
                     volatility,
                 },
                 novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),

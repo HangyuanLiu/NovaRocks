@@ -1668,6 +1668,10 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 },
             ])?,
         ),
+        execution
+            .sql_semantics()
+            .sql_mode()
+            .decimal_overflow_policy(),
         control,
     )?;
     let version = plan.version();

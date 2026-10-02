@@ -36,6 +36,7 @@ use novarocks_spi::connector::write_stack::{
 };
 
 use crate::analysis::{ExprKind, LiteralValue, TypedExpr, UnpivotConstant};
+use crate::binding::SqlFunctionBinding;
 use crate::compiler::SqlFunctionCatalog;
 use novarocks_functions::ResolvedFunctionBinding;
 
@@ -47,7 +48,7 @@ const MAX_UNPIVOT_OUTPUT_BYTES: usize =
 pub struct WriterPartialAggregateCall {
     pub(crate) input_slot_id: u32,
     pub(crate) function_name: String,
-    pub(crate) resolved: ResolvedFunctionBinding,
+    pub(crate) resolved: SqlFunctionBinding,
     pub(crate) intermediate_slot_id: u32,
 }
 
@@ -58,7 +59,10 @@ impl WriterPartialAggregateCall {
     pub fn function_name(&self) -> &str {
         &self.function_name
     }
-    pub const fn resolved(&self) -> &ResolvedFunctionBinding {
+    pub fn resolved(&self) -> &ResolvedFunctionBinding {
+        self.resolved.resolved()
+    }
+    pub const fn binding(&self) -> &SqlFunctionBinding {
         &self.resolved
     }
     pub const fn intermediate_slot_id(&self) -> u32 {
@@ -80,7 +84,7 @@ impl WriterPartialAggregatePlan {
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
     pub(crate) function_name: String,
-    pub(crate) resolved: ResolvedFunctionBinding,
+    pub(crate) resolved: SqlFunctionBinding,
     pub(crate) intermediate_input_slot_id: u32,
     pub(crate) final_output_slot_id: u32,
 }
@@ -89,7 +93,10 @@ impl WriterFinalAggregateCall {
     pub fn function_name(&self) -> &str {
         &self.function_name
     }
-    pub const fn resolved(&self) -> &ResolvedFunctionBinding {
+    pub fn resolved(&self) -> &ResolvedFunctionBinding {
+        self.resolved.resolved()
+    }
+    pub const fn binding(&self) -> &SqlFunctionBinding {
         &self.resolved
     }
     pub const fn intermediate_input_slot_id(&self) -> u32 {
@@ -261,6 +268,7 @@ pub struct WriterStatisticsTargetInput<'a> {
 pub fn plan_writer_statistics(
     targets: &[WriterStatisticsTargetInput<'_>],
     functions: &dyn SqlFunctionCatalog,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<WriterAuxiliaryPlan, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -300,11 +308,11 @@ pub fn plan_writer_statistics(
     let mut partial_by_target = BTreeMap::new();
     let mut final_calls = Vec::new();
     let mut mappings = Vec::new();
-    let mut shared_channels = HashMap::<(ResolvedFunctionBinding, usize), (u32, u32)>::new();
+    let mut shared_channels = HashMap::<(SqlFunctionBinding, usize), (u32, u32)>::new();
 
     for target in targets {
         let mut partial_calls = Vec::with_capacity(target.requirements.len());
-        let mut occurrence_by_signature = HashMap::<ResolvedFunctionBinding, usize>::new();
+        let mut occurrence_by_signature = HashMap::<SqlFunctionBinding, usize>::new();
         for requirement in target.requirements {
             let input = target
                 .input_schema
@@ -368,6 +376,7 @@ pub fn plan_writer_statistics(
                 )
                 .into());
             }
+            let resolved = SqlFunctionBinding::new(resolved, decimal_overflow_policy);
             let occurrence = occurrence_by_signature.entry(resolved.clone()).or_default();
             let shared_key = (resolved.clone(), *occurrence);
             *occurrence = occurrence
@@ -655,6 +664,7 @@ mod tests {
                 requirements: &required,
             }],
             &build_builtin_engine_function_catalog().expect("builtin function catalog"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("count does not produce a binary artifact body");
@@ -673,6 +683,7 @@ mod tests {
                 requirements: &required,
             }],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
@@ -720,6 +731,7 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
@@ -752,6 +764,7 @@ mod tests {
                 requirements: &requirements,
             }],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
@@ -779,6 +792,7 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
@@ -821,9 +835,46 @@ mod tests {
                 },
             ],
             &binary_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("unordered targets");
         assert!(error.to_string().contains("strictly ascending"));
+    }
+
+    #[test]
+    fn writer_statistics_partial_and_final_keep_the_authored_statement_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+        let schema = input_schema();
+        let requirements = vec![requirement(11)];
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let mut authored = Vec::new();
+        for policy in [OutputNull, ReportError] {
+            let plan = plan_writer_statistics(
+                &[WriterStatisticsTargetInput {
+                    target,
+                    input_schema: &schema,
+                    requirements: &requirements,
+                }],
+                &binary_catalog(),
+                policy,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let partial = plan.partial_for(target).unwrap();
+            let partial = &partial.calls()[0];
+            let final_call = &plan.final_plan().calls()[0];
+            assert_eq!(partial.binding().decimal_overflow_policy(), policy);
+            assert_eq!(final_call.binding().decimal_overflow_policy(), policy);
+            assert!(std::ptr::eq(partial.resolved(), final_call.resolved()));
+            assert_eq!(
+                partial.intermediate_slot_id(),
+                final_call.intermediate_input_slot_id()
+            );
+            authored.push(final_call.binding().clone());
+        }
+        assert_eq!(authored[0].resolved(), authored[1].resolved());
+        assert_ne!(authored[0], authored[1]);
     }
 }

@@ -802,12 +802,21 @@ pub struct SqlAnalyzedQuery {
     factory: crate::column_id::ColumnRefFactory,
     intent: SqlCompileIntent,
     settings: SessionOptimizerSettings,
+    /// Policy of the admitted root scope for calls synthesized after analysis.
+    /// Existing calls retain their own scope policy in `SqlFunctionBinding`.
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
     function_catalog: Arc<dyn SqlFunctionCatalog>,
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
     constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+}
+
+impl SqlAnalyzedQuery {
+    pub(crate) fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.decimal_overflow_policy
+    }
 }
 
 /// Typed phase-one outcome. Analyze-only and logical-only requests terminate
@@ -847,6 +856,10 @@ pub struct SqlOptimizeRequest<'a> {
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
+    pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.analyzed.decimal_overflow_policy()
+    }
+
     pub(crate) fn control(&self) -> &SqlCompileControl {
         &self.control
     }
@@ -1193,6 +1206,7 @@ impl SqlCompiler {
             logical_input,
             consumer_requires_semantic_snapshot,
             legacy_allow_throw_exception,
+            decimal_overflow_policy,
         ) = match &request.statement.kind {
             SqlStatementInputKind::LogicalPlan { plan, factory } => (
                 plan.clone(),
@@ -1210,6 +1224,11 @@ impl SqlCompiler {
                     .sql_semantics
                     .sql_mode()
                     .allow_throw_exception(),
+                request
+                    .session
+                    .sql_semantics
+                    .sql_mode()
+                    .decimal_overflow_policy(),
             ),
             _ => {
                 let query = parse_query(&request.statement)?;
@@ -1264,6 +1283,10 @@ impl SqlCompiler {
                         .map_err(SqlCompileError::from)?
                         .sql_mode()
                         .allow_throw_exception(),
+                    crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
+                        .map_err(SqlCompileError::from)?
+                        .sql_mode()
+                        .decimal_overflow_policy(),
                 )
             }
         };
@@ -1323,6 +1346,7 @@ impl SqlCompiler {
                         ),
                     snapshot: Arc::clone(input.snapshot()),
                     disabled_rules: settings.disabled_rules.clone(),
+                    decimal_overflow_policy,
                     control: &request.control,
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
                     #[cfg(not(test))]
@@ -1400,6 +1424,7 @@ impl SqlCompiler {
             factory,
             intent: request.intent,
             settings,
+            decimal_overflow_policy,
             change_stream,
             mv_rewrite,
             function_catalog,
@@ -1416,6 +1441,7 @@ impl SqlCompiler {
             factory,
             intent,
             settings,
+            decimal_overflow_policy,
             change_stream,
             mv_rewrite,
             function_catalog,
@@ -1459,6 +1485,7 @@ impl SqlCompiler {
                     &settings,
                     constant_evaluator,
                     Arc::clone(&function_catalog),
+                    decimal_overflow_policy,
                     &control,
                 ),
             ),
@@ -1472,6 +1499,7 @@ impl SqlCompiler {
                     &settings,
                     constant_evaluator,
                     Arc::clone(&function_catalog),
+                    decimal_overflow_policy,
                     &control,
                 ),
             ),
@@ -2896,6 +2924,45 @@ mod tests {
                 );
                 assert_eq!(owner.checks.lock().unwrap().len(), at);
             }
+        }
+    }
+
+    #[test]
+    fn analyzed_root_policy_keeps_admitted_hint_across_optimize_handoff() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        for (session, sql, expected) in [
+            ("32", "SELECT 1", OutputNull),
+            (
+                "32",
+                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+                ReportError,
+            ),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                OutputNull,
+            ),
+            ("ERROR_IF_OVERFLOW", "SELECT 1", ReportError),
+            (
+                "32",
+                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 AS x) s",
+                OutputNull,
+            ),
+        ] {
+            let cancellation = Arc::new(Cancellation::default());
+            let mut input = request(control(None, &cancellation));
+            input.statement = SqlStatementInput::sql(sql);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session));
+            let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            assert_eq!(analyzed.decimal_overflow_policy(), expected);
+            let statistics = crate::planning::dml::DmlStatisticsSnapshot::default();
+            let optimize =
+                SqlOptimizeRequest::new(analyzed, &statistics, control(None, &cancellation));
+            assert_eq!(optimize.decimal_overflow_policy(), expected);
         }
     }
 

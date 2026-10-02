@@ -1005,7 +1005,10 @@ mod intrinsic_error_consumer_tests {
                 name: name.into(),
                 args,
                 distinct: false,
-                binding: binding.into(),
+                binding: crate::binding::SqlFunctionBinding::new(
+                    binding,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
                 volatility,
             },
             novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
@@ -1054,7 +1057,8 @@ mod intrinsic_error_consumer_tests {
         let mut exact = binding.as_ref().clone();
         exact.semantics.failure_behavior =
             novarocks_functions::FunctionFailureBehavior::ReturnsNull;
-        *binding = exact.into();
+        *binding =
+            crate::binding::SqlFunctionBinding::new(exact, binding.decimal_overflow_policy());
         let catching = arena.intern(
             catching,
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

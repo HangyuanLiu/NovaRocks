@@ -131,7 +131,7 @@ pub(super) fn convert_value_domain_with_catalog(
         kind: ExprKind::FunctionCall {
             name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.to_string(),
             volatility: binding.semantics.volatility,
-            binding: binding.into(),
+            binding: crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy),
             args: vec![source],
             distinct: false,
         },

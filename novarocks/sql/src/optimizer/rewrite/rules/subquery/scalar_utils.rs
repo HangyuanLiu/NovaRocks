@@ -653,6 +653,7 @@ pub(super) fn coalesce_false(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     pred: ScalarId,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let false_lit = bool_literal(arena, false, control)?;
@@ -662,6 +663,7 @@ pub(super) fn coalesce_false(
         arena,
         "coalesce",
         &args,
+        policy,
         control,
     )?;
     arena.intern_observed(
@@ -682,6 +684,7 @@ pub(super) fn ifnull_zero(
     arena: &mut ScalarArena,
     value: ScalarId,
     result_type: DataType,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let zero = int_literal(arena, 0, control)?;
@@ -691,6 +694,7 @@ pub(super) fn ifnull_zero(
         arena,
         "ifnull",
         &args,
+        policy,
         control,
     )?;
     arena.intern_observed(
@@ -711,6 +715,7 @@ pub(super) fn assert_true(
     arena: &mut ScalarArena,
     condition: ScalarId,
     message: impl Into<String>,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let message = string_literal(arena, message, control)?;
@@ -720,6 +725,7 @@ pub(super) fn assert_true(
         arena,
         "assert_true",
         &args,
+        policy,
         control,
     )?;
     arena.intern_observed(

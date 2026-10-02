@@ -341,6 +341,7 @@ fn inject_join_apply_key(
             branch,
             evidence,
             &join_apply_key_column,
+            ctx.decimal_overflow_policy(),
             &ctx.control_view(),
         )?;
         prune_raw_join_row_id_output_from_branch(branch, evidence)?;
@@ -423,6 +424,7 @@ fn inject_join_apply_key_into_branch(
     branch: &mut LogicalPlanNode,
     evidence: &JoinDeltaBranchEvidence,
     join_apply_key_column: &OutputColumn,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), crate::compiler::SqlCompileError> {
     let LogicalPlanKind::Project(project) = &mut branch.kind else {
@@ -439,7 +441,7 @@ fn inject_join_apply_key_into_branch(
         return Ok(());
     }
     project.items.push(ProjectItem {
-        expr: join_row_key_expr(function_catalog, evidence, control)?,
+        expr: join_row_key_expr(function_catalog, evidence, policy, control)?,
         output_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         output_column_id: join_apply_key_column.column_id,
     });
@@ -467,6 +469,7 @@ fn prune_raw_join_row_id_output_from_branch(
 fn join_row_key_expr(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     evidence: &JoinDeltaBranchEvidence,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
@@ -479,6 +482,7 @@ fn join_row_key_expr(
         function_catalog,
         "join_row_key",
         &args,
+        policy,
         control,
     )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -1681,6 +1685,7 @@ mod tests {
         let expr = join_row_key_expr(
             crate::functions::builtin_sql_function_catalog(),
             &evidence,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("join-row-key binding");

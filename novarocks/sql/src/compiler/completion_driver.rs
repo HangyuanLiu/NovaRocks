@@ -733,6 +733,7 @@ fn optimize_to_physical(
         factory,
         intent,
         settings,
+        decimal_overflow_policy,
         change_stream: _,
         mv_rewrite,
         function_catalog,
@@ -767,6 +768,7 @@ fn optimize_to_physical(
         &settings,
         constant_evaluator,
         Arc::clone(&function_catalog),
+        decimal_overflow_policy,
         control,
     );
     let optimized = match root_distribution {

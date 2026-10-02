@@ -74,6 +74,7 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
             expr,
             function_catalog.as_ref(),
             &mut arena,
+            ctx.decimal_overflow_policy(),
             &ctx.control_view(),
         )? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
@@ -97,6 +98,7 @@ fn apply_expr(
     expr: OptExpr,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
@@ -164,7 +166,7 @@ fn apply_expr(
             return Ok(None);
         };
         let extra = if negated && arena.nullable(lifted_pred) {
-            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred, control)?
+            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred, policy, control)?
         } else {
             lifted_pred
         };
