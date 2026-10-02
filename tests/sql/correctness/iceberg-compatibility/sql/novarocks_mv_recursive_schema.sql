@@ -180,7 +180,7 @@ printf 'RECURSIVE_MV_OBSERVED\n'
 -- query 10
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS recursive_encodings_${uuid0}.ns_${uuid0}.recursive_mv;
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.recursive_mv;
 DROP TABLE IF EXISTS recursive_encodings_${uuid0}.ns_${uuid0}.recursive_source FORCE;
 DROP DATABASE recursive_encodings_${uuid0}.ns_${uuid0};
 DROP CATALOG recursive_encodings_${uuid0};

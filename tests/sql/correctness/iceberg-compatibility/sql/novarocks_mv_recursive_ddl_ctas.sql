@@ -94,7 +94,7 @@ SELECT label,payload,ordered FROM recursive_source;
 -- @skip_result_check=true
 CREATE TABLE recursive_ddl (
   label STRING,
-  payload STRUCT<items:ARRAY<BIGINT>,attrs:MAP<STRING,BIGINT>,detail:STRUCT<code:BIGINT,note:STRING>>,
+  payload STRUCT<items ARRAY<BIGINT>,attrs MAP<STRING,BIGINT>,detail STRUCT<code BIGINT,note STRING>>,
   ordered MAP<STRING,BIGINT>
 ) TBLPROPERTIES ("format-version"="3","write.row-lineage"="true");
 
