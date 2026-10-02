@@ -1,0 +1,43 @@
+-- query 3
+json_type	n_type	s_type	xs_type	js_type
+varchar	int	int	array<int>	array<varchar>
+
+-- query 4
+id	j	n	s	xs	js
+1	{"b":2,"a":1}	-128	-32768	[-128,null,127]	["{\"b\":2,\"a\":1}",null,"{}"]
+2	{"b":2,"a":1}	-128	-32768	[-128,null,127]	["{\"b\":2,\"a\":1}",null,"{}"]
+3	{}	127	32767	[]	[]
+4	NULL	NULL	NULL	NULL	NULL
+5	not-json	0	0	[0]	["not-json"]
+
+-- query 5
+json_type	n_type	s_type	xs_type	js_type
+varchar	int	int	array<int>	array<varchar>
+
+-- query 6
+id	j	n	s	xs	js
+1	{"b":2,"a":1}	-128	-32768	[-128,null,127]	["{\"b\":2,\"a\":1}",null,"{}"]
+2	{"b":2,"a":1}	-128	-32768	[-128,null,127]	["{\"b\":2,\"a\":1}",null,"{}"]
+3	{}	127	32767	[]	[]
+4	NULL	NULL	NULL	NULL	NULL
+5	not-json	0	0	[0]	["not-json"]
+
+-- query 7
+json_type	n_type	s_type	xs_type	js_type
+json	tinyint	smallint	array<tinyint>	array<json>
+
+-- query 8
+id	j	n	s	xs	js
+1	{"b":2,"a":1}	-128	-32768	[-128,null,127]	['{"b":2,"a":1}',null,'{}']
+2	{"b":2,"a":1}	-128	-32768	[-128,null,127]	['{"b":2,"a":1}',null,'{}']
+3	{}	127	32767	[]	[]
+4	NULL	NULL	NULL	NULL	NULL
+5	not-json	0	0	[0]	['not-json']
+
+-- query 26
+id	j	n	s	xs	js
+1	{"b":2,"a":1}	-128	-32768	[-128,null,127]	['{"b":2,"a":1}',null,'{}']
+2	{"b":2,"a":1}	-128	-32768	[-128,null,127]	['{"b":2,"a":1}',null,'{}']
+3	{}	127	32767	[]	[]
+4	NULL	NULL	NULL	NULL	NULL
+5	not-json	0	0	[0]	['not-json']
