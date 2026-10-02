@@ -563,6 +563,18 @@ impl IcebergColumnHandle {
         declarations: &crate::field_domain::PersistedFieldDomains,
     ) -> Result<Self, ConnectorError> {
         use crate::field_domain::PersistedFieldDomains;
+        // Split-synthesized metadata is not a data field. Even a formal empty
+        // declaration belongs only to data columns in the frozen relation.
+        if super::schema_binding::IcebergMetadataColumn::from_field_id(self.base_field_id())
+            .is_some()
+        {
+            if !matches!(self.field_domains, PersistedFieldDomains::None) {
+                return Err(invalid(
+                    "metadata column cannot carry a data-field declaration",
+                ));
+            }
+            return Ok(self);
+        }
         let selected = match declarations {
             PersistedFieldDomains::None => PersistedFieldDomains::None,
             PersistedFieldDomains::LegacyTopIntegerV1(fields) => {
@@ -1178,6 +1190,21 @@ pub(crate) fn validate_frozen_column_domains<'a>(
     columns: impl IntoIterator<Item = &'a IcebergColumnHandle>,
     declarations: &crate::field_domain::PersistedFieldDomains,
 ) -> Result<(), ConnectorError> {
+    // This is the frozen relation's data schema, never the physical Parquet
+    // schema (which may legitimately store reserved row-lineage fields).
+    for metadata in [
+        super::schema_binding::IcebergMetadataColumn::Path,
+        super::schema_binding::IcebergMetadataColumn::RowPosition,
+        super::schema_binding::IcebergMetadataColumn::RowId,
+        super::schema_binding::IcebergMetadataColumn::LastUpdatedSequenceNumber,
+        super::schema_binding::IcebergMetadataColumn::IsDeleted,
+    ] {
+        if schema.field_by_id(metadata.field_id()).is_some() {
+            return Err(invalid(
+                "data schema conflicts with a reserved metadata field identity",
+            ));
+        }
+    }
     for column in columns {
         if !schema
             .as_struct()
@@ -1294,6 +1321,69 @@ pub(super) mod tests {
         field_id: i32,
     ) -> IcebergColumnHandle {
         IcebergColumnHandle::base_column_of(schema, field_id).expect("base column handle")
+    }
+
+    #[test]
+    fn synthesized_metadata_columns_keep_no_data_field_domain_authority() {
+        use super::super::schema_binding::IcebergMetadataColumn;
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        let data = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "js", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let sources = [
+            PersistedFieldDomains::None,
+            PersistedFieldDomains::LegacyTopIntegerV1(BTreeMap::new()),
+            PersistedFieldDomains::FieldDomainsV1(BTreeMap::new()),
+            PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([(1, FieldDomain::Json)])),
+        ];
+        for metadata in [
+            IcebergMetadataColumn::Path,
+            IcebergMetadataColumn::RowPosition,
+            IcebergMetadataColumn::RowId,
+            IcebergMetadataColumn::LastUpdatedSequenceNumber,
+            IcebergMetadataColumn::IsDeleted,
+        ] {
+            let column = IcebergColumnHandle::base_column(&NestedField::optional(
+                metadata.field_id(),
+                metadata.column_name(),
+                Type::Primitive(metadata.declared_type()),
+            ))
+            .unwrap();
+            for source in &sources {
+                let projected = column.clone().with_table_field_domains(source).unwrap();
+                assert!(matches!(
+                    projected.persisted_field_domains(),
+                    PersistedFieldDomains::None
+                ));
+                assert!(projected.to_proto().field_domains_json.is_none());
+                validate_frozen_column_domains(&data, [&projected], source).unwrap();
+                assert_eq!(
+                    IcebergColumnHandle::from_proto(&projected.to_proto()).unwrap(),
+                    column
+                );
+            }
+            let collision = Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(
+                        metadata.field_id(),
+                        metadata.column_name(),
+                        Type::Primitive(metadata.declared_type()),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap();
+            assert!(validate_frozen_column_domains(&collision, [&column], &sources[0]).is_err());
+            let forged = column
+                .clone()
+                .with_field_domains(PersistedFieldDomains::FieldDomainsV1(BTreeMap::new()))
+                .unwrap();
+            assert!(validate_frozen_column_domains(&data, [&forged], &sources[2]).is_err());
+            assert!(forged.with_table_field_domains(&sources[2]).is_err());
+        }
     }
 
     #[test]
