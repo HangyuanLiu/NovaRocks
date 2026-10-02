@@ -315,3 +315,11 @@ update this file.
   on `None`.
 - `ViewRepresentations::new` is public so downstream crates can build
   representation lists.
+
+## Provider-preflighted table metadata file decode
+
+`TableMetadata::read_from_with_decoder` accepts an exact provider decoder after
+the existing file read and gzip detection/decompression. `read_from` retains
+its original default serde policy. NovaRocks uses the callback to check every
+retained schema before SDK indexes are materialized, then decode admitted
+depth-64 metadata. This adds no whole-file or decompression budget claim.

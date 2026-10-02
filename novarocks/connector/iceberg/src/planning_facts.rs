@@ -227,9 +227,16 @@ pub fn table_planning_facts(
             .with_write_target_type(write_target_type))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let metadata = input.serialized_metadata.and_then(|serialized| {
-        serde_json::from_str::<crate::iceberg::spec::TableMetadata>(serialized).ok()
-    });
+    let metadata = input
+        .serialized_metadata
+        .map(crate::schema_preflight::decode_table_metadata)
+        .transpose()
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg planning metadata: {error}"),
+            )
+        })?;
     let (unique_constraints, foreign_key_constraints) = metadata
         .as_ref()
         .map(|metadata| {
@@ -513,6 +520,27 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("valid request context")
+    }
+
+    #[test]
+    fn malformed_frozen_metadata_cannot_silently_drop_planning_facts() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let context = context();
+        let error = table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: &schema,
+            iceberg_schema: None,
+            metadata_columns: &[],
+            hidden_columns: &[],
+            logical_type_columns: &BTreeMap::new(),
+            serialized_metadata: Some("{\"schemas\":[]} trailing"),
+            namespace: &Arc::from("db"),
+            instance_id: &instance_id,
+            context: &context,
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("trailing JSON"));
     }
 
     #[test]

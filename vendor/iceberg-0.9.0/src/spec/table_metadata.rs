@@ -528,6 +528,19 @@ impl TableMetadata {
         file_io: &FileIO,
         metadata_location: impl AsRef<str>,
     ) -> Result<TableMetadata> {
+        Self::read_from_with_decoder(file_io, metadata_location, |bytes| {
+            serde_json::from_slice(bytes).map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Read metadata through the catalog provider's preflighted decoder while
+    /// retaining the SDK's file and compression handling.
+    pub async fn read_from_with_decoder(
+        file_io: &FileIO,
+        metadata_location: impl AsRef<str>,
+        decode: impl FnOnce(&[u8]) -> Result<TableMetadata>,
+    ) -> Result<TableMetadata> {
         let metadata_location = metadata_location.as_ref();
         let input_file = file_io.new_input(metadata_location)?;
         let metadata_content = input_file.read().await?;
@@ -547,9 +560,9 @@ impl TableMetadata {
                     .with_context("file_path", metadata_location)
                     .with_source(e)
                 })?;
-            serde_json::from_slice(&decompressed_data)?
+            decode(&decompressed_data)?
         } else {
-            serde_json::from_slice(&metadata_content)?
+            decode(&metadata_content)?
         };
 
         Ok(metadata)

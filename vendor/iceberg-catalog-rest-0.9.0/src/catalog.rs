@@ -40,7 +40,7 @@ use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
 use crate::client::{
-    HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
+    HttpClient, deserialize_catalog_response, deserialize_table_response, deserialize_unexpected_catalog_error,
 };
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CommitViewRequest,
@@ -83,6 +83,7 @@ impl Default for RestCatalogBuilder {
                 warehouse: None,
                 props: HashMap::new(),
                 client: None,
+                table_response_preflight: None,
             },
             storage_factory: None,
         }
@@ -142,6 +143,16 @@ impl CatalogBuilder for RestCatalogBuilder {
 }
 
 impl RestCatalogBuilder {
+    /// Install the provider's allocation-free schema preflight for table
+    /// responses. Only table metadata endpoints use this callback and the
+    /// corresponding schema-aware JSON recursion handling.
+    pub fn with_table_response_preflight(
+        mut self,
+        preflight: fn(&[u8]) -> std::result::Result<(), String>,
+    ) -> Self {
+        self.config.table_response_preflight = Some(preflight);
+        self
+    }
     /// Configures the catalog with a custom HTTP client.
     pub fn with_client(mut self, client: Client) -> Self {
         self.config.client = Some(client);
@@ -165,6 +176,9 @@ pub(crate) struct RestCatalogConfig {
 
     #[builder(default)]
     client: Option<Client>,
+
+    #[builder(default)]
+    table_response_preflight: Option<fn(&[u8]) -> std::result::Result<(), String>>,
 }
 
 impl RestCatalogConfig {
@@ -922,7 +936,9 @@ impl RestCatalog {
         let http_response = context.client.query_catalog(request).await?;
         let response = match http_response.status() {
             StatusCode::OK | StatusCode::NOT_MODIFIED => {
-                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+                deserialize_table_response::<LoadTableResult>(
+                    http_response, context.config.table_response_preflight,
+                ).await?
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
@@ -1057,7 +1073,9 @@ impl RestCatalog {
             .map_err(StagedCreateError::PossiblyDispatched)?;
         let status = http_response.status();
         let response = match status {
-            StatusCode::OK => deserialize_catalog_response::<LoadTableResult>(http_response)
+            StatusCode::OK => deserialize_table_response::<LoadTableResult>(
+                    http_response, context.config.table_response_preflight,
+                )
                 .await
                 .map_err(StagedCreateError::PossiblyDispatched)?,
             StatusCode::CONFLICT => {
@@ -1245,7 +1263,9 @@ impl RestCatalog {
             .map_err(StagedCommitError::PossiblyDispatched)?;
         let status = http_response.status();
         let response: CommitTableResponse = match status {
-            StatusCode::OK => deserialize_catalog_response(http_response)
+            StatusCode::OK => deserialize_table_response(
+                http_response, context.config.table_response_preflight,
+            )
                 .await
                 .map_err(StagedCommitError::CommittedResponseInvalid)?,
             StatusCode::CONFLICT => {
@@ -1339,7 +1359,9 @@ impl RestCatalog {
         let http_response = context.client.query_catalog(request).await?;
         let response = match http_response.status() {
             StatusCode::OK => {
-                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+                deserialize_table_response::<LoadTableResult>(
+                    http_response, context.config.table_response_preflight,
+                ).await?
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
@@ -1728,7 +1750,9 @@ impl Catalog for RestCatalog {
 
         let response = match http_response.status() {
             StatusCode::OK | StatusCode::NOT_MODIFIED => {
-                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+                deserialize_table_response::<LoadTableResult>(
+                    http_response, context.config.table_response_preflight,
+                ).await?
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
@@ -1856,7 +1880,9 @@ impl Catalog for RestCatalog {
 
         let response: LoadTableResult = match http_response.status() {
             StatusCode::OK => {
-                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+                deserialize_table_response::<LoadTableResult>(
+                    http_response, context.config.table_response_preflight,
+                ).await?
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
@@ -1913,7 +1939,9 @@ impl Catalog for RestCatalog {
         let http_response = context.client.query_catalog(request).await?;
 
         let response: CommitTableResponse = match http_response.status() {
-            StatusCode::OK => deserialize_catalog_response(http_response).await?,
+            StatusCode::OK => deserialize_table_response(
+                http_response, context.config.table_response_preflight,
+            ).await?,
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
                     ErrorKind::TableNotFound,
@@ -4141,6 +4169,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_response_preflight_refusal_after_http_success_is_committed_response_invalid() {
+        fn reject(_: &[u8]) -> std::result::Result<(), String> {
+            Err("schema depth exceeds the provider contract".to_string())
+        }
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let commit_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body("{\"storage-secret-canary\":true}")
+            .expect(1)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .table_response_preflight(Some(reject))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let error = catalog
+            .commit_staged_table_typed(typed_staged_commit())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StagedCommitError::CommittedResponseInvalid(_)
+        ));
+        assert!(!format!("{error:?}").contains("storage-secret-canary"));
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn typed_staged_commit_with_caller_file_io_needs_no_catalog_storage_factory() {
         let mut server = Server::new_async().await;
         let config_mock = create_config_mock(&mut server).await;
@@ -4355,6 +4417,7 @@ mod tests {
             .upgrade_table_version()
             .set_format_version(FormatVersion::V2)
             .apply(tx)
+            .await
             .unwrap()
             .commit(&catalog)
             .await
@@ -4498,6 +4561,7 @@ mod tests {
             .upgrade_table_version()
             .set_format_version(FormatVersion::V2)
             .apply(tx)
+            .await
             .unwrap()
             .commit(&catalog)
             .await;

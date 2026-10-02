@@ -137,7 +137,8 @@ async fn build_rest_catalog_with_access_delegation(
             configuration.warehouse_uri.clone(),
         );
     }
-    let builder = RestCatalogBuilder::default();
+    let builder = RestCatalogBuilder::default()
+        .with_table_response_preflight(crate::schema_preflight::preflight_rest_table_response);
     let builder = match rest_access_delegation {
         RestAccessDelegationMode::Static => {
             builder.with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
@@ -172,6 +173,7 @@ pub(crate) async fn build_rest_catalog_from_properties(
         );
     }
     RestCatalogBuilder::default()
+        .with_table_response_preflight(crate::schema_preflight::preflight_rest_table_response)
         .load("rest".to_string(), properties)
         .await
         .map_err(|error| format!("build REST iceberg catalog: {error}"))
@@ -224,6 +226,7 @@ pub async fn build_hms_catalog(
         },
     );
     HmsCatalogBuilder::default()
+        .with_table_metadata_decoder(crate::schema_preflight::decode_sdk_table_metadata)
         .with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
         .load("hms".to_string(), properties)
         .await

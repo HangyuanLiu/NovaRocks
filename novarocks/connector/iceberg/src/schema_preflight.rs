@@ -24,6 +24,10 @@ const MAX_JSON_VALUES: usize = 131_072;
 
 #[derive(Clone, Copy)]
 enum Role {
+    RestTable,
+    Metadata,
+    Schemas,
+    OptionalSchema,
     Root,
     Type(usize),
     Field(usize),
@@ -38,6 +42,8 @@ struct Scan<'a> {
     nodes: usize,
     names: usize,
     values: usize,
+    json_depth_limit: usize,
+    json_value_limit: Option<usize>,
     limits: LogicalTypeLimits,
 }
 
@@ -49,6 +55,63 @@ pub(crate) fn preflight_type(json: &str) -> Result<(), String> {
     preflight(json, Role::Type(1), true)
 }
 
+/// Check each retained schema independently before the SDK constructs its
+/// field indexes. Metadata history is not one logical schema budget.
+pub(crate) fn preflight_table_metadata(json: &str) -> Result<(), String> {
+    preflight(json, Role::Metadata, false)
+}
+
+/// REST load/create/register/commit responses carry one `metadata` envelope.
+/// This callback runs before SDK response materialization, not after it.
+pub(crate) fn preflight_rest_table_response(bytes: &[u8]) -> Result<(), String> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|_| "Iceberg table response preflight: invalid UTF-8".to_string())?;
+    preflight(json, Role::RestTable, false)
+}
+
+pub(crate) fn decode_table_metadata(
+    json: &str,
+) -> Result<crate::iceberg::spec::TableMetadata, String> {
+    use serde::Deserialize;
+    preflight_table_metadata(json)?;
+    let mut decoder = serde_json::Deserializer::from_str(json);
+    decoder.disable_recursion_limit();
+    let metadata = crate::iceberg::spec::TableMetadata::deserialize(&mut decoder)
+        .map_err(|error| format!("decode Iceberg table metadata: {error}"))?;
+    decoder
+        .end()
+        .map_err(|error| format!("decode Iceberg table metadata: {error}"))?;
+    Ok(metadata)
+}
+
+pub(crate) fn decode_table_metadata_bytes(
+    bytes: &[u8],
+) -> Result<crate::iceberg::spec::TableMetadata, String> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|error| format!("decode Iceberg table metadata UTF-8: {error}"))?;
+    decode_table_metadata(json)
+}
+
+pub(crate) async fn read_table_metadata(
+    file_io: &crate::iceberg::io::FileIO,
+    location: impl AsRef<str>,
+) -> crate::iceberg::Result<crate::iceberg::spec::TableMetadata> {
+    crate::iceberg::spec::TableMetadata::read_from_with_decoder(
+        file_io,
+        location,
+        decode_sdk_table_metadata,
+    )
+    .await
+}
+
+pub(crate) fn decode_sdk_table_metadata(
+    bytes: &[u8],
+) -> crate::iceberg::Result<crate::iceberg::spec::TableMetadata> {
+    decode_table_metadata_bytes(bytes).map_err(|message| {
+        crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
+    })
+}
+
 fn preflight(json: &str, root: Role, count_root: bool) -> Result<(), String> {
     let mut scan = Scan {
         bytes: json.as_bytes(),
@@ -56,6 +119,16 @@ fn preflight(json: &str, root: Role, count_root: bool) -> Result<(), String> {
         nodes: 0,
         names: 0,
         values: 0,
+        json_depth_limit: if matches!(root, Role::Metadata | Role::RestTable) {
+            127
+        } else {
+            MAX_JSON_DEPTH
+        },
+        json_value_limit: if matches!(root, Role::Metadata | Role::RestTable) {
+            None
+        } else {
+            Some(MAX_JSON_VALUES)
+        },
         limits: LogicalTypeLimits::default(),
     };
     if count_root {
@@ -70,6 +143,80 @@ fn preflight(json: &str, root: Role, count_root: bool) -> Result<(), String> {
 }
 
 impl<'a> Scan<'a> {
+    // Inspect the discriminator without materializing values or depending on
+    // object member order. The semantic pass below remains the JSON authority.
+    fn metadata_has_v1_schema(&self) -> Result<bool, String> {
+        let mut scan = Scan {
+            offset: self.offset,
+            ..*self
+        };
+        scan.expect(b'{')?;
+        let mut legacy = false;
+        loop {
+            scan.space();
+            if scan.bytes.get(scan.offset) == Some(&b'}') {
+                return Ok(legacy);
+            }
+            let (key, _, _) = scan.string()?;
+            scan.expect(b':')?;
+            scan.space();
+            let start = scan.offset;
+            scan.skip_value()?;
+            if metadata_key_eq(key, b"format-version") {
+                legacy = &scan.bytes[start..scan.offset] == b"1";
+            }
+            scan.space();
+            match scan.bytes.get(scan.offset) {
+                Some(b',') => scan.offset += 1,
+                Some(b'}') => return Ok(legacy),
+                _ => return Err("Iceberg metadata preflight: invalid object separator".into()),
+            }
+        }
+    }
+
+    // A lexical walk needs only a depth counter, even for a schema that the
+    // next pass will reject. It cannot construct SDK vectors or field indexes.
+    fn skip_value(&mut self) -> Result<(), String> {
+        match self.bytes.get(self.offset) {
+            Some(b'"') => {
+                self.string()?;
+            }
+            Some(b'{' | b'[') => {
+                let mut depth = 0usize;
+                loop {
+                    match self.bytes.get(self.offset) {
+                        Some(b'"') => {
+                            self.string()?;
+                            continue;
+                        }
+                        Some(b'{' | b'[') => depth += 1,
+                        Some(b'}' | b']') => depth -= 1,
+                        Some(_) => (),
+                        None => return Err("Iceberg metadata preflight: truncated value".into()),
+                    }
+                    self.offset += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                let start = self.offset;
+                while self
+                    .bytes
+                    .get(self.offset)
+                    .is_some_and(|b| !b.is_ascii_whitespace() && !b",]}".contains(b))
+                {
+                    self.offset += 1;
+                }
+                if start == self.offset {
+                    return Err("Iceberg metadata preflight: missing value".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn space(&mut self) {
         while self
             .bytes
@@ -179,8 +326,42 @@ impl<'a> Scan<'a> {
         }
     }
     fn value(&mut self, role: Role, json_depth: usize) -> Result<(), String> {
-        self.values += 1;
-        if json_depth > MAX_JSON_DEPTH || self.values > MAX_JSON_VALUES {
+        // The envelope may contain optional V1 `schema`/`schemas`. Every
+        // non-null schema restarts the existing independent shape budgets.
+        if matches!(role, Role::OptionalSchema) {
+            self.space();
+            if self.bytes.get(self.offset) != Some(&b'n') {
+                let saved = (
+                    self.nodes,
+                    self.names,
+                    self.values,
+                    self.json_depth_limit,
+                    self.json_value_limit,
+                );
+                self.nodes = 0;
+                self.names = 0;
+                self.values = 0;
+                self.json_depth_limit = MAX_JSON_DEPTH;
+                self.json_value_limit = Some(MAX_JSON_VALUES);
+                let result = self.value(Role::Root, 0);
+                (
+                    self.nodes,
+                    self.names,
+                    self.values,
+                    self.json_depth_limit,
+                    self.json_value_limit,
+                ) = saved;
+                return result;
+            }
+        }
+        if self.json_value_limit.is_some() {
+            self.values += 1;
+        }
+        if json_depth > self.json_depth_limit
+            || self
+                .json_value_limit
+                .is_some_and(|limit| self.values > limit)
+        {
             return Err("Iceberg schema preflight: independent JSON budget exceeded".into());
         }
         if let Role::Field(depth) = role {
@@ -191,13 +372,27 @@ impl<'a> Scan<'a> {
             .bytes
             .get(self.offset)
             .ok_or("Iceberg schema preflight: missing value")?;
-        if matches!(role, Role::Root | Role::Field(_)) && byte != b'{'
+        if self.json_value_limit.is_none()
+            && matches!(byte, b'{' | b'[')
+            && json_depth >= self.json_depth_limit
+        {
+            return Err(
+                "Iceberg metadata preflight: ordinary JSON recursion limit exceeded".into(),
+            );
+        }
+        if matches!(
+            role,
+            Role::RestTable | Role::Metadata | Role::Root | Role::Field(_)
+        ) && byte != b'{'
             || matches!(role, Role::Fields(_)) && byte != b'['
+            || matches!(role, Role::Schemas) && byte != b'[' && byte != b'n'
         {
             return Err("Iceberg schema preflight: invalid semantic shape".into());
         }
         match byte {
             b'{' => {
+                let legacy_schema =
+                    matches!(role, Role::Metadata) && self.metadata_has_v1_schema()?;
                 self.offset += 1;
                 self.space();
                 if self.bytes.get(self.offset) == Some(&b'}') {
@@ -206,12 +401,17 @@ impl<'a> Scan<'a> {
                 }
                 loop {
                     let (key, escaped, _) = self.string()?;
-                    if escaped && !matches!(role, Role::Opaque) {
+                    if escaped && !matches!(role, Role::Opaque | Role::Metadata | Role::RestTable) {
                         return Err("Iceberg schema preflight: noncanonical grammar key".into());
                     }
                     // Keys borrow the input, so no field vector or SDK index
                     // exists while semantic child budgets are being checked.
                     let next = match (role, key) {
+                        (Role::RestTable, _) if metadata_key_eq(key, b"metadata") => Role::Metadata,
+                        (Role::Metadata, _) if legacy_schema && metadata_key_eq(key, b"schema") => {
+                            Role::OptionalSchema
+                        }
+                        (Role::Metadata, _) if metadata_key_eq(key, b"schemas") => Role::Schemas,
                         (Role::Root, b"fields") => Role::Fields(1),
                         (Role::Type(depth), b"fields") => Role::Fields(depth + 1),
                         (Role::Field(depth), b"type") => Role::Type(depth),
@@ -254,6 +454,7 @@ impl<'a> Scan<'a> {
                 }
                 loop {
                     let next = match role {
+                        Role::Schemas => Role::OptionalSchema,
                         Role::Fields(depth) => Role::Field(depth),
                         _ => Role::Opaque,
                     };
@@ -306,9 +507,269 @@ impl<'a> Scan<'a> {
     }
 }
 
+// The JSON envelope accepts escaped member names just as the SDK does. Only
+// two ASCII names matter here; no decoded key allocation is needed.
+fn metadata_key_eq(raw: &[u8], expected: &[u8]) -> bool {
+    let mut offset = 0;
+    for &byte in expected {
+        let actual = match raw.get(offset) {
+            Some(b'\\') if raw.get(offset + 1) == Some(&b'u') => {
+                let Some(digits) = raw.get(offset + 2..offset + 6) else {
+                    return false;
+                };
+                let mut scalar = 0u32;
+                for digit in digits {
+                    let Some(hex) = (*digit as char).to_digit(16) else {
+                        return false;
+                    };
+                    scalar = scalar * 16 + hex;
+                }
+                offset += 6;
+                scalar
+            }
+            Some(&plain) => {
+                offset += 1;
+                u32::from(plain)
+            }
+            None => return false,
+        };
+        if actual != u32::from(byte) {
+            return false;
+        }
+    }
+    offset == raw.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table_metadata_json(depth: usize) -> String {
+        table_metadata_json_version(depth, crate::iceberg::spec::FormatVersion::V2)
+    }
+
+    fn table_metadata_json_version(
+        depth: usize,
+        version: crate::iceberg::spec::FormatVersion,
+    ) -> String {
+        use crate::iceberg::spec::{
+            NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, StructType,
+            TableMetadataBuilder, Type,
+        };
+        use std::sync::Arc;
+        let mut field = NestedField::optional(
+            depth as i32,
+            format!("n{depth}"),
+            Type::Primitive(PrimitiveType::Int),
+        );
+        for id in (1..depth).rev() {
+            field = NestedField::optional(
+                id as i32,
+                format!("n{id}"),
+                Type::Struct(StructType::new(vec![Arc::new(field)])),
+            );
+        }
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(field)])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "s3://warehouse/deep".into(),
+            version,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        serde_json::to_string(&metadata).unwrap()
+    }
+
+    #[test]
+    fn full_table_metadata_preflight_accepts_64_before_sdk_and_rejects_65() {
+        let exact = table_metadata_json(64);
+        assert!(serde_json::from_str::<crate::iceberg::spec::TableMetadata>(&exact).is_err());
+        let decoded = decode_table_metadata(&exact).unwrap();
+        assert_eq!(decoded.current_schema().highest_field_id(), 64);
+        assert!(
+            decode_table_metadata(&table_metadata_json(65))
+                .unwrap_err()
+                .contains("semantic budget")
+        );
+        assert!(decode_table_metadata(&(exact.clone() + " null")).is_err());
+        assert!(decode_table_metadata_bytes(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn full_table_metadata_preflight_checks_every_schema_with_independent_budgets() {
+        let fields = (1..=3000)
+            .map(|id| {
+                format!("{{\"id\":{id},\"name\":\"n{id}\",\"required\":false,\"type\":\"int\"}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema = format!("{{\"type\":\"struct\",\"fields\":[{fields}]}}");
+        assert!(
+            preflight_table_metadata(&format!(
+                "{{\"schemas\":[{schema},{schema}],\"schema\":null}}"
+            ))
+            .is_ok()
+        );
+        let invalid = format!(
+            "{{\"type\":\"struct\",\"fields\":[{{\"id\":1,\"name\":\"n\",\"required\":false,\"type\":{}}}]}}",
+            nested_type(65)
+        );
+        assert!(
+            preflight_table_metadata(&format!("{{\"schemas\":[{schema},{invalid}]}}")).is_err()
+        );
+        assert!(
+            preflight_table_metadata(&format!(
+                "{{\"schema\":{invalid},\"schemas\":[{schema}],\"format-version\":1}}"
+            ))
+            .is_err()
+        );
+        assert!(preflight_table_metadata("{\"schema\":null,\"schemas\":null}").is_ok());
+    }
+
+    #[test]
+    fn full_table_metadata_preflight_preserves_versioned_legacy_schema_semantics() {
+        use crate::iceberg::spec::FormatVersion;
+        let v1 = table_metadata_json_version(64, FormatVersion::V1);
+        assert_eq!(
+            decode_table_metadata(&v1)
+                .unwrap()
+                .current_schema()
+                .highest_field_id(),
+            64
+        );
+        assert!(
+            decode_table_metadata(&table_metadata_json_version(65, FormatVersion::V1)).is_err()
+        );
+
+        let v2 = table_metadata_json(1);
+        for extension in ["0", "[]", "\"ignored\""] {
+            let extended = format!("{{\"schema\":{extension},{}", &v2[1..]);
+            assert!(serde_json::from_str::<crate::iceberg::spec::TableMetadata>(&extended).is_ok());
+            assert!(decode_table_metadata(&extended).is_ok());
+        }
+        let mut unknown = "0".to_owned();
+        for _ in 0..65 {
+            unknown = format!("{{\"unknown\":{unknown}}}");
+        }
+        let extended = format!("{{\"schema\":{unknown},{}", &v2[1..]);
+        assert!(serde_json::from_str::<crate::iceberg::spec::TableMetadata>(&extended).is_ok());
+        assert!(decode_table_metadata(&extended).is_ok());
+        let invalid_v1 = format!(
+            "{{\"schema\":0,{}",
+            &table_metadata_json_version(1, FormatVersion::V1)[1..]
+        );
+        assert!(decode_table_metadata(&invalid_v1).is_err());
+    }
+
+    #[test]
+    fn full_table_metadata_preflight_recognizes_escaped_envelope_keys() {
+        let json = table_metadata_json(64).replacen("\"schemas\"", "\"\\u0073chemas\"", 1);
+        assert!(decode_table_metadata(&json).is_ok());
+        let invalid = table_metadata_json(65).replacen("\"schemas\"", "\"schem\\u0061s\"", 1);
+        assert!(
+            preflight_table_metadata(&invalid)
+                .unwrap_err()
+                .contains("semantic budget")
+        );
+    }
+
+    #[test]
+    fn full_table_metadata_preflight_covers_rest_response_before_sdk() {
+        let metadata = table_metadata_json(64);
+        let response = format!(
+            "{{\"metadata\":{metadata},\"metadata-location\":\"s3://warehouse/metadata.json\",\"config\":{{}}}}"
+        );
+        assert!(preflight_rest_table_response(response.as_bytes()).is_ok());
+        assert!(serde_json::from_str::<serde_json::Value>(&response).is_err());
+        let mut decoder = serde_json::Deserializer::from_str(&response);
+        decoder.disable_recursion_limit();
+        let decoded: serde_json::Value = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        let table: crate::iceberg::spec::TableMetadata =
+            serde_json::from_value(decoded["metadata"].clone()).unwrap();
+        assert_eq!(table.current_schema().highest_field_id(), 64);
+        assert!(
+            preflight_rest_table_response(
+                response
+                    .replacen("\"metadata\"", "\"\\u006detadata\"", 1)
+                    .as_bytes()
+            )
+            .is_ok()
+        );
+        let over = format!("{{\"metadata\":{}}}", table_metadata_json(65));
+        assert!(
+            preflight_rest_table_response(over.as_bytes())
+                .unwrap_err()
+                .contains("semantic budget")
+        );
+        let unrelated = format!(
+            "{{\"config\":{}0{},\"metadata\":{metadata}}}",
+            "[".repeat(127),
+            "]".repeat(127)
+        );
+        assert!(preflight_rest_table_response(unrelated.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn full_table_metadata_preflight_preserves_ordinary_json_recursion_boundary() {
+        for depth in [125, 126, 127, 128] {
+            let unknown = format!(
+                "{{\"unknown\":{}0{}}}",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            );
+            assert_eq!(
+                preflight_table_metadata(&unknown).is_ok(),
+                serde_json::from_str::<serde_json::Value>(&unknown).is_ok(),
+                "ordinary envelope depth {depth}"
+            );
+        }
+        let large = format!("{{\"unknown\":[{}]}}", "0,".repeat(MAX_JSON_VALUES) + "0");
+        assert!(
+            preflight_table_metadata(&large).is_ok(),
+            "metadata-wide value cap must not replace per-schema limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_table_metadata_preflight_file_reads_preserve_sdk_compression() {
+        use crate::iceberg::io::FileIO;
+        use std::io::Write;
+        let io = FileIO::new_with_memory();
+        for compressed in [false, true] {
+            for depth in [64, 65] {
+                let json = table_metadata_json(depth);
+                let bytes = if compressed {
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(json.as_bytes()).unwrap();
+                    encoder.finish().unwrap()
+                } else {
+                    json.into_bytes()
+                };
+                let path = format!("/schema-{depth}-{compressed}.metadata.json");
+                io.new_output(&path)
+                    .unwrap()
+                    .write(bytes.into())
+                    .await
+                    .unwrap();
+                let result = read_table_metadata(&io, &path).await;
+                if depth == 64 {
+                    assert_eq!(result.unwrap().current_schema().highest_field_id(), 64);
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("semantic budget"));
+                }
+            }
+        }
+    }
 
     fn nested_type(depth: usize) -> String {
         let mut ty = "\"int\"".to_string();
