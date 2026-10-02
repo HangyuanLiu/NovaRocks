@@ -103,9 +103,12 @@ impl Header {
     }
 
     pub(crate) fn new_shared(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+        if name.as_ref() == b":method" {
+            return Ok(Header::Method(Method::from_owned_bytes(value)?));
+        }
         if name.first().is_none_or(|b| *b == b':') {
-            // Preserve every pseudo-header conversion and error rule. Their
-            // Method/Scheme metadata is a separate ownership obligation.
+            // Other pseudo-headers already transfer their immutable Bytes or
+            // reduce to inline values. Preserve their conversion/error rules.
             return Self::new(name, value);
         }
         Ok(Header::Field {
@@ -245,6 +248,7 @@ impl<'a> Name<'a> {
                 name: name.clone(),
                 value: HeaderValue::from_maybe_shared(value)?,
             }),
+            Name::Method => Ok(Header::Method(Method::from_owned_bytes(value)?)),
             other => other.into_entry(value),
         }
     }

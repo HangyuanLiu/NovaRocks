@@ -32,7 +32,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::{self, FromStr};
 
-use self::scheme::Scheme2;
+use self::scheme::{Scheme2, SchemeStorage};
 
 pub use self::authority::Authority;
 pub use self::builder::Builder;
@@ -838,7 +838,7 @@ fn parse_full(mut s: Bytes) -> Result<Uri, InvalidUri> {
             // Allocate the ByteStr
             let val = unsafe { ByteStr::from_utf8_unchecked(scheme) };
 
-            Scheme2::Other(Box::new(val))
+            Scheme2::Other(SchemeStorage::Owned(Box::new(val)))
         }
     };
 

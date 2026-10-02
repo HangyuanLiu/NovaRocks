@@ -2047,7 +2047,7 @@ impl proto::Peer for Peer {
             if is_connect && !has_protocol {
                 malformed!("malformed headers: :scheme in CONNECT");
             }
-            let maybe_scheme = scheme.parse();
+            let maybe_scheme = uri::Scheme::from_owned_bytes(scheme.clone().into_inner());
             let scheme = maybe_scheme.or_else(|why| {
                 malformed!(
                     "malformed headers: malformed scheme ({:?}): {}",

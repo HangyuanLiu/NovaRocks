@@ -18,6 +18,7 @@
 use self::extension::{AllocatedExtension, InlineExtension};
 use self::Inner::*;
 
+use bytes::Bytes;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::str::FromStr;
@@ -132,6 +133,25 @@ impl Method {
                 }
             }
         }
+    }
+
+    /// Converts owned bytes to an HTTP method without allocating or copying a
+    /// long extension method.
+    ///
+    /// Validation, case sensitivity and standard-method recognition are the
+    /// same as [`Method::from_bytes`]. Standard methods and extensions of at
+    /// most 15 bytes use their existing static or inline representation and
+    /// release the input owner. Longer extensions retain the exact immutable
+    /// bytes and their owner through every clone. This constructor does not
+    /// acquire funding; callers provide already-owned storage whose backing
+    /// remains valid until the last alias exits.
+    pub fn from_owned_bytes(src: Bytes) -> Result<Method, InvalidMethod> {
+        if src.len() <= InlineExtension::MAX {
+            return Method::from_bytes(&src);
+        }
+        Ok(Method(ExtensionAllocated(AllocatedExtension::new_shared(
+            src,
+        )?)))
     }
 
     fn extension_inline(src: &[u8]) -> Result<Method, InvalidMethod> {
@@ -306,15 +326,39 @@ impl Error for InvalidMethod {}
 
 mod extension {
     use super::InvalidMethod;
+    use bytes::Bytes;
+    use std::hash::{Hash, Hasher};
     use std::str;
 
     #[derive(Clone, PartialEq, Eq, Hash)]
     // Invariant: the first self.1 bytes of self.0 are valid UTF-8.
     pub struct InlineExtension([u8; InlineExtension::MAX], u8);
 
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    // Invariant: self.0 contains valid UTF-8.
-    pub struct AllocatedExtension(Box<[u8]>);
+    #[derive(Clone)]
+    // Invariant: both storage variants contain valid UTF-8 method tokens.
+    pub struct AllocatedExtension(Storage);
+
+    #[derive(Clone)]
+    enum Storage {
+        // Preserve the ordinary constructor's eager Box clone.
+        Owned(Box<[u8]>),
+        // Clones retain the exact original immutable backing without allocation.
+        Shared(Bytes),
+    }
+
+    impl PartialEq for AllocatedExtension {
+        fn eq(&self, other: &Self) -> bool {
+            self.as_bytes() == other.as_bytes()
+        }
+    }
+
+    impl Eq for AllocatedExtension {}
+
+    impl Hash for AllocatedExtension {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.as_bytes().hash(state);
+        }
+    }
 
     impl InlineExtension {
         // Method::from_bytes() assumes this is at least 7
@@ -346,13 +390,27 @@ mod extension {
 
             // Invariant: data is exactly src.len() long and write_checked
             // ensures that the first src.len() bytes of data are valid UTF-8.
-            Ok(AllocatedExtension(data.into_boxed_slice()))
+            Ok(AllocatedExtension(Storage::Owned(data.into_boxed_slice())))
+        }
+
+        pub fn new_shared(src: Bytes) -> Result<AllocatedExtension, InvalidMethod> {
+            if src.iter().any(|&b| METHOD_CHARS[b as usize] == 0) {
+                return Err(InvalidMethod::new());
+            }
+            // Invariant: METHOD_CHARS accepts only valid single-byte UTF-8.
+            Ok(AllocatedExtension(Storage::Shared(src)))
+        }
+
+        fn as_bytes(&self) -> &[u8] {
+            match &self.0 {
+                Storage::Owned(bytes) => bytes,
+                Storage::Shared(bytes) => bytes,
+            }
         }
 
         pub fn as_str(&self) -> &str {
-            // Safety: the invariant of AllocatedExtension ensures that self.0
-            // contains valid UTF-8.
-            unsafe { str::from_utf8_unchecked(&self.0) }
+            // Safety: both constructors validate every byte with METHOD_CHARS.
+            unsafe { str::from_utf8_unchecked(self.as_bytes()) }
         }
     }
 

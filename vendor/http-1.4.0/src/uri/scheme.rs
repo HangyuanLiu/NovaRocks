@@ -1,6 +1,7 @@
 use std::convert::TryFrom;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::str::FromStr;
 
 use bytes::Bytes;
@@ -15,10 +16,29 @@ pub struct Scheme {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum Scheme2<T = Box<ByteStr>> {
+pub(super) enum Scheme2<T = SchemeStorage> {
     None,
     Standard(Protocol),
     Other(T),
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum SchemeStorage {
+    // Preserve ordinary parser and Clone allocation behavior.
+    Owned(Box<ByteStr>),
+    // The supplied immutable owner remains inline through Scheme/Uri clones.
+    Shared(ByteStr),
+}
+
+impl Deref for SchemeStorage {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -41,6 +61,30 @@ impl Scheme {
     pub(super) fn empty() -> Self {
         Scheme {
             inner: Scheme2::None,
+        }
+    }
+
+    /// Parse a scheme while retaining the original immutable byte owner.
+    ///
+    /// This uses the same validation and case-preserving behavior as
+    /// [`Scheme::try_from`]. A custom scheme keeps `bytes` inline without copying
+    /// its payload or allocating a `Box`; clones share that byte owner. The
+    /// recognized `http` and `https` schemes use their static representation and
+    /// release the supplied bytes. Invalid input also releases its owner.
+    ///
+    /// This method does not normalize the input or impose additional URI syntax
+    /// restrictions. Any allocation or capacity ownership of the supplied bytes
+    /// remains the caller's responsibility.
+    pub fn from_owned_bytes(bytes: Bytes) -> Result<Self, InvalidUri> {
+        match Scheme2::parse_exact(&bytes)? {
+            Scheme2::None => Err(ErrorKind::InvalidScheme.into()),
+            Scheme2::Standard(protocol) => Ok(Scheme2::Standard(protocol).into()),
+            Scheme2::Other(()) => {
+                // SAFETY: parse_exact accepts only single-byte UTF-8 scheme
+                // characters, and the immutable Bytes retains those exact bytes.
+                let value = unsafe { ByteStr::from_utf8_unchecked(bytes) };
+                Ok(Scheme2::Other(SchemeStorage::Shared(value)).into())
+            }
         }
     }
 
@@ -83,7 +127,7 @@ impl<'a> TryFrom<&'a [u8]> for Scheme {
                 // hence bytes are valid UTF-8.
                 let string = unsafe { ByteStr::from_utf8_unchecked(bytes) };
 
-                Ok(Other(Box::new(string)).into())
+                Ok(Other(SchemeStorage::Owned(Box::new(string))).into())
             }
         }
     }
