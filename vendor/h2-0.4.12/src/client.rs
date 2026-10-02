@@ -324,6 +324,7 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
     max_receive_buffered_events: Option<usize>,
+    receive_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
@@ -657,6 +658,7 @@ impl Builder {
         Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             max_receive_buffered_events: None,
+            receive_buffer_pool: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -1098,6 +1100,15 @@ impl Builder {
         self
     }
 
+    /// Supply fixed retained DATA backing owned through its last Bytes alias.
+    /// One pool binds once to one connection. A reused pool or a local receive
+    /// frame maximum exceeding its buffer size is refused before handshake I/O.
+    /// This does not bound the original codec read or header/write backing.
+    pub fn receive_buffer_pool(&mut self, pool: crate::ReceiveBufferPool) -> &mut Self {
+        self.receive_buffer_pool = Some(pool);
+        self
+    }
+
     /// Enables or disables server push promises.
     ///
     /// This value is included in the initial SETTINGS handshake.
@@ -1333,7 +1344,7 @@ where
         // A pushed request can precede its parent's response while no push
         // consumer exists. Native's bounded profile explicitly disables push;
         // refuse the conflicting local configuration before writing a preface.
-        if builder.max_receive_buffered_events.is_some()
+        if (builder.max_receive_buffered_events.is_some() || builder.receive_buffer_pool.is_some())
             && builder.settings.is_push_enabled().unwrap_or(true)
         {
             return Err(crate::Error::from_io(std::io::Error::new(
@@ -1341,6 +1352,18 @@ where
                 "bounded receive events require explicit enable_push(false)",
             )));
         }
+        if builder.receive_buffer_pool.is_some() && builder.max_receive_buffered_events.is_none() {
+            return Err(crate::Error::from_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "receive pool requires an explicit buffered event limit",
+            )));
+        }
+        let receive_pool = builder
+            .receive_buffer_pool
+            .as_ref()
+            .map(|pool| pool.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
+            .transpose()
+            .map_err(crate::Error::from_io)?;
         bind_connection(&mut io).await?;
 
         // Create the codec
@@ -1348,6 +1371,10 @@ where
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
+        }
+
+        if let Some(pool) = receive_pool {
+            codec.set_receive_pool(pool);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {

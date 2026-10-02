@@ -346,3 +346,163 @@ async fn hyper_canceling_stalled_body_resumes_the_other_stream() {
     drop(connection);
     exec.cancel_all();
 }
+
+fn funded_receive_pool() -> (
+    h2::ReceiveBufferPool,
+    Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
+    usize,
+) {
+    use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
+    let bytes = h2::ReceiveBufferPool::allocation_capacity_bound(1, 16384).unwrap()
+        + Bytes::owner_with_exit_guard_metadata_size::<Bytes, ResultWriteCredit>();
+    let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
+        std::num::NonZeroUsize::new(bytes).unwrap(),
+    );
+    let ResultWriteAdmission::Granted(credit) = budget.try_reserve_process(bytes).unwrap() else {
+        panic!("original pool pregrant");
+    };
+    let carrier = Bytes::from_owner_with_exit_guard(Bytes::new(), credit);
+    (
+        h2::ReceiveBufferPool::new(1, 16384, carrier).unwrap(),
+        budget,
+        bytes,
+    )
+}
+
+fn assert_pool_held(budget: &Arc<novarocks_worker::result_buffer::ResultRetainedBudget>) {
+    assert!(matches!(
+        budget.try_reserve_process(1).unwrap(),
+        novarocks_execution::runtime::fragment::io::ResultWriteAdmission::Blocked
+    ));
+}
+fn assert_pool_released(
+    budget: &Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
+    bytes: usize,
+) {
+    assert!(matches!(
+        budget.try_reserve_process(bytes).unwrap(),
+        novarocks_execution::runtime::fragment::io::ResultWriteAdmission::Granted(_)
+    ));
+}
+
+#[tokio::test]
+async fn hyper_server_retained_alias_keeps_original_pool_through_transport_exit() {
+    let (io, mut peer) = tokio::io::duplex(64 * 1024);
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    frame(&mut wire, 4, 0, 0, &[]);
+    frame(&mut wire, 4, 1, 0, &[]);
+    frame(&mut wire, 1, 4, 1, b"\x83\x86\x84\x01\x09localhost");
+    frame(&mut wire, 0, 0, 1, &[1]);
+    frame(&mut wire, 0, 1, 1, &[2]);
+    peer.write_all(&wire).await.unwrap();
+    let exec = ManualExecutor::default();
+    let (sender, receiver) = mpsc::channel();
+    let service = service_fn(move |request: Request<Incoming>| {
+        sender.send(request.into_body()).unwrap();
+        std::future::pending::<Result<Response<Empty>, Infallible>>()
+    });
+    let (pool, budget, bytes) = funded_receive_pool();
+    let mut builder = hyper::server::conn::http2::Builder::new(exec.clone());
+    builder
+        .max_receive_buffered_events(8)
+        .receive_buffer_pool(pool.clone());
+    let mut connection = Box::pin(builder.clone().serve_connection(TokioIo::new(io), service));
+    let waker = Waker::from(Arc::new(WakeCount::default()));
+    let mut cx = Context::from_waker(&waker);
+    assert!(connection.as_mut().poll(&mut cx).is_pending());
+    let mut body = receiver.try_recv().unwrap();
+    let Poll::Ready(Some(Ok(first))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+        panic!("first DATA");
+    };
+    let first = first.into_data().unwrap();
+    assert_eq!(first.as_ref(), &[1]);
+    assert_eq!(pool.available_buffers(), 0);
+    // Incoming already released flow capacity. The retained alias still owns
+    // the full fixed backing; the connection cannot read the second DATA.
+    assert!(connection.as_mut().poll(&mut cx).is_pending());
+    assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
+    drop(first);
+    assert!(connection.as_mut().poll(&mut cx).is_pending());
+    let Poll::Ready(Some(Ok(last))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+        panic!("second DATA resumes");
+    };
+    let last = last.into_data().unwrap();
+    assert_eq!(last.as_ref(), &[2]);
+    drop(body);
+    drop(connection);
+    drop(builder);
+    exec.cancel_all();
+    drop(pool);
+    assert_pool_held(&budget);
+    drop(last);
+    assert_pool_released(&budget, bytes);
+}
+
+#[tokio::test]
+async fn hyper_client_retained_alias_keeps_original_pool_through_transport_exit() {
+    let (io, mut peer) = tokio::io::duplex(64 * 1024);
+    let mut wire = Vec::new();
+    frame(&mut wire, 4, 0, 0, &[]);
+    frame(&mut wire, 4, 1, 0, &[]);
+    frame(&mut wire, 1, 4, 1, &[0x88]);
+    frame(&mut wire, 0, 0, 1, &[1]);
+    frame(&mut wire, 0, 1, 1, &[2]);
+    peer.write_all(&wire).await.unwrap();
+    let exec = ManualExecutor::default();
+    let (pool, budget, bytes) = funded_receive_pool();
+    let mut builder = hyper::client::conn::http2::Builder::new(exec.clone());
+    builder
+        .max_receive_buffered_events(8)
+        .receive_buffer_pool(pool.clone());
+    let (mut sender, connection) = builder
+        .clone()
+        .handshake::<_, Empty>(TokioIo::new(io))
+        .await
+        .unwrap();
+    let mut connection = Box::pin(connection);
+    let mut response = Box::pin(
+        sender.send_request(
+            Request::builder()
+                .uri("http://localhost/")
+                .body(Empty)
+                .unwrap(),
+        ),
+    );
+    let waker = Waker::from(Arc::new(WakeCount::default()));
+    let mut cx = Context::from_waker(&waker);
+    assert!(connection.as_mut().poll(&mut cx).is_pending());
+    let mut body = None;
+    for _ in 0..8 {
+        exec.poll_once(&mut cx);
+        if let Poll::Ready(result) = response.as_mut().poll(&mut cx) {
+            body = Some(result.unwrap().into_body());
+            break;
+        }
+    }
+    let mut body = body.unwrap();
+    let Poll::Ready(Some(Ok(first))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+        panic!("first DATA");
+    };
+    let first = first.into_data().unwrap();
+    assert_eq!(first.as_ref(), &[1]);
+    exec.poll_once(&mut cx);
+    assert_eq!(pool.available_buffers(), 0);
+    assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
+    drop(first);
+    exec.poll_once(&mut cx);
+    let Poll::Ready(Some(Ok(last))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+        panic!("second DATA resumes");
+    };
+    let last = last.into_data().unwrap();
+    assert_eq!(last.as_ref(), &[2]);
+    drop(body);
+    drop(response);
+    drop(sender);
+    drop(connection);
+    drop(builder);
+    exec.cancel_all();
+    drop(pool);
+    assert_pool_held(&budget);
+    drop(last);
+    assert_pool_released(&budget, bytes);
+}

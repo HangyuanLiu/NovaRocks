@@ -66,6 +66,10 @@ impl<T, B> Codec<T, B> {
     /// size greater than `val` but less than the max frame size in effect
     /// before calling this function, then the frame will be allowed.
     #[inline]
+    pub fn set_receive_pool(&mut self, pool: crate::ReceiveBufferPool) {
+        self.inner.set_receive_pool(pool);
+    }
+
     pub fn set_max_recv_frame_size(&mut self, val: usize) {
         self.inner.set_max_frame_size(val)
     }

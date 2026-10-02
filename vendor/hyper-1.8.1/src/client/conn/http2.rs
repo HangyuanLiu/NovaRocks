@@ -472,6 +472,15 @@ where
         self
     }
 
+    /// Supplies fixed retained DATA backing through its final Bytes alias.
+    /// The pool binds once to one connection and requires an explicit receive
+    /// event limit. A cloned builder retains the same original pool owner.
+    /// This does not bound the codec's original read/header/write backing.
+    pub fn receive_buffer_pool(&mut self, pool: h2::ReceiveBufferPool) -> &mut Self {
+        self.h2_builder.receive_buffer_pool = Some(pool);
+        self
+    }
+
     /// Configures the maximum number of pending reset streams allowed before a GOAWAY will be sent.
     ///
     /// This will default to the default value set by the [`h2` crate](https://crates.io/crates/h2).

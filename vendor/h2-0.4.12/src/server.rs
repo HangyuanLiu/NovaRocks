@@ -253,6 +253,7 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
     max_receive_buffered_events: Option<usize>,
+    receive_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams due to protocol error across
     /// the lifetime of the connection.
@@ -308,6 +309,7 @@ impl<B: Buf + fmt::Debug> fmt::Debug for SendPushedResponse<B> {
 
 /// Stages of an in-progress handshake.
 enum Handshaking<T, B: Buf> {
+    Failed(Option<crate::Error>),
     /// State 1. Connection is flushing pending SETTINGS frame.
     Flushing(Instrumented<Flush<T, Prioritized<B>>>),
     /// State 2. Connection is waiting for the client preface.
@@ -381,11 +383,42 @@ where
         let span = tracing::trace_span!("server_handshake");
         let entered = span.enter();
 
+        if builder.receive_buffer_pool.is_some() && builder.max_receive_buffered_events.is_none() {
+            drop(entered);
+            return Handshake {
+                builder,
+                state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "receive pool requires an explicit buffered event limit",
+                )))),
+                span,
+            };
+        }
+        let receive_pool = match builder
+            .receive_buffer_pool
+            .as_ref()
+            .map(|pool| pool.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
+            .transpose()
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
         // Create the codec.
         let mut codec = Codec::new(io);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
+        }
+
+        if let Some(pool) = receive_pool {
+            codec.set_receive_pool(pool);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {
@@ -657,6 +690,7 @@ impl Builder {
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             max_receive_buffered_events: None,
+            receive_buffer_pool: None,
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
@@ -990,6 +1024,15 @@ impl Builder {
     pub fn max_receive_buffered_events(&mut self, max: usize) -> &mut Self {
         assert!(max > 0, "receive event capacity must be positive");
         self.max_receive_buffered_events = Some(max);
+        self
+    }
+
+    /// Supply fixed retained DATA backing owned through its last Bytes alias.
+    /// One pool binds once to one connection. A reused pool or a local receive
+    /// frame maximum exceeding its buffer size is refused before handshake I/O.
+    /// This does not bound the original codec read or header/write backing.
+    pub fn receive_buffer_pool(&mut self, pool: crate::ReceiveBufferPool) -> &mut Self {
+        self.receive_buffer_pool = Some(pool);
         self
     }
 
@@ -1422,6 +1465,11 @@ where
 
                     return Poll::Ready(Ok(c));
                 }
+                Handshaking::Failed(error) => {
+                    let error = error.take().expect("failed handshake is polled only once");
+                    self.state = Handshaking::Done;
+                    return Poll::Ready(Err(error));
+                }
                 Handshaking::Done => {
                     panic!("Handshaking::poll() called again after handshaking was complete")
                 }
@@ -1658,6 +1706,7 @@ where
         match *self {
             Handshaking::Flushing(_) => f.write_str("Flushing(_)"),
             Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
+            Handshaking::Failed(_) => f.write_str("Failed"),
             Handshaking::Done => f.write_str("Done"),
         }
     }

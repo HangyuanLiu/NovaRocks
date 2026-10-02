@@ -54,6 +54,7 @@ pub(crate) struct Config {
     pub(crate) keep_alive_timeout: Duration,
     pub(crate) max_send_buffer_size: usize,
     pub(crate) max_receive_buffered_events: Option<usize>,
+    pub(crate) receive_buffer_pool: Option<h2::ReceiveBufferPool>,
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
 }
@@ -73,6 +74,7 @@ impl Default for Config {
             keep_alive_timeout: Duration::from_secs(20),
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
             max_receive_buffered_events: None,
+            receive_buffer_pool: None,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
         }
@@ -138,6 +140,9 @@ where
             .max_header_list_size(config.max_header_list_size)
             .max_local_error_reset_streams(config.max_local_error_reset_streams)
             .max_send_buffer_size(config.max_send_buffer_size);
+        if let Some(pool) = &config.receive_buffer_pool {
+            builder.receive_buffer_pool(pool.clone());
+        }
         if let Some(max) = config.max_receive_buffered_events {
             builder.max_receive_buffered_events(max);
         }

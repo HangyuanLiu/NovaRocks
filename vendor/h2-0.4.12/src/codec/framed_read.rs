@@ -33,6 +33,7 @@ pub struct FramedRead<T> {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+    receive_pool: Option<crate::ReceiveBufferPool>,
 }
 
 /// Partially loaded headers frame
@@ -64,6 +65,7 @@ impl<T> FramedRead<T> {
             max_header_list_size,
             max_continuation_frames,
             partial: None,
+            receive_pool: None,
         }
     }
 
@@ -73,6 +75,12 @@ impl<T> FramedRead<T> {
 
     pub fn get_mut(&mut self) -> &mut T {
         self.inner.get_mut()
+    }
+
+    /// Install fixed retained DATA backing for this decoder.
+    pub fn set_receive_pool(&mut self, pool: crate::ReceiveBufferPool) {
+        assert!(self.max_frame_size() <= pool.buffer_capacity_bytes());
+        self.receive_pool = Some(pool);
     }
 
     /// Returns the current max frame size setting
@@ -86,6 +94,9 @@ impl<T> FramedRead<T> {
     /// Must be within 16,384 and 16,777,215.
     #[inline]
     pub fn set_max_frame_size(&mut self, val: usize) {
+        if let Some(pool) = &self.receive_pool {
+            assert!(val <= pool.buffer_capacity_bytes());
+        }
         assert!(DEFAULT_MAX_FRAME_SIZE as usize <= val && val <= MAX_MAX_FRAME_SIZE as usize);
         self.inner.decoder_mut().set_max_frame_length(val);
         // Update max CONTINUATION frames too, since its based on this
@@ -380,6 +391,9 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
+            if let Some(pool) = &self.receive_pool {
+                ready!(pool.poll_ready(cx));
+            }
             let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
                 Some(Ok(bytes)) => bytes,
                 Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
@@ -394,16 +408,30 @@ where
                 max_continuation_frames,
                 ..
             } = *self;
-            if let Some(frame) = decode_frame(
+            if let Some(mut frame) = decode_frame(
                 hpack,
                 max_header_list_size,
                 max_continuation_frames,
                 partial,
                 bytes,
             )? {
+                if let (Some(pool), Frame::Data(data)) = (&self.receive_pool, &mut frame) {
+                    // Replace the whole original read-buffer alias before it
+                    // escapes. Flow credit is independent of this pool slot.
+                    let owned = pool.copy_data(data.payload());
+                    *data.payload_mut() = owned;
+                }
                 tracing::debug!(?frame, "received");
                 return Poll::Ready(Some(Ok(frame)));
             }
+        }
+    }
+}
+
+impl<T> Drop for FramedRead<T> {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.receive_pool {
+            pool.detach_waker();
         }
     }
 }

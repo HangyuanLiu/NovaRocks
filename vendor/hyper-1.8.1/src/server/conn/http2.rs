@@ -270,6 +270,15 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Supplies fixed retained DATA backing through its final Bytes alias.
+    /// The pool binds once to one connection and requires an explicit receive
+    /// event limit. A cloned builder retains the same original pool owner.
+    /// This does not bound the codec's original read/header/write backing.
+    pub fn receive_buffer_pool(&mut self, pool: h2::ReceiveBufferPool) -> &mut Self {
+        self.h2_builder.receive_buffer_pool = Some(pool);
+        self
+    }
+
     /// Enables the [extended CONNECT protocol].
     ///
     /// [extended CONNECT protocol]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
