@@ -16,6 +16,7 @@
 // under the License.
 
 //! Global allocator adapter. Every route preserves requested Layout and provenance.
+// Design: ADR-0167 (docs/adr/ADR-0167-size-banded-allocation-attribution.md)
 use super::{
     band::{is_tagged, tagged_layout},
     counters::{BandCounters, BandSnapshot},

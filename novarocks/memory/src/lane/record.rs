@@ -16,6 +16,7 @@
 // under the License.
 
 //! Fixed records and the atomic lifetime word shared by hooks and reclamation.
+// Design: ADR-0167 (docs/adr/ADR-0167-size-banded-allocation-attribution.md)
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) const COUNT_BITS: u32 = 40;

@@ -2,9 +2,9 @@
 id: ADR-0166
 title: "Independent funding domains and stable allocation origins replace retention lineage"
 domain: [memory-governance]
-status: active
+status: superseded
 supersedes: [ADR-0160]
-superseded-by: null
+superseded-by: ADR-0167
 date: 2026-09-30
 provenance:
   - "discussion: 2026-09-29 independent funding, local stock and stable-origin retirement"
@@ -12,7 +12,7 @@ provenance:
 code-anchors:
   - "novarocks/memory/src/account.rs (Path, grow_locked, AccountHandle)"
   - "novarocks/memory/src/domain.rs (FundingDomain, split_free)"
-  - "novarocks/memory/src/owner.rs (OwnerRecord, AllocationOrigin)"
+  - "novarocks/memory/src/lane/handle.rs (LaneHandle, FactToken)"
   - "novarocks/memory/src/lifecycle.rs (retire, transfer_residual)"
   - "novarocks/memory/src/maintenance.rs (maintain, shortage_is_fresh)"
 ---

@@ -16,6 +16,7 @@
 // under the License.
 
 //! R1 attribution helpers retain access responsibility without funding authority.
+// Design: ADR-0167 (docs/adr/ADR-0167-size-banded-allocation-attribution.md)
 use super::{band::is_tagged, binding};
 use crate::lane::{LaneHandle, RecordRef};
 use std::{alloc::Layout, marker::PhantomData, rc::Rc};

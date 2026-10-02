@@ -16,6 +16,7 @@
 // under the License.
 
 //! One destructor-free TLS slot; byte deltas never substitute for lifetime pins.
+// Design: ADR-0167 (docs/adr/ADR-0167-size-banded-allocation-attribution.md)
 use super::{record::*, store::RecordStore, token::RecordRef};
 use crate::sync::Ordering;
 
