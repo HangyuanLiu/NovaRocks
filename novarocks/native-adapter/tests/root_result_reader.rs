@@ -828,3 +828,405 @@ async fn installation_in_progress_is_preparing_without_new_read_holder() {
         fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
     ));
 }
+
+// These probes concern Tonic's post-root-admission allocations. No listener
+// or H2 connection is installed, so they make no pre-decode lane claim.
+use hyper::body::Body as HttpBody;
+use novarocks_native_adapter::root_result_unary::{NativeRootUnaryBody, root_result_unary};
+use novarocks_proto_models::novarocks as wire;
+use prost::Message;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+thread_local! {
+    static SEND_ALLOC_SIZE: Cell<usize> = const { Cell::new(0) };
+    static SEND_ALLOC_POINTER: Cell<usize> = const { Cell::new(0) };
+    static SEND_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    static SEND_REALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    static SEND_FREED: Cell<bool> = const { Cell::new(false) };
+}
+struct SendAllocationProbe;
+#[global_allocator]
+static SEND_ALLOCATOR: SendAllocationProbe = SendAllocationProbe;
+unsafe impl GlobalAlloc for SendAllocationProbe {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        let selected = SEND_ALLOC_SIZE
+            .try_with(|size| size.get() != 0 && size.get() == layout.size())
+            .unwrap_or(false);
+        if selected {
+            let _ = SEND_ALLOC_POINTER.try_with(|value| value.set(pointer as usize));
+            let _ = SEND_ALLOC_COUNT.try_with(|value| value.set(value.get() + 1));
+            let _ = SEND_FREED.try_with(|value| value.set(false));
+        }
+        pointer
+    }
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let selected = SEND_ALLOC_POINTER
+            .try_with(|value| value.get() != 0 && value.get() == pointer as usize)
+            .unwrap_or(false);
+        let result = unsafe { System.realloc(pointer, layout, size) };
+        if selected {
+            let _ = SEND_REALLOC_COUNT.try_with(|value| value.set(value.get() + 1));
+            let _ = SEND_ALLOC_POINTER.try_with(|value| value.set(result as usize));
+        }
+        result
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        let selected = SEND_ALLOC_POINTER
+            .try_with(|value| value.get() != 0 && value.get() == pointer as usize)
+            .unwrap_or(false);
+        unsafe { System.dealloc(pointer, layout) };
+        if selected {
+            let _ = SEND_FREED.try_with(|value| value.set(true));
+        }
+    }
+}
+fn start_send_probe(capacity: usize) {
+    SEND_ALLOC_POINTER.with(|value| value.set(0));
+    SEND_ALLOC_COUNT.with(|value| value.set(0));
+    SEND_REALLOC_COUNT.with(|value| value.set(0));
+    SEND_FREED.with(|value| value.set(false));
+    SEND_ALLOC_SIZE.with(|value| value.set(capacity));
+}
+fn stop_send_probe() {
+    SEND_ALLOC_SIZE.with(|value| value.set(0));
+}
+fn unary_request(read: &RootResultRead) -> axum::http::Request<axum::body::Body> {
+    let message = novarocks_task_codec::root_result::encode_read(read);
+    let mut bytes = Vec::with_capacity(5 + message.encoded_len());
+    bytes.push(0);
+    bytes.extend_from_slice(&(message.encoded_len() as u32).to_be_bytes());
+    message.encode(&mut bytes).unwrap();
+    axum::http::Request::builder()
+        .uri("/novarocks.NovaRocksGrpc/FetchTaskResult")
+        .header("content-type", "application/grpc")
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
+}
+async fn unary_data(body: &mut NativeRootUnaryBody) -> Bytes {
+    poll_fn(|cx| std::pin::Pin::new(&mut *body).poll_frame(cx))
+        .await
+        .expect("one unary frame")
+        .expect("valid encoded frame")
+        .into_data()
+        .expect("first frame is DATA")
+}
+fn unary_message(data: &Bytes) -> wire::FetchRootResultResponse {
+    assert_eq!(data[0], 0, "compression is disabled");
+    assert_eq!(
+        u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize,
+        data.len() - 5
+    );
+    Message::decode(&data[5..]).unwrap()
+}
+
+#[tokio::test]
+async fn unary_unpolled_body_keeps_preallocated_buffer_and_full_credit() {
+    let fixture = Fixture::new(false);
+    fixture.finish();
+    start_send_probe(SEGMENT);
+    let response = root_result_unary(
+        &fixture.reader,
+        unary_request(&fixture.request(Some(1), 0, 1)),
+    )
+    .await;
+    stop_send_probe();
+    assert_eq!(
+        SEND_ALLOC_COUNT.with(Cell::get),
+        1,
+        "one buffer before first body poll"
+    );
+    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
+    assert!(!SEND_FREED.with(Cell::get));
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - COPY);
+    assert!(matches!(
+        fixture.budget.try_reserve_process(1).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    drop(response);
+    assert!(
+        SEND_FREED.with(Cell::get),
+        "actual buffer exits before credit can be reused"
+    );
+    drop(fixture.fill_process(COPY));
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_last_data_slice_outlives_body_and_context_seal() {
+    let fixture = Fixture::new(false);
+    fixture.finish();
+    start_send_probe(SEGMENT);
+    let response = root_result_unary(
+        &fixture.reader,
+        unary_request(&fixture.request(Some(1), 0, 1)),
+    )
+    .await;
+    stop_send_probe();
+    let mut body = response.into_body();
+    let data = unary_data(&mut body).await;
+    let message = unary_message(&data);
+    let decoded = novarocks_task_codec::root_result::decode_reply(
+        message,
+        &fixture.request(Some(1), 0, 1),
+        0,
+        novarocks_proto_codec::FieldPath::root("root_reply"),
+    )
+    .unwrap();
+    let RootReadOutcome::Data(payload) = decoded.outcome else {
+        panic!("Data")
+    };
+    assert_eq!(payload.body().as_ref(), b"\x02\0\0\0\x011");
+    assert_eq!(payload.end_after_data().unwrap().output_rows, 1);
+    drop(payload);
+    let tail = data.slice(5..);
+    drop(data);
+    fixture.seal();
+    drop(body);
+    assert!(!SEND_FREED.with(Cell::get));
+    assert!(!fixture.root.physical_idle());
+    let filler = fixture.fill_process(PROCESS - FIXED - COPY);
+    assert!(matches!(
+        fixture.budget.try_reserve_process(1).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    drop(tail);
+    assert!(SEND_FREED.with(Cell::get));
+    assert!(fixture.root.physical_idle());
+    drop(fixture.fill_process(COPY));
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_ack_only_encodes_from_metadata_when_process_data_pool_is_full() {
+    let fixture = Fixture::new(false);
+    fixture.finish();
+    drop(owned(
+        fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
+    ));
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT);
+    start_send_probe(RootProfileV1::ENVELOPE_BYTES);
+    let response =
+        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
+    stop_send_probe();
+    // This size also selects the separate pre-admission request decoder.
+    assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 2);
+    let mut body = response.into_body();
+    let data = unary_data(&mut body).await;
+    let message = unary_message(&data);
+    assert_eq!(message.accepted_consumed_sequence, 1);
+    assert_eq!(
+        message.outcome,
+        Some(wire::fetch_root_result_response::Outcome::AckOnly(true))
+    );
+    drop(body);
+    assert!(!fixture.root.physical_idle());
+    drop(data);
+    assert!(SEND_FREED.with(Cell::get));
+    assert!(fixture.root.physical_idle());
+    drop(fixture.fill_process(SEGMENT));
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
+    let fixture = Fixture::new(false);
+    fixture.finish();
+    drop(owned(
+        fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
+    ));
+    let reader_metadata =
+        novarocks_native_adapter::root_result_reader::native_root_send_metadata_bytes()
+            + 2 * RootProfileV1::ENVELOPE_BYTES;
+    let FrozenRootOutput::ClientRows(schema) = fixture.root.spec().contract.output() else {
+        panic!("ClientRows")
+    };
+    // The old reader alone still fits; the actual unary transport does not.
+    let metadata = fixture
+        .root
+        .try_reserve_metadata(
+            FIXED - RootProfileV1::ENVELOPE_BYTES - schema.backing_bytes() - reader_metadata,
+        )
+        .unwrap();
+    drop(owned(
+        fixture.reader.read(&fixture.request(None, 0, 1)).await,
+    ));
+    let response =
+        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
+    assert_eq!(response.headers()["grpc-status"], "8");
+    assert_eq!(fixture.root.snapshot().consumed_through, 0);
+    drop(response);
+    drop(metadata);
+    let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
+        .await
+        .into_body();
+    assert_eq!(
+        unary_message(&unary_data(&mut body).await).accepted_consumed_sequence,
+        1
+    );
+    drop(body);
+    assert!(fixture.root.physical_idle());
+}
+
+#[tokio::test]
+async fn unary_cancellation_of_admitted_long_poll_exits_all_original_grants() {
+    let fixture = Fixture::new(false);
+    let request = unary_request(&fixture.request(Some(1), 0, 300));
+    let mut future = Box::pin(root_result_unary(&fixture.reader, request));
+    pending(future.as_mut()).await;
+    assert!(!fixture.root.physical_idle());
+    let filler = fixture.fill_process(PROCESS - FIXED - COPY);
+    assert!(matches!(
+        fixture.budget.try_reserve_process(1).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    drop(future);
+    assert!(fixture.root.physical_idle());
+    drop(fixture.fill_process(COPY));
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_closed_route_preserves_actual_ack_without_new_root_holder() {
+    let fixture = Fixture::new(false);
+    fixture.finish();
+    drop(owned(
+        fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
+    ));
+    // Keep the existing context in Releasing rather than its already retired
+    // horizon, where lookup correctly becomes UnknownRoot.
+    let old_credit = granted(fixture.root.try_reserve(1).unwrap());
+    fixture.seal();
+    assert_eq!(
+        fixture.registry.context_state(fixture.context),
+        QueryContextState::Releasing
+    );
+    let filler = fixture.fill_process(PROCESS - FIXED - 1);
+    let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
+        .await
+        .into_body();
+    let message = unary_message(&unary_data(&mut body).await);
+    assert_eq!(message.accepted_consumed_sequence, 0);
+    assert_eq!(
+        message.outcome,
+        Some(wire::fetch_root_result_response::Outcome::AwaitTerminalControl(true))
+    );
+    drop(old_credit);
+    assert!(
+        fixture.root.physical_idle(),
+        "closed route never reopens root resources"
+    );
+    drop(body);
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_two_bodies_hold_two_read_positions_before_first_poll() {
+    let fixture = Fixture::new(false);
+    fixture.finish();
+    let read = fixture.request(Some(1), 0, 1);
+    let first = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    let second = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    let third = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    assert_eq!(third.headers()["grpc-status"], "8");
+    drop(third);
+    drop(first);
+    let replacement = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    assert!(!replacement.headers().contains_key("grpc-status"));
+    drop(second);
+    drop(replacement);
+    fixture.seal();
+    assert!(fixture.root.physical_idle());
+}
+
+#[tokio::test]
+async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
+    let fixture = Fixture::new(false);
+    let producer = fixture.root.start_producer().unwrap();
+    fixture.root.note_rows(1).unwrap();
+    fixture.root.request_finish().unwrap();
+    let mut builder = fixture.root.try_segment().unwrap().unwrap();
+    let count = RootProfileV1::SEGMENT_BYTES;
+    for offset in (0..count).step_by(RootProfileV1::EMIT_BYTES_PER_TURN) {
+        builder.output_at(offset).fill(b'x');
+    }
+    builder.output()[..4].copy_from_slice(&((count - 4) as u32).to_le_bytes());
+    fixture.root.publish_segment(builder, count, true).unwrap();
+    drop(producer);
+    start_send_probe(SEGMENT);
+    let mut body = root_result_unary(
+        &fixture.reader,
+        unary_request(&fixture.request(Some(1), 0, 1)),
+    )
+    .await
+    .into_body();
+    stop_send_probe();
+    let data = unary_data(&mut body).await;
+    assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 1);
+    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
+    assert!(data.len() > RootProfileV1::SEGMENT_BYTES && data.len() <= SEGMENT);
+    let message = unary_message(&data);
+    let Some(wire::fetch_root_result_response::Outcome::Data(payload)) = message.outcome else {
+        panic!("Data")
+    };
+    assert_eq!(payload.body.len(), count);
+    assert_eq!(payload.end_after_data.unwrap().output_rows, 1);
+    let trailers = poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+        .await
+        .unwrap()
+        .unwrap()
+        .into_trailers()
+        .unwrap();
+    assert_eq!(trailers["grpc-status"], "0");
+    assert!(
+        poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .is_none()
+    );
+    drop(body);
+    drop(data);
+    assert!(SEND_FREED.with(Cell::get));
+}
+
+#[tokio::test]
+async fn unary_oversized_request_is_rejected_before_root_admission() {
+    let fixture = Fixture::new(false);
+    let size = RootProfileV1::ENVELOPE_BYTES + 1;
+    let mut payload = Vec::with_capacity(size + 5);
+    payload.push(0);
+    payload.extend_from_slice(&(size as u32).to_be_bytes());
+    payload.resize(size + 5, 0);
+    let request = axum::http::Request::builder()
+        .header("content-type", "application/grpc")
+        .body(axum::body::Body::from(payload))
+        .unwrap();
+    let response = root_result_unary(&fixture.reader, request).await;
+    assert_eq!(response.headers()["grpc-status"], "11");
+    assert!(fixture.root.physical_idle());
+    assert_eq!(fixture.root.snapshot().consumed_through, 0);
+}
+
+#[tokio::test]
+async fn unary_count_only_end_uses_the_same_frozen_codec_without_row_payload() {
+    let fixture = Fixture::new(true);
+    fixture.finish();
+    let read = fixture.request(Some(1), 0, 1);
+    let mut body = root_result_unary(&fixture.reader, unary_request(&read))
+        .await
+        .into_body();
+    let message = unary_message(&unary_data(&mut body).await);
+    let reply = novarocks_task_codec::root_result::decode_reply(
+        message,
+        &read,
+        0,
+        novarocks_proto_codec::FieldPath::root("root_reply"),
+    )
+    .unwrap();
+    let RootReadOutcome::End(end) = reply.outcome else {
+        panic!("End")
+    };
+    assert_eq!(end.output_rows, 1);
+    drop(body);
+    assert!(fixture.root.physical_idle());
+}

@@ -162,6 +162,17 @@ impl NativeRootResultReader {
     }
 
     pub async fn read(&self, request: &RootResultRead) -> NativeRootReadResponse {
+        self.read_with_transport_metadata(request, 0).await
+    }
+
+    /// Pregrant the transport's exact post-admission allocation inventory
+    /// from the same fixed root metadata envelope, before ACK or projection.
+    /// Pre-decode lane/stream allocations remain the caller's responsibility.
+    pub(crate) async fn read_with_transport_metadata(
+        &self,
+        request: &RootResultRead,
+        transport_metadata_bytes: usize,
+    ) -> NativeRootReadResponse {
         let admitted = match self.registry.context_root_result_route(request) {
             ContextRootRoute::Read(read) => read,
             ContextRootRoute::AwaitTerminalControl { accepted_consumed } => {
@@ -183,7 +194,10 @@ impl NativeRootResultReader {
             } else {
                 0
             })
-            .expect("fixed root send metadata fits usize");
+            .and_then(|bytes| bytes.checked_add(transport_metadata_bytes));
+        let Some(metadata_bytes) = metadata_bytes else {
+            return refusal(NativeRootReadRefusal::MetadataCapacity);
+        };
         let metadata = match admitted.try_reserve_native_send_metadata(metadata_bytes) {
             Ok(metadata) => metadata,
             Err(RootChannelError::Closed) => {
