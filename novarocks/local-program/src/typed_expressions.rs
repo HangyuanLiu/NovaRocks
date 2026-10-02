@@ -16,8 +16,8 @@
 // under the License.
 
 //! Mandatory complete definition types owned with the same resolved program.
-//! This checks carrier/signature correspondence, not primitive operation
-//! typing, lexical capture closure, or correct lowering from a physical plan.
+//! This checks carrier/signature correspondence and the primitive type rules
+//! authored here, not lexical capture closure or correct physical lowering.
 //! Source NULL/logical facts are explicit; legacy optional schemas never fill
 //! an absent entry. A TruthOnly use does not change its definition's value type.
 
@@ -77,6 +77,18 @@ impl ProgramTypedExpressions {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramExpressionTypeError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = Self::try_new_core(calls, types, &mut work);
+        if matches!(result, Err(ProgramExpressionTypeError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+    fn try_new_core(
+        calls: ProgramResolvedCalls,
+        types: BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ProgramExpressionTypeError> {
         let arenas = calls.snapshot().roots().arenas();
         if types.len() != arenas.len() {
             return Err(ProgramExpressionTypeError::IncompleteCoverage);
@@ -114,16 +126,16 @@ impl ProgramTypedExpressions {
                         if arg_slots.len() != parameter_types.len() {
                             return Err(ProgramExpressionTypeError::WrongLambda);
                         }
-                        validate(result_type, &mut work)?;
-                        same_carrier(definition.data_type(), &result_type.data_type, &mut work)?;
+                        validate(result_type, work)?;
+                        same_carrier(definition.data_type(), &result_type.data_type, work)?;
                         let Some(FunctionArgumentType::Value(body_type)) =
                             entries.get(body.index())
                         else {
                             return Err(ProgramExpressionTypeError::WrongLambda);
                         };
-                        same_value(body_type, result_type, false, &mut work)?;
+                        same_value(body_type, result_type, false, work)?;
                         for parameter in parameter_types {
-                            validate(parameter, &mut work)?;
+                            validate(parameter, work)?;
                         }
                     }
                     (StaticExprKind::LambdaFunction { .. }, _)
@@ -131,10 +143,15 @@ impl ProgramTypedExpressions {
                         return Err(ProgramExpressionTypeError::WrongKind);
                     }
                     (_, FunctionArgumentType::Value(value)) => {
-                        validate(value, &mut work)?;
-                        same_carrier(definition.data_type(), &value.data_type, &mut work)?;
+                        validate(value, work)?;
+                        same_carrier(definition.data_type(), &value.data_type, work)?;
                         if let StaticExprKind::Constant(constant) = definition.kind() {
-                            same_value(constant.value_type(), value, false, &mut work)?;
+                            same_value(constant.value_type(), value, false, work)?;
+                        }
+                        if let StaticExprKind::Eq(left, right) | StaticExprKind::Ne(left, right) =
+                            definition.kind()
+                        {
+                            validate_equality_types(*left, *right, value, entries, work)?;
                         }
                         if let StaticExprKind::Case {
                             has_case_expr,
@@ -148,7 +165,7 @@ impl ProgramTypedExpressions {
                                 children,
                                 value,
                                 entries,
-                                &mut work,
+                                work,
                             )?;
                         }
                         if let StaticExprKind::Not(argument)
@@ -270,7 +287,7 @@ impl ProgramTypedExpressions {
             else {
                 return Err(ProgramExpressionTypeError::WrongKind);
             };
-            same_value(actual_result, result, false, &mut work)?;
+            same_value(actual_result, result, false, work)?;
             for (argument, expected) in args.iter().zip(&call.selected().argument_types) {
                 work.step()?;
                 match (&entries[argument.index()], expected) {
@@ -278,7 +295,7 @@ impl ProgramTypedExpressions {
                         FunctionArgumentType::Value(actual),
                         FunctionArgumentType::Value(expected),
                     ) => {
-                        same_value(actual, expected, true, &mut work)?;
+                        same_value(actual, expected, true, work)?;
                     }
                     (
                         FunctionArgumentType::Lambda {
@@ -295,15 +312,14 @@ impl ProgramTypedExpressions {
                         }
                         for (actual, expected) in actual_parameters.iter().zip(expected_parameters)
                         {
-                            same_value(actual, expected, false, &mut work)?;
+                            same_value(actual, expected, false, work)?;
                         }
-                        same_value(actual_result, expected_result, false, &mut work)?;
+                        same_value(actual_result, expected_result, false, work)?;
                     }
                     _ => return Err(ProgramExpressionTypeError::WrongKind),
                 }
             }
         }
-        work.finish()?;
         Ok(Self {
             calls,
             types: Arc::new(
@@ -328,6 +344,41 @@ impl ProgramTypedExpressions {
         self.types.get(&arena)?.get(definition.index())
     }
 }
+/// Definition typing applies even without an evaluation occurrence. Runtime
+/// recipes independently admit their implemented carriers; that capability
+/// must not decide whether a static expression has a coherent value domain.
+/// This check covers root SQL NULL. Nested successful-NULL capabilities still
+/// require their comparison author before those recipes can be admitted.
+fn validate_equality_types(
+    left: ProgramExprId,
+    right: ProgramExprId,
+    result: &FunctionValueType,
+    types: &[FunctionArgumentType],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramExpressionTypeError> {
+    let value = |id: ProgramExprId| -> Result<&FunctionValueType, ProgramExpressionTypeError> {
+        match types.get(id.index()) {
+            Some(FunctionArgumentType::Value(value)) => Ok(value),
+            _ => Err(ProgramExpressionTypeError::WrongKind),
+        }
+    };
+    let left = value(left)?;
+    let right = value(right)?;
+    if result.data_type != arrow_schema::DataType::Boolean
+        || result.logical_type != ValueLogicalType::Physical
+        || left.logical_type != right.logical_type
+        || (!result.nullable
+            && (left.nullable
+                || right.nullable
+                || left.data_type == arrow_schema::DataType::Null
+                || right.data_type == arrow_schema::DataType::Null))
+    {
+        return Err(ProgramExpressionTypeError::TypeMismatch);
+    }
+    work.step()?;
+    same_carrier(&left.data_type, &right.data_type, work)
+}
+
 /// CASE consumes only values. Its common result domain is frozen by the
 /// source type author; this check neither coerces operands nor admits a runtime
 /// carrier implementation. Simple labels ignore only outer NULL admission.
@@ -443,3 +494,6 @@ mod nary_tests;
 
 #[cfg(test)]
 mod case_tests;
+
+#[cfg(test)]
+mod equality_tests;
