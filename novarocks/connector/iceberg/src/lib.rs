@@ -46,6 +46,7 @@ pub mod delete_semantics;
 pub mod distributed_rewrite;
 pub mod document_storage;
 mod execution_authority;
+pub(crate) mod field_domain;
 pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;

@@ -270,9 +270,8 @@ pub(crate) fn exact_logical_fields(
     metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<Vec<novarocks_types::logical_type::LogicalField>, String> {
     validate_exact_schema(metadata.current_schema())?;
-    let carrier =
-        crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())
-            .map_err(|e| e.to_string())?;
+    let carrier = crate::field_domain::metadata_sql_schema(metadata, metadata.current_schema())
+        .map_err(|e| e.to_string())?;
     let logical_markers = crate::metadata::logical_type_columns(metadata.properties());
     carrier
         .fields()
