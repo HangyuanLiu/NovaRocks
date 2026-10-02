@@ -2314,6 +2314,7 @@ pub(super) fn scalar_definition_parts(
             .map(|(identity, signature)| FunctionOverloadDeclaration {
                 effects: match name {
                     "abs" => Some(super::abs_owner::effects()),
+                    "crc32" => Some(super::crc32_owner::effects()),
                     "dround" => Some(super::dround_owner::effects()),
                     name if super::bit_shift_owner::operation(name).is_some() => {
                         Some(super::bit_shift_owner::effects())
@@ -2458,6 +2459,7 @@ pub fn contribute_builtin_functions(
         let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
         let definition = match name.as_str() {
             "abs" => super::abs_owner::definition(declaration, resolver)?,
+            "crc32" => super::crc32_owner::definition(declaration, resolver)?,
             "dround" => super::dround_owner::definition(declaration, resolver)?,
             name if super::bit_shift_owner::operation(name).is_some() => {
                 super::bit_shift_owner::definition(name, declaration, resolver)?

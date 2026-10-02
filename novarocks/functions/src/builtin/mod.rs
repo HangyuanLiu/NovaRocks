@@ -38,6 +38,8 @@ mod bit_shift;
 mod bit_shift_owner;
 mod bitwise;
 mod bitwise_owner;
+mod crc32;
+mod crc32_owner;
 mod dround;
 mod dround_owner;
 mod numeric_binary;
