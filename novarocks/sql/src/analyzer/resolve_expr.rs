@@ -174,6 +174,9 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         let resolved = self.analyze_expr_impl(expr, scope)?;
+        // Validate selected-field proof before a projection can freeze this
+        // scalar result under a new ColumnId without its original metadata.
+        declared_input_logical_type(&resolved, scope, expr.span())?;
         if self.sql_semantics.sql_mode().decimal_overflow_policy()
             == novarocks_type_contract::DecimalOverflowPolicy::ReportError
         {
@@ -1231,7 +1234,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             args.push(typed);
         }
-        let json_items = self.json_array_elements_provenance(array, &args, scope);
+        let json_items = self.json_array_elements_provenance(array, &args, scope)?;
         let physical =
             resolved_scalar_call_at(self.function_catalog, "__array_literal", args, array.span)?;
         self.adapt_json_list_output(physical, json_items, array.span)
@@ -1909,8 +1912,8 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         // typeof(<expr>) on a non-CAST argument: analyze the argument with
         // StarRocks' narrowest-integer-literal-type rule applied, then map
-        // the resulting Arrow type to its StarRocks spelling. Some function
-        // families return BINARY/VARCHAR at the Arrow level but carry a
+        // the resulting proven logical type or Arrow type to its StarRocks
+        // spelling. Some function families return BINARY/VARCHAR but carry a
         // distinct logical type (BITMAP/HLL/JSON/null literal) in
         // StarRocks, so recognise those by the producing function name
         // first.
@@ -1923,8 +1926,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 });
             }
             let typed_arg = self.analyze_expr(arg_exprs[0], scope)?;
+            let logical_type = declared_input_logical_type(&typed_arg, scope, func.span)?;
             let narrowed = narrow_int_literals_in_typed_expr(typed_arg);
-            let type_name = arrow_type_to_starrocks_name(&narrowed.data_type);
+            let type_name = typeof_type_to_starrocks_name(
+                &narrowed.data_type,
+                logical_type.as_ref(),
+                func.span,
+            )?;
             return Ok(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::String(type_name)),
                 data_type: DataType::Utf8,
@@ -2245,15 +2253,23 @@ impl<'a> super::AnalyzerContext<'a> {
             {
                 return Err(AnalyzeError::invalid_argument("Unknown error", func.span));
             }
-            if let Some(semantic_type) = args_typed.first().and_then(|arg| {
-                // Metadata output adapters must preserve the existing JSON
-                // DISTINCT rejection after the literal's physical call is wrapped.
-                if self.json_list_provenance(effective_arg_exprs.first().copied(), arg, scope) {
-                    Some("array<json>".to_string())
-                } else {
-                    json_semantic_group_by_type_name(arg)
+            let semantic_type = match args_typed.first() {
+                Some(arg) => {
+                    // Preserve the existing JSON DISTINCT rejection after
+                    // the literal's physical call is wrapped.
+                    if self.json_list_provenance(
+                        effective_arg_exprs.first().copied(),
+                        arg,
+                        scope,
+                    )? {
+                        Some("array<json>".to_string())
+                    } else {
+                        json_semantic_group_by_type_name(arg)
+                    }
                 }
-            }) {
+                None => None,
+            };
+            if let Some(semantic_type) = semantic_type {
                 let arg_display = expr_display_name(arg_exprs[0]);
                 return Err(AnalyzeError::invalid_argument(
                     format!(
@@ -2435,10 +2451,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             };
             let ignore_nulls = matches!(func.null_treatment, Some(ast::NullTreatment::IgnoreNulls));
-            let json_input = args_typed.first().is_some_and(|arg| {
-                self.logical_output_type(effective_arg_exprs.first().copied(), arg, scope)
-                    == Some(novarocks_types::schema::SqlType::Json)
-            });
+            let json_input = match args_typed.first() {
+                Some(arg) => {
+                    self.logical_output_type(effective_arg_exprs.first().copied(), arg, scope)?
+                        == Some(novarocks_types::schema::SqlType::Json)
+                }
+                None => false,
+            };
             return self.adapt_json_list_output(
                 TypedExpr {
                     kind: ExprKind::WindowCall {
@@ -2573,11 +2592,10 @@ impl<'a> super::AnalyzerContext<'a> {
         // Freeze authoritative source provenance before exact scalar binding
         // materializes plain List<T> coercions. Public target spelling alone
         // cannot establish validated JSON values.
-        let json_list_input = effective_arg_exprs
-            .first()
-            .copied()
-            .zip(args_typed.first())
-            .is_some_and(|(source, value)| self.json_list_provenance(Some(source), value, scope));
+        let json_list_input = match effective_arg_exprs.first().copied().zip(args_typed.first()) {
+            Some((source, value)) => self.json_list_provenance(Some(source), value, scope)?,
+            None => false,
+        };
         let mut bound_scalar = None;
         self.validate_percentile_arguments(&name, &args_typed, func.span)?;
         let mut bound_aggregate = None;
@@ -2773,10 +2791,13 @@ impl<'a> super::AnalyzerContext<'a> {
             let result = crate::functions::aggregate_result_type(&signature);
             let return_type = result.data_type.clone();
             let nullable = result.nullable;
-            let json_input = args_typed.first().is_some_and(|arg| {
-                self.logical_output_type(effective_arg_exprs.first().copied(), arg, scope)
-                    == Some(novarocks_types::schema::SqlType::Json)
-            });
+            let json_input = match args_typed.first() {
+                Some(arg) => {
+                    self.logical_output_type(effective_arg_exprs.first().copied(), arg, scope)?
+                        == Some(novarocks_types::schema::SqlType::Json)
+                }
+                None => false,
+            };
             self.adapt_json_list_output(
                 TypedExpr {
                     kind: ExprKind::AggregateCall {
@@ -6007,6 +6028,300 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
     }
 }
 
+/// Follow only the frozen built-in access identities. Their selected field
+/// metadata lives on the parent carrier, not on the scalar result DataType.
+pub(super) fn declared_input_logical_type(
+    expression: &TypedExpr,
+    scope: &AnalyzerScope,
+    span: Span,
+) -> Result<Option<novarocks_types::schema::SqlType>, AnalyzeError> {
+    use novarocks_functions::{FunctionArgumentType, FunctionKind, FunctionResultType};
+    use novarocks_types::schema::SqlType;
+
+    if let ExprKind::Nested(inner) = &expression.kind {
+        return declared_input_logical_type(inner, scope, span);
+    }
+    let ExprKind::FunctionCall {
+        binding,
+        args,
+        distinct,
+        ..
+    } = &expression.kind
+    else {
+        let logical = scope.logical_type_of_expr(expression);
+        // The existing factory separately preserves exact Array<Json>
+        // provenance across projection and CTE ColumnId rebinding.
+        let json_list = matches!(&expression.kind, ExprKind::ColumnRef { column_id, .. }
+            if scope.factory().borrow().has_json_list_provenance(*column_id));
+        return Ok(logical.or_else(|| json_list.then(|| SqlType::Array(Box::new(SqlType::Json)))));
+    };
+    let access = match binding.function_id.as_str() {
+        "builtin.scalar/__struct_subfield/v1" => 0,
+        "builtin.scalar/__array_element_at/v1" => 1,
+        "builtin.scalar/__map_element_at/v1" => 2,
+        _ => return Ok(None),
+    };
+    let invalid = || {
+        AnalyzeError::type_mismatch(
+            "typeof access does not match its exact selected function binding",
+            span,
+        )
+    };
+    if binding.kind != FunctionKind::Scalar
+        || *distinct
+        || args.len() != 2
+        || binding.selected.argument_types.len() != args.len()
+        || binding
+            .selected
+            .argument_types
+            .iter()
+            .zip(args)
+            .enumerate()
+            .any(|(index, (selected, argument))| {
+                // Existing List/Map TypeSpec selection constructs canonical
+                // child fields without metadata. Compare its physical shape;
+                // semantic proof still comes only from the actual parent.
+                !matches!(selected, FunctionArgumentType::Value(value)
+                    if value.nullable == argument.nullable
+                    && (value.data_type == argument.data_type
+                        || (index == 0 && matches!(access, 1 | 2)
+                            && crate::literal::arrow_type_equals_ignoring_metadata(
+                                &value.data_type, &argument.data_type))))
+            })
+    {
+        return Err(invalid());
+    }
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        return Err(invalid());
+    };
+    if result.data_type != expression.data_type || result.nullable != expression.nullable {
+        return Err(invalid());
+    }
+    // This shared bounded adapter also checks Map entries wrapper metadata and
+    // nullability before selecting a value from its child fields.
+    novarocks_types::logical_type::logical_type_from_engine_arrow(&args[0].data_type)
+        .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+    let parent = declared_input_logical_type(&args[0], scope, span)?;
+    let (field, logical) = match (access, &args[0].data_type, parent.as_ref()) {
+        (0, DataType::Struct(fields), None | Some(SqlType::Struct(_))) => {
+            let ExprKind::Literal(LiteralValue::String(name)) = &args[1].kind else {
+                return Err(invalid());
+            };
+            let index = fields
+                .iter()
+                .position(|field| field.name() == name)
+                .ok_or_else(invalid)?;
+            let logical = match &parent {
+                Some(SqlType::Struct(logical_fields)) => {
+                    if logical_fields.len() != fields.len()
+                        || logical_fields
+                            .iter()
+                            .zip(fields)
+                            .any(|((name, _), field)| name != field.name())
+                    {
+                        return Err(invalid());
+                    }
+                    Some(&logical_fields[index].1)
+                }
+                _ => None,
+            };
+            (fields[index].as_ref(), logical)
+        }
+        (1, DataType::List(field), None | Some(SqlType::Array(_))) => {
+            let logical = match &parent {
+                Some(SqlType::Array(inner)) => Some(inner.as_ref()),
+                _ => None,
+            };
+            (field.as_ref(), logical)
+        }
+        (2, DataType::Map(entries, _), None | Some(SqlType::Map(_, _))) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(invalid());
+            };
+            if fields.len() != 2 {
+                return Err(invalid());
+            }
+            let logical = match &parent {
+                Some(SqlType::Map(_, value)) => Some(value.as_ref()),
+                _ => None,
+            };
+            (fields[1].as_ref(), logical)
+        }
+        _ => return Err(invalid()),
+    };
+    if field.data_type() != &expression.data_type {
+        return Err(invalid());
+    }
+    let logical = typeof_field_logical_type(field, logical, span)?;
+    if let Some(logical) = &logical
+        && !matches!(
+            logical,
+            SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_)
+        )
+    {
+        typeof_type_to_starrocks_name(field.data_type(), Some(logical), span)?;
+    }
+    Ok(logical)
+}
+
+/// Consume catalog provenance and nested field markers without inferring a
+/// logical domain from a physical carrier. Keep the existing type spellings
+/// for types whose Arrow representation already identifies them.
+fn typeof_type_to_starrocks_name(
+    data_type: &DataType,
+    logical_type: Option<&novarocks_types::schema::SqlType>,
+    span: Span,
+) -> Result<String, AnalyzeError> {
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::schema::SqlType;
+
+    let marked = match logical_type {
+        Some(SqlType::Json) => Some((LogicalType::Json, "json")),
+        Some(SqlType::Bitmap) => Some((LogicalType::Bitmap, "bitmap")),
+        Some(SqlType::Hll) => Some((LogicalType::Hll, "hll")),
+        _ => None,
+    };
+    if let Some((marker, name)) = marked {
+        // Use the shared field adapter's exact marker/carrier validation.
+        let field = field_with_logical_type(
+            arrow::datatypes::Field::new("", data_type.clone(), true),
+            marker,
+        );
+        novarocks_types::logical_type::logical_field_from_engine_arrow(&field)
+            .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+        return Ok(name.into());
+    }
+    let mismatch = || {
+        AnalyzeError::type_mismatch(
+            "typeof logical type does not match its declared Arrow carrier",
+            span,
+        )
+    };
+    match (data_type, logical_type) {
+        (DataType::List(field), None | Some(SqlType::Array(_))) => {
+            let inner = match logical_type {
+                Some(SqlType::Array(inner)) => Some(inner.as_ref()),
+                _ => None,
+            };
+            Ok(format!(
+                "array<{}>",
+                typeof_field_to_starrocks_name(field, inner, span)?
+            ))
+        }
+        (DataType::Map(entries, _), None | Some(SqlType::Map(_, _))) => {
+            novarocks_types::logical_type::logical_type_from_engine_arrow(data_type)
+                .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(mismatch());
+            };
+            if fields.len() != 2 {
+                return Err(mismatch());
+            }
+            let (key, value) = match logical_type {
+                Some(SqlType::Map(key, value)) => (Some(key.as_ref()), Some(value.as_ref())),
+                _ => (None, None),
+            };
+            Ok(format!(
+                "map<{},{}>",
+                typeof_field_to_starrocks_name(&fields[0], key, span)?,
+                typeof_field_to_starrocks_name(&fields[1], value, span)?
+            ))
+        }
+        (DataType::Struct(fields), None | Some(SqlType::Struct(_))) => {
+            let logical_fields = match logical_type {
+                Some(SqlType::Struct(logical_fields)) => {
+                    if logical_fields.len() != fields.len()
+                        || logical_fields
+                            .iter()
+                            .zip(fields)
+                            .any(|((name, _), field)| name != field.name())
+                    {
+                        return Err(mismatch());
+                    }
+                    Some(logical_fields)
+                }
+                _ => None,
+            };
+            let parts = fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let logical = logical_fields.map(|fields| &fields[index].1);
+                    Ok(format!(
+                        "{} {}",
+                        field.name(),
+                        typeof_field_to_starrocks_name(field, logical, span)?
+                    ))
+                })
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
+            Ok(format!("struct<{}>", parts.join(", ")))
+        }
+        (_, Some(SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_)))
+        | (DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_), Some(_)) => {
+            Err(mismatch())
+        }
+        _ => {
+            if let Some(logical) = logical_type {
+                let declared = crate::literal::sql_type_to_arrow_type(logical)
+                    .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+                let declared =
+                    novarocks_types::logical_type::logical_type_from_engine_arrow(&declared)
+                        .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+                let actual =
+                    novarocks_types::logical_type::logical_type_from_engine_arrow(data_type)
+                        .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+                if declared != actual {
+                    return Err(mismatch());
+                }
+            }
+            Ok(arrow_type_to_starrocks_name(data_type))
+        }
+    }
+}
+
+fn typeof_field_to_starrocks_name(
+    field: &arrow::datatypes::Field,
+    logical_type: Option<&novarocks_types::schema::SqlType>,
+    span: Span,
+) -> Result<String, AnalyzeError> {
+    let logical = typeof_field_logical_type(field, logical_type, span)?;
+    typeof_type_to_starrocks_name(field.data_type(), logical.as_ref(), span)
+}
+
+fn typeof_field_logical_type(
+    field: &arrow::datatypes::Field,
+    logical_type: Option<&novarocks_types::schema::SqlType>,
+    span: Span,
+) -> Result<Option<novarocks_types::schema::SqlType>, AnalyzeError> {
+    use novarocks_types::logical_type::{LogicalType, logical_field_from_engine_arrow};
+    use novarocks_types::schema::SqlType;
+
+    let marker = if field
+        .metadata()
+        .contains_key(novarocks_types::logical::NR_LOGICAL_TYPE_KEY)
+    {
+        let logical = logical_field_from_engine_arrow(field)
+            .map_err(|error| AnalyzeError::type_mismatch(error, span))?;
+        match logical.data_type {
+            LogicalType::Json => Some(SqlType::Json),
+            LogicalType::Bitmap => Some(SqlType::Bitmap),
+            LogicalType::Hll => Some(SqlType::Hll),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(marker) = &marker
+        && logical_type.is_some_and(|logical| logical != marker)
+    {
+        return Err(AnalyzeError::type_mismatch(
+            "typeof field logical marker conflicts with its catalog type",
+            span,
+        ));
+    }
+    Ok(marker.or_else(|| logical_type.cloned()))
+}
+
 /// Render an Arrow `DataType` as the StarRocks-style type name used when the
 /// analyzer folds `typeof(<expr>)` into a string literal.
 fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
@@ -6557,6 +6872,513 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    struct TypeofCatalog {
+        columns: Vec<novarocks_types::schema::ColumnDef>,
+    }
+
+    impl PlannerTableProvider for TypeofCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            let planner = crate::planner::table::TableDef {
+                name: table.into(),
+                columns: self.columns.clone(),
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::Sql(SqlScanSource::new(
+                    SqlTableBindingId::new(
+                        SqlTableBindingScopeId::new(NonZeroU64::new(45).unwrap()),
+                        NonZeroU32::new(1).unwrap(),
+                    ),
+                    SqlTableIdentity {
+                        catalog: catalog.unwrap_or("default_catalog").into(),
+                        namespace: database.into(),
+                        table: table.into(),
+                    },
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                )),
+            };
+            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
+        }
+    }
+
+    fn typeof_column(
+        name: &str,
+        data_type: DataType,
+        logical_type: Option<novarocks_types::schema::SqlType>,
+    ) -> novarocks_types::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
+            name: name.into(),
+            data_type,
+            nullable: true,
+            write_default: None,
+            logical_type,
+        }
+    }
+
+    fn assert_catalog_typeof(catalog: &TypeofCatalog, sql: &str, expected: &str) {
+        let expression = analyze_projection_expr_with_catalog(
+            sql,
+            catalog,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert_eq!(expression.data_type, DataType::Utf8, "{sql}");
+        assert!(!expression.nullable, "{sql}");
+        assert!(
+            matches!(expression.kind, ExprKind::Literal(LiteralValue::String(ref value)) if value == expected),
+            "{sql}: {expression:?}"
+        );
+    }
+
+    #[test]
+    fn typeof_catalog_domains_survive_alias_and_cte_without_carrier_inference() {
+        use novarocks_types::schema::SqlType;
+        let catalog = TypeofCatalog {
+            columns: vec![
+                typeof_column("j", DataType::Utf8, Some(SqlType::Json)),
+                // Identical carrier and a suggestive name do not prove JSON.
+                typeof_column("json", DataType::Utf8, None),
+                typeof_column("b", DataType::Binary, Some(SqlType::Bitmap)),
+                typeof_column("h", DataType::Binary, Some(SqlType::Hll)),
+                typeof_column("bitmap", DataType::Binary, None),
+            ],
+        };
+        for (column, expected) in [
+            ("j", "json"),
+            ("json", "varchar"),
+            ("b", "bitmap"),
+            ("h", "hll"),
+            ("bitmap", "varbinary"),
+        ] {
+            for sql in [
+                format!("select typeof({column}) from input"),
+                format!("select typeof(t.{column}) from input t"),
+                format!(
+                    "select typeof(q.payload) from (select {column} as renamed from input) q(payload)"
+                ),
+                format!(
+                    "with q as (select {column} as payload from input) select typeof(payload) from q"
+                ),
+            ] {
+                assert_catalog_typeof(&catalog, &sql, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn typeof_catalog_nested_markers_survive_alias_and_cte() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        let nested = DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            DataType::Map(
+                std::sync::Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int8, true),
+                            Field::new(
+                                "value",
+                                DataType::Struct(
+                                    vec![
+                                        field_with_logical_type(
+                                            Field::new("payload", DataType::Utf8, true),
+                                            LogicalType::Json,
+                                        ),
+                                        Field::new("plain", DataType::Utf8, true),
+                                        Field::new("narrow", DataType::Int16, false),
+                                    ]
+                                    .into(),
+                                ),
+                                true,
+                            ),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )));
+        let catalog = TypeofCatalog {
+            columns: vec![
+                typeof_column("n", nested, None),
+                typeof_column(
+                    "ja",
+                    DataType::List(std::sync::Arc::new(field_with_logical_type(
+                        Field::new("item", DataType::Utf8, true),
+                        LogicalType::Json,
+                    ))),
+                    None,
+                ),
+                typeof_column(
+                    "foreign",
+                    DataType::List(std::sync::Arc::new(Field::new(
+                        "item",
+                        DataType::Utf8,
+                        true,
+                    ))),
+                    None,
+                ),
+            ],
+        };
+        for sql in [
+            "select typeof(n) from input",
+            "select typeof(q.payload) from (select n as renamed from input) q(payload)",
+            "with q as (select n as payload from input) select typeof(payload) from q",
+        ] {
+            assert_catalog_typeof(
+                &catalog,
+                sql,
+                "array<map<tinyint,struct<payload json, plain varchar, narrow smallint>>>",
+            );
+        }
+        for (column, expected) in [("ja", "array<json>"), ("foreign", "array<varchar>")] {
+            for sql in [
+                format!("select typeof({column}) from input"),
+                format!(
+                    "select typeof(q.payload) from (select {column} as renamed from input) q(payload)"
+                ),
+                format!(
+                    "with q as (select {column} as payload from input) select typeof(payload) from q"
+                ),
+            ] {
+                assert_catalog_typeof(&catalog, &sql, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn typeof_catalog_nested_access_preserves_selected_domains_and_controls() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        use novarocks_types::schema::SqlType;
+        let json =
+            || field_with_logical_type(Field::new("note", DataType::Utf8, true), LogicalType::Json);
+        let list = |field: Field| DataType::List(std::sync::Arc::new(field));
+        let map = |field: Field| {
+            DataType::Map(
+                std::sync::Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(vec![Field::new("key", DataType::Utf8, true), field].into()),
+                    false,
+                )),
+                false,
+            )
+        };
+        let payload = DataType::Struct(
+            vec![
+                json(),
+                Field::new("plain", DataType::Utf8, true),
+                field_with_logical_type(
+                    Field::new("b", DataType::Binary, true),
+                    LogicalType::Bitmap,
+                ),
+                field_with_logical_type(Field::new("h", DataType::Binary, true), LogicalType::Hll),
+                Field::new("raw", DataType::Binary, true),
+            ]
+            .into(),
+        );
+        let catalog = TypeofCatalog {
+            columns: vec![
+                typeof_column("payload", payload.clone(), None),
+                typeof_column("a", list(json()), None),
+                typeof_column("m", map(json()), None),
+                typeof_column(
+                    "plain_a",
+                    list(Field::new("item", DataType::Utf8, true)),
+                    None,
+                ),
+                typeof_column(
+                    "plain_m",
+                    map(Field::new("value", DataType::Utf8, true)),
+                    None,
+                ),
+                typeof_column("chain", list(Field::new("item", payload, true)), None),
+                typeof_column(
+                    "legacy_a",
+                    list(Field::new("item", DataType::Utf8, true)),
+                    Some(SqlType::Array(Box::new(SqlType::Json))),
+                ),
+            ],
+        };
+        for (column, access, expected) in [
+            ("payload", ".note", "json"),
+            ("payload", ".plain", "varchar"),
+            ("payload", ".b", "bitmap"),
+            ("payload", ".h", "hll"),
+            ("payload", ".raw", "varbinary"),
+            ("a", "[1]", "json"),
+            ("m", "['x']", "json"),
+            ("plain_a", "[1]", "varchar"),
+            ("plain_m", "['x']", "varchar"),
+            ("chain", "[1].note", "json"),
+            ("legacy_a", "[1]", "json"),
+        ] {
+            for sql in [
+                format!("select typeof({column}{access}) from input"),
+                format!(
+                    "select typeof(q.renamed{access}) from (select {column} as renamed from input) q"
+                ),
+                format!(
+                    "with q as (select {column} as renamed from input) select typeof(renamed{access}) from q"
+                ),
+                format!(
+                    "select typeof(q.note) from (select {column}{access} as note from input) q"
+                ),
+                format!(
+                    "with q as (select {column}{access} as note from input) select typeof(note) from q"
+                ),
+            ] {
+                assert_catalog_typeof(&catalog, &sql, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn typeof_access_requires_frozen_binding_identity_and_exact_selection() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        let catalog = TypeofCatalog {
+            columns: vec![typeof_column(
+                "a",
+                DataType::List(std::sync::Arc::new(field_with_logical_type(
+                    Field::new("item", DataType::Utf8, true),
+                    LogicalType::Json,
+                ))),
+                None,
+            )],
+        };
+        let mut expression = analyze_projection_expr_with_catalog(
+            "select a[1] from input",
+            &catalog,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .unwrap();
+        let scope = super::AnalyzerScope::new(std::rc::Rc::new(std::cell::RefCell::new(
+            crate::column_id::ColumnRefFactory::new(),
+        )));
+        let span = novarocks_parser::Span::new(0, 1);
+        // Display names are not provenance; the immutable binding is.
+        let ExprKind::FunctionCall { name, .. } = &mut expression.kind else {
+            panic!("expected access");
+        };
+        *name = "unrelated_display_name".into();
+        assert_eq!(
+            super::declared_input_logical_type(&expression, &scope, span).unwrap(),
+            Some(novarocks_types::schema::SqlType::Json)
+        );
+        let mut wrong_selection = expression.clone();
+        wrong_selection.data_type = DataType::Int32;
+        assert!(super::declared_input_logical_type(&wrong_selection, &scope, span).is_err());
+        let ExprKind::FunctionCall { name, binding, .. } = &mut expression.kind else {
+            unreachable!();
+        };
+        *name = "__array_element_at".into();
+        let mut unrelated = binding.resolved().clone();
+        unrelated.function_id =
+            novarocks_functions::FunctionId::try_new("external.scalar/__array_element_at/v1")
+                .unwrap();
+        *binding = unrelated.into();
+        assert_eq!(
+            super::declared_input_logical_type(&expression, &scope, span).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn typeof_nested_access_rejects_bad_markers_and_map_wrappers() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY, field_with_logical_type};
+        let bad_markers = [
+            field_with_logical_type(Field::new("note", DataType::Int32, true), LogicalType::Json),
+            Field::new("note", DataType::Utf8, true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+        ];
+        for field in bad_markers {
+            let catalog = TypeofCatalog {
+                columns: vec![
+                    typeof_column(
+                        "payload",
+                        DataType::Struct(vec![field.clone()].into()),
+                        None,
+                    ),
+                    typeof_column(
+                        "a",
+                        DataType::List(std::sync::Arc::new(field.clone())),
+                        None,
+                    ),
+                    typeof_column(
+                        "m",
+                        DataType::Map(
+                            std::sync::Arc::new(Field::new(
+                                "entries",
+                                DataType::Struct(
+                                    vec![Field::new("key", DataType::Utf8, true), field].into(),
+                                ),
+                                false,
+                            )),
+                            false,
+                        ),
+                        None,
+                    ),
+                ],
+            };
+            for sql in [
+                "select typeof(payload.note) from input",
+                "select typeof(a[1]) from input",
+                "select typeof(m['x']) from input",
+            ] {
+                let error = analyze_projection_expr_with_catalog(
+                    sql,
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                )
+                .unwrap_err();
+                assert!(error.contains("marker"), "{sql}: {error}");
+            }
+            for access in ["payload.note", "a[1]", "m['x']"] {
+                for sql in [
+                    format!("select q.note from (select {access} as note from input) q"),
+                    format!("with q as (select {access} as note from input) select note from q"),
+                ] {
+                    let error = analyze_projection_expr_with_catalog(
+                        &sql,
+                        &catalog,
+                        crate::functions::builtin_sql_function_catalog(),
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("marker"), "{sql}: {error}");
+                }
+            }
+        }
+        for (nullable, marker) in [
+            (true, None),
+            (false, Some("json")),
+            (false, Some("unknown")),
+        ] {
+            let mut entries = Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, true),
+                        Field::new("value", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                nullable,
+            );
+            if let Some(marker) = marker {
+                entries =
+                    entries.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            }
+            let catalog = TypeofCatalog {
+                columns: vec![typeof_column(
+                    "m",
+                    DataType::Map(std::sync::Arc::new(entries), false),
+                    None,
+                )],
+            };
+            for sql in [
+                "select typeof(m) from input",
+                "select typeof(m['x']) from input",
+            ] {
+                let error = analyze_projection_expr_with_catalog(
+                    sql,
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                )
+                .unwrap_err();
+                assert!(error.contains("entries"), "{sql}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn typeof_consumes_complete_catalog_logical_container_facts() {
+        use novarocks_types::schema::SqlType;
+        let logical = SqlType::Struct(vec![(
+            "ordered".into(),
+            SqlType::Map(
+                Box::new(SqlType::String),
+                Box::new(SqlType::Array(Box::new(SqlType::Json))),
+            ),
+        )]);
+        let carrier = crate::literal::sql_type_to_arrow_type(&logical).unwrap();
+        let catalog = TypeofCatalog {
+            columns: vec![typeof_column("n", carrier, Some(logical))],
+        };
+        assert_catalog_typeof(
+            &catalog,
+            "select typeof(n) from input",
+            "struct<ordered map<varchar,array<json>>>",
+        );
+    }
+
+    #[test]
+    fn typeof_rejects_conflicting_catalog_carriers_and_nested_markers() {
+        use arrow::datatypes::Field;
+        use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY, field_with_logical_type};
+        use novarocks_types::schema::SqlType;
+        let invalid = [
+            typeof_column("n", DataType::Int32, Some(SqlType::Json)),
+            typeof_column("n", DataType::Int32, Some(SqlType::TinyInt)),
+            typeof_column("n", DataType::Utf8, Some(SqlType::Bitmap)),
+            typeof_column(
+                "n",
+                DataType::Utf8,
+                Some(SqlType::Array(Box::new(SqlType::Json))),
+            ),
+            typeof_column(
+                "n",
+                DataType::List(std::sync::Arc::new(field_with_logical_type(
+                    Field::new("item", DataType::Int32, true),
+                    LogicalType::Json,
+                ))),
+                None,
+            ),
+            typeof_column(
+                "n",
+                DataType::List(std::sync::Arc::new(
+                    Field::new("item", DataType::Utf8, true)
+                        .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+                )),
+                None,
+            ),
+            typeof_column(
+                "n",
+                DataType::List(std::sync::Arc::new(field_with_logical_type(
+                    Field::new("item", DataType::Utf8, true),
+                    LogicalType::Json,
+                ))),
+                Some(SqlType::Array(Box::new(SqlType::String))),
+            ),
+        ];
+        for column in invalid {
+            let catalog = TypeofCatalog {
+                columns: vec![column],
+            };
+            let error = analyze_projection_expr_with_catalog(
+                "select typeof(n) from input",
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("logical") || error.contains("marker"),
+                "{error}"
+            );
+        }
     }
 
     fn assert_json_list_scalar_adapter(expression: &crate::analysis::TypedExpr, expected_id: &str) {
