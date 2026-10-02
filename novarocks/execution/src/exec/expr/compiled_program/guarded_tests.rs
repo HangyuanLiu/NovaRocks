@@ -158,6 +158,7 @@ struct Author {
     function: BoundFunction,
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
+    expected_result_type: Option<FunctionValueType>,
     shape: ControlShape,
 }
 impl Author {
@@ -165,7 +166,7 @@ impl Author {
         FunctionBindingRequest {
             arguments: &self.arguments,
             logical_argument_count: self.arguments.len(),
-            expected_result_type: None,
+            expected_result_type: self.expected_result_type.as_ref(),
         }
     }
     fn result(&self) -> FunctionValueType {
@@ -187,15 +188,47 @@ fn author(
     arguments: Vec<FunctionArgument>,
     shape: ControlShape,
 ) -> Author {
+    author_with_target(functions, name, arguments, shape, None)
+}
+
+fn trusted_author(
+    functions: &PureEngineFunctionCatalog,
+    name: &str,
+    arguments: Vec<FunctionArgument>,
+    shape: ControlShape,
+    expected_result_type: FunctionValueType,
+) -> Author {
+    author_with_target(
+        functions,
+        name,
+        arguments,
+        shape,
+        Some(expected_result_type),
+    )
+}
+
+fn author_with_target(
+    functions: &PureEngineFunctionCatalog,
+    name: &str,
+    arguments: Vec<FunctionArgument>,
+    shape: ControlShape,
+    expected_result_type: Option<FunctionValueType>,
+) -> Author {
     let request = FunctionBindingRequest {
         arguments: &arguments,
         logical_argument_count: arguments.len(),
-        expected_result_type: None,
+        expected_result_type: expected_result_type.as_ref(),
     };
-    let bound = functions
-        .metadata()
-        .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
-        .unwrap();
+    let bound = if expected_result_type.is_some() {
+        functions
+            .metadata()
+            .resolve_bound_trusted(name, FunctionKind::Scalar, request, &Control)
+    } else {
+        functions
+            .metadata()
+            .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
+    }
+    .unwrap();
     let selected = Arc::new(bound.selected.clone());
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         panic!("scalar owner")
@@ -216,6 +249,7 @@ fn author(
         function,
         selected,
         arguments,
+        expected_result_type,
         shape,
     }
 }
@@ -1066,3 +1100,6 @@ mod equality_tests;
 
 #[path = "arithmetic_tests.rs"]
 mod arithmetic_tests;
+
+#[path = "value_conversion_tests.rs"]
+mod value_conversion_tests;

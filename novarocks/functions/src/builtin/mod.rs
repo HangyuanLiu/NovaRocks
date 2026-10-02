@@ -26,6 +26,8 @@ pub mod signature;
 pub mod catalogue;
 
 pub mod value_conversion;
+mod value_conversion_kernel;
+mod value_conversion_owner;
 
 mod binding_control;
 

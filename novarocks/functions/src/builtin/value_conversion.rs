@@ -17,8 +17,7 @@
 
 //! Exact, internal value-domain conversions selected by the FE type owner.
 //!
-//! This declaration is not installed kernel coverage. It has no runtime
-//! dependency and does not authorize a carrier CAST to change logical identity.
+//! This owner does not authorize a carrier CAST to change logical identity.
 //! Binding requires an explicit complete target; there is no default target,
 //! name-based source classification or decimal error-policy default. The
 //! structural binder uses the existing bounded FVT validation, not a resource
@@ -40,24 +39,28 @@ use crate::{
     FunctionBindingRequest, FunctionBindingResolver, FunctionBindingSelection,
     FunctionCatalogError, FunctionDefinition, FunctionFailureBehavior, FunctionId,
     FunctionIntrinsicRowError, FunctionKind, FunctionOverloadDeclaration, FunctionOverloadId,
-    FunctionResultType, FunctionValueType, FunctionVisibility, FunctionVolatility,
+    FunctionResultType, FunctionValueType, FunctionVolatility,
 };
 
 pub const VALUE_CONVERSION_NAME: &str = "__value_domain_conversion";
 pub const VALUE_CONVERSION_FUNCTION_ID: &str = "builtin.scalar/value_domain_conversion/v1";
 
-const JSON_TEXT: &str = "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
-const SIGNED_LARGEINT: &str = "builtin.scalar/value_domain_conversion/signed_to_largeint/v1";
-const LARGEINT_SIGNED: &str =
+pub(super) const JSON_TEXT: &str =
+    "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
+pub(super) const SIGNED_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/signed_to_largeint/v1";
+pub(super) const LARGEINT_SIGNED: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_signed_null_overflow/v1";
-const LARGEINT_FLOAT: &str = "builtin.scalar/value_domain_conversion/largeint_to_float_round/v1";
-const NULL_LIFT: &str = "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1";
+pub(super) const LARGEINT_FLOAT: &str =
+    "builtin.scalar/value_domain_conversion/largeint_to_float_round/v1";
+pub(super) const NULL_LIFT: &str =
+    "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1";
 
 /// Full effects shared by these total value conversions. Overflow NULL is a
 /// result of the signed narrowing overload, not suppression of a child,
 /// control, resource, contract or lifecycle failure. JSON bytes are preserved;
 /// signed integers extend exactly; floats use the existing i128 `as` rounding.
-fn effects() -> FunctionEffectDeclaration {
+pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: FunctionIntrinsicRowError::NoRowError,
@@ -70,9 +73,14 @@ fn effects() -> FunctionEffectDeclaration {
     }
 }
 
-/// Metadata-only construction. Server composition must attach and seal the
-/// actual implementation separately before claiming pure executable coverage.
+/// Install the exact internal binder and all of its pure scalar families.
 pub fn value_conversion_definition() -> Result<FunctionDefinition, FunctionCatalogError> {
+    let (declaration, resolver) = definition_parts()?;
+    super::value_conversion_owner::definition(declaration, resolver)
+}
+
+pub(super) fn definition_parts()
+-> Result<(FunctionBindingDeclaration, ValueConversionResolver), FunctionCatalogError> {
     let invalid = |error: &dyn std::fmt::Display| FunctionCatalogError::InvalidStableIdentity {
         subject: "internal value-domain conversion declaration",
         value: error.to_string().into(),
@@ -101,15 +109,10 @@ pub fn value_conversion_definition() -> Result<FunctionDefinition, FunctionCatal
         overloads,
     )
     .map_err(|error| invalid(&error))?;
-    FunctionDefinition::try_new_bound(
-        VALUE_CONVERSION_NAME,
-        FunctionVisibility::Hidden,
-        declaration,
-        Arc::new(ValueConversionResolver),
-    )
+    Ok((declaration, ValueConversionResolver))
 }
 
-struct ValueConversionResolver;
+pub(super) struct ValueConversionResolver;
 
 /// Check an assignment through this exact implementation-owner binder. The
 /// returned selection still needs the registered function identity, FE
@@ -696,6 +699,7 @@ fn json_carriers_observed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FunctionVisibility;
     use crate::{EngineFunctionCatalog, EngineFunctionCatalogBuilder};
 
     fn catalog() -> EngineFunctionCatalog {
