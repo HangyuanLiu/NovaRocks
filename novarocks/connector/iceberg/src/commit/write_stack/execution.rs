@@ -55,6 +55,7 @@ use crate::commit::write_stack::domain::{
     IcebergDataFileArtifact, IcebergDeletionVectorArtifact, IcebergEqualityDeleteFileArtifact,
     IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriterHandle,
 };
+use crate::commit::write_stack::equality_schema::resolve_equality_columns;
 use crate::commit::write_stack::old_delete::read_and_merge_old_deletes;
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::commit::{DeletionVector, write_single_deletion_vector_puffin};
@@ -809,54 +810,6 @@ impl IcebergEqualityDeleteStackWriter {
         }
         Ok(())
     }
-}
-
-/// Bind the frozen match key to the Arrow types the fragment actually carries.
-///
-/// The handle names the columns and their field ids; the fragment's expected
-/// schema is the only place a real Arrow type exists on this side. Requiring
-/// them to agree exactly is what keeps an Arrow value off the FE/BE boundary
-/// without letting a writer invent a type.
-fn resolve_equality_columns(
-    recipe: &crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe,
-    expected_schema: &arrow::datatypes::SchemaRef,
-) -> Result<Vec<crate::commit::EqualityDeleteColumn>, ConnectorError> {
-    if recipe.columns().len() != expected_schema.fields().len() {
-        return Err(error(
-            ConnectorErrorKind::InvalidRequest,
-            format!(
-                "Iceberg equality-delete handle names {} columns but its fragment input carries {}",
-                recipe.columns().len(),
-                expected_schema.fields().len()
-            ),
-        ));
-    }
-    recipe
-        .columns()
-        .iter()
-        .zip(expected_schema.fields())
-        .map(|(frozen, actual)| {
-            if frozen.name() != actual.name().as_str()
-                || frozen.data_type() != format!("{:?}", actual.data_type())
-                || frozen.nullable() != actual.is_nullable()
-            {
-                return Err(error(
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "Iceberg equality-delete column `{}` does not match fragment input `{}`",
-                        frozen.name(),
-                        actual.name()
-                    ),
-                ));
-            }
-            Ok(crate::commit::EqualityDeleteColumn {
-                name: frozen.name().to_string(),
-                field_id: frozen.field_id(),
-                data_type: actual.data_type().clone(),
-                nullable: actual.is_nullable(),
-            })
-        })
-        .collect()
 }
 
 #[async_trait::async_trait]

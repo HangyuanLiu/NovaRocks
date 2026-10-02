@@ -27,7 +27,7 @@ use crate::{
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 /// Count preflight derived from the existing aggregate schema allocation bound,
 /// not from the read recipe's unrelated column limit.
@@ -40,7 +40,7 @@ pub const MAX_CONNECTOR_WRITER_HANDLE_BYTES: usize = 16 * 1024 * 1024;
 pub struct ConnectorWriteRecipeDraft {
     binding: ConnectorWriteBinding,
     payload: ConnectorEncodedPayload,
-    input: ConnectorWriteInputShape,
+    input: Arc<ConnectorWriteInputShape>,
     charged_bytes: usize,
 }
 
@@ -84,6 +84,15 @@ impl ConnectorWriteRecipeDraft {
         let charged_bytes = schema_bytes
             .checked_add(payload.payload().len())
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            // The shared shape moved out of Self. Preserve its structural
+            // retained invoice, including the Arc counters; this is not an
+            // allocator-size or unique-ownership memory grant.
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<ConnectorWriteInputShape>()
+                        + 2 * std::mem::size_of::<usize>(),
+                )
+            })
             .and_then(|bytes| {
                 bytes.checked_add(
                     input.field_count() * std::mem::size_of::<crate::ConnectorWriteFieldToken>(),
@@ -98,7 +107,7 @@ impl ConnectorWriteRecipeDraft {
         Ok(Self {
             binding,
             payload,
-            input,
+            input: Arc::new(input),
             charged_bytes,
         })
     }
@@ -109,7 +118,7 @@ impl ConnectorWriteRecipeDraft {
     pub const fn payload(&self) -> &ConnectorEncodedPayload {
         &self.payload
     }
-    pub const fn input(&self) -> &ConnectorWriteInputShape {
+    pub fn input(&self) -> &ConnectorWriteInputShape {
         &self.input
     }
     pub const fn charged_bytes(&self) -> usize {
@@ -146,7 +155,15 @@ impl<E: Error> fmt::Display for ConnectorWriteRecipeCompileError<E> {
         }
     }
 }
-impl<E: Error> Error for ConnectorWriteRecipeCompileError<E> {}
+impl<E: Error + 'static> Error for ConnectorWriteRecipeCompileError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Contract(error) => Some(error),
+            Self::Provider(error) => Some(error),
+            Self::Control(error) => Some(error),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriteRecipe(ConnectorWriteRecipeDraft);
@@ -159,9 +176,11 @@ impl ConnectorWriteRecipe {
     ) -> Result<Self, ConnectorWriteRecipeCompileError<C::Error>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)
             .map_err(ConnectorWriteRecipeCompileError::Control)?;
-        let canonical =
-            compiler
-                .compile_private(draft, control)
+        let result = (|| {
+            work.flush()
+                .map_err(ConnectorWriteRecipeCompileError::Control)?;
+            let canonical = compiler
+                .compile_private(draft, work.control())
                 .map_err(|failure| match failure {
                     PureProviderCompileError::Provider(error) => {
                         ConnectorWriteRecipeCompileError::Provider(error)
@@ -170,20 +189,40 @@ impl ConnectorWriteRecipe {
                         ConnectorWriteRecipeCompileError::Control(error)
                     }
                 })?;
-        if canonical.binding != draft.binding
-            || canonical.payload.header() != draft.payload.header()
-            || !canonical
-                .input
-                .same_layout_observed::<CompileControlError>(&draft.input, || work.step())
-                .map_err(ConnectorWriteRecipeCompileError::Control)?
-        {
-            return Err(ConnectorWriteRecipeCompileError::Contract(invalid(
-                "writer recipe public facts changed during provider canonicalization",
-            )));
+            let same_envelope = canonical.binding == draft.binding
+                && canonical.payload.header() == draft.payload.header();
+            work.step()
+                .map_err(ConnectorWriteRecipeCompileError::Control)?;
+            if !same_envelope {
+                return Err(ConnectorWriteRecipeCompileError::Contract(invalid(
+                    "writer recipe public facts changed during provider canonicalization",
+                )));
+            }
+            let same_backing = Arc::ptr_eq(&canonical.input, &draft.input);
+            work.step()
+                .map_err(ConnectorWriteRecipeCompileError::Control)?;
+            // Both drafts own checked immutable input snapshots. Sharing this
+            // exact backing proves identity without copying or rescanning all
+            // field trees. A new provider-authored snapshot still faces the
+            // complete role/token/field comparison.
+            let same_input = same_backing
+                || canonical
+                    .input
+                    .same_layout_observed::<CompileControlError>(&draft.input, || work.step())
+                    .map_err(ConnectorWriteRecipeCompileError::Control)?;
+            if !same_input {
+                return Err(ConnectorWriteRecipeCompileError::Contract(invalid(
+                    "writer recipe public facts changed during provider canonicalization",
+                )));
+            }
+            Ok(Self(canonical))
+        })();
+        if matches!(&result, Err(ConnectorWriteRecipeCompileError::Control(_))) {
+            return result;
         }
         work.finish()
             .map_err(ConnectorWriteRecipeCompileError::Control)?;
-        Ok(Self(canonical))
+        result
     }
     pub const fn draft(&self) -> &ConnectorWriteRecipeDraft {
         &self.0
@@ -249,7 +288,7 @@ mod tests {
             draft: &ConnectorWriteRecipeDraft,
             _: &dyn PureCompileControl,
         ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>> {
-            let mut input = draft.input.clone();
+            let mut input = draft.input().clone();
             let mut binding = draft.binding.clone();
             let mut payload = draft.payload.clone();
             if let ConnectorWriteInputShape::Data { fields } = &mut input {
@@ -429,5 +468,148 @@ mod tests {
         assert_eq!(fields.capacity(), fields.len());
         assert!(fields[0].field().metadata().capacity() < 10);
         assert_eq!(fields[0].field().metadata()["key"], "value");
+    }
+
+    #[test]
+    fn writer_draft_clones_share_the_exact_owned_input_without_reauthoring_fields() {
+        let original = draft(ConnectorWriteInputShape::RowLineage {
+            data_fields: vec![field(1)],
+            row_identity_fields: vec![field(2)],
+        });
+        let copied = original.clone();
+        assert!(std::ptr::eq(original.input(), copied.input()));
+        assert_eq!(original.charged_bytes(), copied.charged_bytes());
+        struct ValidatedCopy;
+        impl ConnectorWriteRecipeCompiler for ValidatedCopy {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                draft: &ConnectorWriteRecipeDraft,
+                _: &dyn PureCompileControl,
+            ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>>
+            {
+                Ok(draft.clone())
+            }
+        }
+        // This fixture tests the neutral seal's immutable ownership only;
+        // it does not certify any provider-private bytes as meaningful.
+        let sealed =
+            ConnectorWriteRecipe::try_compile_with_provider(&original, &ValidatedCopy, &Control)
+                .unwrap();
+        assert!(std::ptr::eq(original.input(), sealed.draft().input()));
+        drop(original);
+        assert_eq!(sealed.draft().input(), copied.input());
+    }
+
+    #[test]
+    fn writer_seal_observes_ordinary_error_tail_and_never_rechecks_primary_control() {
+        use std::sync::Mutex;
+        struct Trace {
+            units: Mutex<Vec<u32>>,
+            cause: CompileControlError,
+            refuse_tail: bool,
+        }
+        impl PureCompileControl for Trace {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::ProviderValidation);
+                let mut trace = self.units.lock().unwrap();
+                trace.push(units);
+                if self.refuse_tail && trace.len() == 3 {
+                    Err(self.cause)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        struct Refusal(Option<CompileControlError>);
+        impl ConnectorWriteRecipeCompiler for Refusal {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                _: &ConnectorWriteRecipeDraft,
+                _: &dyn PureCompileControl,
+            ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>>
+            {
+                match self.0 {
+                    Some(cause) => Err(PureProviderCompileError::Control(cause)),
+                    None => Err(PureProviderCompileError::Provider(invalid(
+                        "private refusal",
+                    ))),
+                }
+            }
+        }
+        let original = draft(ConnectorWriteInputShape::Data {
+            fields: vec![field(1)],
+        });
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Trace {
+                units: Mutex::default(),
+                cause,
+                refuse_tail: true,
+            };
+            let error = ConnectorWriteRecipe::try_compile_with_provider(
+                &original,
+                &Refusal(None),
+                &control,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ConnectorWriteRecipeCompileError::Control(actual) if actual == cause)
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+            assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0, 0]);
+
+            let control = Trace {
+                units: Mutex::default(),
+                cause,
+                refuse_tail: true,
+            };
+            let error = ConnectorWriteRecipe::try_compile_with_provider(
+                &original,
+                &Refusal(Some(cause)),
+                &control,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ConnectorWriteRecipeCompileError::Control(actual) if actual == cause)
+            );
+            assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0]);
+        }
+        let control = Trace {
+            units: Mutex::default(),
+            cause: CompileControlError::Cancelled,
+            refuse_tail: false,
+        };
+        let error =
+            ConnectorWriteRecipe::try_compile_with_provider(&original, &Refusal(None), &control)
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectorWriteRecipeCompileError::Provider(_)
+        ));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<ConnectorError>()
+                .unwrap()
+                .message(),
+            "private refusal"
+        );
+        assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0, 0]);
     }
 }

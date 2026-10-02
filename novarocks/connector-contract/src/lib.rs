@@ -93,7 +93,7 @@ pub use write_input::{
 };
 pub use write_recipe::{
     ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,
-    ConnectorWriteRecipeDraft, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    ConnectorWriteRecipeDraft, MAX_CONNECTOR_WRITE_INPUT_FIELDS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
 pub use write_schema::*;
 
