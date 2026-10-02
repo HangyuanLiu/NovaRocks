@@ -72,7 +72,7 @@ pub fn decode_bounded(src: &[u8], max: usize) -> Result<bytes::Bytes, DecoderErr
     Ok(bytes::Bytes::from(output))
 }
 
-pub fn encode(src: &[u8], dst: &mut BytesMut) {
+pub fn encode<B: BufMut>(src: &[u8], dst: &mut B) {
     let mut bits: u64 = 0;
     let mut bits_left = 40;
 

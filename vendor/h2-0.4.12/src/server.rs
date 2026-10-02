@@ -256,6 +256,7 @@ pub struct Builder {
     send_frame_buffer: Option<crate::SendFrameBuffer>,
     max_receive_header_block_size: Option<usize>,
     max_send_header_table_size: Option<u32>,
+    send_header_block_pool: Option<crate::SendHeaderBlockPool>,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
@@ -389,6 +390,18 @@ where
         let span = tracing::trace_span!("server_handshake");
         let entered = span.enter();
 
+        if builder.send_header_block_pool.is_some() && builder.max_send_header_table_size != Some(0)
+        {
+            drop(entered);
+            return Handshake {
+                builder,
+                state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "send header block pool requires explicit max_send_header_table_size(0)",
+                )))),
+                span,
+            };
+        }
         if builder.receive_buffer_pool.is_some() && builder.max_receive_buffered_events.is_none() {
             drop(entered);
             return Handshake {
@@ -400,6 +413,22 @@ where
                 span,
             };
         }
+        let send_header_pool = match builder
+            .send_header_block_pool
+            .as_ref()
+            .map(crate::SendHeaderBlockPool::bind)
+            .transpose()
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
         let receive_pool = match builder
             .receive_buffer_pool
             .as_ref()
@@ -474,6 +503,9 @@ where
         codec.set_retain_data_payloads(builder.retain_data_payloads);
         if let Some(max) = builder.max_send_header_table_size {
             codec.set_max_send_header_table_size(max as usize);
+        }
+        if let Some(pool) = send_header_pool {
+            codec.set_send_header_block_pool(pool);
         }
 
         if let Some(max) = builder.settings.max_frame_size() {
@@ -763,6 +795,7 @@ impl Builder {
             send_frame_buffer: None,
             max_receive_header_block_size: None,
             max_send_header_table_size: None,
+            send_header_block_pool: None,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             receive_frame_buffer: None,
@@ -1149,6 +1182,17 @@ impl Builder {
     /// capacity or original funding. Complete encoded blocks remain separate.
     pub fn max_send_header_table_size(&mut self, max: u32) -> &mut Self {
         self.max_send_header_table_size = Some(max);
+        self
+    }
+
+    /// Supply original fixed backing for one complete outbound HPACK block.
+    ///
+    /// Requires explicit `max_send_header_table_size(0)`; conflicting settings
+    /// are refused before handshake I/O or any pool binding. The pool binds
+    /// once across builder clones. Default None preserves upstream behavior.
+    /// HeaderMap storage and other connection allocations remain separate.
+    pub fn send_header_block_pool(&mut self, pool: crate::SendHeaderBlockPool) -> &mut Self {
+        self.send_header_block_pool = Some(pool);
         self
     }
 

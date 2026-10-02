@@ -42,3 +42,8 @@ Client/server connection builders expose send_frame_buffer(h2::SendFrameBuffer),
 ## Local outbound HPACK ceiling forwarding
 
 Both connection builders expose max_send_header_table_size(u32), default None, preserving the value across private Config clones before h2 handshake. This is independent of the inbound table advertisement. Zero on a fresh encoder avoids dynamic table storage; positive values limit logical size and do not prove physical backing funding. Complete header blocks, HTTP metadata and Native profile installation remain separate.
+
+
+## Complete outbound HPACK block pool forwarding
+
+Both connection builders expose send_header_block_pool(h2::SendHeaderBlockPool), default None. Cloned private Config preserves and forwards the original once-bound owner; h2 requires an explicit outbound table ceiling of zero. Real peers decode multi-frame blocks and original Worker grants stay held through actual connection exit and remaining builder/pool handles. The independent fixed writer owns copied wire bytes. HTTP metadata, inbound decoding and complete Native connection ownership remain separate; product defaults and performance acceptance are unchanged.

@@ -4,6 +4,68 @@ use super::{huffman, Header};
 use bytes::{BufMut, BytesMut};
 use http::header::{HeaderName, HeaderValue};
 
+// The existing encoding/length-prefix-shift algorithm writes either the
+// default growable buffer or an originally funded fixed Vec.
+pub(crate) trait EncodeBuffer: BufMut + AsRef<[u8]> + AsMut<[u8]> {
+    fn len(&self) -> usize;
+}
+impl EncodeBuffer for BytesMut {
+    fn len(&self) -> usize {
+        BytesMut::len(self)
+    }
+}
+
+pub(crate) struct FixedEncodeBuffer<'a> {
+    buffer: &'a mut Vec<u8>,
+}
+impl<'a> FixedEncodeBuffer<'a> {
+    pub(crate) fn new(buffer: &'a mut Vec<u8>) -> Self {
+        Self { buffer }
+    }
+}
+impl AsRef<[u8]> for FixedEncodeBuffer<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_slice()
+    }
+}
+impl AsMut<[u8]> for FixedEncodeBuffer<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_mut_slice()
+    }
+}
+impl EncodeBuffer for FixedEncodeBuffer<'_> {
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+// SAFETY: chunk_mut exposes only the fixed Vec's uninitialized spare range;
+// advance_mut checks that range before marking caller-initialized bytes live.
+// No method reserves or grows backing.
+unsafe impl BufMut for FixedEncodeBuffer<'_> {
+    fn remaining_mut(&self) -> usize {
+        self.buffer.capacity() - self.buffer.len()
+    }
+    unsafe fn advance_mut(&mut self, count: usize) {
+        assert!(
+            count <= self.remaining_mut(),
+            "fixed HPACK buffer exhausted"
+        );
+        // SAFETY: BufMut's caller initialized these bytes and the check above
+        // keeps the new initialized length inside the original allocation.
+        unsafe {
+            self.buffer.set_len(self.buffer.len() + count);
+        }
+    }
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        let len = self.buffer.len();
+        let spare = self.remaining_mut();
+        // SAFETY: exclusive Vec borrow, within its allocated spare capacity.
+        unsafe {
+            bytes::buf::UninitSlice::from_raw_parts_mut(self.buffer.as_mut_ptr().add(len), spare)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Encoder {
     table: Table,
@@ -81,6 +143,14 @@ impl Encoder {
     where
         I: IntoIterator<Item = Header<Option<HeaderName>>>,
     {
+        self.encode_into(headers, dst);
+    }
+
+    pub(crate) fn encode_into<I, B>(&mut self, headers: I, dst: &mut B)
+    where
+        I: IntoIterator<Item = Header<Option<HeaderName>>>,
+        B: EncodeBuffer,
+    {
         let span = tracing::trace_span!("hpack::encode");
         let _e = span.enter();
 
@@ -115,7 +185,7 @@ impl Encoder {
         }
     }
 
-    fn encode_size_updates(&mut self, dst: &mut BytesMut) {
+    fn encode_size_updates<B: EncodeBuffer>(&mut self, dst: &mut B) {
         match self.size_update.take() {
             Some(SizeUpdate::One(val)) => {
                 self.table.resize(val);
@@ -131,7 +201,7 @@ impl Encoder {
         }
     }
 
-    fn encode_header(&mut self, index: &Index, dst: &mut BytesMut) {
+    fn encode_header<B: EncodeBuffer>(&mut self, index: &Index, dst: &mut B) {
         match *index {
             Index::Indexed(idx, _) => {
                 encode_int(idx, 7, 0x80, dst);
@@ -172,11 +242,11 @@ impl Encoder {
         }
     }
 
-    fn encode_header_without_name(
+    fn encode_header_without_name<B: EncodeBuffer>(
         &mut self,
         last: &Index,
         value: &HeaderValue,
-        dst: &mut BytesMut,
+        dst: &mut B,
     ) {
         match *last {
             Index::Indexed(..)
@@ -207,11 +277,11 @@ impl Default for Encoder {
     }
 }
 
-fn encode_size_update(val: usize, dst: &mut BytesMut) {
+fn encode_size_update<B: EncodeBuffer>(val: usize, dst: &mut B) {
     encode_int(val, 5, 0b0010_0000, dst)
 }
 
-fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+fn encode_not_indexed<B: EncodeBuffer>(name: usize, value: &[u8], sensitive: bool, dst: &mut B) {
     if sensitive {
         encode_int(name, 4, 0b10000, dst);
     } else {
@@ -221,7 +291,7 @@ fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut Byte
     encode_str(value, dst);
 }
 
-fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+fn encode_not_indexed2<B: EncodeBuffer>(name: &[u8], value: &[u8], sensitive: bool, dst: &mut B) {
     if sensitive {
         dst.put_u8(0b10000);
     } else {
@@ -232,7 +302,7 @@ fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut Byt
     encode_str(value, dst);
 }
 
-fn encode_str(val: &[u8], dst: &mut BytesMut) {
+fn encode_str<B: EncodeBuffer>(val: &[u8], dst: &mut B) {
     if !val.is_empty() {
         let idx = position(dst);
 
@@ -246,7 +316,7 @@ fn encode_str(val: &[u8], dst: &mut BytesMut) {
 
         if encode_int_one_byte(huff_len, 7) {
             // Write the string head
-            dst[idx] = 0x80 | huff_len as u8;
+            dst.as_mut()[idx] = 0x80 | huff_len as u8;
         } else {
             // Write the head to a placeholder
             const PLACEHOLDER_LEN: usize = 8;
@@ -265,12 +335,12 @@ fn encode_str(val: &[u8], dst: &mut BytesMut) {
             for i in 0..huff_len {
                 let src_i = idx + 1 + (huff_len - (i + 1));
                 let dst_i = idx + head_len + (huff_len - (i + 1));
-                dst[dst_i] = dst[src_i];
+                dst.as_mut()[dst_i] = dst.as_ref()[src_i];
             }
 
             // Copy in the head
             for i in 0..head_len {
-                dst[idx + i] = buf[i];
+                dst.as_mut()[idx + i] = buf[i];
             }
         }
     } else {
@@ -311,7 +381,7 @@ fn encode_int_one_byte(value: usize, prefix_bits: usize) -> bool {
     value < (1 << prefix_bits) - 1
 }
 
-fn position(buf: &BytesMut) -> usize {
+fn position<B: EncodeBuffer>(buf: &B) -> usize {
     buf.len()
 }
 

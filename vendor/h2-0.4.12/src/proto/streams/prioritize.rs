@@ -546,7 +546,10 @@ impl Prioritize {
                     if let Frame::Data(ref frame) = frame {
                         self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
                     }
-                    dst.buffer(frame).expect("invalid frame");
+                    // A locally bounded header refusal terminates this
+                    // connection; never panic or resume with consumed state.
+                    dst.buffer(frame)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
                     // Ensure the codec is ready to try the loop again.
                     ready!(dst.poll_ready(cx))?;

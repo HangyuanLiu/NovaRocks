@@ -22,6 +22,8 @@ pub struct Http2ConnectionConfig {
     pub max_receive_header_block_size: Option<usize>,
     /// Local outbound HPACK table ceiling; zero disables dynamic storage.
     pub max_send_header_table_size: Option<u32>,
+    /// Fresh fixed whole HPACK block; requires explicit zero outbound table cap.
+    pub send_header_block_pool: Option<h2::SendHeaderBlockPool>,
     /// Connection-wide count of buffered DATA/header/trailer events.
     pub max_receive_buffered_events: Option<usize>,
     /// Maximum per-stream outbound DATA write buffering.
@@ -40,6 +42,11 @@ pub struct Http2ConnectionConfig {
 
 impl Http2ConnectionConfig {
     pub(crate) fn apply<E: Clone>(self, builder: &mut Builder<E>) -> io::Result<()> {
+        if self.send_header_block_pool.is_some() && self.max_send_header_table_size != Some(0) {
+            return Err(invalid(
+                "per-connection send header block pool requires explicit max_send_header_table_size(0)",
+            ));
+        }
         let max_frame = self.max_frame_size.unwrap_or(16384) as usize;
         if !(16384..=16777215).contains(&max_frame) {
             return Err(invalid("invalid per-connection HTTP/2 frame maximum"));
@@ -100,6 +107,9 @@ impl Http2ConnectionConfig {
         }
         if let Some(max) = self.max_send_header_table_size {
             builder.max_send_header_table_size(max);
+        }
+        if let Some(pool) = self.send_header_block_pool {
+            builder.send_header_block_pool(pool);
         }
         if let Some(max) = self.max_receive_buffered_events {
             builder.max_receive_buffered_events(max);

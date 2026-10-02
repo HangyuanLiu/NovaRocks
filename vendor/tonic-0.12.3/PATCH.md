@@ -19,3 +19,6 @@ The upstream benchmark README contains trailing spaces and a final blank line. I
 The per-attempt configuration also forwards an optional original-funded send_frame_buffer. Its constructor validates independent capacity/frame geometry before the factory returns it; h2 binds once before handshake I/O. Actual Channel tests include this writer in the same original attempt grant. Header/HPACK/queue owners remain outside that scope.
 
 Http2ConnectionConfig also forwards an optional max_send_header_table_size. Zero configures a fresh encoder without dynamic table backing; it is independent of inbound table settings. Defaults follow the peer. The actual factory regression uses zero alongside its original fixed writer/pools; this does not fund encoded header blocks or HTTP metadata and has no product/performance acceptance claim.
+
+
+Http2ConnectionConfig also forwards send_header_block_pool for each physical attempt. A present pool requires explicit max_send_header_table_size=Some(0); conflicting configuration is rejected before builder mutation or connector.call. Actual Channel regressions fund this backing in the same original attempt grant and refuse an oversized block before any HEADERS/CONTINUATION reaches the wire. Reconnect creates a fresh pool; HTTP metadata and whole Native profile installation remain separate.

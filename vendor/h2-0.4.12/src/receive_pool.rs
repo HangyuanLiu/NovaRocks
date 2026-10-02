@@ -56,6 +56,21 @@ impl ReceiveBufferPool {
     /// No allocator caches or whole-process RSS are included.
     pub fn allocation_capacity_bound(slots: usize, block_bytes: usize) -> io::Result<usize> {
         validate_geometry(slots, block_bytes)?;
+        Self::allocation_capacity_bound_for_payload(slots, block_bytes)
+    }
+
+    // Shared fixed-payload kernel; receive-frame public geometry remains strict.
+    pub(crate) fn allocation_capacity_bound_for_payload(
+        slots: usize,
+        block_bytes: usize,
+    ) -> io::Result<usize> {
+        if slots == 0 || slots > 4096 || block_bytes == 0 {
+            return Err(invalid("invalid fixed payload pool geometry"));
+        }
+        std::alloc::Layout::array::<Slot>(slots)
+            .map_err(|_| invalid("fixed payload slot layout overflow"))?;
+        std::alloc::Layout::array::<u8>(block_bytes)
+            .map_err(|_| invalid("fixed payload buffer layout overflow"))?;
         let arc = std::mem::size_of::<Core>()
             .checked_add(3 * std::mem::size_of::<usize>())
             .and_then(|n| n.checked_add(std::mem::align_of::<Core>()));
@@ -76,6 +91,15 @@ impl ReceiveBufferPool {
     /// capacities; no return path grows either allocation.
     pub fn new(slots: usize, block_bytes: usize, ownership: Bytes) -> io::Result<Self> {
         Self::allocation_capacity_bound(slots, block_bytes)?;
+        Self::new_for_payload(slots, block_bytes, ownership)
+    }
+
+    pub(crate) fn new_for_payload(
+        slots: usize,
+        block_bytes: usize,
+        ownership: Bytes,
+    ) -> io::Result<Self> {
+        Self::allocation_capacity_bound_for_payload(slots, block_bytes)?;
         let mut storage = Vec::with_capacity(slots);
         assert_eq!(storage.capacity(), slots);
         for _ in 0..slots {
@@ -157,6 +181,15 @@ impl ReceiveBufferPool {
     /// No payload copy or wrapper allocation occurs until a position is acquired.
     pub(crate) fn try_copy_payload(&self, data: &[u8]) -> Option<Bytes> {
         assert!(data.len() <= self.buffer_capacity_bytes());
+        self.try_fill_payload(|buffer| buffer.extend_from_slice(data))
+    }
+
+    // Establish both retirement owners before calling the encoder, including
+    // callback unwind before a Bytes wrapper exists. The fixed Vec never grows.
+    pub(crate) fn try_fill_payload<F>(&self, fill: F) -> Option<Bytes>
+    where
+        F: FnOnce(&mut Vec<u8>),
+    {
         // FREE is published before available is incremented by the exit guard.
         // Observe the count first so that transient FREE cannot underflow it.
         if self.available_buffers() == 0 {
@@ -173,18 +206,23 @@ impl ReceiveBufferPool {
         // access. No owner or exit guard from the previous use remains.
         let mut buffer = unsafe { (&mut *slot.buffer.get()).take().unwrap() };
         buffer.clear();
-        buffer.extend_from_slice(data);
-        Some(Bytes::from_owner_with_exit_guard(
-            PoolBuffer {
-                buffer: Some(buffer),
-                index,
-                pool: self.clone(),
-            },
-            BufferExit {
-                index,
-                pool: Some(self.clone()),
-            },
-        ))
+        // Local destruction is reverse declaration order: return the buffer
+        // before publishing FREE if the callback panics.
+        let exit = BufferExit {
+            index,
+            pool: Some(self.clone()),
+        };
+        let mut owner = PoolBuffer {
+            buffer: Some(buffer),
+            index,
+            pool: self.clone(),
+        };
+        fill(owner.buffer.as_mut().expect("live fixed payload buffer"));
+        assert_eq!(
+            owner.buffer.as_ref().unwrap().capacity(),
+            self.buffer_capacity_bytes()
+        );
+        Some(Bytes::from_owner_with_exit_guard(owner, exit))
     }
 }
 

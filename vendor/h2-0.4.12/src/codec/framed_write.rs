@@ -35,6 +35,7 @@ pub struct FramedWrite<T, B> {
 struct Encoder<B> {
     /// HPACK encoder
     hpack: hpack::Encoder,
+    send_header_block_pool: Option<crate::SendHeaderBlockPool>,
 
     /// Write buffer
     ///
@@ -115,6 +116,7 @@ where
             final_flush_done: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
+                send_header_block_pool: None,
                 buf: Cursor::new(buffer),
                 next: None,
                 last_data_frame: None,
@@ -303,13 +305,21 @@ where
             }
             Frame::Headers(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
+                let continuation = match &self.send_header_block_pool {
+                    Some(pool) => v.encode_bounded(&mut self.hpack, pool, &mut buf)?,
+                    None => v.encode(&mut self.hpack, &mut buf),
+                };
+                if let Some(continuation) = continuation {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
             Frame::PushPromise(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
+                let continuation = match &self.send_header_block_pool {
+                    Some(pool) => v.encode_bounded(&mut self.hpack, pool, &mut buf)?,
+                    None => v.encode(&mut self.hpack, &mut buf),
+                };
+                if let Some(continuation) = continuation {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
@@ -398,6 +408,10 @@ impl<T, B> FramedWrite<T, B> {
     }
 
     /// Set the peer's header table size.
+    pub(crate) fn set_send_header_block_pool(&mut self, pool: crate::SendHeaderBlockPool) {
+        self.encoder.send_header_block_pool = Some(pool);
+    }
+
     pub fn set_max_header_table_size(&mut self, val: usize) {
         self.encoder.hpack.set_max_size_limit(val);
     }

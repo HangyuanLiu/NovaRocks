@@ -503,6 +503,16 @@ where
         self
     }
 
+    /// Supply original fixed backing for one whole outbound HPACK block.
+    /// Requires explicit `max_send_header_table_size(0)`; h2 refuses conflicting
+    /// settings before handshake I/O or pool binding. Builder clones share the
+    /// same once-bound pool. Default None preserves upstream behavior.
+    /// HTTP headers and other connection allocations remain separate.
+    pub fn send_header_block_pool(&mut self, pool: h2::SendHeaderBlockPool) -> &mut Self {
+        self.h2_builder.send_header_block_pool = Some(pool);
+        self
+    }
+
     /// Supply independent fixed GOAWAY debug backing, retained through its last
     /// error alias. One pool binds once; exhaustion closes before another copy.
     /// Default None preserves upstream behavior. Other connection owners remain

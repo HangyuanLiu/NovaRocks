@@ -22,7 +22,7 @@
 //! HPACK and Tonic/Hyper/error metadata are separate. Watchdogs only fail hangs.
 
 use bytes::Bytes;
-use h2::{ReceiveBufferPool, ReceiveFrameBuffer, SendFrameBuffer};
+use h2::{ReceiveBufferPool, ReceiveFrameBuffer, SendFrameBuffer, SendHeaderBlockPool};
 use hyper::body::Body;
 use hyper::http::{Request, Response, Uri};
 use hyper::rt::Executor;
@@ -194,6 +194,7 @@ fn connector(
 fn attempt_bytes() -> usize {
     ReceiveFrameBuffer::allocation_capacity_bound(FRAME_BYTES).unwrap()
         + SendFrameBuffer::allocation_capacity_bound(65536, FRAME_BYTES).unwrap()
+        + SendHeaderBlockPool::allocation_capacity_bound(FRAME_BYTES).unwrap()
         + 2 * ReceiveBufferPool::allocation_capacity_bound(2, FRAME_BYTES).unwrap()
         + Bytes::owner_with_exit_guard_metadata_size::<Bytes, ResultWriteCredit>()
 }
@@ -213,6 +214,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
         max_header_list_size: Some(FRAME_BYTES as u32),
         max_receive_header_block_size: Some(FRAME_BYTES),
         max_send_header_table_size: Some(0),
+        send_header_block_pool: Some(SendHeaderBlockPool::new(FRAME_BYTES, owner.clone())?),
         max_receive_buffered_events: Some(8),
         max_send_buffer_size: Some(65536),
         retain_data_payloads: true,
@@ -365,7 +367,7 @@ async fn factory_rejection_happens_before_connector_call_or_owned_io() {
 
 #[tokio::test]
 async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant() {
-    for case in 0..11 {
+    for case in 0..13 {
         let original_budget = budget(1);
         let factory_budget = original_budget.clone();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -394,6 +396,8 @@ async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant(
                         config.max_frame_size = Some(32768);
                     }
                     10 => config.max_receive_header_block_size = Some(usize::MAX),
+                    11 => config.max_send_header_table_size = None,
+                    12 => config.max_send_header_table_size = Some(1),
                     _ => unreachable!(),
                 }
                 Ok::<_, io::Error>(config)
@@ -707,5 +711,67 @@ async fn actual_channel_factory_forwards_zero_outbound_table_before_first_header
     drop(channel);
     drop(endpoint);
     drain(&executor).await;
+    reserve_all(&original_budget, attempt_bytes());
+}
+
+#[tokio::test]
+async fn actual_channel_factory_refuses_oversized_block_before_first_headers() {
+    let (input, peer, exit) = io_pair();
+    let wire = input.wire.clone();
+    let join = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        if let Some(request) = connection.accept().await {
+            assert!(
+                request.is_err(),
+                "oversized request must never reach the actual peer"
+            );
+        }
+    });
+    let executor = ManualExecutor::default();
+    let original_budget = budget(1);
+    let factory_budget = original_budget.clone();
+    let endpoint = Endpoint::from_static("http://localhost")
+        .executor(executor.clone())
+        .http2_connection_factory(move || funded_config(&factory_budget));
+    let channel = endpoint
+        .clone()
+        .connect_with_connector(connector(
+            Arc::new(Mutex::new(VecDeque::from([input]))),
+            Arc::new(AtomicUsize::new(0)),
+        ))
+        .await
+        .unwrap();
+    let mut request = boxed_request();
+    request.headers_mut().insert(
+        "x-full-block",
+        hyper::http::HeaderValue::from_bytes(&vec![b'~'; FRAME_BYTES]).unwrap(),
+    );
+    assert!(
+        drive(&executor, channel.clone().oneshot(request))
+            .await
+            .is_err()
+    );
+    join.await.unwrap();
+    drive(&executor, exit).await.unwrap();
+    drop(channel);
+    drop(endpoint);
+    drain(&executor).await;
+    {
+        let trace = wire.lock().unwrap();
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        assert!(trace.starts_with(preface));
+        let mut frames = &trace[preface.len()..];
+        while !frames.is_empty() {
+            assert!(frames.len() >= 9);
+            let len =
+                ((frames[0] as usize) << 16) | ((frames[1] as usize) << 8) | frames[2] as usize;
+            assert!(frames.len() >= len + 9);
+            assert!(
+                !matches!(frames[3], 1 | 9),
+                "refused block wrote HEADERS/CONTINUATION"
+            );
+            frames = &frames[9 + len..];
+        }
+    }
     reserve_all(&original_budget, attempt_bytes());
 }

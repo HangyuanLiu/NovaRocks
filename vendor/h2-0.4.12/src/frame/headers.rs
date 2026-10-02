@@ -287,6 +287,19 @@ impl Headers {
             .encode(&head, dst, |_| {})
     }
 
+    pub(crate) fn encode_bounded(
+        self,
+        encoder: &mut hpack::Encoder,
+        pool: &crate::SendHeaderBlockPool,
+        dst: &mut EncodeBuf<'_>,
+    ) -> Result<Option<Continuation>, crate::codec::UserError> {
+        let head = self.head();
+        Ok(self
+            .header_block
+            .into_bounded_encoding(encoder, pool)?
+            .encode(&head, dst, |_| {}))
+    }
+
     fn head(&self) -> Head {
         Head::new(Kind::Headers, self.flags.into(), self.stream_id)
     }
@@ -510,6 +523,22 @@ impl PushPromise {
             })
     }
 
+    pub(crate) fn encode_bounded(
+        self,
+        encoder: &mut hpack::Encoder,
+        pool: &crate::SendHeaderBlockPool,
+        dst: &mut EncodeBuf<'_>,
+    ) -> Result<Option<Continuation>, crate::codec::UserError> {
+        let head = self.head();
+        let promised_id = self.promised_id;
+        Ok(self
+            .header_block
+            .into_bounded_encoding(encoder, pool)?
+            .encode(&head, dst, |dst| {
+                dst.put_u32(promised_id.into());
+            }))
+    }
+
     fn head(&self) -> Head {
         Head::new(Kind::PushPromise, self.flags.into(), self.stream_id)
     }
@@ -670,6 +699,9 @@ impl EncodingHeaderBlock {
         } else {
             dst.put_slice(&self.hpack);
 
+            // Wire I/O now references the separate writer backing. The last
+            // source wrapper may physically exit and return its fixed slot;
+            // its pool Core still holds the complete original block grant.
             None
         };
 
@@ -937,6 +969,57 @@ impl HeaderBlock {
             return Err(Error::MalformedMessage);
         }
 
+        Ok(())
+    }
+
+    fn into_bounded_encoding(
+        self,
+        encoder: &mut hpack::Encoder,
+        pool: &crate::SendHeaderBlockPool,
+    ) -> Result<EncodingHeaderBlock, crate::codec::UserError> {
+        // Inspect the complete borrowed list before iterator consumption, HPACK
+        // mutation, checkout/wrapper allocation or any frame bytes are written.
+        self.check_send_header_list_size(pool.max_header_list_size())?;
+        let hpack = pool
+            .try_encode(|buffer| {
+                let headers = Iter {
+                    pseudo: Some(self.pseudo),
+                    fields: self.fields.into_iter(),
+                };
+                encoder.encode_into(headers, &mut hpack::FixedEncodeBuffer::new(buffer));
+            })
+            .ok_or(crate::codec::UserError::Rejected)?;
+        Ok(EncodingHeaderBlock { hpack })
+    }
+
+    fn check_send_header_list_size(&self, max: usize) -> Result<(), crate::codec::UserError> {
+        let mut total = 0usize;
+        let mut add = |name: usize, value: usize| {
+            total = name
+                .checked_add(value)
+                .and_then(|n| n.checked_add(32))
+                .and_then(|n| n.checked_add(total))
+                .filter(|&n| n <= max)
+                .ok_or(crate::codec::UserError::PayloadTooBig)?;
+            Ok::<_, crate::codec::UserError>(())
+        };
+        macro_rules! pseudo {
+            ($field:ident) => {
+                if let Some(value) = &self.pseudo.$field {
+                    add(stringify!($field).len() + 1, value.as_str().len())?;
+                }
+            };
+        }
+        pseudo!(method);
+        pseudo!(scheme);
+        pseudo!(status);
+        pseudo!(authority);
+        pseudo!(path);
+        pseudo!(protocol);
+        // HeaderMap::iter visits each duplicate value with its exact name.
+        for (name, value) in &self.fields {
+            add(name.as_str().len(), value.len())?;
+        }
         Ok(())
     }
 
