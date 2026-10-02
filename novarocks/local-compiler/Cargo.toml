@@ -1,0 +1,20 @@
+[package]
+name = "novarocks-local-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+novarocks-connector-contract.workspace = true
+novarocks-physical-plan.workspace = true
+novarocks-type-contract.workspace = true
+
+[dev-dependencies]
+arrow-schema.workspace = true
+bytes.workspace = true

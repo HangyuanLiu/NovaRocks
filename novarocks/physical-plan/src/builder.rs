@@ -35,7 +35,7 @@ pub struct FragmentBuilder {
     id: FragmentId,
     next_value: u32,
     next_expr: u32,
-    next_node: u32,
+    next_node: Option<u32>,
     values: BTreeMap<ValueId, ValueDef>,
     expressions: ExprArena,
     nodes: BTreeMap<NodeId, PhysicalNode>,
@@ -48,7 +48,7 @@ impl FragmentBuilder {
             id,
             next_value: 0,
             next_expr: 0,
-            next_node: 0,
+            next_node: Some(0),
             values: BTreeMap::new(),
             expressions: ExprArena::default(),
             nodes: BTreeMap::new(),
@@ -70,11 +70,11 @@ impl FragmentBuilder {
     }
 
     pub fn reserve_node_id(&mut self) -> Result<NodeId, BuildError> {
-        let id = NodeId::new(self.next_node);
-        self.next_node = self
+        let next = self
             .next_node
-            .checked_add(1)
             .ok_or(BuildError::IdentitySpaceExhausted("node"))?;
+        let id = NodeId::new(next);
+        self.next_node = next.checked_add(1);
         Ok(id)
     }
 
@@ -967,11 +967,9 @@ impl FragmentBuilder {
     /// exist to reject, which is the only way to prove they are rejected.
     pub fn insert_node_unchecked(&mut self, node: PhysicalNode) -> Result<(), BuildError> {
         let id = node.id;
-        let next_node = self.next_node.max(
-            id.get()
-                .checked_add(1)
-                .ok_or(BuildError::IdentitySpaceExhausted("node"))?,
-        );
+        let next_node = self
+            .next_node
+            .and_then(|next| id.get().checked_add(1).map(|after| next.max(after)));
         match self.nodes.entry(id) {
             Entry::Vacant(entry) => {
                 entry.insert(node);
@@ -1315,3 +1313,86 @@ impl fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+#[cfg(test)]
+mod sparse_node_identity_tests {
+    use super::*;
+
+    fn add_empty_values(builder: &mut FragmentBuilder, id: u32) {
+        builder
+            .add_values(
+                NodeId::new(id),
+                Box::from([Box::<[ExprId]>::default()]),
+                Box::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_max_node_is_valid_and_only_later_reservation_is_exhausted() {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        add_empty_values(&mut builder, u32::MAX);
+        for _ in 0..2 {
+            assert!(matches!(
+                builder.reserve_node_id(),
+                Err(BuildError::IdentitySpaceExhausted("node"))
+            ));
+        }
+        let fragment = builder
+            .finish_definition(
+                NodeId::new(u32::MAX),
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(fragment.root().get(), u32::MAX);
+        assert_eq!(fragment.nodes().len(), 1);
+    }
+
+    #[test]
+    fn monotone_reservation_returns_both_last_legal_ids_without_wraparound() {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        add_empty_values(&mut builder, u32::MAX - 2);
+        assert_eq!(builder.reserve_node_id().unwrap().get(), u32::MAX - 1);
+        assert_eq!(builder.reserve_node_id().unwrap().get(), u32::MAX);
+        assert!(matches!(
+            builder.reserve_node_id(),
+            Err(BuildError::IdentitySpaceExhausted("node"))
+        ));
+        // Explicit sparse insertion does not reopen automatic allocation.
+        add_empty_values(&mut builder, 0);
+        assert!(matches!(
+            builder.reserve_node_id(),
+            Err(BuildError::IdentitySpaceExhausted("node"))
+        ));
+    }
+
+    #[test]
+    fn duplicate_max_node_reports_duplicate_and_keeps_the_original_node() {
+        let mut builder = FragmentBuilder::new(FragmentId::new(7));
+        add_empty_values(&mut builder, u32::MAX);
+        assert!(matches!(
+            builder.add_values(NodeId::new(u32::MAX), Box::default(), Box::default()),
+            Err(BuildError::DuplicateNode(id)) if id.get() == u32::MAX
+        ));
+        let fragment = builder
+            .finish_definition(
+                NodeId::new(u32::MAX),
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let NodeKind::Values { rows } = &fragment.nodes()[&fragment.root()].kind else {
+            panic!("original node was replaced");
+        };
+        assert_eq!(rows.len(), 1);
+    }
+}
