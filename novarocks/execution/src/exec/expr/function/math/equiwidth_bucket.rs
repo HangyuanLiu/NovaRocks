@@ -119,3 +119,231 @@ pub fn eval_equiwidth_bucket(
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
     super::common::cast_output(out, arena.data_type(expr))
 }
+
+#[cfg(test)]
+mod legacy_equiwidth_contract_tests {
+    use super::*;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::ExprNode;
+    use crate::exec::expr::function::FunctionKind;
+    use arrow::array::Float64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    fn integers(values: Vec<Option<i64>>) -> ArrayRef {
+        Arc::new(Int64Array::from(values))
+    }
+
+    fn evaluate(inputs: [ArrayRef; 4]) -> Result<Vec<Option<i64>>, String> {
+        let slots = [
+            SlotId::new(1),
+            SlotId::new(2),
+            SlotId::new(3),
+            SlotId::new(4),
+        ];
+        let types = inputs
+            .iter()
+            .map(|array| array.data_type().clone())
+            .collect::<Vec<_>>();
+        let fields = types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| Field::new(format!("v{index}"), ty.clone(), true))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), Vec::from(inputs)).unwrap();
+        let schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        let mut arena = ExprArena::default();
+        let args = slots
+            .into_iter()
+            .zip(types)
+            .map(|(slot, ty)| arena.push_typed(ExprNode::SlotId(slot), ty))
+            .collect();
+        let call = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Math("equiwidth_bucket"),
+                args,
+            },
+            DataType::Int64,
+        );
+        let frozen = arena.into_immutable().unwrap();
+        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
+        assert_eq!(output.data_type(), &DataType::Int64);
+        Ok(output
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect())
+    }
+
+    fn row(
+        size: Option<i64>,
+        min: Option<i64>,
+        max: Option<i64>,
+        buckets: Option<i64>,
+    ) -> [ArrayRef; 4] {
+        [size, min, max, buckets].map(|value| integers(vec![value]))
+    }
+
+    #[test]
+    fn integer_formula_keeps_inclusive_max_and_does_not_clamp_to_bucket_count() {
+        let output = evaluate([
+            integers(vec![Some(-5), Some(-4), Some(0), Some(5)]),
+            integers(vec![Some(-5); 4]),
+            integers(vec![Some(5); 4]),
+            integers(vec![Some(6); 4]),
+        ])
+        .unwrap();
+        assert_eq!(output, vec![Some(0), Some(1), Some(5), Some(10)]);
+        assert_eq!(
+            evaluate(row(Some(10), Some(0), Some(10), Some(3))).unwrap(),
+            vec![Some(3)]
+        );
+    }
+
+    #[test]
+    fn direct_int32_inputs_and_mixed_integer_carriers_produce_int64_output() {
+        let output = evaluate([
+            Arc::new(Int32Array::from(vec![Some(0), Some(5), Some(10)])),
+            integers(vec![Some(0); 3]),
+            Arc::new(Int32Array::from(vec![Some(10); 3])),
+            integers(vec![Some(2); 3]),
+        ])
+        .unwrap();
+        assert_eq!(output, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn size_null_is_successful_only_after_nonnull_valid_parameters() {
+        assert_eq!(
+            evaluate(row(None, Some(0), Some(10), Some(2))).unwrap(),
+            vec![None]
+        );
+        for (index, name) in [
+            (1, "argument[min]"),
+            (2, "argument[max]"),
+            (3, "argument[buckets]"),
+        ] {
+            let mut values = [None, Some(0), Some(10), Some(2)];
+            values[index] = None;
+            let error = evaluate(values.map(|value| integers(vec![value]))).unwrap_err();
+            assert!(error.contains(name));
+            assert!(error.contains("must be constant"));
+        }
+        assert!(
+            evaluate(row(None, Some(10), Some(0), Some(2)))
+                .unwrap_err()
+                .contains("min < max")
+        );
+        assert!(
+            evaluate(row(None, Some(0), Some(10), Some(0)))
+                .unwrap_err()
+                .contains("buckets > 0")
+        );
+    }
+
+    #[test]
+    fn invalid_range_bucket_count_and_outside_values_remain_errors() {
+        for (min, max) in [(1, 1), (2, 1)] {
+            assert!(
+                evaluate(row(Some(1), Some(min), Some(max), Some(2)))
+                    .unwrap_err()
+                    .contains("min < max")
+            );
+        }
+        for buckets in [0, -1, i64::MIN] {
+            assert!(
+                evaluate(row(Some(1), Some(0), Some(10), Some(buckets)))
+                    .unwrap_err()
+                    .contains("buckets > 0")
+            );
+        }
+        assert!(
+            evaluate(row(Some(-1), Some(0), Some(10), Some(2)))
+                .unwrap_err()
+                .contains("size >= min")
+        );
+        assert!(
+            evaluate(row(Some(11), Some(0), Some(10), Some(2)))
+                .unwrap_err()
+                .contains("size <= max")
+        );
+    }
+
+    #[test]
+    fn finite_and_nonfinite_float_carriers_are_all_rejected_before_numeric_evaluation() {
+        for value in [1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for index in 0..4 {
+                let mut inputs = row(Some(1), Some(0), Some(10), Some(2));
+                inputs[index] = Arc::new(Float64Array::from(vec![Some(value)]));
+                assert!(
+                    evaluate(inputs)
+                        .unwrap_err()
+                        .contains("expects BIGINT arguments")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn varying_legal_bounds_fail_together_but_succeed_as_separate_single_row_batches() {
+        let together = evaluate([
+            integers(vec![Some(5), Some(6)]),
+            integers(vec![Some(0), Some(1)]),
+            integers(vec![Some(10), Some(11)]),
+            integers(vec![Some(2), Some(2)]),
+        ])
+        .unwrap_err();
+        assert!(together.contains("argument[min] must be constant"));
+        assert_eq!(
+            evaluate(row(Some(5), Some(0), Some(10), Some(2))).unwrap(),
+            vec![Some(1)]
+        );
+        assert_eq!(
+            evaluate(row(Some(6), Some(1), Some(11), Some(2))).unwrap(),
+            vec![Some(1)]
+        );
+        for index in 1..4 {
+            let mut inputs = [
+                integers(vec![Some(1); 2]),
+                integers(vec![Some(0); 2]),
+                integers(vec![Some(10); 2]),
+                integers(vec![Some(2); 2]),
+            ];
+            inputs[index] = integers(match index {
+                1 => vec![Some(0), Some(1)],
+                2 => vec![Some(10), Some(11)],
+                _ => vec![Some(2), Some(3)],
+            });
+            assert!(evaluate(inputs).unwrap_err().contains("must be constant"));
+        }
+    }
+
+    #[test]
+    fn extreme_signed_inputs_with_representable_differences_preserve_exact_integer_results() {
+        // Keep both differences in i64. The production subtractions outside
+        // this range remain unchecked; this oracle does not invent a policy
+        // for debug panics or unchecked-build wrapping.
+        assert_eq!(
+            evaluate(row(
+                Some(i64::MIN),
+                Some(i64::MIN),
+                Some(-1),
+                Some(i64::MAX)
+            ))
+            .unwrap(),
+            vec![Some(0)]
+        );
+        assert_eq!(
+            evaluate(row(Some(-1), Some(i64::MIN), Some(-1), Some(i64::MAX))).unwrap(),
+            vec![Some(i64::MAX)]
+        );
+        assert_eq!(
+            evaluate(row(Some(i64::MAX), Some(0), Some(i64::MAX), Some(i64::MAX))).unwrap(),
+            vec![Some(i64::MAX)]
+        );
+    }
+}

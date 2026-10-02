@@ -134,12 +134,24 @@ impl CastRecipe {
         target: CastTarget,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, FunctionBindingError> {
-        if source.logical_type != ValueLogicalType::Physical {
+        Self::prepare_type(&source.data_type, source.logical_type, target, work)
+    }
+
+    /// Borrow an already admitted source type without cloning its field tree.
+    /// The caller supplies the exact authored root identity and the same
+    /// observed full-type preflight used by `prepare`.
+    pub(super) fn prepare_type(
+        source: &DataType,
+        logical_type: ValueLogicalType,
+        target: CastTarget,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FunctionBindingError> {
+        if logical_type != ValueLogicalType::Physical {
             return Err(unsupported());
         }
         let mut steps = [Step::Done; MAX_VALUE_TYPE_DEPTH];
         let mut count = 0;
-        let mut ty = &source.data_type;
+        let mut ty = source;
         loop {
             work.step()?;
             let depth = count + 1;
@@ -538,3 +550,7 @@ fn read_leaf(
 #[cfg(test)]
 #[path = "round_cast_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "round_cast_arrow_tests.rs"]
+mod arrow_tests;
