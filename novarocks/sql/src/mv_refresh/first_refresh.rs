@@ -682,6 +682,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
             final_write,
         },
         decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
         &control,
     )
 }
@@ -734,6 +735,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         None,
         shape,
         decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
         &control,
     )
 }
@@ -844,6 +846,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
             final_write,
         },
         decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
         &control,
     )
 }
@@ -891,6 +894,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         None,
         shape,
         decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
         &control,
     )
 }

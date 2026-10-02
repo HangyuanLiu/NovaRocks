@@ -346,6 +346,82 @@ mod tests {
     }
 
     #[test]
+    fn intrinsic_allow_throw_parameter_author_keeps_scoped_boolean_refs_and_exact_keys() {
+        use wire::semantic_parameter::Value;
+        let dto = wire::SemanticParameters {
+            entries: vec![
+                entry(0, Value::AllowThrowException(false)),
+                entry(u32::MAX, Value::AllowThrowException(true)),
+            ],
+        };
+        let table = decode(&dto, &Control::default()).unwrap();
+        assert_eq!(encode(&table, &Control::default()).unwrap(), dto);
+        for (id, value) in [(0, false), (u32::MAX, true)] {
+            let reference = SemanticParameterRef {
+                id: SemanticParameterId::new(id),
+                expected_key: SemanticParameterKey::AllowThrowException,
+            };
+            let encoded = projected(&Control::default(), CompilePhase::Encode, |work| {
+                encode_reference(&reference, work)
+            })
+            .unwrap();
+            assert_eq!(encoded.id, Some(id));
+            assert_eq!(
+                encoded.expected_key,
+                wire::SemanticParameterKey::AllowThrowException as i32
+            );
+            let decoded = projected(&Control::default(), CompilePhase::Decode, |work| {
+                decode_reference(&encoded, work)
+            })
+            .unwrap();
+            assert_eq!(decoded, reference);
+            assert_eq!(
+                table.require(decoded).unwrap(),
+                &SemanticParameterValue::AllowThrowException(value)
+            );
+            let wrong = SemanticParameterRef {
+                expected_key: SemanticParameterKey::DecimalOverflowToDouble,
+                ..decoded
+            };
+            assert!(table.require(wrong).is_err());
+        }
+        assert!(
+            table
+                .require(SemanticParameterRef {
+                    id: SemanticParameterId::new(71),
+                    expected_key: SemanticParameterKey::AllowThrowException
+                })
+                .is_err()
+        );
+        for expected_key in [0, i32::MAX] {
+            assert!(matches!(
+                projected(&Control::default(), CompilePhase::Decode, |work| {
+                    decode_reference(
+                        &wire::SemanticParameterRef {
+                            id: Some(0),
+                            expected_key,
+                        },
+                        work,
+                    )
+                }),
+                Err(SemanticsCodecError::InvalidShape(_))
+            ));
+        }
+        assert!(matches!(
+            projected(&Control::default(), CompilePhase::Decode, |work| {
+                decode_reference(
+                    &wire::SemanticParameterRef {
+                        id: None,
+                        expected_key: wire::SemanticParameterKey::AllowThrowException as i32,
+                    },
+                    work,
+                )
+            }),
+            Err(SemanticsCodecError::InvalidShape(_))
+        ));
+    }
+
+    #[test]
     fn parameter_projection_keeps_scoped_keys_and_sparse_reference_identity() {
         use wire::semantic_parameter::Value;
         let dto = wire::SemanticParameters {

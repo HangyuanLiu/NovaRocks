@@ -21,7 +21,7 @@ use arrow_schema::DataType;
 
 use novarocks_type_contract::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId,
-    FunctionKind, FunctionOverloadId, FunctionVolatility,
+    FunctionKind, FunctionOverloadId, FunctionVolatility, SemanticParameterRef,
 };
 
 use crate::{ExprId, FunctionArgumentType, ValueId, ValueType};
@@ -210,6 +210,9 @@ pub enum ExprKind {
         op: BinaryOperator,
         right: ExprId,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        /// Required for arithmetic; absent for comparisons and bitwise operators.
+        /// The value is supplied by the plan's immutable parameter table.
+        allow_throw_exception: Option<SemanticParameterRef>,
     },
     /// SQL `AND` over an ordered argument list.
     ///
@@ -244,6 +247,7 @@ pub enum ExprKind {
         expr: ExprId,
         target: DataType,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        allow_throw_exception: SemanticParameterRef,
     },
     IsNull {
         expr: ExprId,
@@ -287,6 +291,23 @@ pub enum ExprKind {
 }
 
 impl ExprKind {
+    /// Actual primitive parameter consumers, independent of function-call
+    /// occurrence environments and legacy binding migration fields.
+    pub fn intrinsic_parameter_references(&self) -> impl Iterator<Item = &SemanticParameterRef> {
+        match self {
+            Self::Binary {
+                allow_throw_exception,
+                ..
+            } => allow_throw_exception.as_ref(),
+            Self::Cast {
+                allow_throw_exception,
+                ..
+            } => Some(allow_throw_exception),
+            _ => None,
+        }
+        .into_iter()
+    }
+
     pub(crate) fn expression_references(&self, output: &mut Vec<ExprId>) {
         let result = self.expression_references_observed::<std::convert::Infallible>(|id| {
             output.push(id);

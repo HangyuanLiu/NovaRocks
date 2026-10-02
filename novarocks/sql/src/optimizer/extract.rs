@@ -1455,6 +1455,7 @@ mod tests {
                     requires_power_of_two: true,
                 },
                 crate::functions::builtin_sql_function_catalog(),
+                false, // This test authors a statement with throwing disabled.
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("lower final physical plan")

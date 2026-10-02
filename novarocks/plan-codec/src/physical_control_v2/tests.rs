@@ -143,6 +143,7 @@ fn binary_fixture() -> (Fragment, PhysicalRootUses) {
             node,
             ty,
             ExprKind::Binary {
+                allow_throw_exception: None,
                 left,
                 op: BinaryOperator::Eq,
                 right,

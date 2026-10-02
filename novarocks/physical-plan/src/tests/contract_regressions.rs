@@ -2438,6 +2438,11 @@ fn higher_order_function_fragment(
                 node,
                 parameter_type.clone(),
                 ExprKind::Binary {
+                    allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
+                        id: novarocks_type_contract::SemanticParameterId::new(0),
+                        expected_key:
+                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                    }),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     left: call,

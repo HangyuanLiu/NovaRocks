@@ -66,7 +66,8 @@ use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
 use novarocks_spi::connector::write_stack::{RootWriteResultSchema, WriteTargetOrdinal};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, OrderedComparisonAlgorithm,
-    PartitionCountParameterId, PartitionSpaceId, PureCompileControl,
+    PartitionCountParameterId, PartitionSpaceId, PureCompileControl, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
 use sha2::{Digest, Sha256};
 
@@ -102,9 +103,18 @@ pub(crate) fn lower_final_physical_plan(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    root_allow_throw_exception: bool,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    lower_final_physical_plan_inner(plan, version, dop_domain, None, functions, control)
+    lower_final_physical_plan_inner(
+        plan,
+        version,
+        dop_domain,
+        None,
+        functions,
+        root_allow_throw_exception,
+        control,
+    )
 }
 
 pub(crate) fn lower_final_physical_plan_with_provider_reads(
@@ -113,9 +123,18 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     dop_domain: PipelineDopDomain,
     reads: FinalizedProviderReadSet,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    root_allow_throw_exception: bool,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads), functions, control)
+    lower_final_physical_plan_inner(
+        plan,
+        version,
+        dop_domain,
+        Some(reads),
+        functions,
+        root_allow_throw_exception,
+        control,
+    )
 }
 
 /// Lower one admitted SQL write directly into the final physical-plan
@@ -136,6 +155,7 @@ pub(crate) fn lower_final_physical_write_plan(
     dop_domain: PipelineDopDomain,
     input: FinalWriteLowering<'_>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    root_allow_throw_exception: bool,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let FinalWriteLowering {
@@ -145,7 +165,14 @@ pub(crate) fn lower_final_physical_write_plan(
         auxiliary,
         mut targets,
     } = input;
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, functions, control)?;
+    let mut visitor = ContractLoweringVisitor::new(
+        version,
+        dop_domain,
+        reads,
+        functions,
+        root_allow_throw_exception,
+        control,
+    )?;
     // A write states the runtime filters it can name, for the same reason a
     // read does: a filter whose probe is not one value of one type is a filter
     // the plan cannot say anything exact about.
@@ -177,6 +204,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     dop_domain: PipelineDopDomain,
     input: FinalChangeStreamWriteLowering<'_>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    root_allow_throw_exception: bool,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
@@ -185,7 +213,14 @@ pub(crate) fn lower_final_change_stream_write_plan(
         auxiliary,
         mut targets,
     } = input;
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, functions, control)?;
+    let mut visitor = ContractLoweringVisitor::new(
+        version,
+        dop_domain,
+        reads,
+        functions,
+        root_allow_throw_exception,
+        control,
+    )?;
     dag.validate().map_err(invalid_write)?;
     if !matches!(plan.kind, PhysicalPlanKind::ChangeEventExpand(_)) {
         return Err(invalid_write(
@@ -210,9 +245,17 @@ fn lower_final_physical_plan_inner(
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    root_allow_throw_exception: bool,
     control: &dyn PureCompileControl,
 ) -> Result<PlanBuilder, ContractLoweringError> {
-    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads, functions, control)?;
+    let mut visitor = ContractLoweringVisitor::new(
+        version,
+        dop_domain,
+        reads,
+        functions,
+        root_allow_throw_exception,
+        control,
+    )?;
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let root = visitor.lower_node(plan)?;
 
@@ -239,6 +282,8 @@ fn lower_final_physical_plan_inner(
 }
 
 struct ContractLoweringVisitor<'a> {
+    root_allow_throw_exception: bool,
+    root_allow_throw_exception_used: bool,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     control: &'a dyn PureCompileControl,
     work: CompileCheckpoints<'a>,
@@ -1283,10 +1328,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         dop_domain: PipelineDopDomain,
         provider_reads: Option<FinalizedProviderReadSet>,
         functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+        root_allow_throw_exception: bool,
         control: &'a dyn PureCompileControl,
     ) -> Result<Self, ContractLoweringError> {
         let work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         Ok(Self {
+            root_allow_throw_exception,
+            root_allow_throw_exception_used: false,
             functions,
             control,
             work,
@@ -1317,6 +1365,16 @@ impl<'a> ContractLoweringVisitor<'a> {
             runtime_filter_attachments: BTreeSet::new(),
             edges: BTreeMap::new(),
         })
+    }
+
+    /// One admitted statement authors this source for every arithmetic/cast
+    /// occurrence, independently of the occurrence's decimal overflow policy.
+    fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
+        self.root_allow_throw_exception_used = true;
+        SemanticParameterRef {
+            id: SemanticParameterId::new(0),
+            expected_key: SemanticParameterKey::AllowThrowException,
+        }
     }
 
     fn fragment_mut(&mut self) -> &mut FragmentBuilder {
@@ -1559,6 +1617,16 @@ impl<'a> ContractLoweringVisitor<'a> {
         for fragment in finished_fragments.into_values() {
             self.work.step()?;
             self.plan_builder.add_fragment(fragment)?;
+        }
+        if self.root_allow_throw_exception_used {
+            let parameters = SemanticParameters::try_new([(
+                SemanticParameterId::new(0),
+                SemanticParameterValue::AllowThrowException(self.root_allow_throw_exception),
+            )])
+            .map_err(|error| ContractLoweringError::InvalidFunctionBinding {
+                detail: error.to_string(),
+            })?;
+            self.plan_builder = self.plan_builder.with_semantic_parameters(parameters);
         }
         self.work.finish()?;
         Ok(self.plan_builder)
@@ -7363,9 +7431,20 @@ impl<'a> ContractLoweringVisitor<'a> {
                 } else {
                     (lowered_left, lowered_right)
                 };
+                let op = lower_binary_operator(*op);
+                let allow_throw_exception = matches!(
+                    op,
+                    BinaryOperator::Add
+                        | BinaryOperator::Subtract
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                )
+                .then(|| self.root_allow_throw_reference());
                 ContractExprKind::Binary {
+                    allow_throw_exception,
                     left: lowered_left,
-                    op: lower_binary_operator(*op),
+                    op,
                     right: lowered_right,
                     decimal_overflow_policy: *decimal_overflow_policy,
                 }
@@ -7884,10 +7963,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         if self.expression_value_type(expression)? == *target {
             return Ok(expression);
         }
+        let allow_throw_exception = self.root_allow_throw_reference();
         self.add_scoped_expression(
             owner,
             target.clone(),
             ContractExprKind::Cast {
+                allow_throw_exception,
                 expr: expression,
                 target: target.data_type.clone(),
                 decimal_overflow_policy: policy,
@@ -10532,6 +10613,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &control,
             ));
             assert_eq!(error, cause);
@@ -10568,6 +10650,7 @@ mod tests {
                     version(),
                     dop(),
                     crate::functions::builtin_sql_function_catalog(),
+                    false,
                     &control
                 )),
                 cause
@@ -10600,6 +10683,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &control
             )),
             CompileControlError::Cancelled
@@ -10631,6 +10715,7 @@ mod tests {
             version(),
             dop(),
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &control,
         )
         .unwrap();
@@ -11058,6 +11143,7 @@ mod tests {
             version(),
             dop(),
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )?
         .finish()?)
@@ -11098,6 +11184,7 @@ mod tests {
                 targets,
             },
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11155,6 +11242,7 @@ mod tests {
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11240,6 +11328,7 @@ mod tests {
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11326,6 +11415,7 @@ mod tests {
                 targets,
             },
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11418,6 +11508,7 @@ mod tests {
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11827,6 +11918,7 @@ mod tests {
             dop(),
             reads,
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11887,6 +11979,7 @@ mod tests {
             dop(),
             bucket_reads,
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -11956,6 +12049,7 @@ mod tests {
             dop(),
             None,
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &control,
         )
         .unwrap();
@@ -12590,6 +12684,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidUnpivot { .. })
@@ -12619,6 +12714,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidRepeat { .. })
@@ -12652,6 +12748,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidTableFunction { .. })
@@ -12688,6 +12785,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidWindow { .. })
@@ -12714,6 +12812,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .is_err()
@@ -12739,6 +12838,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -12769,6 +12869,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -13397,6 +13498,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -13542,6 +13644,7 @@ mod tests {
                 dop(),
                 None,
                 crate::functions::builtin_sql_function_catalog(),
+                false,
                 &control,
             )
             .unwrap();
@@ -13604,6 +13707,7 @@ mod tests {
             dop(),
             None,
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &control,
         )
         .unwrap();
@@ -13639,6 +13743,7 @@ mod tests {
             dop(),
             None,
             crate::functions::builtin_sql_function_catalog(),
+            false,
             &control,
         )
         .unwrap();

@@ -600,6 +600,7 @@ pub fn build_final_frozen_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     let scan_occurrence = final_write
@@ -634,6 +635,7 @@ pub fn build_final_frozen_connector_write_plan(
         settings,
         final_write,
         functions,
+        root_allow_throw_exception,
         control,
     )
 }
@@ -646,6 +648,7 @@ pub fn build_final_frozen_connector_write_plan(
 /// accounted for under, so the two halves are separated here -- the needs
 /// leave, the facts come back, and the plan is lowered against them.
 pub struct DmlWriteCompletion {
+    root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
@@ -700,6 +703,7 @@ pub fn begin_final_connector_write_plan(
     )?;
     Ok((
         DmlWriteCompletion {
+            root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
             query_statistics: compiled.statistics.snapshot,
             physical,
@@ -733,6 +737,7 @@ impl DmlWriteCompletion {
                 targets: targets.0,
             },
             self.functions.as_ref(),
+            self.root_allow_throw_exception,
             control,
         )
         .map_err(final_lowering_error)?;
@@ -781,6 +786,7 @@ pub fn compile_final_connector_write_plan(
         settings,
         final_write,
         compiled.function_catalog.as_ref(),
+        compiled.root_allow_throw_exception,
         &control,
     )
 }
@@ -795,6 +801,7 @@ fn complete_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    root_allow_throw_exception: bool,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -815,6 +822,7 @@ fn complete_connector_write_plan(
             targets: finalized_targets.0,
         },
         functions,
+        root_allow_throw_exception,
         control,
     )
     .map_err(final_lowering_error)?;
@@ -826,6 +834,7 @@ fn complete_connector_write_plan(
 
 /// One internal DML read, optimized and waiting for its provider facts.
 pub struct DmlReadCompletion {
+    root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
@@ -856,6 +865,7 @@ pub fn begin_final_dml_read_plan(
     )?;
     Ok((
         DmlReadCompletion {
+            root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
             physical,
             query_statistics: compiled.statistics.snapshot,
@@ -880,6 +890,7 @@ impl DmlReadCompletion {
                     dop_domain,
                     reads,
                     self.functions.as_ref(),
+                    self.root_allow_throw_exception,
                     control,
                 )
             }
@@ -888,6 +899,7 @@ impl DmlReadCompletion {
                 version,
                 dop_domain,
                 self.functions.as_ref(),
+                self.root_allow_throw_exception,
                 control,
             ),
         }
@@ -904,6 +916,7 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    root_allow_throw_exception: bool,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
     function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -936,10 +949,12 @@ impl DmlCtasSourcePlan {
         use sha2::{Digest, Sha256};
 
         let material = format!("{:#?}", self.optimized);
+        let root_allow = [u8::from(self.root_allow_throw_exception)];
         let mut digest = Sha256::new();
         for part in [
-            b"novarocks.ctas-optimized-capture.v1".as_slice(),
+            b"novarocks.ctas-optimized-capture.v2".as_slice(),
             material.as_bytes(),
+            root_allow.as_slice(),
         ] {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part);
@@ -958,6 +973,7 @@ pub fn compile_ctas_source(
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     Ok(DmlCtasSourcePlan {
+        root_allow_throw_exception: compiled.root_allow_throw_exception,
         query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
         function_catalog: compiled.function_catalog,
@@ -1005,6 +1021,7 @@ pub fn begin_final_ctas_connector_write_plan(
     )?;
     Ok((
         DmlWriteCompletion {
+            root_allow_throw_exception: source.root_allow_throw_exception,
             functions: source.function_catalog.clone(),
             query_statistics: source.query_statistics.clone(),
             physical,
@@ -1144,6 +1161,7 @@ pub struct DmlFinalChangeStreamPlan {
 /// An optimized change stream whose provider reads have been stated but not
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
+    root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
@@ -1170,6 +1188,7 @@ impl DmlChangeStreamCompletion {
                 targets: finalized_targets.0,
             },
             self.functions.as_ref(),
+            self.root_allow_throw_exception,
             control,
         )
         .map_err(final_lowering_error)?;
@@ -1196,6 +1215,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1254,6 +1274,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     )?;
     Ok((
         DmlChangeStreamCompletion {
+            root_allow_throw_exception,
             functions,
             query_statistics,
             physical,
@@ -1344,6 +1365,7 @@ pub fn begin_final_dml_change_stream(
         request.pre_expand_keyed_assert,
         request.shape,
         decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
         &control,
     )
 }
@@ -1395,6 +1417,7 @@ pub fn compile_final_dml_change_stream(
             final_write: request.final_write,
         },
         decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
         &control,
     )
 }
@@ -1411,6 +1434,7 @@ pub(crate) fn seal_final_change_stream_producer(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
@@ -1442,6 +1466,7 @@ pub(crate) fn seal_final_change_stream_producer(
         functions,
         context,
         decimal_overflow_policy,
+        root_allow_throw_exception,
         control,
     )
 }
@@ -1456,6 +1481,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
@@ -1515,6 +1541,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
             targets: finalized_targets.0,
         },
         functions,
+        root_allow_throw_exception,
         control,
     )
     .map_err(final_lowering_error)?;
@@ -2250,6 +2277,7 @@ pub fn build_final_statistics_connector_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_context: DmlFinalPlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     if required.is_empty() {
@@ -2280,7 +2308,13 @@ pub fn build_final_statistics_connector_plan(
     );
     let builder =
         crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
-            &physical, version, dop_domain, reads, functions, control,
+            &physical,
+            version,
+            dop_domain,
+            reads,
+            functions,
+            root_allow_throw_exception,
+            control,
         )
         .map_err(final_lowering_error)?;
     builder
@@ -2985,6 +3019,7 @@ mod tests {
             &SessionOptimizerSettings::default(),
             statistics_final_context(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            false,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("ANALYZE plan");
@@ -3711,6 +3746,139 @@ mod tests {
                     .node(expression),
                 crate::optimizer::scalar::ScalarNode::ColumnRef(crate::column_id::ColumnId(4))
             ));
+        }
+    }
+
+    #[test]
+    fn dml_read_and_ctas_keep_actual_analyzed_root_allow_across_move_handoffs() {
+        use crate::compiler::{
+            SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
+            SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput,
+        };
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let statistics = DmlStatisticsSnapshot::empty();
+        for (session_mode, sql, expected) in [
+            ("32", "SELECT 1", false),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true),
+            ("ERROR_IF_OVERFLOW", "SELECT 1", false),
+            (
+                "32",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                false,
+            ),
+            (
+                "32",
+                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1 AS x) s",
+                false,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x) s",
+                true,
+            ),
+        ] {
+            let request = |intent| {
+                let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                    SqlStatementInput::sql(sql),
+                    intent,
+                    SqlSessionContext {
+                        sql_semantics: crate::sql_mode::SqlSemanticSettings::default()
+                            .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode)),
+                        current_catalog: None,
+                        current_database: "default".into(),
+                        optimizer_settings: SessionOptimizerSettings::default(),
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                    crate::compiler::noop_constant_evaluator(),
+                    None,
+                    SqlCompileControl::unbounded(),
+                ))
+                .unwrap()
+                .into_pending()
+                .unwrap();
+                assert_eq!(analyzed.root_allow_throw_exception(), expected);
+                let request =
+                    SqlOptimizeRequest::new(analyzed, &statistics, SqlCompileControl::unbounded());
+                assert_eq!(request.root_allow_throw_exception(), expected);
+                request
+            };
+            let (completion, reads) = super::begin_final_dml_read_plan(
+                request(SqlCompileIntent::DmlInternalRead),
+                &SessionOptimizerSettings::default(),
+            )
+            .unwrap();
+            assert!(reads.is_empty());
+            assert_eq!(completion.root_allow_throw_exception, expected);
+            let source = super::compile_ctas_source(request(SqlCompileIntent::Query)).unwrap();
+            assert_eq!(source.root_allow_throw_exception, expected);
+            assert_eq!(source.output_columns().len(), 1);
+        }
+    }
+
+    #[test]
+    fn ctas_capture_fingerprint_binds_root_allow_for_identical_actual_optimized_sources() {
+        use crate::compiler::{
+            SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
+            SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput,
+        };
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let statistics = DmlStatisticsSnapshot::empty();
+        let sources = ["32", "ALLOW_THROW_EXCEPTION"].map(|session_mode| {
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql("SELECT 1"),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    sql_semantics: crate::sql_mode::SqlSemanticSettings::default()
+                        .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode)),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+                crate::compiler::noop_constant_evaluator(),
+                None,
+                SqlCompileControl::unbounded(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            super::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &statistics,
+                SqlCompileControl::unbounded(),
+            ))
+            .unwrap()
+        });
+        assert!(!sources[0].root_allow_throw_exception);
+        assert!(sources[1].root_allow_throw_exception);
+        // The previous capture material was identical for these two admitted
+        // statements, even though their frozen terminal exception modes differ.
+        assert_eq!(
+            format!("{:#?}", sources[0].optimized),
+            format!("{:#?}", sources[1].optimized)
+        );
+        assert_ne!(
+            sources[0].capture_fingerprint(),
+            sources[1].capture_fingerprint()
+        );
+        for source in &sources {
+            assert_eq!(
+                source.capture_fingerprint(),
+                source.clone().capture_fingerprint()
+            );
         }
     }
 }

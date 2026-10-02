@@ -1132,6 +1132,11 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
                 node,
                 value_type.clone(),
                 ExprKind::Cast {
+                    allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
+                        id: novarocks_type_contract::SemanticParameterId::new(0),
+                        expected_key:
+                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                    },
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     expr: expression,
@@ -1682,6 +1687,11 @@ fn integer_division_keeps_its_resolved_float_result() {
             node,
             ty(DataType::Float64, false),
             ExprKind::Binary {
+                allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
+                    id: novarocks_type_contract::SemanticParameterId::new(0),
+                    expected_key:
+                        novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 left,
                 op: BinaryOperator::Divide,
@@ -2235,6 +2245,19 @@ fn physical_binary_policy_rejects_reporting_comparisons_before_publication() {
                 node,
                 ty(result_type.clone(), false),
                 ExprKind::Binary {
+                    allow_throw_exception: matches!(
+                        op,
+                        BinaryOperator::Add
+                            | BinaryOperator::Subtract
+                            | BinaryOperator::Multiply
+                            | BinaryOperator::Divide
+                            | BinaryOperator::Modulo
+                    )
+                    .then_some(novarocks_type_contract::SemanticParameterRef {
+                        id: novarocks_type_contract::SemanticParameterId::new(0),
+                        expected_key:
+                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                    }),
                     left: operand,
                     op,
                     right: operand,
@@ -2314,6 +2337,11 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
                 node,
                 ty(result_type.clone(), true),
                 ExprKind::Cast {
+                    allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
+                        id: novarocks_type_contract::SemanticParameterId::new(0),
+                        expected_key:
+                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                    },
                     expr: operand,
                     target: result_type.clone(),
                     decimal_overflow_policy: policy,

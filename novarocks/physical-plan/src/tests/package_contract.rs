@@ -170,6 +170,29 @@ fn fixture_pruning_tables(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FrozenFra
         .collect()
 }
 
+fn intrinsic_reference(id: u32) -> SemanticParameterRef {
+    SemanticParameterRef {
+        id: SemanticParameterId::new(id),
+        expected_key: SemanticParameterKey::AllowThrowException,
+    }
+}
+
+fn fixture_plan_parameters(plan: &PhysicalPlan, parameters: SemanticParameters) -> PhysicalPlan {
+    let plan = crate::plan::PhysicalPlanParts {
+        parameters,
+        version: plan.version(),
+        fragments: plan.fragments().clone(),
+        edges: plan.edges().clone(),
+        runtime_filters: plan.runtime_filters().clone(),
+        result_port: plan.result_port().cloned(),
+        required: plan.required(),
+        annotations: plan.annotations().to_vec().into_boxed_slice(),
+    }
+    .into();
+    validate_plan(&plan).unwrap();
+    plan
+}
+
 fn extract(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
@@ -179,9 +202,8 @@ fn extract(
     let controls = fixture_controls(plan);
     let calls = fixture_call_tables(plan, &controls);
     extract_fragment_packages(
-        plan,
+        &fixture_plan_parameters(plan, parameters.clone()),
         scans,
-        parameters,
         writes,
         &controls,
         &calls,
@@ -202,6 +224,20 @@ fn package_input_with_controls(
     calls: FrozenFragmentCalls,
 ) -> FragmentPackageInput {
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control).unwrap();
+    let parameters = SemanticParameters::try_new(
+        fragment
+            .expressions()
+            .iter()
+            .flat_map(|(_, expression)| expression.kind.intrinsic_parameter_references())
+            .map(|reference| {
+                (
+                    reference.id,
+                    SemanticParameterValue::AllowThrowException(false),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .unwrap();
     FragmentPackageInput {
         version: version(),
         required: RequiredContracts::default(),
@@ -211,7 +247,7 @@ fn package_input_with_controls(
         fragment,
         cuts: FragmentCuts::default(),
         result: None,
-        parameters: SemanticParameters::default(),
+        parameters,
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
@@ -229,9 +265,8 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
     let parameters = SemanticParameters::default();
     let extract_with = |controls: &BTreeMap<FragmentId, PhysicalRootUses>| {
         extract_fragment_packages(
-            &plan,
+            &fixture_plan_parameters(&plan, parameters.clone()),
             &BTreeMap::new(),
-            &parameters,
             &BTreeMap::new(),
             controls,
             &calls,
@@ -272,9 +307,8 @@ fn extraction_requires_explicit_pruning_table_for_every_fragment() {
     let pruning = fixture_pruning_tables(&plan);
     let extract_with = |pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>| {
         extract_fragment_packages(
-            &plan,
+            &fixture_plan_parameters(&plan, parameters.clone()),
             &BTreeMap::new(),
-            &parameters,
             &BTreeMap::new(),
             &controls,
             &calls,
@@ -321,9 +355,8 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
     // The map key is correct; the table's own exact fragment identity is not.
     assert_eq!(
         extract_fragment_packages(
-            &plan,
+            &fixture_plan_parameters(&plan, SemanticParameters::default().clone()),
             &BTreeMap::new(),
-            &SemanticParameters::default(),
             &BTreeMap::new(),
             &controls,
             &calls,
@@ -360,6 +393,7 @@ fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, Expr
             ty(DataType::Int64, false),
             ExprKind::Binary {
                 left,
+                allow_throw_exception: Some(intrinsic_reference(0)),
                 op: BinaryOperator::Subtract,
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -472,6 +506,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
                 let mut root_definition = expressions.get(root).unwrap().clone();
                 root_definition.kind = ExprKind::Binary {
                     left: right,
+                    allow_throw_exception: Some(intrinsic_reference(0)),
                     op: BinaryOperator::Subtract,
                     right: left,
                     decimal_overflow_policy:
@@ -583,9 +618,8 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
             let expected = FragmentPackageExtractionError::Control(failure);
             assert_eq!(
                 extract_fragment_packages(
-                    &plan,
+                    &fixture_plan_parameters(&plan, SemanticParameters::default().clone()),
                     &BTreeMap::new(),
-                    &SemanticParameters::default(),
                     &BTreeMap::new(),
                     &controls,
                     &calls,
@@ -944,11 +978,7 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
         value: "17".into(),
     });
     let plan = builder.finish().unwrap();
-    let parameters = SemanticParameters::try_new([(
-        SemanticParameterId::new(u32::MAX),
-        SemanticParameterValue::StatementStartUtc(-17),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
     let scans = BTreeMap::from([(ProviderReadOccurrenceId::new(0), scan.clone())]);
     let packages = extract(&plan, &scans, &parameters, &BTreeMap::new()).unwrap();
     let package = &packages[&fragment_id];
@@ -1446,9 +1476,8 @@ fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls()
     let parameters = SemanticParameters::default();
     let extract_with = |calls: &BTreeMap<FragmentId, FrozenFragmentCalls>| {
         extract_fragment_packages(
-            &plan,
+            &fixture_plan_parameters(&plan, parameters.clone()),
             &BTreeMap::new(),
-            &parameters,
             &BTreeMap::new(),
             &controls,
             calls,
@@ -1583,9 +1612,8 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish().unwrap();
     let packages = extract_fragment_packages(
-        &plan,
+        &fixture_plan_parameters(&plan, input.parameters.clone()),
         &BTreeMap::new(),
-        &input.parameters,
         &BTreeMap::new(),
         &BTreeMap::from([(FragmentId::new(81), uses)]),
         &BTreeMap::from([(FragmentId::new(81), calls)]),
@@ -1682,20 +1710,16 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish().unwrap();
-    let snapshot = SemanticParameters::try_new([
-        (legacy.id, SemanticParameterValue::TimeZone("UTC".into())),
-        (
-            active.id,
-            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
-        ),
-    ])
+    let snapshot = SemanticParameters::try_new([(
+        active.id,
+        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+    )])
     .unwrap();
     let controls = BTreeMap::from([(FragmentId::new(81), uses)]);
     let tables = BTreeMap::from([(FragmentId::new(81), calls)]);
     let packages = extract_fragment_packages(
-        &plan,
+        &fixture_plan_parameters(&plan, snapshot.clone()),
         &BTreeMap::new(),
-        &snapshot,
         &BTreeMap::new(),
         &controls,
         &tables,
@@ -1718,9 +1742,8 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
     );
     assert!(matches!(
         extract_fragment_packages(
-            &plan,
+            &fixture_plan_parameters(&plan, input.parameters.clone()),
             &BTreeMap::new(),
-            &input.parameters,
             &BTreeMap::new(),
             &controls,
             &tables,
@@ -1742,7 +1765,19 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish().unwrap();
-    let parameters = SemanticParameters::try_new([
+    let parameters = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+    )])
+    .unwrap();
+    let packages = extract(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
+    let mut input = packages[&FragmentId::new(81)].clone().into_input();
+    assert_eq!(input.parameters.entries().len(), 1);
+    assert_eq!(
+        input.parameters.require(reference).unwrap(),
+        &SemanticParameterValue::TimeZone("Asia/Shanghai".into())
+    );
+    input.parameters = SemanticParameters::try_new([
         (
             reference.id,
             SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
@@ -1753,19 +1788,13 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
         ),
     ])
     .unwrap();
-    let packages = extract(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
-    let mut input = packages[&FragmentId::new(81)].clone().into_input();
-    assert_eq!(input.parameters.entries().len(), 1);
+    assert!(matches!(
+        extract(&plan, &BTreeMap::new(), &input.parameters, &BTreeMap::new()),
+        Err(FragmentPackageExtractionError::UnusedParameters)
+    ));
     assert_eq!(
-        input.parameters.require(reference).unwrap(),
-        &SemanticParameterValue::TimeZone("Asia/Shanghai".into())
-    );
-    input.parameters = parameters;
-    assert!(
-        FragmentPackage::try_new(input.clone(), &Control)
-            .unwrap_err()
-            .to_string()
-            .contains("unused definitions")
+        FragmentPackage::try_new(input.clone(), &Control).unwrap_err(),
+        FragmentPackageError::UnusedParameters
     );
     input.parameters = SemanticParameters::default();
     assert!(
@@ -2019,9 +2048,8 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = builder.finish().unwrap();
     let packages = extract_fragment_packages(
-        &plan,
+        &fixture_plan_parameters(&plan, parameters.clone()),
         &BTreeMap::new(),
-        &parameters,
         &BTreeMap::new(),
         &BTreeMap::from([(fragment.id(), uses)]),
         &BTreeMap::from([(fragment.id(), calls.clone())]),
@@ -2031,4 +2059,433 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     .unwrap();
     assert_eq!(packages[&fragment.id()].calls(), &calls);
     assert_eq!(packages[&fragment.id()], checked);
+}
+
+fn intrinsic_package_fixture() -> FragmentPackageInput {
+    let mut builder = FragmentBuilder::new(FragmentId::new(91));
+    let node = builder.reserve_node_id().unwrap();
+    let left = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Literal(LiteralValue::Int64(4)),
+        )
+        .unwrap();
+    let right = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Literal(LiteralValue::Int64(2)),
+        )
+        .unwrap();
+    let arithmetic = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Binary {
+                left,
+                op: BinaryOperator::Add,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                allow_throw_exception: Some(intrinsic_reference(0)),
+            },
+        )
+        .unwrap();
+    let cast = builder
+        .add_expression(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Cast {
+                expr: arithmetic,
+                target: DataType::Int64,
+                decimal_overflow_policy:
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: intrinsic_reference(u32::MAX),
+            },
+        )
+        .unwrap();
+    let output = builder
+        .add_value(
+            ty(DataType::Int64, false),
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .add_values(node, Box::from([Box::from([cast])]), Box::from([output]))
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let invocations = [
+        (cast, vec![1]),
+        (arithmetic, vec![2, 3]),
+        (left, vec![]),
+        (right, vec![]),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, (definition, arguments))| ExpressionInvocation {
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(id as u32),
+            domain,
+            demand: EvaluationDemand::Value,
+        },
+        definition,
+        control: ControlShape::Eager,
+        arguments: arguments.into_iter().map(ExpressionUseId::new).collect(),
+    })
+    .collect();
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let uses = PhysicalRootUses::try_new(
+        &fragment,
+        flow,
+        vec![(
+            ExpressionRootSite {
+                node,
+                role: ExpressionRootRole::ValuesCell { row: 0, column: 0 },
+            },
+            ExpressionUseId::new(0),
+        )],
+        &Control,
+    )
+    .unwrap();
+    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, Vec::new(), &Control).unwrap();
+    let mut input = package_input_with_controls(fragment, uses, calls);
+    input.parameters = SemanticParameters::try_new([
+        (
+            SemanticParameterId::new(0),
+            SemanticParameterValue::AllowThrowException(false),
+        ),
+        (
+            SemanticParameterId::new(u32::MAX),
+            SemanticParameterValue::AllowThrowException(true),
+        ),
+    ])
+    .unwrap();
+    input
+}
+
+#[test]
+fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_scopes() {
+    let input = intrinsic_package_fixture();
+    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    assert_eq!(
+        checked
+            .parameters()
+            .require(intrinsic_reference(0))
+            .unwrap(),
+        &SemanticParameterValue::AllowThrowException(false)
+    );
+    assert_eq!(
+        checked
+            .parameters()
+            .require(intrinsic_reference(u32::MAX))
+            .unwrap(),
+        &SemanticParameterValue::AllowThrowException(true)
+    );
+    let mut builder =
+        PlanBuilder::new(version()).with_semantic_parameters(input.parameters.clone());
+    builder.add_fragment(input.fragment).unwrap();
+    let plan = builder.finish().unwrap();
+    let packages = extract_fragment_packages(
+        &plan,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::from([(checked.fragment().id(), input.expression_uses)]),
+        &BTreeMap::from([(checked.fragment().id(), input.calls)]),
+        &fixture_pruning_tables(&plan),
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(packages[&checked.fragment().id()], checked);
+}
+
+#[test]
+fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values() {
+    let input = intrinsic_package_fixture();
+    let mut missing = input.clone();
+    missing.parameters = SemanticParameters::default();
+    assert_eq!(
+        FragmentPackage::try_new(missing, &Control).unwrap_err(),
+        FragmentPackageError::Parameter(
+            novarocks_type_contract::SemanticParameterError::MissingId(SemanticParameterId::new(0))
+        )
+    );
+    let mut wrong = input.clone();
+    wrong.parameters = SemanticParameters::try_new([
+        (
+            SemanticParameterId::new(0),
+            SemanticParameterValue::AllowThrowException(false),
+        ),
+        (
+            SemanticParameterId::new(u32::MAX),
+            SemanticParameterValue::GroupConcatLegacy(true),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(
+        FragmentPackage::try_new(wrong, &Control).unwrap_err(),
+        FragmentPackageError::Parameter(
+            novarocks_type_contract::SemanticParameterError::KeyMismatch(intrinsic_reference(
+                u32::MAX
+            ))
+        )
+    );
+    let mut extra = input.clone();
+    extra.parameters = SemanticParameters::try_new(
+        input
+            .parameters
+            .entries()
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .chain([(
+                SemanticParameterId::new(7),
+                SemanticParameterValue::AllowThrowException(false),
+            )]),
+    )
+    .unwrap();
+    assert_eq!(
+        FragmentPackage::try_new(extra.clone(), &Control).unwrap_err(),
+        FragmentPackageError::UnusedParameters
+    );
+    let mut builder = PlanBuilder::new(version()).with_semantic_parameters(extra.parameters);
+    builder.add_fragment(extra.fragment).unwrap();
+    let plan = builder.finish().unwrap();
+    assert_eq!(
+        extract_fragment_packages(
+            &plan,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::from([(input.fragment.id(), input.expression_uses)]),
+            &BTreeMap::from([(input.fragment.id(), input.calls)]),
+            &fixture_pruning_tables(&plan),
+            &Control
+        )
+        .unwrap_err(),
+        FragmentPackageExtractionError::UnusedParameters
+    );
+    // Whole-plan publication cannot leave even an unused-runtime definition's
+    // intrinsic reference dangling. No external extraction table can repair it.
+    let mut missing_plan = PlanBuilder::new(version());
+    missing_plan.add_fragment(input.fragment).unwrap();
+    assert!(
+        missing_plan
+            .finish()
+            .unwrap_err()
+            .errors()
+            .iter()
+            .any(|error| error.message().contains("missing semantic parameter ID"))
+    );
+}
+
+#[test]
+fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
+    let input = intrinsic_package_fixture();
+    for mutation in 0..4 {
+        let mut expressions = input.fragment.expressions().clone();
+        let (id, mut expression) = expressions
+            .iter()
+            .find_map(|(id, expression)| {
+                let selected = if mutation == 3 {
+                    matches!(expression.kind, ExprKind::Cast { .. })
+                } else {
+                    matches!(expression.kind, ExprKind::Binary { .. })
+                };
+                selected.then(|| (*id, expression.clone()))
+            })
+            .unwrap();
+        match &mut expression.kind {
+            ExprKind::Binary {
+                op,
+                allow_throw_exception,
+                ..
+            } => match mutation {
+                0 => *allow_throw_exception = None,
+                1 => {
+                    *op = BinaryOperator::BitAnd;
+                }
+                _ => {
+                    *allow_throw_exception = Some(SemanticParameterRef {
+                        id: SemanticParameterId::new(0),
+                        expected_key: SemanticParameterKey::TimeZone,
+                    })
+                }
+            },
+            ExprKind::Cast {
+                allow_throw_exception,
+                ..
+            } => allow_throw_exception.expected_key = SemanticParameterKey::TimeZone,
+            _ => unreachable!(),
+        }
+        assert_eq!(id, expression.id);
+        expressions.insert(expression);
+        let fragment = Fragment::from(FragmentParts {
+            id: input.fragment.id(),
+            root: input.fragment.root(),
+            values: input.fragment.values().clone(),
+            expressions,
+            nodes: input.fragment.nodes().clone(),
+            sink: input.fragment.sink().clone(),
+            dop_domain: input.fragment.dop_domain(),
+            runtime_filters: input.fragment.runtime_filters().into(),
+        });
+        let errors = validate_fragment_definition(&fragment).unwrap_err();
+        assert!(
+            errors
+                .errors()
+                .iter()
+                .any(|error| error.message().contains("ALLOW_THROW_EXCEPTION"))
+        );
+    }
+}
+
+#[test]
+fn parameter_free_actual_definitions_keep_original_control_at_every_package_boundary() {
+    let mut builder = FragmentBuilder::new(FragmentId::new(92));
+    let node = builder.reserve_node_id().unwrap();
+    let mut row = Vec::new();
+    let mut outputs = Vec::new();
+    for ordinal in 0..320 {
+        row.push(
+            builder
+                .add_expression(
+                    node,
+                    ty(DataType::Int64, false),
+                    ExprKind::Literal(LiteralValue::Int64(ordinal)),
+                )
+                .unwrap(),
+        );
+        outputs.push(
+            builder
+                .add_value(
+                    ty(DataType::Int64, false),
+                    ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    builder
+        .add_values(
+            node,
+            Box::from([row.into_boxed_slice()]),
+            outputs.into_boxed_slice(),
+        )
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap();
+    let input = package_input(fragment);
+    assert_eq!(input.fragment.expressions().len(), 320);
+    assert!(input.parameters.entries().is_empty());
+    struct Trace {
+        calls: std::sync::Mutex<Vec<u32>>,
+        refusal: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Trace {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(units);
+            match self.refusal {
+                Some((index, error)) if calls.len() == index + 1 => Err(error),
+                _ => Ok(()),
+            }
+        }
+    }
+    let good = Trace {
+        calls: Default::default(),
+        refusal: None,
+    };
+    FragmentPackage::try_new(input.clone(), &good).unwrap();
+    let trace = good.calls.into_inner().unwrap();
+    // Empty calls/pruning finish first. Before opaque structural validation,
+    // the actual 320-definition reference/count pass must charge 256 + 64.
+    assert_eq!(&trace[..8], &[0, 0, 0, 0, 0, 0, 256, 64]);
+    // The admitted reference collection also walks all 320 nonconsumers.
+    // Both walks expose a complete quantum and their pending tail; refusal
+    // below covers every callback of the full constructor, including the
+    // second walk rather than only the pre-profile count pass.
+    assert!(
+        trace
+            .windows(3)
+            .filter(|units| *units == [0, 256, 64])
+            .count()
+            >= 2
+    );
+    for index in 0..trace.len() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Trace {
+                calls: Default::default(),
+                refusal: Some((index, error)),
+            };
+            assert_eq!(
+                FragmentPackage::try_new(input.clone(), &control).unwrap_err(),
+                FragmentPackageError::Control(error)
+            );
+            assert_eq!(*control.calls.lock().unwrap(), trace[..=index]);
+        }
+    }
+}
+
+#[test]
+fn extraction_reference_preallocation_uses_the_existing_fragment_profile_boundary() {
+    let fragment = parameter_fragment(SemanticParameterRef {
+        id: SemanticParameterId::new(0),
+        expected_key: SemanticParameterKey::TimeZone,
+    });
+    let mut errors = crate::validation::ValidationContext::new();
+    let mut usage = crate::resource::CutResourcePreflight::new();
+    usage.add_fragment(&fragment, &mut errors);
+    let actual = usage.validate("fixture.resources", &mut errors);
+    assert!(errors.is_empty());
+    let remaining = crate::MAX_FRAGMENT_DYNAMIC_ITEMS - actual.items;
+    // Counts come from the allocation-free observed walk. Test the real
+    // preallocation gate without allocating millions of repeated references.
+    crate::validation::validate_fragment_parameter_resource_usage(&fragment, remaining).unwrap();
+    for count in [remaining + 1, usize::MAX] {
+        let errors =
+            crate::validation::validate_fragment_parameter_resource_usage(&fragment, count)
+                .unwrap_err();
+        assert!(errors.errors().iter().any(|error| {
+            error.path() == "package.resources" && error.message().contains("dynamic items")
+        }));
+    }
 }

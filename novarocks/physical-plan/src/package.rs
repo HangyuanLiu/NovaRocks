@@ -25,8 +25,9 @@ use novarocks_connector_contract::{
     ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, SemanticParameterError,
-    SemanticParameterProjectionError, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    SemanticParameterError, SemanticParameterProjectionError, SemanticParameterRef,
+    SemanticParameters,
 };
 
 use crate::{
@@ -85,8 +86,16 @@ impl FragmentPackage {
             .pruning
             .dynamic_items_observed(control)
             .map_err(pruning_error)?;
-        crate::validation::validate_package(&input, call_items.saturating_add(pruning_items))
-            .map_err(FragmentPackageError::Structure)?;
+        let counts =
+            visit_fragment_parameter_references(&input.fragment, &input.calls, control, |_| {})
+                .map_err(parameter_error)?;
+        crate::validation::validate_package(
+            &input,
+            call_items
+                .saturating_add(pruning_items)
+                .saturating_add(counts.intrinsic),
+        )
+        .map_err(FragmentPackageError::Structure)?;
         input
             .calls
             .validate_fragment(&input.fragment, &input.expression_uses, control)
@@ -95,13 +104,13 @@ impl FragmentPackage {
                 FrozenCallError::Roots(error) => FragmentPackageError::ExpressionUses(error),
                 error => FragmentPackageError::Calls(error),
             })?;
+        // The exact package profile must admit the complete source before
+        // materializing any repeated semantic-parameter references.
+        let references = fragment_parameter_references(&input.fragment, &input.calls, control)
+            .map_err(parameter_error)?;
         let closure = input
             .parameters
-            .project_observed(
-                input.calls.parameter_references(),
-                CompilePhase::Validate,
-                control,
-            )
+            .project_observed(references, CompilePhase::Validate, control)
             .map_err(|error| match error {
                 SemanticParameterProjectionError::Control(error) => {
                     FragmentPackageError::Control(error)
@@ -205,6 +214,71 @@ impl fmt::Display for FragmentPackageError {
 }
 impl std::error::Error for FragmentPackageError {}
 
+fn parameter_error(error: SemanticParameterProjectionError) -> FragmentPackageError {
+    match error {
+        SemanticParameterProjectionError::Control(error) => FragmentPackageError::Control(error),
+        SemanticParameterProjectionError::Parameter(error) => {
+            FragmentPackageError::Parameter(error)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ParameterReferenceCounts {
+    total: usize,
+    intrinsic: usize,
+}
+
+// Both the allocation-free counting pass and the admitted collection pass
+// observe every actual definition, including definitions with no consumer.
+// A filtering iterator must not hide an arbitrarily long source walk.
+fn visit_fragment_parameter_references(
+    fragment: &Fragment,
+    calls: &FrozenFragmentCalls,
+    control: &dyn PureCompileControl,
+    mut visit: impl FnMut(SemanticParameterRef),
+) -> Result<ParameterReferenceCounts, SemanticParameterProjectionError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+        .map_err(SemanticParameterProjectionError::Control)?;
+    let mut counts = ParameterReferenceCounts::default();
+    for call in calls.entries().values() {
+        for reference in &call.effects.environment {
+            visit(*reference);
+            counts.total = counts.total.saturating_add(1);
+            work.step()
+                .map_err(SemanticParameterProjectionError::Control)?;
+        }
+        work.step()
+            .map_err(SemanticParameterProjectionError::Control)?;
+    }
+    for (_, definition) in fragment.expressions().iter() {
+        for reference in definition.kind.intrinsic_parameter_references() {
+            visit(*reference);
+            counts.total = counts.total.saturating_add(1);
+            counts.intrinsic = counts.intrinsic.saturating_add(1);
+        }
+        work.step()
+            .map_err(SemanticParameterProjectionError::Control)?;
+    }
+    work.finish()
+        .map_err(SemanticParameterProjectionError::Control)?;
+    Ok(counts)
+}
+
+// Callers must first admit the allocation-free count using the existing
+// package resource profile. This second observed walk then copies references.
+fn fragment_parameter_references(
+    fragment: &Fragment,
+    calls: &FrozenFragmentCalls,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<SemanticParameterRef>, SemanticParameterProjectionError> {
+    let mut references = Vec::new();
+    visit_fragment_parameter_references(fragment, calls, control, |reference| {
+        references.push(reference);
+    })?;
+    Ok(references)
+}
+
 fn pruning_error(error: FrozenPruningError) -> FragmentPackageError {
     match error {
         FrozenPruningError::Control(error) => FragmentPackageError::Control(error),
@@ -222,7 +296,6 @@ fn pruning_error(error: FrozenPruningError) -> FragmentPackageError {
 pub fn extract_fragment_packages(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
-    parameters: &SemanticParameters,
     writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
     expression_uses: &BTreeMap<FragmentId, PhysicalRootUses>,
     calls: &BTreeMap<FragmentId, FrozenFragmentCalls>,
@@ -252,6 +325,7 @@ pub fn extract_fragment_packages(
     let mut outputs = BTreeMap::new();
     let mut consumed = std::collections::BTreeSet::new();
     let mut consumed_writes = std::collections::BTreeSet::new();
+    let mut consumed_parameters = std::collections::BTreeSet::new();
     for fragment in plan.fragments().values() {
         let mut local_scans = BTreeMap::new();
         let mut local_writes = BTreeMap::new();
@@ -277,6 +351,36 @@ pub fn extract_fragment_packages(
             .remove(&fragment.id())
             .unwrap_or_default()
             .into_boxed_slice();
+        let local_calls = calls
+            .get(&fragment.id())
+            .ok_or(FragmentPackageExtractionError::MissingCalls(fragment.id()))?;
+        let counts = visit_fragment_parameter_references(fragment, local_calls, control, |_| {})
+            .map_err(extraction_parameter_error)?;
+        // The complete plan has no ownership of the external frozen call
+        // table. Admit this necessary subset of the eventual package profile
+        // before copying its potentially repeated environment references.
+        crate::validation::validate_fragment_parameter_resource_usage(
+            fragment,
+            local_calls.entries().len().saturating_add(counts.total),
+        )
+        .map_err(|error| {
+            FragmentPackageExtractionError::Local(FragmentPackageError::Structure(error))
+        })?;
+        let references = fragment_parameter_references(fragment, local_calls, control)
+            .map_err(extraction_parameter_error)?;
+        let parameters = plan
+            .parameters()
+            .project_observed(references, CompilePhase::Validate, control)
+            .map_err(extraction_parameter_error)?;
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+            .map_err(FragmentPackageExtractionError::Control)?;
+        for id in parameters.entries().keys() {
+            consumed_parameters.insert(*id);
+            work.step()
+                .map_err(FragmentPackageExtractionError::Control)?;
+        }
+        work.finish()
+            .map_err(FragmentPackageExtractionError::Control)?;
         let package = FragmentPackage::try_new(
             FragmentPackageInput {
                 version: plan.version(),
@@ -305,20 +409,7 @@ pub fn extract_fragment_packages(
                     .result_port()
                     .filter(|result| result.fragment == fragment.id())
                     .cloned(),
-                parameters: parameters
-                    .project_observed(
-                        calls[&fragment.id()].parameter_references(),
-                        CompilePhase::Validate,
-                        control,
-                    )
-                    .map_err(|error| match error {
-                        SemanticParameterProjectionError::Control(error) => {
-                            FragmentPackageExtractionError::Control(error)
-                        }
-                        SemanticParameterProjectionError::Parameter(error) => {
-                            FragmentPackageExtractionError::Parameter(error)
-                        }
-                    })?,
+                parameters,
                 scans: local_scans,
                 writes: local_writes,
                 annotations,
@@ -330,6 +421,9 @@ pub fn extract_fragment_packages(
             error => FragmentPackageExtractionError::Local(error),
         })?;
         outputs.insert(fragment.id(), package);
+    }
+    if consumed_parameters.len() != plan.parameters().entries().len() {
+        return Err(FragmentPackageExtractionError::UnusedParameters);
     }
     if consumed.len() != scans.len() {
         return Err(FragmentPackageExtractionError::UnusedScan);
@@ -367,6 +461,7 @@ pub enum FragmentPackageExtractionError {
     UnusedCalls,
     MissingPruning(FragmentId),
     UnusedPruning,
+    UnusedParameters,
 }
 
 impl fmt::Display for FragmentPackageExtractionError {
@@ -404,8 +499,24 @@ impl fmt::Display for FragmentPackageExtractionError {
             Self::UnusedPruning => {
                 f.write_str("frozen pruning declarations name an unused fragment")
             }
+            Self::UnusedParameters => {
+                f.write_str("complete plan contains unused semantic parameters")
+            }
         }
     }
 }
 
 impl std::error::Error for FragmentPackageExtractionError {}
+
+fn extraction_parameter_error(
+    error: SemanticParameterProjectionError,
+) -> FragmentPackageExtractionError {
+    match error {
+        SemanticParameterProjectionError::Control(error) => {
+            FragmentPackageExtractionError::Control(error)
+        }
+        SemanticParameterProjectionError::Parameter(error) => {
+            FragmentPackageExtractionError::Parameter(error)
+        }
+    }
+}

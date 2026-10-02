@@ -310,6 +310,7 @@ pub(crate) struct SqlStatisticsCompletionState {
 }
 
 pub(crate) struct SqlProviderReadCompletionState {
+    root_allow_throw_exception: bool,
     common: FinalPlanCommon,
     physical: PhysicalPlanNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -719,6 +720,7 @@ fn optimize_and_prepare_provider(
 /// The optimizer result and the immutable base-table facts it consumed travel
 /// together until final-plan completion. Provider negotiation cannot replace them.
 struct OptimizedPhysicalPlan {
+    root_allow_throw_exception: bool,
     physical: PhysicalPlanNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
 }
@@ -734,6 +736,7 @@ fn optimize_to_physical(
         intent,
         settings,
         decimal_overflow_policy,
+        root_allow_throw_exception,
         change_stream: _,
         mv_rewrite,
         function_catalog,
@@ -793,6 +796,7 @@ fn optimize_to_physical(
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
         .map_err(SqlCompileError::Compilation)?;
     Ok(OptimizedPhysicalPlan {
+        root_allow_throw_exception,
         physical,
         query_statistics: statistics.snapshot,
     })
@@ -805,6 +809,7 @@ fn provider_or_ready_step(
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     let OptimizedPhysicalPlan {
+        root_allow_throw_exception,
         mut physical,
         query_statistics,
     } = optimized;
@@ -822,6 +827,7 @@ fn provider_or_ready_step(
         return Ok(CompilerStep::need(
             SqlNeedBatch::ProviderReads(needs.clone()),
             CompilerContinuation::provider_read(SqlProviderReadCompletionState {
+                root_allow_throw_exception,
                 common,
                 physical,
                 query_statistics,
@@ -834,6 +840,7 @@ fn provider_or_ready_step(
         common.version,
         common.dop_domain,
         common.functions.as_ref(),
+        root_allow_throw_exception,
         control,
     )
     .map_err(SqlCompileError::from)?;
@@ -1186,6 +1193,7 @@ pub(super) fn resume_provider_read(
             state.common.dop_domain,
             reads,
             state.common.functions.as_ref(),
+            state.root_allow_throw_exception,
             control,
         )
         .map_err(SqlCompileError::from)?;
@@ -1277,6 +1285,51 @@ mod tests {
             },
             DEFAULT_COMPLETION_LIMITS,
         )
+    }
+
+    #[test]
+    fn completion_optimizer_carries_the_analyzed_root_allow_override() {
+        for (session_mode, sql, expected_allow) in [
+            ("ERROR_IF_OVERFLOW", "SELECT 1", false),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                false,
+            ),
+        ] {
+            let mut input = request(sql, SqlCompileIntent::Query);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                input.statement,
+                input.intent,
+                input.session,
+                input.environment,
+                &snapshot,
+                input.functions.as_ref(),
+                input.constant_evaluator,
+                None,
+                input.control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            assert_eq!(analyzed.root_allow_throw_exception(), expected_allow);
+            let optimized =
+                optimize_to_physical(analyzed, &DmlStatisticsSnapshot::empty(), &input.control)
+                    .unwrap();
+            assert_eq!(optimized.root_allow_throw_exception, expected_allow);
+        }
     }
 
     fn provider_type_scan(value_type: ValueType, count: usize) -> PhysicalPlanNode {
@@ -1813,6 +1866,172 @@ mod tests {
         let progress = SqlCompiler::start(seed).expect("completed values plan");
 
         assert!(matches!(progress, SqlCompileProgress::Complete(_)));
+    }
+
+    fn complete_root_intrinsic_fixture(
+        sql: &str,
+        session_mode: &str,
+    ) -> super::super::SqlCompletedPlan {
+        let mut input = request(sql, SqlCompileIntent::Query);
+        input.session.sql_semantics = input
+            .session
+            .sql_semantics
+            .clone()
+            .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+        let mut progress = SqlCompiler::start(input.try_into_completion().unwrap()).unwrap();
+        loop {
+            match progress {
+                SqlCompileProgress::Complete(completed) => return completed,
+                SqlCompileProgress::Incomplete(compilation) => {
+                    progress = match compilation.needs() {
+                        SqlNeedBatch::CatalogRelations(_) => answer_catalog(compilation),
+                        SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                        SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+                        SqlNeedBatch::MaterializedViews(_) => {
+                            panic!("fixture disabled optional MV discovery")
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_arithmetic_and_cast_refs_freeze_the_exact_admitted_root_allow_value() {
+        use novarocks_physical_plan::{BinaryOperator, ExprKind};
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy::{OutputNull, ReportError},
+            SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
+        };
+        let ordinary =
+            "SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders";
+        for (mode, sql, expected_allow, expected_policy) in [
+            ("32", ordinary, false, OutputNull),
+            ("ALLOW_THROW_EXCEPTION", ordinary, true, OutputNull),
+            ("ERROR_IF_OVERFLOW", ordinary, false, ReportError),
+            (
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                ordinary,
+                true,
+                ReportError,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
+                false,
+                ReportError,
+            ),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
+                true,
+                OutputNull,
+            ),
+        ] {
+            let completed = complete_root_intrinsic_fixture(sql, mode);
+            let plan = completed.plan();
+            assert_eq!(plan.parameters().entries().len(), 1);
+            let mut arithmetic = 0;
+            let mut casts = 0;
+            for fragment in plan.fragments().values() {
+                for (_, expression) in fragment.expressions().iter() {
+                    let (reference, policy) = match &expression.kind {
+                        ExprKind::Binary {
+                            op: BinaryOperator::Add,
+                            allow_throw_exception: Some(reference),
+                            decimal_overflow_policy,
+                            ..
+                        } => {
+                            arithmetic += 1;
+                            (*reference, *decimal_overflow_policy)
+                        }
+                        ExprKind::Cast {
+                            allow_throw_exception,
+                            decimal_overflow_policy,
+                            ..
+                        } => {
+                            casts += 1;
+                            (*allow_throw_exception, *decimal_overflow_policy)
+                        }
+                        _ => continue,
+                    };
+                    assert_eq!(reference.id, SemanticParameterId::new(0));
+                    assert_eq!(
+                        reference.expected_key,
+                        SemanticParameterKey::AllowThrowException
+                    );
+                    assert_eq!(
+                        plan.parameters().require(reference).unwrap(),
+                        &SemanticParameterValue::AllowThrowException(expected_allow),
+                    );
+                    assert_eq!(policy, expected_policy);
+                }
+            }
+            assert!(arithmetic > 0, "column arithmetic must not be folded away");
+            assert!(casts > 0, "column conversion must retain its actual cast");
+        }
+    }
+
+    #[test]
+    fn completed_nested_decimal_scope_keeps_root_allow_refs_and_local_policy_separate() {
+        use novarocks_physical_plan::{BinaryOperator, ExprKind};
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy::{OutputNull, ReportError},
+            SemanticParameterValue,
+        };
+        let completed = complete_root_intrinsic_fixture(
+            "SELECT x + 1 AS a FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
+            "ALLOW_THROW_EXCEPTION",
+        );
+        let plan = completed.plan();
+        assert_eq!(plan.parameters().entries().len(), 1);
+        let mut saw_root_arithmetic = false;
+        let mut saw_nested_cast = false;
+        for fragment in plan.fragments().values() {
+            for (_, expression) in fragment.expressions().iter() {
+                for reference in expression.kind.intrinsic_parameter_references() {
+                    assert_eq!(
+                        plan.parameters().require(*reference).unwrap(),
+                        &SemanticParameterValue::AllowThrowException(true),
+                    );
+                }
+                match &expression.kind {
+                    ExprKind::Binary {
+                        op: BinaryOperator::Add,
+                        decimal_overflow_policy: OutputNull,
+                        allow_throw_exception: Some(_),
+                        ..
+                    } => saw_root_arithmetic = true,
+                    ExprKind::Cast {
+                        decimal_overflow_policy: ReportError,
+                        ..
+                    } => saw_nested_cast = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_root_arithmetic);
+        assert!(saw_nested_cast);
+    }
+
+    #[test]
+    fn completed_plans_without_intrinsic_consumers_do_not_invent_an_allow_parameter() {
+        for mode in ["32", "ALLOW_THROW_EXCEPTION"] {
+            for sql in ["SELECT 1", "SELECT order_key FROM orders"] {
+                let completed = complete_root_intrinsic_fixture(sql, mode);
+                let plan = completed.plan();
+                assert!(plan.parameters().entries().is_empty());
+                assert!(plan.fragments().values().all(|fragment| {
+                    fragment.expressions().iter().all(|(_, expression)| {
+                        expression
+                            .kind
+                            .intrinsic_parameter_references()
+                            .next()
+                            .is_none()
+                    })
+                }));
+            }
+        }
     }
 
     #[test]

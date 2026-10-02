@@ -212,3 +212,177 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
         v2::ConstantReference::default().encode_to_vec()
     );
 }
+
+#[test]
+fn intrinsic_allow_throw_references_use_dedicated_v2_messages_and_presence() {
+    let pool = pool();
+    for (name, number) in [("BinaryExpression", 5), ("CastExpression", 4)] {
+        let descriptor = pool
+            .get_message_by_name(&format!("novarocks.physical_package_v2.{name}"))
+            .unwrap();
+        let field = descriptor
+            .get_field_by_name("allow_throw_exception")
+            .unwrap();
+        assert_eq!(field.number(), number);
+        assert!(field.supports_presence());
+        assert!(!field.is_list());
+        let Kind::Message(reference) = field.kind() else {
+            panic!("intrinsic uses a typed reference");
+        };
+        assert_eq!(
+            reference.full_name(),
+            "novarocks.physical_semantics_v2.SemanticParameterRef"
+        );
+        assert_eq!(
+            reference.get_field_by_name("id").unwrap().kind(),
+            Kind::Uint32
+        );
+        assert!(
+            reference
+                .get_field_by_name("id")
+                .unwrap()
+                .supports_presence()
+        );
+    }
+    // Published legacy expression messages retain their original vocabulary.
+    for name in ["BinaryOpExpr", "CastExpr"] {
+        let descriptor = pool
+            .get_message_by_name(&format!("novarocks.expr.{name}"))
+            .unwrap();
+        assert!(
+            descriptor
+                .get_field_by_name("allow_throw_exception")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn intrinsic_reference_raw_wire_distinguishes_absence_zero_max_and_unknown_key() {
+    use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as semantics};
+    // Independent raw field tags: v2 Binary field 5 and Cast field 4 wrap an
+    // explicit zero ID and the closed AllowThrowException key (3).
+    let binary = v2::BinaryExpression::decode(&[0x2a, 4, 8, 0, 16, 3][..]).unwrap();
+    let cast = v2::CastExpression::decode(&[0x22, 4, 8, 0, 16, 3][..]).unwrap();
+    let zero = semantics::SemanticParameterRef {
+        id: Some(0),
+        expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
+    };
+    assert_eq!(binary.allow_throw_exception, Some(zero));
+    assert_eq!(cast.allow_throw_exception, Some(zero));
+    assert_eq!(binary.encode_to_vec(), [0x2a, 4, 8, 0, 16, 3]);
+    assert_eq!(cast.encode_to_vec(), [0x22, 4, 8, 0, 16, 3]);
+    assert!(
+        v2::BinaryExpression::decode(&[][..])
+            .unwrap()
+            .allow_throw_exception
+            .is_none()
+    );
+    assert!(
+        v2::CastExpression::decode(&[][..])
+            .unwrap()
+            .allow_throw_exception
+            .is_none()
+    );
+    let empty_binary = v2::BinaryExpression::decode(&[0x2a, 0][..]).unwrap();
+    assert_eq!(
+        empty_binary.allow_throw_exception,
+        Some(semantics::SemanticParameterRef::default())
+    );
+    assert_ne!(
+        empty_binary.encode_to_vec(),
+        v2::BinaryExpression::default().encode_to_vec()
+    );
+    for id in [0, u32::MAX] {
+        for expected_key in [
+            semantics::SemanticParameterKey::AllowThrowException as i32,
+            0,
+            i32::MAX,
+        ] {
+            let reference = semantics::SemanticParameterRef {
+                id: Some(id),
+                expected_key,
+            };
+            let binary = v2::BinaryExpression {
+                allow_throw_exception: Some(reference),
+                ..Default::default()
+            };
+            let cast = v2::CastExpression {
+                allow_throw_exception: Some(reference),
+                ..Default::default()
+            };
+            assert_eq!(
+                v2::BinaryExpression::decode(binary.encode_to_vec().as_slice()).unwrap(),
+                binary
+            );
+            assert_eq!(
+                v2::CastExpression::decode(cast.encode_to_vec().as_slice()).unwrap(),
+                cast
+            );
+        }
+    }
+    // This DTO preserves absent/unknown facts for typed rejection; it does not
+    // itself prove arithmetic presence, key legality or parameter closure.
+}
+
+#[test]
+fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier() {
+    use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as semantics};
+    let reference = |id| semantics::SemanticParameterRef {
+        id: Some(id),
+        expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
+    };
+    let expressions = vec![
+        v2::ExpressionDefinition {
+            id: 0,
+            kind: Some(v2::expression_definition::Kind::Binary(
+                v2::BinaryExpression {
+                    left_expr_id: Some(0),
+                    right_expr_id: Some(u32::MAX),
+                    op: v2::BinaryOperator::Multiply as i32,
+                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
+                    allow_throw_exception: Some(reference(0)),
+                },
+            )),
+            ..Default::default()
+        },
+        v2::ExpressionDefinition {
+            id: u32::MAX,
+            kind: Some(v2::expression_definition::Kind::Cast(v2::CastExpression {
+                expr_id: Some(0),
+                target_carrier_type_id: Some(u32::MAX),
+                decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
+                allow_throw_exception: Some(reference(u32::MAX)),
+            })),
+            ..Default::default()
+        },
+    ];
+    let parameters = semantics::SemanticParameters {
+        entries: vec![
+            semantics::SemanticParameter {
+                id: 0,
+                value: Some(semantics::semantic_parameter::Value::AllowThrowException(
+                    false,
+                )),
+            },
+            semantics::SemanticParameter {
+                id: u32::MAX,
+                value: Some(semantics::semantic_parameter::Value::AllowThrowException(
+                    true,
+                )),
+            },
+        ],
+    };
+    let package = v2::FragmentPackage {
+        fragment: Some(v2::Fragment {
+            expressions: expressions.clone(),
+            ..Default::default()
+        }),
+        parameters: Some(parameters.clone()),
+        ..Default::default()
+    };
+    let decoded = v2::FragmentPackage::decode(package.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.fragment.unwrap().expressions, expressions);
+    assert_eq!(decoded.parameters, Some(parameters));
+    // Deliberately carrier-only: no fake full FragmentPackage validation claim.
+}

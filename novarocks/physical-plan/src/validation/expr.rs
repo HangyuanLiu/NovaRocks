@@ -296,7 +296,27 @@ pub(crate) fn validate_expression(
             op,
             right,
             decimal_overflow_policy,
+            allow_throw_exception,
         } => {
+            let arithmetic = matches!(
+                op,
+                crate::BinaryOperator::Add
+                    | crate::BinaryOperator::Subtract
+                    | crate::BinaryOperator::Multiply
+                    | crate::BinaryOperator::Divide
+                    | crate::BinaryOperator::Modulo
+            );
+            if arithmetic != allow_throw_exception.is_some()
+                || allow_throw_exception.is_some_and(|reference| {
+                    reference.expected_key
+                        != novarocks_type_contract::SemanticParameterKey::AllowThrowException
+                })
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "binary ALLOW_THROW_EXCEPTION reference differs from its operator profile",
+                ));
+            }
             if !matches!(
                 op,
                 crate::BinaryOperator::Add
@@ -402,7 +422,16 @@ pub(crate) fn validate_expression(
             expr,
             target,
             decimal_overflow_policy,
+            allow_throw_exception,
         } => {
+            if allow_throw_exception.expected_key
+                != novarocks_type_contract::SemanticParameterKey::AllowThrowException
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "CAST requires an ALLOW_THROW_EXCEPTION semantic reference",
+                ));
+            }
             if let Some(input) = fragment.expressions().get(*expr)
                 && (input.ty.logical_type != expression.ty.logical_type
                     || !novarocks_type_contract::preserves_nested_logical_identity(

@@ -542,6 +542,7 @@ fn compile_dml_change_stream_write(
                 field_names,
             },
         ),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(
@@ -549,7 +550,9 @@ fn compile_dml_change_stream_write(
             assembly: crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
                 encoded,
                 version,
-                None,
+                Some(
+                    crate::query_execution::contract::synthetic_statement_query_options(execution),
+                ),
                 execution.clone(),
                 state.query_execution().clone(),
                 Arc::clone(write_session),
@@ -3098,6 +3101,7 @@ fn execute_exact_cow_match_query(
         paired,
         state.function_catalog().as_ref(),
         None,
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
@@ -3127,7 +3131,7 @@ fn execute_exact_cow_match_query(
             description,
             template,
         ),
-        None,
+        Some(crate::query_execution::contract::synthetic_statement_query_options(execution)),
         crate::query_execution::contract::DistributedQueryIntent::Result,
         execution,
         None,

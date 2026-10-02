@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use arrow_schema::DataType;
+use novarocks_type_contract::SemanticParameters;
 
 use crate::{
     Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId, FragmentParts,
@@ -1015,6 +1016,7 @@ impl FragmentBuilder {
 }
 
 pub struct PlanBuilder {
+    parameters: SemanticParameters,
     version: PlanVersionId,
     next_edge: u32,
     fragments: BTreeMap<FragmentId, Fragment>,
@@ -1028,6 +1030,8 @@ pub struct PlanBuilder {
 impl PlanBuilder {
     pub fn new(version: PlanVersionId) -> Self {
         Self {
+            // An empty table supplies no semantic value or implicit flag.
+            parameters: SemanticParameters::default(),
             version,
             next_edge: 0,
             fragments: BTreeMap::new(),
@@ -1037,6 +1041,12 @@ impl PlanBuilder {
             required: RequiredContracts::default(),
             annotations: Vec::new(),
         }
+    }
+
+    /// Install the authored parameter values consumed by exact expression refs.
+    pub fn with_semantic_parameters(mut self, parameters: SemanticParameters) -> Self {
+        self.parameters = parameters;
+        self
     }
 
     pub fn with_required_contracts(mut self, required: RequiredContracts) -> Self {
@@ -1107,6 +1117,7 @@ impl PlanBuilder {
     // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
     pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
+            parameters: self.parameters,
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,

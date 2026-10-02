@@ -805,6 +805,8 @@ pub struct SqlAnalyzedQuery {
     /// Policy of the admitted root scope for calls synthesized after analysis.
     /// Existing calls retain their own scope policy in `SqlFunctionBinding`.
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    /// The admitted root option, independent of lexical decimal policies.
+    root_allow_throw_exception: bool,
     change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
     function_catalog: Arc<dyn SqlFunctionCatalog>,
@@ -814,6 +816,10 @@ pub struct SqlAnalyzedQuery {
 }
 
 impl SqlAnalyzedQuery {
+    pub(crate) fn root_allow_throw_exception(&self) -> bool {
+        self.root_allow_throw_exception
+    }
+
     pub(crate) fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.decimal_overflow_policy
     }
@@ -856,6 +862,10 @@ pub struct SqlOptimizeRequest<'a> {
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
+    pub fn root_allow_throw_exception(&self) -> bool {
+        self.analyzed.root_allow_throw_exception()
+    }
+
     pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.analyzed.decimal_overflow_policy()
     }
@@ -887,6 +897,7 @@ pub(crate) struct SqlAnalysisOutput {
     reason = "Optimizer metadata remains part of the compiler terminal until the lifecycle handoff consumes it."
 )]
 pub(crate) struct SqlOptimizedOutput {
+    pub(crate) root_allow_throw_exception: bool,
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
     pub(crate) function_catalog: Arc<dyn SqlFunctionCatalog>,
     pub(crate) statistics: SqlStatisticsPlan,
@@ -1425,6 +1436,7 @@ impl SqlCompiler {
             intent: request.intent,
             settings,
             decimal_overflow_policy,
+            root_allow_throw_exception: legacy_allow_throw_exception,
             change_stream,
             mv_rewrite,
             function_catalog,
@@ -1442,6 +1454,7 @@ impl SqlCompiler {
             intent,
             settings,
             decimal_overflow_policy,
+            root_allow_throw_exception,
             change_stream,
             mv_rewrite,
             function_catalog,
@@ -1507,6 +1520,7 @@ impl SqlCompiler {
         control.check()?;
 
         Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
+            root_allow_throw_exception,
             optimized_tree,
             function_catalog,
             statistics,
@@ -2397,6 +2411,7 @@ mod tests {
                     requires_power_of_two: true,
                 },
                 crate::functions::builtin_sql_function_catalog(),
+                optimized.root_allow_throw_exception,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
@@ -2853,6 +2868,7 @@ mod tests {
                     requires_power_of_two: true,
                 },
                 crate::functions::builtin_sql_function_catalog(),
+                optimized.root_allow_throw_exception,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
@@ -2967,6 +2983,105 @@ mod tests {
     }
 
     #[test]
+    fn analyzed_root_allow_mode_survives_optimization_independently_of_decimal_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        for (session_mode, sql, expected_allow, expected_policy) in [
+            ("32", "SELECT 1", false, OutputNull),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true, OutputNull),
+            ("ERROR_IF_OVERFLOW", "SELECT 1", false, ReportError),
+            (
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                "SELECT 1",
+                true,
+                ReportError,
+            ),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
+                OutputNull,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+                false,
+                ReportError,
+            ),
+        ] {
+            let cancellation = Arc::new(Cancellation::default());
+            let request_control = control(None, &cancellation);
+            let mut input = request(request_control.clone());
+            input.statement = SqlStatementInput::sql(sql);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+            let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            assert_eq!(analyzed.root_allow_throw_exception(), expected_allow);
+            assert_eq!(analyzed.decimal_overflow_policy(), expected_policy);
+            let optimize = SqlOptimizeRequest::new(analyzed, &STATISTICS, request_control);
+            assert_eq!(optimize.root_allow_throw_exception(), expected_allow);
+            assert_eq!(optimize.decimal_overflow_policy(), expected_policy);
+            let optimized = SqlCompiler::optimize(optimize)
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+            assert_eq!(optimized.root_allow_throw_exception, expected_allow);
+        }
+    }
+
+    #[test]
+    fn nested_decimal_policy_does_not_replace_the_admitted_root_allow_mode() {
+        use crate::analysis::ExprKind;
+        use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        fn cast_policies(
+            node: &LogicalPlanNode,
+            out: &mut Vec<novarocks_type_contract::DecimalOverflowPolicy>,
+        ) {
+            if let LogicalPlanKind::Project(project) = &node.kind {
+                for item in &project.items {
+                    if let ExprKind::Cast {
+                        decimal_overflow_policy,
+                        ..
+                    } = &item.expr.kind
+                    {
+                        out.push(*decimal_overflow_policy);
+                    }
+                }
+            }
+            for child in &node.children {
+                cast_policies(child, out);
+            }
+        }
+        let cancellation = Arc::new(Cancellation::default());
+        let request_control = control(None, &cancellation);
+        let mut input = request(request_control.clone());
+        input.statement = SqlStatementInput::sql(
+            "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(1 AS DECIMAL(18,6)) AS x) s",
+        );
+        input.session.sql_semantics = input.session.sql_semantics.clone().with_sql_mode(
+            crate::sql_mode::SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"),
+        );
+        let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+        assert!(analyzed.root_allow_throw_exception());
+        assert_eq!(analyzed.decimal_overflow_policy(), OutputNull);
+        let mut policies = Vec::new();
+        cast_policies(&analyzed.logical_plan, &mut policies);
+        assert_eq!(policies, [ReportError]);
+        let optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
+            analyzed,
+            &STATISTICS,
+            request_control,
+        ))
+        .unwrap()
+        .into_optimized_output()
+        .unwrap();
+        assert!(optimized.root_allow_throw_exception);
+    }
+
+    #[test]
     fn analyzed_root_allow_mode_freezes_only_the_numeric_fold_eligibility() {
         struct NullableEvaluator;
         impl SqlConstantEvaluator for NullableEvaluator {
@@ -3008,6 +3123,7 @@ mod tests {
                 .clone()
                 .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
             let pending = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            assert_eq!(pending.root_allow_throw_exception(), disabled);
             let result = pending
                 .constant_evaluator
                 .unwrap()

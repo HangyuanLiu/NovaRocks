@@ -246,6 +246,11 @@ fn binary_fixture(repeated: bool) -> Fixture {
                 node,
                 ty(DataType::Int64, false),
                 ExprKind::Binary {
+                    allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
+                        id: novarocks_type_contract::SemanticParameterId::new(0),
+                        expected_key:
+                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                    }),
                     left,
                     op: BinaryOperator::Subtract,
                     right,

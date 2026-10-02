@@ -371,6 +371,7 @@ pub fn prepare_completed_statistics_collection(
             .sql_semantics()
             .sql_mode()
             .decimal_overflow_policy(),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )
     .map_err(DistributedQueryError::from_compile)?;
@@ -388,6 +389,7 @@ pub fn prepare_completed_statistics_collection(
         paired,
         functions,
         None,
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )
     .map_err(DistributedQueryError::from_encode)?;
@@ -415,12 +417,13 @@ pub fn prepare_completed_statistics_collection(
             ),
         )
         .map_err(contract_violation)?;
+    let options = crate::query_execution::contract::synthetic_statement_query_options(execution);
     crate::query_execution::contract::build_request_from_finalized_execution(
         crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
             description,
             template,
         ),
-        None,
+        Some(options),
         crate::query_execution::contract::DistributedQueryIntent::Statistics,
         execution,
         Some(program),

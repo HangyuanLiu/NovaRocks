@@ -332,6 +332,10 @@ message BinaryExpression {
   BinaryOperator op = 2;
   optional uint32 right_expr_id = 3;
   novarocks.physical_semantics_v2.DecimalOverflowPolicy decimal_overflow_policy = 4;
+  // Required for all five arithmetic operations; absent for comparison/bitwise.
+  // The typed decoder checks the closed AllowThrowException key and resolves
+  // this exact lexical reference from the package's sole parameter table.
+  novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 5;
 }
 enum BinaryOperator {
   BINARY_OPERATOR_UNSPECIFIED = 0;
@@ -363,6 +367,9 @@ message CastExpression {
   optional uint32 expr_id = 1;
   optional uint32 target_carrier_type_id = 2;
   novarocks.physical_semantics_v2.DecimalOverflowPolicy decimal_overflow_policy = 3;
+  // Required: absence is not false. The reference retains the original scope,
+  // independently of the frozen DecimalOverflowPolicy enum above.
+  novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 4;
 }
 message IsNullExpression {
   optional uint32 expr_id = 1;

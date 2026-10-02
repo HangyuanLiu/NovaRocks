@@ -93,6 +93,16 @@ impl ResolvedQueryOptions {
     }
 }
 
+/// Project admitted statement semantics for synthetic executions that previously
+/// supplied no options. Existing sealed options must not pass through this path.
+pub(crate) fn synthetic_statement_query_options(execution: &QueryExecutionContext) -> QueryOptions {
+    let mut runtime = RuntimeQueryOptions::default();
+    runtime.set_allow_throw_exception(execution.sql_semantics().sql_mode().allow_throw_exception());
+    QueryOptions::from_proto(
+        crate::native::fragment_encoder::instance::encode_query_options(&runtime),
+    )
+}
+
 /// Freeze a completed plan's per-instance driver range from the same resolved
 /// query DOP that its eventual native request will use. Backend count controls
 /// placement, not the number of drivers inside one placed fragment instance.
@@ -361,6 +371,19 @@ pub struct DistributedQueryRequestParts {
     pub statistics_program: Option<StatisticsCollectionProgram>,
 }
 
+fn validate_completed_runtime_options(
+    description: &FrozenExecutionDescription,
+    options: &ResolvedQueryOptions,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), DistributedQueryError> {
+    description
+        .validate_legacy_intrinsic_allow_throw_exception(
+            options.runtime_options().allow_throw_exception,
+            control,
+        )
+        .map_err(DistributedQueryError::from_compile)
+}
+
 pub(crate) fn build_request_from_finalized_execution(
     finalized: crate::query_execution::post_compile::FinalizedDistributedExecution,
     options: Option<QueryOptions>,
@@ -377,6 +400,8 @@ pub(crate) fn build_request_from_finalized_execution(
     let (description, attempt_template) = finalized.into_parts();
     let description = Arc::new(description);
     let options = Arc::new(ResolvedQueryOptions::from_upstream(options));
+    let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
+    validate_completed_runtime_options(&description, &options, &control)?;
     let restartable_read = matches!(
         intent,
         DistributedQueryIntent::Result | DistributedQueryIntent::Profile
@@ -727,6 +752,251 @@ mod tests {
     use super::{completed_plan_dop_domain, reconstruct_runtime_query_options};
     use novarocks_proto_codec::lifecycle::QueryOptions;
     use novarocks_proto_models::novarocks;
+
+    #[test]
+    fn synthetic_options_preserve_admitted_root_hints_and_absent_options_defaults() {
+        use novarocks_query_application::admitted_query_context::{
+            RequestAdmission, RequestContext,
+        };
+        use novarocks_query_application::api::BackendTopologySnapshot;
+        use novarocks_query_application::cancellation::QueryCancellationSource;
+        use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings, statement_sql_semantics};
+
+        for (session_mode, sql, expected_allow) in [
+            ("32", "SELECT 1", false),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true),
+            (
+                "32",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                false,
+            ),
+        ] {
+            let session = SqlSemanticSettings::default()
+                .with_sql_mode(SqlMode::from_assignment(session_mode));
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let admitted_semantics = statement_sql_semantics(&session, &statements[0]).unwrap();
+            let cancellation = QueryCancellationSource::new();
+            let context = RequestContext::admit(RequestAdmission::new(
+                None,
+                "default".to_owned(),
+                novarocks_types::ClusterRole::Fe,
+                BackendTopologySnapshot::empty(7),
+                None,
+                cancellation.view(),
+                novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                admitted_semantics,
+            ));
+            let options = super::synthetic_statement_query_options(context.execution());
+            assert_eq!(options.as_proto().allow_throw_exception, expected_allow);
+            let reconstructed = reconstruct_runtime_query_options(&options);
+            let mut expected = novarocks_execution::runtime::query_options::QueryOptions::default();
+            expected.set_allow_throw_exception(expected_allow);
+            assert_eq!(reconstructed, expected);
+
+            let resolved = super::ResolvedQueryOptions::from_upstream(Some(options));
+            let mut absent = super::ResolvedQueryOptions::from_upstream(None);
+            absent.runtime.set_allow_throw_exception(expected_allow);
+            assert_eq!(resolved.runtime_options(), absent.runtime_options());
+            super::validate_completed_runtime_options(
+                &intrinsic_runtime_description(expected_allow),
+                &resolved,
+                &runtime_gate_control(None),
+            )
+            .unwrap();
+        }
+    }
+
+    fn intrinsic_runtime_description(allow: bool) -> super::FrozenExecutionDescription {
+        use arrow::datatypes::DataType;
+        use novarocks_physical_plan::{
+            ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, PipelineDopDomain,
+            PlanBuilder, PlanVersionId, ValueOrigin, ValueType,
+        };
+        use novarocks_query_application::preparation::{
+            CompletedPhysicalPlanCandidate, ExecutionResourceRequirements, FrozenCostEstimate,
+            FrozenEstimateUnknownReason, FrozenExecutionDescription, OutputContract,
+        };
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+            SemanticParameterValue, SemanticParameters,
+        };
+        let mut fragment = FragmentBuilder::new(FragmentId::new(13));
+        let node = fragment.reserve_node_id().unwrap();
+        let ty = ValueType::new(DataType::Int64, false);
+        let literal = fragment
+            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(4)))
+            .unwrap();
+        let cast = fragment
+            .add_expression(
+                node,
+                ty.clone(),
+                ExprKind::Cast {
+                    expr: literal,
+                    target: DataType::Int64,
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    allow_throw_exception: SemanticParameterRef {
+                        id: SemanticParameterId::new(u32::MAX),
+                        expected_key: SemanticParameterKey::AllowThrowException,
+                    },
+                },
+            )
+            .unwrap();
+        let value = fragment
+            .add_value(
+                ty,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        fragment
+            .add_values(node, Box::from([Box::from([cast])]), Box::from([value]))
+            .unwrap();
+        let fragment = fragment
+            .finish_definition(
+                node,
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap())
+            .with_semantic_parameters(
+                SemanticParameters::try_new([(
+                    SemanticParameterId::new(u32::MAX),
+                    SemanticParameterValue::AllowThrowException(allow),
+                )])
+                .unwrap(),
+            );
+        builder.add_fragment(fragment).unwrap();
+        let candidate =
+            CompletedPhysicalPlanCandidate::for_program(builder.finish().unwrap()).unwrap();
+        FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Write,
+            candidate,
+            Vec::new(),
+            OutputContract::CompletionOnly,
+            novarocks_query_application::coordination::ExecutionEffect::None,
+            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap()
+    }
+
+    struct RuntimeGateControl {
+        calls: std::sync::Mutex<Vec<(novarocks_type_contract::CompilePhase, u32)>>,
+        refuse: Option<(usize, novarocks_type_contract::CompileControlError)>,
+    }
+    impl novarocks_type_contract::PureCompileControl for RuntimeGateControl {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((phase, units));
+            match self.refuse {
+                Some((ordinal, cause)) if calls.len() == ordinal + 1 => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    fn runtime_gate_control(
+        refuse: Option<(usize, novarocks_type_contract::CompileControlError)>,
+    ) -> RuntimeGateControl {
+        RuntimeGateControl {
+            calls: std::sync::Mutex::new(Vec::new()),
+            refuse,
+        }
+    }
+
+    #[test]
+    fn native_runtime_gate_compares_actual_resolved_options_with_the_same_candidate() {
+        for actual in [false, true] {
+            let options = super::ResolvedQueryOptions::from_upstream(Some(
+                QueryOptions::from_proto(novarocks::QueryOptions {
+                    allow_throw_exception: actual,
+                    ..Default::default()
+                }),
+            ));
+            let description = intrinsic_runtime_description(actual);
+            super::validate_completed_runtime_options(
+                &description,
+                &options,
+                &runtime_gate_control(None),
+            )
+            .unwrap();
+            let error = super::validate_completed_runtime_options(
+                &intrinsic_runtime_description(!actual),
+                &options,
+                &runtime_gate_control(None),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                super::DistributedQueryErrorKind::ContractViolation
+            );
+            assert_eq!(error.compile_control_error(), None);
+        }
+        let default_options = super::ResolvedQueryOptions::from_upstream(None);
+        assert!(
+            super::validate_completed_runtime_options(
+                &intrinsic_runtime_description(true),
+                &default_options,
+                &runtime_gate_control(None)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_runtime_gate_preserves_all_typed_control_prefixes_in_the_terminal_owner() {
+        use novarocks_type_contract::CompileControlError;
+        let description = intrinsic_runtime_description(true);
+        let options = super::ResolvedQueryOptions::from_upstream(Some(QueryOptions::from_proto(
+            novarocks::QueryOptions {
+                allow_throw_exception: true,
+                ..Default::default()
+            },
+        )));
+        for success in [true, false] {
+            let description = if success {
+                description.clone()
+            } else {
+                intrinsic_runtime_description(false)
+            };
+            let trace = runtime_gate_control(None);
+            let result = super::validate_completed_runtime_options(&description, &options, &trace);
+            assert_eq!(result.is_ok(), success);
+            let callbacks = trace.calls.into_inner().unwrap();
+            assert_eq!(callbacks.len(), 2);
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                for ordinal in 0..callbacks.len() {
+                    let trace = runtime_gate_control(Some((ordinal, cause)));
+                    let error =
+                        super::validate_completed_runtime_options(&description, &options, &trace)
+                            .unwrap_err();
+                    assert_eq!(error.compile_control_error(), Some(cause));
+                    assert_eq!(*trace.calls.lock().unwrap(), callbacks[..=ordinal]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn completed_plan_dop_domain_uses_resolved_driver_width_not_backend_count() {

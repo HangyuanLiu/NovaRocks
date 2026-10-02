@@ -550,6 +550,9 @@ fn encode_kind(
             op,
             right,
             decimal_overflow_policy,
+            // Complete-plan v1 preflight checks this value against admitted
+            // QueryOptions; the v2 carrier retains the reference identity.
+            allow_throw_exception: _,
         } => Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
             op: encode_binary(*op)? as i32,
             decimal_overflow_policy: encode_decimal_overflow_policy(*decimal_overflow_policy),
@@ -603,6 +606,9 @@ fn encode_kind(
             expr: operand,
             target,
             decimal_overflow_policy,
+            // Complete-plan v1 preflight checks this value against admitted
+            // QueryOptions; the v2 carrier retains the reference identity.
+            allow_throw_exception: _,
         } => Kind::Cast(Box::new(expr::CastExpr {
             operand: Some(Box::new(child(*operand)?)),
             target: Some(encode_physical_type(target)?),

@@ -143,6 +143,25 @@ pub fn validate_plan_with_limits(
 
     for fragment in plan.fragments().values() {
         validate_fragment_into(fragment, &mut errors);
+        // The complete-plan table is the sole intrinsic source. Fragment-only
+        // validation checks reference shape; publication resolves exact values.
+        for (id, expression) in fragment.expressions().iter() {
+            for reference in expression.kind.intrinsic_parameter_references() {
+                if let Err(error) = plan.parameters().require(*reference) {
+                    errors.push(ValidationError::new(
+                        format!(
+                            "fragments[{}].expressions[{}].parameters",
+                            fragment.id().get(),
+                            id.get()
+                        ),
+                        error.to_string(),
+                    ));
+                }
+            }
+            if errors.is_saturated() {
+                break;
+            }
+        }
         if errors.is_saturated() {
             errors.mark_truncated();
             return Err(ValidationErrors::from_collector(errors));

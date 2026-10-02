@@ -657,6 +657,7 @@ impl FrontendQueryCompiler {
             completed,
             self.functions.as_ref(),
             None,
+            execution.sql_semantics().sql_mode().allow_throw_exception(),
             &encoding_control,
         )
         .map_err(FrontendQueryCompilerError::from_encode)?;
@@ -779,6 +780,7 @@ impl FrontendQueryCompiler {
             completed,
             self.functions.as_ref(),
             None,
+            execution.sql_semantics().sql_mode().allow_throw_exception(),
             &encoding_control,
         )
         .map_err(FrontendQueryCompilerError::from_encode)?;

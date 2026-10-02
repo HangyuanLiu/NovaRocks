@@ -110,12 +110,14 @@ impl PreparedDistributedRewriteCohort {
     pub fn finish(
         self,
     ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, String> {
+        let options =
+            crate::query_execution::contract::synthetic_statement_query_options(&self.execution);
         let request = crate::query_execution::contract::build_request_from_finalized_execution(
             crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
                 self.description,
                 self.template,
             ),
-            None,
+            Some(options),
             crate::query_execution::contract::DistributedQueryIntent::Write,
             &self.execution,
             None,
@@ -1672,6 +1674,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             .sql_semantics()
             .sql_mode()
             .decimal_overflow_policy(),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         control,
     )?;
     let version = plan.version();
@@ -1686,6 +1689,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         paired,
         function_catalog,
         Some(&write_target_facts),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         control,
     )
     .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;

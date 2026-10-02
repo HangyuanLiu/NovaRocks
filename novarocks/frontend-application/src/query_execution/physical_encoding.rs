@@ -153,6 +153,7 @@ pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     functions: &EngineFunctionCatalog,
     write_targets: Option<&WriteTargetFacts<'_>>,
+    root_allow_throw_exception: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
@@ -175,7 +176,8 @@ pub(crate) fn encode_completed_plan(
             capabilities.insert(occurrence, (read.binding, access, generation, catalog));
         }
         let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
-        let encoded = encode_physical_plan_v1(plan, functions, &facts, control)?;
+        let encoded =
+            encode_physical_plan_v1(plan, functions, &facts, root_allow_throw_exception, control)?;
         let access = attempt_access_for_completed_plan(plan, capabilities)?;
         let scans = completed_plan_scan_facts(plan, &encodings)?;
         let provenance = mint_native_encoding_provenance();
@@ -952,6 +954,7 @@ mod tests {
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
             None,
+            false,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("a completed plan encodes");
@@ -1038,7 +1041,7 @@ mod tests {
                 earlier_error: None,
             };
             assert!(matches!(
-                encode_completed_plan(completed, &functions, None, &control),
+                encode_completed_plan(completed, &functions, None, false, &control),
                 Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
             ));
             assert_eq!(control.encode_checkpoints.load(Ordering::SeqCst), 4);
@@ -1059,7 +1062,7 @@ mod tests {
                 earlier_error: Some(error),
             };
             assert!(matches!(
-                encode_completed_plan(completed, &functions, None, &first_failure),
+                encode_completed_plan(completed, &functions, None, false, &first_failure),
                 Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
             ));
             assert_eq!(first_failure.encode_checkpoints.load(Ordering::SeqCst), 2);
@@ -1085,6 +1088,7 @@ mod tests {
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
             None,
+            false,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("a completed plan encodes");

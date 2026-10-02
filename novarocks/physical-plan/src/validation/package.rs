@@ -19,6 +19,25 @@ use super::*;
 use crate::resource::CutResourcePreflight;
 use crate::{FragmentPackageInput, FragmentSink, RuntimeFilterApplyPoint};
 
+// Extraction must bound the externally supplied call references before
+// materializing them. This is a necessary subset of the same package profile;
+// the final package constructor still checks cuts and all other owned facts.
+pub(crate) fn validate_fragment_parameter_resource_usage(
+    fragment: &Fragment,
+    semantic_items: usize,
+) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationContext::new();
+    let mut usage = CutResourcePreflight::new();
+    usage.add_fragment(fragment, &mut errors);
+    usage.add_items(semantic_items);
+    usage.validate("package.resources", &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors::from_collector(errors))
+    }
+}
+
 pub(crate) fn validate_package(
     input: &FragmentPackageInput,
     semantic_items: usize,

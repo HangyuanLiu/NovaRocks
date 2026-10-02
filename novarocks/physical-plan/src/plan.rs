@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use novarocks_type_contract::SemanticParameters;
+
 use novarocks_connector_contract::{
     ConnectorEncodedPayload, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
     ConnectorWriteRouteId, WriteTargetOrdinal,
@@ -1496,6 +1498,7 @@ pub enum AnnotationSubject {
 /// Complete immutable final physical plan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalPlan {
+    parameters: SemanticParameters,
     version: PlanVersionId,
     fragments: BTreeMap<FragmentId, Fragment>,
     edges: BTreeMap<EdgeId, Edge>,
@@ -1506,6 +1509,11 @@ pub struct PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    /// The sole immutable parameter-value authority for this plan.
+    pub const fn parameters(&self) -> &SemanticParameters {
+        &self.parameters
+    }
+
     pub const fn version(&self) -> PlanVersionId {
         self.version
     }
@@ -1536,6 +1544,7 @@ impl PhysicalPlan {
 }
 
 pub(crate) struct PhysicalPlanParts {
+    pub parameters: SemanticParameters,
     pub version: PlanVersionId,
     pub fragments: BTreeMap<FragmentId, Fragment>,
     pub edges: BTreeMap<EdgeId, Edge>,
@@ -1548,6 +1557,7 @@ pub(crate) struct PhysicalPlanParts {
 impl From<PhysicalPlanParts> for PhysicalPlan {
     fn from(parts: PhysicalPlanParts) -> Self {
         Self {
+            parameters: parts.parameters,
             version: parts.version,
             fragments: parts.fragments,
             edges: parts.edges,

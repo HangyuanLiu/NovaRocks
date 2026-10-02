@@ -220,6 +220,7 @@ pub fn encode_physical_plan_v1(
     physical: &PhysicalPlan,
     function_catalog: &EngineFunctionCatalog,
     private_facts: &impl PhysicalV1PrivateFacts,
+    root_allow_throw_exception: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<plan::DistributedPlan, PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
@@ -231,7 +232,13 @@ pub fn encode_physical_plan_v1(
         // their complete nesting and expansion shape has passed preflight.
         preflight_physical_plan_v1(physical).map_err(|error| error.to_string())?;
         preflight_native_v1_wire_shape(physical)?;
-        preflight_encoder(physical, function_catalog, private_facts, control)?;
+        preflight_encoder(
+            physical,
+            function_catalog,
+            private_facts,
+            root_allow_throw_exception,
+            control,
+        )?;
 
         let layouts = physical
             .fragments()
@@ -1169,6 +1176,7 @@ fn preflight_encoder(
     physical: &PhysicalPlan,
     function_catalog: &EngineFunctionCatalog,
     private_facts: &impl PhysicalV1PrivateFacts,
+    root_allow_throw_exception: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), PhysicalEncodeError> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -1223,6 +1231,22 @@ fn preflight_encoder(
                     id.get()
                 )
             };
+            // v1 delivers this setting in statement QueryOptions, not in
+            // expression DTOs. Refuse any source that that projection loses.
+            for reference in expression.kind.intrinsic_parameter_references() {
+                let frozen = physical
+                    .parameters()
+                    .require(*reference)
+                    .map_err(|error| subject(error.to_string()))?;
+                if !matches!(frozen,
+                    novarocks_type_contract::SemanticParameterValue::AllowThrowException(value)
+                        if *value == root_allow_throw_exception)
+                {
+                    return Err(subject(
+                        "intrinsic ALLOW_THROW_EXCEPTION differs from the admitted v1 statement setting".into()
+                    ).into());
+                }
+            }
             validate_v1_value_type(&expression.ty).map_err(subject)?;
             match &expression.kind {
                 ExprKind::Cast { target, .. } => {
@@ -5097,6 +5121,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("the actual plan can be materialized before its tail is refused");
@@ -5108,7 +5133,13 @@ mod tests {
         ] {
             let control = EncodeTailControl::new(error);
             assert_eq!(
-                encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts, &control),
+                encode_physical_plan_v1(
+                    &physical,
+                    &catalog,
+                    &NoPhysicalV1PrivateFacts,
+                    false,
+                    &control
+                ),
                 Err(PhysicalEncodeError::Control(error)),
             );
             assert_eq!(control.encode_checkpoints.load(Ordering::SeqCst), 2);
@@ -5121,6 +5152,7 @@ mod tests {
                     &physical,
                     &catalog,
                     &NoPhysicalV1PrivateFacts,
+                    false,
                     &first_failure
                 ),
                 Err(PhysicalEncodeError::Control(error)),
@@ -5157,7 +5189,13 @@ mod tests {
                 Err(PhysicalEncodeError::Control(error))
             );
             assert_eq!(
-                encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts, &control),
+                encode_physical_plan_v1(
+                    &physical,
+                    &catalog,
+                    &NoPhysicalV1PrivateFacts,
+                    false,
+                    &control
+                ),
                 Err(PhysicalEncodeError::Control(error))
             );
         }
@@ -5472,6 +5510,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("a split TopN states both halves as nodes of its own");
@@ -5545,6 +5584,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect_err("ordered JoinBuildKey must fail in encoder preflight");
@@ -5721,6 +5761,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("HashJoin RightAnti preserved-side output is representable");
@@ -5798,6 +5839,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("the v1 backend projects cropped HashJoin output columns");
@@ -5917,6 +5959,32 @@ mod tests {
         cast_policy: novarocks_type_contract::DecimalOverflowPolicy,
         binary_policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> PhysicalPlan {
+        finish_project_expression_plan_with_sources(
+            cast_depth,
+            diamond_depth,
+            cast_policy,
+            binary_policy,
+            false,
+            false,
+        )
+    }
+
+    fn finish_project_expression_plan_with_sources(
+        cast_depth: usize,
+        diamond_depth: usize,
+        cast_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        binary_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        cast_allow: bool,
+        binary_allow: bool,
+    ) -> PhysicalPlan {
+        let reference = novarocks_type_contract::SemanticParameterRef {
+            id: novarocks_type_contract::SemanticParameterId::new(0),
+            expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+        };
+        let binary_reference = novarocks_type_contract::SemanticParameterRef {
+            id: novarocks_type_contract::SemanticParameterId::new(u32::MAX),
+            expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+        };
         let fragment_id = FragmentId::new(24);
         let mut builder = FragmentBuilder::new(fragment_id);
         let ty = ValueType::new(DataType::Int64, false);
@@ -5963,6 +6031,7 @@ mod tests {
                     project,
                     ty.clone(),
                     ExprKind::Cast {
+                        allow_throw_exception: reference,
                         decimal_overflow_policy: cast_policy,
                         expr: expression,
                         target: DataType::Int64,
@@ -5976,6 +6045,7 @@ mod tests {
                     project,
                     ty.clone(),
                     ExprKind::Binary {
+                        allow_throw_exception: Some(binary_reference),
                         decimal_overflow_policy: binary_policy,
                         op: novarocks_physical_plan::BinaryOperator::Add,
                         left: expression,
@@ -6020,6 +6090,22 @@ mod tests {
             )
             .unwrap();
         let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([24; 16]).unwrap());
+        let mut parameters = Vec::new();
+        if cast_depth != 0 {
+            parameters.push((
+                reference.id,
+                novarocks_type_contract::SemanticParameterValue::AllowThrowException(cast_allow),
+            ));
+        }
+        if diamond_depth != 0 {
+            parameters.push((
+                binary_reference.id,
+                novarocks_type_contract::SemanticParameterValue::AllowThrowException(binary_allow),
+            ));
+        }
+        plan_builder = plan_builder.with_semantic_parameters(
+            novarocks_type_contract::SemanticParameters::try_new(parameters).unwrap(),
+        );
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -6133,6 +6219,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("the decoder-safe boundary is encodable");
@@ -6160,6 +6247,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect_err("preflight must reject before layout or protobuf tree construction");
@@ -6174,6 +6262,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("the combined decoder-safe expression boundary is encodable");
@@ -6191,6 +6280,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect_err("combined node and expression nesting must fail closed");
@@ -6205,6 +6295,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect_err("an exponentially expanded v1 expression must fail closed");
@@ -6425,6 +6516,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .unwrap_err();
@@ -7233,6 +7325,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .unwrap();
@@ -7304,6 +7397,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect_err("Limit overflow must fail in encoder preflight");
@@ -7314,7 +7408,13 @@ mod tests {
         let control =
             EncodeTailControl::new(novarocks_type_contract::CompileControlError::Cancelled);
         assert_eq!(
-            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts, &control),
+            encode_physical_plan_v1(
+                &physical,
+                &catalog,
+                &NoPhysicalV1PrivateFacts,
+                false,
+                &control
+            ),
             Err(PhysicalEncodeError::Control(
                 novarocks_type_contract::CompileControlError::Cancelled
             )),
@@ -7530,6 +7630,7 @@ mod tests {
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
+            false,
             &CodecTestControl,
         )
         .expect("a Repeat that nulls its grouping columns in place encodes");
@@ -7632,6 +7733,61 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_projection_requires_every_intrinsic_ref_to_match_the_admitted_statement() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let (catalog, _) = exact_scalar_catalog();
+        for frozen in [false, true] {
+            let physical = finish_project_expression_plan_with_sources(
+                1,
+                1,
+                ReportError,
+                OutputNull,
+                frozen,
+                frozen,
+            );
+            let encoded = encode_physical_plan_v1(
+                &physical,
+                &catalog,
+                &NoPhysicalV1PrivateFacts,
+                frozen,
+                &CodecTestControl,
+            )
+            .unwrap();
+            assert_eq!(encoded.fragments.len(), 1);
+            let error = encode_physical_plan_v1(
+                &physical,
+                &catalog,
+                &NoPhysicalV1PrivateFacts,
+                !frozen,
+                &CodecTestControl,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("differs from the admitted v1 statement setting")
+            );
+        }
+        let mixed =
+            finish_project_expression_plan_with_sources(1, 1, OutputNull, ReportError, false, true);
+        for admitted in [false, true] {
+            let error = encode_physical_plan_v1(
+                &mixed,
+                &catalog,
+                &NoPhysicalV1PrivateFacts,
+                admitted,
+                &CodecTestControl,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("differs from the admitted v1 statement setting")
+            );
+        }
+    }
+
+    #[test]
     fn physical_codec_preserves_expression_local_decimal_policy() {
         use novarocks_type_contract::DecimalOverflowPolicy as Policy;
         for (cast_policy, binary_policy) in [
@@ -7645,6 +7801,7 @@ mod tests {
                 &physical,
                 &catalog,
                 &NoPhysicalV1PrivateFacts,
+                false,
                 &CodecTestControl,
             )
             .unwrap();

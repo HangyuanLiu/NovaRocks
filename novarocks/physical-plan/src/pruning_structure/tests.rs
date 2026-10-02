@@ -172,6 +172,7 @@ fn predicate(builder: &mut FragmentBuilder, node: NodeId, value: ValueId) -> Exp
             node,
             ty(DataType::Boolean),
             ExprKind::Binary {
+                allow_throw_exception: None,
                 left,
                 op: BinaryOperator::Gt,
                 right,

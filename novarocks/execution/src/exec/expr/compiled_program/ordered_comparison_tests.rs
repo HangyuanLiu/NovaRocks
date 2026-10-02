@@ -158,6 +158,7 @@ fn ordered_value_program(
                 left,
                 right,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                allow_throw_exception: None,
             },
         )
         .unwrap();

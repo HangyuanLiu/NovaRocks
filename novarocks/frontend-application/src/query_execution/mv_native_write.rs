@@ -223,10 +223,12 @@ pub(crate) fn prepare_completed_mv_write(
                 field_names,
             },
         ),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         control,
     )
     .map_err(encode_compile_error)?;
-    PreparedMvNativeWriteAssembly::session(encoded, version, None, write_session)
+    let options = crate::query_execution::contract::synthetic_statement_query_options(execution);
+    PreparedMvNativeWriteAssembly::session(encoded, version, Some(options), write_session)
         .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
 }
 

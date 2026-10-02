@@ -801,6 +801,7 @@ fn prepare_planned_ctas_connector_write(
                 field_names,
             },
         ),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(

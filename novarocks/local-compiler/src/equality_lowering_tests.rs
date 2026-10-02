@@ -208,6 +208,7 @@ fn fixture(
                     op,
                     right: b,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    allow_throw_exception: None,
                 },
                 ty,
                 vec![a, b],

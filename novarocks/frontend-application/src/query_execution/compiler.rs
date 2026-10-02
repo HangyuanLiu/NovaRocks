@@ -1349,6 +1349,10 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             &maintenance_execution
         }
     };
+    let query_opts = Some(match query_opts {
+        Some(options) => options,
+        None => crate::query_execution::contract::synthetic_statement_query_options(execution),
+    });
     let optimizer_settings = execution.optimizer_settings().clone();
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
@@ -1521,6 +1525,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         paired,
         DmlQueryExecutionKernel::function_catalog(state),
         Some(&write_target_facts),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
