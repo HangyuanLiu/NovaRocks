@@ -120,6 +120,21 @@ pub fn encode_type_table(
     finish(work, result)
 }
 
+/// Project explicit complete root fields as well as value types. Authored
+/// field IDs are retained in their own namespace; nested occurrence fields
+/// receive fresh IDs that never collide with those reserved identities.
+/// This does not infer a root field from a value type or add logical metadata.
+pub fn encode_type_table_with_fields(
+    values: &[(u32, FunctionValueType)],
+    fields: &[(u32, Arc<Field>)],
+    limits: TypeProjectionLimits,
+    control: &dyn PureCompileControl,
+) -> Result<wire::TypeTable, TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = encode::encode_with_fields(values, fields, limits, &mut work);
+    finish(work, result)
+}
+
 pub fn decode_type_table(
     table: &wire::TypeTable,
     limits: TypeProjectionLimits,
@@ -267,3 +282,6 @@ fn validate_type(ty: &DataType, work: &mut CompileCheckpoints<'_>) -> Result<(),
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod fields_tests;

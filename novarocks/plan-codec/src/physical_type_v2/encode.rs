@@ -19,11 +19,11 @@
 //! normalization. The entire projection envelope is checked before allocating
 //! output definitions or copying strings. Scratch work is not a MEM grant.
 
-use super::{TypeCodecError, TypeProjectionLimits, encode_logical, validate_type};
+use super::{TypeCodecError, TypeProjectionLimits, encode_logical, validate_field, validate_type};
 use arrow::datatypes::{DataType, Field, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
-use novarocks_type_contract::{CompileCheckpoints, FunctionValueType};
-use std::{cmp::Ordering, collections::BTreeSet};
+use novarocks_type_contract::{CompileCheckpoints, FunctionValueType, field_logical_type};
+use std::{cmp::Ordering, collections::BTreeSet, sync::Arc};
 use wire::carrier_type_definition::Kind;
 
 type Error = TypeCodecError;
@@ -150,9 +150,26 @@ fn count_field(
 
 fn preflight(
     values: &[(u32, FunctionValueType)],
+    fields: &[(u32, Arc<Field>)],
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Counts, Error> {
+) -> Result<(Counts, BTreeSet<u32>), Error> {
+    let root_count = values
+        .len()
+        .checked_add(fields.len())
+        .ok_or(Error::InvalidShape("root definition count overflow"))?;
+    if root_count > limits.max_definitions {
+        return Err(Error::InvalidShape(
+            "type projection exceeds its admitted envelope",
+        ));
+    }
+    let mut reserved_fields = BTreeSet::new();
+    for (id, _) in fields {
+        work.step()?;
+        if !reserved_fields.insert(*id) {
+            return Err(Error::InvalidShape("duplicate field definition ID"));
+        }
+    }
     let mut counts = Counts {
         definitions: 0,
         expanded: 0,
@@ -179,7 +196,21 @@ fn preflight(
         let nodes = count_type(&value.data_type, &mut counts, work)?;
         counts.expansion(nodes)?;
     }
-    Ok(counts)
+    for (_, field) in fields {
+        work.step()?;
+        validate_field(field, work)?;
+        field_logical_type(field)?;
+        validate_type(field.data_type(), work)?;
+        #[allow(deprecated)]
+        let dictionary_id = field.dict_id();
+        if dictionary_id.is_some() != field.dict_is_ordered().is_some() {
+            return Err(Error::InvalidShape(
+                "incomplete field dictionary attributes",
+            ));
+        }
+        count_field(field, &mut counts, work)?;
+    }
+    Ok((counts, reserved_fields))
 }
 
 fn copy_string(input: &str, work: &mut CompileCheckpoints<'_>) -> Result<String, Error> {
@@ -249,15 +280,40 @@ fn metadata(
     Ok(output)
 }
 
+struct FieldIds {
+    reserved: BTreeSet<u32>,
+    cursor: u64,
+}
+impl FieldIds {
+    fn next(&mut self, work: &mut CompileCheckpoints<'_>) -> Result<u32, Error> {
+        // The cursor never resets: across the whole emission, it tests at
+        // most reserved-root-count + automatic-field-count identities. MAX
+        // reservations do not allocate a sparse array or force a large scan.
+        loop {
+            work.step()?;
+            let id = u32::try_from(self.cursor)
+                .map_err(|_| Error::InvalidShape("field definition IDs are exhausted"))?;
+            self.cursor += 1;
+            if !self.reserved.contains(&id) {
+                return Ok(id);
+            }
+        }
+    }
+}
+
 fn emit_field(
     field: &Field,
+    explicit_id: Option<u32>,
     table: &mut wire::TypeTable,
+    ids: &mut FieldIds,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u32, Error> {
     work.step()?;
-    let carrier_type_id = emit_type(field.data_type(), table, work)?;
-    let id = u32::try_from(table.fields.len())
-        .map_err(|_| Error::InvalidShape("field definition IDs are exhausted"))?;
+    let carrier_type_id = emit_type(field.data_type(), table, ids, work)?;
+    let id = match explicit_id {
+        Some(id) => id,
+        None => ids.next(work)?,
+    };
     #[allow(deprecated)]
     let dictionary_id = field.dict_id();
     table.fields.push(wire::FieldDefinition {
@@ -275,6 +331,7 @@ fn emit_field(
 fn emit_type(
     ty: &DataType,
     table: &mut wire::TypeTable,
+    ids: &mut FieldIds,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u32, Error> {
     work.step()?;
@@ -287,20 +344,24 @@ fn emit_type(
         .carriers
         .push(wire::CarrierTypeDefinition { id, kind: None });
     let kind = match ty {
-        DataType::List(field) => Kind::ListFieldId(emit_field(field, table, work)?),
-        DataType::ListView(field) => Kind::ListViewFieldId(emit_field(field, table, work)?),
-        DataType::LargeList(field) => Kind::LargeListFieldId(emit_field(field, table, work)?),
+        DataType::List(field) => Kind::ListFieldId(emit_field(field, None, table, ids, work)?),
+        DataType::ListView(field) => {
+            Kind::ListViewFieldId(emit_field(field, None, table, ids, work)?)
+        }
+        DataType::LargeList(field) => {
+            Kind::LargeListFieldId(emit_field(field, None, table, ids, work)?)
+        }
         DataType::LargeListView(field) => {
-            Kind::LargeListViewFieldId(emit_field(field, table, work)?)
+            Kind::LargeListViewFieldId(emit_field(field, None, table, ids, work)?)
         }
         DataType::FixedSizeList(field, length) => Kind::FixedSizeList(wire::FixedSizeList {
-            item_field_id: Some(emit_field(field, table, work)?),
+            item_field_id: Some(emit_field(field, None, table, ids, work)?),
             length: *length,
         }),
         DataType::Struct(fields) => {
             let mut field_ids = Vec::with_capacity(fields.len());
             for field in fields {
-                field_ids.push(emit_field(field, table, work)?);
+                field_ids.push(emit_field(field, None, table, ids, work)?);
             }
             Kind::StructType(wire::StructFields { field_ids })
         }
@@ -309,7 +370,7 @@ fn emit_type(
             for (type_id, field) in fields.iter() {
                 output.push(wire::UnionField {
                     type_id: i32::from(type_id),
-                    field_id: Some(emit_field(field, table, work)?),
+                    field_id: Some(emit_field(field, None, table, ids, work)?),
                 });
             }
             Kind::UnionType(wire::UnionFields {
@@ -321,16 +382,16 @@ fn emit_type(
             })
         }
         DataType::Dictionary(key, value) => Kind::Dictionary(wire::DictionaryTypes {
-            key_type_id: Some(emit_type(key, table, work)?),
-            value_type_id: Some(emit_type(value, table, work)?),
+            key_type_id: Some(emit_type(key, table, ids, work)?),
+            value_type_id: Some(emit_type(value, table, ids, work)?),
         }),
         DataType::Map(entries, ordered) => Kind::Map(wire::MapField {
-            entries_field_id: Some(emit_field(entries, table, work)?),
+            entries_field_id: Some(emit_field(entries, None, table, ids, work)?),
             ordered: *ordered,
         }),
         DataType::RunEndEncoded(ends, values) => Kind::RunEndEncoded(wire::RunEndEncodedFields {
-            run_ends_field_id: Some(emit_field(ends, table, work)?),
-            values_field_id: Some(emit_field(values, table, work)?),
+            run_ends_field_id: Some(emit_field(ends, None, table, ids, work)?),
+            values_field_id: Some(emit_field(values, None, table, ids, work)?),
         }),
         _ => super::scalars::encode_scalar(ty)?
             .ok_or(Error::InvalidShape("Arrow type has no v2 carrier variant"))?,
@@ -344,8 +405,21 @@ pub(super) fn encode(
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::TypeTable, Error> {
-    let counts = preflight(values, limits, work)?;
+    encode_with_fields(values, &[], limits, work)
+}
+
+pub(super) fn encode_with_fields(
+    values: &[(u32, FunctionValueType)],
+    fields: &[(u32, Arc<Field>)],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::TypeTable, Error> {
+    let (counts, reserved) = preflight(values, fields, limits, work)?;
     work.flush()?;
+    let mut ids = FieldIds {
+        reserved,
+        cursor: 0,
+    };
     let mut table = wire::TypeTable {
         carriers: Vec::with_capacity(counts.carriers),
         fields: Vec::with_capacity(counts.fields),
@@ -353,13 +427,17 @@ pub(super) fn encode(
     };
     for (id, value) in values {
         work.step()?;
-        let carrier_type_id = emit_type(&value.data_type, &mut table, work)?;
+        let carrier_type_id = emit_type(&value.data_type, &mut table, &mut ids, work)?;
         table.value_types.push(wire::ValueTypeDefinition {
             id: *id,
             carrier_type_id: Some(carrier_type_id),
             nullable: value.nullable,
             logical_type: encode_logical(value.logical_type),
         });
+    }
+    for (id, field) in fields {
+        work.step()?;
+        emit_field(field, Some(*id), &mut table, &mut ids, work)?;
     }
     Ok(table)
 }
