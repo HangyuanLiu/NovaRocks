@@ -192,6 +192,34 @@ fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
     min_frames_for_list.saturating_add(padding).max(5)
 }
 
+enum FrameInput<'a> {
+    Owned(BytesMut),
+    Borrowed(&'a [u8]),
+}
+impl std::ops::Deref for FrameInput<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Borrowed(bytes) => bytes,
+        }
+    }
+}
+impl FrameInput<'_> {
+    fn into_owned(self) -> BytesMut {
+        match self {
+            Self::Owned(bytes) => bytes,
+            // Header/CONT workspace still uses the existing owned path; this
+            // copy remains outside the fixed raw/DATA/diagnostic grants.
+            Self::Borrowed(bytes) => BytesMut::from(bytes),
+        }
+    }
+}
+struct DecodePools<'a> {
+    data: Option<&'a crate::ReceiveBufferPool>,
+    goaway: Option<&'a crate::ReceiveBufferPool>,
+}
+
 /// Decodes a frame.
 ///
 /// This method is intentionally de-generified and outlined because it is very large.
@@ -202,8 +230,32 @@ fn decode_frame(
     max_header_block_size: Option<usize>,
     partial_inout: &mut Option<Partial>,
     goaway_pool: Option<&crate::ReceiveBufferPool>,
-    mut bytes: BytesMut,
+    bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
+    decode_frame_input(
+        hpack,
+        max_header_list_size,
+        max_continuation_frames,
+        max_header_block_size,
+        partial_inout,
+        DecodePools {
+            data: None,
+            goaway: goaway_pool,
+        },
+        FrameInput::Owned(bytes),
+    )
+}
+
+fn decode_frame_input(
+    hpack: &mut hpack::Decoder,
+    max_header_list_size: usize,
+    max_continuation_frames: usize,
+    max_header_block_size: Option<usize>,
+    partial_inout: &mut Option<Partial>,
+    pools: DecodePools<'_>,
+    bytes: FrameInput<'_>,
+) -> Result<Option<Frame>, Error> {
+    let goaway_pool = pools.goaway;
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
     let _e = span.enter();
 
@@ -312,8 +364,18 @@ fn decode_frame(
             .into()
         }
         Kind::Data => {
-            bytes.advance(frame::HEADER_LEN);
-            let res = frame::Data::load(head, bytes.freeze());
+            let res = match pools.data {
+                Some(pool) => {
+                    frame::Data::load_with_payload(head, &bytes[frame::HEADER_LEN..], |payload| {
+                        pool.copy_data(payload)
+                    })
+                }
+                None => {
+                    let mut bytes = bytes.into_owned();
+                    bytes.advance(frame::HEADER_LEN);
+                    frame::Data::load(head, bytes.freeze())
+                }
+            };
 
             // TODO: Should this always be connection level? Probably not...
             res.map_err(|e| {
@@ -322,7 +384,10 @@ fn decode_frame(
             })?
             .into()
         }
-        Kind::Headers => header_block!(Headers, head, bytes),
+        Kind::Headers => {
+            let mut bytes = bytes.into_owned();
+            header_block!(Headers, head, bytes)
+        }
         Kind::Reset => {
             let res = frame::Reset::load(head, &bytes[frame::HEADER_LEN..]);
             res.map_err(|e| {
@@ -353,7 +418,10 @@ fn decode_frame(
             })?
             .into()
         }
-        Kind::PushPromise => header_block!(PushPromise, head, bytes),
+        Kind::PushPromise => {
+            let mut bytes = bytes.into_owned();
+            header_block!(PushPromise, head, bytes)
+        }
         Kind::Priority => {
             if head.stream_id() == 0 {
                 // Invalid stream identifier
@@ -378,6 +446,7 @@ fn decode_frame(
             }
         }
         Kind::Continuation => {
+            let mut bytes = bytes.into_owned();
             let is_end_headers = (head.flag() & 0x4) == 0x4;
 
             let mut partial = match partial_inout.take() {
@@ -496,36 +565,64 @@ where
             if let Some(pool) = &self.receive_pool {
                 ready!(pool.poll_ready(cx));
             }
-            let next = match &mut self.inner {
-                ReadKind::Default(inner) => Pin::new(inner).poll_next(cx),
-                ReadKind::Fixed(inner) => inner.poll_frame(cx),
-            };
-            let bytes = match ready!(next) {
-                Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
-                None => return Poll::Ready(None),
-            };
-
-            tracing::trace!(read.bytes = bytes.len());
             let Self {
-                ref mut hpack,
-                max_header_list_size,
-                ref mut partial,
-                max_continuation_frames,
-                max_header_block_size,
-                ref goaway_pool,
-                ..
-            } = *self;
-            if let Some(mut frame) = decode_frame(
+                inner,
                 hpack,
                 max_header_list_size,
+                partial,
                 max_continuation_frames,
                 max_header_block_size,
-                partial,
-                goaway_pool.as_ref(),
-                bytes,
-            )? {
-                if let (Some(pool), Frame::Data(data)) = (&self.receive_pool, &mut frame) {
+                goaway_pool,
+                receive_pool,
+                ..
+            } = &mut *self;
+            let (decoded, needs_data_copy) = match inner {
+                ReadKind::Default(inner) => {
+                    let bytes = match ready!(Pin::new(inner).poll_next(cx)) {
+                        Some(Ok(bytes)) => bytes,
+                        Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                        None => return Poll::Ready(None),
+                    };
+                    (
+                        decode_frame(
+                            hpack,
+                            *max_header_list_size,
+                            *max_continuation_frames,
+                            *max_header_block_size,
+                            partial,
+                            goaway_pool.as_ref(),
+                            bytes,
+                        ),
+                        true,
+                    )
+                }
+                ReadKind::Fixed(inner) => {
+                    let decoded = inner.poll_frame_with(cx, |bytes| {
+                        decode_frame_input(
+                            hpack,
+                            *max_header_list_size,
+                            *max_continuation_frames,
+                            *max_header_block_size,
+                            partial,
+                            DecodePools {
+                                data: receive_pool.as_ref(),
+                                goaway: goaway_pool.as_ref(),
+                            },
+                            FrameInput::Borrowed(bytes),
+                        )
+                    });
+                    let decoded = match ready!(decoded) {
+                        Some(Ok(decoded)) => decoded,
+                        Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                        None => return Poll::Ready(None),
+                    };
+                    (decoded, false)
+                }
+            };
+            if let Some(mut frame) = decoded? {
+                if let (true, Some(pool), Frame::Data(data)) =
+                    (needs_data_copy, &self.receive_pool, &mut frame)
+                {
                     // Replace the whole original read-buffer alias before it
                     // escapes. Flow credit is independent of this pool slot.
                     let owned = pool.copy_data(data.payload());

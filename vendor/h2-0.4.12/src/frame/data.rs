@@ -117,6 +117,31 @@ impl<T> Data<T> {
 }
 
 impl Data<Bytes> {
+    // Validate the borrowed payload before creating any owned DATA backing.
+    // The metadata/stripping semantics match load; padding contents are ignored.
+    pub(crate) fn load_with_payload(
+        head: Head,
+        payload: &[u8],
+        copy: impl FnOnce(&[u8]) -> Bytes,
+    ) -> Result<Self, Error> {
+        let flags = DataFlags::load(head.flag());
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+        let (payload, pad_len) = if flags.is_padded() {
+            let len = util::padding_len(payload)?;
+            (&payload[1..payload.len() - usize::from(len)], Some(len))
+        } else {
+            (payload, None)
+        };
+        Ok(Data {
+            stream_id: head.stream_id(),
+            data: copy(payload),
+            flags,
+            pad_len,
+        })
+    }
+
     pub(crate) fn load(head: Head, mut payload: Bytes) -> Result<Self, Error> {
         let flags = DataFlags::load(head.flag());
 

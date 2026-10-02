@@ -1,0 +1,10 @@
+{
+  "Cargo.toml": "9e2aea3d19cc4c32821730441c1e4c767d21f36c2c1dc78f345ea3ec24a303d3",
+  "Cargo.lock": "304e9295831d5b83e34241e10c308e4dc7da221d3061a9c48a18b03ff9bba188",
+  "vendor/h2-0.4.12/PATCH.md": "14157ed6248e7babdaf56cd1660d168c10e49258a527dbbb8e99e9e1d71ae9b2",
+  "vendor/h2-0.4.12/src/receive_frame.rs": "9ede3bbac5631643468342eabe5f98e401b1576e20b8864ecaaedb1c4e859aca",
+  "vendor/h2-0.4.12/src/codec/framed_read.rs": "e5c3873047b163f014d2a1a05e8d75b0b5dd9351a4399fc51cd09a72650f5b63",
+  "vendor/h2-0.4.12/src/frame/data.rs": "db624da5b3cbda2e32f9aac575b5b924da2d2a320100146b37c33d4a4f461598",
+  "vendor/h2-0.4.12/src/frame/util.rs": "a20c9aea0c4314636c03c18aa66fda355f4d95af742cae623413c5b87328391d",
+  "novarocks/native-adapter/tests/native_h2_borrowed_frame.rs": "54799db874ae44931e9985c979ca1a28ef9dfb38d8b31f24c65070a1de5d685b"
+}

@@ -18,6 +18,15 @@ use bytes::{Buf, Bytes};
 /// to the total length), returns `None`.
 pub fn strip_padding(payload: &mut Bytes) -> Result<u8, Error> {
     let payload_len = payload.len();
+    let pad_len = padding_len(payload)? as usize;
+    payload.advance(1);
+    payload.truncate(payload_len - pad_len - 1);
+    Ok(pad_len as u8)
+}
+
+// Shared borrowed validation preserves the original empty/equal padding rules.
+pub(super) fn padding_len(payload: &[u8]) -> Result<u8, Error> {
+    let payload_len = payload.len();
     if payload_len == 0 {
         // If this is the case, the frame is invalid as no padding length can be
         // extracted, even though the frame should be padded.
@@ -31,9 +40,6 @@ pub fn strip_padding(payload: &mut Bytes) -> Result<u8, Error> {
         // total frame size.
         return Err(Error::TooMuchPadding);
     }
-
-    payload.advance(1);
-    payload.truncate(payload_len - pad_len - 1);
 
     Ok(pad_len as u8)
 }

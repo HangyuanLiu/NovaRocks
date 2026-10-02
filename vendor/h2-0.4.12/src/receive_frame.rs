@@ -1,6 +1,8 @@
 //! Fixed raw frame input backing for one opt-in HTTP/2 connection.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(test)]
+use bytes::BytesMut;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::io;
@@ -26,9 +28,11 @@ unsafe impl Sync for Core {}
 /// Fixed raw input storage whose original funding lasts through its physical
 /// allocation exit. One buffer binds once to one connection, before I/O.
 ///
-/// This covers the raw input Vec and Core allocation only. The emitted
-/// BytesMut frame copy, HPACK/headers/continuations, retained DATA, socket,
-/// task backing and caller ownership-carrier metadata are separate.
+/// This covers the raw input Vec and Core allocation only. The fixed parser
+/// borrows complete frames: controls need no frame copy, and installed DATA
+/// or diagnostic pools own their independent payload copies. Owned header/
+/// continuation fallback, retained payload pools, socket/task backing and
+/// caller ownership-carrier metadata are separate.
 /// Defaults do not install this buffer.
 pub struct ReceiveFrameBuffer {
     core: Option<Arc<Core>>,
@@ -158,10 +162,21 @@ impl<T> FixedFrameRead<T> {
     }
 }
 impl<T: AsyncRead + Unpin> FixedFrameRead<T> {
+    #[cfg(test)]
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<BytesMut>>> {
+        self.poll_frame_with(cx, |bytes| BytesMut::from(bytes))
+    }
+
+    // The callback cannot return a borrow of raw storage: R is independent of
+    // its argument's lifetime. Complete frame parsing runs within this lease.
+    pub(crate) fn poll_frame_with<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        decode: impl FnOnce(&[u8]) -> R,
+    ) -> Poll<Option<io::Result<R>>> {
         if self.failed {
             return Poll::Ready(None);
         }
@@ -209,12 +224,12 @@ impl<T: AsyncRead + Unpin> FixedFrameRead<T> {
                     continue;
                 }
             }
-            // This separate exact frame copy is bounded before allocation, but
-            // is not part of the fixed input Vec's ownership/allocation claim.
-            let frame = BytesMut::from(&self.buffer.storage()[..self.target]);
+            // Reset before invoking user-independent decode, so an unwinding
+            // callback cannot replay this complete frame on a later poll.
+            let frame_len = self.target;
             self.filled = 0;
             self.target = 9;
-            return Poll::Ready(Some(Ok(frame)));
+            return Poll::Ready(Some(Ok(decode(&self.buffer.storage()[..frame_len]))));
         }
     }
 }
