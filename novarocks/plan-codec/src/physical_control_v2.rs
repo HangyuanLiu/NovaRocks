@@ -20,8 +20,8 @@
 //! preflight or the complete fragment-package codec.
 
 use novarocks_physical_plan::{
-    ExprId, ExpressionRootRole, ExpressionRootSite, Fragment, JoinSide, NodeId, PhysicalRootUses,
-    RootUseBindingError,
+    ExprId, ExpressionRootError, ExpressionRootRole, ExpressionRootSite, Fragment, JoinSide,
+    NodeId, PhysicalRootUses, RootUseBindingError,
 };
 use novarocks_proto_models::physical_control_v2 as wire;
 use novarocks_type_contract::{
@@ -66,7 +66,10 @@ impl From<ExpressionControlFlowError> for ControlCodecError {
 impl From<RootUseBindingError> for ControlCodecError {
     fn from(error: RootUseBindingError) -> Self {
         match error {
-            RootUseBindingError::Control(error) => Self::Control(error),
+            RootUseBindingError::Control(error)
+            | RootUseBindingError::Roots(ExpressionRootError::Control(error)) => {
+                Self::Control(error)
+            }
             error => Self::Roots(error),
         }
     }
@@ -398,75 +401,84 @@ pub fn decode_expression_control(
     control: &dyn PureCompileControl,
 ) -> Result<PhysicalRootUses, ControlCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    if input.domains.len() > MAX_CONTROL_DEFINITIONS
-        || input.uses.len() > MAX_CONTROL_USE_REFERENCES
-        || input.roots.len() > MAX_CONTROL_USE_REFERENCES
-    {
-        return Err(ExpressionControlFlowError::TooManyItems.into());
-    }
-    let mut references = input.uses.len();
-    for invocation in &input.uses {
-        references = references
-            .checked_add(invocation.argument_use_ids.len())
-            .ok_or(ExpressionControlFlowError::TooManyItems)?;
-        if references > MAX_CONTROL_USE_REFERENCES {
+    let projected = (|| {
+        if input.domains.len() > MAX_CONTROL_DEFINITIONS
+            || input.uses.len() > MAX_CONTROL_USE_REFERENCES
+            || input.roots.len() > MAX_CONTROL_USE_REFERENCES
+        {
             return Err(ExpressionControlFlowError::TooManyItems.into());
         }
-        work.step()?;
-    }
-    let mut domains = Vec::with_capacity(input.domains.len());
-    for domain in &input.domains {
-        domains.push(ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(domain.id),
-            parent: domain.parent_domain_id.map(EvaluationDomainId::new),
-            guard: domain.guard.as_ref().map(decode_guard).transpose()?,
-        });
-        work.step()?;
-    }
-    let mut uses = Vec::with_capacity(input.uses.len());
-    for invocation in &input.uses {
-        let mut arguments = Vec::with_capacity(invocation.argument_use_ids.len());
-        for argument in &invocation.argument_use_ids {
-            arguments.push(ExpressionUseId::new(*argument));
+        let mut references = input.uses.len();
+        for invocation in &input.uses {
+            references = references
+                .checked_add(invocation.argument_use_ids.len())
+                .ok_or(ExpressionControlFlowError::TooManyItems)?;
+            if references > MAX_CONTROL_USE_REFERENCES {
+                return Err(ExpressionControlFlowError::TooManyItems.into());
+            }
             work.step()?;
         }
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(invocation.id),
-                domain: EvaluationDomainId::new(required(
-                    invocation.domain_id,
-                    "use domain is missing",
+        let mut domains = Vec::with_capacity(input.domains.len());
+        for domain in &input.domains {
+            domains.push(ExpressionEvaluationDomain {
+                id: EvaluationDomainId::new(domain.id),
+                parent: domain.parent_domain_id.map(EvaluationDomainId::new),
+                guard: domain.guard.as_ref().map(decode_guard).transpose()?,
+            });
+            work.step()?;
+        }
+        let mut uses = Vec::with_capacity(input.uses.len());
+        for invocation in &input.uses {
+            let mut arguments = Vec::with_capacity(invocation.argument_use_ids.len());
+            for argument in &invocation.argument_use_ids {
+                arguments.push(ExpressionUseId::new(*argument));
+                work.step()?;
+            }
+            uses.push(ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(invocation.id),
+                    domain: EvaluationDomainId::new(required(
+                        invocation.domain_id,
+                        "use domain is missing",
+                    )?),
+                    demand: decode_demand(invocation.demand)?,
+                },
+                definition: ExprId::new(required(
+                    invocation.definition_id,
+                    "use definition is missing",
                 )?),
-                demand: decode_demand(invocation.demand)?,
-            },
-            definition: ExprId::new(required(
-                invocation.definition_id,
-                "use definition is missing",
-            )?),
-            control: decode_shape(
-                invocation
-                    .control
-                    .as_ref()
-                    .ok_or(ControlCodecError::InvalidShape("use control is missing"))?,
-            )?,
-            arguments: arguments.into_boxed_slice(),
-        });
-        work.step()?;
-    }
-    let mut roots = Vec::with_capacity(input.roots.len());
-    for binding in &input.roots {
-        roots.push((
-            decode_site(
-                binding
-                    .site
-                    .as_ref()
-                    .ok_or(ControlCodecError::InvalidShape("root site is missing"))?,
-            )?,
-            ExpressionUseId::new(required(binding.use_id, "root use is missing")?),
-        ));
-        work.step()?;
+                control: decode_shape(
+                    invocation
+                        .control
+                        .as_ref()
+                        .ok_or(ControlCodecError::InvalidShape("use control is missing"))?,
+                )?,
+                arguments: arguments.into_boxed_slice(),
+            });
+            work.step()?;
+        }
+        let mut roots = Vec::with_capacity(input.roots.len());
+        for binding in &input.roots {
+            roots.push((
+                decode_site(
+                    binding
+                        .site
+                        .as_ref()
+                        .ok_or(ControlCodecError::InvalidShape("root site is missing"))?,
+                )?,
+                ExpressionUseId::new(required(binding.use_id, "root use is missing")?),
+            ));
+            work.step()?;
+        }
+        Ok((domains, uses, roots))
+    })();
+    // An original control refusal is final. Ordinary malformed input still
+    // observes work already completed before returning its format error.
+    if let Err(ControlCodecError::Control(error)) = &projected {
+        return Err(ControlCodecError::Control(*error));
     }
     work.finish()?;
+    let (domains, uses, roots) = projected?;
     let flow = ExpressionControlFlow::try_new(
         domains,
         uses,

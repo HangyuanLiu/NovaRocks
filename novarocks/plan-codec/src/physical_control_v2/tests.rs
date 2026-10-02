@@ -1014,7 +1014,7 @@ fn valid_reference_budget_boundary_roundtrips_and_one_more_edge_fails_before_pro
     );
     assert_eq!(
         *control.observations.lock().unwrap(),
-        [(CompilePhase::Decode, 0)]
+        [(CompilePhase::Decode, 0), (CompilePhase::Decode, 0)]
     );
 }
 
@@ -1060,7 +1060,10 @@ fn domain_and_root_count_equality_reaches_shape_checks_but_overflow_does_not_pro
         );
         assert_eq!(
             *control.observations.lock().unwrap(),
-            [(CompilePhase::Decode, 0)]
+            [(CompilePhase::Decode, 0), (CompilePhase::Decode, 0)]
         );
     }
 }
+
+#[path = "failure_tail_tests.rs"]
+mod failure_tail_tests;
