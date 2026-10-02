@@ -1,0 +1,13 @@
+# P04：H2 接收事件数量背压
+
+parent `10b22dec2fe0a86019f74f03a4453488e5a2d02e`。只闭合可选H2 receive event节点数量门，未接production listener/FE Channel，也没有完整read backing、headers/stream/frame aliases、H2 writer独立副本、连接2MiB或lane/握手预算证明。P04仍executing，V1未advertise，无候选native或性能验收。
+
+锁定h2 0.4.12从原registry复制；UPSTREAM.json记录crate checksum和66原始文件hash，仅7源码文件变化。Cargo.lock只退出该crate的registry source/checksum，版本/依赖未迁移。client/server Builder新增opt-in max_receive_buffered_events(max)，默认None保持原路径，0明确拒绝。固定Slab在frame parsing前预分配；connection在每个下一frame前检查实际持久节点数，满则Pending，consumer真实pop/clear后wake同一connection。payload字节flow-control不替代对象门：1MiB能包含百万1-byte节点，0-byte非EOS甚至不消耗窗口；16KiB最大frame不能推出65个节点。断言在insert前阻止内部遗漏admission时增长。
+
+单frame至多新增一个Event，Headers/trailers分支互斥；pop→push仍在原streams mutex下，净节点数不增加；connection外层Pending照常poll outbound flush/window updates。真实解析测试在任何consumer poll之前放好64个合法DATA frame，cap2下第三个data必须Pending；逐次消费/refill保留每条1-byte/empty frame与EOS准确顺序。真实client/server、满body Drop→nextstream、receive满仍发送响应、default不安装界均通过。
+
+只读审查发现取消未poll的HEADERS-only ResponseFuture会遗留零byte Event：最后stream ref清理因in_flight_recv_data=0提前return，既无RecvStream也无consumer可再释放。真实测试先red再green；bounded mode在零byte路径清队列并wake，默认None不改变旧路径。未消费PushPromise（含放弃PushPromises reader）会阻断parent consumer：新增bounded client要求显式enable_push(false)，握手写preface/构造codec前冲突配置InvalidInput；不隐式降级push。Hyper Native已有这个明确设置；默认None保留原push行为。禁用push后非法PushPromise在child/Event插入前拒绝，HPACK decode临时backing仍是另项未证明容量。
+
+两项mutant真实失败并逐字节恢复：不安装node界→第三DATA错误Ready；遗漏真实dequeue wake→后续唤醒oracle失败。源码、命令、恢复hash、raw/gzip日志hash见index.json。最终Native定向58（新H2 7/reader25/session14/statistics12）+Native全lib574共632通过；h2 lib Clippy无warning、Native all-target Clippy既有warning、workspace all-target check、root/vendor fmt/diff通过。
+
+上游h2独立lib suite未取得结果：workspace -p test拒绝非member的dev-dependencies；原vendor standalone offline缺backtrace，隔离Root-lock harness offline缺env_logger；隔离online解析开始拉未固定的兼容dev依赖，主agent中止（130），未当测试通过。该尝试未改production Cargo.lock或原vendor Cargo.lock，原66文件hash已逐项复核；日志保留。最终632 actual production-dependency consumer测试使用本workspace锁定依赖，不来自该独立harness。Docker images/JAR完整BOM仍齐备；Linux正式测试由用户后续手动执行。
