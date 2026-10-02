@@ -37,6 +37,7 @@ pub mod aggregate_types;
 mod binding;
 pub mod builtin;
 mod call_contract;
+pub mod datetime_value;
 mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
