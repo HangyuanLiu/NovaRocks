@@ -244,7 +244,18 @@ fn validate(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramExpressionTypeError> {
-    validate_function_value_type_observed(value, work).map_err(ProgramExpressionTypeError::Kernel)
+    validate_function_value_type_observed(value, work).map_err(|error| match error {
+        KernelFailure::Cancelled => {
+            ProgramExpressionTypeError::Control(CompileControlError::Cancelled)
+        }
+        KernelFailure::DeadlineExceeded => {
+            ProgramExpressionTypeError::Control(CompileControlError::DeadlineExceeded)
+        }
+        KernelFailure::ResourceExhausted => {
+            ProgramExpressionTypeError::Control(CompileControlError::ResourceExhausted)
+        }
+        error => ProgramExpressionTypeError::Kernel(error),
+    })
 }
 fn same_carrier(
     actual: &arrow_schema::DataType,

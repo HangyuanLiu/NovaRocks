@@ -45,11 +45,11 @@ pub use contract::{
 pub use control_flow::*;
 pub use expression_roots::*;
 pub use expressions::{
-    ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH, MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
-    MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind, StaticExprNode, StaticExpressionError,
-    StaticFieldSchema, StaticFunctionKind, StaticLiteral,
+    ExpressionsCompileError, ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH,
+    MAX_STATIC_EXPRESSION_DYNAMIC_BYTES, MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind,
+    StaticExprNode, StaticExpressionError, StaticFieldSchema, StaticFunctionKind, StaticLiteral,
 };
-pub use layout::{LayoutError, StaticLayout};
+pub use layout::{LayoutCompileError, LayoutError, StaticLayout};
 pub use lexical_bindings::*;
 pub use novarocks_connector_contract::{
     ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
@@ -69,8 +69,8 @@ pub use program::{
 };
 pub use provenance::*;
 pub use requirements::{
-    BindingRequirement, BindingRequirements, BindingRequirementsError, ProgramNodeId,
-    ScanSourceKind,
+    BindingRequirement, BindingRequirements, BindingRequirementsCompileError,
+    BindingRequirementsError, ProgramNodeId, ScanSourceKind,
 };
 pub use resolved_calls::*;
 pub use runtime_filter::{

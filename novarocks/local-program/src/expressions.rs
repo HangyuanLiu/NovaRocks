@@ -23,7 +23,10 @@ use std::sync::Arc;
 
 use arrow_buffer::i256;
 use arrow_schema::DataType;
-use novarocks_type_contract::DecimalOverflowPolicy;
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
+    PureCompileControl,
+};
 use novarocks_types::SlotId;
 use novarocks_types::logical::LogicalType;
 
@@ -199,19 +202,29 @@ impl StaticExprKind {
         }
     }
 
-    fn references(&self) -> Vec<ProgramExprId> {
+    fn try_for_each_reference<E>(
+        &self,
+        mut visit: impl FnMut(ProgramExprId) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
-            Self::Constant(_) | Self::Literal(_) | Self::SlotId(_) => Vec::new(),
+            Self::Constant(_) | Self::Literal(_) | Self::SlotId(_) => {}
             Self::ArrayExpr { elements } | Self::StructExpr { fields: elements } => {
-                elements.clone()
+                for id in elements {
+                    visit(*id)?;
+                }
             }
             Self::LambdaFunction {
                 body,
                 common_sub_exprs,
                 ..
-            } => std::iter::once(*body)
-                .chain(common_sub_exprs.iter().map(|(_, id)| *id))
-                .collect(),
+            } => {
+                // Dependency validation retains the original body-first order;
+                // invocation/common order belongs to the checked control graph.
+                visit(*body)?;
+                for (_, id) in common_sub_exprs {
+                    visit(*id)?;
+                }
+            }
             Self::DictDecode { child, .. }
             | Self::Cast(child, _)
             | Self::CastTime(child, _)
@@ -219,7 +232,7 @@ impl StaticExprKind {
             | Self::Not(child)
             | Self::IsNull(child)
             | Self::IsNotNull(child)
-            | Self::Clone(child) => vec![*child],
+            | Self::Clone(child) => visit(*child)?,
             Self::Add(a, b, _)
             | Self::Sub(a, b, _)
             | Self::Mul(a, b, _)
@@ -233,13 +246,23 @@ impl StaticExprKind {
             | Self::Gt(a, b)
             | Self::Ge(a, b)
             | Self::And(a, b)
-            | Self::Or(a, b) => vec![*a, *b],
-            Self::In { child, values, .. } => std::iter::once(*child)
-                .chain(values.iter().copied())
-                .collect(),
-            Self::Case { children, .. } => children.clone(),
-            Self::FunctionCall { args, .. } => args.clone(),
+            | Self::Or(a, b) => {
+                visit(*a)?;
+                visit(*b)?;
+            }
+            Self::In { child, values, .. } => {
+                visit(*child)?;
+                for id in values {
+                    visit(*id)?;
+                }
+            }
+            Self::Case { children, .. } | Self::FunctionCall { args: children, .. } => {
+                for id in children {
+                    visit(*id)?;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -329,6 +352,46 @@ impl fmt::Display for StaticExpressionError {
 
 impl std::error::Error for StaticExpressionError {}
 
+/// Original expression failures and original request-control interruptions stay
+/// distinct at pure compilation. The result owns no control capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpressionsCompileError {
+    Expression(StaticExpressionError),
+    Control(CompileControlError),
+}
+impl From<StaticExpressionError> for ExpressionsCompileError {
+    fn from(error: StaticExpressionError) -> Self {
+        Self::Expression(error)
+    }
+}
+impl From<CompileControlError> for ExpressionsCompileError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl fmt::Display for ExpressionsCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Expression(error) => error.fmt(formatter),
+            Self::Control(error) => error.fmt(formatter),
+        }
+    }
+}
+impl std::error::Error for ExpressionsCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::Expression(error) => error,
+            Self::Control(error) => error,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExpressionObservation {
+    Step,
+    OpaqueBoundary,
+}
+
 impl ImmutableExpressions {
     pub fn try_new(
         nodes: Vec<StaticExprNode>,
@@ -336,8 +399,59 @@ impl ImmutableExpressions {
         query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
         session_time_zone: Option<Arc<str>>,
     ) -> Result<Self, StaticExpressionError> {
-        if nodes.len() > MAX_STATIC_EXPRESSIONS {
-            return Err(StaticExpressionError::TooManyNodes);
+        Self::try_new_core(
+            nodes,
+            allow_throw_exception,
+            query_global_dicts,
+            session_time_zone,
+            |_| Ok(()),
+        )
+    }
+
+    /// Pure compilation uses the original request control. The legacy entry
+    /// shares the same validation core without adding a runtime control source.
+    /// SDK policy traversal and final Arc allocation have observations around
+    /// opaque work; this does not establish internal cooperation or MEM grants.
+    pub fn try_new_for_compile(
+        nodes: Vec<StaticExprNode>,
+        allow_throw_exception: bool,
+        query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
+        session_time_zone: Option<Arc<str>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ExpressionsCompileError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = Self::try_new_core(
+            nodes,
+            allow_throw_exception,
+            query_global_dicts,
+            session_time_zone,
+            |operation| match operation {
+                ExpressionObservation::Step => {
+                    work.step().map_err(ExpressionsCompileError::Control)
+                }
+                ExpressionObservation::OpaqueBoundary => {
+                    work.flush().map_err(ExpressionsCompileError::Control)
+                }
+            },
+        );
+        if matches!(&result, Err(ExpressionsCompileError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+
+    fn try_new_core<E: From<StaticExpressionError>>(
+        nodes: Vec<StaticExprNode>,
+        allow_throw_exception: bool,
+        query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
+        session_time_zone: Option<Arc<str>>,
+        mut observe: impl FnMut(ExpressionObservation) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        let too_many = nodes.len() > MAX_STATIC_EXPRESSIONS;
+        observe(ExpressionObservation::Step)?;
+        if too_many {
+            return Err(StaticExpressionError::TooManyNodes.into());
         }
         let mut depths = Vec::with_capacity(nodes.len());
         let mut dynamic_bytes = session_time_zone.as_ref().map_or(0, |zone| zone.len());
@@ -345,62 +459,84 @@ impl ImmutableExpressions {
         let mut charged_constant_arrays = HashSet::new();
         for (index, node) in nodes.iter().enumerate() {
             let mut depth = 1_usize;
-            for child in node.kind.references() {
-                if child.index() >= index {
-                    return Err(StaticExpressionError::InvalidReference);
+            node.kind.try_for_each_reference(|child| -> Result<(), E> {
+                let valid = child.index() < index;
+                if valid {
+                    depth = depth.max(depths[child.index()] + 1);
                 }
-                depth = depth.max(depths[child.index()] + 1);
-            }
+                observe(ExpressionObservation::Step)?;
+                if !valid {
+                    return Err(StaticExpressionError::InvalidReference.into());
+                }
+                Ok(())
+            })?;
             if let StaticExprKind::Cast(child, policy)
             | StaticExprKind::CastTime(child, policy)
             | StaticExprKind::CastTimeFromDatetime(child, policy) = &node.kind
-                && !novarocks_type_contract::decimal_error_policy_cast_supported(
+            {
+                observe(ExpressionObservation::OpaqueBoundary)?;
+                let supported = novarocks_type_contract::decimal_error_policy_cast_supported(
                     &nodes[child.index()].data_type,
                     &node.data_type,
                     *policy,
-                )
-            {
-                return Err(StaticExpressionError::UnsupportedDecimalCastPolicy);
+                );
+                observe(ExpressionObservation::OpaqueBoundary)?;
+                if !supported {
+                    return Err(StaticExpressionError::UnsupportedDecimalCastPolicy.into());
+                }
             }
-            if depth > MAX_STATIC_EXPRESSION_DEPTH {
-                return Err(StaticExpressionError::TooDeep);
+            let too_deep = depth > MAX_STATIC_EXPRESSION_DEPTH;
+            observe(ExpressionObservation::Step)?;
+            if too_deep {
+                return Err(StaticExpressionError::TooDeep.into());
             }
             depths.push(depth);
+            observe(ExpressionObservation::Step)?;
             if let StaticExprKind::Literal(literal) = &node.kind {
-                dynamic_bytes = dynamic_bytes
-                    .checked_add(literal.dynamic_bytes())
-                    .ok_or(StaticExpressionError::TooManyBytes)?;
+                let next = dynamic_bytes.checked_add(literal.dynamic_bytes());
+                observe(ExpressionObservation::Step)?;
+                dynamic_bytes = next.ok_or(StaticExpressionError::TooManyBytes)?;
             }
             if let StaticExprKind::Constant(value) = &node.kind {
-                if !novarocks_type_contract::arrow_data_types_exact(
+                // Keep the original exact comparison and admission semantics.
+                // Its type/metadata traversal is opaque in this slice; a flush
+                // is an interruption boundary, not completed internal work.
+                observe(ExpressionObservation::OpaqueBoundary)?;
+                let same = novarocks_type_contract::arrow_data_types_exact(
                     &node.data_type,
                     &value.value_type().data_type,
-                ) {
-                    return Err(StaticExpressionError::ConstantTypeMismatch);
+                );
+                observe(ExpressionObservation::OpaqueBoundary)?;
+                if !same {
+                    return Err(StaticExpressionError::ConstantTypeMismatch.into());
                 }
-                // This pointer deduplicates retained ownership only; it is
-                // never a semantic equality test. A selected row retains the
-                // whole immutable pool, including its unselected buffers.
+                // Ownership deduplication is not semantic equality; a selected
+                // ordinal retains its whole already checked immutable pool.
                 let array = Arc::as_ptr(value.pool().array()) as *const () as usize;
-                if charged_constant_arrays.insert(array) {
+                let first = charged_constant_arrays.insert(array);
+                observe(ExpressionObservation::Step)?;
+                if first {
                     let facts = value.pool().resource_facts();
                     let retained = facts
                         .retained_buffer_capacity_bytes
                         .checked_add(facts.metadata_bytes)
-                        .and_then(|bytes| usize::try_from(bytes).ok())
-                        .ok_or(StaticExpressionError::TooManyBytes)?;
-                    dynamic_bytes = dynamic_bytes
-                        .checked_add(retained)
-                        .ok_or(StaticExpressionError::TooManyBytes)?;
+                        .and_then(|bytes| usize::try_from(bytes).ok());
+                    observe(ExpressionObservation::Step)?;
+                    let retained = retained.ok_or(StaticExpressionError::TooManyBytes)?;
+                    let next = dynamic_bytes.checked_add(retained);
+                    observe(ExpressionObservation::Step)?;
+                    dynamic_bytes = next.ok_or(StaticExpressionError::TooManyBytes)?;
                 }
             }
-            if let StaticExprKind::DictDecode { dict, .. } = &node.kind
-                && charged_dicts.insert(Arc::as_ptr(dict))
-            {
-                for value in dict.values() {
-                    dynamic_bytes = dynamic_bytes
-                        .checked_add(value.len())
-                        .ok_or(StaticExpressionError::TooManyBytes)?;
+            if let StaticExprKind::DictDecode { dict, .. } = &node.kind {
+                let first = charged_dicts.insert(Arc::as_ptr(dict));
+                observe(ExpressionObservation::Step)?;
+                if first {
+                    for value in dict.values() {
+                        let next = dynamic_bytes.checked_add(value.len());
+                        observe(ExpressionObservation::Step)?;
+                        dynamic_bytes = next.ok_or(StaticExpressionError::TooManyBytes)?;
+                    }
                 }
             }
             if let StaticExprKind::LambdaFunction {
@@ -410,36 +546,48 @@ impl ImmutableExpressions {
             } = &node.kind
             {
                 let mut slots = BTreeSet::new();
-                if arg_slots
+                for slot in arg_slots
                     .iter()
                     .chain(common_sub_exprs.iter().map(|(slot, _)| slot))
-                    .any(|slot| !slots.insert(*slot))
                 {
-                    return Err(StaticExpressionError::DuplicateLambdaSlot);
+                    let duplicate = !slots.insert(*slot);
+                    observe(ExpressionObservation::Step)?;
+                    if duplicate {
+                        return Err(StaticExpressionError::DuplicateLambdaSlot.into());
+                    }
                 }
             }
-            if dynamic_bytes > MAX_STATIC_EXPRESSION_DYNAMIC_BYTES {
-                return Err(StaticExpressionError::TooManyBytes);
+            let too_many_bytes = dynamic_bytes > MAX_STATIC_EXPRESSION_DYNAMIC_BYTES;
+            observe(ExpressionObservation::Step)?;
+            if too_many_bytes {
+                return Err(StaticExpressionError::TooManyBytes.into());
             }
         }
         for dict in query_global_dicts.values() {
-            if charged_dicts.insert(Arc::as_ptr(dict)) {
+            let first = charged_dicts.insert(Arc::as_ptr(dict));
+            observe(ExpressionObservation::Step)?;
+            if first {
                 for value in dict.values() {
-                    dynamic_bytes = dynamic_bytes
-                        .checked_add(value.len())
-                        .ok_or(StaticExpressionError::TooManyBytes)?;
-                    if dynamic_bytes > MAX_STATIC_EXPRESSION_DYNAMIC_BYTES {
-                        return Err(StaticExpressionError::TooManyBytes);
+                    let next = dynamic_bytes.checked_add(value.len());
+                    observe(ExpressionObservation::Step)?;
+                    dynamic_bytes = next.ok_or(StaticExpressionError::TooManyBytes)?;
+                    let too_many_bytes = dynamic_bytes > MAX_STATIC_EXPRESSION_DYNAMIC_BYTES;
+                    observe(ExpressionObservation::Step)?;
+                    if too_many_bytes {
+                        return Err(StaticExpressionError::TooManyBytes.into());
                     }
                 }
             }
         }
-        Ok(Self {
+        observe(ExpressionObservation::OpaqueBoundary)?;
+        let result = Self {
             nodes: Arc::from(nodes),
             allow_throw_exception,
             query_global_dicts: Arc::new(query_global_dicts),
             session_time_zone,
-        })
+        };
+        observe(ExpressionObservation::OpaqueBoundary)?;
+        Ok(result)
     }
 
     pub fn nodes(&self) -> &[StaticExprNode] {
@@ -569,5 +717,283 @@ mod tests {
                 }
             }
         }
+    }
+    struct TestControl {
+        trace: std::sync::Mutex<Vec<u32>>,
+        stop: Option<(usize, CompileControlError)>,
+    }
+    impl TestControl {
+        fn new(stop: Option<(usize, CompileControlError)>) -> Self {
+            Self {
+                trace: std::sync::Mutex::new(Vec::new()),
+                stop,
+            }
+        }
+        fn trace(&self) -> Vec<u32> {
+            self.trace.lock().unwrap().clone()
+        }
+    }
+    impl PureCompileControl for TestControl {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::LowerProgram);
+            assert!(units <= 256);
+            let mut trace = self.trace.lock().unwrap();
+            let index = trace.len();
+            trace.push(units);
+            if let Some((at, cause)) = self.stop
+                && index == at
+            {
+                return Err(cause);
+            }
+            Ok(())
+        }
+    }
+    fn slot() -> StaticExprNode {
+        StaticExprNode::new(
+            StaticExprKind::SlotId(SlotId::new(1)),
+            DataType::Int32,
+            None,
+        )
+    }
+    fn assert_every_checkpoint_refuses(nodes: &[StaticExprNode]) -> Vec<u32> {
+        let baseline = TestControl::new(None);
+        ImmutableExpressions::try_new_for_compile(
+            nodes.to_vec(),
+            false,
+            HashMap::new(),
+            None,
+            &baseline,
+        )
+        .unwrap();
+        let trace = baseline.trace();
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = TestControl::new(Some((at, cause)));
+                let result = ImmutableExpressions::try_new_for_compile(
+                    nodes.to_vec(),
+                    false,
+                    HashMap::new(),
+                    None,
+                    &control,
+                );
+                assert!(
+                    matches!(result, Err(ExpressionsCompileError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(
+                    control.trace(),
+                    trace[..=at],
+                    "no callback after the first interruption"
+                );
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn compile_reference_loop_observes_real_quantum_and_all_tails() {
+        // Only two nodes: the positive quantum necessarily includes actual
+        // dependency visits rather than a wide arena's outer-node loop.
+        let nodes = vec![
+            slot(),
+            StaticExprNode::new(
+                StaticExprKind::ArrayExpr {
+                    elements: vec![ProgramExprId::new(0); 320],
+                },
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                ))),
+                None,
+            ),
+        ];
+        let trace = assert_every_checkpoint_refuses(&nodes);
+        assert_eq!(trace.first(), Some(&0));
+        assert!(trace.contains(&256));
+        assert!(trace.iter().any(|units| *units > 0 && *units < 256));
+        assert_eq!(trace.last(), Some(&0));
+    }
+
+    #[test]
+    fn compile_dictionary_loop_observes_real_quantum_without_rebuilding_backing() {
+        let dict = Arc::new(
+            (0..320)
+                .map(|key| (key, vec![b'x']))
+                .collect::<HashMap<_, _>>(),
+        );
+        let nodes = vec![
+            slot(),
+            StaticExprNode::new(
+                StaticExprKind::DictDecode {
+                    child: ProgramExprId::new(0),
+                    dict: dict.clone(),
+                },
+                DataType::Utf8,
+                None,
+            ),
+        ];
+        assert!(assert_every_checkpoint_refuses(&nodes).contains(&256));
+        let control = TestControl::new(None);
+        let result = ImmutableExpressions::try_new_for_compile(
+            nodes,
+            true,
+            HashMap::from([(SlotId::new(9), dict.clone())]),
+            Some(Arc::from("UTC")),
+            &control,
+        )
+        .unwrap();
+        let StaticExprKind::DictDecode { dict: retained, .. } = result.nodes()[1].kind() else {
+            panic!("dict decode");
+        };
+        assert!(Arc::ptr_eq(&dict, retained));
+        assert!(Arc::ptr_eq(
+            &dict,
+            result.query_global_dict(SlotId::new(9)).unwrap()
+        ));
+        assert!(result.allow_throw_exception());
+        assert_eq!(result.session_time_zone(), Some("UTC"));
+    }
+
+    #[test]
+    fn compile_ordinary_error_tail_preserves_original_control_and_legacy_error() {
+        let nodes = vec![StaticExprNode::new(
+            StaticExprKind::Not(ProgramExprId::new(0)),
+            DataType::Boolean,
+            None,
+        )];
+        let control = TestControl::new(None);
+        assert!(matches!(
+            ImmutableExpressions::try_new_for_compile(
+                nodes.clone(),
+                false,
+                HashMap::new(),
+                None,
+                &control
+            ),
+            Err(ExpressionsCompileError::Expression(
+                StaticExpressionError::InvalidReference
+            ))
+        ));
+        assert_eq!(control.trace(), [0, 2]);
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = TestControl::new(Some((1, cause)));
+            assert!(
+                matches!(ImmutableExpressions::try_new_for_compile(nodes.clone(), false, HashMap::new(), None, &control),
+                Err(ExpressionsCompileError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.trace(), [0, 2]);
+        }
+        assert!(matches!(
+            ImmutableExpressions::try_new(nodes, false, HashMap::new(), None),
+            Err(StaticExpressionError::InvalidReference)
+        ));
+    }
+
+    #[test]
+    fn compile_lambda_slot_loop_preserves_first_duplicate_and_control_quantum() {
+        let args = (0..320).map(SlotId::new).collect::<Vec<_>>();
+        let valid = vec![
+            slot(),
+            StaticExprNode::new(
+                StaticExprKind::LambdaFunction {
+                    body: ProgramExprId::new(0),
+                    arg_slots: args.clone(),
+                    common_sub_exprs: Vec::new(),
+                    is_nondeterministic: false,
+                },
+                DataType::Int32,
+                None,
+            ),
+        ];
+        assert!(assert_every_checkpoint_refuses(&valid).contains(&256));
+        let mut duplicate = args;
+        duplicate.push(SlotId::new(0));
+        let invalid = vec![
+            slot(),
+            StaticExprNode::new(
+                StaticExprKind::LambdaFunction {
+                    body: ProgramExprId::new(0),
+                    arg_slots: duplicate,
+                    common_sub_exprs: Vec::new(),
+                    is_nondeterministic: false,
+                },
+                DataType::Int32,
+                None,
+            ),
+        ];
+        let control = TestControl::new(None);
+        assert!(matches!(
+            ImmutableExpressions::try_new_for_compile(
+                invalid.clone(),
+                false,
+                HashMap::new(),
+                None,
+                &control
+            ),
+            Err(ExpressionsCompileError::Expression(
+                StaticExpressionError::DuplicateLambdaSlot
+            ))
+        ));
+        assert!(matches!(
+            ImmutableExpressions::try_new(invalid, false, HashMap::new(), None),
+            Err(StaticExpressionError::DuplicateLambdaSlot)
+        ));
+    }
+
+    #[test]
+    fn compile_and_legacy_preserve_shared_dictionary_retained_byte_boundary() {
+        let dict = Arc::new(HashMap::from([(
+            1,
+            vec![0; MAX_STATIC_EXPRESSION_DYNAMIC_BYTES],
+        )]));
+        let nodes = vec![
+            slot(),
+            StaticExprNode::new(
+                StaticExprKind::DictDecode {
+                    child: ProgramExprId::new(0),
+                    dict: dict.clone(),
+                },
+                DataType::Utf8,
+                None,
+            ),
+        ];
+        let globals = HashMap::from([(SlotId::new(1), dict.clone()), (SlotId::new(2), dict)]);
+        let control = TestControl::new(None);
+        ImmutableExpressions::try_new_for_compile(
+            nodes.clone(),
+            false,
+            globals.clone(),
+            None,
+            &control,
+        )
+        .unwrap();
+        ImmutableExpressions::try_new(nodes.clone(), false, globals.clone(), None).unwrap();
+        let mut over = globals;
+        over.insert(SlotId::new(3), Arc::new(HashMap::from([(1, vec![1])])));
+        let control = TestControl::new(None);
+        assert!(matches!(
+            ImmutableExpressions::try_new_for_compile(
+                nodes.clone(),
+                false,
+                over.clone(),
+                None,
+                &control
+            ),
+            Err(ExpressionsCompileError::Expression(
+                StaticExpressionError::TooManyBytes
+            ))
+        ));
+        assert!(matches!(
+            ImmutableExpressions::try_new(nodes, false, over, None),
+            Err(StaticExpressionError::TooManyBytes)
+        ));
     }
 }
