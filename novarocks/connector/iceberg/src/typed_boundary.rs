@@ -418,10 +418,15 @@ impl IcebergTypedBoundary {
             .endpoint()
             .schema()
             .map_err(|e| corrupt(e.to_string()))?;
-        let integer_domains = crate::scalar_integer_domain::of_schema(
+        let selected = scoped_field_domains(
             &schema,
-            &crate::scalar_integer_domain::metadata_declarations(table.metadata())?,
+            &crate::field_domain::metadata_declarations(table.metadata())?,
         )?;
+        let integer_domains = selected
+            .fields()
+            .iter()
+            .filter_map(|(id, domain)| domain.integer().map(|d| (*id, d)))
+            .collect();
         let partition_specs = domain
             .endpoint()
             .partition_spec_jsons()
@@ -1102,9 +1107,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     columns.push((
                         field.name.to_string(),
                         IcebergColumnHandle::base_column(field.as_ref())?
-                            .with_scalar_integer_domain(
-                                handle.scalar_integer_domains().get(&field.id).copied(),
-                            )?,
+                            .with_table_field_domains(handle.persisted_field_domains())?,
                         false,
                     ));
                 }
@@ -2121,9 +2124,9 @@ fn pinned_table_handle_with_schema(
         storage_properties: reader_visible_storage_properties(metadata.properties()),
         pinned_data_files,
     })?
-    .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
+    .with_field_domains(scoped_field_domains(
         &schema,
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        &crate::field_domain::metadata_declarations(metadata)?,
     )?)
 }
 
@@ -2181,20 +2184,17 @@ fn pinned_change_window_handle(
         )));
     }
 
-    let domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
-    let from_domains = crate::scalar_integer_domain::of_schema(&from_schema, &domains)?;
-    let to_domains = crate::scalar_integer_domain::of_schema(&to_schema, &domains)?;
+    let domains = crate::field_domain::metadata_declarations(metadata)?;
+    let from_domains = scoped_field_domains(&from_schema, &domains)?;
+    let to_domains = scoped_field_domains(&to_schema, &domains)?;
     if from_domains != to_domains {
         return Err(unsupported(
-            "Iceberg change-window endpoints have different declared scalar integer domains",
+            "Iceberg change-window endpoints have different declared field domains",
         ));
     }
     let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?
         .into_iter()
-        .map(|column| {
-            let domain = to_domains.get(&column.base_field_id()).copied();
-            column.with_scalar_integer_domain(domain)
-        })
+        .map(|column| column.with_table_field_domains(&to_domains))
         .collect::<Result<Vec<_>, _>>()?;
     let table_schema_json = serde_json::to_string(to_schema.as_ref())
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
@@ -2226,6 +2226,7 @@ fn pinned_change_window_handle(
             .map_err(corrupt)?,
         partition_spec_jsons,
     })
+    .and_then(|handle| handle.with_field_domains(to_domains))
     .map(Some)
 }
 
@@ -2509,6 +2510,25 @@ fn check_manifest_control(control: Option<&dyn ConnectorOperationControl>) -> Re
 /// silently discard rows, so the query must fail rather than guess.
 /// Narrow logical declarations constrain every supplied physical INT fact,
 /// including facts used to discard a file before any rows are materialized.
+fn scoped_field_domains(
+    schema: &Schema,
+    declarations: &crate::field_domain::PersistedFieldDomains,
+) -> Result<crate::field_domain::PersistedFieldDomains, ConnectorError> {
+    use crate::field_domain::PersistedFieldDomains;
+    let active = crate::field_domain::active(schema, declarations.fields())?;
+    Ok(match declarations {
+        PersistedFieldDomains::None => PersistedFieldDomains::None,
+        PersistedFieldDomains::LegacyTopIntegerV1(_) => {
+            if active.is_empty() {
+                PersistedFieldDomains::None
+            } else {
+                PersistedFieldDomains::LegacyTopIntegerV1(active)
+            }
+        }
+        PersistedFieldDomains::FieldDomainsV1(_) => PersistedFieldDomains::FieldDomainsV1(active),
+    })
+}
+
 fn validate_scalar_integer_manifest_facts(
     declarations: &crate::scalar_integer_domain::ScalarIntegerDomains,
     facts: &DataFileManifestFacts,
@@ -2563,7 +2583,9 @@ fn manifest_statistics_domain(
     for column in dynamic_filter_columns {
         // Manifest metrics and partition constants describe whole top-level
         // fields.  A nested path has no independently addressable metric.
-        if !column.is_base_column() {
+        if !column.is_base_column()
+            || column.field_domain() == Some(crate::field_domain::FieldDomain::Json)
+        {
             continue;
         }
         let Some(field) = schema.field_by_id(column.base_field_id()) else {

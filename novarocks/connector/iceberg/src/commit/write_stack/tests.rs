@@ -21,7 +21,7 @@
 //! filesystem so that "missing", "corrupt", and "stale" are genuine I/O
 //! outcomes rather than mocked verdicts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -3131,6 +3131,23 @@ fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldR
     .collect()
 }
 
+fn frozen_scalar_integer_fields() -> Vec<Field> {
+    vec![
+        Field::new("id", DataType::Int8, false).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+            "1".into(),
+        )])),
+        Field::new("small", DataType::Int16, true).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+            "2".into(),
+        )])),
+        Field::new("plain", DataType::Int32, false).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+            "3".into(),
+        )])),
+    ]
+}
+
 #[test]
 fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
     use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
@@ -3173,13 +3190,24 @@ fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
             ),
             Arc::clone(&runtime),
         );
+        // Begin consumes the provider's prepared fields, including exact IDs;
+        // caller hints are used only by the preceding preparation step.
+        request.input = ConnectorWriteInputRequest::Data {
+            fields: prepared
+                .input()
+                .fields()
+                .iter()
+                .map(|binding| {
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                        binding.field().clone(),
+                    )
+                })
+                .collect(),
+        };
         let session = control
             .begin_write(request)
             .expect("begin with authoritative scalar fields");
-        let expected = scalar_integer_fields()
-            .iter()
-            .map(|f| f.field().clone())
-            .collect::<Vec<_>>();
+        let expected = frozen_scalar_integer_fields();
         let prepared_fields = prepared
             .input()
             .fields()
@@ -3245,7 +3273,7 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
             };
             assert_eq!(
                 prepared.input().fields()[forged_ordinal].field(),
-                scalar_integer_fields()[forged_ordinal].field()
+                &frozen_scalar_integer_fields()[forged_ordinal]
             );
             let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
                 descriptor("unit"),

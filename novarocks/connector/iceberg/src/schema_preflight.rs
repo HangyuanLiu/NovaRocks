@@ -41,7 +41,15 @@ struct Scan<'a> {
     limits: LogicalTypeLimits,
 }
 
-pub(super) fn preflight(json: &str) -> Result<(), String> {
+pub(crate) fn preflight_schema(json: &str) -> Result<(), String> {
+    preflight(json, Role::Root, false)
+}
+
+pub(crate) fn preflight_type(json: &str) -> Result<(), String> {
+    preflight(json, Role::Type(1), true)
+}
+
+fn preflight(json: &str, root: Role, count_root: bool) -> Result<(), String> {
     let mut scan = Scan {
         bytes: json.as_bytes(),
         offset: 0,
@@ -50,10 +58,13 @@ pub(super) fn preflight(json: &str) -> Result<(), String> {
         values: 0,
         limits: LogicalTypeLimits::default(),
     };
-    scan.value(Role::Root, 0)?;
+    if count_root {
+        scan.node(1, 0)?;
+    }
+    scan.value(root, 0)?;
     scan.space();
     if scan.offset != scan.bytes.len() {
-        return Err("writer schema preflight: trailing JSON".into());
+        return Err("Iceberg schema preflight: trailing JSON".into());
     }
     Ok(())
 }
@@ -71,7 +82,7 @@ impl<'a> Scan<'a> {
     fn expect(&mut self, byte: u8) -> Result<(), String> {
         self.space();
         if self.bytes.get(self.offset) != Some(&byte) {
-            return Err("writer schema preflight: invalid JSON shape".into());
+            return Err("Iceberg schema preflight: invalid JSON shape".into());
         }
         self.offset += 1;
         Ok(())
@@ -81,13 +92,13 @@ impl<'a> Scan<'a> {
         self.names = self
             .names
             .checked_add(name_bytes)
-            .ok_or("writer schema preflight: name overflow")?;
+            .ok_or("Iceberg schema preflight: name overflow")?;
         if depth > self.limits.max_depth
             || self.nodes > self.limits.max_nodes
             || self.names > self.limits.max_text_bytes
         {
             return Err(
-                "writer schema preflight: semantic budget exceeded before SDK decode".into(),
+                "Iceberg schema preflight: semantic budget exceeded before SDK decode".into(),
             );
         }
         Ok(())
@@ -98,14 +109,14 @@ impl<'a> Scan<'a> {
             let byte = *self
                 .bytes
                 .get(self.offset)
-                .ok_or("writer schema preflight: truncated escape")?;
+                .ok_or("Iceberg schema preflight: truncated escape")?;
             self.offset += 1;
             value = value * 16
                 + match byte {
                     b'0'..=b'9' => u32::from(byte - b'0'),
                     b'a'..=b'f' => u32::from(byte - b'a' + 10),
                     b'A'..=b'F' => u32::from(byte - b'A' + 10),
-                    _ => return Err("writer schema preflight: invalid escape".into()),
+                    _ => return Err("Iceberg schema preflight: invalid escape".into()),
                 };
         }
         Ok(value)
@@ -121,7 +132,7 @@ impl<'a> Scan<'a> {
             let byte = *self
                 .bytes
                 .get(self.offset)
-                .ok_or("writer schema preflight: unterminated string")?;
+                .ok_or("Iceberg schema preflight: unterminated string")?;
             if byte == b'"' {
                 let end = self.offset;
                 self.offset += 1;
@@ -129,13 +140,13 @@ impl<'a> Scan<'a> {
             }
             self.offset += 1;
             match byte {
-                0..=31 => return Err("writer schema preflight: invalid string byte".into()),
+                0..=31 => return Err("Iceberg schema preflight: invalid string byte".into()),
                 b'\\' => {
                     escaped = true;
                     let escape = *self
                         .bytes
                         .get(self.offset)
-                        .ok_or("writer schema preflight: truncated escape")?;
+                        .ok_or("Iceberg schema preflight: truncated escape")?;
                     self.offset += 1;
                     decoded += match escape {
                         b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => 1,
@@ -144,23 +155,23 @@ impl<'a> Scan<'a> {
                             if (0xd800..=0xdbff).contains(&scalar) {
                                 if self.bytes.get(self.offset..self.offset + 2) != Some(b"\\u") {
                                     return Err(
-                                        "writer schema preflight: missing low surrogate".into()
+                                        "Iceberg schema preflight: missing low surrogate".into()
                                     );
                                 }
                                 self.offset += 2;
                                 let low = self.hex()?;
                                 if !(0xdc00..=0xdfff).contains(&low) {
                                     return Err(
-                                        "writer schema preflight: invalid low surrogate".into()
+                                        "Iceberg schema preflight: invalid low surrogate".into()
                                     );
                                 }
                                 scalar = 0x10000 + ((scalar - 0xd800) << 10) + low - 0xdc00;
                             }
                             char::from_u32(scalar)
-                                .ok_or("writer schema preflight: invalid Unicode scalar")?
+                                .ok_or("Iceberg schema preflight: invalid Unicode scalar")?
                                 .len_utf8()
                         }
-                        _ => return Err("writer schema preflight: invalid escape".into()),
+                        _ => return Err("Iceberg schema preflight: invalid escape".into()),
                     };
                 }
                 _ => decoded += 1,
@@ -170,7 +181,7 @@ impl<'a> Scan<'a> {
     fn value(&mut self, role: Role, json_depth: usize) -> Result<(), String> {
         self.values += 1;
         if json_depth > MAX_JSON_DEPTH || self.values > MAX_JSON_VALUES {
-            return Err("writer schema preflight: independent JSON budget exceeded".into());
+            return Err("Iceberg schema preflight: independent JSON budget exceeded".into());
         }
         if let Role::Field(depth) = role {
             self.node(depth, 0)?;
@@ -179,11 +190,11 @@ impl<'a> Scan<'a> {
         let byte = *self
             .bytes
             .get(self.offset)
-            .ok_or("writer schema preflight: missing value")?;
+            .ok_or("Iceberg schema preflight: missing value")?;
         if matches!(role, Role::Root | Role::Field(_)) && byte != b'{'
             || matches!(role, Role::Fields(_)) && byte != b'['
         {
-            return Err("writer schema preflight: invalid semantic shape".into());
+            return Err("Iceberg schema preflight: invalid semantic shape".into());
         }
         match byte {
             b'{' => {
@@ -196,7 +207,7 @@ impl<'a> Scan<'a> {
                 loop {
                     let (key, escaped, _) = self.string()?;
                     if escaped && !matches!(role, Role::Opaque) {
-                        return Err("writer schema preflight: noncanonical grammar key".into());
+                        return Err("Iceberg schema preflight: noncanonical grammar key".into());
                     }
                     // Keys borrow the input, so no field vector or SDK index
                     // exists while semantic child budgets are being checked.
@@ -228,7 +239,9 @@ impl<'a> Scan<'a> {
                             self.offset += 1;
                             break;
                         }
-                        _ => return Err("writer schema preflight: invalid object separator".into()),
+                        _ => {
+                            return Err("Iceberg schema preflight: invalid object separator".into());
+                        }
                     }
                 }
             }
@@ -252,7 +265,7 @@ impl<'a> Scan<'a> {
                             self.offset += 1;
                             break;
                         }
-                        _ => return Err("writer schema preflight: invalid array separator".into()),
+                        _ => return Err("Iceberg schema preflight: invalid array separator".into()),
                     }
                 }
             }
@@ -262,15 +275,15 @@ impl<'a> Scan<'a> {
                     self.names = self
                         .names
                         .checked_add(length)
-                        .ok_or("writer schema preflight: name overflow")?;
+                        .ok_or("Iceberg schema preflight: name overflow")?;
                     if self.names > self.limits.max_text_bytes {
-                        return Err("writer schema preflight: semantic name budget exceeded before SDK decode".into());
+                        return Err("Iceberg schema preflight: semantic name budget exceeded before SDK decode".into());
                     }
                 }
             }
             _ => {
                 if matches!(role, Role::Name) {
-                    return Err("writer schema preflight: invalid name".into());
+                    return Err("Iceberg schema preflight: invalid name".into());
                 }
                 let start = self.offset;
                 while self
@@ -281,14 +294,50 @@ impl<'a> Scan<'a> {
                     self.offset += 1;
                 }
                 if start == self.offset {
-                    return Err("writer schema preflight: invalid primitive".into());
+                    return Err("Iceberg schema preflight: invalid primitive".into());
                 }
                 // This scalar-only parse has no recursive allocation. SDK serde
                 // remains the authority for primitive type names and values.
                 serde_json::from_slice::<serde::de::IgnoredAny>(&self.bytes[start..self.offset])
-                    .map_err(|_| "writer schema preflight: invalid primitive".to_string())?;
+                    .map_err(|_| "Iceberg schema preflight: invalid primitive".to_string())?;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nested_type(depth: usize) -> String {
+        let mut ty = "\"int\"".to_string();
+        for _ in 1..depth {
+            ty = format!(
+                "{{\"type\":\"list\",\"element-id\":1,\"element-required\":false,\"element\":{ty}}}"
+            );
+        }
+        ty
+    }
+
+    #[test]
+    fn borrowed_type_preflight_counts_root_and_collection_children_before_sdk_decode() {
+        let limits = LogicalTypeLimits::default();
+        assert!(preflight_type(&nested_type(limits.max_depth)).is_ok());
+        assert!(preflight_type(&nested_type(limits.max_depth + 1)).is_err());
+        let fields = (1..limits.max_nodes)
+            .map(|id| {
+                format!("{{\"id\":{id},\"name\":\"n{id}\",\"required\":false,\"type\":\"int\"}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let exact = format!("{{\"type\":\"struct\",\"fields\":[{fields}]}}");
+        assert!(preflight_type(&exact).is_ok());
+        let over = exact.replacen(
+            "]}",
+            ", {\"id\":99999,\"name\":\"extra\",\"required\":false,\"type\":\"int\"}]}",
+            1,
+        );
+        assert!(preflight_type(&over).is_err());
     }
 }

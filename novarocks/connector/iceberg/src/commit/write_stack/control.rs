@@ -2770,16 +2770,18 @@ fn write_statistics_contract(
         return WriteStatisticsContract::try_new(input, Vec::new());
     };
     if let Some(metadata) = metadata {
-        let declarations = crate::scalar_integer_domain::of_schema(
+        let declarations = crate::field_domain::active(
             metadata.current_schema(),
-            &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+            crate::field_domain::metadata_declarations(metadata)?.fields(),
         )?;
         for binding in input.fields() {
             let field = binding.field();
             if let Some(storage) = metadata
                 .current_schema()
                 .field_by_name_case_insensitive(field.name())
-                && let Some(domain) = declarations.get(&storage.id)
+                && let Some(domain) = declarations
+                    .get(&storage.id)
+                    .and_then(|domain| domain.integer())
                 && field.data_type() != &domain.data_type()
             {
                 return Err(invalid(
@@ -2800,7 +2802,7 @@ fn write_statistics_contract(
     // rule shallowly -- it adapted the top-level primitives and cloned every
     // nested type verbatim -- and the two statements drifted apart the moment
     // one of them said something about a nested field.
-    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
+    let arrow_schema = crate::field_domain::metadata_sql_schema(metadata, iceberg_schema)?;
     let mut requirements = Vec::new();
     for (ordinal, binding) in input.fields().into_iter().enumerate() {
         let field = binding.field();
@@ -3983,12 +3985,16 @@ fn data_branch_recipe(
         names.push(field.name.clone());
         transforms.push(field.transform.to_string());
     }
-    IcebergDataBranchRecipe::try_new(
+    IcebergDataBranchRecipe::try_new_with_field_domains(
         Some(schema.clone()),
         sources,
         names,
         transforms,
         row_lineage,
+        crate::field_domain::active(
+            schema,
+            crate::field_domain::metadata_declarations(metadata)?.fields(),
+        )?,
     )
 }
 

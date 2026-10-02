@@ -90,7 +90,10 @@ fn static_file_predicates(predicate: &TupleDomain<IcebergColumnHandle>) -> Vec<S
     };
     let mut predicates = Vec::new();
     for (column, domain) in domains {
-        if domain.null_allowed() || !column.is_base_column() {
+        if domain.null_allowed()
+            || !column.is_base_column()
+            || column.field_domain() == Some(crate::field_domain::FieldDomain::Json)
+        {
             continue;
         }
         let values = domain.values();
@@ -372,7 +375,9 @@ impl DynamicFilterColumn {
         let handle = column.clone();
         // A nested field has no single primitive leaf statistic to read, and
         // inferring one from an ancestor would be a guess.
-        if !handle.is_base_column() {
+        if !handle.is_base_column()
+            || handle.field_domain() == Some(crate::field_domain::FieldDomain::Json)
+        {
             return None;
         }
         let iceberg_type = parse_type(handle.type_json(), "type_json").ok()?;
@@ -505,12 +510,24 @@ fn row_group_bounds(
             ParquetStatisticsSortOrder::Undefined
         );
     ColumnValueBounds {
-        min: statistics
-            .min()
-            .and_then(|value| column.value_kind.value(value)),
-        max: statistics
-            .max()
-            .and_then(|value| column.value_kind.value(value)),
+        min: statistics.min().and_then(|value| {
+            column.value_kind.value(value).and_then(|value| {
+                match (column.column.scalar_integer_domain(), value) {
+                    (Some(domain), ConnectorValue::Integer(value)) => domain.value(value).ok(),
+                    (None, value) => Some(value),
+                    _ => None,
+                }
+            })
+        }),
+        max: statistics.max().and_then(|value| {
+            column.value_kind.value(value).and_then(|value| {
+                match (column.column.scalar_integer_domain(), value) {
+                    (Some(domain), ConnectorValue::Integer(value)) => domain.value(value).ok(),
+                    (None, value) => Some(value),
+                    _ => None,
+                }
+            })
+        }),
         null_count: statistics.null_count(),
         value_count: row_count,
         bounds_are_exact,
@@ -756,8 +773,16 @@ pub struct IcebergReadRelation {
     partition_spec: PartitionSpec,
     name_mapping: Option<Arc<NameMapping>>,
     effective_predicate: TupleDomain<IcebergColumnHandle>,
-    scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
+    field_domains: crate::field_domain::PersistedFieldDomains,
     delete_domains: super::delete_manager::DeleteDomainBindings,
+}
+
+fn retained_relation_domains(source: &crate::field_domain::PersistedFieldDomains) -> u64 {
+    match source {
+        crate::field_domain::PersistedFieldDomains::None => 0,
+        source => crate::field_domain::retained_bytes(source.fields())
+            .expect("validated bounded field-domain map") as u64,
+    }
 }
 
 impl IcebergReadRelation {
@@ -771,7 +796,7 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: handle.effective_predicate()?,
-            scalar_integer_domains: handle.scalar_integer_domains().clone(),
+            field_domains: handle.persisted_field_domains().clone(),
             delete_domains: super::delete_manager::DeleteDomainBindings::Single(Arc::clone(
                 handle.read_domain().ok_or_else(|| {
                     invalid("iceberg data reader requires its pinned read domain")
@@ -794,15 +819,7 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: TupleDomain::all(),
-            scalar_integer_domains: handle
-                .columns()
-                .iter()
-                .filter_map(|column| {
-                    column
-                        .scalar_integer_domain()
-                        .map(|domain| (column.base_field_id(), domain))
-                })
-                .collect(),
+            field_domains: handle.persisted_field_domains().clone(),
             delete_domains: super::delete_manager::DeleteDomainBindings::Window {
                 from: Arc::clone(handle.from_read_domain()),
                 to: Arc::clone(handle.to_read_domain()),
@@ -881,18 +898,11 @@ fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, 
         )?;
     }
 
-    for column in request.columns {
-        let declaration = request
-            .relation
-            .scalar_integer_domains
-            .get(&column.base_field_id())
-            .copied();
-        if column.scalar_integer_domain() != declaration {
-            return Err(invalid(
-                "Iceberg scan column declaration differs from its frozen relation",
-            ));
-        }
-    }
+    super::column_handle::validate_frozen_column_domains(
+        &request.relation.table_schema,
+        request.columns,
+        &request.relation.field_domains,
+    )?;
     let table_schema = Arc::clone(&request.relation.table_schema);
     let partition_spec = request.relation.partition_spec.clone();
     if partition_spec.spec_id() != split.partition_spec_id() {
@@ -946,6 +956,7 @@ fn partition_only_source(
 /// Everything one data split's reader is built from, owned so that a page
 /// stream can build it in its first poll.
 struct ParquetSplitRequest {
+    field_domains: crate::field_domain::PersistedFieldDomains,
     split: IcebergSplit,
     name_mapping: Option<Arc<NameMapping>>,
     columns: Vec<IcebergColumnHandle>,
@@ -967,6 +978,7 @@ impl ParquetSplitRequest {
     fn of(request: IcebergPageSourceRequest<'_>) -> (Self, DeleteEvaluationMode) {
         (
             Self {
+                field_domains: request.relation.field_domains.clone(),
                 split: request.split.clone(),
                 name_mapping: request.relation.name_mapping.clone(),
                 columns: request.columns.to_vec(),
@@ -1001,6 +1013,13 @@ impl ParquetSplitRequest {
         self.split
             .retained_size_in_bytes()
             .saturating_add(self.prepared_retained_capacity())
+            .saturating_add(retained_relation_domains(&self.field_domains))
+            .saturating_add(
+                self.columns
+                    .iter()
+                    .map(|column| column.retained_field_domains_bytes() as u64)
+                    .sum::<u64>(),
+            )
     }
 
     fn into_source(
@@ -1009,18 +1028,40 @@ impl ParquetSplitRequest {
         delete_filter: SplitDeleteFilter,
         delete_mode: DeleteEvaluationMode,
         successor_control: Arc<SuccessorPreparationGroup>,
-    ) -> IcebergParquetPageSource {
-        let hidden_columns = delete_filter.required_hidden_columns().to_vec();
+    ) -> Result<IcebergParquetPageSource, ConnectorError> {
+        let hidden_columns = delete_filter
+            .required_hidden_columns()
+            .iter()
+            .cloned()
+            .map(|column| column.with_table_field_domains(&self.field_domains))
+            .collect::<Result<Vec<_>, _>>()?;
         let prepared_retained_capacity = self.prepared_retained_capacity();
-        IcebergParquetPageSource {
+        let prefix_len = self.columns.len();
+        let bound_handles = self
+            .columns
+            .into_iter()
+            .chain(hidden_columns)
+            .collect::<Vec<_>>();
+        let retained_bytes = self
+            .split
+            .retained_size_in_bytes()
+            .saturating_add(retained_relation_domains(&self.field_domains))
+            .saturating_add(
+                bound_handles
+                    .iter()
+                    .map(|column| column.retained_field_domains_bytes() as u64)
+                    .sum::<u64>(),
+            );
+        Ok(IcebergParquetPageSource {
+            field_domains: self.field_domains,
             delete_domains: self.delete_domains,
             delete_mode,
             table_schema: admitted.table_schema,
             name_mapping: self.name_mapping,
             partition_spec: admitted.partition_spec,
             partition_values: admitted.partition_values,
-            prefix_len: self.columns.len(),
-            bound_handles: self.columns.into_iter().chain(hidden_columns).collect(),
+            prefix_len,
+            bound_handles,
             delete_filter,
             effective_predicate: admitted.effective_predicate,
             access_binding: self.access_binding,
@@ -1048,10 +1089,10 @@ impl ParquetSplitRequest {
             file_metrics: Default::default(),
             completed_positions: 0,
             read_time_nanos: 0,
-            retained_bytes: self.split.retained_size_in_bytes(),
+            retained_bytes,
             split: self.split,
             finished: false,
-        }
+        })
     }
 }
 
@@ -1470,6 +1511,7 @@ struct PredicateCheck {
 
 /// The per-split Parquet reader state a page stream moves through its steps.
 pub struct IcebergParquetPageSource {
+    field_domains: crate::field_domain::PersistedFieldDomains,
     split: IcebergSplit,
     table_schema: Arc<Schema>,
     name_mapping: Option<Arc<NameMapping>>,
@@ -1942,14 +1984,7 @@ impl IcebergParquetPageSource {
                 partition_spec: self.partition_spec.clone(),
                 name_mapping: self.name_mapping.clone(),
                 effective_predicate: self.effective_predicate.clone(),
-                scalar_integer_domains: self.bound_handles[..self.prefix_len]
-                    .iter()
-                    .filter_map(|column| {
-                        column
-                            .scalar_integer_domain()
-                            .map(|domain| (column.base_field_id(), domain))
-                    })
-                    .collect(),
+                field_domains: self.field_domains.clone(),
                 delete_domains: self.delete_domains.clone(),
             };
             let split = self.split.clone();

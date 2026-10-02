@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 pub(crate) const PROPERTY: &str = "novarocks.field_domains.v1";
 pub(crate) const PREFIX: &str = "novarocks.field_domains.";
-const MAX_BYTES: usize = 1 << 20;
+pub(crate) const MAX_BYTES: usize = 1 << 20;
 const MAX_FIELDS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -40,6 +40,16 @@ pub(crate) enum FieldDomain {
     Json,
 }
 pub(crate) type FieldDomains = BTreeMap<i32, FieldDomain>;
+
+/// Conservative retained charge for a decoded domain map, including its root
+/// allocation. Text bytes are charged independently by the private codec.
+pub(crate) fn retained_bytes(fields: &FieldDomains) -> Result<usize, ConnectorError> {
+    fields
+        .len()
+        .checked_mul(64)
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or_else(|| corrupt("Iceberg field domain retained byte charge overflow"))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PersistedFieldDomains {
@@ -132,7 +142,11 @@ pub(crate) fn decode(raw: &str) -> Result<FieldDomains, ConnectorError> {
     if payload.version != 1 {
         return Err(corrupt("unsupported Iceberg field domain version"));
     }
-    Ok(payload.fields.0)
+    let fields = payload.fields.0;
+    if encode(&fields)? != raw {
+        return Err(corrupt("Iceberg field domain payload is not canonical"));
+    }
+    Ok(fields)
 }
 pub(crate) fn encode(fields: &FieldDomains) -> Result<String, ConnectorError> {
     if fields.len() > MAX_FIELDS || fields.keys().any(|id| *id <= 0) {
@@ -369,6 +383,15 @@ pub(crate) fn metadata_sql_schema(
     metadata: &TableMetadata,
     schema: &Schema,
 ) -> Result<SchemaRef, ConnectorError> {
+    crate::schema_mapping::validate_exact_schema(schema).map_err(corrupt)?;
+    if !metadata
+        .schemas_iter()
+        .any(|retained| retained.as_ref() == schema)
+    {
+        return Err(corrupt(
+            "Iceberg logical projection schema is not an exact retained metadata schema",
+        ));
+    }
     let domains = metadata_declarations(metadata)?;
     apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(schema).map_err(corrupt)?,
@@ -621,6 +644,9 @@ mod tests {
             r#"{"version":1,"fields":{"0":"json"}}"#,
             r#"{"version":1,"fields":{"01":"json"}}"#,
             r#"{"version":1,"fields":{"1":"JSON"}}"#,
+            r#"{"fields":{},"version":1}"#,
+            r#"{"version":1,"fields":{"5":"json","2":"json"}}"#,
+            r#"{"version":1, "fields":{}}"#,
         ] {
             assert!(decode(raw).is_err(), "{raw}");
         }
@@ -945,6 +971,71 @@ mod history_tests {
         );
         assert!(metadata_declarations(&corrupted).is_err());
     }
+    #[test]
+    fn field_domain_projection_rejects_foreign_schema_with_reused_id() {
+        let metadata = metadata();
+        let id = metadata.current_schema().field_by_name("tiny").unwrap().id;
+        let metadata = property(metadata, FieldDomains::from([(id, FieldDomain::Int8)]));
+        let foreign = Schema::builder()
+            .with_schema_id(metadata.current_schema_id())
+            .with_fields(vec![Arc::new(NestedField::optional(
+                id,
+                "foreign",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        assert!(metadata_sql_schema(&metadata, &foreign).is_err());
+        assert_eq!(
+            metadata_sql_schema(&metadata, metadata.current_schema())
+                .unwrap()
+                .field(0)
+                .data_type(),
+            &DataType::Int8
+        );
+    }
+
+    #[test]
+    fn historical_bound_narrow_fields_keep_independently_frozen_v1_bytes() {
+        // Source-derived fixtures from 8c04a1d5a680faccc2391f79d3136e2fd1e6f176:
+        // schema_mapping's ProviderFieldIdentity serializes id/required/type.
+        // These literals are not captures from a historical product execution.
+        for (field, domain, expected) in [
+            (
+                NestedField::optional(1, "tiny", Type::Primitive(PrimitiveType::Int)),
+                FieldDomain::Int8,
+                b"novarocks.iceberg.exact-field.v1:{\"id\":1,\"required\":false,\"type\":\"int\"}"
+                    .as_slice(),
+            ),
+            (
+                NestedField::required(2, "small", Type::Primitive(PrimitiveType::Int)),
+                FieldDomain::Int16,
+                b"novarocks.iceberg.exact-field.v1:{\"id\":2,\"required\":true,\"type\":\"int\"}"
+                    .as_slice(),
+            ),
+        ] {
+            let domains = FieldDomains::from([(field.id, domain)]);
+            assert_eq!(
+                exact_provider_type_binding(&field, &domains)
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+            assert_eq!(
+                crate::schema_mapping::legacy_scalar_type(&field),
+                Some(novarocks_types::logical_type::LogicalType::Int32)
+            );
+            let mut renamed = field.clone();
+            renamed.name = "renamed".into();
+            assert_eq!(
+                exact_provider_type_binding(&renamed, &domains)
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn field_domain_legacy_namespace_migration_keeps_complete_bound_root_identity() {
         let initial = metadata();

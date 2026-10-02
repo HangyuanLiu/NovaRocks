@@ -84,8 +84,7 @@ pub(crate) fn decode_read_domain(
     .map_err(|e| invalid(e.to_string()))?;
     let table_uuid = uuid::Uuid::from_slice(&raw.table_uuid)
         .map_err(|_| invalid("Iceberg read table UUID must contain 16 bytes"))?;
-    let schema: Schema =
-        serde_json::from_str(&raw.schema_json).map_err(|e| invalid(e.to_string()))?;
+    let schema = super::column_handle::parse_schema(&raw.schema_json)?;
     let specs = raw
         .partition_spec_jsons
         .iter()

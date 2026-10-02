@@ -446,9 +446,9 @@ fn exact_row_lineage_data_write_fields(
 fn position_delete_partition_field_requests(
     metadata: &TableMetadata,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    let declarations = crate::scalar_integer_domain::of_schema(
+    let declarations = crate::field_domain::active(
         metadata.current_schema(),
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        crate::field_domain::metadata_declarations(metadata)?.fields(),
     )?;
     metadata
         .default_partition_spec()
@@ -467,15 +467,16 @@ fn position_delete_partition_field_requests(
             let data_type =
                 crate::metadata_batch_reader::iceberg_type_to_arrow_type(source.field_type.as_ref())
                 .map_err(invalid_write_activation)?;
-            let data_type = match declarations.get(&source.id) {
+            let data_type = match declarations.get(&source.id).and_then(|domain| domain.integer()) {
                 Some(domain) => domain.data_type(),
                 None => data_type,
             };
-            Ok(ConnectorWriteFieldRequest::new(Field::new(
-                &source.name,
-                data_type,
-                !source.required,
-            )))
+            let mut field=Field::new(&source.name,data_type,!source.required);
+            if declarations.get(&source.id)==Some(&crate::field_domain::FieldDomain::Json) {
+                field=field.with_metadata(std::collections::HashMap::from([
+                    ("nr_logical_type".into(),"json".into())]));
+            }
+            Ok(ConnectorWriteFieldRequest::new(field))
         })
         .collect()
 }
@@ -959,7 +960,12 @@ mod tests {
                 .iter()
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
-            vec![Field::new("id", DataType::Int64, false)]
+            vec![
+                Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "1".into(),
+                )]))
+            ]
         );
     }
 
@@ -1019,8 +1025,14 @@ mod tests {
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
             vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, true),
+                Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "1".into()
+                )])),
+                Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "2".into()
+                )])),
             ]
         );
 
@@ -1159,8 +1171,14 @@ mod tests {
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
             vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, true),
+                Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "1".into(),
+                )])),
+                Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "2".into(),
+                )])),
                 Field::new("_row_id", DataType::Int64, true),
                 Field::new("_last_updated_sequence_number", DataType::Int64, true),
             ]
@@ -1436,8 +1454,14 @@ mod tests {
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
             vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, true)
+                Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "1".into(),
+                )])),
+                Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+                    "2".into(),
+                )])),
             ]
         );
         assert_eq!(rebound.digest(), exact_preparation.digest());

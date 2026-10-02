@@ -33,7 +33,8 @@ use crate::PROVIDER_ID;
 use crate::provider_types::IcebergReadTypes;
 
 use super::{
-    ICEBERG_READ_CODEC_REVISION, MAX_PRIVATE_READ_BYTES, MAX_PRIVATE_RETAINED_BYTES, split_category,
+    ICEBERG_READ_CODEC_REVISION, MAX_PRIVATE_CARRIER_DEPTH, MAX_PRIVATE_READ_BYTES,
+    MAX_PRIVATE_RETAINED_BYTES, split_category,
 };
 
 /// Pure codec for static relations and dynamic Task split inputs.
@@ -188,7 +189,7 @@ fn decode_with_binding<T>(
         MAX_PRIVATE_RETAINED_BYTES,
         MAX_PRIVATE_READ_BYTES,
         1_000_000,
-        64,
+        MAX_PRIVATE_CARRIER_DEPTH,
     )
     .expect("Iceberg recipe decode limits are finite");
     let mut ledger = ConnectorDecodeLedger::new(limits);

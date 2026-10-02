@@ -74,6 +74,7 @@ fn frozen_facts(
         partition_column_names: Vec::new(),
         transform_exprs: Vec::new(),
         data_input_schema: Arc::new(iceberg_schema_from_arrow_schema(&annotated).unwrap()),
+        data_field_domains: Default::default(),
         parquet_row_group_size_bytes: Some(1024),
     }
 }
@@ -699,6 +700,7 @@ fn recursive_frozen_facts(
         partition_column_names: vec![],
         transform_exprs: vec![],
         data_input_schema: provider,
+        data_field_domains: Default::default(),
         parquet_row_group_size_bytes: Some(1024),
     }
 }
@@ -783,5 +785,323 @@ async fn frozen_recursive_writer_rejects_actual_null_required_map_key() {
     assert!(
         error.contains("Iceberg MAP keys must be non-null"),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn frozen_field_domains_write_standard_parquet_and_roundtrip_recursive_values() {
+    use crate::field_domain::FieldDomain;
+    use arrow::array::StringArray;
+    let provider = Arc::new(
+        crate::iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "j",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "t",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "xs",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        4,
+                        Type::Primitive(PrimitiveType::Int),
+                        false,
+                    )))),
+                )),
+                Arc::new(NestedField::optional(
+                    5,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            6,
+                            "n",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                        Arc::new(NestedField::optional(
+                            7,
+                            "j",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    ])),
+                )),
+                Arc::new(NestedField::optional(
+                    8,
+                    "m",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::map_key_element(
+                            9,
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                        Arc::new(NestedField::map_value_element(
+                            10,
+                            Type::Primitive(PrimitiveType::String),
+                            false,
+                        )),
+                    )),
+                )),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let domains = std::collections::BTreeMap::from([
+        (1, FieldDomain::Json),
+        (2, FieldDomain::Int8),
+        (4, FieldDomain::Int16),
+        (6, FieldDomain::Int8),
+        (7, FieldDomain::Json),
+        (9, FieldDomain::Int8),
+        (10, FieldDomain::Json),
+    ]);
+    let logical = crate::field_domain::apply_schema(
+        crate::schema_mapping::sql_write_schema_from_iceberg(&provider).unwrap(),
+        &provider,
+        &domains,
+    )
+    .unwrap();
+    let DataType::List(child) = logical.field(2).data_type() else {
+        unreachable!()
+    };
+    let list = Arc::new(
+        ListArray::try_new(
+            child.clone(),
+            OffsetBuffer::new(vec![0, 3, 3, 3].into()),
+            Arc::new(Int16Array::from(vec![Some(-32768), Some(32767), None])),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let DataType::Struct(children) = logical.field(3).data_type() else {
+        unreachable!()
+    };
+    let record = Arc::new(
+        StructArray::try_new(
+            children.clone(),
+            vec![
+                Arc::new(Int8Array::from(vec![-128, 127, 0])),
+                Arc::new(StringArray::from(vec![
+                    Some("{\"b\":2, \"a\":1}"),
+                    Some("hidden"),
+                    None,
+                ])),
+            ],
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let DataType::Map(entries, sorted) = logical.field(4).data_type() else {
+        unreachable!()
+    };
+    let DataType::Struct(children) = entries.data_type() else {
+        unreachable!()
+    };
+    let map_entries = StructArray::try_new(
+        children.clone(),
+        vec![
+            Arc::new(Int8Array::from(vec![2, 1])),
+            Arc::new(StringArray::from(vec![Some("[2, 1]"), None])),
+        ],
+        None,
+    )
+    .unwrap();
+    let map = Arc::new(
+        MapArray::try_new(
+            entries.clone(),
+            OffsetBuffer::new(vec![0, 2, 2, 2].into()),
+            map_entries,
+            Some(NullBuffer::from(vec![true, false, true])),
+            *sorted,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let input = RecordBatch::try_new(
+        logical.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("{\"z\":0, \"a\":1}"),
+                None,
+                Some("{}"),
+            ])),
+            Arc::new(Int8Array::from(vec![Some(-128), Some(127), None])),
+            list,
+            record,
+            map,
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let location = format!("file://{}", dir.path().display());
+    let mut facts = recursive_frozen_facts(&location, provider.clone());
+    facts.data_field_domains = domains.clone();
+    let ctx = staged_write_context_from_frozen_facts(&local_binding(), &logical, facts).unwrap();
+    let files = crate::commit::data_writer::write_record_batches(&ctx, [input])
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    let path = files[0].data_file.file_path();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(
+        File::open(path.strip_prefix("file://").unwrap()).unwrap(),
+    )
+    .unwrap();
+    // The external footer is standard STRING/INT32, never a private narrow
+    // Parquet primitive. Requiredness and IDs still belong to the SDK tree.
+    for column in builder.parquet_schema().columns() {
+        let id = column.self_type().get_basic_info().id();
+        assert_eq!(
+            column.physical_type(),
+            if matches!(id, 1 | 7 | 10) {
+                ParquetPhysicalType::BYTE_ARRAY
+            } else {
+                ParquetPhysicalType::INT32
+            }
+        );
+    }
+    let output = builder.build().unwrap().next().unwrap().unwrap();
+    // Independent engine marker interpretation must still see Json even
+    // though the external Parquet leaf is standard STRING.
+    assert_eq!(
+        novarocks_types::logical_type::logical_field_from_engine_arrow(output.schema().field(0))
+            .unwrap()
+            .data_type,
+        novarocks_types::logical_type::LogicalType::Json
+    );
+    let restored = output
+        .columns()
+        .iter()
+        .zip(provider.as_struct().fields())
+        .zip(logical.fields())
+        .map(|((array, storage), target)| {
+            crate::field_domain::restore_array(array, storage, target, &domains).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let result = RecordBatch::try_new(logical, restored).unwrap();
+    assert_eq!(
+        result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"z\":0, \"a\":1}"
+    );
+    assert_eq!(
+        result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(-128), Some(127), None]
+    );
+    let map = result
+        .column(4)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(
+        map.keys()
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[2, 1]
+    );
+    assert!(map.is_null(1));
+    assert_eq!(map.value_length(2), 0);
+    let s = result
+        .column(3)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert!(s.is_null(1));
+    assert_eq!(
+        s.column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"b\":2, \"a\":1}"
+    );
+    let list = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(
+        list.values()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(-32768), Some(32767), None]
+    );
+    assert!(list.is_null(1));
+    assert_eq!(list.value_length(2), 0);
+    let staged = files
+        .iter()
+        .map(|file| file.data_file.file_path().to_string())
+        .collect::<Vec<_>>();
+    crate::commit::data_writer::cleanup_staged_files(&ctx, &staged)
+        .await
+        .unwrap();
+    assert!(!std::path::Path::new(path.strip_prefix("file://").unwrap()).exists());
+}
+
+#[tokio::test]
+async fn frozen_field_domain_overflow_rejects_before_artifact_and_preserves_cleanup_owner() {
+    use crate::field_domain::FieldDomain;
+    let provider = Arc::new(
+        crate::iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tiny",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap(),
+    );
+    let logical = Arc::new(Schema::new(vec![Field::new("tiny", DataType::Int8, true)]));
+    let dir = tempfile::tempdir().unwrap();
+    let location = format!("file://{}", dir.path().display());
+    let mut facts = recursive_frozen_facts(&location, provider);
+    facts.data_field_domains = std::collections::BTreeMap::from([(1, FieldDomain::Int8)]);
+    let ctx = staged_write_context_from_frozen_facts(&local_binding(), &logical, facts).unwrap();
+    let input = Arc::new(Schema::new(vec![Field::new("tiny", DataType::Int32, true)]));
+    let good =
+        RecordBatch::try_new(input.clone(), vec![Arc::new(Int32Array::from(vec![127]))]).unwrap();
+    let staged = crate::commit::data_writer::write_record_batches(&ctx, [good])
+        .await
+        .unwrap();
+    let bad = RecordBatch::try_new(input, vec![Arc::new(Int32Array::from(vec![128]))]).unwrap();
+    let error = crate::commit::data_writer::write_record_batches(&ctx, [bad])
+        .await
+        .err()
+        .expect("overflow must refuse a prepared file");
+    assert!(error.contains("declared integer domain"), "{error}");
+    let paths = staged
+        .iter()
+        .map(|file| file.data_file.file_path().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("data")).unwrap().count(),
+        paths.len()
+    );
+    crate::commit::data_writer::cleanup_staged_files(&ctx, &paths)
+        .await
+        .unwrap();
+    assert!(
+        paths
+            .iter()
+            .all(|p| !std::path::Path::new(p.strip_prefix("file://").unwrap()).exists())
     );
 }

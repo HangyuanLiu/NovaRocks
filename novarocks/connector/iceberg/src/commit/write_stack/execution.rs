@@ -267,6 +267,7 @@ impl IcebergDataStackWriter {
             partition_column_names: recipe.partition_column_names().to_vec(),
             transform_exprs: recipe.transform_exprs().to_vec(),
             data_input_schema: input_schema,
+            data_field_domains: recipe.field_domains().clone(),
             parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
         };
         let context =

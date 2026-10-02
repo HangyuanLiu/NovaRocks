@@ -188,6 +188,7 @@ pub struct TableChangesFunctionHandleParams {
 pub struct TableChangesFunctionHandle {
     schema_table_name: SchemaTableName,
     table_schema_json: Arc<str>,
+    field_domains: crate::field_domain::PersistedFieldDomains,
     columns: Vec<IcebergColumnHandle>,
     name_mapping_json: Option<Arc<str>>,
     start_snapshot_id: i64,
@@ -215,6 +216,7 @@ impl TableChangesFunctionHandle {
         Ok(Self {
             schema_table_name,
             table_schema_json: Arc::from(table_schema_json.as_str()),
+            field_domains: crate::field_domain::PersistedFieldDomains::None,
             columns,
             name_mapping_json: name_mapping_json.map(|value| Arc::from(value.as_str())),
             start_snapshot_id,
@@ -228,6 +230,78 @@ impl TableChangesFunctionHandle {
 
     pub fn table_schema_json(&self) -> &str {
         &self.table_schema_json
+    }
+
+    pub(crate) fn with_field_domains(
+        mut self,
+        declarations: crate::field_domain::PersistedFieldDomains,
+    ) -> Result<Self, ConnectorError> {
+        let schema = super::column_handle::parse_schema(&self.table_schema_json)?;
+        if crate::field_domain::active(&schema, declarations.fields())? != *declarations.fields() {
+            return Err(invalid(
+                "change relation declarations are outside its selected schema",
+            ));
+        }
+        crate::field_domain::encode(declarations.fields())?;
+        super::column_handle::validate_frozen_column_domains(
+            &schema,
+            &self.columns,
+            &declarations,
+        )?;
+        self.field_domains = declarations;
+        Ok(self)
+    }
+
+    pub(crate) fn field_domains_json(&self) -> Option<String> {
+        match &self.field_domains {
+            crate::field_domain::PersistedFieldDomains::FieldDomainsV1(fields) => {
+                Some(crate::field_domain::encode(fields).expect("validated bounded field domains"))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn decode_wire_field_domains(
+        formal: Option<&str>,
+    ) -> Result<Option<crate::field_domain::PersistedFieldDomains>, ConnectorError> {
+        formal
+            .map(|raw| {
+                crate::field_domain::decode(raw)
+                    .map(crate::field_domain::PersistedFieldDomains::FieldDomainsV1)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn with_decoded_wire_field_domains(
+        self,
+        formal: Option<crate::field_domain::PersistedFieldDomains>,
+    ) -> Result<Self, ConnectorError> {
+        use crate::field_domain::PersistedFieldDomains;
+        let declarations = if let Some(declarations) = formal {
+            declarations
+        } else {
+            // Legacy relation DTOs carried their explicit top-level integer source on columns.
+            let mut fields = BTreeMap::new();
+            for column in &self.columns {
+                match column.persisted_field_domains() {
+                    PersistedFieldDomains::FieldDomainsV1(_) => {
+                        return Err(invalid(
+                            "change relation omits its formal field-domain authority",
+                        ));
+                    }
+                    PersistedFieldDomains::LegacyTopIntegerV1(values) => {
+                        fields.extend(values.iter().map(|(id, value)| (*id, *value)))
+                    }
+                    PersistedFieldDomains::None => {}
+                }
+            }
+            if fields.is_empty() {
+                PersistedFieldDomains::None
+            } else {
+                PersistedFieldDomains::LegacyTopIntegerV1(fields)
+            }
+        };
+        self.with_field_domains(declarations)
     }
 
     pub fn columns(&self) -> &[IcebergColumnHandle] {
@@ -253,6 +327,7 @@ impl TableChangesFunctionHandle {
                 table_name: self.schema_table_name.table_name().to_string(),
             }),
             table_schema_json: self.table_schema_json.to_string(),
+            field_domains_json: self.field_domains_json(),
             columns: self
                 .columns
                 .iter()
@@ -268,6 +343,7 @@ impl TableChangesFunctionHandle {
     }
 
     pub fn from_proto(raw: &dto::TableChangesFunctionHandle) -> Result<Self, ConnectorError> {
+        let declarations = Self::decode_wire_field_domains(raw.field_domains_json.as_deref())?;
         let schema_table_name = raw
             .schema_table_name
             .as_ref()
@@ -282,7 +358,8 @@ impl TableChangesFunctionHandle {
             name_mapping_json: raw.name_mapping_json.clone(),
             start_snapshot_id: raw.start_snapshot_id,
             end_snapshot_id: raw.end_snapshot_id,
-        })
+        })?
+        .with_decoded_wire_field_domains(declarations)
     }
 }
 
@@ -544,6 +621,7 @@ pub struct IcebergChangeWindowHandleParams {
 pub struct IcebergChangeWindowHandle {
     schema_table_name: SchemaTableName,
     table_schema_json: Arc<str>,
+    field_domains: crate::field_domain::PersistedFieldDomains,
     columns: Vec<IcebergColumnHandle>,
     name_mapping_json: Option<Arc<str>>,
     from_snapshot_id_exclusive: i64,
@@ -568,8 +646,7 @@ impl IcebergChangeWindowHandle {
         } = params;
 
         validate_change_columns(&table_schema_json, &columns, name_mapping_json.as_deref())?;
-        let schema: Schema =
-            serde_json::from_str(&table_schema_json).map_err(|error| invalid(error.to_string()))?;
+        let schema = super::column_handle::parse_schema(&table_schema_json)?;
         for (snapshot, domain) in [
             (from_snapshot_id_exclusive, &from_read_domain),
             (to_snapshot_id_inclusive, &to_read_domain),
@@ -612,6 +689,7 @@ impl IcebergChangeWindowHandle {
         Ok(Self {
             schema_table_name,
             table_schema_json: Arc::from(table_schema_json.as_str()),
+            field_domains: crate::field_domain::PersistedFieldDomains::None,
             columns,
             name_mapping_json: name_mapping_json.map(|value| Arc::from(value.as_str())),
             from_snapshot_id_exclusive,
@@ -633,6 +711,82 @@ impl IcebergChangeWindowHandle {
 
     pub fn table_schema_json(&self) -> &str {
         &self.table_schema_json
+    }
+
+    pub(crate) fn with_field_domains(
+        mut self,
+        declarations: crate::field_domain::PersistedFieldDomains,
+    ) -> Result<Self, ConnectorError> {
+        let schema = super::column_handle::parse_schema(&self.table_schema_json)?;
+        if crate::field_domain::active(&schema, declarations.fields())? != *declarations.fields() {
+            return Err(invalid(
+                "change relation declarations are outside its selected schema",
+            ));
+        }
+        crate::field_domain::encode(declarations.fields())?;
+        super::column_handle::validate_frozen_column_domains(
+            &schema,
+            &self.columns,
+            &declarations,
+        )?;
+        self.field_domains = declarations;
+        Ok(self)
+    }
+
+    pub(crate) fn persisted_field_domains(&self) -> &crate::field_domain::PersistedFieldDomains {
+        &self.field_domains
+    }
+
+    pub(crate) fn field_domains_json(&self) -> Option<String> {
+        match &self.field_domains {
+            crate::field_domain::PersistedFieldDomains::FieldDomainsV1(fields) => {
+                Some(crate::field_domain::encode(fields).expect("validated bounded field domains"))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn decode_wire_field_domains(
+        formal: Option<&str>,
+    ) -> Result<Option<crate::field_domain::PersistedFieldDomains>, ConnectorError> {
+        formal
+            .map(|raw| {
+                crate::field_domain::decode(raw)
+                    .map(crate::field_domain::PersistedFieldDomains::FieldDomainsV1)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn with_decoded_wire_field_domains(
+        self,
+        formal: Option<crate::field_domain::PersistedFieldDomains>,
+    ) -> Result<Self, ConnectorError> {
+        use crate::field_domain::PersistedFieldDomains;
+        let declarations = if let Some(declarations) = formal {
+            declarations
+        } else {
+            // Legacy relation DTOs carried their explicit top-level integer source on columns.
+            let mut fields = BTreeMap::new();
+            for column in &self.columns {
+                match column.persisted_field_domains() {
+                    PersistedFieldDomains::FieldDomainsV1(_) => {
+                        return Err(invalid(
+                            "change relation omits its formal field-domain authority",
+                        ));
+                    }
+                    PersistedFieldDomains::LegacyTopIntegerV1(values) => {
+                        fields.extend(values.iter().map(|(id, value)| (*id, *value)))
+                    }
+                    PersistedFieldDomains::None => {}
+                }
+            }
+            if fields.is_empty() {
+                PersistedFieldDomains::None
+            } else {
+                PersistedFieldDomains::LegacyTopIntegerV1(fields)
+            }
+        };
+        self.with_field_domains(declarations)
     }
 
     pub fn columns(&self) -> &[IcebergColumnHandle] {
@@ -660,8 +814,7 @@ impl IcebergChangeWindowHandle {
     }
 
     pub fn parse_table_schema(&self) -> Result<Schema, ConnectorError> {
-        serde_json::from_str::<Schema>(&self.table_schema_json)
-            .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))
+        super::column_handle::parse_schema(&self.table_schema_json)
     }
 
     /// The partition spec one of this window's splits names.
@@ -700,6 +853,7 @@ impl IcebergChangeWindowHandle {
                 table_name: self.schema_table_name.table_name().to_string(),
             }),
             table_schema_json: self.table_schema_json.to_string(),
+            field_domains_json: self.field_domains_json(),
             columns: self
                 .columns
                 .iter()
@@ -718,6 +872,7 @@ impl IcebergChangeWindowHandle {
     }
 
     pub fn from_proto(raw: &dto::IcebergChangeWindowHandle) -> Result<Self, ConnectorError> {
+        let declarations = Self::decode_wire_field_domains(raw.field_domains_json.as_deref())?;
         let schema_table_name = raw
             .schema_table_name
             .as_ref()
@@ -743,7 +898,8 @@ impl IcebergChangeWindowHandle {
                 })?,
             )?,
             partition_spec_jsons: raw.partition_spec_jsons.clone(),
-        })
+        })?
+        .with_decoded_wire_field_domains(declarations)
     }
 }
 
@@ -1182,8 +1338,7 @@ fn validate_change_columns(
             "iceberg table schema json must be non-empty and bounded",
         ));
     }
-    serde_json::from_str::<Schema>(table_schema_json)
-        .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
+    super::column_handle::parse_schema(table_schema_json)?;
     if columns.is_empty() {
         return Err(invalid(
             "an iceberg change relation requires at least one output column",
@@ -1450,6 +1605,54 @@ mod tests {
             splits,
         )
     }
+    #[test]
+    fn change_relations_preserve_formal_empty_source_and_reject_missing_column_authority() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        let domains =
+            PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([(2, FieldDomain::Json)]));
+        let mut handle = change_window_handle();
+        handle.columns = handle
+            .columns
+            .into_iter()
+            .map(|column| column.with_table_field_domains(&domains))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let handle = handle.with_field_domains(domains).unwrap();
+        assert_eq!(
+            IcebergChangeWindowHandle::from_proto(&handle.to_proto()).unwrap(),
+            handle
+        );
+        let mut bad = handle.to_proto();
+        bad.columns[1].field_domains_json = None;
+        assert!(IcebergChangeWindowHandle::from_proto(&bad).is_err());
+        let mut bad = handle.to_proto();
+        bad.field_domains_json = None;
+        assert!(IcebergChangeWindowHandle::from_proto(&bad).is_err());
+        let mut bad = handle.to_proto();
+        bad.table_schema_json = "not-a-schema".into();
+        bad.field_domains_json = Some("{\"version\":9,\"fields\":{}}".into());
+        assert!(
+            IcebergChangeWindowHandle::from_proto(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("domain version")
+        );
+        let empty = PersistedFieldDomains::FieldDomainsV1(BTreeMap::new());
+        let mut handle = change_window_handle();
+        handle.columns = handle
+            .columns
+            .into_iter()
+            .map(|column| column.with_table_field_domains(&empty))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let handle = handle.with_field_domains(empty).unwrap();
+        assert!(handle.to_proto().field_domains_json.is_some());
+        assert_eq!(
+            IcebergChangeWindowHandle::from_proto(&handle.to_proto()).unwrap(),
+            handle
+        );
+    }
+
     #[test]
     fn complete_endpoint_variants_round_trip_with_derived_signs() {
         for split in [added("a"), removed("b", 0, 100), difference("c")] {

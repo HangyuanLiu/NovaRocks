@@ -53,6 +53,9 @@ use super::table_handle::{IcebergTableHandle, identity_partition_source_field_id
 /// Float bounds use SQL ordering and cannot prove NativeResultContentV1
 /// absence for NaN payloads or signed zero. Unknown type facts fail open too.
 fn content_filter_column_safe(column: &IcebergColumnHandle) -> bool {
+    if column.field_domain() == Some(crate::field_domain::FieldDomain::Json) {
+        return false;
+    }
     match super::column_handle::parse_type(column.type_json(), "type_json") {
         Ok(Type::Primitive(
             crate::iceberg::spec::PrimitiveType::Float

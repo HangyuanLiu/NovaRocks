@@ -579,8 +579,63 @@ pub(crate) fn validate_creation_metadata(
     }
     let observed =
         crate::field_domain::metadata_declarations(metadata).map_err(|e| e.to_string())?;
+    if !matches!(
+        observed,
+        crate::field_domain::PersistedFieldDomains::FieldDomainsV1(_)
+    ) {
+        return Err("created Iceberg table requires its single new field domain authority".into());
+    }
     if observed.fields() != requested_domains {
         return Err("created Iceberg logical domains differ from the requested field IDs".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod field_domain_creation_authority_tests {
+    use super::*;
+    use crate::iceberg::{
+        TableUpdate,
+        spec::{FormatVersion, PartitionSpec, SortOrder, TableMetadataBuilder},
+    };
+    #[test]
+    fn field_domain_creation_rejects_missing_and_legacy_authority_even_if_values_match() {
+        let columns = [ConnectorColumnDefinition {
+            name: "tiny".into(),
+            data_type: ConnectorDataType::Int8,
+            nullable: true,
+            aggregation: None,
+            default: None,
+        }];
+        let requested = creation_schema(&columns).unwrap();
+        let domains = creation_domains(&requested, &columns).unwrap();
+        let metadata = TableMetadataBuilder::new(
+            requested.clone(),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://authority".into(),
+            FormatVersion::V3,
+            Default::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        assert!(validate_creation_metadata(&metadata, &requested, &domains).is_err());
+        let legacy = TableUpdate::SetProperties {
+            updates: [("novarocks.logical_type.tiny".into(), "tinyint".into())].into(),
+        }
+        .apply(metadata.into_builder(None))
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        assert_eq!(
+            crate::field_domain::metadata_declarations(&legacy)
+                .unwrap()
+                .fields(),
+            &domains
+        );
+        assert!(validate_creation_metadata(&legacy, &requested, &domains).is_err());
+    }
 }

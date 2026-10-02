@@ -42,6 +42,7 @@ pub struct FrozenDataWriteFacts {
     pub partition_column_names: Vec<String>,
     pub transform_exprs: Vec<String>,
     pub data_input_schema: Arc<crate::iceberg::spec::Schema>,
+    pub(crate) data_field_domains: crate::field_domain::FieldDomains,
     pub parquet_row_group_size_bytes: Option<u64>,
 }
 
@@ -76,7 +77,13 @@ pub fn staged_write_context_from_frozen_facts(
             .build()
             .map_err(|e| format!("build exact projected writer schema: {e}"))?,
     );
-    let annotated_schema = scalar_integer_storage_schema(&annotated_schema);
+    crate::field_domain::validate_schema(&facts.data_input_schema, &facts.data_field_domains)
+        .map_err(|error| error.to_string())?;
+    let annotated_schema = writer_domain_schema(
+        &annotated_schema,
+        &facts.data_input_schema,
+        &facts.data_field_domains,
+    )?;
     let metadata = build_target_table_metadata(&facts, writer_schema.as_ref())?;
     let file_io = build_staged_file_io(binding, &facts.data_location)?;
     StagedWriteContext::from_parts_with_partition_spec_id(
@@ -86,6 +93,84 @@ pub fn staged_write_context_from_frozen_facts(
         annotated_schema,
         facts.target_partition_spec_id,
     )
+}
+
+/// This private marker is installed solely from the verified frozen recipe.
+/// It is never interpreted as caller-supplied provider authority.
+pub(super) const WRITE_DOMAIN_KEY: &str = "novarocks.iceberg.write-domain";
+
+pub(super) fn writer_domain_schema(
+    arrow: &ArrowSchemaRef,
+    provider: &crate::iceberg::spec::Schema,
+    domains: &crate::field_domain::FieldDomains,
+) -> Result<ArrowSchemaRef, String> {
+    if crate::field_domain::active(provider, domains).map_err(|e| e.to_string())? != *domains {
+        return Err("frozen writer domains must all bind active schema leaves".into());
+    }
+    fn convert(
+        field: &Field,
+        provider: &crate::iceberg::spec::Schema,
+        domains: &crate::field_domain::FieldDomains,
+    ) -> Result<Arc<Field>, String> {
+        let ty = match field.data_type() {
+            DataType::Struct(fields) => DataType::Struct(
+                fields
+                    .iter()
+                    .map(|f| convert(f, provider, domains))
+                    .collect::<Result<_, _>>()?,
+            ),
+            DataType::List(child) => DataType::List(convert(child, provider, domains)?),
+            DataType::LargeList(child) => DataType::LargeList(convert(child, provider, domains)?),
+            DataType::Map(child, sorted) => {
+                DataType::Map(convert(child, provider, domains)?, *sorted)
+            }
+            DataType::Int8 | DataType::Int16 => DataType::Int32,
+            other => other.clone(),
+        };
+        let mut metadata = field.metadata().clone();
+        metadata.remove(WRITE_DOMAIN_KEY);
+        // JSON provider identity comes only from the sealed domain map.
+        if metadata
+            .get("nr_logical_type")
+            .is_some_and(|marker| marker.eq_ignore_ascii_case("json"))
+        {
+            metadata.remove("nr_logical_type");
+        }
+        if let Some(id) = crate::schema_mapping::field_id_for_arrow_field(field)?
+            && let Some(domain) = domains.get(&id)
+        {
+            provider
+                .field_by_id(id)
+                .ok_or("writer domain has no exact provider field")?;
+            let name = match domain {
+                crate::field_domain::FieldDomain::Int8 => "tinyint",
+                crate::field_domain::FieldDomain::Int16 => "smallint",
+                crate::field_domain::FieldDomain::Json => "json",
+            };
+            let expected = match domain {
+                crate::field_domain::FieldDomain::Json => DataType::Utf8,
+                _ => DataType::Int32,
+            };
+            if ty != expected {
+                return Err("frozen writer domain conflicts with its physical projection".into());
+            }
+            metadata.insert(WRITE_DOMAIN_KEY.into(), name.into());
+            if *domain == crate::field_domain::FieldDomain::Json {
+                metadata.insert("nr_logical_type".into(), "json".into());
+            }
+        }
+        Ok(Arc::new(
+            field.clone().with_data_type(ty).with_metadata(metadata),
+        ))
+    }
+    Ok(Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        arrow
+            .fields()
+            .iter()
+            .map(|f| convert(f, provider, domains))
+            .collect::<Result<Vec<_>, _>>()?,
+        arrow.metadata().clone(),
+    )))
 }
 
 /// Iceberg INT has a four-byte storage carrier even when the signed SQL input

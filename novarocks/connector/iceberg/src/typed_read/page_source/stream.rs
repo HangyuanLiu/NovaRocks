@@ -115,7 +115,7 @@ impl ParquetStreamInit {
             delete_filter,
             self.delete_mode,
             self.successor_control,
-        )))
+        )?))
     }
 }
 

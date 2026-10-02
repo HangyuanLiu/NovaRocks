@@ -986,6 +986,54 @@ mod tests {
         assert!(scalar.validate_schema_type().is_ok());
     }
     #[test]
+    fn historical_bound_narrow_signatures_keep_exact_source_derived_bytes() {
+        // Independently frozen from the 8c04a1d5a producer source, not an
+        // execution capture: v1 exact-field bytes and its bound type grammar.
+        for (logical, binding, signature) in [
+            (
+                LogicalType::Int8,
+                b"novarocks.iceberg.exact-field.v1:{\"id\":1,\"required\":false,\"type\":\"int\"}"
+                    .as_slice(),
+                "mvtype:1:bound(i8,71:6e6f7661726f636b732e696365626572672e65786163742d6669656c642e76313a7b226964223a312c227265717569726564223a66616c73652c2274797065223a22696e74227d)",
+            ),
+            (
+                LogicalType::Int16,
+                b"novarocks.iceberg.exact-field.v1:{\"id\":2,\"required\":true,\"type\":\"int\"}"
+                    .as_slice(),
+                "mvtype:1:bound(i16,70:6e6f7661726f636b732e696365626572672e65786163742d6669656c642e76313a7b226964223a322c227265717569726564223a747275652c2274797065223a22696e74227d)",
+            ),
+        ] {
+            let frozen = MvLogicalType::decode_signature(signature).unwrap();
+            assert_eq!(frozen.encode_signature(), signature);
+            assert_eq!(frozen.provider_type_binding().unwrap().as_ref(), binding);
+            assert!(frozen.matches_schema(&logical, binding, Some(&LogicalType::Int32)));
+            assert!(!frozen.matches_schema(
+                &LogicalType::Int32,
+                binding,
+                Some(&LogicalType::Int32)
+            ));
+            assert!(!frozen.matches_schema(&logical, b"changed", Some(&logical)));
+            assert_eq!(
+                MvLogicalType::from_schema_type(logical, Bytes::copy_from_slice(binding))
+                    .unwrap()
+                    .encode_signature(),
+                signature
+            );
+        }
+        let raw_int = MvLogicalType::decode_signature("int").unwrap();
+        assert!(!raw_int.matches_schema(
+            &LogicalType::Int8,
+            b"same-physical-int",
+            Some(&LogicalType::Int32)
+        ));
+        assert!(!raw_int.matches_schema(
+            &LogicalType::Int16,
+            b"same-physical-int",
+            Some(&LogicalType::Int32)
+        ));
+    }
+
+    #[test]
     fn historical_plain_timestamp_requires_provider_exact_legacy_domain() {
         let old = MvLogicalType::decode_signature("timestamp").unwrap();
         let projected = LogicalType::Timestamp {

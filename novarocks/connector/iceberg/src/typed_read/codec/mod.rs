@@ -43,6 +43,10 @@ pub use recipe::IcebergReadRecipeCompiler;
 pub(crate) use crate::contract_revision::ICEBERG_CONTRACT_REVISION as ICEBERG_READ_CODEC_REVISION;
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRIVATE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+// The deepest closed path is ReadTable/TableExecute/Optimize/Table/
+// TupleDomain/ColumnDomain/Column/Identity: a depth-64 identity leaf is
+// protobuf depth 70. Keep carrier framing separate from logical depth 64.
+pub(crate) const MAX_PRIVATE_CARRIER_DEPTH: usize = 72;
 
 #[derive(Clone)]
 pub struct IcebergConnectorReadWireAdapter<P>
@@ -123,7 +127,7 @@ where
             MAX_PRIVATE_RETAINED_BYTES,
             MAX_PRIVATE_READ_BYTES,
             1_000_000,
-            64,
+            MAX_PRIVATE_CARRIER_DEPTH,
         )
         .expect("Iceberg read decode limits are finite and non-zero")
     }

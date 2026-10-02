@@ -158,6 +158,7 @@ pub struct IcebergTableHandle {
     read_domain: Option<Arc<crate::delete_semantics::ReadDomain>>,
     table_schema_json: Arc<str>,
     scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
+    field_domains: crate::field_domain::PersistedFieldDomains,
     spec_id: Option<i32>,
     partition_spec_jsons: BTreeMap<i32, String>,
     format_version: i32,
@@ -213,8 +214,7 @@ impl IcebergTableHandle {
         // Parsing here is the fail-fast point: a handle that cannot be turned
         // back into a schema would only fail later, on a worker, after the
         // split has already been scheduled.
-        let schema = serde_json::from_str::<Schema>(&table_schema_json)
-            .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
+        let schema = super::column_handle::parse_schema(&table_schema_json)?;
 
         if table_location.is_empty() || table_location.len() > MAX_PATH_BYTES {
             return Err(invalid(
@@ -300,6 +300,7 @@ impl IcebergTableHandle {
             read_domain,
             table_schema_json: Arc::from(table_schema_json.as_str()),
             scalar_integer_domains: BTreeMap::new(),
+            field_domains: crate::field_domain::PersistedFieldDomains::None,
             spec_id,
             partition_spec_jsons,
             format_version,
@@ -380,8 +381,166 @@ impl IcebergTableHandle {
                 ));
             }
         }
+        self.field_domains = if domains.is_empty() {
+            crate::field_domain::PersistedFieldDomains::None
+        } else {
+            crate::field_domain::PersistedFieldDomains::LegacyTopIntegerV1(
+                domains
+                    .iter()
+                    .map(|(id, value)| {
+                        (
+                            *id,
+                            match value {
+                                crate::scalar_integer_domain::ScalarIntegerDomain::Int8 => {
+                                    crate::field_domain::FieldDomain::Int8
+                                }
+                                crate::scalar_integer_domain::ScalarIntegerDomain::Int16 => {
+                                    crate::field_domain::FieldDomain::Int16
+                                }
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        super::column_handle::validate_frozen_column_domains(
+            &schema,
+            self.projected_columns
+                .iter()
+                .chain(
+                    self.unenforced_predicate
+                        .domains()
+                        .into_iter()
+                        .flat_map(|m| m.keys()),
+                )
+                .chain(
+                    self.enforced_predicate
+                        .domains()
+                        .into_iter()
+                        .flat_map(|m| m.keys()),
+                ),
+            &self.field_domains,
+        )?;
         self.scalar_integer_domains = domains;
         Ok(self)
+    }
+
+    pub(crate) fn with_field_domains(
+        mut self,
+        declarations: crate::field_domain::PersistedFieldDomains,
+    ) -> Result<Self, ConnectorError> {
+        use crate::field_domain::PersistedFieldDomains;
+        match &declarations {
+            PersistedFieldDomains::None => {
+                return self.with_scalar_integer_domains(BTreeMap::new());
+            }
+            PersistedFieldDomains::LegacyTopIntegerV1(fields) => {
+                let domains = fields
+                    .iter()
+                    .map(|(id, domain)| {
+                        domain.integer().map(|d| (*id, d)).ok_or_else(|| {
+                            invalid("legacy integer relation contains a noninteger domain")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                return self.with_scalar_integer_domains(domains);
+            }
+            PersistedFieldDomains::FieldDomainsV1(fields) => {
+                let schema = self.parse_table_schema()?;
+                if crate::field_domain::active(&schema, fields)? != *fields {
+                    return Err(invalid(
+                        "relation field declarations are outside its exact selected schema",
+                    ));
+                }
+                crate::field_domain::encode(fields)?;
+                super::column_handle::validate_frozen_column_domains(
+                    &schema,
+                    self.projected_columns
+                        .iter()
+                        .chain(
+                            self.unenforced_predicate
+                                .domains()
+                                .into_iter()
+                                .flat_map(|m| m.keys()),
+                        )
+                        .chain(
+                            self.enforced_predicate
+                                .domains()
+                                .into_iter()
+                                .flat_map(|m| m.keys()),
+                        ),
+                    &declarations,
+                )?;
+                if self
+                    .unenforced_predicate
+                    .domains()
+                    .into_iter()
+                    .chain(self.enforced_predicate.domains())
+                    .flat_map(|m| m.keys())
+                    .any(|column| {
+                        column.field_domain() == Some(crate::field_domain::FieldDomain::Json)
+                    })
+                {
+                    return Err(invalid(
+                        "JSON field cannot carry an unproved Iceberg storage predicate",
+                    ));
+                }
+                self.scalar_integer_domains = fields
+                    .iter()
+                    .filter_map(|(id, domain)| domain.integer().map(|d| (*id, d)))
+                    .collect();
+            }
+        }
+        self.field_domains = declarations;
+        Ok(self)
+    }
+
+    pub(crate) fn persisted_field_domains(&self) -> &crate::field_domain::PersistedFieldDomains {
+        &self.field_domains
+    }
+    pub(crate) fn field_domains_json(&self) -> Option<String> {
+        match &self.field_domains {
+            crate::field_domain::PersistedFieldDomains::FieldDomainsV1(fields) => {
+                Some(crate::field_domain::encode(fields).expect("validated bounded field domains"))
+            }
+            _ => None,
+        }
+    }
+    pub(crate) fn decode_wire_field_domains(
+        legacy: &BTreeMap<i32, String>,
+        formal: Option<&str>,
+    ) -> Result<crate::field_domain::PersistedFieldDomains, ConnectorError> {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        if let Some(raw) = formal {
+            if !legacy.is_empty() {
+                return Err(invalid("relation contains two field-domain authorities"));
+            }
+            Ok(PersistedFieldDomains::FieldDomainsV1(
+                crate::field_domain::decode(raw)?,
+            ))
+        } else {
+            let fields = legacy
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        *id,
+                        match crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)? {
+                            crate::scalar_integer_domain::ScalarIntegerDomain::Int8 => {
+                                FieldDomain::Int8
+                            }
+                            crate::scalar_integer_domain::ScalarIntegerDomain::Int16 => {
+                                FieldDomain::Int16
+                            }
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, ConnectorError>>()?;
+            Ok(if fields.is_empty() {
+                PersistedFieldDomains::None
+            } else {
+                PersistedFieldDomains::LegacyTopIntegerV1(fields)
+            })
+        }
     }
 
     pub(crate) fn scalar_integer_domains(
@@ -436,8 +595,7 @@ impl IcebergTableHandle {
 
     /// The frozen table schema this handle pins.
     pub fn parse_table_schema(&self) -> Result<Schema, ConnectorError> {
-        serde_json::from_str::<Schema>(&self.table_schema_json)
-            .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))
+        super::column_handle::parse_schema(&self.table_schema_json)
     }
 
     /// One of the partition specs the pinned snapshot may reference.
@@ -511,11 +669,12 @@ impl IcebergTableHandle {
         let mut unenforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut remaining: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         for (column, domain) in summary_domains {
+            if column.field_domain() == Some(crate::field_domain::FieldDomain::Json) {
+                remaining.insert(column.clone(), domain.clone());
+                continue;
+            }
             if column.scalar_integer_domain()
-                != self
-                    .scalar_integer_domains
-                    .get(&column.base_field_id())
-                    .copied()
+                != self.scalar_integer_domains.get(&column.field_id()).copied()
                 || column
                     .scalar_integer_domain()
                     .is_some_and(|declaration| domain.value_type() != declaration.value_type())
@@ -573,18 +732,7 @@ impl IcebergTableHandle {
 
         let mut handle = self.clone();
         handle.projected_columns = assignments.projected_column_set();
-        for column in &handle.projected_columns {
-            if column.scalar_integer_domain()
-                != handle
-                    .scalar_integer_domains
-                    .get(&column.base_field_id())
-                    .copied()
-            {
-                return Err(invalid(
-                    "Iceberg projection differs from its frozen scalar integer declaration",
-                ));
-            }
-        }
+        handle = handle.with_field_domains(self.field_domains.clone())?;
 
         Ok(ProjectionApplicationResult::new(
             handle,
@@ -639,11 +787,15 @@ impl IcebergTableHandle {
                 .map(|value| value.to_string()),
             table_location: self.table_location.to_string(),
             storage_properties: self.storage_properties.clone(),
-            scalar_integer_domains: self
-                .scalar_integer_domains
-                .iter()
-                .map(|(id, domain)| (*id, domain.name().to_string()))
-                .collect(),
+            scalar_integer_domains: if self.field_domains_json().is_some() {
+                BTreeMap::new()
+            } else {
+                self.scalar_integer_domains
+                    .iter()
+                    .map(|(id, domain)| (*id, domain.name().to_string()))
+                    .collect()
+            },
+            field_domains_json: self.field_domains_json(),
             pinned_data_files: self
                 .pinned_data_files
                 .as_ref()
@@ -652,6 +804,10 @@ impl IcebergTableHandle {
     }
 
     pub fn from_proto(raw: &dto::IcebergTableHandle) -> Result<Self, ConnectorError> {
+        let declarations = Self::decode_wire_field_domains(
+            &raw.scalar_integer_domains,
+            raw.field_domains_json.as_deref(),
+        )?;
         let schema_table_name = raw
             .schema_table_name
             .as_ref()
@@ -702,17 +858,7 @@ impl IcebergTableHandle {
                 .map(IcebergPinnedDataFileSet::from_proto)
                 .transpose()?,
         })?
-        .with_scalar_integer_domains(
-            raw.scalar_integer_domains
-                .iter()
-                .map(|(id, value)| {
-                    Ok((
-                        *id,
-                        crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)?,
-                    ))
-                })
-                .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
-        )
+        .with_field_domains(declarations)
     }
 }
 
@@ -900,6 +1046,142 @@ pub(super) mod tests {
             .expect("value set"),
             false,
         )
+    }
+
+    #[test]
+    fn formal_relation_rejects_marker_loss_and_retains_empty_authority() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        let schema = partitioned_schema();
+        let domains =
+            PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([(2, FieldDomain::Json)]));
+        let column = IcebergColumnHandle::base_column_of(&schema, 2)
+            .unwrap()
+            .with_table_field_domains(&domains)
+            .unwrap();
+        let mut params = table_handle_params(&schema, None);
+        params.projected_columns.insert(column);
+        let handle = IcebergTableHandle::try_new(params)
+            .unwrap()
+            .with_field_domains(domains)
+            .unwrap();
+        let mut raw = handle.to_proto();
+        assert_eq!(IcebergTableHandle::from_proto(&raw).unwrap(), handle);
+        raw.projected_columns[0].field_domains_json = None;
+        assert!(IcebergTableHandle::from_proto(&raw).is_err());
+        let mut raw = handle.to_proto();
+        raw.field_domains_json = None;
+        assert!(IcebergTableHandle::from_proto(&raw).is_err());
+        let empty = IcebergTableHandle::try_new(table_handle_params(&schema, None))
+            .unwrap()
+            .with_field_domains(PersistedFieldDomains::FieldDomainsV1(BTreeMap::new()))
+            .unwrap();
+        assert!(empty.to_proto().field_domains_json.is_some());
+        assert_eq!(
+            IcebergTableHandle::from_proto(&empty.to_proto()).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
+    fn formal_relation_rejects_same_id_fake_type_and_accepts_exact_history_schema() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        let schema = Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![StdArc::new(NestedField::optional(
+                1,
+                "n",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let declarations =
+            PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([(1, FieldDomain::Int8)]));
+        let mut params = table_handle_params(&schema, None);
+        params.projected_columns.insert(
+            IcebergColumnHandle::base_column_of(&schema, 1)
+                .unwrap()
+                .with_table_field_domains(&declarations)
+                .unwrap(),
+        );
+        let handle = IcebergTableHandle::try_new(params)
+            .unwrap()
+            .with_field_domains(declarations)
+            .unwrap();
+        assert_eq!(
+            IcebergTableHandle::from_proto(&handle.to_proto()).unwrap(),
+            handle
+        );
+        let mut wrong = handle.to_proto();
+        wrong.projected_columns[0].base_type_json = "\"long\"".into();
+        wrong.projected_columns[0].type_json = "\"long\"".into();
+        wrong.projected_columns[0].field_domains_json =
+            Some("{\"version\":1,\"fields\":{}}".into());
+        assert!(IcebergTableHandle::from_proto(&wrong).is_err());
+        let mut wrong = handle.to_proto();
+        wrong.projected_columns[0]
+            .base_column_identity
+            .as_mut()
+            .unwrap()
+            .field_id = 999;
+        wrong.projected_columns[0].field_domains_json =
+            Some("{\"version\":1,\"fields\":{}}".into());
+        assert!(IcebergTableHandle::from_proto(&wrong).is_err());
+        // A promoted selected historical INT32 field has no active narrow claim;
+        // its precise LONG carrier remains accepted without inferring Int8.
+        let promoted = Schema::builder()
+            .with_schema_id(8)
+            .with_fields(vec![StdArc::new(NestedField::optional(
+                1,
+                "n",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let empty = PersistedFieldDomains::FieldDomainsV1(BTreeMap::new());
+        let mut params = table_handle_params(&promoted, None);
+        params.projected_columns.insert(
+            IcebergColumnHandle::base_column_of(&promoted, 1)
+                .unwrap()
+                .with_table_field_domains(&empty)
+                .unwrap(),
+        );
+        let handle = IcebergTableHandle::try_new(params)
+            .unwrap()
+            .with_field_domains(empty)
+            .unwrap();
+        assert_eq!(
+            IcebergTableHandle::from_proto(&handle.to_proto()).unwrap(),
+            handle
+        );
+    }
+
+    #[test]
+    fn json_storage_predicate_is_returned_to_engine_without_pushdown() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        let schema = partitioned_schema();
+        let domains =
+            PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([(2, FieldDomain::Json)]));
+        let column = IcebergColumnHandle::base_column_of(&schema, 2)
+            .unwrap()
+            .with_table_field_domains(&domains)
+            .unwrap();
+        let handle = IcebergTableHandle::try_new(table_handle_params(
+            &schema,
+            Some(&identity_partition_spec(&schema)),
+        ))
+        .unwrap()
+        .with_field_domains(domains)
+        .unwrap();
+        let predicate = TupleDomain::with_column_domains(BTreeMap::from([(
+            column,
+            Domain::new(ValueSet::all(ConnectorValueType::Varchar), false),
+        )]))
+        .unwrap();
+        let result = handle
+            .apply_filter(&Constraint::of_summary(predicate.clone()))
+            .unwrap();
+        assert_eq!(result.remaining_filter(), &predicate);
+        assert!(result.handle().effective_predicate().unwrap().is_all());
     }
 
     #[test]

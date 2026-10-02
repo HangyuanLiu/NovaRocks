@@ -584,7 +584,7 @@ impl ConnectorMetadata for IcebergMetadata {
         let definition_schema = metadata.current_schema().clone();
         let table_comment = metadata.properties().get("comment").cloned();
         let mut base_schema =
-            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+            crate::field_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
         let hidden_columns = hidden_internal_columns(metadata.properties());
         base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
         // Carry the same frozen field facts a scan output schema carries, so the
@@ -1450,11 +1450,11 @@ pub(crate) fn projected_schema(
     } else {
         metadata.current_schema().clone()
     };
-    let declarations = crate::scalar_integer_domain::metadata_declarations(&metadata)?;
-    let storage = crate::scalar_integer_domain::apply_schema(
+    let declarations = crate::field_domain::metadata_declarations(&metadata)?;
+    let storage = crate::field_domain::apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(&storage_schema).map_err(corrupt)?,
         &storage_schema,
-        &declarations,
+        declarations.fields(),
     )?;
     // Field IDs survive the Arrow conversion but initial defaults do not, so the
     // frozen schema has to re-stamp them before the scan schema leaves the

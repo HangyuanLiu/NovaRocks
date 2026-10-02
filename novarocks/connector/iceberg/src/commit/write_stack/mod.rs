@@ -52,7 +52,6 @@ pub mod old_delete;
 pub mod planning;
 pub(crate) mod repartition;
 pub(crate) mod runtime;
-mod schema_preflight;
 
 #[cfg(test)]
 pub(crate) mod test_support;

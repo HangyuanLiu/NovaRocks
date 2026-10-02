@@ -223,7 +223,7 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::WriteTable, 1..=6) => Some(singular(F::Text)),
         (M::WriteTable, 7..=11) => Some(singular(F::Varint)),
         (M::WriterOutput, 1..=3) => Some(singular(F::Varint)),
-        (M::DataRecipe, 1) => Some(singular(F::Text)),
+        (M::DataRecipe, 1 | 6) => Some(singular(F::Text)),
         (M::DataRecipe, 2..=4) => Some(repeated(F::Text)),
         (M::DataRecipe, 5) => Some(singular(F::Varint)),
 
@@ -680,6 +680,18 @@ fn validate_data_recipe(
             false,
         )?;
     }
+    let domains = recipe.field_domains_json.as_deref().ok_or_else(|| {
+        missing(
+            path.field("field_domains_json"),
+            "writer requires frozen field domains",
+        )
+    })?;
+    bounded_text(
+        domains,
+        crate::field_domain::MAX_BYTES,
+        path.field("field_domains_json"),
+        false,
+    )?;
     bounded_count(
         recipe.partition_source_column_names.len(),
         MAX_PARTITION_COLUMNS,

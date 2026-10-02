@@ -21,6 +21,7 @@
 //! facts before they diverge into their own field-signing rules. Keeping the
 //! shared resolution here stops the two paths from drifting apart.
 
+#[cfg(test)]
 use arrow::datatypes::Field;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorWriteFieldRequest};
 
@@ -74,11 +75,12 @@ pub(crate) fn exact_requested_write_fields_at_schema(
                 "convert frozen Iceberg write schema to Arrow: {error}"
             ))
         })?;
-    let arrow_schema = crate::scalar_integer_domain::apply_schema(
+    let arrow_schema = crate::field_domain::apply_schema(
         arrow_schema,
         iceberg_schema,
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        crate::field_domain::metadata_declarations(metadata)?.fields(),
     )?;
+    let legacy_root_markers = crate::metadata::logical_type_columns(metadata.properties());
     requested
         .iter()
         .map(|request| {
@@ -95,12 +97,18 @@ pub(crate) fn exact_requested_write_fields_at_schema(
                     ))
                 })?;
             let arrow_field = arrow_schema.field(ordinal);
-            let data_type = arrow_field.data_type().clone();
-            Ok(ConnectorWriteFieldRequest::new(Field::new(
-                &iceberg_field.name,
-                data_type,
-                !iceberg_field.required,
-            )))
+            // Root markers (JSON/Bitmap/Hll) are part of the signed Field, not
+            // merely its Arrow storage type. Preserve child facts and metadata.
+            let mut exact = arrow_field.clone().with_name(&iceberg_field.name)
+                .with_nullable(!iceberg_field.required);
+            if let Some(marker) = legacy_root_markers.get(&iceberg_field.name.to_ascii_lowercase()) {
+                let mut tags = exact.metadata().clone();
+                tags.insert("nr_logical_type".into(), marker.clone());
+                exact = exact.with_metadata(tags);
+            }
+            novarocks_types::logical_type::logical_field_from_engine_arrow(&exact)
+                .map_err(invalid_write_activation)?;
+            Ok(ConnectorWriteFieldRequest::new(exact))
         })
         .collect()
 }
@@ -238,5 +246,91 @@ mod tests {
             panic!("read map")
         };
         assert!(key.nullable);
+    }
+    #[test]
+    fn exact_write_fields_keep_root_json_bitmap_hll_and_nested_domain_markers() {
+        use crate::field_domain::FieldDomain;
+        let initial = metadata(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "j",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "b",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::optional(
+                3,
+                "h",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::optional(
+                4,
+                "record",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::optional(
+                        5,
+                        "j",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        6,
+                        "n",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                ])),
+            )),
+        ]);
+        let schema = initial.current_schema();
+        let j = schema.field_by_name("j").unwrap().id;
+        let nested_json = schema.field_by_name("record.j").unwrap().id;
+        let nested_int = schema.field_by_name("record.n").unwrap().id;
+        let domains = std::collections::BTreeMap::from([
+            (j, FieldDomain::Json),
+            (nested_json, FieldDomain::Json),
+            (nested_int, FieldDomain::Int16),
+        ]);
+        let table = initial
+            .into_builder(None)
+            .set_properties(std::collections::HashMap::from([
+                (
+                    crate::field_domain::PROPERTY.into(),
+                    crate::field_domain::encode(&domains).unwrap(),
+                ),
+                ("novarocks.logical_type.b".into(), "bitmap".into()),
+                ("novarocks.logical_type.h".into(), "hll".into()),
+            ]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let requests = ["j", "b", "h", "record"]
+            .into_iter()
+            .map(|name| ConnectorWriteFieldRequest::new(Field::new(name, DataType::Null, true)))
+            .collect::<Vec<_>>();
+        let resolved = exact_requested_write_fields(&table, &requests).unwrap();
+        for (field, marker) in resolved.iter().zip(["json", "bitmap", "hll"]) {
+            assert_eq!(
+                field
+                    .field()
+                    .metadata()
+                    .get("nr_logical_type")
+                    .map(String::as_str),
+                Some(marker)
+            );
+        }
+        let DataType::Struct(children) = resolved[3].field().data_type() else {
+            unreachable!()
+        };
+        assert_eq!(
+            children[0]
+                .metadata()
+                .get("nr_logical_type")
+                .map(String::as_str),
+            Some("json")
+        );
+        assert_eq!(children[1].data_type(), &DataType::Int16);
     }
 }
