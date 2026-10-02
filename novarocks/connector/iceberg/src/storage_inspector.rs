@@ -601,6 +601,7 @@ fn target_observation(
     }
     let mut budget = 0_usize;
     let logical_fields = crate::schema_mapping::exact_logical_fields(table).map_err(corrupt)?;
+    let domains = crate::field_domain::metadata_declarations(table)?;
     let fields = schema
         .as_struct()
         .fields()
@@ -612,7 +613,8 @@ fn target_observation(
             let usage = logical_type.validate(Default::default()).map_err(corrupt)?;
             reserve_bytes(context, &mut budget, usage.nodes * 128 + usage.text_bytes)?;
             let provider_type_binding =
-                crate::schema_mapping::exact_provider_type_binding(field).map_err(corrupt)?;
+                crate::field_domain::exact_provider_type_binding(field, domains.fields())
+                    .map_err(corrupt)?;
             reserve_bytes(context, &mut budget, provider_type_binding.len())?;
             let legacy_scalar_type = crate::schema_mapping::legacy_scalar_type(field);
             if let Some(legacy) = &legacy_scalar_type {
@@ -1142,6 +1144,73 @@ mod tests {
         assert!(observed.partition.fields.is_empty());
         assert!(!observed.format_v3);
         assert!(!observed.explicit_row_lineage_enabled);
+    }
+
+    #[test]
+    fn target_projection_matches_prepared_field_domain_bindings() {
+        use crate::iceberg::spec::ListType;
+        use novarocks_types::logical_type::LogicalType;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "js", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(2, "tiny", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    3,
+                    "items",
+                    Type::List(ListType::new(
+                        NestedField::optional(4, "element", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let table = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///domain-target-observation".into(),
+            FormatVersion::V3,
+            HashMap::from([(
+                crate::field_domain::PROPERTY.into(),
+                r#"{"version":1,"fields":{"1":"json","2":"tinyint","4":"json"}}"#.into(),
+            )]),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let domains = crate::field_domain::metadata_declarations(&table).unwrap();
+        let observed = target_observation(&table, &context(16 * 1024)).unwrap();
+        assert_eq!(observed.fields[0].logical_type, LogicalType::Json);
+        assert_eq!(observed.fields[1].logical_type, LogicalType::Int8);
+        for (field, projected) in table
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .zip(&observed.fields)
+        {
+            // Staged CREATE freezes this same field-domain binding. The later
+            // inspector must emit it unchanged from the exact table generation.
+            assert_eq!(
+                projected.provider_type_binding,
+                crate::field_domain::exact_provider_type_binding(field, domains.fields()).unwrap()
+            );
+            let old = crate::schema_mapping::exact_provider_type_binding(field).unwrap();
+            if field.name == "tiny" {
+                assert_eq!(projected.provider_type_binding, old);
+            } else {
+                assert_ne!(projected.provider_type_binding, old);
+                assert!(
+                    projected
+                        .provider_type_binding
+                        .starts_with(b"novarocks.iceberg.exact-field-domains.v1:")
+                );
+            }
+        }
+        assert!(target_observation(&table, &context(128)).is_err());
     }
 
     #[test]
