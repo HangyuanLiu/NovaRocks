@@ -1,0 +1,15 @@
+# P04：Statistics 源头事前增长与真实 Host 接线
+
+parent `cbe98cb65c73d066d13919893064a3d530d351a8`。本地行为切片；P04仍executing。其余InternalFacts codec、FE assembly/collector、Native listener/lane/H2独立副本及P05–P10未闭合，V1未advertise；没有候选分布式或性能验收结论。Linux正式测试按用户安排后续手动执行。当前desktop-linux fixture完整BOM通过，无缺image/JAR。
+
+Statistics准确frozen用途选择最后Unpivot的专用materializer；普通Unpivot继续原路径。output_schema按真实输出名称/次序编码，Arrow physical decoder直接创建fresh metadata owner，准确Schema/Field Arc与nested来源穿过ChunkSchema和LocalProgram；借用整张schema的无分配预检及标准Buffer固定metadata的静态保守上界在任何增长前可用。通用decoder原16MiB语义可接受范围保持：65552-field以及原语义界内但实际metadata table超过旧2倍估算的反例均通过；新表容量使用有来源的独立保守界。没有unknown map normalize或结构相等继承。
+
+最终四列batch的7个预分配buffer、11个最终Buffer metadata owner、数组/Map inline Struct/Vec spare、准确schema/index、Chunk/RecordBatch与共同workspace都在同一原RootInputPermit覆盖下预检，最大32MiB。单body≤16MiB、累计body≤128MiB、rows≤4096、声明metadata≤16MiB。上游宽aggregate保持原MEM owner，可超过32MiB；最终batch先定界再分割，无事后IPC探针或候选复制。真实borrowed storage oracle验证最终carrier没有超出预检容量。字段IDs为准确正唯一列表，blob为非空UTF8常量，properties准确空Map。
+
+最大batch32行。sizing按直接ordinal借用数据；复制每turn保守计入源读/写及固定lookup，examined≤64KiB/work≤1024；完成复制仍Yielded，下一turn单独执行有限offset/array finalization，同generation原grant持续覆盖workspace。UTF8 unchecked constructor仅复用immutable Rust str的原字节，并在整条字符串复制完成后写monotone offset；避免全concat重扫。production Arrow feature closure没有force_validate或pool，该结论有cargo-tree日志。数组使用原List item/Map entries/children Field Arc，取消先退出真实input/workspace再还grant。
+
+真实wire Unpivot→Host preparation→LocalProgram→driver→protected source→session→Worker context生成精确STA1 golden。root Finished不等任何ACK，context继续留存结果。原session累计domain totals跨batch，2MiB scratch在cursor/columns Vec创建前预授；满两段窗口暂停同一原input，cancel以实际Weak backing退出验证。错误用途与32MiB-1 frozen bounds拒绝，不能悄悄选generic Unpivot。
+
+Host prepare-error初版测试曾把逻辑错误返回等同物理容量立即释放：广泛Host测试63pass/1fail，原样单跑通过。代码核验RootResultRegistration rollback→session.abort→pool wake获得worker pin，真实释放晚于run()最后pin销毁。最终测试先断言无TaskRuntime，再join实际worker，要求除保留不变的pool固定信用外全部容量可用；没有放宽容量或增加slack。完整Host64通过。metadata来源fixture的等值foreign Field Arc明确拒绝；Weak fixture最初用retag构造产生新Arc，已修为直接RecordBatch观察真实原owner，历史日志保留。
+
+验证与负向mutation的命令、源码hash、原始/gzip日志hash见index.json；原版缺finalization Yielded、关闭protected source选择、丢失wire来源证明的mutant都真实失败并逐字节恢复。final batch32再次运行finalization mutant失败。初次Types过滤命令实际0 tests，不能计为通过；最终Types全lib92通过。Execution全lib1535、ProtoCodec69、PlanCodec34、Host64、Native integration31、wire来源1通过（子集不重复计）；workspace all-target check、五包all-target Clippy（既有warning）、fmt/diff通过。完整切换后的最终同SHA macOS 1FE+3BE SQL/system CI仍在后续阶段。

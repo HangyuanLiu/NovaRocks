@@ -9,3 +9,5 @@ Buffer::standard_allocation_capacity() forwards the private Bytes allocation des
 ## 2. Fixed metadata of a closed standard owner
 
 Buffer::standard_owner_metadata_size() reads the known fixed Bytes type size plus conservative Arc header/alignment. Unpooled Standard returns Some; Custom or a pool-enabled build returns None because an opaque deallocator/reservation can retain additional objects. This additive getter never locks/invokes an opaque owner and does not change standard_allocation_capacity() or capacity(). Source receipts remain necessary for unknown owners.
+
+Buffer::standard_unpooled_owner_metadata_capacity() exposes the same conservative fixed bound before allocation. The borrowed Standard query delegates to this static bound. A pool-enabled build returns None; the static method does not certify any existing Custom buffer or its backing.

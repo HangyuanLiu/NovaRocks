@@ -811,9 +811,23 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) => {
                 if matches!(
                     contract.kind(),
-                    novarocks_result_contract::RootOutputKind::InternalFacts(_)
+                    novarocks_result_contract::RootOutputKind::InternalFacts(domain) if domain != novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1
                 ) {
                     return Err(protocol("explicit internal root codec is not installed"));
+                }
+                let local_program = submission.program().local_program();
+                if contract.kind()
+                    == novarocks_result_contract::RootOutputKind::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+                    )
+                    && !matches!(
+                        local_program.nodes()[local_program.root().index()].kind(),
+                        novarocks_local_program::ProgramNodeKind::Unpivot { .. }
+                    )
+                {
+                    return Err(protocol(
+                        "StatisticsArtifactV1 requires its bounded final Unpivot source",
+                    ));
                 }
                 let channel = novarocks_worker::root_result_channel::RootResultChannel::try_open(
                     novarocks_execution::runtime::fragment::io::RootResultWriteSpec {
@@ -1890,6 +1904,122 @@ mod tests {
             }));
             body
         }
+        fn bounded_statistics() -> Self {
+            use arrow::datatypes::{DataType, Field, Schema};
+            use novarocks_proto_models::{common, expr};
+            let mut body = Self::bounded_root(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+                ),
+                &[1],
+            );
+            let root = body.frozen.plan.as_mut().unwrap().root.as_mut().unwrap();
+            let mut child = root.clone();
+            child.node_id = 9;
+            let Some(plan::distributed_node::Payload::Physical(physical)) = child.payload.as_mut()
+            else {
+                unreachable!()
+            };
+            let binary = novarocks_plan_codec::encode_native_type(&DataType::Binary).unwrap();
+            let column = common::OutputColumn {
+                column_id: 10,
+                name: "aggregate".into(),
+                r#type: Some(binary.clone()),
+                nullable: false,
+                is_internal: false,
+            };
+            physical.output_columns = vec![column.clone()];
+            physical.kind = Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                columns: vec![column],
+                rows: vec![plan::ExprList {
+                    values: vec![expr::Expr {
+                        r#type: Some(binary),
+                        nullable: false,
+                        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                            value: Some(common::LiteralValue {
+                                value: Some(common::literal_value::Value::BinaryValue(vec![
+                                    255, 0, 3,
+                                ])),
+                            }),
+                        })),
+                    }],
+                }],
+            }));
+            let label = expr::Expr {
+                r#type: Some(novarocks_plan_codec::encode_native_type(&DataType::Utf8).unwrap()),
+                nullable: false,
+                kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                    value: Some(common::LiteralValue {
+                        value: Some(common::literal_value::Value::StringValue("theta".into())),
+                    }),
+                })),
+            };
+            let entries = Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(Field::new("value", DataType::Utf8, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            ));
+            let schema = Schema::new(vec![
+                Field::new(
+                    "input_fields",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                    false,
+                ),
+                Field::new("blob_type", DataType::Utf8, false),
+                Field::new("body", DataType::Binary, false),
+                Field::new("properties", DataType::Map(entries, false), false),
+            ]);
+            let (columns, schema_metadata) = novarocks_proto_codec::arrow_physical::encode_schema(
+                &schema,
+                &[1, 2, 3, 4],
+                false,
+                FieldPath::root("schema"),
+            )
+            .unwrap();
+            root.children = vec![child];
+            root.payload = Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: Vec::new(),
+                kind: Some(plan::plan_node::Kind::Unpivot(plan::UnpivotNode {
+                    passthrough_columns: Vec::new(),
+                    value_output_column_id: 3,
+                    literal_output_column_ids: vec![1, 2, 4],
+                    value_mappings: vec![plan::UnpivotValueMapping {
+                        input_value_column_id: 10,
+                        constants: vec![
+                            plan::UnpivotConstant {
+                                value: Some(plan::unpivot_constant::Value::Int32List(
+                                    plan::Int32List { values: vec![7] },
+                                )),
+                            },
+                            plan::UnpivotConstant {
+                                value: Some(plan::unpivot_constant::Value::ScalarLiteral(label)),
+                            },
+                            plan::UnpivotConstant {
+                                value: Some(plan::unpivot_constant::Value::Utf8Map(
+                                    plan::Utf8Map {
+                                        entries: Vec::new(),
+                                    },
+                                )),
+                            },
+                        ],
+                    }],
+                    max_output_rows: 4096,
+                    max_output_bytes: 32 << 20,
+                    output_schema: Some(plan::ArrowPhysicalSchema {
+                        columns,
+                        schema_metadata,
+                    }),
+                })),
+            }));
+            body
+        }
+
         /// A decodable, self-contained fragment: one VALUES node into a NOOP
         /// sink, frozen for exactly `pipeline_dop`.
         fn values(pipeline_dop: u32) -> Self {
@@ -4988,6 +5118,118 @@ mod tests {
             ),
         );
         fixture.host.inner.root_producer_pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn bounded_statistics_root_runs_real_wire_decode_driver_and_context_channel() {
+        use novarocks_execution_contract::root_result::RootReadOutcome;
+        use novarocks_result_contract::{InternalResultDomain, RootOutputKind};
+        use novarocks_worker::root_result_channel::ContextRootRoute;
+        let fixture = OwnerFixture::new(91_005);
+        let root = fixture.identity(1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_005, 1));
+        let receipt = fixture.create(&descriptor, &Body::bounded_statistics());
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+        wait_bounded_root_finished(&fixture, root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ContextRootRoute::Read(read) =
+            fixture.registry.context_root_result_route(&bounded_read(
+                root,
+                RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
+            ))
+        else {
+            panic!("finished statistics root absent");
+        };
+        let delivery = runtime.block_on(read.read()).unwrap();
+        let RootReadOutcome::Data(data) = &delivery.reply().outcome else {
+            panic!("statistics root did not encode STA1 bytes");
+        };
+        assert_eq!(
+            data.body().as_ref(),
+            &[
+                83, 84, 65, 49, 36, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 7, 0,
+                0, 0, 116, 104, 101, 116, 97, 255, 0, 3
+            ]
+        );
+        assert!(
+            data.end_after_data()
+                .is_some_and(|end| end.output_rows == 1 && end.sequence.get() == 2)
+        );
+        drop(delivery);
+        fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::QueryFailed,
+            ),
+        );
+        fixture.host.inner.root_producer_pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn statistics_host_refuses_an_unprotected_source_before_channel_installation() {
+        let (host, _) = isolated_resource_host();
+        let root = identity(91_007, 1, 1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_007, 1));
+        let body = Body::bounded_root(
+            novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+            ),
+            &[1],
+        );
+        let error = host
+            .install_receiver(&descriptor, body.input(&descriptor))
+            .unwrap_err();
+        assert_eq!(error.category(), TaskFailureCategory::Protocol);
+        assert!(host.task_runtime(root).is_none());
+        host.root_producer_pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn statistics_host_rejects_a_profile_that_the_generic_unpivot_would_accept() {
+        let (host, _) = isolated_resource_host();
+        let root = identity(91_006, 1, 1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_006, 1));
+        let mut body = Body::bounded_statistics();
+        let node = body.frozen.plan.as_mut().unwrap().root.as_mut().unwrap();
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        else {
+            unreachable!()
+        };
+        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = physical.kind.as_mut() else {
+            unreachable!()
+        };
+        unpivot.max_output_bytes -= 1;
+        let available = host.result_retained_limits.per_process().get()
+            - host.root_producer_pool.reserved_bytes();
+        let reserve_remaining = |phase| {
+            let novarocks_execution::runtime::fragment::io::ResultWriteAdmission::Granted(credit) =
+                host.result_retained_budget
+                    .try_reserve_process(available)
+                    .unwrap()
+            else {
+                panic!("Statistics capacity is still retained {phase}");
+            };
+            drop(credit);
+        };
+        reserve_remaining("before installation");
+        let error = match host.install_receiver(&descriptor, body.input(&descriptor)) {
+            Err(error) => error,
+            Ok(_) => panic!("generic Unpivot must not replace the protected Statistics source"),
+        };
+        assert!(
+            format!("{error:?}")
+                .contains("statistics materializer roles or bounds differ from its frozen domain")
+        );
+        assert!(host.task_runtime(root).is_none());
+        // Prepare rollback activates asynchronous producer cleanup. Joining
+        // proves the last worker pin has exited; shutdown keeps the pool's
+        // original fixed reservation, so the full-capacity oracle is unchanged.
+        host.root_producer_pool.shutdown().unwrap();
+        reserve_remaining("after rollback and physical worker exit");
     }
 
     #[test]

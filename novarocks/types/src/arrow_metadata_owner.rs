@@ -147,8 +147,15 @@ impl ArrowMetadataOwner {
         data_type: DataType,
         nullable: bool,
     ) -> MetadataOwnedField {
+        self.into_field_definition(Field::new(name, data_type, nullable))
+    }
+
+    /// Moves this freshly constructed map into a field definition, preserving
+    /// its physical and dictionary attributes. Any prior map on the definition
+    /// is replaced and receives no provenance receipt.
+    pub fn into_field_definition(self, definition: Field) -> MetadataOwnedField {
         MetadataOwnedField {
-            field: Arc::new(Field::new(name, data_type, nullable).with_metadata(self.metadata)),
+            field: Arc::new(definition.with_metadata(self.metadata)),
             metadata_backing_bytes: self.backing_bytes,
         }
     }

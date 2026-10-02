@@ -24,9 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, Decimal256Array, DictionaryArray, Int32Array, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, Decimal256Array, DictionaryArray, Int32Array, RecordBatch,
+    StringArray,
 };
-use arrow::datatypes::{DataType, Int32Type};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow_buffer::i256;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use novarocks_execution::runtime::fragment::io::{
@@ -715,4 +716,154 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         .expect("fixed metadata did not exit with the callback snapshot");
     assert!(channel.physical_idle());
     shutdown(&pool).await;
+}
+
+// Construct from the real Arrow physical DTO decoder and retain its exact
+// nested Field owners in each List/Map carrier. A borrowed equal schema cannot
+// stand in for this construction provenance.
+fn statistics_chunk(ids: &[i32], blob: &str, body: &[u8]) -> (Chunk, std::sync::Weak<BinaryArray>) {
+    use arrow::array::{ListArray, MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use novarocks_proto_codec::{FieldPath, arrow_physical};
+    let entries = Arc::new(Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::Utf8, false)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let schema = Schema::new(vec![
+        Field::new(
+            "input_fields",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+            false,
+        ),
+        Field::new("blob_type", DataType::Utf8, false),
+        Field::new("body", DataType::Binary, true),
+        Field::new("properties", DataType::Map(entries, false), false),
+    ]);
+    let (wire, metadata) =
+        arrow_physical::encode_schema(&schema, &[1, 2, 3, 4], false, FieldPath::root("schema"))
+            .unwrap();
+    let decoded =
+        arrow_physical::decode_schema(&wire, &metadata, FieldPath::root("schema")).unwrap();
+    let chunk_schema = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+        decoded.schema_metadata_origin(),
+        decoded.field_metadata_origins(),
+        &[
+            SlotId::new(1),
+            SlotId::new(2),
+            SlotId::new(3),
+            SlotId::new(4),
+        ],
+    )
+    .unwrap();
+    let DataType::List(item) = decoded.schema().field(0).data_type() else {
+        panic!("list");
+    };
+    let DataType::Map(entries, false) = decoded.schema().field(3).data_type() else {
+        panic!("map");
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        panic!("entries");
+    };
+    let empty = || Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+    let body_array = Arc::new(BinaryArray::from_iter_values([body]));
+    let weak = Arc::downgrade(&body_array);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(ListArray::new(
+            item.clone(),
+            OffsetBuffer::new(vec![0, ids.len() as i32].into()),
+            Arc::new(Int32Array::from(ids.to_vec())),
+            None,
+        )),
+        Arc::new(StringArray::from(vec![blob])),
+        body_array,
+        Arc::new(MapArray::new(
+            entries.clone(),
+            OffsetBuffer::new(vec![0, 0].into()),
+            StructArray::new(fields.clone(), vec![empty(), empty()], None),
+            None,
+            false,
+        )),
+    ];
+    let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns).unwrap();
+    (
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap(),
+        weak,
+    )
+}
+
+#[tokio::test]
+async fn statistics_domain_emits_exact_opaque_records_across_two_original_inputs() {
+    use novarocks_result_contract::InternalResultDomain;
+    let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
+        InternalResultDomain::StatisticsArtifactV1,
+    ));
+    let (chunk, weak) = statistics_chunk(&[9, 7], "é", &[0, 255, 65]);
+    fixture
+        .session
+        .submit_input(chunk, input(&fixture.session).await)
+        .unwrap();
+    let second_permit = input(&fixture.session).await;
+    assert!(weak.upgrade().is_none());
+    let first = read(&fixture.channel, Some(1), 0).await;
+    assert_eq!(
+        body(&first),
+        &[
+            83, 84, 65, 49, 37, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0,
+            0, 7, 0, 0, 0, 195, 169, 0, 255, 65
+        ]
+    );
+    drop(first);
+    let (chunk, _) = statistics_chunk(&[3], "x", &[]);
+    fixture.session.submit_input(chunk, second_permit).unwrap();
+    fixture.session.finish_input().unwrap();
+    wait_until(|| fixture.session.producer_exited()).await;
+    let second = read(&fixture.channel, Some(2), 1).await;
+    assert_eq!(
+        body(&second),
+        &[
+            83, 84, 65, 49, 29, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0,
+            0, 120
+        ]
+    );
+    drop(second);
+    assert_end(&read(&fixture.channel, Some(3), 2).await, 3, 2);
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
+async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_backing() {
+    use novarocks_result_contract::InternalResultDomain;
+    let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
+        InternalResultDomain::StatisticsArtifactV1,
+    ));
+    let body_bytes = vec![0xf3; 3 << 20];
+    let (chunk, weak) = statistics_chunk(&[1], "theta", &body_bytes);
+    fixture
+        .session
+        .submit_input(chunk, input(&fixture.session).await)
+        .unwrap();
+    wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
+    assert!(!fixture.session.producer_exited());
+    assert!(weak.upgrade().is_some());
+    let first = read(&fixture.channel, Some(1), 0).await;
+    assert_eq!(&body(&first)[..4], b"STA1");
+    assert_eq!(body(&first).len(), 1 << 20);
+    drop(first);
+    fixture.session.abort(ResultAbort::Cancelled(
+        "cancel statistics continuation".into(),
+    ));
+    wait_until(|| fixture.session.producer_exited()).await;
+    assert!(weak.upgrade().is_none());
+    assert!(matches!(
+        fixture.session.producer_state(),
+        RootProducerState::Failed(_)
+    ));
+    shutdown(&fixture.pool).await;
 }

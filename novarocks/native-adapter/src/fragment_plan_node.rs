@@ -1511,14 +1511,17 @@ fn decode_unpivot_output_schema(
         .copied()
         .map(SlotId::new)
         .collect::<Vec<_>>();
-    ChunkSchema::try_ref_from_schema_and_slot_ids(decoded.schema().as_ref(), &slot_ids).map_err(
-        |error| {
-            NativeFragmentDecodeError::invalid_value(
-                path.clone().field("columns"),
-                format!("UnpivotNode output schema: {error}"),
-            )
-        },
+    ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+        decoded.schema_metadata_origin(),
+        decoded.field_metadata_origins(),
+        &slot_ids,
     )
+    .map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            path.clone().field("columns"),
+            format!("UnpivotNode output schema: {error}"),
+        )
+    })
 }
 
 pub fn decode_unpivot_constant(
@@ -3191,6 +3194,99 @@ mod tests {
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
     use novarocks_proto_models::plan;
     use novarocks_types::SlotId;
+
+    #[test]
+    fn unpivot_physical_decode_retains_nested_metadata_origins_through_local_program() {
+        use novarocks_execution::exec::chunk::{
+            RootArrayStorageLimits, borrowed_root_chunk_schema_storage, borrowed_root_chunk_storage,
+        };
+        use novarocks_execution::exec::expr::ExprArena;
+        use novarocks_execution::exec::node::ExecPlan;
+        use novarocks_local_program::StaticSinkProgram;
+        use novarocks_proto_codec::arrow_physical;
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let schema = arrow::datatypes::Schema::new(vec![
+            Field::new(
+                "input_fields",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                false,
+            ),
+            Field::new("blob_type", DataType::Utf8, false),
+            Field::new("body", DataType::Binary, false),
+            Field::new("properties", DataType::Map(entries, false), false),
+        ]);
+        let (columns, schema_metadata) =
+            arrow_physical::encode_schema(&schema, &[1, 2, 3, 4], false, FieldPath::root("schema"))
+                .unwrap();
+        let wire = plan::ArrowPhysicalSchema {
+            columns,
+            schema_metadata,
+        };
+        let source =
+            super::decode_unpivot_output_schema(Some(&wire), FieldPath::root("unpivot")).unwrap();
+        let limits = RootArrayStorageLimits {
+            bytes: 32 << 20,
+            nodes: 8192,
+            depth: 64,
+        };
+        assert!(borrowed_root_chunk_schema_storage(&source, limits).is_ok());
+        let batch = arrow::record_batch::RecordBatch::new_empty(source.arrow_schema_ref());
+        let chunk = Chunk::try_new_with_chunk_schema(batch, source.clone()).unwrap();
+        assert!(borrowed_root_chunk_storage(&chunk, limits).is_ok());
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 7 }),
+            },
+        };
+        let profile = plan
+            .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
+            .unwrap();
+        let (program, _) = plan
+            .into_local_program_and_bindings(
+                profile,
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+                StaticSinkProgram::Noop,
+            )
+            .unwrap();
+        let layout = program.nodes()[program.root().index()].output_layout();
+        let thawed = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+            layout.schema_metadata_origin().unwrap(),
+            layout.field_metadata_origins().unwrap(),
+            layout.slots(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &source.arrow_schema_ref(),
+            &thawed.arrow_schema_ref()
+        ));
+        assert!(borrowed_root_chunk_schema_storage(&thawed, limits).is_ok());
+        for slot in thawed.slots() {
+            assert!(
+                slot.metadata_origins()
+                    .unwrap()
+                    .metadata_bytes_for(slot.field_ref())
+                    .is_some()
+            );
+            assert!(
+                slot.metadata_origins()
+                    .unwrap()
+                    .metadata_bytes_for(&Arc::new(slot.field().clone()))
+                    .is_none()
+            );
+        }
+    }
 
     fn child() -> NativeLoweredPlanNode {
         let output_schema = Arc::new(ChunkSchema::empty());

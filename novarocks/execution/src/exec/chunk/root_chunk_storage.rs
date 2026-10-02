@@ -19,7 +19,7 @@
 
 use super::root_array_storage::borrowed_root_batch_storage_with_types;
 use super::root_schema_backing::{RootSchemaBackingError, RootSchemaInspection};
-use super::{Chunk, RootArrayStorageError, RootArrayStorageLimits};
+use super::{Chunk, ChunkSchema, RootArrayStorageError, RootArrayStorageLimits};
 use novarocks_result_contract::RootProfileV1;
 
 /// Inspect this input's actual Arrow backing, immutable metadata owners, and
@@ -97,6 +97,46 @@ pub fn borrowed_root_chunk_storage(
         .checked_add(metadata.bytes())
         .filter(|bytes| *bytes <= cap)
         .ok_or(RootArrayStorageError::CapacityExceeded)
+}
+
+/// Borrow only the immutable output schema, provenance indices, and its own
+/// scaffolds before a source allocates arrays. No dummy batch, map clone, or
+/// row inspection is needed. This does not cover arrays, Chunk/RecordBatch
+/// holders, column Vec capacity, or construction workspace; the source must
+/// include those in the same original grant's preflight.
+pub fn borrowed_root_chunk_schema_storage(
+    schema: &ChunkSchema,
+    limits: RootArrayStorageLimits,
+) -> Result<usize, RootArrayStorageError> {
+    if schema.slots().len() > RootProfileV1::MAX_COLUMNS {
+        return Err(RootArrayStorageError::WorkExceeded);
+    }
+    let origins = schema
+        .field_metadata_origins()
+        .ok_or(RootArrayStorageError::UnknownMetadataOwner)?;
+    let top = schema
+        .schema_metadata_origin()
+        .ok_or(RootArrayStorageError::UnknownMetadataOwner)?;
+    let actual = schema.arrow_schema_ref();
+    let mut inspection = RootSchemaInspection::new(limits.bytes, limits.nodes, limits.depth);
+    schema
+        .inspect_root_scaffolds(&mut inspection)
+        .map_err(map_error)?;
+    for slot in schema.slots() {
+        inspection
+            .inspect_origin_index(
+                slot.metadata_origins()
+                    .ok_or(RootArrayStorageError::UnknownMetadataOwner)?,
+            )
+            .map_err(map_error)?;
+    }
+    inspection
+        .inspect_origin_index(origins)
+        .map_err(map_error)?;
+    inspection
+        .inspect_schema(&actual, top, origins)
+        .map_err(map_error)?;
+    Ok(inspection.bytes())
 }
 
 fn map_error(error: RootSchemaBackingError) -> RootArrayStorageError {

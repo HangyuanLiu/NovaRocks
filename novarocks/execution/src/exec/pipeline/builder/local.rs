@@ -1090,7 +1090,7 @@ fn build_pipeline_for_program_node(
             max_output_bytes,
         } => {
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
-            let passthrough_columns = passthrough_columns
+            let passthrough_columns: Vec<UnpivotPassthroughColumn> = passthrough_columns
                 .iter()
                 .map(|column| UnpivotPassthroughColumn {
                     input_slot_id: column.input_slot_id,
@@ -1126,20 +1126,41 @@ fn build_pipeline_for_program_node(
                         .collect(),
                 })
                 .collect();
-            build
-                .pipeline
-                .factories
-                .push(Box::new(UnpivotProcessorFactory::new(
-                    node_id,
-                    Arc::clone(&ctx.arena),
-                    passthrough_columns,
-                    *value_output_slot_id,
-                    literal_output_slot_ids.clone(),
-                    value_mappings,
-                    ChunkSchema::from_static_layout(node.output_layout())?,
-                    *max_output_rows,
-                    *max_output_bytes,
-                )?));
+            let statistics_root = id == program.root()
+                && matches!(program.sink(),
+                Some(lp::StaticSinkProgram::RootResult(contract))
+                    if contract.kind() == novarocks_result_contract::RootOutputKind::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1));
+            if statistics_root {
+                build.pipeline.factories.push(Box::new(
+                    crate::exec::operators::StatisticsMaterializerFactory::try_new(
+                        Arc::clone(&ctx.arena),
+                        *value_output_slot_id,
+                        literal_output_slot_ids.clone(),
+                        value_mappings,
+                        program.nodes()[input.index()].output_layout().slots(),
+                        ChunkSchema::from_static_layout(node.output_layout())?,
+                        passthrough_columns.len(),
+                        *max_output_rows,
+                        *max_output_bytes,
+                    )?,
+                ));
+            } else {
+                build
+                    .pipeline
+                    .factories
+                    .push(Box::new(UnpivotProcessorFactory::new(
+                        node_id,
+                        Arc::clone(&ctx.arena),
+                        passthrough_columns,
+                        *value_output_slot_id,
+                        literal_output_slot_ids.clone(),
+                        value_mappings,
+                        ChunkSchema::from_static_layout(node.output_layout())?,
+                        *max_output_rows,
+                        *max_output_bytes,
+                    )?));
+            }
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }

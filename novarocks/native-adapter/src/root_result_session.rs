@@ -32,8 +32,10 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::observable::{Observable, ObserverSubscription};
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
-use novarocks_result_contract::{RootOutputKind, RootProfileV1};
-use novarocks_result_render::{ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurnStatus};
+use novarocks_result_contract::{InternalResultDomain, RootOutputKind, RootProfileV1};
+use novarocks_result_render::{
+    ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurn, RenderTurnStatus,
+};
 use novarocks_worker::root_result_channel::{
     RootMetadataReservation, RootProducerExit, RootResultChannel, RootSegmentBuilder,
 };
@@ -44,10 +46,46 @@ use crate::root_producer_pool::{
 };
 pub use crate::root_producer_pool::{RootProducerLimits, RootProducerPool};
 
+use crate::root_statistics_codec::{
+    StatisticsArtifactEncoder, StatisticsCodecStatus, StatisticsCodecTotals,
+};
+
+enum InputEncoder {
+    Client(Box<ArrowMysqlTextEncoder>),
+    Statistics(Box<StatisticsArtifactEncoder>),
+}
+impl InputEncoder {
+    fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, ()> {
+        match self {
+            Self::Client(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::Statistics(encoder) => encoder
+                .step(output)
+                .map(|turn| RenderTurn {
+                    emitted_bytes: turn.emitted_bytes,
+                    examined_bytes: turn.examined_bytes,
+                    visited_cells: turn.work,
+                    completed_rows: turn.completed_rows,
+                    status: match turn.status {
+                        StatisticsCodecStatus::Yielded => RenderTurnStatus::Yielded,
+                        StatisticsCodecStatus::NeedsOutput => RenderTurnStatus::NeedsOutput,
+                        StatisticsCodecStatus::InputComplete => RenderTurnStatus::InputComplete,
+                    },
+                })
+                .map_err(|_| ()),
+        }
+    }
+    fn statistics_totals(&self) -> Option<StatisticsCodecTotals> {
+        match self {
+            Self::Statistics(encoder) => Some(encoder.totals()),
+            Self::Client(_) => None,
+        }
+    }
+}
+
 // Destruction order is deliberate: original/cursor Arrow owners are gone
 // before input overlap credit can wake another driver. Scratch follows cursor.
 struct Input {
-    encoder: Option<Box<ArrowMysqlTextEncoder>>,
+    encoder: Option<InputEncoder>,
     chunk: Chunk,
     permit: RootInputPermit,
     scratch: Option<ResultWriteCredit>,
@@ -56,6 +94,7 @@ struct ProducerState {
     input: Option<Input>,
     builder: Option<RootSegmentBuilder>,
     used: usize,
+    statistics_totals: StatisticsCodecTotals,
     sealed: bool,
     failed: Option<&'static str>,
     producer: Option<RootProducerExit>,
@@ -106,7 +145,7 @@ impl NativeRootResultSession {
     ) -> Result<Arc<Self>, FragmentIoError> {
         if matches!(
             channel.spec().contract.kind(),
-            RootOutputKind::InternalFacts(_)
+            RootOutputKind::InternalFacts(domain) if domain != InternalResultDomain::StatisticsArtifactV1
         ) {
             return Err(io_error("explicit internal root codec is not installed"));
         }
@@ -153,6 +192,7 @@ impl NativeRootResultSession {
                 input: None,
                 builder: None,
                 used: 0,
+                statistics_totals: StatisticsCodecTotals::default(),
                 sealed: false,
                 failed: None,
                 producer: None,
@@ -281,31 +321,53 @@ impl NativeRootResultSession {
                 input.scratch = Some(credit);
                 // This clone only allocates the finite columns Vec. Original
                 // Chunk accounting/source capabilities remain live in input.
-                let encoder = match ArrowMysqlTextEncoder::try_new_root(
-                    Arc::clone(&self.spec().contract),
-                    input.chunk.batch.clone(),
-                ) {
-                    Ok(encoder) => encoder,
-                    Err(_) => {
-                        return self.fail(
-                            state,
-                            "root input cannot be rendered under its frozen schema",
-                        );
-                    }
-                };
                 let cloning =
                     input.chunk.batch.num_columns() * std::mem::size_of::<arrow::array::ArrayRef>();
-                if encoder
-                    .scratch_capacity_bytes()
-                    .checked_add(cloning)
-                    .and_then(|bytes| {
-                        bytes.checked_add(std::mem::size_of::<ArrowMysqlTextEncoder>())
-                    })
-                    .is_none_or(|b| b > capacity)
+                let encoder = if self.spec().contract.kind()
+                    == RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1)
                 {
-                    return self.fail(state, "root renderer scratch exceeds its pregrant");
-                }
-                input.encoder = Some(Box::new(encoder));
+                    // Cursor storage is fixed and its RecordBatch clone owns only
+                    // a finite columns Vec; both are prepaid before creation.
+                    if StatisticsArtifactEncoder::inline_capacity_bytes()
+                        .checked_add(cloning)
+                        .is_none_or(|n| n > capacity)
+                    {
+                        return self.fail(state, "statistics cursor scratch exceeds its pregrant");
+                    }
+                    match StatisticsArtifactEncoder::try_new(
+                        input.chunk.batch.clone(),
+                        state.statistics_totals,
+                    ) {
+                        Ok(encoder) => InputEncoder::Statistics(Box::new(encoder)),
+                        Err(_) => {
+                            return self
+                                .fail(state, "statistics input differs from its frozen domain");
+                        }
+                    }
+                } else {
+                    let encoder = match ArrowMysqlTextEncoder::try_new_root(
+                        Arc::clone(&self.spec().contract),
+                        input.chunk.batch.clone(),
+                    ) {
+                        Ok(encoder) => encoder,
+                        Err(_) => {
+                            return self.fail(
+                                state,
+                                "root input cannot be rendered under its frozen schema",
+                            );
+                        }
+                    };
+                    if encoder
+                        .scratch_capacity_bytes()
+                        .checked_add(cloning)
+                        .and_then(|n| n.checked_add(std::mem::size_of::<ArrowMysqlTextEncoder>()))
+                        .is_none_or(|n| n > capacity)
+                    {
+                        return self.fail(state, "root renderer scratch exceeds its pregrant");
+                    }
+                    InputEncoder::Client(Box::new(encoder))
+                };
+                input.encoder = Some(encoder);
                 return RootProducerTurn::Yielded;
             }
             if state.builder.is_none() {
@@ -325,7 +387,7 @@ impl NativeRootResultSession {
                 .step(state.builder.as_mut().unwrap().output_at(state.used))
             {
                 Ok(turn) => turn,
-                Err(_) => return self.fail(state, "root text encoding failed"),
+                Err(_) => return self.fail(state, "root encoding failed under its frozen domain"),
             };
             state.used += turn.emitted_bytes;
             if self.channel.note_rows(turn.completed_rows).is_err() {
@@ -333,6 +395,9 @@ impl NativeRootResultSession {
             }
             let input_complete = turn.status == RenderTurnStatus::InputComplete;
             if input_complete {
+                if let Some(totals) = input.encoder.as_ref().unwrap().statistics_totals() {
+                    state.statistics_totals = totals;
+                }
                 drop(state.input.take());
             }
             let finishing = input_complete && state.sealed;
@@ -413,8 +478,13 @@ impl RootResultSession for NativeRootResultSession {
         }
         // Bounded structural inspection only: no render/hydrate/row counting
         // in the driver. An oversized/unknown original cannot enter the queue.
-        let cap =
-            NativeResultSupportGeometry::V1.root_original_input_backing_capacity_bytes as usize;
+        let cap = if self.spec().contract.kind()
+            == RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1)
+        {
+            novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
+        } else {
+            NativeResultSupportGeometry::V1.root_original_input_backing_capacity_bytes as usize
+        };
         if borrowed_root_chunk_storage(
             &input.chunk,
             RootArrayStorageLimits {

@@ -38,3 +38,10 @@ actual peak = buffer capacity + Array/Buffer Arc layouts + Vec spare
 Statistics SQL 直接以原四列顺序创建 Unpivot；physical-plan 保留输出端口为排序权威，专用 validator 检查实际 distinct port set 与独立角色 set 精确相等，继续核验 produced value 的 port ordinal/type/nullability。wire 原有唯一 `output_schema`、Native/Local 的 SlotId 角色关联和普通 runtime 的 schema 顺序没有改变。来源、缺列、额外列、重复 reused child 和错误 ordinal 都有定向反例。详情和日志见本轮 `evidence/p04-root-input-edge/`。
 
 下一步的无分配预授接点仍是：Arrow Buffer 私有标准 owner Layout 的 static getter，以及可在创建数组前借用的准确 ChunkSchema/origin/scaffold footprint。四列直接构造需要计入 11 个 Buffer metadata owners（含两个零容量 values owner）、7 个实际 Arc<Array>、RecordBatch columns Vec4 与 Map entries children Vec2；Map 的 StructArray 本身 inline。必须把实际 schema/index、workspace 和共同临时 holder 加入先前 buffer 公式。最终 safe constructor 的 UTF8/offset 检查同样消耗 quantum，不能只给复制计量；任何批大小选择需覆盖合法单条最大 label/body，不能靠收窄领域合同规避。未接入原 session 前 InternalFacts 仍明确拒绝。
+
+
+## 2026-10-02：事前增长与实际 Host 切片已实现
+
+准确frozen Statistics root选择专用source；Buffer静态标准owner保守bound和borrowed准确ChunkSchema预检使完整batch/workspace增长前定界。最大32行、32MiB，7个预分配buffer及11个Buffer metadata owners、实际数组/Vec/schema/index/scaffold共同计入；same-generation原permit跨sizing/copy/finalization continuation保持。复制完成强制Yielded，safe offset/array检查另占有限turn；UTF8直接复制immutable str并使用有局部不变量的unchecked constructor避免全concat重扫。真正physical decoder保留准确Schema/Field Arc和fresh metadata receipts，经LocalProgram、builder、实际carrier验证；通用16MiB解码范围未缩窄。Native session接入STA1，真实Host root在无ACK时Finished且context留存。prepare失败的worker pin按异步真实退出保留预算，不把错误返回当作capacity已还。细节、负向mutation和历史失败见[收据](evidence/p04-statistics-source/README.md)。
+
+此切片不等于P04完成；FE Statistics assembly/collector/all-success、其它InternalFacts codec及Native listener/lane/H2独立copy仍继续。

@@ -2968,7 +2968,7 @@ fn encode_node_payload(
                 .collect::<Result<Vec<_>, String>>()?,
             max_output_rows: spec.max_output_rows,
             max_output_bytes: spec.max_output_bytes,
-            output_schema: Some(encode_unpivot_schema(fragment, layout, node)?),
+            output_schema: Some(encode_unpivot_schema(fragment, layout, node, &outputs)?),
         }),
         NodeKind::GenerateSeries { start, stop, step } => {
             Kind::GenerateSeries(plan::GenerateSeriesNode {
@@ -3444,14 +3444,19 @@ fn encode_unpivot_schema(
     fragment: &Fragment,
     layout: &WireLayout,
     node: &PhysicalNode,
+    outputs: &[common::OutputColumn],
 ) -> Result<plan::ArrowPhysicalSchema, String> {
+    if outputs.len() != node.output.columns.len() {
+        return Err("Unpivot output names differ from its exact output port count".into());
+    }
     let schema = arrow::datatypes::Schema::new(
         node.output
             .columns
             .iter()
-            .map(|value| {
+            .zip(outputs)
+            .map(|(value, output)| {
                 let ty = &fragment.values()[value].ty;
-                arrow::datatypes::Field::new(value_name(*value), ty.data_type.clone(), ty.nullable)
+                arrow::datatypes::Field::new(&output.name, ty.data_type.clone(), ty.nullable)
             })
             .collect::<Vec<_>>(),
     );
@@ -5527,6 +5532,190 @@ mod tests {
         let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
             .expect("the v1 backend projects cropped HashJoin output columns");
         assert_eq!(encoded.fragments.len(), 1);
+    }
+
+    #[test]
+    fn direct_statistics_unpivot_wire_uses_exact_result_names_types_and_port_order() {
+        use arrow::datatypes::Field;
+        use novarocks_physical_plan::{UnpivotSpec, UnpivotValueMapping};
+        let mut builder = FragmentBuilder::new(FragmentId::new(24));
+        let source = builder.reserve_node_id().unwrap();
+        let body_ty = ValueType::new(DataType::Binary, false);
+        let body_expr = builder
+            .add_expression(
+                source,
+                body_ty.clone(),
+                ExprKind::Literal(LiteralValue::Binary(Box::from([0xffu8]))),
+            )
+            .unwrap();
+        let body_input = builder
+            .add_value(
+                body_ty.clone(),
+                ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: source,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: source,
+                    columns: Box::from([body_input]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([body_expr])]),
+                },
+            })
+            .unwrap();
+        let root = builder.reserve_node_id().unwrap();
+        let types = [
+            ValueType::new(
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                false,
+            ),
+            ValueType::new(DataType::Utf8, false),
+            body_ty,
+            ValueType::new(
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Utf8, false)),
+                                Arc::new(Field::new("value", DataType::Utf8, false)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+        ];
+        let outputs = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                builder
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::NodeOutput {
+                            node: root,
+                            output_ordinal: i as u32,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let label = builder
+            .add_expression(
+                root,
+                types[1].clone(),
+                ExprKind::Literal(LiteralValue::Utf8("theta".into())),
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: root,
+                inputs: Box::from([source]),
+                required_inputs: Box::from([properties()]),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: root,
+                    columns: outputs.clone().into(),
+                },
+                kind: NodeKind::Unpivot {
+                    spec: UnpivotSpec {
+                        passthrough: Box::default(),
+                        value_output: outputs[2],
+                        literal_outputs: Box::from([outputs[0], outputs[1], outputs[3]]),
+                        mappings: Box::from([UnpivotValueMapping {
+                            input: body_input,
+                            constants: Box::from([
+                                UnpivotConstant::Int32List(Box::from([1])),
+                                UnpivotConstant::Scalar(label),
+                                UnpivotConstant::Utf8Map(Box::default()),
+                            ]),
+                        }]),
+                        max_output_rows: 4096,
+                        max_output_bytes: 32 << 20,
+                    },
+                },
+            })
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                root,
+                FragmentSink::Result,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([24; 16]).unwrap());
+        plan_builder.add_fragment(fragment).unwrap();
+        let names = ["input_fields", "blob_type", "body", "properties"];
+        plan_builder
+            .set_result_port(ResultPort {
+                fragment: FragmentId::new(24),
+                output: OutputPort {
+                    node: root,
+                    columns: outputs.clone().into(),
+                },
+                fields: names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| ResultField {
+                        name: (*name).into(),
+                        alias: None,
+                        value: outputs[i],
+                        ty: types[i].clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            })
+            .unwrap();
+        let physical = plan_builder.finish().unwrap();
+        let (catalog, _) = exact_scalar_catalog();
+        let encoded =
+            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap();
+        let root = encoded.fragments[0].root.as_ref().unwrap();
+        let Some(plan::distributed_node::Payload::Physical(node)) = &root.payload else {
+            panic!("physical root");
+        };
+        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = &node.kind else {
+            panic!("direct unpivot root");
+        };
+        assert!(node.output_columns.is_empty());
+        let wire = unpivot.output_schema.as_ref().unwrap();
+        let decoded = arrow_physical::decode_schema(
+            &wire.columns,
+            &wire.schema_metadata,
+            FieldPath::root("unpivot"),
+        )
+        .unwrap();
+        for (i, field) in decoded.schema().fields().iter().enumerate() {
+            assert_eq!(field.name(), names[i]);
+            assert_eq!(field.data_type(), &types[i].data_type);
+            assert_eq!(field.is_nullable(), types[i].nullable);
+        }
+        assert_eq!(decoded.slot_ids()[2], unpivot.value_output_column_id);
+        assert_eq!(
+            [
+                decoded.slot_ids()[0],
+                decoded.slot_ids()[1],
+                decoded.slot_ids()[3]
+            ],
+            unpivot.literal_output_column_ids.as_slice()
+        );
     }
 
     fn properties() -> PhysicalProperties {

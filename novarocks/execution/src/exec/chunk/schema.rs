@@ -856,6 +856,39 @@ impl ChunkSchema {
         Self::try_new_with_schema_metadata(slots, schema.metadata().clone()).map(Arc::new)
     }
 
+    /// Retains an exact immutable schema constructed by an owned decoder.
+    /// Structural equality never substitutes for the field/map owner receipts.
+    pub fn try_ref_from_owned_schema_and_slot_ids(
+        source: &MetadataOwnedSchema,
+        origins: &FieldMetadataOrigins,
+        slot_ids: &[SlotId],
+    ) -> Result<ChunkSchemaRef, String> {
+        if source.schema().fields().len() != slot_ids.len() {
+            return Err("owned chunk schema slot id length mismatch".into());
+        }
+        let slots = source
+            .schema()
+            .fields()
+            .iter()
+            .zip(slot_ids)
+            .map(|(field, slot)| {
+                ChunkSlotSchema::try_new_with_metadata_origins(
+                    *slot,
+                    Arc::clone(field),
+                    origins
+                        .for_field_tree(field, 65536, 64)
+                        .map_err(|_| "owned chunk field metadata origins are incomplete")?,
+                    None,
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut schema = Self::try_new(slots)?;
+        schema.arrow_schema = Arc::clone(source.schema());
+        schema.schema_metadata_origin = Some(source.clone());
+        Ok(Arc::new(schema))
+    }
+
     pub fn slot(&self, slot_id: SlotId) -> Option<&ChunkSlotSchema> {
         self.index_by_slot
             .get(&slot_id)

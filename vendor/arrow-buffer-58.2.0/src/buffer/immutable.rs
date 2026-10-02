@@ -218,6 +218,15 @@ impl Buffer {
         self.data.standard_owner_metadata_size()
     }
 
+    /// Fixed upper bound for the private metadata allocated when a standard
+    /// MutableBuffer becomes this immutable Buffer. This is available before
+    /// creating either owner, excludes the payload region, and does not allocate.
+    /// As with the borrowed query, pool-enabled builds require a separate proof
+    /// and return None. Custom allocations are outside this construction contract.
+    pub const fn standard_unpooled_owner_metadata_capacity() -> Option<usize> {
+        Bytes::standard_unpooled_owner_metadata_capacity()
+    }
+
     /// Tries to shrink the capacity of the buffer as much as possible, freeing unused memory.
     ///
     /// If the buffer is shared, this is a no-op.
