@@ -58,5 +58,7 @@ mod round_cast_float_text;
 mod round_cast_text;
 mod round_owner;
 mod rounding_binding;
+mod string_measure;
+mod string_measure_owner;
 mod truncate;
 mod truncate_owner;
