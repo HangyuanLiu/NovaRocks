@@ -3080,9 +3080,16 @@ impl fmt::Display for LiteralDisplay<'_> {
                 write!(formatter, "{}[bits=0x{value:016x}]", f64::from_bits(*value))
             }
             novarocks_physical_plan::LiteralValue::LargeInt(value)
-            | novarocks_physical_plan::LiteralValue::Decimal128(value)
-            | novarocks_physical_plan::LiteralValue::IntervalMonthDayNano(value) => {
-                value.fmt(formatter)
+            | novarocks_physical_plan::LiteralValue::Decimal128(value) => value.fmt(formatter),
+            novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            } => {
+                write!(
+                    formatter,
+                    "INTERVAL(months={months}, days={days}, nanoseconds={nanoseconds})"
+                )
             }
             novarocks_physical_plan::LiteralValue::Decimal256(value) => {
                 arrow::datatypes::i256::from_be_bytes(*value).fmt(formatter)
@@ -3570,6 +3577,19 @@ fn node_header<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_interval_literal_display_preserves_all_three_components() {
+        let literal = novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
+            months: -7,
+            days: 23,
+            nanoseconds: i64::MIN,
+        };
+        assert_eq!(
+            super::format_literal(&literal).to_string(),
+            "INTERVAL(months=-7, days=23, nanoseconds=-9223372036854775808)"
+        );
+    }
+
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
         ExactInputVersion, PipelineDopDomain, PlanVersionId, PredicateGuaranteeKind,

@@ -764,7 +764,16 @@ impl std::fmt::Display for LiteralText<'_> {
             LiteralValue::Time64(value) | LiteralValue::Timestamp(value) => {
                 write!(formatter, "{value}")
             }
-            LiteralValue::IntervalMonthDayNano(value) => write!(formatter, "{value}"),
+            LiteralValue::IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            } => {
+                write!(
+                    formatter,
+                    "INTERVAL(months={months}, days={days}, nanoseconds={nanoseconds})"
+                )
+            }
         }
     }
 }
@@ -1251,5 +1260,21 @@ fn partition_topn_text(kind: novarocks_physical_plan::PartitionTopNType) -> &'st
         PartitionTopNType::RowNumber => "ROW_NUMBER",
         PartitionTopNType::Rank => "RANK",
         PartitionTopNType::DenseRank => "DENSE_RANK",
+    }
+}
+
+#[cfg(test)]
+mod interval_literal_tests {
+    #[test]
+    fn explicit_interval_literal_display_preserves_all_three_components() {
+        let literal = novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
+            months: -7,
+            days: 23,
+            nanoseconds: i64::MIN,
+        };
+        assert_eq!(
+            super::literal_text(&literal).to_string(),
+            "INTERVAL(months=-7, days=23, nanoseconds=-9223372036854775808)"
+        );
     }
 }

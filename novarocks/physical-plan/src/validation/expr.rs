@@ -598,7 +598,7 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::Timestamp(_) => {
             matches!(ty.data_type, DataType::Timestamp(_, _))
         }
-        crate::LiteralValue::IntervalMonthDayNano(_) => {
+        crate::LiteralValue::IntervalMonthDayNano { .. } => {
             ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano)
         }
     };
@@ -632,7 +632,7 @@ const fn literal_kind_name(literal: &crate::LiteralValue) -> &'static str {
         crate::LiteralValue::Date32(_) => "date32",
         crate::LiteralValue::Time64(_) => "time64",
         crate::LiteralValue::Timestamp(_) => "timestamp",
-        crate::LiteralValue::IntervalMonthDayNano(_) => "interval",
+        crate::LiteralValue::IntervalMonthDayNano { .. } => "interval",
     }
 }
 

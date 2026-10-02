@@ -181,7 +181,12 @@ pub enum LiteralValue {
     Date32(i32),
     Time64(i64),
     Timestamp(i64),
-    IntervalMonthDayNano(i128),
+    /// Independent calendar months, calendar days and elapsed nanoseconds.
+    IntervalMonthDayNano {
+        months: i32,
+        days: i32,
+        nanoseconds: i64,
+    },
 }
 
 pub use novarocks_type_contract::{WindowFrameExclusion, WindowFrameUnits};

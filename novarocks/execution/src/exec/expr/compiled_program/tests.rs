@@ -1006,3 +1006,6 @@ fn oversized_actual_empty_port_domain_is_refused_before_controller_allocation() 
         Err(KernelFailure::InstanceFailed)
     ));
 }
+
+#[path = "literal_tests.rs"]
+mod literal_tests;

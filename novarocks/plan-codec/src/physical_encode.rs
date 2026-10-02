@@ -2003,13 +2003,19 @@ fn physical_function_literal(literal: &LiteralValue) -> Option<FunctionLiteral> 
         LiteralValue::Decimal128(value) => Some(FunctionLiteral::Decimal128(*value)),
         LiteralValue::Utf8(value) => Some(FunctionLiteral::Utf8(value.clone())),
         LiteralValue::Binary(value) => Some(FunctionLiteral::Binary(value.clone())),
-        LiteralValue::Date32(_)
-        | LiteralValue::Time64(_)
-        | LiteralValue::Timestamp(_)
-        | LiteralValue::IntervalMonthDayNano(_)
-        // A constant-folding fact is carried in the vocabulary the function
-        // registry speaks, which has no 256-bit decimal in it.
-        | LiteralValue::Decimal256(_) => None,
+        LiteralValue::Date32(value) => Some(FunctionLiteral::Date32(*value)),
+        LiteralValue::Time64(value) => Some(FunctionLiteral::Time64(*value)),
+        LiteralValue::Timestamp(value) => Some(FunctionLiteral::Timestamp(*value)),
+        LiteralValue::IntervalMonthDayNano {
+            months,
+            days,
+            nanoseconds,
+        } => Some(FunctionLiteral::IntervalMonthDayNano {
+            months: *months,
+            days: *days,
+            nanoseconds: *nanoseconds,
+        }),
+        LiteralValue::Decimal256(value) => Some(FunctionLiteral::Decimal256(*value)),
     }
 }
 
@@ -4862,6 +4868,39 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn physical_literal_binding_metadata_preserves_temporal_and_decimal256_constants() {
+        use super::physical_function_literal;
+        use novarocks_functions::FunctionLiteral;
+        use novarocks_physical_plan::LiteralValue;
+        for (source, expected) in [
+            (LiteralValue::Date32(-17), FunctionLiteral::Date32(-17)),
+            (LiteralValue::Time64(-99), FunctionLiteral::Time64(-99)),
+            (
+                LiteralValue::Timestamp(i64::MIN),
+                FunctionLiteral::Timestamp(i64::MIN),
+            ),
+            (
+                LiteralValue::Decimal256([255; 32]),
+                FunctionLiteral::Decimal256([255; 32]),
+            ),
+            (
+                LiteralValue::IntervalMonthDayNano {
+                    months: i32::MIN,
+                    days: i32::MAX,
+                    nanoseconds: i64::MIN,
+                },
+                FunctionLiteral::IntervalMonthDayNano {
+                    months: i32::MIN,
+                    days: i32::MAX,
+                    nanoseconds: i64::MIN,
+                },
+            ),
+        ] {
+            assert_eq!(physical_function_literal(&source), Some(expected));
+        }
+    }
+
     struct CodecTestControl;
     impl novarocks_type_contract::PureCompileControl for CodecTestControl {
         fn checkpoint(

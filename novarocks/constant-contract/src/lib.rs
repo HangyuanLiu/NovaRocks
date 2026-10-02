@@ -22,6 +22,8 @@
 //! including retained capacity, and are not allocation authorization.
 
 #[cfg(test)]
+mod scalar_factory_tests;
+#[cfg(test)]
 mod tests;
 
 mod semantic_key;
@@ -33,7 +35,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionMode};
 use novarocks_type_contract::{
     CarrierParameterError, CompileCheckpoints, CompileControlError, CompilePhase,
-    FunctionValueType, PureCompileControl, ValueTypeError, ValueTypeVisit,
+    FunctionValueType, PureCompileControl, ValueLogicalType, ValueTypeError, ValueTypeVisit,
     validate_arrow_carrier_parameters_observed,
 };
 use std::{collections::BTreeSet, fmt, sync::Arc};
@@ -1411,6 +1413,322 @@ impl ConstantValue {
         let row = self.ordinal as usize;
         Ok(a.is_valid(row).then(|| a.value(row)))
     }
+    /// Exact signed LARGEINT extraction. Fixed binary never confers this domain.
+    pub fn try_largeint(&self) -> Result<Option<i128>, ConstantError> {
+        if self.value_type().logical_type != ValueLogicalType::LargeInt
+            || self.value_type().data_type != DataType::FixedSizeBinary(16)
+        {
+            return Err(ConstantError::Invalid(
+                "constant is not an exact LARGEINT value",
+            ));
+        }
+        let array = self
+            .pool
+            .array()
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+            .ok_or(ConstantError::Invalid(
+                "LARGEINT array differs from carrier",
+            ))?;
+        let row = self.ordinal as usize;
+        if array.is_null(row) {
+            return Ok(None);
+        }
+        let bytes = array
+            .value(row)
+            .try_into()
+            .map_err(|_| ConstantError::Invalid("LARGEINT value requires sixteen bytes"))?;
+        Ok(Some(i128::from_be_bytes(bytes)))
+    }
+    /// Temporal accessors return the authored unit's raw value, without conversion.
+    pub fn try_date32(&self) -> Result<Option<i32>, ConstantError> {
+        if self.value_type().logical_type != ValueLogicalType::Physical {
+            return Err(ConstantError::Invalid(
+                "Date32 accessor requires Physical domain",
+            ));
+        }
+        let array = self
+            .pool
+            .array()
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .ok_or(ConstantError::Invalid("constant is not a Date32 carrier"))?;
+        let row = self.ordinal as usize;
+        Ok(array.is_valid(row).then(|| array.value(row)))
+    }
+    pub fn try_time64(&self) -> Result<Option<i64>, ConstantError> {
+        if self.value_type().logical_type != ValueLogicalType::Physical {
+            return Err(ConstantError::Invalid(
+                "Time64 accessor requires Physical domain",
+            ));
+        }
+        let array = self.pool.array();
+        let row = self.ordinal as usize;
+        macro_rules! read {
+            ($array:ty) => {{
+                let a = array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .ok_or(ConstantError::Invalid("Time64 array differs from carrier"))?;
+                Ok(a.is_valid(row).then(|| a.value(row)))
+            }};
+        }
+        match array.data_type() {
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
+                read!(arrow_array::Time64MicrosecondArray)
+            }
+            DataType::Time64(arrow_schema::TimeUnit::Nanosecond) => {
+                read!(arrow_array::Time64NanosecondArray)
+            }
+            _ => Err(ConstantError::Invalid(
+                "constant is not a supported Time64 carrier",
+            )),
+        }
+    }
+    pub fn try_timestamp(&self) -> Result<Option<i64>, ConstantError> {
+        if self.value_type().logical_type != ValueLogicalType::Physical {
+            return Err(ConstantError::Invalid(
+                "Timestamp accessor requires Physical domain",
+            ));
+        }
+        let array = self.pool.array();
+        let row = self.ordinal as usize;
+        macro_rules! read {
+            ($array:ty) => {{
+                let a = array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .ok_or(ConstantError::Invalid(
+                        "Timestamp array differs from carrier",
+                    ))?;
+                Ok(a.is_valid(row).then(|| a.value(row)))
+            }};
+        }
+        match array.data_type() {
+            DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => {
+                read!(arrow_array::TimestampSecondArray)
+            }
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+                read!(arrow_array::TimestampMillisecondArray)
+            }
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+                read!(arrow_array::TimestampMicrosecondArray)
+            }
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+                read!(arrow_array::TimestampNanosecondArray)
+            }
+            _ => Err(ConstantError::Invalid(
+                "constant is not a Timestamp carrier",
+            )),
+        }
+    }
+    /// The authored interval components have independent units and signs.
+    /// No packed integer representation or calendar conversion is inferred.
+    pub fn try_interval_month_day_nano(&self) -> Result<Option<(i32, i32, i64)>, ConstantError> {
+        if self.value_type().logical_type != ValueLogicalType::Physical
+            || self.value_type().data_type
+                != DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)
+        {
+            return Err(ConstantError::Invalid(
+                "constant is not an exact Physical MonthDayNano interval",
+            ));
+        }
+        let array = self
+            .pool
+            .array()
+            .as_any()
+            .downcast_ref::<arrow_array::IntervalMonthDayNanoArray>()
+            .ok_or(ConstantError::Invalid(
+                "MonthDayNano interval array differs from carrier",
+            ))?;
+        let row = self.ordinal as usize;
+        Ok(array.is_valid(row).then(|| {
+            let value = array.value(row);
+            (value.months, value.days, value.nanoseconds)
+        }))
+    }
+    pub fn try_decimal256_be(&self) -> Result<Option<[u8; 32]>, ConstantError> {
+        self.try_decimal256()
+            .map(|value| value.map(arrow_buffer::i256::to_be_bytes))
+    }
+    pub fn from_u64(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: u64,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        if ty.logical_type != ValueLogicalType::Physical || ty.data_type != DataType::UInt64 {
+            return Err(ConstantError::Invalid(
+                "unsigned factory requires exact Physical UInt64 type",
+            ));
+        }
+        Self::from_scalar_array(
+            field,
+            ty,
+            arrow_array::UInt64Array::from(vec![value]).to_data(),
+            policy,
+            phase,
+            control,
+        )
+    }
+    pub fn from_largeint(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: i128,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        if ty.logical_type != ValueLogicalType::LargeInt
+            || ty.data_type != DataType::FixedSizeBinary(16)
+        {
+            return Err(ConstantError::Invalid(
+                "LARGEINT factory requires exact logical LARGEINT type",
+            ));
+        }
+        let bytes = value.to_be_bytes();
+        let array =
+            arrow_array::FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter())
+                .map_err(|error| ConstantError::Arrow(error.to_string()))?;
+        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+    }
+    pub fn from_date32(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: i32,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        if ty.logical_type != ValueLogicalType::Physical || ty.data_type != DataType::Date32 {
+            return Err(ConstantError::Invalid(
+                "date factory requires exact Physical Date32 type",
+            ));
+        }
+        Self::from_scalar_array(
+            field,
+            ty,
+            arrow_array::Date32Array::from(vec![value]).to_data(),
+            policy,
+            phase,
+            control,
+        )
+    }
+    pub fn from_time64(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: i64,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        if ty.logical_type != ValueLogicalType::Physical {
+            return Err(ConstantError::Invalid(
+                "Time64 factory requires Physical domain",
+            ));
+        }
+        let array = match ty.data_type {
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
+                arrow_array::Time64MicrosecondArray::from(vec![value]).to_data()
+            }
+            DataType::Time64(arrow_schema::TimeUnit::Nanosecond) => {
+                arrow_array::Time64NanosecondArray::from(vec![value]).to_data()
+            }
+            _ => {
+                return Err(ConstantError::Invalid(
+                    "time factory requires exact supported Time64 type",
+                ));
+            }
+        };
+        Self::from_scalar_array(field, ty, array, policy, phase, control)
+    }
+    pub fn from_timestamp(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: i64,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        if ty.logical_type != ValueLogicalType::Physical {
+            return Err(ConstantError::Invalid(
+                "Timestamp factory requires Physical domain",
+            ));
+        }
+        let array = match &ty.data_type {
+            DataType::Timestamp(arrow_schema::TimeUnit::Second, zone) => {
+                arrow_array::TimestampSecondArray::from(vec![value])
+                    .with_timezone_opt(zone.clone())
+                    .to_data()
+            }
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, zone) => {
+                arrow_array::TimestampMillisecondArray::from(vec![value])
+                    .with_timezone_opt(zone.clone())
+                    .to_data()
+            }
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, zone) => {
+                arrow_array::TimestampMicrosecondArray::from(vec![value])
+                    .with_timezone_opt(zone.clone())
+                    .to_data()
+            }
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, zone) => {
+                arrow_array::TimestampNanosecondArray::from(vec![value])
+                    .with_timezone_opt(zone.clone())
+                    .to_data()
+            }
+            _ => {
+                return Err(ConstantError::Invalid(
+                    "timestamp factory requires exact Timestamp type",
+                ));
+            }
+        };
+        Self::from_scalar_array(field, ty, array, policy, phase, control)
+    }
+    pub fn from_interval_month_day_nano(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: (i32, i32, i64),
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        if ty.logical_type != ValueLogicalType::Physical
+            || ty.data_type != DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)
+        {
+            return Err(ConstantError::Invalid(
+                "interval factory requires exact Physical MonthDayNano type",
+            ));
+        }
+        let value = arrow_buffer::IntervalMonthDayNano::new(value.0, value.1, value.2);
+        let array = arrow_array::IntervalMonthDayNanoArray::from(vec![value]);
+        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+    }
+    /// Big-endian coefficient bytes are lossless; precision/scale remain authored type facts.
+    pub fn from_decimal256_be(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: [u8; 32],
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        Self::from_decimal256(
+            field,
+            ty,
+            arrow_buffer::i256::from_be_bytes(value),
+            policy,
+            phase,
+            control,
+        )
+    }
     pub fn from_i64(
         field: Arc<Field>,
         ty: FunctionValueType,
@@ -1500,14 +1818,17 @@ impl ConstantValue {
             phase,
             control,
         )?;
-        Self::from_scalar_array(
-            field,
-            ty,
-            arrow_array::StringArray::from(vec![value]).to_data(),
-            policy,
-            phase,
-            control,
-        )
+        let array = match ty.data_type {
+            DataType::Utf8 => arrow_array::StringArray::from(vec![value]).to_data(),
+            DataType::LargeUtf8 => arrow_array::LargeStringArray::from(vec![value]).to_data(),
+            DataType::Utf8View => arrow_array::StringViewArray::from(vec![value]).to_data(),
+            _ => {
+                return Err(ConstantError::Invalid(
+                    "UTF8 factory requires exact UTF8 carrier",
+                ));
+            }
+        };
+        Self::from_scalar_array(field, ty, array, policy, phase, control)
     }
     pub fn from_binary(
         field: Arc<Field>,
@@ -1526,14 +1847,17 @@ impl ConstantValue {
             phase,
             control,
         )?;
-        Self::from_scalar_array(
-            field,
-            ty,
-            arrow_array::BinaryArray::from(vec![value]).to_data(),
-            policy,
-            phase,
-            control,
-        )
+        let array = match ty.data_type {
+            DataType::Binary => arrow_array::BinaryArray::from(vec![value]).to_data(),
+            DataType::LargeBinary => arrow_array::LargeBinaryArray::from(vec![value]).to_data(),
+            DataType::BinaryView => arrow_array::BinaryViewArray::from(vec![value]).to_data(),
+            _ => {
+                return Err(ConstantError::Invalid(
+                    "binary factory requires exact binary carrier",
+                ));
+            }
+        };
+        Self::from_scalar_array(field, ty, array, policy, phase, control)
     }
     pub fn from_decimal128(
         field: Arc<Field>,

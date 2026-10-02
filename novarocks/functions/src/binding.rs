@@ -263,6 +263,16 @@ pub enum FunctionLiteral {
     UInt64(u64),
     Float64Bits(u64),
     Decimal128(i128),
+    /// Big-endian two's-complement unscaled value; precision/scale stay in the type.
+    Decimal256([u8; 32]),
+    Date32(i32),
+    Time64(i64),
+    Timestamp(i64),
+    IntervalMonthDayNano {
+        months: i32,
+        days: i32,
+        nanoseconds: i64,
+    },
     Utf8(Box<str>),
     Binary(Box<[u8]>),
 }

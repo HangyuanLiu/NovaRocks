@@ -940,7 +940,7 @@ fn encode_literal(
         LiteralValue::UInt64(_)
         | LiteralValue::Time64(_)
         | LiteralValue::Timestamp(_)
-        | LiteralValue::IntervalMonthDayNano(_) => {
+        | LiteralValue::IntervalMonthDayNano { .. } => {
             return Err("native wire v1 cannot preserve this literal kind".into());
         }
     };

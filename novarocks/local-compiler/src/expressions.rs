@@ -63,7 +63,6 @@ pub(crate) enum ExpressionLoweringError {
     Specialization(FunctionSpecializationFailure),
     Effects(EffectContractError),
     UnsupportedExpression(ExprId),
-    UnsupportedLiteral(ExprId),
     UnsupportedCall(PhysicalCallSite),
     Invalid(&'static str),
 }
@@ -80,7 +79,6 @@ impl fmt::Display for ExpressionLoweringError {
             Self::UnsupportedExpression(id) => {
                 write!(f, "unsupported physical expression {}", id.get())
             }
-            Self::UnsupportedLiteral(id) => write!(f, "unsupported physical literal {}", id.get()),
             Self::UnsupportedCall(site) => write!(f, "unsupported physical call {site:?}"),
             Self::Invalid(message) => f.write_str(message),
         }
@@ -328,6 +326,18 @@ fn lower_core(
                     work.flush()?;
                     let field = Arc::new(node.ty.try_to_field("constant")?);
                     work.flush()?;
+                    macro_rules! scalar {
+                        ($factory:ident, $value:expr) => {
+                            ConstantValue::$factory(
+                                field,
+                                node.ty.clone(),
+                                $value,
+                                policy,
+                                CompilePhase::LowerProgram,
+                                control,
+                            )?
+                        };
+                    }
                     let value = match literal {
                         LiteralValue::Null => ConstantValue::null(
                             field,
@@ -336,31 +346,25 @@ fn lower_core(
                             CompilePhase::LowerProgram,
                             control,
                         )?,
-                        LiteralValue::Boolean(value) => ConstantValue::from_boolean(
-                            field,
-                            node.ty.clone(),
-                            *value,
-                            policy,
-                            CompilePhase::LowerProgram,
-                            control,
-                        )?,
-                        LiteralValue::Int64(value) => ConstantValue::from_i64(
-                            field,
-                            node.ty.clone(),
-                            *value,
-                            policy,
-                            CompilePhase::LowerProgram,
-                            control,
-                        )?,
-                        LiteralValue::Float64Bits(value) => ConstantValue::from_f64_bits(
-                            field,
-                            node.ty.clone(),
-                            *value,
-                            policy,
-                            CompilePhase::LowerProgram,
-                            control,
-                        )?,
-                        _ => return Err(ExpressionLoweringError::UnsupportedLiteral(id)),
+                        LiteralValue::Boolean(value) => scalar!(from_boolean, *value),
+                        LiteralValue::Int64(value) => scalar!(from_i64, *value),
+                        LiteralValue::UInt64(value) => scalar!(from_u64, *value),
+                        LiteralValue::Float64Bits(value) => scalar!(from_f64_bits, *value),
+                        LiteralValue::LargeInt(value) => scalar!(from_largeint, *value),
+                        LiteralValue::Decimal128(value) => scalar!(from_decimal128, *value),
+                        LiteralValue::Decimal256(value) => scalar!(from_decimal256_be, *value),
+                        LiteralValue::Utf8(value) => scalar!(from_utf8, value.as_ref()),
+                        LiteralValue::Binary(value) => scalar!(from_binary, value.as_ref()),
+                        LiteralValue::Date32(value) => scalar!(from_date32, *value),
+                        LiteralValue::Time64(value) => scalar!(from_time64, *value),
+                        LiteralValue::Timestamp(value) => scalar!(from_timestamp, *value),
+                        LiteralValue::IntervalMonthDayNano {
+                            months,
+                            days,
+                            nanoseconds,
+                        } => {
+                            scalar!(from_interval_month_day_nano, (*months, *days, *nanoseconds))
+                        }
                     };
                     work.flush()?;
                     StaticExprKind::Constant(value)
@@ -1071,6 +1075,112 @@ fn prepare_core(
     Ok(result)
 }
 
+// Metadata remains an actual constant for every lowered source kind. Validation
+// reads the checked CV owner, never an unchecked Arrow payload or an inferred
+// logical domain. Variable bytes share one bounded observation cursor.
+fn checked_literal_metadata(
+    literal: &LiteralValue,
+    value: &ConstantValue,
+    control: &dyn PureCompileControl,
+) -> Result<FunctionLiteral, ExpressionLoweringError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        macro_rules! scalar {
+            ($getter:ident, $variant:ident, $expected:expr) => {{
+                if value.$getter()? != Some(*$expected) {
+                    return Err(ExpressionLoweringError::Invalid(
+                        "lowered literal differs from source",
+                    ));
+                }
+                FunctionLiteral::$variant(*$expected)
+            }};
+        }
+        let metadata = match literal {
+            LiteralValue::Null => {
+                if !value.is_null_observed(CompilePhase::FunctionSpecialization, control)? {
+                    return Err(ExpressionLoweringError::Invalid(
+                        "lowered NULL differs from source",
+                    ));
+                }
+                FunctionLiteral::Null
+            }
+            LiteralValue::Boolean(expected) => scalar!(try_boolean, Boolean, expected),
+            LiteralValue::Int64(expected) => scalar!(try_i64, Int64, expected),
+            LiteralValue::UInt64(expected) => scalar!(try_u64, UInt64, expected),
+            LiteralValue::Float64Bits(expected) => scalar!(try_f64_bits, Float64Bits, expected),
+            LiteralValue::LargeInt(expected) => scalar!(try_largeint, LargeInt, expected),
+            LiteralValue::Decimal128(expected) => scalar!(try_decimal128, Decimal128, expected),
+            LiteralValue::Decimal256(expected) => scalar!(try_decimal256_be, Decimal256, expected),
+            LiteralValue::Date32(expected) => scalar!(try_date32, Date32, expected),
+            LiteralValue::Time64(expected) => scalar!(try_time64, Time64, expected),
+            LiteralValue::Timestamp(expected) => scalar!(try_timestamp, Timestamp, expected),
+            LiteralValue::Utf8(expected) => {
+                if !literal_bytes_equal(
+                    value.try_utf8()?.map(str::as_bytes),
+                    expected.as_bytes(),
+                    &mut work,
+                )? {
+                    return Err(ExpressionLoweringError::Invalid(
+                        "lowered UTF8 differs from source",
+                    ));
+                }
+                work.flush()?;
+                let metadata = FunctionLiteral::Utf8(expected.clone());
+                work.flush()?;
+                metadata
+            }
+            LiteralValue::Binary(expected) => {
+                if !literal_bytes_equal(value.try_binary()?, expected, &mut work)? {
+                    return Err(ExpressionLoweringError::Invalid(
+                        "lowered Binary differs from source",
+                    ));
+                }
+                work.flush()?;
+                let metadata = FunctionLiteral::Binary(expected.clone());
+                work.flush()?;
+                metadata
+            }
+            LiteralValue::IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            } => {
+                if value.try_interval_month_day_nano()? != Some((*months, *days, *nanoseconds)) {
+                    return Err(ExpressionLoweringError::Invalid(
+                        "lowered interval differs from source",
+                    ));
+                }
+                FunctionLiteral::IntervalMonthDayNano {
+                    months: *months,
+                    days: *days,
+                    nanoseconds: *nanoseconds,
+                }
+            }
+        };
+        work.step()?;
+        Ok(metadata)
+    })();
+    finish(result, &mut work)
+}
+
+fn literal_bytes_equal(
+    actual: Option<&[u8]>,
+    expected: &[u8],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ExpressionLoweringError> {
+    work.step()?;
+    let Some(actual) = actual.filter(|actual| actual.len() == expected.len()) else {
+        return Ok(false);
+    };
+    for (actual, expected) in actual.iter().zip(expected) {
+        work.step()?;
+        if actual != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn literal_argument(
     source: &ExprNode,
     node: &StaticExprNode,
@@ -1090,40 +1200,8 @@ fn literal_argument(
         ));
     }
     match (&source.kind, node.kind()) {
-        (ExprKind::Literal(LiteralValue::Null), StaticExprKind::Constant(value)) => {
-            if !value.is_null_observed(CompilePhase::FunctionSpecialization, control)? {
-                return Err(ExpressionLoweringError::Invalid(
-                    "lowered NULL differs from source",
-                ));
-            }
-            Ok(Some(FunctionLiteral::Null))
-        }
-        (ExprKind::Literal(LiteralValue::Boolean(expected)), StaticExprKind::Constant(value)) => {
-            if value.try_boolean()? != Some(*expected) {
-                return Err(ExpressionLoweringError::Invalid(
-                    "lowered Boolean differs from source",
-                ));
-            }
-            Ok(Some(FunctionLiteral::Boolean(*expected)))
-        }
-        (ExprKind::Literal(LiteralValue::Int64(expected)), StaticExprKind::Constant(value)) => {
-            if value.try_i64()? != Some(*expected) {
-                return Err(ExpressionLoweringError::Invalid(
-                    "lowered Int64 differs from source",
-                ));
-            }
-            Ok(Some(FunctionLiteral::Int64(*expected)))
-        }
-        (
-            ExprKind::Literal(LiteralValue::Float64Bits(expected)),
-            StaticExprKind::Constant(value),
-        ) => {
-            if value.try_f64_bits()? != Some(*expected) {
-                return Err(ExpressionLoweringError::Invalid(
-                    "lowered Float64 bits differ from source",
-                ));
-            }
-            Ok(Some(FunctionLiteral::Float64Bits(*expected)))
+        (ExprKind::Literal(literal), StaticExprKind::Constant(value)) => {
+            checked_literal_metadata(literal, value, control).map(Some)
         }
         // A resolved input is not a constant, even if this particular runtime
         // batch happens to broadcast one scalar value (notably RAND seeds).
@@ -1168,3 +1246,7 @@ fn comparison_operator(
         _ => return None,
     })
 }
+
+#[cfg(test)]
+#[path = "literal_metadata_tests.rs"]
+mod literal_metadata_tests;

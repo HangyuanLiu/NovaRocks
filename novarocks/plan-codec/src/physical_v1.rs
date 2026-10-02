@@ -1153,7 +1153,7 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                     LiteralValue::UInt64(_)
                     | LiteralValue::Time64(_)
                     | LiteralValue::Timestamp(_)
-                    | LiteralValue::IntervalMonthDayNano(_),
+                    | LiteralValue::IntervalMonthDayNano { .. },
                 ) => {
                     return Err(PhysicalV1PreflightError::ExpressionShape {
                         fragment: fragment.id(),

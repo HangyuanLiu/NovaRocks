@@ -2801,9 +2801,12 @@ pub(crate) fn unpivot_scalar_literal_bytes(fragment: &Fragment, expression: Expr
         | crate::LiteralValue::Time64(_)
         | crate::LiteralValue::Timestamp(_) => std::mem::size_of::<u64>(),
         crate::LiteralValue::Date32(_) => std::mem::size_of::<u32>(),
-        crate::LiteralValue::LargeInt(_)
-        | crate::LiteralValue::Decimal128(_)
-        | crate::LiteralValue::IntervalMonthDayNano(_) => std::mem::size_of::<u128>(),
+        crate::LiteralValue::LargeInt(_) | crate::LiteralValue::Decimal128(_) => {
+            std::mem::size_of::<u128>()
+        }
+        crate::LiteralValue::IntervalMonthDayNano { .. } => {
+            2 * std::mem::size_of::<i32>() + std::mem::size_of::<i64>()
+        }
         crate::LiteralValue::Decimal256(value) => value.len(),
     }
 }

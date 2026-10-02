@@ -790,3 +790,6 @@ fn metadata_static_selection_checks_exact_identity_overload_and_kind_without_eff
             .is_err()
     );
 }
+
+#[path = "literal_lowering_tests.rs"]
+mod literal_lowering_tests;
