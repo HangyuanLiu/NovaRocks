@@ -73,7 +73,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/initial-source.jsonl"
 printf 'VISIBLE_CONTENT_ENCODINGS_READY\n'
 
 -- query 3
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=dictionary_mv
 CREATE MATERIALIZED VIEW dictionary_mv
 DISTRIBUTED BY HASH(label) BUCKETS 3
@@ -81,7 +81,7 @@ REFRESH DEFERRED MANUAL
 PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT label FROM encoded_source;
 REFRESH MATERIALIZED VIEW dictionary_mv WITH SYNC MODE;
-SELECT label FROM dictionary_mv;
+SELECT label, 1 AS row_present FROM dictionary_mv;
 
 -- query 4
 -- @skip_result_check=true
@@ -128,10 +128,10 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/delta-source.jsonl"
 printf 'SCALAR_DICTIONARY_CHANGED\n'
 
 -- query 6
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=dictionary_mv
 REFRESH MATERIALIZED VIEW dictionary_mv WITH SYNC MODE;
-SELECT label FROM dictionary_mv;
+SELECT label, 1 AS row_present FROM dictionary_mv;
 
 -- query 7
 -- @skip_result_check=true
@@ -156,10 +156,10 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/incremental-target.jsonl"
 printf 'SCALAR_DICTIONARY_OBSERVED\n'
 
 -- query 8
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=dictionary_mv
 REFRESH MATERIALIZED VIEW dictionary_mv FULL WITH SYNC MODE;
-SELECT label FROM dictionary_mv;
+SELECT label, 1 AS row_present FROM dictionary_mv;
 
 -- query 9
 -- @skip_result_check=true

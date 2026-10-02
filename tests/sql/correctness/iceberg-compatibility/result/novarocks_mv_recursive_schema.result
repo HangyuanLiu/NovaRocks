@@ -1,0 +1,28 @@
+-- query 3
+label	payload	ordered
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"b":null,"a":1}
+NULL	NULL	NULL
+same	{"items":[],"attrs":{},"detail":null}	{}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":null}}	{"a":1,"b":null}
+
+-- query 6
+label	payload	ordered
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"b":null,"a":1}
+NULL	NULL	NULL
+same	{"items":[],"attrs":{},"detail":null}	{}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":null}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":9,"note":"nested"}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":9,"note":"nested"}}	{"a":1,"b":null}
+
+-- query 8
+label	payload	ordered
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":"nested"}}	{"b":null,"a":1}
+NULL	NULL	NULL
+same	{"items":[],"attrs":{},"detail":null}	{}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":7,"note":null}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":9,"note":"nested"}}	{"a":1,"b":null}
+same	{"items":[1,null],"attrs":{"a":1},"detail":{"code":9,"note":"nested"}}	{"a":1,"b":null}

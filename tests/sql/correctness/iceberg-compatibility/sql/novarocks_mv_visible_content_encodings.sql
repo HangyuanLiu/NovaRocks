@@ -71,7 +71,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/initial-source.jsonl"
 printf 'VISIBLE_CONTENT_ENCODINGS_READY\n'
 
 -- query 3
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=encoded_mv
 CREATE MATERIALIZED VIEW encoded_mv
 DISTRIBUTED BY HASH(label) BUCKETS 3
@@ -126,7 +126,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/delta-source.jsonl"
 printf 'VISIBLE_CONTENT_ENCODINGS_CHANGED\n'
 
 -- query 6
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=encoded_mv
 REFRESH MATERIALIZED VIEW encoded_mv WITH SYNC MODE;
 SELECT label,items,attrs,rec FROM encoded_mv;
@@ -154,7 +154,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/incremental-target.jsonl"
 printf 'VISIBLE_CONTENT_ENCODINGS_OBSERVED\n'
 
 -- query 8
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=encoded_mv
 REFRESH MATERIALIZED VIEW encoded_mv FULL WITH SYNC MODE;
 SELECT label,items,attrs,rec FROM encoded_mv;

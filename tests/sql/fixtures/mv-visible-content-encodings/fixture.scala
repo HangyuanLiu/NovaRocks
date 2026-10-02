@@ -324,12 +324,14 @@ object RecursiveTypeFixture {
   val Visible = "label,payload,ordered"
   val Source = "recursive_source"
   val Target = "recursive_mv"
+  val Ddl = "recursive_ddl"
+  val Ctas = "recursive_ctas"
   def session = {
     require(IcebergBuild.version()=="1.11.0","The recursive oracle requires Iceberg 1.11.0")
     org.apache.spark.sql.SparkSession.active
   }
   def table(ns: String, name: String): Table = {
-    require(ns.length<=64 && ns.matches("[a-zA-Z0-9_]+") && Set(Source,Target).contains(name))
+    require(ns.length<=64 && ns.matches("[a-zA-Z0-9_]+") && Set(Source,Target,Ddl,Ctas).contains(name))
     val t = Spark3Util.loadIcebergTable(session,s"ice_rest.$ns.$name"); t.refresh(); t
   }
   // SDK create may assign fresh IDs. Freeze the actual returned schema, never
@@ -446,8 +448,9 @@ object RecursiveTypeFixture {
     val kinds=if(stage=="initial") Vector("same","same","reverse","null","empty","note-null") else Vector("same","reverse","null","empty","note-null","changed","changed")
     kinds.zipWithIndex.map { case(kind,i) => content(sourceSchema,row(sourceSchema,i+1,kind)) }.groupBy(identity).map { case(k,v)=>k->v.size }
   }
-  def assertParquetIds(t: Table): Unit = {
-    val expected=facts(t.schema())
+  def assertParquetIds(t: Table): Unit = assertParquetIds(t,facts(t.schema()))
+  def assertParquetIds(t: Table,expected: Vector[FieldFact]): Unit = {
+    require(expected==facts(t.schema()),"Parquet oracle must use the exact actual provider schema")
     boundedScan(t).foreach { task =>
       val in=t.io().newInputFile(task.file().location())
       require(in.getLength>0 && in.getLength<=MaxFileBytes && in.getLength==task.file().fileSizeInBytes(),"Parquet actual/manifest length differs or exceeds budget")
@@ -551,5 +554,97 @@ object RecursiveTypeFixture {
     require(t.currentSnapshot().snapshotId()>0 && s.currentSnapshot().snapshotId()>0,"Observation lacks exact positive snapshot")
     boundedEmit(obj("record"->"recursive_mv_observed","stage"->stage,"table_uuid"->metadata(t).uuid().toString,"source_uuid"->metadata(s).uuid().toString,"source_schema_json"->schemaJson(s),"source_schema_id"->s.schema().schemaId(),"source_snapshot"->s.currentSnapshot().snapshotId(),"source_fields"->sourceFields.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"schema_json"->schemaJson(t),"schema_id"->t.schema().schemaId(),"snapshot"->t.currentSnapshot().snapshotId(),"data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->liveDeletes.map(fileFact),"summary"->summary(t),"fields"->bound.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),"bag"->sdkTarget.toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) }))
     println("RECURSIVE_MV_OBSERVED")
+  }
+  // Ordinary DDL defaults each child to optional except the required Map key.
+  // CTAS instead freezes the already-proved source children without widening.
+  def assertDdlCtasSchema(t: Table,isCtas: Boolean): Vector[FieldFact] = {
+    require(metadata(t).formatVersion()==3,"DDL/CTAS fixture requires format-v3")
+    schemaJson(t)
+    val actual=facts(t.schema())
+    val expected=facts(sourceSchema).filter(_.path!="id").map(f =>
+      if(isCtas) f else f.copy(required=f.path.endsWith(".key")))
+    require(actual.map(f=>(f.path,f.required,f.kind))==expected.map(f=>(f.path,f.required,f.kind)),"DDL default or CTAS source recursive contract differs")
+    require(actual.map(_.id).distinct.size==actual.size,"DDL/CTAS actual provider IDs are not unique")
+    actual
+  }
+  def ddlCtasTableFacts(t: Table): JsonNode = {
+    val uuidText=metadata(t).uuid().toString
+    val uuid=java.util.UUID.fromString(uuidText)
+    require(uuid.toString==uuidText && uuid!=new java.util.UUID(0L,0L) && t.schema().schemaId()>=0,"DDL/CTAS provider identity/schema ID invalid")
+    val current=Option(t.currentSnapshot())
+    current.foreach(s=>require(s.snapshotId()>0,"DDL/CTAS snapshot is not positive"))
+    val fs=facts(t.schema())
+    val tasks=if(current.isEmpty) Vector.empty[FileScanTask] else boundedScan(t)
+    obj("table_uuid"->metadata(t).uuid().toString,"schema_id"->t.schema().schemaId(),
+      "schema_json"->schemaJson(t),"snapshot"->current.map(s=>s.snapshotId():Any).getOrElse(null),
+      "fields"->fs.map(f=>obj("path"->f.path,"id"->f.id,"required"->f.required,"kind"->f.kind)),
+      "data_files"->tasks.map(task=>fileFact(task.file())),"delete_files"->deletes(tasks).map(fileFact),
+      "summary"->current.map(_=>summary(t)).getOrElse(obj()),
+      "bag"->sdkBagIfSnapshot(t).toVector.sortBy(_._1).map { case(k,v)=>obj("content"->k,"count"->v) })
+  }
+  def sdkBagIfSnapshot(t: Table): Map[String,Int] =
+    if(t.currentSnapshot()==null) Map.empty[String,Int] else sdkBag(t)
+  def prepareDdlCtas(ns: String): Unit = {
+    val s=table(ns,Source); val d=table(ns,Ddl)
+    assertSchema(s,false); assertDdlCtasSchema(d,false); assertParquetIds(s)
+    require(metadata(s).uuid()!=metadata(d).uuid(),"DDL table aliased source UUID")
+    require(s.currentSnapshot()!=null && sdkBag(s)==expected("initial") && sdkBag(s)==sparkBag(ns,Source),"DDL/CTAS input differs from frozen six-row recipe")
+    require(d.currentSnapshot()==null,"DDL/CTAS prepared table already has a snapshot")
+    boundedEmit(obj("record"->"recursive_ddl_ctas_prepared","namespace"->ns,
+      "source"->ddlCtasTableFacts(s),"ddl"->ddlCtasTableFacts(d)))
+    println("RECURSIVE_DDL_CTAS_PREPARED")
+  }
+  def observeDdlCtas(ns: String,frozenInputJson: String): Unit = {
+    require(frozenInputJson.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=MaxSchemaBytes,"Frozen DDL/CTAS input exceeds budget")
+    val reader=mapper.copy().enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val frozen=reader.readTree(frozenInputJson)
+    def member(n: JsonNode,key: String): JsonNode = {
+      require(n!=null && n.isObject && n.has(key),"Missing frozen DDL/CTAS member: "+key); n.get(key)
+    }
+    def text(n: JsonNode,key: String): String = {
+      val v=member(n,key); require(v.isTextual && v.asText().nonEmpty,"Invalid frozen DDL/CTAS string: "+key); v.asText()
+    }
+    def integer(n: JsonNode,key: String,positive: Boolean): Long = {
+      val v=member(n,key); require(v.isIntegralNumber && v.canConvertToLong,"Invalid frozen DDL/CTAS integer: "+key)
+      val out=v.asLong(); require(if(positive) out>0 else out>=0,"Out-of-range frozen DDL/CTAS integer: "+key); out
+    }
+    require(frozen!=null && frozen.isObject && frozen.fieldNames().asScala.toSet==Set("record","namespace","source","ddl"),"Unexpected frozen DDL/CTAS receipt shape")
+    require(text(frozen,"record")=="recursive_ddl_ctas_prepared" && text(frozen,"namespace")==ns,"Frozen DDL/CTAS receipt belongs to another stage/namespace")
+    Vector("source","ddl").foreach { k=>
+      val prior=member(frozen,k)
+      require(prior.isObject && prior.fieldNames().asScala.toSet==Set("table_uuid","schema_id","schema_json","snapshot","fields","data_files","delete_files","summary","bag"),"Unexpected frozen DDL/CTAS table-fact shape")
+    }
+    val s=table(ns,Source); val d=table(ns,Ddl); val c=table(ns,Ctas)
+    assertSchema(s,false); val df=assertDdlCtasSchema(d,false); val cf=assertDdlCtasSchema(c,true)
+    val sf=facts(s.schema())
+    require(Vector(metadata(s).uuid(),metadata(d).uuid(),metadata(c).uuid()).distinct.size==3,"DDL/CTAS provider UUIDs were aliased")
+    Vector((s,member(frozen,"source")),(d,member(frozen,"ddl"))).foreach { case(t,prior)=>
+      val u=java.util.UUID.fromString(text(prior,"table_uuid")); require(u.toString==text(prior,"table_uuid") && u!=new java.util.UUID(0L,0L) && u.toString==metadata(t).uuid().toString,"DDL/CTAS frozen UUID changed")
+      require(integer(prior,"schema_id",false)==t.schema().schemaId() && text(prior,"schema_json")==schemaJson(t),"DDL/CTAS frozen schema changed")
+      val observed=ddlCtasTableFacts(t)
+      require(member(prior,"fields").isArray && member(prior,"fields")==member(observed,"fields"),"DDL/CTAS frozen field bindings changed")
+    }
+    val priorSource=member(frozen,"source"); val priorDdl=member(frozen,"ddl")
+    require(s.currentSnapshot()!=null && integer(priorSource,"snapshot",true)==s.currentSnapshot().snapshotId(),"DDL/CTAS source frontier changed")
+    require(member(priorDdl,"snapshot").isNull && member(priorDdl,"data_files").isArray && member(priorDdl,"data_files").size()==0 && member(priorDdl,"delete_files").isArray && member(priorDdl,"delete_files").size()==0 && member(priorDdl,"bag").isArray && member(priorDdl,"bag").size()==0,"Prepared DDL was not empty")
+    val sourceFact=ddlCtasTableFacts(s)
+    Vector("data_files","delete_files","summary","bag").foreach(k=>require(member(priorSource,k)==member(sourceFact,k),"DDL/CTAS source fact changed: "+k))
+    val sourceByPath=sf.map(f=>f.path->f.id).toMap
+    require(cf.forall(f=>sourceByPath(f.path)!=f.id),"This CTAS fixture copied source IDs instead of allocating its own bindings")
+    // Pass role-specific actual provider facts to the bounded raw-ID oracle.
+    assertParquetIds(s,sf); assertParquetIds(d,df); assertParquetIds(c,cf)
+    Vector((Source,s),(Ddl,d),(Ctas,c)).foreach { case(name,t)=>
+      require(t.currentSnapshot()!=null && sdkBag(t)==expected("initial") && sdkBag(t)==sparkBag(ns,name),"DDL/CTAS complete SDK/Spark ordered bag differs: "+name)
+      val tasks=boundedScan(t)
+      require(tasks.nonEmpty && deletes(tasks).isEmpty,"DDL/CTAS write has no data or unexpected deletes: "+name)
+      Vector("total-data-files"->tasks.size.toLong,"total-delete-files"->0L,
+        "total-records"->tasks.map(_.file().recordCount()).sum,"total-files-size"->tasks.map(_.file().fileSizeInBytes()).sum,
+        "total-position-deletes"->0L,"total-equality-deletes"->0L).foreach { case(k,v)=>
+          require(countSummary(t,k)==v,"DDL/CTAS exact summary total differs: "+name+"/"+k) }
+      require(countSummary(t,"total-records")==6,"DDL/CTAS physical row count differs from six-row recipe")
+    }
+    boundedEmit(obj("record"->"recursive_ddl_ctas_observed","namespace"->ns,
+      "frozen_input"->frozen,"source"->sourceFact,"ddl"->ddlCtasTableFacts(d),"ctas"->ddlCtasTableFacts(c)))
+    println("RECURSIVE_DDL_CTAS_OBSERVED")
   }
 }

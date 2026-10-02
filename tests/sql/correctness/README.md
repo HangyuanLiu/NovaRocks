@@ -184,3 +184,14 @@ UEA-7B3 新增 `iceberg_ivm_visible_bag_duplicate_retractions`、`iceberg_ivm_vi
 `iceberg-compatibility/spark_rest_minio_v3_mv_visible_bag_cow` 明确配置 Spark UPDATE/MERGE 为 COW，检查 overwrite 与真实文件替换，再跨 MERGE+官方 DV 的源历史窗口及已有 DV 后续 COW 更新，比较两个 MV 的完整可见袋与全量定义查询。第二 MV 按源 identity 分区列分区；仅作为候选冻结的产品输入，不声明已有准确文件范围或扫描字节收据。完整可见袋与实际文件替换已在原生 1FE+3BE 验证。
 
 `iceberg-compatibility/novarocks_mv_target_candidate_freeze` 使用官方 Spark Equality 文件和 debug-only 初始发布 seed，将数据与 no-op Equality 正常提交在同一首次发布事务，保持准确 P/E。用例比较 writer/reader 的真实完整候选文件集合与独立 SDK 的 p1 集合，验证 p2 非候选 Equality 豁免、命中 p2 时格式拒绝及停止、源变化不解除、人工 FULL 恢复。扫描字节缺少准确观测入口时标记 Unavailable；不能从 Equality 结果推断 Parquet position 格式产品验证。
+
+
+UEA-7B3 recursive-schema coverage is in `iceberg-compatibility`:
+`novarocks_mv_dictionary_encodings`, `novarocks_mv_visible_content_encodings`,
+`novarocks_mv_recursive_schema`, and `novarocks_mv_recursive_ddl_ctas`.
+The MV cases check complete native initial/incremental/FULL row bags against
+independently derived goldens and retain official SDK/Spark content/schema/file
+oracles. The DDL/CTAS case separately checks ordinary nullable child defaults
+and CTAS preservation of analyzed required children, actual provider identities
+and full six-row bags. The system scenario `mv/recursive-type-restart` covers
+lake-only recovery after replacing FE with the same three BE processes.

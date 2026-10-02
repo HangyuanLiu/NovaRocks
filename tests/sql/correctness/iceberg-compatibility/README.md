@@ -65,3 +65,13 @@ stage logs/receipts under `reports/uea7b3`. They do not establish a particular
 Arrow array encoding inside the matcher. The system scenario
 `mv/recursive-type-restart` separately covers native lake-only recovery after
 FE replacement and owns each Spark job's exact bounded lifecycle and cleanup.
+
+
+`novarocks_mv_recursive_ddl_ctas` separately freezes an empty ordinary DDL
+schema, inserts the complete six-row source bag, and creates a CTAS table from
+the same source. Independent SDK checks distinguish ordinary optional child
+defaults from CTAS required children and verify exact source/DDL identities,
+new CTAS bindings, actual Parquet IDs and complete SDK/Spark bags. All four
+cases have native complete row goldens derived from the fixed input recipe and
+existing value-formatting contract; row order is ignored, while container
+order and multiplicity are preserved.

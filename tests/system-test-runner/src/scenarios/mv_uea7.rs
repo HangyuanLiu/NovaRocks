@@ -158,13 +158,22 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
         if invocation != expected {
             bail!("recursive Spark invocation differs from its frozen stage");
         }
-        let workspace = self.rest.workspace_root();
-        let mut script = String::new();
-        for relative in [
-            "tests/sql/fixtures/iceberg-delete-applicability/generate.scala",
-            "tests/sql/fixtures/mv-visible-content-encodings/fixture.scala",
-        ] {
-            script.push_str(&read_recursive_input(&workspace.join(relative), deadline)?);
+        // Compile the committed inputs into the runner. The isolated fixture's
+        // workspace is its private runtime, not the repository source checkout.
+        let inputs = [
+            include_str!("../../../sql/fixtures/iceberg-delete-applicability/generate.scala"),
+            include_str!("../../../sql/fixtures/mv-visible-content-encodings/fixture.scala"),
+        ];
+        let input_bytes = inputs.iter().try_fold(0usize, |n, input| {
+            n.checked_add(input.len() + 1)
+                .context("recursive input size overflow")
+        })?;
+        if input_bytes > 256 * 1024 {
+            bail!("compiled recursive Spark inputs exceed their byte budget");
+        }
+        let mut script = String::with_capacity(input_bytes + 512);
+        for input in inputs {
+            script.push_str(input);
             script.push('\n');
         }
         script.push_str("try {\n  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, \"ns\", \"recursive_types\")\n  ");
@@ -583,11 +592,6 @@ fn recursive_spark_invocation(stage: &str) -> Result<&'static str> {
         "full" => Ok("RecursiveTypeFixture.observe(\"ns\",\"full\")"),
         _ => bail!("unknown frozen recursive Spark stage"),
     }
-}
-
-fn read_recursive_input(path: &Path, deadline: std::time::Instant) -> Result<String> {
-    String::from_utf8(read_recursive_file(path, 256 * 1024, deadline)?)
-        .context("recursive Scala input is not UTF-8")
 }
 
 fn read_recursive_file(path: &Path, cap: usize, deadline: std::time::Instant) -> Result<Vec<u8>> {

@@ -71,7 +71,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/initial-source.jsonl"
 printf 'RECURSIVE_SOURCE_READY\n'
 
 -- query 3
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=recursive_mv
 CREATE MATERIALIZED VIEW recursive_mv DISTRIBUTED BY HASH(label) BUCKETS 3 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT label,payload,ordered FROM recursive_source;
 REFRESH MATERIALIZED VIEW recursive_mv WITH SYNC MODE;
@@ -122,7 +122,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/delta-source.jsonl"
 printf 'RECURSIVE_SOURCE_CHANGED\n'
 
 -- query 6
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=recursive_mv
 REFRESH MATERIALIZED VIEW recursive_mv WITH SYNC MODE;
 SELECT label,payload,ordered FROM recursive_mv;
@@ -150,7 +150,7 @@ grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/incremental-target.jsonl"
 printf 'RECURSIVE_MV_OBSERVED\n'
 
 -- query 8
--- @skip_result_check=true
+-- @order_sensitive=false
 -- @imv_equivalence_check=recursive_mv
 REFRESH MATERIALIZED VIEW recursive_mv FULL WITH SYNC MODE;
 SELECT label,payload,ordered FROM recursive_mv;
