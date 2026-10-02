@@ -177,7 +177,7 @@ from active scopes and hook live samples.
 |---|---|---|
 | V1 格式 | `attribution_format`、lib `lane::token` / `attribution::tls`、Server `server_binary_smoke` | 非对齐尾部、原对齐/原 Layout、溢出失败、small 无 TLS；真实 GLOBAL 在 jemalloc/System 两构建 |
 | V2 释放/保活 | `attribution_release`、`owner_lifetime`、`lane_exhaustion`；L1/L5、`owner_loom` | 同/远端晚 free 一次；槽 pin 和强 owner 保活；回收后不访问；旧代次拒绝 |
-| V3 resize | `attribution_resize`、`attribution_explicit`；L2/L3 | 同段和跨阈值、搬迁与受控失败；旧内容/事实不变，R1 切换不重不漏 |
+| V3 resize | `attribution_resize`、`attribution_explicit`；L2/L3 | 固定地址与必然搬迁后端各覆盖六条尺寸路线，断言地址关系、用户前缀、来源/count/两段事实；受控失败保持旧块，R1 切换不重不漏 |
 | V4 作用域/explicit | `attribution_scope`、`attribution_explicit` | 嵌套/unwind、跨线程 poll、Pending/Ready/Drop、spawn 不继承；explicit 优先且恢复 outer |
 | V5 政策隔离 | `domain_split`、`lane_lifecycle`、`attribution_scope`、`attribution_hook_contract`；Server/Worker 回归 | 创建/绑定观测 lane 不 qualify、不消费 stock；失败可见，不制造 SQL 拒绝 |
 | V6 原生装配 | system `memory-attribution/observation-families`、`query-lifecycle/distributed-baseline`、`query-lifecycle/mysql-disconnect`、`query-concurrency/16-64-256-governance`；Server smoke | cross-process 1FE+3BE 独立进程观测/取消/退出；all-in-one 仅 smoke |
