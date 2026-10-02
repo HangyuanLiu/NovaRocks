@@ -43,10 +43,29 @@ impl<'a> Selection<'a> {
         batch_rows: usize,
         rows: &'a [usize],
     ) -> Result<Self, EvaluationContractError> {
-        if rows.last().is_some_and(|row| *row >= batch_rows)
-            || rows.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(EvaluationContractError::InvalidSelection);
+        Self::try_sparse_observed(batch_rows, rows, || Ok::<_, EvaluationContractError>(()))
+    }
+
+    /// The same ordered-row author with caller-owned work observations. No
+    /// allocation, limit, runtime control or unchecked selection is retained.
+    pub fn try_sparse_observed<E: From<EvaluationContractError>>(
+        batch_rows: usize,
+        rows: &'a [usize],
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        if let Some(row) = rows.last() {
+            let outside = *row >= batch_rows;
+            observe()?;
+            if outside {
+                return Err(EvaluationContractError::InvalidSelection.into());
+            }
+        }
+        for pair in rows.windows(2) {
+            let unordered = pair[0] >= pair[1];
+            observe()?;
+            if unordered {
+                return Err(EvaluationContractError::InvalidSelection.into());
+            }
         }
         if rows.len() == batch_rows {
             return Ok(Self::all(batch_rows));
@@ -238,23 +257,71 @@ impl<'a> SelectedValues<'a> {
         values: ArrayRef,
         errors: Box<[RowDataError]>,
     ) -> Result<Self, EvaluationContractError> {
+        Self::try_new_with(
+            selection,
+            exact_type,
+            values,
+            errors,
+            || Ok(()),
+            |left, right, _| Ok(novarocks_type_contract::arrow_data_types_exact(left, right)),
+        )
+    }
+
+    /// The same result author with caller-owned observations and a bounded
+    /// exact type walk. Frozen result domains must already have been admitted.
+    pub fn try_new_observed<
+        E: From<EvaluationContractError> + From<novarocks_type_contract::ValueTypeError>,
+    >(
+        selection: Selection<'a>,
+        exact_type: &DataType,
+        values: ArrayRef,
+        errors: Box<[RowDataError]>,
+        observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        Self::try_new_with(
+            selection,
+            exact_type,
+            values,
+            errors,
+            observe,
+            |left, right, observe| {
+                novarocks_type_contract::arrow_data_types_exact_observed(left, right, observe)
+            },
+        )
+    }
+
+    fn try_new_with<E: From<EvaluationContractError>, F: FnMut() -> Result<(), E>>(
+        selection: Selection<'a>,
+        exact_type: &DataType,
+        values: ArrayRef,
+        errors: Box<[RowDataError]>,
+        mut observe: F,
+        compare: impl FnOnce(&DataType, &DataType, &mut F) -> Result<bool, E>,
+    ) -> Result<Self, E> {
         if values.len() != selection.len() {
-            return Err(EvaluationContractError::ResultLength);
+            return Err(EvaluationContractError::ResultLength.into());
         }
-        if !novarocks_type_contract::arrow_data_types_exact(values.data_type(), exact_type) {
-            return Err(EvaluationContractError::ResultType);
+        if !compare(values.data_type(), exact_type, &mut observe)? {
+            return Err(EvaluationContractError::ResultType.into());
         }
-        if errors.len() > selection.len()
-            || errors
-                .windows(2)
-                .any(|pair| pair[0].selected_ordinal >= pair[1].selected_ordinal)
-            || errors.iter().any(|error| {
-                error.selected_ordinal >= selection.len()
-                    || (values.data_type() != &DataType::Null
-                        && !values.is_null(error.selected_ordinal))
-            })
-        {
-            return Err(EvaluationContractError::InvalidRowErrors);
+        if errors.len() > selection.len() {
+            return Err(EvaluationContractError::InvalidRowErrors.into());
+        }
+        for pair in errors.windows(2) {
+            let unordered = pair[0].selected_ordinal >= pair[1].selected_ordinal;
+            observe()?;
+            if unordered {
+                return Err(EvaluationContractError::InvalidRowErrors.into());
+            }
+        }
+        for error in &errors {
+            let invalid = error.selected_ordinal >= selection.len()
+                || (values.data_type() != &DataType::Null
+                    && !values.is_null(error.selected_ordinal));
+            observe()?;
+            if invalid {
+                return Err(EvaluationContractError::InvalidRowErrors.into());
+            }
         }
         Ok(Self {
             selection,
@@ -322,6 +389,69 @@ mod tests {
     use arrow_array::{Int32Array, NullArray};
 
     use super::*;
+
+    #[test]
+    fn observed_sparse_author_keeps_bare_results_and_preserves_each_primary_refusal() {
+        use crate::KernelFailure;
+        let rows = (0..320).map(|i| i * 2).collect::<Vec<_>>();
+        let bare = Selection::try_sparse(640, &rows).unwrap();
+        let mut visits = 0;
+        let observed = Selection::try_sparse_observed(640, &rows, || {
+            visits += 1;
+            Ok::<_, KernelFailure>(())
+        })
+        .unwrap();
+        assert_eq!(observed, bare);
+        assert_eq!(visits, 320);
+        for stop in [1, 256, 320] {
+            for cause in [
+                KernelFailure::Cancelled,
+                KernelFailure::DeadlineExceeded,
+                KernelFailure::ResourceExhausted,
+            ] {
+                let mut visits = 0;
+                let result = Selection::try_sparse_observed(640, &rows, || {
+                    visits += 1;
+                    if visits == stop {
+                        Err(cause.clone())
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert_eq!(result, Err(cause));
+                assert_eq!(visits, stop);
+            }
+        }
+    }
+
+    #[test]
+    fn observed_sparse_author_preserves_range_order_errors_and_empty_dense_shapes() {
+        for (rows, count) in [(&[8][..], 1), (&[3, 3][..], 2), (&[4, 2][..], 2)] {
+            let mut visits = 0;
+            assert_eq!(
+                Selection::try_sparse_observed(8, rows, || {
+                    visits += 1;
+                    Ok::<_, EvaluationContractError>(())
+                }),
+                Err(EvaluationContractError::InvalidSelection)
+            );
+            assert_eq!(visits, count);
+        }
+        let mut visits = 0;
+        assert_eq!(
+            Selection::try_sparse_observed(0, &[], || {
+                visits += 1;
+                Ok::<_, EvaluationContractError>(())
+            })
+            .unwrap(),
+            Selection::all(0)
+        );
+        assert_eq!(visits, 0);
+        assert_eq!(
+            Selection::try_sparse_observed(3, &[0, 1, 2], || Ok::<_, EvaluationContractError>(())),
+            Ok(Selection::all(3))
+        );
+    }
 
     #[test]
     fn selection_preserves_original_rows_without_dense_storage() {
@@ -449,5 +579,194 @@ mod tests {
         let error = RowDataError::new(0, &"界".repeat(512));
         assert!(error.message().len() <= MAX_ROW_ERROR_MESSAGE_BYTES);
         assert_eq!(error.message().len() % 3, 0);
+    }
+
+    #[test]
+    fn observed_result_author_matches_bare_ordered_unique_null_error_contract() {
+        use crate::KernelFailure;
+        let rows = [1, 4, 9];
+        let selection = Selection::try_sparse(10, &rows).unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(7), None]));
+        let cases: Vec<Box<[RowDataError]>> = vec![
+            Box::default(),
+            Box::from([RowDataError::new(0, "first"), RowDataError::new(2, "last")]),
+            Box::from([RowDataError::new(2, "last"), RowDataError::new(0, "first")]),
+            Box::from([
+                RowDataError::new(0, "first"),
+                RowDataError::new(0, "duplicate"),
+            ]),
+            Box::from([RowDataError::new(3, "outside selected domain")]),
+            Box::from([RowDataError::new(
+                1,
+                "successful nonnull value cannot be an error",
+            )]),
+        ];
+        for errors in cases {
+            let bare = SelectedValues::try_new(
+                selection,
+                &DataType::Int32,
+                values.clone(),
+                errors.clone(),
+            );
+            let mut observations = 0;
+            let observed = SelectedValues::try_new_observed::<KernelFailure>(
+                selection,
+                &DataType::Int32,
+                values.clone(),
+                errors.clone(),
+                || {
+                    observations += 1;
+                    Ok(())
+                },
+            );
+            assert!(observations > 0);
+            match (bare, observed) {
+                (Ok(bare), Ok(observed)) => {
+                    assert_eq!(bare.selection(), selection);
+                    assert_eq!(observed.selection(), selection);
+                    assert_eq!(bare.errors(), errors.as_ref());
+                    assert_eq!(observed.errors(), errors.as_ref());
+                    assert!(Arc::ptr_eq(bare.values(), &values));
+                    assert!(Arc::ptr_eq(observed.values(), &values));
+                    for error in observed.errors() {
+                        assert_eq!(
+                            selection.row(error.selected_ordinal()),
+                            rows.get(error.selected_ordinal()).copied()
+                        );
+                    }
+                }
+                (Err(bare), Err(observed)) => assert_eq!(observed, KernelFailure::from(bare)),
+                _ => panic!("observed result author changed the bare acceptance contract"),
+            }
+        }
+        for (selection, exact_type, expected) in [
+            (
+                Selection::all(4),
+                DataType::Int32,
+                EvaluationContractError::ResultLength,
+            ),
+            (
+                selection,
+                DataType::Int64,
+                EvaluationContractError::ResultType,
+            ),
+        ] {
+            assert_eq!(
+                SelectedValues::try_new(selection, &exact_type, values.clone(), Box::default())
+                    .unwrap_err(),
+                expected,
+            );
+            assert_eq!(
+                SelectedValues::try_new_observed::<KernelFailure>(
+                    selection,
+                    &exact_type,
+                    values.clone(),
+                    Box::default(),
+                    || Ok(())
+                )
+                .unwrap_err(),
+                KernelFailure::from(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn observed_null_result_keeps_row_errors_and_successful_nulls_separate() {
+        use crate::KernelFailure;
+        let rows = [2, 7, 11];
+        let selection = Selection::try_sparse(12, &rows).unwrap();
+        let values: ArrayRef = Arc::new(NullArray::new(3));
+        let result = SelectedValues::try_new_observed::<KernelFailure>(
+            selection,
+            &DataType::Null,
+            values.clone(),
+            Box::from([RowDataError::new(1, "required child error")]),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(result.values(), &values));
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].selected_ordinal(), 1);
+        assert_eq!(
+            result
+                .selection()
+                .row(result.errors()[0].selected_ordinal()),
+            Some(7)
+        );
+        assert_eq!(result.values().logical_null_count(), 3);
+        assert!(
+            result
+                .errors()
+                .iter()
+                .all(|error| error.selected_ordinal() != 0 && error.selected_ordinal() != 2)
+        );
+    }
+
+    #[test]
+    fn observed_result_author_propagates_all_seven_failure_categories_at_each_real_callback() {
+        use crate::{KernelDiagnostic, KernelFailure};
+        let rows = (0..320).map(|row| row * 2 + 1).collect::<Vec<_>>();
+        let selection = Selection::try_sparse(640, &rows).unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![None; 320]));
+        let errors = (0..320)
+            .map(|ordinal| RowDataError::new(ordinal, "required row error"))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut successful_observations = 0;
+        let result = SelectedValues::try_new_observed::<KernelFailure>(
+            selection,
+            &DataType::Int32,
+            values.clone(),
+            errors.clone(),
+            || {
+                successful_observations += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(successful_observations > 256);
+        assert_eq!(result.errors(), errors.as_ref());
+        assert_eq!(
+            result
+                .selection()
+                .row(result.errors()[319].selected_ordinal()),
+            Some(639)
+        );
+        let causes = [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("original invalid program")),
+            KernelFailure::Internal(KernelDiagnostic::new("original internal failure")),
+            KernelFailure::Operational(KernelDiagnostic::new("original operational failure")),
+            KernelFailure::InstanceFailed,
+        ];
+        // This author emits observations; quantum accounting belongs to the
+        // caller. Reject every real observation, including those beyond 256.
+        for stop_at in 1..=successful_observations {
+            for cause in &causes {
+                let mut observed = 0;
+                let mut refused = false;
+                let result = SelectedValues::try_new_observed::<KernelFailure>(
+                    selection,
+                    &DataType::Int32,
+                    values.clone(),
+                    errors.clone(),
+                    || {
+                        assert!(!refused, "result author retried an originating failure");
+                        observed += 1;
+                        if observed == stop_at {
+                            refused = true;
+                            Err(cause.clone())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert_eq!(result.unwrap_err(), *cause);
+                assert!(refused);
+                assert_eq!(observed, stop_at);
+            }
+        }
     }
 }

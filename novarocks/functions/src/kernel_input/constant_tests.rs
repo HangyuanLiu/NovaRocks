@@ -484,3 +484,84 @@ fn entry_256_and_final_failures_keep_all_three_outer_control_categories() {
         }
     }
 }
+
+#[test]
+fn ordinary_argument_type_mismatch_observes_completed_tail_before_error() {
+    let value = pool(
+        Arc::new(Int64Array::from(vec![3, 7])),
+        false,
+        ValueLogicalType::Physical,
+    )
+    .value(1)
+    .unwrap();
+    let wrong = FunctionValueType::new(DataType::UInt64, false);
+    let baseline = Control::default();
+    assert!(matches!(
+        validate(&value, Selection::all(3), &wrong, &baseline),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let checks = baseline.checks();
+    assert_eq!(checks[0], 0);
+    assert_eq!(checks.len(), 2);
+    assert!(*checks.last().unwrap() > 0);
+    for error in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+        KernelFailure::InstanceFailed,
+        KernelFailure::InvalidProgram(crate::KernelDiagnostic::new("original type refusal")),
+        KernelFailure::Internal(crate::KernelDiagnostic::new("original type refusal")),
+        KernelFailure::Operational(crate::KernelDiagnostic::new("original type refusal")),
+    ] {
+        let control = Control::fail_at(1, error.clone());
+        assert_eq!(
+            validate(&value, Selection::all(3), &wrong, &control),
+            Err(error)
+        );
+        assert_eq!(control.checks(), checks);
+    }
+}
+
+#[test]
+fn selected_nonnull_argument_null_rejection_observes_completed_tail() {
+    let column: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(4), None]));
+    let nonnull = FunctionValueType::new(DataType::Int64, false);
+    // The unselected first NULL is not input. The later selected NULL must be
+    // rejected only after checking the successful selected row before it.
+    let selection = Selection::try_sparse(3, &[1, 2]).unwrap();
+    let baseline = Control::default();
+    assert!(matches!(
+        validate_argument_observed(
+            EvaluatedArgument::Column(&column),
+            selection,
+            &nonnull,
+            &baseline
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let checks = baseline.checks();
+    assert_eq!(checks[0], 0);
+    assert_eq!(checks.len(), 2);
+    assert!(*checks.last().unwrap() >= 2);
+    for error in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+        KernelFailure::InstanceFailed,
+        KernelFailure::InvalidProgram(crate::KernelDiagnostic::new("original NULL refusal")),
+        KernelFailure::Internal(crate::KernelDiagnostic::new("original NULL refusal")),
+        KernelFailure::Operational(crate::KernelDiagnostic::new("original NULL refusal")),
+    ] {
+        let control = Control::fail_at(1, error.clone());
+        assert_eq!(
+            validate_argument_observed(
+                EvaluatedArgument::Column(&column),
+                selection,
+                &nonnull,
+                &control
+            ),
+            Err(error)
+        );
+        assert_eq!(control.checks(), checks);
+    }
+}

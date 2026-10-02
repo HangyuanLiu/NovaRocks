@@ -20,6 +20,7 @@ mod array_expr;
 mod case;
 mod cast;
 mod comparison;
+pub mod compiled_program;
 mod constant_eval;
 pub mod decimal;
 mod dict_decode;

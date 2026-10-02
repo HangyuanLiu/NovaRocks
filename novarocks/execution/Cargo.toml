@@ -59,6 +59,8 @@ uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
 libc.workspace = true
+novarocks-local-compiler.workspace = true
+novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
 novarocks-sql.workspace = true

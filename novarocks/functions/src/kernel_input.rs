@@ -31,34 +31,47 @@ use novarocks_type_contract::{CompileCheckpoints, FunctionValueType};
 
 #[cfg(test)]
 mod constant_tests;
+#[cfg(test)]
+mod selected_null_tests;
 
 pub(crate) struct EvaluationCheckpoints<'a> {
     control: &'a dyn KernelEvaluationControl,
     pending: u32,
+    refusal: Option<KernelFailure>,
 }
 impl<'a> EvaluationCheckpoints<'a> {
     pub(crate) fn new(control: &'a dyn KernelEvaluationControl) -> Self {
         Self {
             control,
             pending: 0,
+            refusal: None,
         }
     }
     pub(crate) fn step(&mut self) -> Result<(), KernelFailure> {
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
         self.pending += 1;
         if self.pending == MAX_UNOBSERVED_KERNEL_WORK {
-            self.control.checkpoint(self.pending)?;
+            if let Err(refusal) = self.control.checkpoint(self.pending) {
+                self.refusal = Some(refusal.clone());
+                return Err(refusal);
+            }
             self.pending = 0;
         }
         Ok(())
     }
     pub(crate) fn finish(self) -> Result<(), KernelFailure> {
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
         self.control.checkpoint(self.pending)
     }
 }
 
 /// Shared selected-carrier validation; logical identity belongs to the checked
 /// call, while encoded SQL NULLs are inspected without materializing a bitmap.
-pub(crate) fn validate_argument_observed(
+pub fn validate_argument_observed(
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     value_type: &FunctionValueType,
@@ -66,40 +79,96 @@ pub(crate) fn validate_argument_observed(
 ) -> Result<(), KernelFailure> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
-    argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
-    if let EvaluatedArgument::Constant(value) = argument {
-        work.step()?;
-        if value.value_type().logical_type != value_type.logical_type
-            || (value.value_type().nullable && !value_type.nullable)
-        {
+    let result = (|| {
+        argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
+        if let EvaluatedArgument::Constant(value) = argument {
+            work.step()?;
+            if value.value_type().logical_type != value_type.logical_type
+                || (value.value_type().nullable && !value_type.nullable)
+            {
+                return Err(invalid(
+                    "constant argument differs from its exact logical type or nullability",
+                ));
+            }
+        }
+        if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+            argument.array().data_type(),
+            &value_type.data_type,
+            || work.step(),
+        )? {
             return Err(invalid(
-                "constant argument differs from its exact logical type or nullability",
+                "evaluated argument differs from its exact selected type",
             ));
         }
+        work.step()?;
+        if !value_type.nullable {
+            for (ordinal, row) in selection.iter().enumerate() {
+                if logical_is_null(
+                    argument.array().as_ref(),
+                    argument.value_row(ordinal, row),
+                    1,
+                    &mut work,
+                )? {
+                    return Err(invalid("non-null argument contains a selected SQL NULL"));
+                }
+            }
+        }
+        Ok(())
+    })();
+    if work.refusal.is_some() {
+        return result;
     }
-    if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-        argument.array().data_type(),
-        &value_type.data_type,
-        || work.step(),
-    )? {
-        return Err(invalid(
-            "evaluated argument differs from its exact selected type",
-        ));
-    }
-    work.step()?;
-    if !value_type.nullable {
+    work.finish()?;
+    result
+}
+
+/// Inspect selected SQL NULLs through the original carrier-addressing owner.
+/// The expression controller may inspect error placeholders while forming a
+/// call mask. This does not authorize passing unresolved errors to a kernel.
+pub fn visit_selected_nulls(
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    control: &dyn KernelEvaluationControl,
+    mut visit: impl FnMut(usize, usize, bool) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
+    control.checkpoint(0)?;
+    let mut work = EvaluationCheckpoints::new(control);
+    let mut visitor_refused = false;
+    let result = (|| {
+        if let EvaluatedArgument::SelectedColumn(output) = argument {
+            if !output
+                .selection()
+                .same_rows_observed(selection, || work.step())?
+                || output.values().len() != selection.len()
+            {
+                return Err(invalid(
+                    "NULL inspection requires the exact selected carrier",
+                ));
+            }
+        } else {
+            argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
+        }
         for (ordinal, row) in selection.iter().enumerate() {
-            if logical_is_null(
+            let is_null = logical_is_null(
                 argument.array().as_ref(),
                 argument.value_row(ordinal, row),
                 1,
                 &mut work,
-            )? {
-                return Err(invalid("non-null argument contains a selected SQL NULL"));
+            )?;
+            if let Err(refusal) = visit(ordinal, row, is_null) {
+                visitor_refused = true;
+                return Err(refusal);
             }
         }
+        Ok(())
+    })();
+    // A callback refusal is primary regardless of its error category. Ordinary
+    // shape/address failures still observe the completed work before publication.
+    if visitor_refused || work.refusal.is_some() {
+        return result;
     }
-    work.finish()
+    work.finish()?;
+    result
 }
 
 /// Logical NULL checks never materialize Arrow's dictionary/union/run-end
