@@ -63,8 +63,10 @@ uea_log="$uea_receipts/initial.log"
 cat "$uea_workspace/tests/sql/fixtures/iceberg-delete-applicability/generate.scala" "$uea_workspace/tests/sql/fixtures/mv-visible-content-encodings/fixture.scala" "$uea_workspace/tests/sql/fixtures/uea7b3-metadata-history/fixture.scala" > "$uea_scala"
 cat >> "$uea_scala" <<'SCALA'
 try {
-  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
-  MetadataHistoryFixture.historyInitialize("ns_${uuid0}")
+  MetadataHistoryFixture.withDeadline {
+    DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
+    MetadataHistoryFixture.historyInitialize("ns_${uuid0}")
+  }
 } catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
 if ! "$uea_workspace/docker/iceberg-rest/spark-shell.sh" "$uea_scala" > "$uea_log" 2>&1; then tail -80 "$uea_log" >&2; exit 1; fi
@@ -91,8 +93,10 @@ uea_log="$uea_receipts/renamed.log"
 cat "$uea_workspace/tests/sql/fixtures/iceberg-delete-applicability/generate.scala" "$uea_workspace/tests/sql/fixtures/mv-visible-content-encodings/fixture.scala" "$uea_workspace/tests/sql/fixtures/uea7b3-metadata-history/fixture.scala" > "$uea_scala"
 cat >> "$uea_scala" <<'SCALA'
 try {
-  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
-  MetadataHistoryFixture.historyRenameReorder("ns_${uuid0}")
+  MetadataHistoryFixture.withDeadline {
+    DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
+    MetadataHistoryFixture.historyRenameReorder("ns_${uuid0}")
+  }
 } catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
 if ! "$uea_workspace/docker/iceberg-rest/spark-shell.sh" "$uea_scala" > "$uea_log" 2>&1; then tail -80 "$uea_log" >&2; exit 1; fi
@@ -119,8 +123,10 @@ uea_log="$uea_receipts/readded.log"
 cat "$uea_workspace/tests/sql/fixtures/iceberg-delete-applicability/generate.scala" "$uea_workspace/tests/sql/fixtures/mv-visible-content-encodings/fixture.scala" "$uea_workspace/tests/sql/fixtures/uea7b3-metadata-history/fixture.scala" > "$uea_scala"
 cat >> "$uea_scala" <<'SCALA'
 try {
-  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
-  MetadataHistoryFixture.historyDropReadd("ns_${uuid0}")
+  MetadataHistoryFixture.withDeadline {
+    DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
+    MetadataHistoryFixture.historyDropReadd("ns_${uuid0}")
+  }
 } catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
 if ! "$uea_workspace/docker/iceberg-rest/spark-shell.sh" "$uea_scala" > "$uea_log" 2>&1; then tail -80 "$uea_log" >&2; exit 1; fi
@@ -153,8 +159,10 @@ uea_log="$uea_receipts/promoted.log"
 cat "$uea_workspace/tests/sql/fixtures/iceberg-delete-applicability/generate.scala" "$uea_workspace/tests/sql/fixtures/mv-visible-content-encodings/fixture.scala" "$uea_workspace/tests/sql/fixtures/uea7b3-metadata-history/fixture.scala" > "$uea_scala"
 cat >> "$uea_scala" <<'SCALA'
 try {
-  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
-  MetadataHistoryFixture.historyPromote("ns_${uuid0}")
+  MetadataHistoryFixture.withDeadline {
+    DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, "ns_${uuid0}", "metadata_history")
+    MetadataHistoryFixture.historyPromote("ns_${uuid0}")
+  }
 } catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
 if ! "$uea_workspace/docker/iceberg-rest/spark-shell.sh" "$uea_scala" > "$uea_log" 2>&1; then tail -80 "$uea_log" >&2; exit 1; fi

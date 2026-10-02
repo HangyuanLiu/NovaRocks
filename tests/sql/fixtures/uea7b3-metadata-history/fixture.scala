@@ -28,6 +28,23 @@ object MetadataHistoryFixture {
   val MaxRows = 16
   val MaxSchemas = 16
 
+  // Keep the same SDK-action deadline/daemon form as FieldDomainNullKeyFixture.
+  // The existing Spark wrapper owns its EXIT cleanup; timeout never reports PASS.
+  def withDeadline(action: => Unit): Unit = {
+    val executor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new java.util.concurrent.ThreadFactory {
+      override def newThread(r: Runnable): Thread = {
+        val t = new Thread(r, "metadata-history-sdk-deadline"); t.setDaemon(true); t
+      }
+    })
+    val deadline = executor.schedule(new Runnable {
+      override def run(): Unit = {
+        System.err.println("Metadata/history SDK fixture exceeded 120-second deadline")
+        System.exit(124)
+      }
+    }, 120, java.util.concurrent.TimeUnit.SECONDS)
+    try action finally { deadline.cancel(false); executor.shutdownNow() }
+  }
+
   def session = {
     require(IcebergBuild.version() == "1.11.0", "Metadata history oracle requires Iceberg 1.11.0")
     org.apache.spark.sql.SparkSession.active
