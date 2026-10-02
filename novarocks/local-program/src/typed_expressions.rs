@@ -148,6 +148,30 @@ impl ProgramTypedExpressions {
                         if let StaticExprKind::Constant(constant) = definition.kind() {
                             same_value(constant.value_type(), value, false, work)?;
                         }
+                        if let StaticExprKind::PreparedArithmetic {
+                            operator,
+                            left,
+                            right,
+                            ..
+                        } = definition.kind()
+                        {
+                            let value_at = |id: ProgramExprId| match entries.get(id.index()) {
+                                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                                _ => Err(ProgramExpressionTypeError::WrongKind),
+                            };
+                            work.step()?;
+                            let expected =
+                                novarocks_type_contract::arithmetic_result_value_type_with_op(
+                                    value_at(*left)?,
+                                    value_at(*right)?,
+                                    *operator,
+                                )
+                                .ok_or(ProgramExpressionTypeError::TypeMismatch)?;
+                            if value.logical_type != expected.logical_type || !value.nullable {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            same_carrier(&value.data_type, &expected.data_type, work)?;
+                        }
                         if let Some((_, left, right)) = definition.kind().ordinary_comparison() {
                             validate_comparison_types(left, right, value, entries, work)?;
                         }

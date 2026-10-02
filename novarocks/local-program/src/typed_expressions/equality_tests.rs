@@ -621,3 +621,60 @@ fn invalid_eq_ordinary_error_observes_completed_tail_and_preserves_primary_contr
 
 #[path = "ordered_comparison_tests.rs"]
 mod ordered_comparison_tests;
+
+#[test]
+fn dead_arithmetic_definitions_require_shared_full_types_and_nullable_result() {
+    use novarocks_type_contract::{ArithmeticOperator as A, DecimalOverflowPolicy as P};
+    let left = FunctionValueType::new(DataType::Int8, false);
+    let right = FunctionValueType::new(DataType::Int16, false);
+    for op in [A::Add, A::Subtract, A::Multiply, A::Divide, A::Modulo] {
+        let mut expected =
+            novarocks_type_contract::arithmetic_result_value_type_with_op(&left, &right, op)
+                .unwrap();
+        expected.nullable = true;
+        for invalid in 0..4 {
+            let mut l = left.clone();
+            let mut result = expected.clone();
+            match invalid {
+                0 => {}
+                1 => result.nullable = false,
+                2 => result.data_type = DataType::Int64,
+                3 => l = FunctionValueType::new(DataType::FixedSizeBinary(16), false),
+                _ => unreachable!(),
+            }
+            let (calls, types) = assembled(
+                vec![
+                    slot(0, &l),
+                    slot(1, &right),
+                    StaticExprNode::new(
+                        StaticExprKind::PreparedArithmetic {
+                            operator: op,
+                            left: ProgramExprId::new(0),
+                            right: ProgramExprId::new(1),
+                            decimal_overflow_policy: P::ReportError,
+                            allow_throw_exception: true,
+                        },
+                        result.data_type.clone(),
+                        None,
+                    ),
+                    slot(3, &boolean(false)),
+                ],
+                vec![
+                    FunctionArgumentType::Value(l),
+                    FunctionArgumentType::Value(right.clone()),
+                    FunctionArgumentType::Value(result),
+                    FunctionArgumentType::Value(boolean(false)),
+                ],
+                ProgramExprId::new(3),
+                boolean(false),
+                EvaluationDemand::Value,
+            );
+            let typed = ProgramTypedExpressions::try_new(calls, types, &Control);
+            if invalid == 0 {
+                assert!(typed.is_ok());
+            } else {
+                assert_eq!(typed.unwrap_err(), ProgramExpressionTypeError::TypeMismatch);
+            }
+        }
+    }
+}

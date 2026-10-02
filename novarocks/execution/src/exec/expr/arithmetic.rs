@@ -1897,3 +1897,276 @@ mod overflow_policy_prepared_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod legacy_signed_prepared_oracle_tests {
+    use super::*;
+    use crate::exec::expr::ExprNode;
+    use arrow::array::{Int8Array, Int16Array, Int32Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_functions::{
+        ArithmeticRowResult, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
+        PreparedArithmeticRecipe,
+    };
+    use novarocks_type_contract::{
+        ArithmeticOperator, CompileControlError, CompilePhase, FunctionValueType,
+        PureCompileControl, arithmetic_result_value_type_with_op,
+    };
+    use novarocks_types::SlotId;
+    use std::time::Duration;
+
+    struct OriginalControl;
+    impl PureCompileControl for OriginalControl {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= 256);
+            Ok(())
+        }
+    }
+    impl KernelEvaluationControl for OriginalControl {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= 256);
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("signed arithmetic has no waiting operation")
+        }
+    }
+
+    fn signed_array(ty: &DataType, values: &[Option<i64>]) -> ArrayRef {
+        match ty {
+            DataType::Int8 => Arc::new(Int8Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i8::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int16 => Arc::new(Int16Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i16::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int32 => Arc::new(Int32Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| i32::try_from(v).unwrap()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int64 => Arc::new(Int64Array::from(values.to_vec())),
+            _ => panic!("fixture must author a signed source"),
+        }
+    }
+
+    fn fixture(
+        op: ArithmeticOperator,
+        left: ArrayRef,
+        right: ArrayRef,
+        policy: DecimalOverflowPolicy,
+        allow: bool,
+    ) -> (ExprArena, ExprId, Chunk, PreparedArithmeticRecipe) {
+        let left_type = FunctionValueType::new(left.data_type().clone(), true);
+        let right_type = FunctionValueType::new(right.data_type().clone(), true);
+        let result = arithmetic_result_value_type_with_op(&left_type, &right_type, op).unwrap();
+        let recipe = PreparedArithmeticRecipe::try_new(
+            op,
+            &left_type,
+            &right_type,
+            &result,
+            policy,
+            allow,
+            &OriginalControl,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", left_type.data_type.clone(), true),
+            Field::new("right", right_type.data_type.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let mut arena = ExprArena::default();
+        arena.set_allow_throw_exception(allow);
+        let left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), left_type.data_type);
+        let right = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), right_type.data_type);
+        let kind = match op {
+            ArithmeticOperator::Add => ExprNode::Add(left, right, policy),
+            ArithmeticOperator::Subtract => ExprNode::Sub(left, right, policy),
+            ArithmeticOperator::Multiply => ExprNode::Mul(left, right, policy),
+            ArithmeticOperator::Divide => ExprNode::Div(left, right, policy),
+            ArithmeticOperator::Modulo => ExprNode::Mod(left, right, policy),
+        };
+        let id = arena.push_typed(kind, result.data_type);
+        (arena, id, chunk, recipe)
+    }
+
+    fn prepared_row(
+        recipe: &PreparedArithmeticRecipe,
+        left: &ArrayRef,
+        right: &ArrayRef,
+        row: usize,
+    ) -> ArithmeticRowResult {
+        recipe
+            .evaluate_row(
+                EvaluatedArgument::Column(left),
+                row,
+                row,
+                EvaluatedArgument::Column(right),
+                row,
+                row,
+                &OriginalControl,
+            )
+            .unwrap()
+    }
+
+    fn assert_same_row(legacy: &ArrayRef, row: usize, prepared: ArithmeticRowResult) {
+        match prepared {
+            ArithmeticRowResult::Null => assert!(legacy.is_null(row)),
+            ArithmeticRowResult::Signed(value) => {
+                assert!(!legacy.is_null(row));
+                let value_at = match legacy.data_type() {
+                    DataType::Int16 => i64::from(
+                        legacy
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .unwrap()
+                            .value(row),
+                    ),
+                    DataType::Int32 => i64::from(
+                        legacy
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .value(row),
+                    ),
+                    DataType::Int64 => legacy
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(row),
+                    _ => panic!("foreign signed result"),
+                };
+                assert_eq!(value_at, value);
+            }
+            ArithmeticRowResult::Float(value) => {
+                assert!(!legacy.is_null(row));
+                assert_eq!(
+                    legacy
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .value(row)
+                        .to_bits(),
+                    value.to_bits()
+                );
+            }
+            ArithmeticRowResult::RowError(error) => {
+                panic!("unexpected row error: {}", error.message())
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_signed_arithmetic_oracle_matches_prepared_rows_for_all_frozen_width_pairs() {
+        use ArithmeticOperator::{Add, Divide, Modulo, Multiply, Subtract};
+        for left_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            for right_type in [
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+            ] {
+                let left = signed_array(&left_type, &[Some(7), Some(-7), None, Some(0)]);
+                let right = signed_array(&right_type, &[Some(3), Some(-3), Some(7), None]);
+                for op in [Add, Subtract, Multiply, Divide, Modulo] {
+                    let (arena, id, chunk, recipe) = fixture(
+                        op,
+                        left.clone(),
+                        right.clone(),
+                        DecimalOverflowPolicy::OutputNull,
+                        false,
+                    );
+                    let legacy = arena.eval(id, &chunk).unwrap();
+                    assert_eq!(legacy.data_type(), &recipe.result_type().data_type);
+                    for row in 0..left.len() {
+                        assert_same_row(&legacy, row, prepared_row(&recipe, &left, &right, row));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_signed_fault_oracle_distinguishes_whole_batch_errors_from_prepared_row_errors() {
+        use ArithmeticOperator::{Add, Divide, Modulo, Multiply, Subtract};
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            for allow in [false, true] {
+                for (op, lhs, rhs) in [
+                    (Add, i64::MAX, 1),
+                    (Subtract, i64::MIN, 1),
+                    (Multiply, i64::MAX, 2),
+                    (Modulo, 7, 0),
+                ] {
+                    let left = signed_array(&DataType::Int64, &[None, Some(lhs)]);
+                    let right = signed_array(&DataType::Int64, &[Some(rhs), Some(rhs)]);
+                    let (arena, id, chunk, recipe) =
+                        fixture(op, left.clone(), right.clone(), policy, allow);
+                    // The legacy Arrow kernel fails the batch; the selected recipe
+                    // retains the same diagnostic at the actual required row.
+                    let legacy_error = arena.eval(id, &chunk).unwrap_err();
+                    assert_eq!(
+                        prepared_row(&recipe, &left, &right, 0),
+                        ArithmeticRowResult::Null
+                    );
+                    let ArithmeticRowResult::RowError(error) =
+                        prepared_row(&recipe, &left, &right, 1)
+                    else {
+                        panic!("required signed fault disappeared");
+                    };
+                    assert_eq!(error.selected_ordinal(), 1);
+                    assert!(legacy_error.contains(error.message()), "{legacy_error}");
+                    let masked_left = signed_array(&DataType::Int64, &[None]);
+                    let masked_right = signed_array(&DataType::Int64, &[Some(rhs)]);
+                    let (arena, id, chunk, recipe) =
+                        fixture(op, masked_left.clone(), masked_right.clone(), policy, allow);
+                    let masked = arena.eval(id, &chunk).unwrap();
+                    assert_same_row(
+                        &masked,
+                        0,
+                        prepared_row(&recipe, &masked_left, &masked_right, 0),
+                    );
+                }
+                let left =
+                    signed_array(&DataType::Int64, &[Some(7), Some(i64::MIN), Some(7), None]);
+                let right = signed_array(&DataType::Int64, &[Some(0), Some(-1), Some(2), Some(0)]);
+                let (arena, id, chunk, recipe) =
+                    fixture(Divide, left.clone(), right.clone(), policy, allow);
+                let legacy = arena.eval(id, &chunk).unwrap();
+                assert_eq!(legacy.data_type(), &DataType::Float64);
+                let values = legacy.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert!(values.is_null(0));
+                assert_eq!(
+                    values.value(1).to_bits(),
+                    9_223_372_036_854_775_808.0_f64.to_bits()
+                );
+                assert_eq!(values.value(2), 3.5);
+                assert!(values.is_null(3));
+                for row in 0..left.len() {
+                    assert_same_row(&legacy, row, prepared_row(&recipe, &left, &right, row));
+                }
+            }
+        }
+    }
+}

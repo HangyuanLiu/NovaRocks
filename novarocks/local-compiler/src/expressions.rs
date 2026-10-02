@@ -62,6 +62,7 @@ pub(crate) enum ExpressionLoweringError {
     Expressions(ExpressionsCompileError),
     Specialization(FunctionSpecializationFailure),
     Effects(EffectContractError),
+    Arithmetic(novarocks_functions::ArithmeticPrepareError),
     UnsupportedExpression(ExprId),
     UnsupportedCall(PhysicalCallSite),
     Invalid(&'static str),
@@ -76,6 +77,7 @@ impl fmt::Display for ExpressionLoweringError {
             Self::Expressions(e) => e.fmt(f),
             Self::Specialization(e) => e.fmt(f),
             Self::Effects(e) => e.fmt(f),
+            Self::Arithmetic(e) => e.fmt(f),
             Self::UnsupportedExpression(id) => {
                 write!(f, "unsupported physical expression {}", id.get())
             }
@@ -94,7 +96,17 @@ impl Error for ExpressionLoweringError {
             Self::Expressions(e) => Some(e),
             Self::Specialization(e) => Some(e),
             Self::Effects(e) => Some(e),
+            Self::Arithmetic(e) => Some(e),
             _ => None,
+        }
+    }
+}
+impl From<novarocks_functions::ArithmeticPrepareError> for ExpressionLoweringError {
+    fn from(value: novarocks_functions::ArithmeticPrepareError) -> Self {
+        if let Some(cause) = value.control_error() {
+            Self::Control(cause)
+        } else {
+            Self::Arithmetic(value)
         }
     }
 }
@@ -276,7 +288,12 @@ fn lower_core(
                         | novarocks_physical_plan::BinaryOperator::Lt
                         | novarocks_physical_plan::BinaryOperator::LtEq
                         | novarocks_physical_plan::BinaryOperator::Gt
-                        | novarocks_physical_plan::BinaryOperator::GtEq,
+                        | novarocks_physical_plan::BinaryOperator::GtEq
+                        | novarocks_physical_plan::BinaryOperator::Add
+                        | novarocks_physical_plan::BinaryOperator::Subtract
+                        | novarocks_physical_plan::BinaryOperator::Multiply
+                        | novarocks_physical_plan::BinaryOperator::Divide
+                        | novarocks_physical_plan::BinaryOperator::Modulo,
                     left,
                     right,
                     ..
@@ -416,6 +433,65 @@ fn lower_core(
                         ExprKind::IsNull { negated: false, .. } => StaticExprKind::IsNull(child),
                         ExprKind::IsNull { negated: true, .. } => StaticExprKind::IsNotNull(child),
                         _ => unreachable!("checked unary kind"),
+                    }
+                }
+                ExprKind::Binary {
+                    op,
+                    left,
+                    right,
+                    decimal_overflow_policy,
+                    allow_throw_exception,
+                } if arithmetic_operator(*op).is_some() => {
+                    let local_left = *ids.get(left).ok_or(ExpressionLoweringError::Invalid(
+                        "arithmetic left operand was not lowered",
+                    ))?;
+                    let local_right = *ids.get(right).ok_or(ExpressionLoweringError::Invalid(
+                        "arithmetic right operand was not lowered",
+                    ))?;
+                    let reference =
+                        allow_throw_exception.ok_or(ExpressionLoweringError::Invalid(
+                            "arithmetic has no admitted ALLOW_THROW reference",
+                        ))?;
+                    let novarocks_type_contract::SemanticParameterValue::AllowThrowException(
+                        authored_allow,
+                    ) = package.parameters().require(reference).map_err(|_| {
+                        ExpressionLoweringError::Invalid("arithmetic ALLOW_THROW source differs")
+                    })?
+                    else {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "arithmetic ALLOW_THROW key differs",
+                        ));
+                    };
+                    let operator = arithmetic_operator(*op).expect("checked arithmetic operator");
+                    work.step()?;
+                    work.flush()?;
+                    // Every definition is prepared, even when it has no actual use.
+                    // The source table, never the legacy arena flag, authors this value.
+                    novarocks_functions::PreparedArithmeticRecipe::try_new(
+                        operator,
+                        &source
+                            .get(*left)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing arithmetic left source",
+                            ))?
+                            .ty,
+                        &source
+                            .get(*right)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing arithmetic right source",
+                            ))?
+                            .ty,
+                        &node.ty,
+                        *decimal_overflow_policy,
+                        *authored_allow,
+                        control,
+                    )?;
+                    StaticExprKind::PreparedArithmetic {
+                        operator,
+                        left: local_left,
+                        right: local_right,
+                        decimal_overflow_policy: *decimal_overflow_policy,
+                        allow_throw_exception: *authored_allow,
                     }
                 }
                 ExprKind::Binary {
@@ -801,6 +877,85 @@ fn prepare_core(
                         flow,
                         0,
                     )?
+                }
+                (
+                    ExprKind::Binary {
+                        op,
+                        left,
+                        right,
+                        decimal_overflow_policy,
+                        allow_throw_exception,
+                    },
+                    StaticExprKind::PreparedArithmetic {
+                        operator,
+                        left: local_left,
+                        right: local_right,
+                        decimal_overflow_policy: local_policy,
+                        allow_throw_exception: local_allow,
+                    },
+                ) => {
+                    let reference = allow_throw_exception.ok_or(
+                        ExpressionLoweringError::Invalid("missing arithmetic parameter reference"),
+                    )?;
+                    let source_allow = package.parameters().require(reference).map_err(|_| {
+                        ExpressionLoweringError::Invalid("arithmetic parameter source differs")
+                    })?;
+                    if arithmetic_operator(*op) != Some(*operator)
+                        || decimal_overflow_policy != local_policy
+                        || source_allow
+                            != &novarocks_type_contract::SemanticParameterValue::AllowThrowException(
+                                *local_allow,
+                            )
+                        || invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 2
+                        || lowered.ids.get(left) != Some(local_left)
+                        || lowered.ids.get(right) != Some(local_right)
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "arithmetic occurrence differs from its frozen source",
+                        ));
+                    }
+                    let definitions = package.fragment().expressions();
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedArithmeticRecipe::try_new(
+                        *operator,
+                        &definitions
+                            .get(*left)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing arithmetic left source",
+                            ))?
+                            .ty,
+                        &definitions
+                            .get(*right)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing arithmetic right source",
+                            ))?
+                            .ty,
+                        &source.ty,
+                        *local_policy,
+                        *local_allow,
+                        control,
+                    )?;
+                    let mut combined = recipe.own_effects(invocation.context);
+                    for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
+                        let child_use = invocation.arguments[ordinal];
+                        if flow.uses()[&child_use].definition != physical {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "actual ordered arithmetic use differs",
+                            ));
+                        }
+                        combined = combined.join_control_argument(
+                            *effects
+                                .get(&child_use)
+                                .ok_or(ExpressionLoweringError::Invalid(
+                                    "arithmetic child effects were not prepared",
+                                ))?,
+                            flow,
+                            ordinal,
+                        )?;
+                        work.step()?;
+                    }
+                    combined
                 }
                 (
                     ExprKind::Binary {
@@ -1219,6 +1374,11 @@ fn literal_argument(
         | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
         | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
         (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
+        (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })
+            if arithmetic_operator(*op) == Some(*operator) =>
+        {
+            Ok(None)
+        }
         (ExprKind::Binary { op, .. }, kind)
             if kind.ordinary_comparison().is_some()
                 && comparison_operator(*op) == kind.ordinary_comparison().map(|parts| parts.0) =>
@@ -1250,3 +1410,18 @@ fn comparison_operator(
 #[cfg(test)]
 #[path = "literal_metadata_tests.rs"]
 mod literal_metadata_tests;
+
+fn arithmetic_operator(
+    operator: novarocks_physical_plan::BinaryOperator,
+) -> Option<novarocks_type_contract::ArithmeticOperator> {
+    use novarocks_physical_plan::BinaryOperator as B;
+    use novarocks_type_contract::ArithmeticOperator as A;
+    Some(match operator {
+        B::Add => A::Add,
+        B::Subtract => A::Subtract,
+        B::Multiply => A::Multiply,
+        B::Divide => A::Divide,
+        B::Modulo => A::Modulo,
+        _ => return None,
+    })
+}

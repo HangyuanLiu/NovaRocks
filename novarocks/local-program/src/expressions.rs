@@ -153,6 +153,15 @@ pub enum StaticExprKind {
     Cast(ProgramExprId, DecimalOverflowPolicy),
     CastTime(ProgramExprId, DecimalOverflowPolicy),
     CastTimeFromDatetime(ProgramExprId, DecimalOverflowPolicy),
+    /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
+    /// Legacy construction tags below confer no prepared recipe authority.
+    PreparedArithmetic {
+        operator: novarocks_type_contract::ArithmeticOperator,
+        left: ProgramExprId,
+        right: ProgramExprId,
+        decimal_overflow_policy: DecimalOverflowPolicy,
+        allow_throw_exception: bool,
+    },
     Add(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
     Sub(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
     Mul(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
@@ -243,6 +252,10 @@ impl StaticExprKind {
 
     pub fn decimal_overflow_policy(&self) -> Option<DecimalOverflowPolicy> {
         match self {
+            Self::PreparedArithmetic {
+                decimal_overflow_policy,
+                ..
+            } => Some(*decimal_overflow_policy),
             Self::Cast(_, policy)
             | Self::CastTime(_, policy)
             | Self::CastTimeFromDatetime(_, policy)
@@ -286,7 +299,10 @@ impl StaticExprKind {
             | Self::IsNull(child)
             | Self::IsNotNull(child)
             | Self::Clone(child) => visit(*child)?,
-            Self::Add(a, b, _)
+            Self::PreparedArithmetic {
+                left: a, right: b, ..
+            }
+            | Self::Add(a, b, _)
             | Self::Sub(a, b, _)
             | Self::Mul(a, b, _)
             | Self::Div(a, b, _)

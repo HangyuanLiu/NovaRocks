@@ -776,6 +776,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Cast(..)
             | StaticExprKind::CastTime(..)
             | StaticExprKind::CastTimeFromDatetime(..)
+            | StaticExprKind::PreparedArithmetic { .. }
             | StaticExprKind::Add(..)
             | StaticExprKind::Sub(..)
             | StaticExprKind::Mul(..)
@@ -846,7 +847,10 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::IsNull(definition)
             | StaticExprKind::IsNotNull(definition)
             | StaticExprKind::Clone(definition) => child(*definition)?,
-            StaticExprKind::Add(a, b, _)
+            StaticExprKind::PreparedArithmetic {
+                left: a, right: b, ..
+            }
+            | StaticExprKind::Add(a, b, _)
             | StaticExprKind::Sub(a, b, _)
             | StaticExprKind::Mul(a, b, _)
             | StaticExprKind::Div(a, b, _)

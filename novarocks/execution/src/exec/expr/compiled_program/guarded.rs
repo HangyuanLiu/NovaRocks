@@ -667,6 +667,32 @@ pub(super) fn evaluate_tree<'a>(
                         || work.step(),
                     )?)
                 }
+                StaticExprKind::PreparedArithmetic { .. } => {
+                    if frame.children.len() != 2 {
+                        return Err(invalid("arithmetic requires its exact ordered operands"));
+                    }
+                    let mut children = std::mem::take(&mut frame.children).into_iter();
+                    let left = children
+                        .next()
+                        .ok_or_else(|| internal("missing arithmetic left operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let right = children
+                        .next()
+                        .ok_or_else(|| internal("missing arithmetic right operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let recipe = program
+                        .arithmetic_recipe(frame.occurrence)
+                        .ok_or_else(|| invalid("missing exact arithmetic recipe"))?;
+                    OwnedValue::from_selected(evaluate_arithmetic(
+                        recipe,
+                        &left,
+                        &right,
+                        local_selection,
+                        work,
+                    )?)
+                }
                 kind if kind.ordinary_comparison().is_some() => {
                     if frame.children.len() != 2 {
                         return Err(invalid("comparison requires its exact ordered operands"));
@@ -915,4 +941,129 @@ fn evaluate_comparison<'a>(
         errors.into_boxed_slice(),
         || work.step(),
     )
+}
+
+fn evaluate_arithmetic<'a>(
+    recipe: &novarocks_functions::PreparedArithmeticRecipe,
+    left: &Value<'_>,
+    right: &Value<'_>,
+    selection: Selection<'a>,
+    work: &mut Work<'_>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    use arrow::array::{Float64Array, Int16Array, Int32Array, Int64Array};
+    use novarocks_functions::ArithmeticRowResult as R;
+    let ty = &recipe.result_type().data_type;
+    // This is a checked representation bound and fallible capacity reservation,
+    // not a host Account grant or an Arrow allocation-origin receipt.
+    selection
+        .len()
+        .checked_mul(
+            16 + std::mem::size_of::<RowDataError>()
+                + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    enum Output {
+        I16(Vec<Option<i16>>),
+        I32(Vec<Option<i32>>),
+        I64(Vec<Option<i64>>),
+        Float(Vec<Option<f64>>),
+    }
+    let mut output = match ty {
+        DataType::Int16 => Output::I16(Vec::new()),
+        DataType::Int32 => Output::I32(Vec::new()),
+        DataType::Int64 => Output::I64(Vec::new()),
+        DataType::Float64 => Output::Float(Vec::new()),
+        _ => {
+            return Err(internal(
+                "arithmetic recipe has an unsupported frozen result carrier",
+            ));
+        }
+    };
+    match &mut output {
+        Output::I16(values) => values.try_reserve_exact(selection.len()),
+        Output::I32(values) => values.try_reserve_exact(selection.len()),
+        Output::I64(values) => values.try_reserve_exact(selection.len()),
+        Output::Float(values) => values.try_reserve_exact(selection.len()),
+    }
+    .map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut errors = Vec::new();
+    errors
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    let mut left_errors = left.errors().iter().peekable();
+    let mut right_errors = right.errors().iter().peekable();
+    for (ordinal, row) in selection.iter().enumerate() {
+        let l = if left_errors
+            .peek()
+            .is_some_and(|e| e.selected_ordinal() == ordinal)
+        {
+            left_errors.next()
+        } else {
+            None
+        };
+        let r = if right_errors
+            .peek()
+            .is_some_and(|e| e.selected_ordinal() == ordinal)
+        {
+            right_errors.next()
+        } else {
+            None
+        };
+        let result = if let Some(error) = l.or(r) {
+            R::RowError(error.clone())
+        } else {
+            work.flush()?;
+            recipe.evaluate_row(
+                left.argument(),
+                ordinal,
+                row,
+                right.argument(),
+                ordinal,
+                row,
+                work.control,
+            )?
+        };
+        let result = match result {
+            R::RowError(error) => {
+                errors.push(RowDataError::new(ordinal, error.message()));
+                R::Null
+            }
+            result => result,
+        };
+        match (&mut output, result) {
+            (Output::I16(values), R::Signed(value)) => values.push(i16::try_from(value).ok()),
+            (Output::I32(values), R::Signed(value)) => values.push(i32::try_from(value).ok()),
+            (Output::I64(values), R::Signed(value)) => values.push(Some(value)),
+            (Output::Float(values), R::Float(value)) => values.push(Some(value)),
+            (Output::I16(values), R::Null) => values.push(None),
+            (Output::I32(values), R::Null) => values.push(None),
+            (Output::I64(values), R::Null) => values.push(None),
+            (Output::Float(values), R::Null) => values.push(None),
+            _ => {
+                return Err(internal(
+                    "arithmetic body returned a foreign frozen result carrier",
+                ));
+            }
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    let array: ArrayRef = match (ty, output) {
+        (DataType::Int16, Output::I16(values)) => Arc::new(Int16Array::from(values)),
+        (DataType::Int32, Output::I32(values)) => Arc::new(Int32Array::from(values)),
+        (DataType::Int64, Output::I64(values)) => Arc::new(Int64Array::from(values)),
+        (DataType::Float64, Output::Float(values)) => Arc::new(Float64Array::from(values)),
+        _ => {
+            return Err(internal(
+                "arithmetic recipe has an unsupported frozen result carrier",
+            ));
+        }
+    };
+    work.flush()?;
+    SelectedValues::try_new_observed(selection, ty, array, errors.into_boxed_slice(), || {
+        work.step()
+    })
 }

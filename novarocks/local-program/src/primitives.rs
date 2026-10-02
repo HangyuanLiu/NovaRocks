@@ -39,6 +39,7 @@ pub enum ProgramComparisonSite {
 pub enum ProgramPrimitiveError {
     Control(CompileControlError),
     Comparison(ComparisonPrepareError),
+    Arithmetic(novarocks_functions::ArithmeticPrepareError),
     Invalid(&'static str),
 }
 impl From<CompileControlError> for ProgramPrimitiveError {
@@ -60,6 +61,7 @@ impl fmt::Display for ProgramPrimitiveError {
         match self {
             Self::Control(e) => e.fmt(f),
             Self::Comparison(e) => e.fmt(f),
+            Self::Arithmetic(e) => e.fmt(f),
             Self::Invalid(message) => f.write_str(message),
         }
     }
@@ -69,6 +71,7 @@ impl std::error::Error for ProgramPrimitiveError {
         match self {
             Self::Control(e) => Some(e),
             Self::Comparison(e) => Some(e),
+            Self::Arithmetic(e) => Some(e),
             Self::Invalid(_) => None,
         }
     }
@@ -200,4 +203,85 @@ fn compile_core(
         }
     }
     Ok(recipes)
+}
+
+impl From<novarocks_functions::ArithmeticPrepareError> for ProgramPrimitiveError {
+    fn from(value: novarocks_functions::ArithmeticPrepareError) -> Self {
+        if let Some(cause) = value.control_error() {
+            Self::Control(cause)
+        } else {
+            Self::Arithmetic(value)
+        }
+    }
+}
+
+pub(crate) fn compile_arithmetic(
+    checked: &ProgramLexicalBindings,
+    control: &dyn PureCompileControl,
+) -> Result<
+    BTreeMap<ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
+    ProgramPrimitiveError,
+> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
+        let mut recipes = BTreeMap::new();
+        for (&arena, flow) in snapshot.flows() {
+            let definitions = &snapshot.roots().arenas()[&arena];
+            let types = &typed.types()[&arena];
+            let value = |id: crate::ProgramExprId| match types.get(id.index()) {
+                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                _ => Err(ProgramPrimitiveError::Invalid(
+                    "arithmetic requires complete value types",
+                )),
+            };
+            for (&use_id, invocation) in flow.uses() {
+                work.step()?;
+                let kind = definitions
+                    .node(invocation.definition)
+                    .ok_or(ProgramPrimitiveError::Invalid(
+                        "missing arithmetic definition",
+                    ))?
+                    .kind();
+                let StaticExprKind::PreparedArithmetic {
+                    operator,
+                    left,
+                    right,
+                    decimal_overflow_policy,
+                    allow_throw_exception,
+                } = kind
+                else {
+                    continue;
+                };
+                if invocation.control != ControlShape::Eager
+                    || invocation.arguments.len() != 2
+                    || flow.uses()[&invocation.arguments[0]].definition != *left
+                    || flow.uses()[&invocation.arguments[1]].definition != *right
+                {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "arithmetic differs from its actual ordered occurrence",
+                    ));
+                }
+                work.flush()?;
+                let recipe = novarocks_functions::PreparedArithmeticRecipe::try_new(
+                    *operator,
+                    value(*left)?,
+                    value(*right)?,
+                    value(invocation.definition)?,
+                    *decimal_overflow_policy,
+                    *allow_throw_exception,
+                    control,
+                )?;
+                recipes.insert(ProgramUseRef { arena, use_id }, recipe);
+                work.step()?;
+            }
+        }
+        Ok(recipes)
+    })();
+    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
 }

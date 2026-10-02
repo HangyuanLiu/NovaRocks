@@ -117,6 +117,11 @@ fn old_id(id: ProgramExprId) -> ExprId {
 fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
     use StaticExprKind as Static;
     Ok(match kind {
+        Static::PreparedArithmetic { .. } => {
+            return Err(
+                "compiled arithmetic cannot enter the legacy expression bridge".to_string(),
+            );
+        }
         Static::BoundCall { .. } | Static::NaryAnd { .. } | Static::NaryOr { .. } => {
             return Err("compiled calls cannot enter the legacy expression bridge".to_string());
         }
@@ -434,6 +439,21 @@ mod tests {
     use novarocks_types::SlotId;
 
     use super::*;
+
+    #[test]
+    fn compiled_arithmetic_cannot_lose_source_semantics_in_legacy_bridge() {
+        let kind = StaticExprKind::PreparedArithmetic {
+            operator: novarocks_type_contract::ArithmeticOperator::Add,
+            left: ProgramExprId::new(0),
+            right: ProgramExprId::new(1),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            allow_throw_exception: true,
+        };
+        assert_eq!(
+            thaw_kind(&kind).unwrap_err(),
+            "compiled arithmetic cannot enter the legacy expression bridge"
+        );
+    }
 
     #[test]
     fn compiled_call_cannot_enter_legacy_expression_dispatch() {

@@ -172,3 +172,6 @@ mod case_lowering_tests;
 
 #[cfg(test)]
 mod equality_lowering_tests;
+
+#[cfg(test)]
+mod arithmetic_lowering_tests;

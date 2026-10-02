@@ -1062,3 +1062,6 @@ mod byte_guarded_tests;
 
 #[path = "equality_tests.rs"]
 mod equality_tests;
+
+#[path = "arithmetic_tests.rs"]
+mod arithmetic_tests;

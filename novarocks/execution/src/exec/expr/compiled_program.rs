@@ -248,13 +248,24 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::IsNull(_)
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
+                    | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::Eq(..)
                     | StaticExprKind::Ne(..)
                     | StaticExprKind::Lt(..)
                     | StaticExprKind::Le(..)
                     | StaticExprKind::Gt(..)
                     | StaticExprKind::Ge(..) => {
-                        let mut summary = ScopedExpressionEffects::pure_value(invocation.context);
+                        let mut summary =
+                            if matches!(node.kind(), StaticExprKind::PreparedArithmetic { .. }) {
+                                program
+                                    .arithmetic_recipe(occurrence)
+                                    .ok_or_else(|| {
+                                        invalid("missing mandatory arithmetic effect recipe")
+                                    })?
+                                    .own_effects(invocation.context)
+                            } else {
+                                ScopedExpressionEffects::pure_value(invocation.context)
+                            };
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
                             let child = *effects
                                 .get(&ProgramUseRef {
@@ -311,6 +322,10 @@ impl CompiledExpressionInstance {
                 | StaticExprKind::IsNotNull(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1 => {}
+                StaticExprKind::PreparedArithmetic { .. }
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 2
+                        && program.arithmetic_recipe(occurrence).is_some() => {}
                 kind if kind.ordinary_comparison().is_some()
                     && invocation.control == ControlShape::Eager
                     && invocation.arguments.len() == 2
