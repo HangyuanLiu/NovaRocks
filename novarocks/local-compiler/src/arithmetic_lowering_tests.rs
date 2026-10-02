@@ -738,7 +738,7 @@ fn nullable_false_division_cannot_hide_a_successful_null_behind_nonnullable_resu
 #[test]
 fn unsupported_arithmetic_domains_do_not_gain_a_signed_recipe_from_their_carrier() {
     let functions = functions();
-    for carrier in [DataType::Float64, DataType::Decimal128(18, 2)] {
+    for carrier in [DataType::Float32, DataType::Float64] {
         let ty = FunctionValueType::new(carrier, true);
         let fixture = fixture(
             ty.clone(),

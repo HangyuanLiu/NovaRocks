@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable selected arithmetic for exact Physical signed integer operands.
-//! Preparation freezes both input widths, result, and authored policies. This
+//! Immutable selected arithmetic for exact frozen numeric value domains.
+//! Preparation freezes both complete input domains, result, and authored policies. This
 //! primitive neither allocates output arrays nor grants their memory ownership.
 
 use arrow_array::{Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_buffer::i256;
 use arrow_schema::DataType;
+#[path = "arithmetic_decimal.rs"]
+mod decimal;
+#[path = "arithmetic_largeint.rs"]
+mod largeint;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompileControlError, CompilePhase,
     DecimalOverflowPolicy, ExpressionEffectContext, ExpressionEffects, FunctionValueType,
@@ -68,7 +73,7 @@ impl fmt::Display for ArithmeticPrepareError {
             Self::Control(error) => error.fmt(f),
             Self::Kernel(error) => error.fmt(f),
             Self::Unsupported => {
-                f.write_str("arithmetic requires exact Physical signed integer operands")
+                f.write_str("arithmetic requires an implemented exact numeric value domain")
             }
             Self::TypeMismatch => {
                 f.write_str("arithmetic result differs from its frozen nullable value type")
@@ -152,7 +157,49 @@ pub enum ArithmeticRowResult {
     Null,
     Signed(i64),
     Float(f64),
+    LargeInt(i128),
+    Decimal128(i128),
+    Decimal256(i256),
     RowError(RowDataError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ArithmeticAlgorithm {
+    Signed {
+        left: SignedWidth,
+        right: SignedWidth,
+    },
+    Decimal(decimal::DecimalArithmetic),
+    LargeInt(largeint::LargeIntArithmetic),
+}
+impl ArithmeticAlgorithm {
+    fn validate(&self, array: &dyn Array, left: bool) -> Result<(), KernelFailure> {
+        match self {
+            Self::Signed { left: l, right: r } => {
+                if (if left { *l } else { *r }).validate(array) {
+                    Ok(())
+                } else {
+                    Err(internal(
+                        "signed arithmetic carrier has a foreign array implementation",
+                    ))
+                }
+            }
+            Self::Decimal(recipe) => {
+                if left {
+                    recipe.validate_left(array)
+                } else {
+                    recipe.validate_right(array)
+                }
+            }
+            Self::LargeInt(recipe) => {
+                if left {
+                    recipe.validate_left(array)
+                } else {
+                    recipe.validate_right(array)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,8 +208,7 @@ pub struct PreparedArithmeticRecipe {
     left: FunctionValueType,
     right: FunctionValueType,
     result: FunctionValueType,
-    left_width: SignedWidth,
-    right_width: SignedWidth,
+    algorithm: ArithmeticAlgorithm,
     decimal_overflow_policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
 }
@@ -181,14 +227,35 @@ impl PreparedArithmeticRecipe {
             for ty in [left, right, result] {
                 validate_type_observed(ty, &mut work).map_err(ArithmeticPrepareError::Kernel)?;
             }
-            let left_width = SignedWidth::from_type(left);
-            let right_width = SignedWidth::from_type(right);
+            let mut expected = arithmetic_result_value_type_with_op(left, right, operator)
+                .ok_or(ArithmeticPrepareError::Unsupported)?;
+            // This executable slice admits the source SQL author's nullable
+            // result profile. Capability selection uses the single shared
+            // result author, never a caller's incompatible target carrier.
+            expected.nullable = true;
             work.step()?;
-            let (Some(left_width), Some(right_width)) = (left_width, right_width) else {
+            let algorithm = if let (Some(left), Some(right)) =
+                (SignedWidth::from_type(left), SignedWidth::from_type(right))
+            {
+                ArithmeticAlgorithm::Signed { left, right }
+            } else if let Some(recipe) = decimal::DecimalArithmetic::prepare(
+                operator,
+                left,
+                right,
+                &expected,
+                decimal_policy,
+                allow_throw_exception,
+                &mut work,
+            )? {
+                ArithmeticAlgorithm::Decimal(recipe)
+            } else if let Some(recipe) =
+                largeint::LargeIntArithmetic::prepare(operator, left, right, &expected, &mut work)?
+            {
+                ArithmeticAlgorithm::LargeInt(recipe)
+            } else {
                 return Err(ArithmeticPrepareError::Unsupported);
             };
-            let expected = arithmetic_result_value_type_with_op(left, right, operator)
-                .ok_or(ArithmeticPrepareError::TypeMismatch)?;
+            work.step()?;
             let matches = result.nullable
                 && result.logical_type == expected.logical_type
                 && result.data_type == expected.data_type;
@@ -203,8 +270,7 @@ impl PreparedArithmeticRecipe {
                 left: left.clone(),
                 right: right.clone(),
                 result: result.clone(),
-                left_width,
-                right_width,
+                algorithm,
                 decimal_overflow_policy: decimal_policy,
                 allow_throw_exception,
             };
@@ -240,22 +306,19 @@ impl PreparedArithmeticRecipe {
         self.allow_throw_exception
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        let may_raise_row_error = match self.operator {
-            ArithmeticOperator::Modulo => true,
-            ArithmeticOperator::Divide => false,
-            ArithmeticOperator::Add
-            | ArithmeticOperator::Subtract
-            | ArithmeticOperator::Multiply => {
-                self.left_width == SignedWidth::I64 || self.right_width == SignedWidth::I64
-            }
-        };
-        ScopedExpressionEffects::primitive(
-            context,
-            ExpressionEffects {
-                may_raise_row_error,
+        let effects = match &self.algorithm {
+            ArithmeticAlgorithm::Signed { left, right } => ExpressionEffects {
+                may_raise_row_error: match self.operator {
+                    ArithmeticOperator::Modulo => true,
+                    ArithmeticOperator::Divide => false,
+                    _ => *left == SignedWidth::I64 || *right == SignedWidth::I64,
+                },
                 ..ExpressionEffects::PURE_VALUE
             },
-        )
+            ArithmeticAlgorithm::Decimal(recipe) => recipe.own_effects(),
+            ArithmeticAlgorithm::LargeInt(recipe) => recipe.own_effects(),
+        };
+        ScopedExpressionEffects::primitive(context, effects)
     }
 
     /// Validate both original addresses before strict SQL NULL. Inherited row
@@ -283,7 +346,7 @@ impl PreparedArithmeticRecipe {
                 left_ordinal,
                 left_logical_row,
                 &self.left,
-                self.left_width,
+                |array| self.algorithm.validate(array, true),
                 &mut work,
             )?;
             let r = checked_row(
@@ -291,40 +354,68 @@ impl PreparedArithmeticRecipe {
                 right_ordinal,
                 right_logical_row,
                 &self.right,
-                self.right_width,
+                |array| self.algorithm.validate(array, false),
                 &mut work,
             )?;
             let (Some(l), Some(r)) = (l, r) else {
                 return Ok(ArithmeticRowResult::Null);
             };
-            use ArithmeticOperator::*;
-            let output = match self.operator {
-                Divide if r == 0 => ArithmeticRowResult::Null,
-                Divide => ArithmeticRowResult::Float((l as f64) / (r as f64)),
-                Modulo if r == 0 => ArithmeticRowResult::RowError(RowDataError::new(
-                    left_ordinal,
-                    "Divide by zero error",
-                )),
-                Modulo => ArithmeticRowResult::Signed(l.wrapping_rem(r)),
-                Add | Subtract | Multiply => {
-                    let (value, symbol) = match self.operator {
-                        Add => (l.checked_add(r), '+'),
-                        Subtract => (l.checked_sub(r), '-'),
-                        Multiply => (l.checked_mul(r), '*'),
-                        _ => unreachable!("checked signed arithmetic operation"),
-                    };
-                    match value {
-                        Some(value) => ArithmeticRowResult::Signed(value),
-                        None => ArithmeticRowResult::RowError(RowDataError::new(
+            let output = match &self.algorithm {
+                ArithmeticAlgorithm::Signed {
+                    left: left_width,
+                    right: right_width,
+                } => {
+                    let l = left_width.read(left.array().as_ref(), l)?;
+                    work.step()?;
+                    let r = right_width.read(right.array().as_ref(), r)?;
+                    work.step()?;
+                    use ArithmeticOperator::*;
+                    let output = match self.operator {
+                        Divide if r == 0 => ArithmeticRowResult::Null,
+                        Divide => ArithmeticRowResult::Float((l as f64) / (r as f64)),
+                        Modulo if r == 0 => ArithmeticRowResult::RowError(RowDataError::new(
                             left_ordinal,
-                            &format!(
-                                "Arithmetic overflow: Overflow happened on: {l:?} {symbol} {r:?}"
-                            ),
+                            "Divide by zero error",
                         )),
-                    }
+                        Modulo => ArithmeticRowResult::Signed(l.wrapping_rem(r)),
+                        Add | Subtract | Multiply => {
+                            let (value, symbol) = match self.operator {
+                                Add => (l.checked_add(r), '+'),
+                                Subtract => (l.checked_sub(r), '-'),
+                                Multiply => (l.checked_mul(r), '*'),
+                                _ => unreachable!("checked signed arithmetic operation"),
+                            };
+                            match value {
+                                Some(value) => ArithmeticRowResult::Signed(value),
+                                None => ArithmeticRowResult::RowError(RowDataError::new(
+                                    left_ordinal,
+                                    &format!(
+                                        "Arithmetic overflow: Overflow happened on: {l:?} {symbol} {r:?}"
+                                    ),
+                                )),
+                            }
+                        }
+                    };
+                    work.step()?;
+                    output
                 }
+                ArithmeticAlgorithm::Decimal(recipe) => recipe.evaluate_non_null(
+                    left.array().as_ref(),
+                    l,
+                    right.array().as_ref(),
+                    r,
+                    left_ordinal,
+                    &mut work,
+                )?,
+                ArithmeticAlgorithm::LargeInt(recipe) => recipe.evaluate_non_null(
+                    left.array().as_ref(),
+                    l,
+                    right.array().as_ref(),
+                    r,
+                    left_ordinal,
+                    &mut work,
+                )?,
             };
-            work.step()?;
             Ok(output)
         })();
         // EvaluationCheckpoints preserves any primary callback refusal, even
@@ -339,9 +430,9 @@ fn checked_row(
     ordinal: usize,
     logical_row: usize,
     expected: &FunctionValueType,
-    width: SignedWidth,
+    validate: impl FnOnce(&dyn Array) -> Result<(), KernelFailure>,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<i64>, KernelFailure> {
+) -> Result<Option<usize>, KernelFailure> {
     if let EvaluatedArgument::Constant(value) = argument {
         let actual = value.value_type();
         let matches =
@@ -354,11 +445,13 @@ fn checked_row(
         }
     }
     let array = argument.array();
-    let matches = SignedWidth::from_carrier(array.data_type()) == Some(width);
+    // All admitted arithmetic carriers are closed scalar types, so exact
+    // equality here includes decimal precision/scale without a nested walk.
+    let matches = array.data_type() == &expected.data_type;
     work.step()?;
     if !matches {
         return Err(invalid(
-            "arithmetic argument differs from its frozen signed carrier",
+            "arithmetic argument differs from its frozen numeric carrier",
         ));
     }
     let shape_matches = match argument {
@@ -399,13 +492,9 @@ fn checked_row(
     if !in_bounds {
         return Err(invalid("arithmetic selected address is outside its array"));
     }
-    let valid_implementation = width.validate(array.as_ref());
+    let valid_implementation = validate(array.as_ref());
     work.step()?;
-    if !valid_implementation {
-        return Err(internal(
-            "signed arithmetic carrier has a foreign array implementation",
-        ));
-    }
+    valid_implementation?;
     let is_null = array.is_null(row);
     work.step()?;
     if is_null {
@@ -417,9 +506,7 @@ fn checked_row(
             ))
         };
     }
-    let value = width.read(array.as_ref(), row);
-    work.step()?;
-    Ok(Some(value?))
+    Ok(Some(row))
 }
 
 #[cfg(test)]

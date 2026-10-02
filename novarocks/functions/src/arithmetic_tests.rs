@@ -526,16 +526,9 @@ fn preparation_refuses_other_domains_and_wrong_result_or_nonnullable_output() {
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             false,
-            ValueLogicalType::LargeInt,
-        )
-        .unwrap(),
-        FunctionValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            false,
             ValueLogicalType::Uuid,
         )
         .unwrap(),
-        ty(DataType::Decimal128(18, 6), false),
     ] {
         assert!(matches!(
             PreparedArithmeticRecipe::try_new(
@@ -549,6 +542,28 @@ fn preparation_refuses_other_domains_and_wrong_result_or_nonnullable_output() {
             ),
             Err(ArithmeticPrepareError::Unsupported)
         ));
+    }
+    for other in [
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap(),
+        ty(DataType::Decimal128(18, 6), false),
+    ] {
+        assert_eq!(
+            PreparedArithmeticRecipe::try_new(
+                ArithmeticOperator::Add,
+                &signed,
+                &other,
+                &ty(DataType::Int64, true),
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                &CompileControl::default()
+            ),
+            Err(ArithmeticPrepareError::TypeMismatch)
+        );
     }
     for result in [
         ty(DataType::Int64, false),

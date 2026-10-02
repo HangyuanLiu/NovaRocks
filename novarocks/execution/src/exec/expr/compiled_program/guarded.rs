@@ -950,17 +950,31 @@ fn evaluate_arithmetic<'a>(
     selection: Selection<'a>,
     work: &mut Work<'_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
-    use arrow::array::{Float64Array, Int16Array, Int32Array, Int64Array};
+    use arrow::array::{
+        Decimal128Array, Decimal256Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        builder::FixedSizeBinaryBuilder,
+    };
+    use arrow_buffer::i256;
     use novarocks_functions::ArithmeticRowResult as R;
     let ty = &recipe.result_type().data_type;
     // This is a checked representation bound and fallible capacity reservation,
     // not a host Account grant or an Arrow allocation-origin receipt.
+    let bitmap = selection
+        .len()
+        .checked_add(7)
+        .map(|n| n / 8)
+        .and_then(|n| n.checked_add(63))
+        .map(|n| n / 64 * 64)
+        .ok_or(KernelFailure::ResourceExhausted)?;
     selection
         .len()
         .checked_mul(
-            16 + std::mem::size_of::<RowDataError>()
+            std::mem::size_of::<Option<i256>>()
+                + 32
+                + std::mem::size_of::<RowDataError>()
                 + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
         )
+        .and_then(|n| n.checked_add(bitmap))
         .filter(|bytes| *bytes <= isize::MAX as usize)
         .ok_or(KernelFailure::ResourceExhausted)?;
     work.flush()?;
@@ -969,12 +983,23 @@ fn evaluate_arithmetic<'a>(
         I32(Vec<Option<i32>>),
         I64(Vec<Option<i64>>),
         Float(Vec<Option<f64>>),
+        Decimal128(Vec<Option<i128>>),
+        Decimal256(Vec<Option<i256>>),
+        LargeInt(FixedSizeBinaryBuilder),
     }
     let mut output = match ty {
         DataType::Int16 => Output::I16(Vec::new()),
         DataType::Int32 => Output::I32(Vec::new()),
         DataType::Int64 => Output::I64(Vec::new()),
         DataType::Float64 => Output::Float(Vec::new()),
+        DataType::Decimal128(..) => Output::Decimal128(Vec::new()),
+        DataType::Decimal256(..) => Output::Decimal256(Vec::new()),
+        DataType::FixedSizeBinary(16)
+            if recipe.result_type().logical_type
+                == novarocks_type_contract::ValueLogicalType::LargeInt =>
+        {
+            Output::LargeInt(FixedSizeBinaryBuilder::with_capacity(selection.len(), 16))
+        }
         _ => {
             return Err(internal(
                 "arithmetic recipe has an unsupported frozen result carrier",
@@ -986,6 +1011,9 @@ fn evaluate_arithmetic<'a>(
         Output::I32(values) => values.try_reserve_exact(selection.len()),
         Output::I64(values) => values.try_reserve_exact(selection.len()),
         Output::Float(values) => values.try_reserve_exact(selection.len()),
+        Output::Decimal128(values) => values.try_reserve_exact(selection.len()),
+        Output::Decimal256(values) => values.try_reserve_exact(selection.len()),
+        Output::LargeInt(_) => Ok(()),
     }
     .map_err(|_| KernelFailure::ResourceExhausted)?;
     let mut errors = Vec::new();
@@ -1038,10 +1066,18 @@ fn evaluate_arithmetic<'a>(
             (Output::I32(values), R::Signed(value)) => values.push(i32::try_from(value).ok()),
             (Output::I64(values), R::Signed(value)) => values.push(Some(value)),
             (Output::Float(values), R::Float(value)) => values.push(Some(value)),
+            (Output::Decimal128(values), R::Decimal128(value)) => values.push(Some(value)),
+            (Output::Decimal256(values), R::Decimal256(value)) => values.push(Some(value)),
+            (Output::LargeInt(values), R::LargeInt(value)) => values
+                .append_value(value.to_be_bytes())
+                .map_err(|_| internal("LargeInt result differs from its fixed carrier width"))?,
             (Output::I16(values), R::Null) => values.push(None),
             (Output::I32(values), R::Null) => values.push(None),
             (Output::I64(values), R::Null) => values.push(None),
             (Output::Float(values), R::Null) => values.push(None),
+            (Output::Decimal128(values), R::Null) => values.push(None),
+            (Output::Decimal256(values), R::Null) => values.push(None),
+            (Output::LargeInt(values), R::Null) => values.append_null(),
             _ => {
                 return Err(internal(
                     "arithmetic body returned a foreign frozen result carrier",
@@ -1056,6 +1092,21 @@ fn evaluate_arithmetic<'a>(
         (DataType::Int32, Output::I32(values)) => Arc::new(Int32Array::from(values)),
         (DataType::Int64, Output::I64(values)) => Arc::new(Int64Array::from(values)),
         (DataType::Float64, Output::Float(values)) => Arc::new(Float64Array::from(values)),
+        (DataType::Decimal128(precision, scale), Output::Decimal128(values)) => Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|_| {
+                    internal("Decimal128 result metadata differs from its prepared type")
+                })?,
+        ),
+        (DataType::Decimal256(precision, scale), Output::Decimal256(values)) => Arc::new(
+            Decimal256Array::from(values)
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|_| {
+                    internal("Decimal256 result metadata differs from its prepared type")
+                })?,
+        ),
+        (DataType::FixedSizeBinary(16), Output::LargeInt(mut values)) => Arc::new(values.finish()),
         _ => {
             return Err(internal(
                 "arithmetic recipe has an unsupported frozen result carrier",

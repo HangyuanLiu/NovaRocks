@@ -2064,6 +2064,11 @@ mod legacy_signed_prepared_oracle_tests {
                     value.to_bits()
                 );
             }
+            ArithmeticRowResult::LargeInt(_)
+            | ArithmeticRowResult::Decimal128(_)
+            | ArithmeticRowResult::Decimal256(_) => {
+                panic!("foreign result in signed legacy oracle")
+            }
             ArithmeticRowResult::RowError(error) => {
                 panic!("unexpected row error: {}", error.message())
             }
@@ -2170,3 +2175,10 @@ mod legacy_signed_prepared_oracle_tests {
         }
     }
 }
+#[cfg(test)]
+#[path = "arithmetic_decimal_oracle_tests.rs"]
+mod arithmetic_decimal_oracle_tests;
+
+#[cfg(test)]
+#[path = "arithmetic_largeint_oracle_tests.rs"]
+mod arithmetic_largeint_oracle_tests;
