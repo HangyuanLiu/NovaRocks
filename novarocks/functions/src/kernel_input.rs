@@ -61,6 +61,17 @@ impl<'a> EvaluationCheckpoints<'a> {
         }
         Ok(())
     }
+    pub(crate) fn flush(&mut self) -> Result<(), KernelFailure> {
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
+        if let Err(refusal) = self.control.checkpoint(self.pending) {
+            self.refusal = Some(refusal.clone());
+            return Err(refusal);
+        }
+        self.pending = 0;
+        Ok(())
+    }
     pub(crate) fn finish(self) -> Result<(), KernelFailure> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);

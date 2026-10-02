@@ -152,7 +152,7 @@ impl ProgramTypedExpressions {
                             operation,
                             child,
                             decimal_overflow_policy,
-                            ..
+                            allow_throw_exception,
                         } = definition.kind()
                         {
                             let Some(FunctionArgumentType::Value(source)) =
@@ -185,6 +185,21 @@ impl ProgramTypedExpressions {
                                     signed_width(&value.data_type),
                                 )
                                 && target < source
+                                && !value.nullable
+                            {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            // A nonnullable floating input can still fail safe numeric
+                            // conversion. Only the authored throwing mode turns that
+                            // failure into an error instead of a successful SQL NULL.
+                            if *operation == novarocks_functions::CastOperation::Carrier
+                                && matches!(
+                                    source.data_type,
+                                    arrow_schema::DataType::Float32
+                                        | arrow_schema::DataType::Float64
+                                )
+                                && signed_width(&value.data_type).is_some()
+                                && !allow_throw_exception
                                 && !value.nullable
                             {
                                 return Err(ProgramExpressionTypeError::TypeMismatch);

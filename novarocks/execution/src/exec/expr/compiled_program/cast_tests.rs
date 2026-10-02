@@ -225,12 +225,11 @@ fn fixture(
         let value = if ty.nullable {
             LiteralValue::Null
         } else {
-            assert_eq!(
-                ty.data_type,
-                DataType::Int64,
-                "this Values literal source is precisely I64"
-            );
-            LiteralValue::Int64(0)
+            match ty.data_type {
+                DataType::Int64 => LiteralValue::Int64(0),
+                DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
+                _ => panic!("nonnullable fixture requires an implemented exact numeric literal"),
+            }
         };
         let definition = builder
             .add_expression(input_node, ty.clone(), ExprKind::Literal(value))
@@ -992,3 +991,6 @@ fn cast_compile_preserves_all_original_refusals_and_observes_ordinary_narrowing_
         }
     }
 }
+
+#[path = "cast_float_tests.rs"]
+mod cast_float_tests;

@@ -5325,3 +5325,7 @@ mod intrinsic_cast_row_contract_tests {
         assert_eq!(result.null_count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "cast_float_numeric_oracle_tests.rs"]
+mod cast_float_numeric_oracle_tests;

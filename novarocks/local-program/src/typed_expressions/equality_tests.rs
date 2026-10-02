@@ -171,6 +171,7 @@ fn assembled(
             | StaticExprKind::Le(left, right)
             | StaticExprKind::Gt(left, right)
             | StaticExprKind::Ge(left, right) => (ControlShape::Eager, vec![*left, *right]),
+            StaticExprKind::PreparedCast { child, .. } => (ControlShape::Eager, vec![*child]),
             StaticExprKind::LambdaFunction { body, .. } => (ControlShape::LambdaBody, vec![*body]),
             _ => (ControlShape::Eager, vec![]),
         };
@@ -770,3 +771,76 @@ fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null()
 
 #[path = "nullsafe_tests.rs"]
 mod nullsafe_tests;
+
+#[test]
+fn float_integer_cast_all_definitions_use_the_frozen_allow_mode_for_successful_null() {
+    use novarocks_functions::CastOperation;
+    use novarocks_type_contract::DecimalOverflowPolicy as P;
+    for source_type in [DataType::Float32, DataType::Float64] {
+        for target_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            for allow in [false, true] {
+                for source_nullable in [false, true] {
+                    for result_nullable in [false, true] {
+                        for policy in [P::OutputNull, P::ReportError] {
+                            for dead in [false, true] {
+                                let source =
+                                    FunctionValueType::new(source_type.clone(), source_nullable);
+                                let result =
+                                    FunctionValueType::new(target_type.clone(), result_nullable);
+                                let root = if dead {
+                                    ProgramExprId::new(2)
+                                } else {
+                                    ProgramExprId::new(1)
+                                };
+                                let root_type = if dead { boolean(false) } else { result.clone() };
+                                let (calls, types) = assembled(
+                                    vec![
+                                        slot(0, &source),
+                                        StaticExprNode::new(
+                                            StaticExprKind::PreparedCast {
+                                                operation: CastOperation::Carrier,
+                                                child: ProgramExprId::new(0),
+                                                decimal_overflow_policy: policy,
+                                                allow_throw_exception: allow,
+                                            },
+                                            target_type.clone(),
+                                            None,
+                                        ),
+                                        slot(2, &boolean(false)),
+                                    ],
+                                    vec![
+                                        FunctionArgumentType::Value(source),
+                                        FunctionArgumentType::Value(result),
+                                        FunctionArgumentType::Value(boolean(false)),
+                                    ],
+                                    root,
+                                    root_type,
+                                    EvaluationDemand::Value,
+                                );
+                                let typed =
+                                    ProgramTypedExpressions::try_new(calls, types, &Control);
+                                let valid = result_nullable || (!source_nullable && allow);
+                                if valid {
+                                    assert!(
+                                        typed.is_ok(),
+                                        "{source_type:?}->{target_type:?} allow={allow}, dead={dead}: {typed:?}"
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        typed.unwrap_err(),
+                                        ProgramExpressionTypeError::TypeMismatch
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable selected casts for the exact Physical signed scalar domain.
+//! Immutable selected casts for exact Physical signed and floating scalar domains.
 //! The caller retains original policies and full types; this recipe performs no
 //! output allocation, registry lookup, coercion or memory admission.
 
@@ -25,7 +25,9 @@ use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError,
     ScopedExpressionEffects,
 };
-use arrow_array::{Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_array::{
+    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+};
 use arrow_cast::cast::num_cast;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
@@ -120,6 +122,31 @@ impl SignedWidth {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Source {
+    Signed(SignedWidth),
+    F32,
+    F64,
+}
+impl Source {
+    fn from_type(ty: &DataType) -> Option<Self> {
+        SignedWidth::from_type(ty).map(Self::Signed).or(match ty {
+            DataType::Float32 => Some(Self::F32),
+            DataType::Float64 => Some(Self::F64),
+            _ => None,
+        })
+    }
+    fn validate(self, array: &dyn Array) -> bool {
+        match self {
+            Self::Signed(width) => width.validate(array),
+            Self::F32 => array.as_any().is::<Float32Array>(),
+            Self::F64 => array.as_any().is::<Float64Array>(),
+        }
+    }
+    const fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
     Signed(SignedWidth),
     F32,
@@ -135,8 +162,8 @@ impl Target {
     }
 }
 
-/// Successful narrowing failures are NULL, never row errors for these 24 pairs.
-/// RowError is reserved for subsequent explicitly authored cast families.
+/// Signed narrowing failures are successful NULLs. Floating-to-signed failures
+/// use the original ALLOW policy independently of the decimal overflow policy.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CastRowResult {
     Null,
@@ -151,7 +178,7 @@ pub struct PreparedCastRecipe {
     operation: CastOperation,
     source: FunctionValueType,
     result: FunctionValueType,
-    source_width: SignedWidth,
+    source_kind: Source,
     target: Target,
     decimal_overflow_policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
@@ -176,13 +203,20 @@ impl PreparedCastRecipe {
             if operation != CastOperation::Carrier || !physical {
                 return Err(CastPrepareError::Unsupported);
             }
-            let source_width =
-                SignedWidth::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
+            let source_kind =
+                Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
             let target =
                 Target::from_type(&result.data_type).ok_or(CastPrepareError::Unsupported)?;
             work.step()?;
-            let narrowing = matches!(target, Target::Signed(width) if width < source_width);
-            let valid_nullable = result.nullable || (!source.nullable && !narrowing);
+            if source_kind.is_float() && !matches!(target, Target::Signed(_)) {
+                return Err(CastPrepareError::Unsupported);
+            }
+            let successful_null = match (source_kind, target) {
+                (Source::Signed(source), Target::Signed(target)) => target < source,
+                (Source::F32 | Source::F64, Target::Signed(_)) => !allow_throw_exception,
+                _ => false,
+            };
+            let valid_nullable = result.nullable || (!source.nullable && !successful_null);
             work.step()?;
             if !valid_nullable {
                 return Err(CastPrepareError::TypeMismatch);
@@ -192,7 +226,7 @@ impl PreparedCastRecipe {
                 operation,
                 source: source.clone(),
                 result: result.clone(),
-                source_width,
+                source_kind,
                 target,
                 decimal_overflow_policy: policy,
                 allow_throw_exception,
@@ -229,7 +263,13 @@ impl PreparedCastRecipe {
         self.allow_throw_exception
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::primitive(context, ExpressionEffects::PURE_VALUE)
+        ScopedExpressionEffects::primitive(
+            context,
+            ExpressionEffects {
+                may_raise_row_error: self.source_kind.is_float() && self.allow_throw_exception,
+                ..ExpressionEffects::PURE_VALUE
+            },
+        )
     }
     /// The host excludes inherited errors before this selected-row operation.
     /// Both the actual address and concrete scalar carrier are checked before NULL.
@@ -276,11 +316,53 @@ impl PreparedCastRecipe {
                     output.unwrap_or(CastRowResult::Null)
                 }};
             }
-            Ok(match self.source_width {
-                SignedWidth::I8 => convert!(Int8Array, i8),
-                SignedWidth::I16 => convert!(Int16Array, i16),
-                SignedWidth::I32 => convert!(Int32Array, i32),
-                SignedWidth::I64 => convert!(Int64Array, i64),
+            macro_rules! convert_float {
+                ($array:ty, $native:ty) => {{
+                    let source = argument.array().as_any().downcast_ref::<$array>()
+                        .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
+                        .value(row);
+                    let converted = match self.target {
+                        Target::Signed(SignedWidth::I8) => num_cast::<$native, i8>(source).map(i64::from),
+                        Target::Signed(SignedWidth::I16) => num_cast::<$native, i16>(source).map(i64::from),
+                        Target::Signed(SignedWidth::I32) => num_cast::<$native, i32>(source).map(i64::from),
+                        Target::Signed(SignedWidth::I64) => num_cast::<$native, i64>(source),
+                        _ => return Err(internal("floating cast contains a foreign frozen target")),
+                    };
+                    work.step()?;
+                    match converted {
+                        Some(value) => CastRowResult::Signed(value),
+                        None if !self.allow_throw_exception => CastRowResult::Null,
+                        None => {
+                            let name = match self.target {
+                                Target::Signed(SignedWidth::I8) => "TINYINT",
+                                Target::Signed(SignedWidth::I16) => "SMALLINT",
+                                Target::Signed(SignedWidth::I32) => "INT",
+                                Target::Signed(SignedWidth::I64) => "BIGINT",
+                                _ => return Err(internal("floating cast contains a foreign frozen target")),
+                            };
+                            work.step()?;
+                            work.flush()?;
+                            // The frozen scalar types and one f64 bound the diagnostic.
+                            // String allocation/formatting internals are opaque, not a
+                            // formal host memory grant or an internal work proof.
+                            let message = format!(
+                                "Expr evaluate meet error: CAST failed: from {:?} to {:?}: {} conflict with range of {}",
+                                self.source.data_type, self.result.data_type, source as f64, name,
+                            );
+                            let error = RowDataError::new(ordinal, &message);
+                            work.flush()?;
+                            CastRowResult::RowError(error)
+                        }
+                    }
+                }};
+            }
+            Ok(match self.source_kind {
+                Source::Signed(SignedWidth::I8) => convert!(Int8Array, i8),
+                Source::Signed(SignedWidth::I16) => convert!(Int16Array, i16),
+                Source::Signed(SignedWidth::I32) => convert!(Int32Array, i32),
+                Source::Signed(SignedWidth::I64) => convert!(Int64Array, i64),
+                Source::F32 => convert_float!(Float32Array, f32),
+                Source::F64 => convert_float!(Float64Array, f64),
             })
         })();
         // The same work latch returns any original callback cause without replay.
@@ -347,7 +429,7 @@ impl PreparedCastRecipe {
         if !in_bounds {
             return Err(invalid("cast selected address is outside its array"));
         }
-        let concrete = self.source_width.validate(array.as_ref());
+        let concrete = self.source_kind.validate(array.as_ref());
         work.step()?;
         if !concrete {
             return Err(internal("cast carrier has a foreign array implementation"));
@@ -359,3 +441,7 @@ impl PreparedCastRecipe {
 #[cfg(test)]
 #[path = "cast_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cast_float_tests.rs"]
+mod float_tests;
