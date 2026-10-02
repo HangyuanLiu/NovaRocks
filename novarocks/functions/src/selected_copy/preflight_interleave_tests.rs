@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow::array::{BooleanArray, Decimal128Array, Int64Array, TimestampNanosecondArray};
+use arrow_array::{BooleanArray, Decimal128Array, Int64Array, TimestampNanosecondArray};
 use std::sync::Arc;
 
 fn sources() -> Vec<ArrayRef> {
@@ -33,7 +33,7 @@ fn fixed_interleave_preflight_preserves_actual_compact_source_order_nulls_and_sl
     let choices = [(1, 1), (0, 0), (1, 0), (0, 1)];
     preflight_fixed_interleave(&DataType::Int64, &arrays, &choices, |_| Ok(())).unwrap();
     let refs: Vec<&dyn Array> = arrays.iter().map(|array| array.as_ref()).collect();
-    let output = arrow::compute::interleave(&refs, &choices).unwrap();
+    let output = arrow_select::interleave::interleave(&refs, &choices).unwrap();
     let actual = output.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(
         actual.iter().collect::<Vec<_>>(),
@@ -50,7 +50,7 @@ fn boolean_fallback_and_decimal_primitive_keep_actual_output_type_and_nulls() {
     let choices = [(0, 1), (1, 0), (0, 0)];
     preflight_fixed_interleave(&DataType::Boolean, &bools, &choices, |_| Ok(())).unwrap();
     let refs: Vec<&dyn Array> = bools.iter().map(|array| array.as_ref()).collect();
-    let output = arrow::compute::interleave(&refs, &choices).unwrap();
+    let output = arrow_select::interleave::interleave(&refs, &choices).unwrap();
     assert_eq!(
         output
             .as_any()
@@ -75,7 +75,7 @@ fn boolean_fallback_and_decimal_primitive_keep_actual_output_type_and_nulls() {
     let ty = DataType::Decimal128(3, 2);
     preflight_fixed_interleave(&ty, &decimals, &choices, |_| Ok(())).unwrap();
     let refs: Vec<&dyn Array> = decimals.iter().map(|array| array.as_ref()).collect();
-    let output = arrow::compute::interleave(&refs, &choices).unwrap();
+    let output = arrow_select::interleave::interleave(&refs, &choices).unwrap();
     assert_eq!(output.data_type(), &ty);
     assert_eq!(
         output
@@ -115,10 +115,7 @@ fn exact_fixed_type_and_all_source_bounds_are_checked_even_for_empty_choices() {
     let timestamp: Vec<ArrayRef> = vec![Arc::new(
         TimestampNanosecondArray::from(vec![0]).with_timezone("UTC"),
     )];
-    let wrong_zone = DataType::Timestamp(
-        arrow::datatypes::TimeUnit::Nanosecond,
-        Some("+00:00".into()),
-    );
+    let wrong_zone = DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("+00:00".into()));
     assert!(matches!(
         preflight_fixed_interleave(&wrong_zone, &timestamp, &[], |_| Ok(())),
         Err(CopyError::Invalid(_))
@@ -132,13 +129,13 @@ fn unsupported_variable_and_encoded_carriers_are_not_silently_copied_or_retagged
         DataType::Utf8,
         DataType::FixedSizeBinary(16),
         DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-        DataType::List(Arc::new(arrow::datatypes::Field::new(
+        DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
             DataType::Int64,
             true,
         ))),
     ] {
-        let arrays = vec![arrow::array::new_empty_array(&ty)];
+        let arrays = vec![arrow_array::new_empty_array(&ty)];
         assert!(
             matches!(preflight_fixed_interleave(&ty, &arrays, &[], |_| Ok(())), Err(CopyError::Unsupported(actual)) if actual == ty)
         );

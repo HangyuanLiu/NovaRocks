@@ -98,7 +98,7 @@ impl Frame {
         work: &mut Work<'_>,
     ) -> Result<Self, KernelFailure> {
         if supports_result(result_type) {
-            super::super::constant_eval::guarded_interleave_extent(result_type, rows.len())
+            novarocks_functions::selected_copy::guarded_interleave_extent(result_type, rows.len())
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             work.step()?;
         }
@@ -886,12 +886,17 @@ fn assemble(
         });
         work.step()?;
     }
-    super::super::constant_eval::preflight_guarded_interleave(ty, &sources, &indices, |boundary| {
-        if boundary { work.flush() } else { work.step() }
-    })
+    novarocks_functions::selected_copy::preflight_guarded_interleave(
+        ty,
+        &sources,
+        &indices,
+        |boundary| {
+            if boundary { work.flush() } else { work.step() }
+        },
+    )
     .map_err(|error| match error {
-        super::super::constant_eval::CopyError::Control(error) => error,
-        super::super::constant_eval::CopyError::Extent => KernelFailure::ResourceExhausted,
+        novarocks_functions::selected_copy::CopyError::Control(error) => error,
+        novarocks_functions::selected_copy::CopyError::Extent => KernelFailure::ResourceExhausted,
         _ => invalid("guarded result requires its dedicated carrier protocol"),
     })?;
     let mut arrays = Vec::with_capacity(sources.len());

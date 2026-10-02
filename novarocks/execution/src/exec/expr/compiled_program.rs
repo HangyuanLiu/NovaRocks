@@ -728,15 +728,14 @@ fn gather(
         work.flush()?;
         return Ok(output);
     }
-    super::constant_eval::preflight_take(array.as_ref(), indices, |boundary| {
+    novarocks_functions::selected_copy::preflight_take(array.as_ref(), indices, |boundary| {
         if boundary { work.flush() } else { work.step() }
     })
     .map_err(|error| match error {
-        super::constant_eval::CopyError::Control(error) => error,
-        super::constant_eval::CopyError::Extent => KernelFailure::ResourceExhausted,
-        super::constant_eval::CopyError::Invalid(_)
-        | super::constant_eval::CopyError::Unsupported(_)
-        | super::constant_eval::CopyError::Arrow(_) => {
+        novarocks_functions::selected_copy::CopyError::Control(error) => error,
+        novarocks_functions::selected_copy::CopyError::Extent => KernelFailure::ResourceExhausted,
+        novarocks_functions::selected_copy::CopyError::Invalid(_)
+        | novarocks_functions::selected_copy::CopyError::Unsupported(_) => {
             invalid("selected Arrow copy requires a different carrier protocol")
         }
     })?;

@@ -16,8 +16,8 @@
 // under the License.
 
 use super::*;
-use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
-use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use std::sync::Arc;
 
 fn types() -> [DataType; 4] {
@@ -109,7 +109,7 @@ fn arrays(ty: &DataType) -> Vec<ArrayRef> {
 }
 fn copy(sources: &[ArrayRef], choices: &[(usize, usize)]) -> ArrayRef {
     let refs: Vec<&dyn Array> = sources.iter().map(|array| array.as_ref()).collect();
-    arrow::compute::interleave(&refs, choices).unwrap()
+    arrow_select::interleave::interleave(&refs, choices).unwrap()
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn exact_byte_sources_and_choice_bounds_are_required_even_with_empty_choices() {
         DataType::Utf8View,
         DataType::BinaryView,
         DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-        DataType::List(Arc::new(arrow::datatypes::Field::new(
+        DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
             DataType::Utf8,
             true,

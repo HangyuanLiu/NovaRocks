@@ -51,6 +51,7 @@ mod kernel_input;
 mod lambda_rows;
 mod pure_catalogue;
 mod scalar_kernel;
+pub mod selected_copy;
 mod specialization;
 mod table_call;
 mod table_kernel;

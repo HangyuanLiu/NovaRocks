@@ -31,6 +31,7 @@ doctest = false
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-cast.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
 novarocks-type-contract.workspace = true
@@ -40,4 +41,5 @@ rand.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+arrow-select = "58.2.0"
 arrow-ord = "58.2.0"
