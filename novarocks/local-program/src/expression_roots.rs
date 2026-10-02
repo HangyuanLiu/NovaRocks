@@ -747,8 +747,8 @@ fn validate_intrinsic_correspondence(
             .ok_or(ProgramRootBindingError::InvalidDefinition)?;
         let expected = match definition.kind() {
             StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => continue,
-            StaticExprKind::And(..) => ControlShape::Conjunction,
-            StaticExprKind::Or(..) => ControlShape::Disjunction,
+            StaticExprKind::And(..) | StaticExprKind::NaryAnd { .. } => ControlShape::Conjunction,
+            StaticExprKind::Or(..) | StaticExprKind::NaryOr { .. } => ControlShape::Disjunction,
             StaticExprKind::LambdaFunction { .. } => ControlShape::LambdaBody,
             StaticExprKind::Case {
                 has_case_expr,
@@ -815,6 +815,8 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Literal(_)
             | StaticExprKind::SlotId(_) => {}
             StaticExprKind::ArrayExpr { elements }
+            | StaticExprKind::NaryAnd { args: elements }
+            | StaticExprKind::NaryOr { args: elements }
             | StaticExprKind::StructExpr { fields: elements }
             | StaticExprKind::Case {
                 children: elements, ..
@@ -887,3 +889,6 @@ mod tests;
 
 #[cfg(test)]
 mod control_tests;
+
+#[cfg(test)]
+mod nary_tests;

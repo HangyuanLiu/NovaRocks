@@ -221,7 +221,9 @@ fn lower_core(
             }
             let args: &[ExprId] = match &node.kind {
                 ExprKind::Literal(_) | ExprKind::Value(_) => &[],
-                ExprKind::FunctionCall { args, .. } => args,
+                ExprKind::FunctionCall { args, .. }
+                | ExprKind::Conjunction { args }
+                | ExprKind::Disjunction { args } => args,
                 _ => return Err(ExpressionLoweringError::UnsupportedExpression(id)),
             };
             if let Some(&child) = args.get(next) {
@@ -298,6 +300,40 @@ fn lower_core(
                     };
                     work.flush()?;
                     StaticExprKind::Constant(value)
+                }
+                ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
+                    if args.is_empty()
+                        || node.ty.data_type != arrow_schema::DataType::Boolean
+                        || node.ty.logical_type
+                            != novarocks_type_contract::ValueLogicalType::Physical
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "Boolean connective has an invalid exact result or arity",
+                        ));
+                    }
+                    let mut local_args = Vec::with_capacity(args.len());
+                    for child in args {
+                        let child_source = source
+                            .get(*child)
+                            .ok_or(ExpressionLoweringError::Invalid("missing Boolean operand"))?;
+                        if child_source.ty.data_type != arrow_schema::DataType::Boolean
+                            || child_source.ty.logical_type
+                                != novarocks_type_contract::ValueLogicalType::Physical
+                        {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "Boolean operand differs from its exact physical Boolean type",
+                            ));
+                        }
+                        local_args.push(*ids.get(child).ok_or(
+                            ExpressionLoweringError::Invalid("Boolean operand was not lowered"),
+                        )?);
+                        work.step()?;
+                    }
+                    if matches!(node.kind, ExprKind::Conjunction { .. }) {
+                        StaticExprKind::NaryAnd { args: local_args }
+                    } else {
+                        StaticExprKind::NaryOr { args: local_args }
+                    }
                 }
                 ExprKind::FunctionCall { args, .. } => {
                     let mut local_args = Vec::with_capacity(args.len());
@@ -590,6 +626,43 @@ fn prepare_core(
                         ));
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (ExprKind::Conjunction { args }, StaticExprKind::NaryAnd { args: local_args })
+                | (ExprKind::Disjunction { args }, StaticExprKind::NaryOr { args: local_args }) => {
+                    let expected = if matches!(source.kind, ExprKind::Conjunction { .. }) {
+                        ControlShape::Conjunction
+                    } else {
+                        ControlShape::Disjunction
+                    };
+                    if invocation.control != expected
+                        || args.len() != invocation.arguments.len()
+                        || args.len() != local_args.len()
+                        || args.is_empty()
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "actual Boolean connective control or arity differs",
+                        ));
+                    }
+                    let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
+                    for (ordinal, &child) in args.iter().enumerate() {
+                        let child_use = invocation.arguments[ordinal];
+                        if flow.uses()[&child_use].definition != child {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "ordered Boolean operand occurrences differ",
+                            ));
+                        }
+                        combined = combined.join_control_argument(
+                            *effects
+                                .get(&child_use)
+                                .ok_or(ExpressionLoweringError::Invalid(
+                                    "Boolean operand effects were not prepared",
+                                ))?,
+                            flow,
+                            ordinal,
+                        )?;
+                        work.step()?;
+                    }
+                    combined
                 }
                 (
                     ExprKind::FunctionCall { function, args },

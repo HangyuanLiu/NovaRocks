@@ -67,11 +67,14 @@ impl ExprArena {
     /// The source remains the only retained static expression graph; dictionary
     /// bytes stay behind shared Arcs.
     pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Result<Self, String> {
-        if expressions
-            .nodes()
-            .iter()
-            .any(|node| matches!(node.kind(), StaticExprKind::BoundCall { .. }))
-        {
+        if expressions.nodes().iter().any(|node| {
+            matches!(
+                node.kind(),
+                StaticExprKind::BoundCall { .. }
+                    | StaticExprKind::NaryAnd { .. }
+                    | StaticExprKind::NaryOr { .. }
+            )
+        }) {
             return Err("compiled calls cannot enter the legacy expression bridge".to_string());
         }
         let mut arena = Self::default();
@@ -114,7 +117,7 @@ fn old_id(id: ProgramExprId) -> ExprId {
 fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
     use StaticExprKind as Static;
     Ok(match kind {
-        Static::BoundCall { .. } => {
+        Static::BoundCall { .. } | Static::NaryAnd { .. } | Static::NaryOr { .. } => {
             return Err("compiled calls cannot enter the legacy expression bridge".to_string());
         }
         Static::Literal(value) => ExprNode::Literal(thaw_literal(value)),
@@ -453,6 +456,35 @@ mod tests {
             error,
             "compiled calls cannot enter the legacy expression bridge"
         );
+    }
+
+    #[test]
+    fn compiled_nary_occurrences_cannot_be_rebuilt_as_legacy_binary_uses() {
+        for kind in [
+            StaticExprKind::NaryAnd {
+                args: vec![ProgramExprId::new(0); 3],
+            },
+            StaticExprKind::NaryOr {
+                args: vec![ProgramExprId::new(0); 3],
+            },
+        ] {
+            let expressions = ImmutableExpressions::try_new(
+                vec![
+                    StaticExprNode::new(
+                        StaticExprKind::Literal(StaticLiteral::Bool(true)),
+                        DataType::Boolean,
+                        None,
+                    ),
+                    StaticExprNode::new(kind, DataType::Boolean, None),
+                ],
+                false,
+                HashMap::new(),
+                None,
+            )
+            .unwrap();
+            assert!(ExprArena::from_immutable(&expressions).is_err());
+            assert!(thaw_kind(expressions.node(ProgramExprId::new(1)).unwrap().kind()).is_err());
+        }
     }
 
     #[test]

@@ -136,6 +136,50 @@ impl ProgramTypedExpressions {
                         if let StaticExprKind::Constant(constant) = definition.kind() {
                             same_value(constant.value_type(), value, false, &mut work)?;
                         }
+                        if let StaticExprKind::NaryAnd { args } | StaticExprKind::NaryOr { args } =
+                            definition.kind()
+                        {
+                            if value.data_type != arrow_schema::DataType::Boolean
+                                || value.logical_type != ValueLogicalType::Physical
+                            {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            let deciding =
+                                matches!(definition.kind(), StaticExprKind::NaryOr { .. });
+                            let mut nullable = false;
+                            let mut constant_decides = false;
+                            for argument in args {
+                                work.step()?;
+                                let Some(FunctionArgumentType::Value(operand)) =
+                                    entries.get(argument.index())
+                                else {
+                                    return Err(ProgramExpressionTypeError::WrongKind);
+                                };
+                                if operand.data_type != arrow_schema::DataType::Boolean
+                                    || operand.logical_type != ValueLogicalType::Physical
+                                {
+                                    return Err(ProgramExpressionTypeError::TypeMismatch);
+                                }
+                                nullable |= operand.nullable;
+                                if let StaticExprKind::Constant(constant) = definitions
+                                    .node(*argument)
+                                    .expect("checked operand reference")
+                                    .kind()
+                                {
+                                    constant_decides |= constant
+                                        .try_boolean()
+                                        .map_err(|_| ProgramExpressionTypeError::TypeMismatch)?
+                                        == Some(deciding);
+                                    work.step()?;
+                                }
+                            }
+                            // A conservative nullable declaration is retained.
+                            // A narrower one requires this author's actual
+                            // constant deciding-value proof, not demand coercion.
+                            if !value.nullable && nullable && !constant_decides {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                        }
                     }
                 }
             }
@@ -298,3 +342,6 @@ mod tests;
 
 #[cfg(test)]
 mod call_tests;
+
+#[cfg(test)]
+mod nary_tests;

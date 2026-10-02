@@ -167,6 +167,14 @@ pub enum StaticExprKind {
     Ge(ProgramExprId, ProgramExprId),
     And(ProgramExprId, ProgramExprId),
     Or(ProgramExprId, ProgramExprId),
+    /// Ordered physical Boolean occurrences, without introducing binary
+    /// intermediate definitions or changing the checked invocation graph.
+    NaryAnd {
+        args: Vec<ProgramExprId>,
+    },
+    NaryOr {
+        args: Vec<ProgramExprId>,
+    },
     Not(ProgramExprId),
     IsNull(ProgramExprId),
     IsNotNull(ProgramExprId),
@@ -263,7 +271,9 @@ impl StaticExprKind {
                     visit(*id)?;
                 }
             }
-            Self::Case { children, .. }
+            Self::NaryAnd { args: children }
+            | Self::NaryOr { args: children }
+            | Self::Case { children, .. }
             | Self::FunctionCall { args: children, .. }
             | Self::BoundCall { args: children } => {
                 for id in children {
@@ -467,6 +477,13 @@ impl ImmutableExpressions {
         let mut charged_dicts = HashSet::new();
         let mut charged_constant_arrays = HashSet::new();
         for (index, node) in nodes.iter().enumerate() {
+            if let StaticExprKind::NaryAnd { args } | StaticExprKind::NaryOr { args } = &node.kind {
+                let empty = args.is_empty();
+                observe(ExpressionObservation::Step)?;
+                if empty {
+                    return Err(StaticExpressionError::InvalidMetadataArity.into());
+                }
+            }
             let mut depth = 1_usize;
             node.kind.try_for_each_reference(|child| -> Result<(), E> {
                 let valid = child.index() < index;

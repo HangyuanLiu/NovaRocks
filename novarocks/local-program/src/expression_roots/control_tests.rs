@@ -158,7 +158,7 @@ fn flow(uses: Vec<ProgramExpressionUse>, definition_count: usize) -> ProgramCont
 fn main_flow(value: ProgramControlFlow) -> BTreeMap<ProgramExpressionArena, ProgramControlFlow> {
     BTreeMap::from([(ProgramExpressionArena::Main, value)])
 }
-fn project_program(
+pub(super) fn project_program(
     arena: Arc<ImmutableExpressions>,
     definitions: Vec<usize>,
     ty: DataType,

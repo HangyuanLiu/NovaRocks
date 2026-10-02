@@ -160,3 +160,6 @@ mod channel_tests;
 
 #[cfg(test)]
 mod control_call_tests;
+
+#[cfg(test)]
+mod nary_lowering_tests;
