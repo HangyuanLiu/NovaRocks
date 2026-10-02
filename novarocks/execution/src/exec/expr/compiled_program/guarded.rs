@@ -28,7 +28,14 @@ use novarocks_local_program::{ProgramLexicalBindings, ProgramNodeId};
 use novarocks_type_contract::EvaluationDemand;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
-    *ty == DataType::Boolean || ty.primitive_width().is_some()
+    matches!(
+        ty,
+        DataType::Boolean
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::LargeUtf8
+            | DataType::LargeBinary
+    ) || ty.primitive_width().is_some()
 }
 
 enum OwnedValue {
@@ -90,7 +97,7 @@ impl Frame {
         work: &mut Work<'_>,
     ) -> Result<Self, KernelFailure> {
         if supports_result(result_type) {
-            super::super::constant_eval::fixed_interleave_extent(result_type, rows.len())
+            super::super::constant_eval::guarded_interleave_extent(result_type, rows.len())
                 .map_err(|_| KernelFailure::ResourceExhausted)?;
             work.step()?;
         }
@@ -667,8 +674,8 @@ fn assemble(
     selection: Selection<'_>,
     work: &mut Work<'_>,
 ) -> Result<OwnedValue, KernelFailure> {
-    // This first exact guarded carrier protocol is statically admitted before
-    // any branch state is entered. Other carriers need their multi-source author.
+    // The exact guarded carrier protocol is admitted before entering branch
+    // state. Actual payload admission uses the complete source-choice plan.
     if !supports_result(ty) {
         return Err(invalid(
             "guarded result requires its dedicated carrier protocol",
@@ -701,7 +708,7 @@ fn assemble(
         });
         work.step()?;
     }
-    super::super::constant_eval::preflight_fixed_interleave(ty, &sources, &indices, |boundary| {
+    super::super::constant_eval::preflight_guarded_interleave(ty, &sources, &indices, |boundary| {
         if boundary { work.flush() } else { work.step() }
     })
     .map_err(|error| match error {

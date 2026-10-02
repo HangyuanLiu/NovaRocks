@@ -672,12 +672,132 @@ pub(super) fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), 
     } else if *ty != DataType::Boolean {
         return Err(CopyError::Unsupported(ty.clone()));
     }
+    interleave_bitmap_extent(rows)
+}
+
+fn interleave_bitmap_extent(rows: usize) -> Result<(), CopyError> {
     let bitmap_bytes = add(rows / 8, usize::from(!rows.is_multiple_of(8)))?;
     let bitmap_blocks = add(
         bitmap_bytes / 64,
         usize::from(!bitmap_bytes.is_multiple_of(64)),
     )?;
     buffer_extent(bitmap_blocks, 64)
+}
+
+/// Static offset/validity extent, before entering any guarded child. Actual
+/// byte payload is checked after the exact source choices are known.
+pub(super) fn guarded_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
+    let width = match ty {
+        DataType::Utf8 | DataType::Binary => 4,
+        DataType::LargeUtf8 | DataType::LargeBinary => 8,
+        _ => return fixed_interleave_extent(ty, rows),
+    };
+    buffer_extent(add(rows, 1)?, width)?;
+    interleave_bitmap_extent(rows)
+}
+
+fn byte_interleave_payload_extent(total: usize, large: bool) -> Result<(), CopyError> {
+    limit(total, offset_max(large))?;
+    buffer_extent(total, 1)
+}
+
+fn interleave_byte_payload<T: ByteArrayType>(
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    large: bool,
+    work: &mut CopyObservation<'_>,
+) -> Result<(), CopyError> {
+    let mut total = 0;
+    for &(source, row) in choices {
+        let array: &GenericByteArray<T> = downcast(sources[source].as_ref())?;
+        let start = offset_value(array.value_offsets()[row])?;
+        let end = offset_value(array.value_offsets()[row + 1])?;
+        // Arrow interleave_bytes copies the offset span even for NULL values.
+        // Single-source take's validity-sensitive payload count is insufficient.
+        total = add(total, end.checked_sub(start).ok_or(CopyError::Extent)?)?;
+        work.step()?;
+    }
+    byte_interleave_payload_extent(total, large)
+}
+
+fn validate_interleave_plan(
+    ty: &DataType,
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    work: &mut CopyObservation<'_>,
+) -> Result<(), CopyError> {
+    if sources.is_empty() {
+        return Err(CopyError::Invalid(
+            "Arrow interleave requires a source array",
+        ));
+    }
+    for source in sources {
+        let equal = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+            ty,
+            source.data_type(),
+            || (work.0)(false),
+        )
+        .map_err(CopyError::Control)?;
+        work.step()?;
+        if !equal {
+            return Err(CopyError::Invalid(
+                "interleave source differs from its exact frozen carrier",
+            ));
+        }
+    }
+    for &(source, row) in choices {
+        let valid = sources.get(source).is_some_and(|array| row < array.len());
+        work.step()?;
+        if !valid {
+            return Err(CopyError::Invalid(
+                "interleave choice has an invalid source or row",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Exact multi-source byte plan. Views and encoded/nested carriers retain
+/// their explicit separate admission boundary; this does not mint a grant.
+pub(super) fn preflight_guarded_interleave(
+    ty: &DataType,
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+) -> Result<(), CopyError> {
+    if !matches!(
+        ty,
+        DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary
+    ) {
+        return preflight_fixed_interleave(ty, sources, choices, observe);
+    }
+    let mut work = CopyObservation(&mut observe);
+    work.boundary()?;
+    let result = (|| {
+        guarded_interleave_extent(ty, choices.len())?;
+        work.step()?;
+        validate_interleave_plan(ty, sources, choices, &mut work)?;
+        match ty {
+            DataType::Utf8 => interleave_byte_payload::<arrow::datatypes::Utf8Type>(
+                sources, choices, false, &mut work,
+            ),
+            DataType::Binary => interleave_byte_payload::<arrow::datatypes::BinaryType>(
+                sources, choices, false, &mut work,
+            ),
+            DataType::LargeUtf8 => interleave_byte_payload::<arrow::datatypes::LargeUtf8Type>(
+                sources, choices, true, &mut work,
+            ),
+            DataType::LargeBinary => interleave_byte_payload::<arrow::datatypes::LargeBinaryType>(
+                sources, choices, true, &mut work,
+            ),
+            _ => unreachable!("checked offset byte carrier"),
+        }
+    })();
+    if matches!(&result, Err(CopyError::Control(_))) {
+        return result;
+    }
+    work.boundary()?;
+    result
 }
 
 /// Check the actual fixed-width source-choice plan before opaque Arrow interleave.
@@ -695,35 +815,7 @@ pub(super) fn preflight_fixed_interleave(
     let result = (|| {
         fixed_interleave_extent(ty, choices.len())?;
         work.step()?;
-        if sources.is_empty() {
-            return Err(CopyError::Invalid(
-                "Arrow interleave requires a source array",
-            ));
-        }
-        for source in sources {
-            let equal = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                ty,
-                source.data_type(),
-                || (work.0)(false),
-            )
-            .map_err(CopyError::Control)?;
-            work.step()?;
-            if !equal {
-                return Err(CopyError::Invalid(
-                    "interleave source differs from its exact frozen carrier",
-                ));
-            }
-        }
-        for &(source, row) in choices {
-            let valid = sources.get(source).is_some_and(|array| row < array.len());
-            work.step()?;
-            if !valid {
-                return Err(CopyError::Invalid(
-                    "interleave choice has an invalid source or row",
-                ));
-            }
-        }
-        Ok(())
+        validate_interleave_plan(ty, sources, choices, &mut work)
     })();
     // An observer refusal is primary and must not trigger another callback.
     if matches!(&result, Err(CopyError::Control(_))) {
@@ -736,3 +828,7 @@ pub(super) fn preflight_fixed_interleave(
 #[cfg(test)]
 #[path = "constant_eval/preflight_interleave_tests.rs"]
 mod preflight_interleave_tests;
+
+#[cfg(test)]
+#[path = "constant_eval/preflight_byte_interleave_tests.rs"]
+mod preflight_byte_interleave_tests;

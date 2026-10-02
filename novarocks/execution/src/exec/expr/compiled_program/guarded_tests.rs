@@ -1052,3 +1052,6 @@ mod unary_tests;
 
 #[path = "case_tests.rs"]
 mod case_tests;
+
+#[path = "byte_guarded_tests.rs"]
+mod byte_guarded_tests;
