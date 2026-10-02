@@ -26,6 +26,7 @@ mod physical_encode;
 mod physical_expr;
 pub mod physical_semantics_v2;
 mod physical_type;
+pub mod physical_type_v2;
 mod physical_v1;
 mod write_targets;
 
