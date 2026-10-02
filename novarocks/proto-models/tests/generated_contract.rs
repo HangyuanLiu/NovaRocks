@@ -2093,3 +2093,69 @@ fn root_result_revocation_has_a_distinct_control_wait_status() {
     assert_eq!(status.get_value_by_name("NOT_READY").unwrap().number(), 2);
     assert_eq!(status.get_value_by_name("ERROR").unwrap().number(), 4);
 }
+
+#[test]
+fn membership_and_project_retention_are_append_only_slot_contracts() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let node = pool.get_message_by_name("novarocks.plan.PlanNode").unwrap();
+    let field = node.get_field_by_name("membership").unwrap();
+    assert_eq!(field.number(), 35);
+    assert_eq!(field.containing_oneof().unwrap().name(), "kind");
+    let membership = pool
+        .get_message_by_name("novarocks.plan.MembershipNode")
+        .unwrap();
+    let fields = membership
+        .fields()
+        .map(|field| (field.name().to_string(), field.number()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields,
+        vec![
+            ("probe_column_id".into(), 1),
+            ("build_column_id".into(), 2),
+            ("result_column_id".into(), 3),
+            ("negated".into(), 4),
+            ("comparison".into(), 5),
+            ("distribution".into(), 6),
+        ]
+    );
+    let project = pool
+        .get_message_by_name("novarocks.plan.ProjectNode")
+        .unwrap();
+    assert_eq!(project.get_field_by_name("items").unwrap().number(), 1);
+    assert_eq!(
+        project
+            .get_field_by_name("output_qualifier")
+            .unwrap()
+            .number(),
+        2
+    );
+    assert_eq!(
+        project
+            .get_field_by_name("retention_admission")
+            .unwrap()
+            .number(),
+        3
+    );
+    assert_eq!(
+        plan::ProjectNode::default().retention_admission,
+        plan::ProjectRetentionAdmission::Existing as i32
+    );
+    let original = plan::MembershipNode {
+        probe_column_id: 7,
+        build_column_id: 8,
+        result_column_id: 9,
+        negated: true,
+        comparison: plan::MembershipComparison::JsonInListV1 as i32,
+        distribution: plan::MembershipDistribution::BroadcastBuild as i32,
+    };
+    assert_eq!(
+        plan::MembershipNode::decode(original.encode_to_vec().as_slice()).unwrap(),
+        original
+    );
+    assert_eq!(plan::MembershipComparison::Unspecified as i32, 0);
+    assert_eq!(plan::MembershipDistribution::Unspecified as i32, 0);
+    assert!(plan::MembershipComparison::try_from(999).is_err());
+    assert!(plan::MembershipDistribution::try_from(999).is_err());
+    assert!(plan::ProjectRetentionAdmission::try_from(999).is_err());
+}

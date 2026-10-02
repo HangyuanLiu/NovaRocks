@@ -121,6 +121,7 @@ mod tests {
         let project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: None,
                     output_name: "missing".to_string(),
@@ -146,6 +147,7 @@ mod tests {
         let project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: Some(expr::Expr {
                         r#type: None,
@@ -174,6 +176,7 @@ mod tests {
         let project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: Some(expr::Expr {
                         r#type: Some(common::TypeDesc::default()),
@@ -217,6 +220,7 @@ mod tests {
         let project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: Some(column_ref(1, DataType::Int64)),
                     output_name: "projected_id".to_string(),
@@ -248,6 +252,7 @@ mod tests {
         let mut project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: Some(column_ref(1, DataType::Int64)),
                     output_name: "projected_id".to_string(),
@@ -277,6 +282,7 @@ mod tests {
         let inner = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: Some(column_ref(1, DataType::Int64)),
                     output_name: "projected_id".to_string(),
@@ -290,6 +296,7 @@ mod tests {
         let outer = physical_node(
             21,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![plan::ProjectItem {
                     expr: Some(column_ref(7, DataType::Int64)),
                     output_name: "outer_id".to_string(),
@@ -315,6 +322,7 @@ mod tests {
         let project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![
                     plan::ProjectItem {
                         expr: Some(column_ref(1, DataType::Int64)),
@@ -351,6 +359,7 @@ mod tests {
         let project = physical_node(
             20,
             plan::plan_node::Kind::Project(plan::ProjectNode {
+                retention_admission: plan::ProjectRetentionAdmission::Existing as i32,
                 items: vec![
                     plan::ProjectItem {
                         expr: Some(column_ref(1, DataType::Int64)),

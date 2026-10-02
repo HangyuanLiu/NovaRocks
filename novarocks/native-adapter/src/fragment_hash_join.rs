@@ -252,6 +252,8 @@ fn build_join_output_projection(
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission:
+                    novarocks_execution::exec::node::project::ProjectRetentionAdmission::Existing,
                 input: Box::new(join_node.node),
                 node_id,
                 is_subordinate: true,

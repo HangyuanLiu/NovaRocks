@@ -99,6 +99,24 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
     })
 }
 
+/// Encode only a proved root logical kind over its exact physical carrier.
+pub(crate) fn encode_physical_logical_type(
+    data_type: &DataType,
+    kind: novarocks_physical_plan::ValueLogicalKind,
+) -> Result<common::TypeDesc, String> {
+    if !kind.admits_carrier(data_type) {
+        return Err("native logical kind does not admit the frozen physical carrier".into());
+    }
+    match kind {
+        novarocks_physical_plan::ValueLogicalKind::Json => Ok(common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: common::PrimitiveType::Json as i32,
+                ..Default::default()
+            })),
+        }),
+    }
+}
+
 /// Encode the SQL compatibility descriptor for a value whose complete Arrow
 /// type is carried by a colocated, mandatory `ArrowPhysicalSchema`.
 ///

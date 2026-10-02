@@ -25,6 +25,7 @@ mod change_event_expand;
 mod filter;
 #[cfg(test)]
 mod hash_join_tests;
+mod membership;
 #[cfg(test)]
 mod nestloop_join;
 #[cfg(test)]
@@ -1258,6 +1259,14 @@ fn lower_physical_node(
         )
     })?;
     match kind {
+        plan::plan_node::Kind::Membership(wire) => membership::lower(
+            node,
+            physical,
+            wire,
+            path.clone().field("membership"),
+            physical_output_path.clone(),
+            children,
+        ),
         plan::plan_node::Kind::QuotaPreclaim(quota) => quota_preclaim::lower(
             node,
             physical,
@@ -1285,8 +1294,10 @@ fn lower_physical_node(
         ),
         plan::plan_node::Kind::Project(project) => lower_project_node(
             node,
+            physical,
             project,
             path.clone().field("project"),
+            physical_output_path.clone(),
             children,
             arena,
         ),

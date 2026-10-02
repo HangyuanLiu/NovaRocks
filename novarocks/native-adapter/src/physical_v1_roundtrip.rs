@@ -710,6 +710,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
                 columns: Box::from([effect, routed, routed]),
             },
             kind: NodeKind::Project {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 expressions: Box::from([
                     (effect_ref, effect),
                     (routed_ref, routed),
@@ -1046,6 +1047,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
                 columns: Box::from([value, value]),
             },
             kind: NodeKind::Project {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 expressions: Box::from([(reference, value), (reference, value)]),
             },
         })
@@ -1399,4 +1401,451 @@ fn physical_plan_nest_loop_subset_executes_through_terminal_projection() {
         ExecNodeKind::NestedLoopJoin(_)
     ));
     assert_i64_rows(&chunks, &slots, &[vec![Some(47)]]);
+}
+
+#[test]
+fn physical_v1_membership_json_fields_and_project_retention_roundtrip() {
+    use novarocks_physical_plan::{
+        MembershipComparison, MembershipDistribution, MembershipSpec, ProjectRetentionAdmission,
+        ValueLogicalKind,
+    };
+    use prost::Message;
+    let fragment_id = FragmentId::new(640);
+    let mut builder = FragmentBuilder::new(fragment_id);
+    let mut json_rows = || {
+        let node = builder.reserve_node_id().unwrap();
+        let ty = ValueType::new(DataType::Utf8, true);
+        let expr = builder
+            .add_expression(
+                node,
+                ty.clone(),
+                ExprKind::Literal(LiteralValue::Utf8("{\"n\":1}".into())),
+            )
+            .unwrap();
+        let value = builder
+            .add_value_with_logical_kind(
+                ty,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+                Some(ValueLogicalKind::Json),
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: singleton_properties(),
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expr]), Box::from([expr])]),
+                },
+            })
+            .unwrap();
+        (node, value)
+    };
+    let (probe, lhs) = json_rows();
+    let (build, rhs) = json_rows();
+    let project = builder.reserve_node_id().unwrap();
+    let expression = builder
+        .add_expression(
+            project,
+            ValueType::new(DataType::Utf8, true),
+            ExprKind::Value(lhs),
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: project,
+            inputs: Box::from([probe]),
+            required_inputs: Box::from([singleton_properties()]),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node: project,
+                columns: Box::from([lhs]),
+            },
+            kind: NodeKind::Project {
+                expressions: Box::from([(expression, lhs)]),
+                retention_admission: ProjectRetentionAdmission::CheckedTask,
+            },
+        })
+        .unwrap();
+    let membership = builder.reserve_node_id().unwrap();
+    let result = builder
+        .add_value(
+            ValueType::new(DataType::Boolean, true),
+            ValueOrigin::NodeOutput {
+                node: membership,
+                output_ordinal: 1,
+            },
+        )
+        .unwrap();
+    builder
+        .add_membership(
+            membership,
+            project,
+            build,
+            MembershipSpec {
+                probe: lhs,
+                build: rhs,
+                result,
+                negated: false,
+                comparison: MembershipComparison::JsonInListV1,
+                distribution: MembershipDistribution::Singleton,
+            },
+        )
+        .unwrap();
+    let definition = builder
+        .finish_definition(
+            membership,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap();
+    let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([64; 16]).unwrap());
+    plan_builder.add_fragment(definition).unwrap();
+    plan_builder
+        .set_result_port(ResultPort {
+            fragment: fragment_id,
+            output: OutputPort {
+                node: membership,
+                columns: Box::from([lhs, result]),
+            },
+            fields: Box::from([
+                ResultField {
+                    name: "json".into(),
+                    alias: None,
+                    value: lhs,
+                    ty: ValueType::new(DataType::Utf8, true),
+                },
+                ResultField {
+                    name: "member".into(),
+                    alias: None,
+                    value: result,
+                    ty: ValueType::new(DataType::Boolean, true),
+                },
+            ]),
+        })
+        .unwrap();
+    let physical = plan_builder.finish().unwrap();
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+        &physical,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+    )
+    .unwrap();
+    let encoded = plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice()).unwrap();
+    let mut arena = ExprArena::default();
+    let decoded = decode_node(
+        encoded.fragments[0].root.as_ref().unwrap(),
+        &mut arena,
+        &NativePlanDecodeContext::default(),
+    )
+    .unwrap();
+    let ExecNodeKind::Membership(owner) = &decoded.node.kind else {
+        panic!("membership")
+    };
+    let ExecNodeKind::Project(project) = &owner.probe.kind else {
+        panic!("checked project")
+    };
+    assert_eq!(
+        project.retention_admission,
+        novarocks_execution::exec::node::project::ProjectRetentionAdmission::CheckedTask
+    );
+    let ExecNodeKind::Values(input) = &project.input.kind else {
+        panic!("materialized probe fixture")
+    };
+    assert_eq!(input.chunk.batch.num_rows(), 2);
+    let plan = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
+    let profile = plan
+        .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
+        .unwrap();
+    let (program, _) = plan
+        .into_local_program_and_bindings(
+            profile,
+            std::collections::BTreeMap::new(),
+            vec![],
+            novarocks_local_program::StaticSinkProgram::Noop,
+        )
+        .unwrap();
+    let layout = program.nodes()[program.root().index()].output_layout();
+    assert_eq!(
+        layout.slot_metadata_at(0).unwrap().0.logical_type(),
+        Some(novarocks_types::logical::LogicalType::Json)
+    );
+    assert_eq!(layout.schema().field(1).data_type(), &DataType::Boolean);
+    assert!(layout.schema().field(1).is_nullable());
+}
+
+#[test]
+fn physical_v1_membership_json_identity_project_broadcast_exchange_roundtrip() {
+    use novarocks_execution::runtime::exchange::ExchangeKey;
+    use novarocks_physical_plan::{
+        MembershipComparison, MembershipDistribution, MembershipSpec, ProjectRetentionAdmission,
+        ValueLogicalKind,
+    };
+    use prost::Message;
+    fn json_rows(builder: &mut FragmentBuilder) -> (novarocks_physical_plan::NodeId, ValueId) {
+        let node = builder.reserve_node_id().unwrap();
+        let ty = ValueType::new(DataType::Utf8, true);
+        let expression = builder
+            .add_expression(
+                node,
+                ty.clone(),
+                ExprKind::Literal(LiteralValue::Utf8("{}".into())),
+            )
+            .unwrap();
+        let value = builder
+            .add_value_with_logical_kind(
+                ty,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+                Some(ValueLogicalKind::Json),
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: singleton_properties(),
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expression])]),
+                },
+            })
+            .unwrap();
+        (node, value)
+    }
+    fn dop() -> PipelineDopDomain {
+        PipelineDopDomain {
+            min: 1,
+            max: 1,
+            requires_power_of_two: false,
+        }
+    }
+    let producer_id = FragmentId::new(641);
+    let consumer_id = FragmentId::new(642);
+    let edge = EdgeId::new(1);
+    let mut producer = FragmentBuilder::new(producer_id);
+    let (rows, source) = json_rows(&mut producer);
+    let project = producer.reserve_node_id().unwrap();
+    let reference = producer
+        .add_expression(
+            project,
+            ValueType::new(DataType::Utf8, true),
+            ExprKind::Value(source),
+        )
+        .unwrap();
+    producer
+        .insert_node_unchecked(PhysicalNode {
+            id: project,
+            inputs: Box::from([rows]),
+            required_inputs: Box::from([singleton_properties()]),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node: project,
+                columns: Box::from([source]),
+            },
+            kind: NodeKind::Project {
+                expressions: Box::from([(reference, source)]),
+                retention_admission: ProjectRetentionAdmission::CheckedTask,
+            },
+        })
+        .unwrap();
+    let producer = producer
+        .finish_definition(project, FragmentSink::Stream { edge }, dop())
+        .unwrap();
+    let mut consumer = FragmentBuilder::new(consumer_id);
+    let (probe, lhs) = json_rows(&mut consumer);
+    let exchange = consumer.reserve_node_id().unwrap();
+    let rhs = consumer
+        .add_value_with_logical_kind(
+            ValueType::new(DataType::Utf8, true),
+            ValueOrigin::ExchangeImport {
+                edge,
+                source_value: source,
+            },
+            Some(ValueLogicalKind::Json),
+        )
+        .unwrap();
+    consumer
+        .add_exchange_source(
+            exchange,
+            edge,
+            Box::from([(source, rhs)]),
+            Box::from([rhs]),
+            Distribution::Broadcast,
+            RowMultiplicity::Replicated,
+        )
+        .unwrap();
+    let membership = consumer.reserve_node_id().unwrap();
+    let result = consumer
+        .add_value(
+            ValueType::new(DataType::Boolean, true),
+            ValueOrigin::NodeOutput {
+                node: membership,
+                output_ordinal: 1,
+            },
+        )
+        .unwrap();
+    consumer
+        .add_membership(
+            membership,
+            probe,
+            exchange,
+            MembershipSpec {
+                probe: lhs,
+                build: rhs,
+                result,
+                negated: false,
+                comparison: MembershipComparison::JsonInListV1,
+                distribution: MembershipDistribution::BroadcastBuild,
+            },
+        )
+        .unwrap();
+    let consumer = consumer
+        .finish_definition(membership, FragmentSink::Result, dop())
+        .unwrap();
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new([65; 16]).unwrap());
+    builder.add_fragment(producer).unwrap();
+    builder.add_fragment(consumer).unwrap();
+    builder
+        .add_edge(Edge {
+            id: edge,
+            kind: EdgeKind::Stream,
+            source: EdgeSource {
+                fragment: producer_id,
+                projection: Box::from([source]),
+            },
+            destination: EdgeDestination {
+                fragment: consumer_id,
+                node: exchange,
+                receive_mapping: Box::from([(source, rhs)]),
+            },
+            partitioning: EdgePartitioning {
+                source: Distribution::Broadcast,
+                source_multiplicity: RowMultiplicity::SingleCopy,
+                destination: Distribution::Broadcast,
+                destination_multiplicity: RowMultiplicity::Replicated,
+            },
+        })
+        .unwrap();
+    builder
+        .set_result_port(ResultPort {
+            fragment: consumer_id,
+            output: OutputPort {
+                node: membership,
+                columns: Box::from([lhs, result]),
+            },
+            fields: Box::from([
+                ResultField {
+                    name: "json".into(),
+                    alias: None,
+                    value: lhs,
+                    ty: ValueType::new(DataType::Utf8, true),
+                },
+                ResultField {
+                    name: "member".into(),
+                    alias: None,
+                    value: result,
+                    ty: ValueType::new(DataType::Boolean, true),
+                },
+            ]),
+        })
+        .unwrap();
+    let physical = builder.finish().unwrap();
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let wire = novarocks_plan_codec::encode_physical_plan_v1(
+        &physical,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+    )
+    .unwrap();
+    let wire = plan::DistributedPlan::decode(wire.encode_to_vec().as_slice()).unwrap();
+    let sender = wire
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == producer_id.get())
+        .unwrap();
+    let receiver = wire
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == consumer_id.get())
+        .unwrap();
+    let mut producer_arena = ExprArena::default();
+    let decoded_producer = decode_node(
+        sender.root.as_ref().unwrap(),
+        &mut producer_arena,
+        &NativePlanDecodeContext::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decoded_producer.output_schema.slots()[0]
+            .field_schema()
+            .logical_type(),
+        Some(novarocks_types::logical::LogicalType::Json)
+    );
+    let exchange_id = i32::try_from(exchange.get()).unwrap();
+    let context = NativePlanDecodeContext::default().with_exchange_sender_count(
+        ExchangeKey {
+            finst_id_hi: 4,
+            finst_id_lo: 5,
+            node_id: exchange_id,
+        },
+        3,
+    );
+    let mut arena = ExprArena::default();
+    let decoded = decode_node(receiver.root.as_ref().unwrap(), &mut arena, &context).unwrap();
+    let ExecNodeKind::Membership(owner) = &decoded.node.kind else {
+        panic!("membership")
+    };
+    let ExecNodeKind::ExchangeSource(build) = &owner.build.kind else {
+        panic!("broadcast receiver")
+    };
+    assert_eq!(
+        build.expected_chunk_schema.slots()[0]
+            .field_schema()
+            .logical_type(),
+        Some(novarocks_types::logical::LogicalType::Json)
+    );
+    let plan = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
+    let profile = plan
+        .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
+        .unwrap();
+    let (program, _) = plan
+        .into_local_program_and_bindings(
+            profile,
+            std::collections::BTreeMap::new(),
+            vec![],
+            novarocks_local_program::StaticSinkProgram::Noop,
+        )
+        .unwrap();
+    assert!(program.nodes().iter().any(|node| {
+        matches!(
+            node.kind(),
+            novarocks_local_program::ProgramNodeKind::ExchangeSource { .. }
+        ) && node
+            .output_layout()
+            .slot_metadata_at(0)
+            .unwrap()
+            .0
+            .logical_type()
+            == Some(novarocks_types::logical::LogicalType::Json)
+    }));
 }

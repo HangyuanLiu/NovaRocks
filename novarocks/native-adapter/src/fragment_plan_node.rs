@@ -40,7 +40,7 @@ use novarocks_execution::exec::node::filter::FilterNode;
 use novarocks_execution::exec::node::join::JoinType;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
-use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::project::{ProjectNode, ProjectRetentionAdmission};
 use novarocks_execution::exec::node::repeat::RepeatNode;
 use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
@@ -787,7 +787,7 @@ fn normalize_set_op_inputs(
             let data_type = NativeFragmentDecodeError::map_invalid(child_path.clone().index(col_idx).field("type"), decode_type(data_type))?;
             Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
+        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { retention_admission: ProjectRetentionAdmission::Existing, input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
 }
 
@@ -815,7 +815,7 @@ fn normalize_set_op_inputs_by_position(
             let data_type = child.output_schema.slot(slot).ok_or_else(|| NativeFragmentDecodeError::inconsistent(path.clone().field("child_output_columns").index(idx), format!("SetOpNode child {idx} slot {} missing from child output schema", slot)))?.data_type().clone();
             Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
+        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { retention_admission: ProjectRetentionAdmission::Existing, input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
 }
 
@@ -983,6 +983,7 @@ pub fn build_slot_projection(
     Ok(NativeLoweredPlanNode {
         node: ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission: ProjectRetentionAdmission::Existing,
                 input: Box::new(input.node),
                 node_id,
                 is_subordinate: true,
@@ -1168,6 +1169,7 @@ fn project_join_scope_to_declared_output(
     Ok(NativeLoweredPlanNode {
         node: ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission: ProjectRetentionAdmission::Existing,
                 input: Box::new(joined.node),
                 node_id,
                 is_subordinate: true,
@@ -1826,6 +1828,7 @@ pub fn lower_table_function_node(
             kind: ExecNodeKind::TableFunction(TableFunctionNode {
                 input: Box::new(ExecNode {
                     kind: ExecNodeKind::Project(ProjectNode {
+                        retention_admission: ProjectRetentionAdmission::Existing,
                         input: Box::new(child.node),
                         node_id: node.node_id,
                         is_subordinate: true,
@@ -2134,14 +2137,44 @@ fn table_function_param_slots(
 
 pub fn lower_project_node(
     node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
     project: &plan::ProjectNode,
     path: FieldPath,
+    output_path: FieldPath,
     mut children: Vec<NativeLoweredPlanNode>,
     arena: &mut ExprArena,
 ) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("validated ProjectNode child");
     let input = NativeExpressionInputLayout::from_slot_ids(child.layout.order().iter().copied());
-    let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
+    let retention_admission =
+        match plan::ProjectRetentionAdmission::try_from(project.retention_admission) {
+            Ok(plan::ProjectRetentionAdmission::Existing) => ProjectRetentionAdmission::Existing,
+            Ok(plan::ProjectRetentionAdmission::CheckedTask) => {
+                ProjectRetentionAdmission::CheckedTask
+            }
+            Err(_) => {
+                return Err(NativeFragmentDecodeError::invalid_enum(
+                    path.clone().field("retention_admission"),
+                    "unknown project retention admission",
+                ));
+            }
+        };
+    let declared_output = if physical.output_columns.is_empty() {
+        None
+    } else {
+        Some(
+            decode_output_layout(&physical.output_columns, output_path)
+                .map_err(NativeFragmentDecodeError::from)?
+                .chunk_schema(),
+        )
+    };
+    let project_outputs = project_output_plan(
+        project,
+        &child.layout,
+        &child.output_schema,
+        declared_output.as_ref(),
+        path.clone(),
+    )?;
     let layout = project_outputs.layout.clone();
     let output_schema = Arc::clone(&project_outputs.output_schema);
     let expr_slot_schemas = project_outputs.computed_slot_schemas.clone();
@@ -2176,6 +2209,7 @@ pub fn lower_project_node(
     Ok(NativeLoweredPlanNode {
         node: ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission,
                 input: Box::new(child.node),
                 node_id: node.node_id,
                 is_subordinate: false,
@@ -2203,15 +2237,106 @@ struct ProjectOutputPlan {
 fn project_output_plan(
     project: &plan::ProjectNode,
     input_layout: &SlotLayout,
+    input_schema: &ChunkSchemaRef,
+    declared: Option<&ChunkSchemaRef>,
     path: FieldPath,
 ) -> Result<ProjectOutputPlan, NativeFragmentDecodeError> {
     let decoded = (|| -> Result<ProjectOutputPlan, NativeFragmentLeafDecodeError> {
-        let item_outputs = project
+        let mut item_outputs = project
             .items
             .iter()
             .enumerate()
             .map(project_item_output)
             .collect::<Result<Vec<_>, _>>()?;
+        // Root logical kind has one authority: the frozen output declaration.
+        // Identity items must preserve their direct input's proved semantics.
+        if declared
+            .as_ref()
+            .is_some_and(|schema| schema.slots().len() != item_outputs.len())
+        {
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "output_columns",
+                "project output arity differs from items",
+            ));
+        }
+        for item in &mut item_outputs {
+            let declaration = declared
+                .as_ref()
+                .map(|schema| &schema.slots()[item.item_index]);
+            if let Some(slot) = declaration {
+                if slot.slot_id().as_u32() != item.output_column_id
+                    || slot.field().data_type() != item.field.data_type()
+                    || slot.field().is_nullable() != item.field.is_nullable()
+                    || slot.field().name() != item.field.name()
+                {
+                    return Err(NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InconsistentFields,
+                        "output_columns",
+                        "project output carrier/nullability/identity differs from its item",
+                    ));
+                }
+            }
+            if declaration.is_none()
+                && item.field_schema.logical_type()
+                    == Some(novarocks_types::logical::LogicalType::Json)
+            {
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "output_columns",
+                    "Json project requires its frozen output declaration",
+                ));
+            }
+            if item.can_reuse_input_slot {
+                let source = input_schema
+                    .slot(SlotId::new(item.preferred_compute_column_id))
+                    .ok_or_else(|| {
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InconsistentFields,
+                            "items",
+                            "identity project slot is not in its direct input",
+                        )
+                    })?;
+                let expected = declaration.map_or(&item.field_schema, |slot| slot.field_schema());
+                if source.field().data_type() != item.field.data_type()
+                    || source.field().is_nullable() != item.field.is_nullable()
+                    || source.field_schema() != expected
+                {
+                    return Err(NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InconsistentFields,
+                        "items",
+                        "identity project changes exact input type/nullability/logical semantics",
+                    ));
+                }
+                item.field = source.field().clone().with_name(item.field.name());
+                item.field_schema = source.field_schema().clone();
+                item.unique_id = source.unique_id();
+            } else if let Some(slot) = declaration {
+                let expr_kind = item.field_schema.logical_type();
+                if expr_kind.is_none()
+                    && slot
+                        .field_schema()
+                        .logical_type()
+                        .is_some_and(|kind| kind != novarocks_types::logical::LogicalType::Json)
+                {
+                    return Err(NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InconsistentFields,
+                        "items",
+                        "project cannot invent an unproved logical kind",
+                    ));
+                }
+
+                if expr_kind.is_some() && item.field_schema != *slot.field_schema() {
+                    return Err(NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InconsistentFields,
+                        "items",
+                        "project expression logical kind conflicts with its output declaration",
+                    ));
+                }
+                item.field = slot.field().clone();
+                item.field_schema = slot.field_schema().clone();
+            }
+        }
         let input_column_ids = input_layout
             .order()
             .iter()
@@ -2276,7 +2401,7 @@ fn project_output_plan(
                     compute_slot_id,
                     item.field.clone(),
                     Some(item.field_schema.clone()),
-                    None,
+                    item.unique_id,
                 ));
                 (computed_idx, false)
             };
@@ -2295,7 +2420,7 @@ fn project_output_plan(
                 SlotId::new(output_column_id),
                 item.field,
                 Some(item.field_schema),
-                None,
+                item.unique_id,
             ));
             if is_duplicate_compute
                 || computed_idx != output_indices.len()
@@ -2359,6 +2484,7 @@ struct ProjectItemOutput {
     preferred_compute_column_id: u32,
     output_column_id: u32,
     can_reuse_input_slot: bool,
+    unique_id: Option<i32>,
     field: Field,
     field_schema: ChunkFieldSchema,
 }
@@ -2407,6 +2533,7 @@ fn project_item_output(
         preferred_compute_column_id,
         output_column_id: item.output_column_id,
         can_reuse_input_slot,
+        unique_id: None,
         field,
         field_schema,
     })
@@ -2874,6 +3001,7 @@ pub fn validate_distributed_node_children(
                 plan::plan_node::Kind::Scan(_) => ("ScanNode", 0),
                 plan::plan_node::Kind::HashAggregate(_) => ("HashAggregateNode", 1),
                 plan::plan_node::Kind::HashJoin(_) => ("HashJoinNode", 2),
+                plan::plan_node::Kind::Membership(_) => ("MembershipNode", 2),
                 plan::plan_node::Kind::QuotaPreclaim(_) => ("QuotaPreclaimNode", 2),
                 plan::plan_node::Kind::QuotaTrim(_) => ("QuotaTrimNode", 2),
                 plan::plan_node::Kind::NestLoopJoin(_) => ("NestLoopJoinNode", 2),

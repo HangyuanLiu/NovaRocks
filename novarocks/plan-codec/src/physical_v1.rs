@@ -622,6 +622,16 @@ fn mechanical_output_slots(
         | NodeKind::TableWriter { .. }
         | NodeKind::TableFinish(_)
         | NodeKind::ExchangeSource { .. } => allocate(node.output.columns.len(), next_slot),
+        NodeKind::Membership { spec } => {
+            let (values, mut slots) = child(0)?;
+            let expected = values
+                .iter()
+                .copied()
+                .chain(std::iter::once(spec.result))
+                .collect::<Vec<_>>();
+            slots.push(allocate_wire_slot(fragment.id(), next_slot)?);
+            exact(&expected, slots)
+        }
         NodeKind::Filter { .. }
         | NodeKind::Sort { .. }
         | NodeKind::TopN { .. }
@@ -1522,6 +1532,8 @@ mod tests {
                     columns: Box::from([value, value]),
                 },
                 kind: NodeKind::Project {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     expressions: Box::from([(reference, value), (reference, value)]),
                 },
             })
