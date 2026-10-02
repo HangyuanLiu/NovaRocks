@@ -3610,6 +3610,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-arrow-ipc-frame"
+version = "0.1.0"
+dependencies = [
+ "arrow-ipc",
+ "flatbuffers",
+]
+
+[[package]]
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
@@ -3833,6 +3841,7 @@ dependencies = [
  "libc",
  "libm",
  "md-5 0.10.6",
+ "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",

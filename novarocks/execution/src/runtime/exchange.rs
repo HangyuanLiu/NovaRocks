@@ -2300,6 +2300,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_root_result_preflight_preserves_frame_error_precedence() {
+        let payload = encode_chunks(&[exchange_test_chunk("name")], true).unwrap();
+        let start = typed_test_arrow_payload_offset(&payload);
+        let declared = u32::try_from(MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES + 1).unwrap();
+
+        // This prefix is simultaneously oversized, unaligned and beyond the packet.
+        let mut oversized = payload.clone();
+        oversized[start + 4..start + 8].copy_from_slice(&declared.to_le_bytes());
+        assert_eq!(
+            preflight_typed_test_payload(&oversized).unwrap_err(),
+            format!(
+                "Arrow IPC message metadata has {declared} bytes, exceeding per-message hard limit {MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES}"
+            ),
+        );
+
+        let mut bad_marker = oversized;
+        bad_marker[start] = 0;
+        assert_eq!(
+            preflight_typed_test_payload(&bad_marker).unwrap_err(),
+            "Arrow IPC message at byte offset 0 is not continuation-framed",
+        );
+        bad_marker.truncate(start + 7);
+        assert_eq!(
+            preflight_typed_test_payload(&bad_marker).unwrap_err(),
+            "Arrow IPC message prefix is truncated at byte offset 0",
+        );
+
+        // EOS trailing bytes fail before the missing schema and record batch.
+        let mut early_end = payload[..start].to_vec();
+        early_end.extend_from_slice(&ARROW_IPC_CONTINUATION_MARKER);
+        early_end.extend_from_slice(&0_u32.to_le_bytes());
+        early_end.push(0);
+        assert_eq!(
+            preflight_typed_test_payload(&early_end).unwrap_err(),
+            "Arrow IPC terminal marker has trailing bytes",
+        );
+    }
+
     fn typed_test_arrow_payload_offset(payload: &[u8]) -> usize {
         let slot_count = u32::from_le_bytes(payload[6..10].try_into().unwrap()) as usize;
         10 + slot_count * std::mem::size_of::<u32>()

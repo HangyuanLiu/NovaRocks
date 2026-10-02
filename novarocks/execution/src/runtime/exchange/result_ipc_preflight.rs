@@ -24,7 +24,9 @@ use super::{
     EXCHANGE_ZERO_COLUMN_MARKER_FIELD,
 };
 
-pub(super) const ARROW_IPC_CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
+#[cfg(test)]
+pub(super) const ARROW_IPC_CONTINUATION_MARKER: [u8; 4] =
+    novarocks_arrow_ipc_frame::CONTINUATION_MARKER;
 const ARROW_IPC_ALIGNMENT: usize = 64;
 const MAX_TYPED_ROOT_RESULT_METADATA_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES: usize = 1024 * 1024;
@@ -151,30 +153,34 @@ pub fn preflight_typed_root_result_decode(
     let mut offset = 0usize;
     let mut terminal_seen = false;
     while offset < arrow_payload.len() {
-        let prefix_end = offset
-            .checked_add(8)
-            .ok_or_else(|| "Arrow IPC message prefix offset overflow".to_string())?;
-        let prefix = arrow_payload.get(offset..prefix_end).ok_or_else(|| {
-            format!("Arrow IPC message prefix is truncated at byte offset {offset}")
-        })?;
-        if prefix[..4] != ARROW_IPC_CONTINUATION_MARKER {
-            return Err(format!(
-                "Arrow IPC message at byte offset {offset} is not continuation-framed"
-            ));
-        }
-        let metadata_len =
-            usize::try_from(u32::from_le_bytes(prefix[4..8].try_into().map_err(
-                |_| "Arrow IPC metadata length has invalid width".to_string(),
-            )?))
-            .map_err(|_| "Arrow IPC metadata length does not fit usize".to_string())?;
-        offset = prefix_end;
-        if metadata_len == 0 {
-            terminal_seen = true;
-            if offset != arrow_payload.len() {
-                return Err("Arrow IPC terminal marker has trailing bytes".to_string());
+        let prefix = novarocks_arrow_ipc_frame::continuation_prefix(arrow_payload, offset)
+            .map_err(|error| match error {
+                novarocks_arrow_ipc_frame::PrefixError::Range(
+                    novarocks_arrow_ipc_frame::RangeError::Overflow,
+                ) => "Arrow IPC message prefix offset overflow".to_string(),
+                novarocks_arrow_ipc_frame::PrefixError::Range(
+                    novarocks_arrow_ipc_frame::RangeError::OutOfBounds,
+                ) => format!("Arrow IPC message prefix is truncated at byte offset {offset}"),
+                novarocks_arrow_ipc_frame::PrefixError::NotContinuation => {
+                    format!("Arrow IPC message at byte offset {offset} is not continuation-framed")
+                }
+                novarocks_arrow_ipc_frame::PrefixError::LengthTooLarge => {
+                    "Arrow IPC metadata length does not fit usize".to_string()
+                }
+            })?;
+        let metadata_len = match prefix {
+            novarocks_arrow_ipc_frame::ContinuationPrefix::End { next_offset } => {
+                terminal_seen = true;
+                if next_offset != arrow_payload.len() {
+                    return Err("Arrow IPC terminal marker has trailing bytes".to_string());
+                }
+                break;
             }
-            break;
-        }
+            novarocks_arrow_ipc_frame::ContinuationPrefix::Metadata { start, len } => {
+                offset = start;
+                len
+            }
+        };
         if metadata_len > MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES {
             return Err(format!(
                 "Arrow IPC message metadata has {metadata_len} bytes, exceeding per-message hard limit {MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES}"
@@ -204,16 +210,23 @@ pub fn preflight_typed_root_result_decode(
             .checked_add(1)
             .ok_or_else(|| "Arrow IPC message count overflow".to_string())?;
 
-        let metadata_end = offset
-            .checked_add(metadata_len)
-            .ok_or_else(|| "Arrow IPC metadata end offset overflow".to_string())?;
-        let metadata = arrow_payload.get(offset..metadata_end).ok_or_else(|| {
-            format!(
-                "Arrow IPC message metadata at byte offset {offset} declares {metadata_len} bytes beyond payload"
-            )
-        })?;
-        let message = arrow::ipc::root_as_message(metadata)
-            .map_err(|error| format!("invalid Arrow IPC message metadata: {error:?}"))?;
+        let metadata = novarocks_arrow_ipc_frame::metadata_slice(arrow_payload, offset, metadata_len)
+            .map_err(|error| match error {
+                novarocks_arrow_ipc_frame::RangeError::Overflow => {
+                    "Arrow IPC metadata end offset overflow".to_string()
+                }
+                novarocks_arrow_ipc_frame::RangeError::OutOfBounds => format!(
+                    "Arrow IPC message metadata at byte offset {offset} declares {metadata_len} bytes beyond payload"
+                ),
+            })?;
+        let metadata_end = offset + metadata_len;
+        // Preserve the old result profile's exact official verifier defaults.
+        // Constant-pool callers supply their separately admitted options.
+        let message = novarocks_arrow_ipc_frame::verified_message(
+            metadata,
+            &novarocks_arrow_ipc_frame::VerifierOptions::default(),
+        )
+        .map_err(|error| format!("invalid Arrow IPC message metadata: {error:?}"))?;
         if message.version() != arrow::ipc::MetadataVersion::V5 {
             return Err(format!(
                 "Arrow IPC message uses unsupported metadata version {:?}; expected V5",
@@ -234,14 +247,20 @@ pub fn preflight_typed_root_result_decode(
                 "Arrow IPC message body length {body_len} is not {ARROW_IPC_ALIGNMENT}-byte aligned"
             ));
         }
-        let body_end = metadata_end
-            .checked_add(body_len)
-            .ok_or_else(|| "Arrow IPC message body end offset overflow".to_string())?;
-        if body_end > arrow_payload.len() {
-            return Err(format!(
+        let body_end = novarocks_arrow_ipc_frame::checked_range(
+            arrow_payload.len(),
+            metadata_end,
+            body_len,
+        )
+        .map_err(|error| match error {
+            novarocks_arrow_ipc_frame::RangeError::Overflow => {
+                "Arrow IPC message body end offset overflow".to_string()
+            }
+            novarocks_arrow_ipc_frame::RangeError::OutOfBounds => format!(
                 "Arrow IPC message body at byte offset {metadata_end} declares {body_len} bytes beyond payload"
-            ));
-        }
+            ),
+        })?
+        .end;
 
         match message.header_type() {
             arrow::ipc::MessageHeader::Schema => {
@@ -573,14 +592,11 @@ fn typed_root_result_structure_cover(
 }
 
 fn checked_nonnegative_ipc_i64(value: i64, label: &str) -> Result<usize, String> {
-    usize::try_from(value)
+    novarocks_arrow_ipc_frame::nonnegative_length(value)
         .map_err(|_| format!("Arrow IPC {label} is negative or too large: {value}"))
 }
 
 fn align_ipc_offset(offset: usize) -> Result<usize, String> {
-    let alignment_mask = ARROW_IPC_ALIGNMENT - 1;
-    offset
-        .checked_add(alignment_mask)
-        .map(|value| value & !alignment_mask)
-        .ok_or_else(|| "Arrow IPC aligned offset overflow".to_string())
+    novarocks_arrow_ipc_frame::align_up(offset, ARROW_IPC_ALIGNMENT)
+        .map_err(|_| "Arrow IPC aligned offset overflow".to_string())
 }
