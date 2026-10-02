@@ -1566,7 +1566,8 @@ select * from sc2 where st1 = null order by v1;
 
 -- query 30
 
--- WITH sc2 AS (
+-- SELECT expression: = in projection
+WITH sc2 AS (
   SELECT
     v1,
     array1,
@@ -1622,7 +1623,6 @@ select * from sc2 where st1 = null order by v1;
     END AS st1
   FROM ${case_db}.sc2_seed
 )
-SELECT expression: = in projection
 select array1 = [11,null,31,41] from sc2 order by v1;
 
 -- query 31
