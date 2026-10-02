@@ -66,3 +66,21 @@ pub fn pending_bytes() -> u64 {
 pub unsafe fn publish_small(reference: RecordRef, bytes: i64, count: i64) {
     unsafe { tls::add(reference, 0, bytes, count) };
 }
+
+/// # Safety
+/// Same held global-store owner/restoration contract as install_ambient.
+pub(crate) unsafe fn try_install_ambient(reference: RecordRef) -> Option<RecordRef> {
+    tls::try_replace(reference, false, false)
+}
+/// # Safety
+/// Same publication lifetime contract as publish_small; only for the positive
+/// small side of a tagged-to-small shrink, which creates no physical growth.
+pub(crate) unsafe fn publish_small_transfer(reference: RecordRef, bytes: i64, count: i64) {
+    unsafe { tls::add_transfer(reference, 0, bytes, count) };
+}
+
+/// # Safety
+/// Same owner/restoration contract as install_explicit.
+pub(crate) unsafe fn try_install_explicit(reference: RecordRef) -> Option<RecordRef> {
+    tls::try_replace(reference, true, false)
+}

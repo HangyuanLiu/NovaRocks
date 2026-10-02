@@ -37,6 +37,8 @@ doctest = false
 loom = "0.7.2"
 
 [dev-dependencies]
+hashbrown = "0.14"
+allocator-api2 = "0.2"
 serde_json.workspace = true
 sha2.workspace = true
 [[bench]]

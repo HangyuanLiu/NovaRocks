@@ -739,10 +739,10 @@ pub(crate) fn qualify(
 
 impl Drop for Account {
     fn drop(&mut self) {
-        if let Some(parent) = &self.parent {
-            if let Some(member) = self.membership.lock().unwrap().take() {
-                parent.0.members.remove(&member);
-            }
+        if let Some(parent) = &self.parent
+            && let Some(member) = self.membership.lock().unwrap().take()
+        {
+            parent.0.members.remove(&member);
         }
         let slot = self.slot.load(Ordering::Relaxed);
         if slot != u64::MAX && slot != 0 {

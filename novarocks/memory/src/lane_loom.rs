@@ -237,3 +237,59 @@ fn l4_query_handoff_late_free_flush_and_control_reclaim_keep_one_record() {
         );
     });
 }
+
+#[test]
+fn l3_r1_cross_band_publication_remote_free_and_last_owner_preserve_lifetime() {
+    model(|| {
+        let store = StoreHandle::owned(17);
+        let owner = store.acquire(3, ResponsibilityClass::Query).unwrap();
+        let reference = owner.reference();
+        // Two proven R1 small blocks: one will resize, the other releases remotely.
+        unsafe { SlotCore::direct(store.store(), reference, 0, 72, 2) };
+        let producer_store = store.clone();
+        let free_store = store.clone();
+        let gc_store = store.clone();
+        let (send, receive) = loom::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            let mut slot = SlotCore::new();
+            // SAFETY: owner independently protects each side of the successful
+            // 64→512→128 resize, including its transient count-neutral gap.
+            unsafe {
+                slot.add(producer_store.store(), reference, 520, 0, 1, true);
+                slot.add(producer_store.store(), reference, 0, -64, -1, true);
+                slot.add(producer_store.store(), reference, -520, 0, -1, true);
+                slot.add_transfer(producer_store.store(), reference, 0, 128, 1, true);
+            }
+            drop(owner);
+            send.send(reference).unwrap();
+            thread::yield_now();
+            // SAFETY: this unique slot owns the pin through its final flush.
+            unsafe { slot.flush(producer_store.store()) };
+        });
+        let free = thread::spawn(move || {
+            // SAFETY: the distinct original 8-byte block is genuinely outstanding.
+            unsafe { SlotCore::direct(free_store.store(), reference, 0, -8, -1) };
+            let reference = receive.recv().unwrap();
+            // SAFETY: final resized block is released once after publication
+            // handoff; a source pin may still carry its count/byte obligation.
+            unsafe { SlotCore::direct(free_store.store(), reference, 0, -128, -1) };
+        });
+        let gc = thread::spawn(move || {
+            gc_store.store().reclaim(1);
+        });
+        producer.join().unwrap();
+        free.join().unwrap();
+        gc.join().unwrap();
+        store.store().reclaim(1);
+        assert!(store.store().snapshot_ref(reference).is_none());
+        let faults = store.store().faults.snapshot();
+        assert_eq!(
+            (
+                faults.orphan_events,
+                faults.reclaim_nonzero_events,
+                faults.pinned_slots
+            ),
+            (0, 0, 0)
+        );
+    });
+}

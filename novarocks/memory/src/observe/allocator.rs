@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Counting global allocator (MEM-1 wave-1 T04).
+//! Counting-only allocator retained for baseline measurements and tools.
+//! The Server installs `attribution::AttributingAllocator` instead: its inner
+//! requested layouts include source-token bytes, and its band counters reuse
+//! this module's counting primitives without changing this wrapper's format.
 //!
 //! Wraps the selected allocator and counts successful allocations, releases
 //! and reallocation deltas. A failure keeps the previous accounting. The

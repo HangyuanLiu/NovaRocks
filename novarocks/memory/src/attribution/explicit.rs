@@ -15,4 +15,113 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reserved for the next approved implementation stage.
+//! R1 attribution helpers retain access responsibility without funding authority.
+use super::{band::is_tagged, binding};
+use crate::lane::{LaneHandle, RecordRef};
+use std::{alloc::Layout, marker::PhantomData, rc::Rc};
+
+#[derive(Clone, Debug)]
+pub struct ExplicitOwner {
+    lane: LaneHandle,
+}
+struct ExplicitStep {
+    previous: Option<RecordRef>,
+    _thread: PhantomData<Rc<()>>,
+}
+impl Drop for ExplicitStep {
+    fn drop(&mut self) {
+        // SAFETY: exact saved binding on the same synchronous stack. The helper
+        // retains its owner's handle until this guard has restored/flushed.
+        if let Some(previous) = self.previous {
+            unsafe { binding::restore_explicit(previous) };
+        }
+    }
+}
+impl ExplicitOwner {
+    pub fn new(lane: LaneHandle) -> Self {
+        Self { lane }
+    }
+    pub fn lane(&self) -> &LaneHandle {
+        &self.lane
+    }
+    fn bind(&self) -> ExplicitStep {
+        // Explicit ownership remains effective after seal/teardown: a surviving
+        // container can still resize; diagnostics report growth without refusal.
+        // SAFETY: self holds the owner throughout the helper and guard lifetime.
+        let previous = unsafe { binding::try_install_explicit(self.lane.reference()) };
+        if previous.is_none() {
+            self.lane.store().faults.binding_failed();
+        }
+        ExplicitStep {
+            previous,
+            _thread: PhantomData,
+        }
+    }
+    /// Calls an allocation operation through the wrapped global allocator using
+    /// this exact requested layout. Ok must mean a real successful allocation;
+    /// it must publish neither additional small facts nor a duplicate token.
+    /// Zero-sized allocator-api allocations have no underlying block or fact.
+    pub fn allocate_with<T, E>(
+        &self,
+        layout: Layout,
+        underlying: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _guard = is_tagged(layout.size()).then(|| self.bind());
+        let result = underlying();
+        if result.is_ok() && layout.size() != 0 && !is_tagged(layout.size()) {
+            // SAFETY: successful distinct allocation, owner held to publication.
+            unsafe { binding::publish_small(self.lane.reference(), layout.size() as i64, 1) };
+        }
+        result
+    }
+    /// Releases storage before publishing its final small-allocation decrement.
+    /// # Safety
+    /// The block was allocated by this owner, is genuinely outstanding and is
+    /// released exactly once through the wrapped allocator with its original
+    /// requested layout. underlying must complete that actual release, and must
+    /// not duplicate this helper's small facts. Do not use the block afterward.
+    pub unsafe fn deallocate_with(&self, layout: Layout, underlying: impl FnOnce()) {
+        underlying();
+        if layout.size() != 0 && !is_tagged(layout.size()) {
+            // SAFETY: caller guarantees the one outstanding allocation's free.
+            unsafe { binding::publish_small(self.lane.reference(), -(layout.size() as i64), -1) };
+        }
+    }
+    /// Wraps grow, grow_zeroed or shrink through the wrapped allocator.
+    /// # Safety
+    /// The old live block belongs to this owner; old/new are the exact requested
+    /// layouts. Ok means underlying successfully replaces it with new, Err
+    /// preserves the old block and facts. The allocator must preserve contents
+    /// as its resize contract requires and must not publish duplicate R1 facts.
+    /// The strong owner protects cross-band publication, even at count zero.
+    pub unsafe fn resize_with<T, E>(
+        &self,
+        old: Layout,
+        new: Layout,
+        underlying: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _guard = self.bind();
+        let result = underlying();
+        if result.is_ok() {
+            let old_small = !is_tagged(old.size());
+            let new_small = !is_tagged(new.size());
+            let bytes = (if new_small { new.size() as i64 } else { 0 })
+                - (if old_small { old.size() as i64 } else { 0 });
+            let count =
+                i64::from(new_small && new.size() != 0) - i64::from(old_small && old.size() != 0);
+            if bytes != 0 || count != 0 {
+                // A tagged→small shrink changes representation, not physical
+                // growth. Suppress only that positive transfer's growth fault.
+                // SAFETY: successful transition and held owner protect both sides.
+                unsafe {
+                    if !old_small && new_small {
+                        binding::publish_small_transfer(self.lane.reference(), bytes, count);
+                    } else {
+                        binding::publish_small(self.lane.reference(), bytes, count);
+                    }
+                }
+            }
+        }
+        result
+    }
+}

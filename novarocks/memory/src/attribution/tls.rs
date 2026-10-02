@@ -62,6 +62,12 @@ pub(crate) fn effective_owner() -> RecordRef {
 /// Caller holds a live owner, genuine allocation, or the slot pin; identity alone
 /// is insufficient. The production global store is the only supported store.
 pub(crate) unsafe fn add(reference: RecordRef, tagged: i64, small: i64, count: i64) {
+    unsafe { add_inner(reference, tagged, small, count, false) };
+}
+pub(crate) unsafe fn add_transfer(reference: RecordRef, tagged: i64, small: i64, count: i64) {
+    unsafe { add_inner(reference, tagged, small, count, true) };
+}
+unsafe fn add_inner(reference: RecordRef, tagged: i64, small: i64, count: i64, transfer: bool) {
     access();
     if STATE
         .try_with(|cell| {
@@ -70,16 +76,33 @@ pub(crate) unsafe fn add(reference: RecordRef, tagged: i64, small: i64, count: i
             // SAFETY: caller's lifetime capability protects the new reference; the
             // copied slot is used exactly once and immediately replaced in the Cell.
             unsafe {
-                state
-                    .slot
-                    .add(global_store(), reference, tagged, small, count, buffered)
+                if transfer {
+                    state.slot.add_transfer(
+                        global_store(),
+                        reference,
+                        tagged,
+                        small,
+                        count,
+                        buffered,
+                    );
+                } else {
+                    state
+                        .slot
+                        .add(global_store(), reference, tagged, small, count, buffered);
+                }
             };
             cell.set(state);
         })
         .is_err()
     {
         // SAFETY: same caller lifetime capability, no TLS slot involved.
-        unsafe { SlotCore::direct(global_store(), reference, tagged, small, count) };
+        unsafe {
+            if transfer {
+                SlotCore::direct_transfer(global_store(), reference, tagged, small, count);
+            } else {
+                SlotCore::direct(global_store(), reference, tagged, small, count);
+            }
+        };
     }
 }
 pub(crate) fn flush() {
@@ -92,6 +115,13 @@ pub(crate) fn flush() {
     });
 }
 pub(crate) fn replace(reference: RecordRef, explicit: bool, restoring: bool) -> RecordRef {
+    try_replace(reference, explicit, restoring).unwrap_or(RecordRef::NONE)
+}
+pub(crate) fn try_replace(
+    reference: RecordRef,
+    explicit: bool,
+    restoring: bool,
+) -> Option<RecordRef> {
     access();
     STATE
         .try_with(|cell| {
@@ -106,14 +136,14 @@ pub(crate) fn replace(reference: RecordRef, explicit: bool, restoring: bool) -> 
             } else {
                 state.ambient = reference;
             }
-            if restoring && (!explicit || !state.buffered()) {
+            if restoring && (!explicit || state.ambient.is_none()) {
                 // SAFETY: sole slot pin; flush completes before a binding owner drops.
                 unsafe { state.slot.flush(global_store()) };
             }
             cell.set(state);
             old
         })
-        .unwrap_or(RecordRef::NONE)
+        .ok()
 }
 pub(crate) fn pending_bytes() -> u64 {
     STATE

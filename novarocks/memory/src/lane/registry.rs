@@ -28,6 +28,7 @@ pub(crate) struct ObservationRegistry {
     pub records: Vec<Option<LaneHandle>>,
     pub upper: usize,
     pub cursor: usize,
+    pub occupied: usize,
 }
 impl ObservationRegistry {
     pub fn new(capacity: usize) -> Self {
@@ -35,6 +36,7 @@ impl ObservationRegistry {
             records: (0..capacity).map(|_| None).collect(),
             upper: 0,
             cursor: 0,
+            occupied: 0,
         }
     }
 }
@@ -49,6 +51,7 @@ impl Shared {
         let mut registry = self.observation_lanes.lock().unwrap();
         assert!(registry.records[index].is_none());
         registry.records[index] = Some(lane.clone());
+        registry.occupied += 1;
         registry.upper = registry.upper.max(index + 1);
     }
     pub(crate) fn prune_observations(&self, budget: usize) {
@@ -86,6 +89,7 @@ impl Shared {
                     lane.restore_member(&member);
                     continue;
                 }
+                registry.occupied -= 1;
                 registry.records[index].take()
             };
             let reference = lane.reference();

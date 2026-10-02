@@ -30,6 +30,7 @@ pub(crate) const CLASS_MASK: u32 = 3 << CLASS_SHIFT;
 pub(crate) const DRAINING: u32 = 1 << 4;
 pub(crate) const IMMORTAL: u32 = 1 << 5;
 pub(crate) const ACTIVE_SCOPE: u32 = 1 << 6;
+const ACTIVE_SCOPE_MASK: u32 = !(ACTIVE_SCOPE - 1);
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,16 +195,20 @@ impl LaneRecord {
     pub(crate) fn enter(&self) -> bool {
         self.flags
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
-                (flags & (PRODUCTION_MASK | ACTIVE_SCOPE) == 0).then_some(flags | ACTIVE_SCOPE)
+                if flags & PRODUCTION_MASK == 0 {
+                    flags.checked_add(ACTIVE_SCOPE)
+                } else {
+                    None
+                }
             })
             .is_ok()
     }
     pub(crate) fn leave(&self) {
-        self.flags.fetch_and(!ACTIVE_SCOPE, Ordering::Release);
+        self.flags.fetch_sub(ACTIVE_SCOPE, Ordering::Release);
         self.sequence.fetch_add(1, Ordering::Release);
     }
     pub(crate) fn scope_active(&self) -> bool {
-        self.flags.load(Ordering::Acquire) & ACTIVE_SCOPE != 0
+        self.flags.load(Ordering::Acquire) & ACTIVE_SCOPE_MASK != 0
     }
     pub(crate) fn reset_for_owner(&self, origin: u64, class: ResponsibilityClass) {
         self.tagged.store(0, Ordering::Release);

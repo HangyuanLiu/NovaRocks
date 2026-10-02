@@ -149,10 +149,10 @@ impl AccountHandle {
             let _gates = path.exclusive_gates();
             account.0.ledger.lock().unwrap().retired = true;
             account.0.retired.store(1, crate::sync::Ordering::Release);
-            if let Some(parent) = &account.0.parent {
-                if let Some(member) = account.0.membership.lock().unwrap().take() {
-                    parent.0.members.remove(&member);
-                }
+            if let Some(parent) = &account.0.parent
+                && let Some(member) = account.0.membership.lock().unwrap().take()
+            {
+                parent.0.members.remove(&member);
             }
             let slot = account.0.slot.swap(u64::MAX, crate::sync::Ordering::AcqRel);
             if slot != u64::MAX {

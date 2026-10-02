@@ -72,6 +72,33 @@ impl SlotCore {
         count: i64,
         buffered: bool,
     ) {
+        // SAFETY: forward the caller's live-allocation/owner/slot contract.
+        unsafe { self.add_inner(store, reference, tagged, r1_small, count, buffered, false) };
+    }
+    /// # Safety
+    /// Same contract as add; only for representation transfer without growth.
+    pub(crate) unsafe fn add_transfer(
+        &mut self,
+        store: &RecordStore,
+        reference: RecordRef,
+        tagged: i64,
+        r1_small: i64,
+        count: i64,
+        buffered: bool,
+    ) {
+        unsafe { self.add_inner(store, reference, tagged, r1_small, count, buffered, true) };
+    }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn add_inner(
+        &mut self,
+        store: &RecordStore,
+        reference: RecordRef,
+        tagged: i64,
+        r1_small: i64,
+        count: i64,
+        buffered: bool,
+        transfer: bool,
+    ) {
         if !buffered
             || tagged
                 .unsigned_abs()
@@ -80,7 +107,7 @@ impl SlotCore {
         {
             // Pending facts may have pins even if a direct event releases the
             // last already-published allocation. Flush ordering preserves both.
-            unsafe { Self::direct(store, reference, tagged, r1_small, count) };
+            unsafe { Self::direct_inner(store, reference, tagged, r1_small, count, transfer) };
             return;
         }
         if self.bound != reference {
@@ -103,7 +130,8 @@ impl SlotCore {
         }
         // Diagnose the actual event, not a delayed publication: teardown may
         // reclassify this record while its earlier positive delta is buffered.
-        if (i128::from(tagged) + i128::from(r1_small)) > 0
+        if !transfer
+            && (i128::from(tagged) + i128::from(r1_small)) > 0
             && record.responsibility_class() == ResponsibilityClass::Residual
         {
             store.faults.residual_growth();
@@ -160,10 +188,32 @@ impl SlotCore {
         r1_small: i64,
         count: i64,
     ) {
+        unsafe { Self::direct_inner(store, reference, tagged, r1_small, count, false) };
+    }
+    /// # Safety
+    /// Same contract as direct; only for representation transfer without growth.
+    pub(crate) unsafe fn direct_transfer(
+        store: &RecordStore,
+        reference: RecordRef,
+        tagged: i64,
+        r1_small: i64,
+        count: i64,
+    ) {
+        unsafe { Self::direct_inner(store, reference, tagged, r1_small, count, true) };
+    }
+    unsafe fn direct_inner(
+        store: &RecordStore,
+        reference: RecordRef,
+        tagged: i64,
+        r1_small: i64,
+        count: i64,
+        transfer: bool,
+    ) {
         let Some(record) = store.resolve_hook(reference) else {
             return;
         };
-        let residual_growth = (i128::from(tagged) + i128::from(r1_small)) > 0
+        let residual_growth = !transfer
+            && (i128::from(tagged) + i128::from(r1_small)) > 0
             && record.responsibility_class() == ResponsibilityClass::Residual;
         record.tagged.fetch_add(tagged, Ordering::AcqRel);
         record.r1_small.fetch_add(r1_small, Ordering::AcqRel);

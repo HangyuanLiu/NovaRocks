@@ -203,12 +203,7 @@ impl MemoryAuthority {
     pub fn observation_metadata_bytes(&self) -> u64 {
         let registry = self.shared.observation_lanes.lock().unwrap();
         (registry.records.capacity() * std::mem::size_of::<Option<crate::LaneHandle>>()) as u64
-            + registry
-                .records
-                .iter()
-                .filter(|entry| entry.is_some())
-                .count() as u64
-                * crate::lane::OBSERVATION_LANE_METADATA_BYTES
+            + registry.occupied as u64 * crate::lane::OBSERVATION_LANE_METADATA_BYTES
     }
     pub const fn config(&self) -> AuthorityConfig {
         self.config
@@ -376,6 +371,7 @@ impl Drop for MemoryAuthority {
         let observations = {
             let mut registry = self.shared.observation_lanes.lock().unwrap();
             registry.upper = 0;
+            registry.occupied = 0;
             std::mem::take(&mut registry.records)
         };
         drop(observations);
