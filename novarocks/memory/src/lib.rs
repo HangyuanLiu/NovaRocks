@@ -20,10 +20,13 @@
 //! Allocation facts may exceed backing and remain charged after teardown.
 //! The observation tier is independent of allocation attribution.
 pub mod account;
+#[cfg(not(loom))]
+pub mod attribution;
 pub mod authority;
 pub mod domain;
 pub mod error;
 pub mod ids;
+pub mod lane;
 pub mod observe;
 pub mod owner;
 pub mod policy;
@@ -60,3 +63,6 @@ pub use holder::HolderPin;
 mod ledger_loom;
 #[cfg(all(test, loom))]
 mod owner_loom;
+
+#[cfg(all(test, loom))]
+mod lane_loom;
