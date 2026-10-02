@@ -1,9 +1,14 @@
+use bytes::Bytes;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::{FromIterator, FusedIterator};
 use std::marker::PhantomData;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::{fmt, mem, ops, ptr, vec};
 
 use crate::Error;
@@ -77,7 +82,6 @@ pub use self::into_header_name::IntoHeaderName;
 ///
 /// assert!(!headers.contains_key(HOST));
 /// ```
-#[derive(Clone)]
 pub struct HeaderMap<T = HeaderValue> {
     // Used to mask values to get an index
     mask: Size,
@@ -85,6 +89,8 @@ pub struct HeaderMap<T = HeaderValue> {
     entries: Vec<Bucket<T>>,
     extra_values: Vec<ExtraValue<T>>,
     danger: Danger,
+    // All three physical buffers exit before the original capacity claim.
+    allocation: Option<MapAllocationClaim>,
 }
 
 // # Implementation notes
@@ -138,12 +144,12 @@ pub struct IterMut<'a, T> {
 /// An owning iterator over the entries of a `HeaderMap`.
 ///
 /// This struct is created by the `into_iter` method on `HeaderMap`.
-#[derive(Debug)]
 pub struct IntoIter<T> {
     // If None, pull from `entries`
     next: Option<usize>,
     entries: vec::IntoIter<Bucket<T>>,
-    extra_values: Vec<ExtraValue<T>>,
+    extra_values: Vec<mem::ManuallyDrop<ExtraValue<T>>>,
+    _allocation: Option<MapAllocationClaim>,
 }
 
 /// An iterator over `HeaderMap` keys.
@@ -246,6 +252,7 @@ pub struct ValueIterMut<'a, T> {
 pub struct ValueDrain<'a, T> {
     first: Option<T>,
     next: Option<::std::vec::IntoIter<T>>,
+    _allocation: Option<MapAllocationClaim>,
     lt: PhantomData<&'a mut HeaderMap<T>>,
 }
 
@@ -495,6 +502,7 @@ impl<T> Default for HeaderMap<T> {
             entries: Vec::new(),
             extra_values: Vec::new(),
             danger: Danger::Green,
+            allocation: None,
         }
     }
 }
@@ -568,6 +576,7 @@ impl<T> HeaderMap<T> {
                 entries: Vec::with_capacity(usable_capacity(raw_cap)),
                 extra_values: Vec::new(),
                 danger: Danger::Green,
+                allocation: None,
             })
         }
     }
@@ -751,6 +760,13 @@ impl<T> HeaderMap<T> {
             .checked_add(additional)
             .ok_or_else(MaxSizeReached::new)?;
 
+        if self.allocation.is_some() {
+            return if cap <= self.capacity() {
+                Ok(())
+            } else {
+                Err(MaxSizeReached::new())
+            };
+        }
         let raw_cap = to_raw_capacity(cap)?;
 
         if raw_cap > self.indices.len() {
@@ -1206,6 +1222,15 @@ impl<T> HeaderMap<T> {
         K: Hash + Into<HeaderName>,
         HeaderName: PartialEq<K>,
     {
+        if self.allocation.is_some() {
+            if let Some((probe, index)) = self.find(&key) {
+                return Ok(Entry::Occupied(OccupiedEntry {
+                    map: self,
+                    index,
+                    probe,
+                }));
+            }
+        }
         // Ensure that there is space in the map
         self.try_reserve_one()?;
 
@@ -1320,6 +1345,11 @@ impl<T> HeaderMap<T> {
         K: Hash + Into<HeaderName>,
         HeaderName: PartialEq<K>,
     {
+        if self.allocation.is_some() {
+            if let Some((_, index)) = self.find(&key) {
+                return Ok(Some(self.insert_occupied(index, value)));
+            }
+        }
         self.try_reserve_one()?;
 
         Ok(insert_phase_one!(
@@ -1359,6 +1389,7 @@ impl<T> HeaderMap<T> {
     }
 
     fn insert_occupied_mult(&mut self, index: usize, value: T) -> ValueDrain<'_, T> {
+        let (allocation, values) = self.drain_backing(self.entries[index].links.is_some());
         let old;
         let links;
 
@@ -1366,18 +1397,21 @@ impl<T> HeaderMap<T> {
             let entry = &mut self.entries[index];
 
             old = mem::replace(&mut entry.value, value);
-            links = entry.links.take();
+            // Keep the live entry link until remove_extra_value repairs it.
+            // Taking it early breaks the predecessor of a multi-value chain.
+            links = entry.links;
         }
 
         let raw_links = self.raw_links();
         let extra_values = &mut self.extra_values;
 
-        let next =
-            links.map(|l| drain_all_extra_values(raw_links, extra_values, l.next).into_iter());
+        let next = links
+            .map(|l| drain_all_extra_values(raw_links, extra_values, l.next, values).into_iter());
 
         ValueDrain {
             first: Some(old),
             next,
+            _allocation: allocation,
             lt: PhantomData,
         }
     }
@@ -1463,6 +1497,18 @@ impl<T> HeaderMap<T> {
         K: Hash + Into<HeaderName>,
         HeaderName: PartialEq<K>,
     {
+        if self.allocation.is_some() {
+            if let Some((_, index)) = self.find(&key) {
+                self.try_reserve_extra()?;
+                append_value(
+                    index,
+                    &mut self.entries[index],
+                    &mut self.extra_values,
+                    value,
+                );
+                return Ok(true);
+            }
+        }
         self.try_reserve_one()?;
 
         Ok(insert_phase_one!(
@@ -1482,6 +1528,7 @@ impl<T> HeaderMap<T> {
             },
             // Occupied
             {
+                self.try_reserve_extra()?;
                 append_value(pos, &mut self.entries[pos], &mut self.extra_values, value);
                 true
             },
@@ -1674,7 +1721,9 @@ impl<T> HeaderMap<T> {
         key: HeaderName,
         value: T,
     ) -> Result<(), MaxSizeReached> {
-        if self.entries.len() >= MAX_SIZE {
+        if self.entries.len() >= MAX_SIZE
+            || (self.allocation.is_some() && self.entries.len() == self.entries.capacity())
+        {
             return Err(MaxSizeReached::new());
         }
 
@@ -1737,6 +1786,17 @@ impl<T> HeaderMap<T> {
 
     fn try_reserve_one(&mut self) -> Result<(), MaxSizeReached> {
         let len = self.entries.len();
+        if self.allocation.is_some() {
+            if len == self.capacity() {
+                return Err(MaxSizeReached::new());
+            }
+            if self.danger.is_yellow() {
+                self.danger.set_red();
+                self.indices.fill(Pos::none());
+                self.rebuild();
+            }
+            return Ok(());
+        }
 
         if self.danger.is_yellow() {
             let load_factor = self.entries.len() as f32 / self.indices.len() as f32;
@@ -1777,6 +1837,9 @@ impl<T> HeaderMap<T> {
 
     #[inline]
     fn try_grow(&mut self, new_raw_cap: usize) -> Result<(), MaxSizeReached> {
+        if self.allocation.is_some() {
+            return Err(MaxSizeReached::new());
+        }
         if new_raw_cap > MAX_SIZE {
             return Err(MaxSizeReached::new());
         }
@@ -1813,6 +1876,28 @@ impl<T> HeaderMap<T> {
         let more = self.capacity() - self.entries.len();
         self.entries.reserve_exact(more);
         Ok(())
+    }
+
+    fn drain_backing(&self, has_extra: bool) -> (Option<MapAllocationClaim>, Vec<T>) {
+        if has_extra {
+            if let Some(claim) = &self.allocation {
+                let allocation = claim
+                    .pool
+                    .claim()
+                    .expect("header value drain capacity exhausted");
+                let values = Vec::with_capacity(self.extra_values.len());
+                return (Some(allocation), values);
+            }
+        }
+        (None, Vec::new())
+    }
+
+    fn try_reserve_extra(&self) -> Result<(), MaxSizeReached> {
+        if self.allocation.is_some() && self.extra_values.len() == self.extra_values.capacity() {
+            Err(MaxSizeReached::new())
+        } else {
+            Ok(())
+        }
     }
 
     #[inline]
@@ -1945,8 +2030,8 @@ fn drain_all_extra_values<T>(
     raw_links: RawLinks<T>,
     extra_values: &mut Vec<ExtraValue<T>>,
     mut head: usize,
+    mut vec: Vec<T>,
 ) -> Vec<T> {
-    let mut vec = Vec::new();
     loop {
         let extra = remove_extra_value(raw_links, extra_values, head);
         vec.push(extra.value);
@@ -2035,7 +2120,14 @@ impl<T> IntoIterator for HeaderMap<T> {
         IntoIter {
             next: None,
             entries: self.entries.into_iter(),
-            extra_values: self.extra_values,
+            extra_values: {
+                // Same layout, no allocation. Only next()/Drop moves values out.
+                let mut values = mem::ManuallyDrop::new(self.extra_values);
+                unsafe {
+                    Vec::from_raw_parts(values.as_mut_ptr().cast(), values.len(), values.capacity())
+                }
+            },
+            _allocation: self.allocation,
         }
     }
 }
@@ -3092,17 +3184,32 @@ unsafe impl<'a, T: Send> Send for ValueIterMut<'a, T> {}
 
 // ===== impl IntoIter =====
 
+impl<T: fmt::Debug> fmt::Debug for IntoIter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Extra slots may contain moved-out values after next(). Do not
+        // inspect them when formatting a partially consumed iterator.
+        f.debug_struct("IntoIter")
+            .field("next", &self.next)
+            .field("entries", &self.entries)
+            .field("extra_slots", &self.extra_values.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> Iterator for IntoIter<T> {
     type Item = (Option<HeaderName>, T);
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.next {
-            self.next = match self.extra_values[next].next {
+            debug_assert!(next < self.extra_values.len());
+            // Previously yielded values are moved out. Access the still-live
+            // link directly, without constructing a reference to the whole slot.
+            let extra = unsafe { self.extra_values.as_ptr().add(next).cast::<ExtraValue<T>>() };
+            self.next = match unsafe { ptr::read(ptr::addr_of!((*extra).next)) } {
                 Link::Entry(_) => None,
                 Link::Extra(v) => Some(v),
             };
-
-            let value = unsafe { ptr::read(&self.extra_values[next].value) };
+            let value = unsafe { ptr::read(ptr::addr_of!((*extra).value)) };
 
             return Some((None, value));
         }
@@ -3131,13 +3238,16 @@ impl<T> FusedIterator for IntoIter<T> {}
 
 impl<T> Drop for IntoIter<T> {
     fn drop(&mut self) {
-        // Ensure the iterator is consumed
-        for _ in self.by_ref() {}
-
-        // All the values have already been yielded out.
-        unsafe {
-            self.extra_values.set_len(0);
+        // If one payload destructor panics, finish retiring the remaining
+        // values before physical buffers and their original claim exit.
+        struct Finish<'a, T>(&'a mut IntoIter<T>);
+        impl<T> Drop for Finish<'_, T> {
+            fn drop(&mut self) {
+                for _ in self.0.by_ref() {}
+            }
         }
+        let finish = Finish(self);
+        for _ in finish.0.by_ref() {}
     }
 }
 
@@ -3284,6 +3394,10 @@ impl<'a, T> OccupiedEntry<'a, T> {
     ///
     /// assert_eq!("earth", map["host"]);
     /// ```
+    /// # Panics
+    ///
+    /// An originally funded map panics before modification if its value
+    /// drain cannot acquire another metadata position from the same pool.
     pub fn insert_mult(&mut self, value: T) -> ValueDrain<'_, T> {
         self.map.insert_occupied_mult(self.index, value)
     }
@@ -3310,9 +3424,17 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", *i.next().unwrap());
     /// ```
     pub fn append(&mut self, value: T) {
+        self.try_append(value)
+            .expect("header map capacity exhausted");
+    }
+
+    /// Append without exceeding an original fixed metadata backing.
+    pub fn try_append(&mut self, value: T) -> Result<(), MaxSizeReached> {
+        self.map.try_reserve_extra()?;
         let idx = self.index;
         let entry = &mut self.map.entries[idx];
         append_value(idx, entry, &mut self.map.extra_values, value);
+        Ok(())
     }
 
     /// Remove the entry from the map.
@@ -3373,19 +3495,27 @@ impl<'a, T> OccupiedEntry<'a, T> {
     ///
     /// The key and all values associated with the entry are removed and
     /// returned.
+    /// # Panics
+    ///
+    /// An originally funded map panics before modification if its value
+    /// drain cannot acquire another metadata position from the same pool.
     pub fn remove_entry_mult(self) -> (HeaderName, ValueDrain<'a, T>) {
+        let (allocation, values) = self
+            .map
+            .drain_backing(self.map.entries[self.index].links.is_some());
         let raw_links = self.map.raw_links();
         let extra_values = &mut self.map.extra_values;
 
         let next = self.map.entries[self.index]
             .links
-            .map(|l| drain_all_extra_values(raw_links, extra_values, l.next).into_iter());
+            .map(|l| drain_all_extra_values(raw_links, extra_values, l.next, values).into_iter());
 
         let entry = self.map.remove_found(self.probe, self.index);
 
         let drain = ValueDrain {
             first: Some(entry.value),
             next,
+            _allocation: allocation,
             lt: PhantomData,
         };
         (entry.key, drain)
@@ -3969,4 +4099,206 @@ fn skip_duplicates_during_key_iteration() {
     map.try_append("a", HeaderValue::from_static("a")).unwrap();
     map.try_append("a", HeaderValue::from_static("b")).unwrap();
     assert_eq!(map.keys().count(), map.keys_len());
+}
+
+/// Originally funded fixed metadata storage for a bounded number of maps.
+///
+/// The bound covers all three metadata buffers per map and the pool Arc.
+/// Header name/value payloads, including any metadata allocated by their
+/// Clone implementations, retain separate owners and are outside this bound.
+/// Every copy claims a position before allocating. There is no heap fallback.
+/// Infallible insertion, reservation and Clone APIs panic on exhaustion;
+/// bounded callers must use their fallible equivalents. Owning multi-value
+/// drains conservatively consume another position for their independent
+/// storage; their infallible APIs require that position to be available.
+pub struct HeaderMapAllocationPool {
+    core: Option<Arc<MapAllocationCore>>,
+}
+
+struct MapAllocationCore {
+    raw_capacity: usize,
+    extra_capacity: usize,
+    max_maps: usize,
+    live_maps: AtomicUsize,
+    // The final Arc allocation exits before original ownership.
+    _ownership: Bytes,
+}
+
+#[derive(Debug)]
+struct MapAllocationClaim {
+    pool: HeaderMapAllocationPool,
+}
+
+impl HeaderMapAllocationPool {
+    /// Complete Rust-requested backing bound; caller carrier metadata is separate.
+    pub fn allocation_capacity_bound(
+        max_maps: usize,
+        keys: usize,
+        extra: usize,
+    ) -> Result<usize, MaxSizeReached> {
+        let raw = Self::geometry(max_maps, keys, extra)?;
+        let indices = std::alloc::Layout::array::<Pos>(raw)
+            .map_err(|_| MaxSizeReached::new())?
+            .size();
+        let entries = std::alloc::Layout::array::<Bucket<HeaderValue>>(usable_capacity(raw))
+            .map_err(|_| MaxSizeReached::new())?
+            .size();
+        let extras = std::alloc::Layout::array::<ExtraValue<HeaderValue>>(extra)
+            .map_err(|_| MaxSizeReached::new())?
+            .size();
+        indices
+            .checked_add(entries)
+            .and_then(|n| n.checked_add(extras))
+            .and_then(|n| n.checked_mul(max_maps))
+            .and_then(|n| n.checked_add(mem::size_of::<MapAllocationCore>()))
+            .and_then(|n| {
+                n.checked_add(3 * mem::size_of::<usize>() + mem::align_of::<MapAllocationCore>())
+            })
+            .ok_or_else(MaxSizeReached::new)
+    }
+
+    /// Construct after acquiring the complete original backing bound.
+    pub fn new(
+        max_maps: usize,
+        keys: usize,
+        extra: usize,
+        ownership: Bytes,
+    ) -> Result<Self, MaxSizeReached> {
+        Self::allocation_capacity_bound(max_maps, keys, extra)?;
+        let raw_capacity = Self::geometry(max_maps, keys, extra)?;
+        Ok(Self {
+            core: Some(Arc::new(MapAllocationCore {
+                raw_capacity,
+                extra_capacity: extra,
+                max_maps,
+                live_maps: AtomicUsize::new(0),
+                _ownership: ownership,
+            })),
+        })
+    }
+
+    fn geometry(max_maps: usize, keys: usize, extra: usize) -> Result<usize, MaxSizeReached> {
+        if max_maps == 0 || keys == 0 || extra > MAX_SIZE {
+            return Err(MaxSizeReached::new());
+        }
+        let raw = to_raw_capacity(keys)?
+            .checked_next_power_of_two()
+            .ok_or_else(MaxSizeReached::new)?;
+        if raw > MAX_SIZE {
+            return Err(MaxSizeReached::new());
+        }
+        Ok(raw)
+    }
+
+    /// Number of remaining metadata positions, including copies and value drains.
+    pub fn available_maps(&self) -> usize {
+        let core = self.core();
+        core.max_maps - core.live_maps.load(Ordering::Acquire)
+    }
+
+    fn core(&self) -> &MapAllocationCore {
+        self.core.as_deref().expect("live map allocation pool")
+    }
+
+    fn claim(&self) -> Result<MapAllocationClaim, MaxSizeReached> {
+        let core = self.core();
+        let mut current = core.live_maps.load(Ordering::Acquire);
+        loop {
+            if current == core.max_maps {
+                return Err(MaxSizeReached::new());
+            }
+            match core.live_maps.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        Ok(MapAllocationClaim { pool: self.clone() })
+    }
+}
+
+impl Clone for HeaderMapAllocationPool {
+    fn clone(&self) -> Self {
+        Self {
+            core: Some(Arc::clone(self.core.as_ref().unwrap())),
+        }
+    }
+}
+impl Drop for HeaderMapAllocationPool {
+    fn drop(&mut self) {
+        drop(Arc::into_inner(self.core.take().unwrap()));
+    }
+}
+impl fmt::Debug for HeaderMapAllocationPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderMapAllocationPool")
+            .field("available_maps", &self.available_maps())
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for MapAllocationClaim {
+    fn drop(&mut self) {
+        let previous = self.pool.core().live_maps.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+impl HeaderMap<HeaderValue> {
+    /// Allocate a fixed map from an original metadata grant.
+    /// Payload owners remain independent; no capacity growth is permitted.
+    pub fn try_from_allocation_pool(
+        pool: &HeaderMapAllocationPool,
+    ) -> Result<Self, MaxSizeReached> {
+        Self::from_map_claim(pool.claim()?)
+    }
+}
+
+impl<T> HeaderMap<T> {
+    fn from_map_claim(claim: MapAllocationClaim) -> Result<Self, MaxSizeReached> {
+        let core = claim.pool.core();
+        let raw = core.raw_capacity;
+        Ok(Self {
+            mask: (raw - 1) as Size,
+            indices: vec![Pos::none(); raw].into_boxed_slice(),
+            entries: Vec::with_capacity(usable_capacity(raw)),
+            extra_values: Vec::with_capacity(core.extra_capacity),
+            danger: Danger::Green,
+            allocation: Some(claim),
+        })
+    }
+}
+
+impl<T: Clone> HeaderMap<T> {
+    /// Copy metadata after acquiring another position in its original pool.
+    /// Ordinary maps retain their existing eager Clone behavior.
+    pub fn try_clone(&self) -> Result<Self, MaxSizeReached> {
+        if let Some(claim) = &self.allocation {
+            let mut copy = Self::from_map_claim(claim.pool.claim()?)?;
+            copy.mask = self.mask;
+            copy.indices.copy_from_slice(&self.indices);
+            copy.entries.extend(self.entries.iter().cloned());
+            copy.extra_values.extend(self.extra_values.iter().cloned());
+            copy.danger = self.danger.clone();
+            Ok(copy)
+        } else {
+            Ok(Self {
+                mask: self.mask,
+                indices: self.indices.clone(),
+                entries: self.entries.clone(),
+                extra_values: self.extra_values.clone(),
+                danger: self.danger.clone(),
+                allocation: None,
+            })
+        }
+    }
+}
+impl<T: Clone> Clone for HeaderMap<T> {
+    fn clone(&self) -> Self {
+        self.try_clone()
+            .expect("header map copy capacity exhausted")
+    }
 }
