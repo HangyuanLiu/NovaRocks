@@ -64,6 +64,7 @@ pub(crate) enum ExpressionLoweringError {
     Effects(EffectContractError),
     Arithmetic(novarocks_functions::ArithmeticPrepareError),
     Cast(novarocks_functions::CastPrepareError),
+    Comparison(novarocks_functions::ComparisonPrepareError),
     UnsupportedExpression(ExprId),
     UnsupportedCall(PhysicalCallSite),
     Invalid(&'static str),
@@ -80,6 +81,7 @@ impl fmt::Display for ExpressionLoweringError {
             Self::Effects(e) => e.fmt(f),
             Self::Arithmetic(e) => e.fmt(f),
             Self::Cast(e) => e.fmt(f),
+            Self::Comparison(e) => e.fmt(f),
             Self::UnsupportedExpression(id) => {
                 write!(f, "unsupported physical expression {}", id.get())
             }
@@ -100,6 +102,7 @@ impl Error for ExpressionLoweringError {
             Self::Effects(e) => Some(e),
             Self::Arithmetic(e) => Some(e),
             Self::Cast(e) => Some(e),
+            Self::Comparison(e) => Some(e),
             _ => None,
         }
     }
@@ -119,6 +122,15 @@ impl From<novarocks_functions::CastPrepareError> for ExpressionLoweringError {
             Self::Control(cause)
         } else {
             Self::Cast(value)
+        }
+    }
+}
+impl From<novarocks_functions::ComparisonPrepareError> for ExpressionLoweringError {
+    fn from(value: novarocks_functions::ComparisonPrepareError) -> Self {
+        if let Some(cause) = value.control_error() {
+            Self::Control(cause)
+        } else {
+            Self::Comparison(value)
         }
     }
 }
@@ -297,6 +309,7 @@ fn lower_core(
                 ExprKind::Binary {
                     op:
                         novarocks_physical_plan::BinaryOperator::Eq
+                        | novarocks_physical_plan::BinaryOperator::EqForNull
                         | novarocks_physical_plan::BinaryOperator::NotEq
                         | novarocks_physical_plan::BinaryOperator::Lt
                         | novarocks_physical_plan::BinaryOperator::LtEq
@@ -555,6 +568,48 @@ fn lower_core(
                         right: local_right,
                         decimal_overflow_policy: *decimal_overflow_policy,
                         allow_throw_exception: *authored_allow,
+                    }
+                }
+                ExprKind::Binary {
+                    op: novarocks_physical_plan::BinaryOperator::EqForNull,
+                    left,
+                    right,
+                    ..
+                } => {
+                    let local_left = *ids.get(left).ok_or(ExpressionLoweringError::Invalid(
+                        "null-safe left operand was not lowered",
+                    ))?;
+                    let local_right = *ids.get(right).ok_or(ExpressionLoweringError::Invalid(
+                        "null-safe right operand was not lowered",
+                    ))?;
+                    if node.ty.data_type != arrow_schema::DataType::Boolean
+                        || node.ty.logical_type
+                            != novarocks_type_contract::ValueLogicalType::Physical
+                        || node.ty.nullable
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "null-safe comparison requires nonnullable Physical Boolean result",
+                        ));
+                    }
+                    work.flush()?;
+                    novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
+                        &source
+                            .get(*left)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing null-safe left source",
+                            ))?
+                            .ty,
+                        &source
+                            .get(*right)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing null-safe right source",
+                            ))?
+                            .ty,
+                        control,
+                    )?;
+                    StaticExprKind::PreparedNullSafeComparison {
+                        left: local_left,
+                        right: local_right,
                     }
                 }
                 ExprKind::Binary {
@@ -1097,12 +1152,22 @@ fn prepare_core(
                         op, left, right, ..
                     },
                     kind,
-                ) if kind.ordinary_comparison().is_some()
+                ) if (kind.ordinary_comparison().is_some()
                     && comparison_operator(*op)
-                        == kind.ordinary_comparison().map(|parts| parts.0) =>
+                        == kind.ordinary_comparison().map(|parts| parts.0))
+                    || (*op == novarocks_physical_plan::BinaryOperator::EqForNull
+                        && matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. })) =>
                 {
-                    let (_, local_left, local_right) =
-                        kind.ordinary_comparison().expect("checked comparison kind");
+                    let (local_left, local_right) = match kind {
+                        StaticExprKind::PreparedNullSafeComparison { left, right } => {
+                            (*left, *right)
+                        }
+                        _ => {
+                            let (_, left, right) =
+                                kind.ordinary_comparison().expect("checked comparison kind");
+                            (left, right)
+                        }
+                    };
                     if invocation.control != ControlShape::Eager
                         || invocation.arguments.len() != 2
                         || lowered.ids.get(left) != Some(&local_left)
@@ -1112,7 +1177,32 @@ fn prepare_core(
                             "actual comparison control or operands differ",
                         ));
                     }
-                    let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
+                    let mut combined =
+                        if matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) {
+                            work.flush()?;
+                            novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
+                                &package
+                                    .fragment()
+                                    .expressions()
+                                    .get(*left)
+                                    .ok_or(ExpressionLoweringError::Invalid(
+                                        "missing null-safe left source",
+                                    ))?
+                                    .ty,
+                                &package
+                                    .fragment()
+                                    .expressions()
+                                    .get(*right)
+                                    .ok_or(ExpressionLoweringError::Invalid(
+                                        "missing null-safe right source",
+                                    ))?
+                                    .ty,
+                                control,
+                            )?
+                            .own_effects(invocation.context)
+                        } else {
+                            ScopedExpressionEffects::pure_value(invocation.context)
+                        };
                     for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
                         let child_use = invocation.arguments[ordinal];
                         if flow.uses()[&child_use].definition != physical {
@@ -1515,6 +1605,13 @@ fn literal_argument(
         {
             Ok(None)
         }
+        (
+            ExprKind::Binary {
+                op: novarocks_physical_plan::BinaryOperator::EqForNull,
+                ..
+            },
+            StaticExprKind::PreparedNullSafeComparison { .. },
+        ) => Ok(None),
         (ExprKind::Binary { op, .. }, kind)
             if kind.ordinary_comparison().is_some()
                 && comparison_operator(*op) == kind.ordinary_comparison().map(|parts| parts.0) =>

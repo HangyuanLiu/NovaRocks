@@ -41,6 +41,8 @@ pub struct LocalProgram {
     arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
     casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
     comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
+    null_safe_comparisons:
+        BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNullSafeComparisonRecipe>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +134,8 @@ impl LocalProgram {
         let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
         let casts = crate::primitives::compile_casts(&checked, control)?;
         let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
+        let null_safe_comparisons =
+            crate::primitives::compile_null_safe_comparisons(&checked, control)?;
         // Each delegated author finishes its completed work and propagates a
         // first control refusal directly; no control object enters the product.
         Ok(Self {
@@ -139,6 +143,7 @@ impl LocalProgram {
             provenance,
             writes,
             comparisons,
+            null_safe_comparisons,
             arithmetic,
             casts,
         })
@@ -165,6 +170,12 @@ impl LocalProgram {
         site: ProgramComparisonSite,
     ) -> Option<&novarocks_functions::PreparedComparisonRecipe> {
         self.comparisons.get(&site)
+    }
+    pub fn null_safe_comparison_recipe(
+        &self,
+        site: crate::ProgramUseRef,
+    ) -> Option<&novarocks_functions::PreparedNullSafeComparisonRecipe> {
+        self.null_safe_comparisons.get(&site)
     }
     pub fn arithmetic_recipe(
         &self,

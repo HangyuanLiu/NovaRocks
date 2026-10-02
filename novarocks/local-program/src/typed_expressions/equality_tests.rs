@@ -164,6 +164,8 @@ fn assembled(
         let id = ExpressionUseId::new(uses.len() as u32);
         let (control, children) = match arena.node(definition).unwrap().kind() {
             StaticExprKind::Eq(left, right)
+            | StaticExprKind::EqForNull(left, right)
+            | StaticExprKind::PreparedNullSafeComparison { left, right }
             | StaticExprKind::Ne(left, right)
             | StaticExprKind::Lt(left, right)
             | StaticExprKind::Le(left, right)
@@ -765,3 +767,6 @@ fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null()
         }
     }
 }
+
+#[path = "nullsafe_tests.rs"]
+mod nullsafe_tests;

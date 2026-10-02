@@ -785,6 +785,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Mod(..)
             | StaticExprKind::Eq(..)
             | StaticExprKind::EqForNull(..)
+            | StaticExprKind::PreparedNullSafeComparison { .. }
             | StaticExprKind::Ne(..)
             | StaticExprKind::Lt(..)
             | StaticExprKind::Le(..)
@@ -861,6 +862,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Mod(a, b, _)
             | StaticExprKind::Eq(a, b)
             | StaticExprKind::EqForNull(a, b)
+            | StaticExprKind::PreparedNullSafeComparison { left: a, right: b }
             | StaticExprKind::Ne(a, b)
             | StaticExprKind::Lt(a, b)
             | StaticExprKind::Le(a, b)

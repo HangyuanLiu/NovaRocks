@@ -812,3 +812,6 @@ mod numeric_arithmetic_tests;
 
 #[path = "cast_tests.rs"]
 mod cast_tests;
+
+#[path = "nullsafe_tests.rs"]
+mod nullsafe_tests;

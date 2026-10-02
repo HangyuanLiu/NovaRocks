@@ -176,6 +176,12 @@ pub enum StaticExprKind {
     Mod(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
     Eq(ProgramExprId, ProgramExprId),
     EqForNull(ProgramExprId, ProgramExprId),
+    /// Compiled null-safe equality owns a mandatory recipe. The legacy
+    /// construction tag above cannot carry that authority into ExprArena.
+    PreparedNullSafeComparison {
+        left: ProgramExprId,
+        right: ProgramExprId,
+    },
     Ne(ProgramExprId, ProgramExprId),
     Lt(ProgramExprId, ProgramExprId),
     Le(ProgramExprId, ProgramExprId),
@@ -314,6 +320,7 @@ impl StaticExprKind {
             Self::PreparedArithmetic {
                 left: a, right: b, ..
             }
+            | Self::PreparedNullSafeComparison { left: a, right: b }
             | Self::Add(a, b, _)
             | Self::Sub(a, b, _)
             | Self::Mul(a, b, _)

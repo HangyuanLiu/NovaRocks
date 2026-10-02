@@ -218,6 +218,28 @@ impl ProgramTypedExpressions {
                         if let Some((_, left, right)) = definition.kind().ordinary_comparison() {
                             validate_comparison_types(left, right, value, entries, work)?;
                         }
+                        if let StaticExprKind::EqForNull(left, right)
+                        | StaticExprKind::PreparedNullSafeComparison { left, right } =
+                            definition.kind()
+                        {
+                            // This is a generic type obligation for every definition;
+                            // the pure recipe separately authors runtime capability.
+                            let value_at = |id: ProgramExprId| match entries.get(id.index()) {
+                                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                                _ => Err(ProgramExpressionTypeError::WrongKind),
+                            };
+                            let left = value_at(*left)?;
+                            let right = value_at(*right)?;
+                            if value.data_type != arrow_schema::DataType::Boolean
+                                || value.logical_type != ValueLogicalType::Physical
+                                || value.nullable
+                                || left.logical_type != right.logical_type
+                            {
+                                return Err(ProgramExpressionTypeError::TypeMismatch);
+                            }
+                            work.step()?;
+                            same_carrier(&left.data_type, &right.data_type, work)?;
+                        }
                         if let StaticExprKind::Case {
                             has_case_expr,
                             has_else_expr,

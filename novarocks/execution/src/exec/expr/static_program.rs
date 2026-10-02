@@ -117,6 +117,12 @@ fn old_id(id: ProgramExprId) -> ExprId {
 fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
     use StaticExprKind as Static;
     Ok(match kind {
+        Static::PreparedNullSafeComparison { .. } => {
+            return Err(
+                "compiled null-safe comparison cannot enter the legacy expression bridge"
+                    .to_string(),
+            );
+        }
         Static::PreparedCast { .. } => {
             return Err("compiled cast cannot enter the legacy expression bridge".to_string());
         }
@@ -442,6 +448,20 @@ mod tests {
     use novarocks_types::SlotId;
 
     use super::*;
+
+    #[test]
+    fn compiled_nullsafe_cannot_lose_intrinsic_null_semantics_in_legacy_bridge() {
+        let left = ProgramExprId::new(0);
+        let right = ProgramExprId::new(1);
+        assert_eq!(
+            thaw_kind(&StaticExprKind::PreparedNullSafeComparison { left, right }).unwrap_err(),
+            "compiled null-safe comparison cannot enter the legacy expression bridge"
+        );
+        assert!(matches!(
+            thaw_kind(&StaticExprKind::EqForNull(left, right)).unwrap(),
+            ExprNode::EqForNull(..)
+        ));
+    }
 
     #[test]
     fn compiled_cast_cannot_lose_source_semantics_in_legacy_bridge() {

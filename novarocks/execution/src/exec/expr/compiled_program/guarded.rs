@@ -708,7 +708,9 @@ pub(super) fn evaluate_tree<'a>(
                         work,
                     )?)
                 }
-                kind if kind.ordinary_comparison().is_some() => {
+                kind if kind.ordinary_comparison().is_some()
+                    || matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) =>
+                {
                     if frame.children.len() != 2 {
                         return Err(invalid("comparison requires its exact ordered operands"));
                     }
@@ -723,11 +725,26 @@ pub(super) fn evaluate_tree<'a>(
                         .ok_or_else(|| internal("missing comparison right operand"))?
                         .value
                         .into_value(local_selection, work)?;
-                    let recipe = program
-                        .comparison_recipe(novarocks_local_program::ProgramComparisonSite::Binary(
-                            frame.occurrence,
-                        ))
-                        .ok_or_else(|| invalid("missing exact comparison recipe"))?;
+                    let recipe =
+                        if matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) {
+                            ComparisonRecipe::NullSafe(
+                                program
+                                    .null_safe_comparison_recipe(frame.occurrence)
+                                    .ok_or_else(|| {
+                                        invalid("missing exact null-safe comparison recipe")
+                                    })?,
+                            )
+                        } else {
+                            ComparisonRecipe::Ordinary(
+                                program
+                                    .comparison_recipe(
+                                        novarocks_local_program::ProgramComparisonSite::Binary(
+                                            frame.occurrence,
+                                        ),
+                                    )
+                                    .ok_or_else(|| invalid("missing exact comparison recipe"))?,
+                            )
+                        };
                     OwnedValue::from_selected(evaluate_comparison(
                         recipe,
                         &left,
@@ -900,8 +917,15 @@ fn assemble(
     )?))
 }
 
+/// The shared Boolean journal/assembly is independent of the numeric algorithm.
+/// Null-safe comparison retains its own prepared recipe and scalar semantics.
+enum ComparisonRecipe<'a> {
+    Ordinary(&'a novarocks_functions::PreparedComparisonRecipe),
+    NullSafe(&'a novarocks_functions::PreparedNullSafeComparisonRecipe),
+}
+
 fn evaluate_comparison<'a>(
-    recipe: &novarocks_functions::PreparedComparisonRecipe,
+    recipe: ComparisonRecipe<'_>,
     left: &Value<'_>,
     right: &Value<'_>,
     selection: Selection<'a>,
@@ -909,8 +933,33 @@ fn evaluate_comparison<'a>(
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     let mut left_errors = left.errors().iter().peekable();
     let mut right_errors = right.errors().iter().peekable();
+    // Representation accounting precedes fallible reservations. It is not a
+    // formal host memory grant or an Arrow allocation-origin guarantee.
+    selection
+        .len()
+        .checked_mul(
+            std::mem::size_of::<Option<bool>>()
+                + std::mem::size_of::<RowDataError>()
+                + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )
+        .and_then(|n| {
+            selection
+                .len()
+                .checked_add(7)
+                .and_then(|bits| n.checked_add(bits / 8))
+        })
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    work.flush()?;
     let mut errors = Vec::new();
-    let mut values = Vec::with_capacity(selection.len());
+    let mut values = Vec::new();
+    errors
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    values
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.flush()?;
     for (ordinal, row) in selection.iter().enumerate() {
         let l = if left_errors
             .peek()
@@ -933,15 +982,26 @@ fn evaluate_comparison<'a>(
             values.push(None);
         } else {
             work.flush()?;
-            let compared = recipe.compare_rows(
-                left.argument(),
-                ordinal,
-                row,
-                right.argument(),
-                ordinal,
-                row,
-                work.control,
-            )?;
+            let compared = match recipe {
+                ComparisonRecipe::Ordinary(recipe) => recipe.compare_rows(
+                    left.argument(),
+                    ordinal,
+                    row,
+                    right.argument(),
+                    ordinal,
+                    row,
+                    work.control,
+                )?,
+                ComparisonRecipe::NullSafe(recipe) => Some(recipe.compare_rows(
+                    left.argument(),
+                    ordinal,
+                    row,
+                    right.argument(),
+                    ordinal,
+                    row,
+                    work.control,
+                )?),
+            };
             values.push(compared);
         }
         work.step()?;

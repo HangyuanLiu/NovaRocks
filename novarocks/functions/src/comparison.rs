@@ -563,3 +563,6 @@ fn checked_row(
 #[cfg(test)]
 #[path = "comparison/tests.rs"]
 mod tests;
+
+mod nullsafe;
+pub use nullsafe::PreparedNullSafeComparisonRecipe;

@@ -362,3 +362,72 @@ pub(crate) fn compile_casts(
     work.finish()?;
     result
 }
+
+pub(crate) fn compile_null_safe_comparisons(
+    checked: &ProgramLexicalBindings,
+    control: &dyn PureCompileControl,
+) -> Result<
+    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNullSafeComparisonRecipe>,
+    ProgramPrimitiveError,
+> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
+        let mut recipes = BTreeMap::new();
+        for (&arena, flow) in snapshot.flows() {
+            let definitions = &snapshot.roots().arenas()[&arena];
+            let types = &typed.types()[&arena];
+            let value = |id: crate::ProgramExprId| match types.get(id.index()) {
+                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                _ => Err(ProgramPrimitiveError::Invalid(
+                    "null-safe comparison requires complete value types",
+                )),
+            };
+            for (&use_id, invocation) in flow.uses() {
+                work.step()?;
+                let kind = definitions
+                    .node(invocation.definition)
+                    .ok_or(ProgramPrimitiveError::Invalid(
+                        "missing null-safe comparison definition",
+                    ))?
+                    .kind();
+                let StaticExprKind::PreparedNullSafeComparison { left, right } = kind else {
+                    continue;
+                };
+                if invocation.control != ControlShape::Eager
+                    || invocation.arguments.len() != 2
+                    || flow.uses()[&invocation.arguments[0]].definition != *left
+                    || flow.uses()[&invocation.arguments[1]].definition != *right
+                {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "null-safe comparison differs from its actual ordered occurrence",
+                    ));
+                }
+                let result = value(invocation.definition)?;
+                if result.data_type != arrow_schema::DataType::Boolean
+                    || result.logical_type != ValueLogicalType::Physical
+                    || result.nullable
+                {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "null-safe comparison requires nonnullable Physical Boolean result",
+                    ));
+                }
+                work.flush()?;
+                let recipe = novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
+                    value(*left)?,
+                    value(*right)?,
+                    control,
+                )?;
+                recipes.insert(ProgramUseRef { arena, use_id }, recipe);
+                work.step()?;
+            }
+        }
+        Ok(recipes)
+    })();
+    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}

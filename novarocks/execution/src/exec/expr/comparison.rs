@@ -3005,3 +3005,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "nullsafe_numeric_oracle_tests.rs"]
+mod nullsafe_numeric_oracle_tests;
