@@ -65,6 +65,7 @@ impl RootResultSinkFactory {
             return Err("bounded root metadata DOP is outside its frozen profile".to_string());
         }
         let per_driver = std::mem::size_of::<RootResultSink>()
+            + std::mem::size_of::<Option<(usize, RootInputPermit)>>()
             // Driver sink/finish callbacks and their Arc registrations,
             // driver sink/finish forwarding, live slots and notify snapshots.
             + 32 * std::mem::size_of::<usize>();
@@ -111,6 +112,12 @@ impl OperatorFactory for RootResultSinkFactory {
             blocked_at: Mutex::new(None),
         })
     }
+}
+
+// Establish physical Drop order before invoking any fallible host code.
+struct PreparedRootInput {
+    chunk: Chunk,
+    permit: RootInputPermit,
 }
 
 struct RootResultSink {
@@ -225,6 +232,38 @@ impl ProcessorOperator for RootResultSink {
             self.release_unused_input();
         }
     }
+    fn take_prepared_root_input(&mut self) -> Option<RootInputPermit> {
+        self.input.lock().unwrap().take()
+    }
+    fn can_accept_root_input(
+        &self,
+        _chunk: &Chunk,
+        input: &RootInputPermit,
+    ) -> Result<bool, String> {
+        self.check_state()?;
+        if input.task() != self.session.spec().task {
+            return Err("root edge input grant belongs to a different task".to_string());
+        }
+        Ok(!self.finished && !self.cancelled)
+    }
+    fn push_chunk_with_root_input(
+        &mut self,
+        _state: &RuntimeState,
+        chunk: Chunk,
+        input: RootInputPermit,
+    ) -> Result<(), String> {
+        let input = PreparedRootInput {
+            chunk,
+            permit: input,
+        };
+        self.check_state()?;
+        if self.finished || self.cancelled {
+            return Err("bounded root input reached a closed driver".to_string());
+        }
+        self.session
+            .submit_input(input.chunk, input.permit)
+            .map_err(|error| error.to_string())
+    }
     fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
         self.check_state()?;
         if self.finished || self.cancelled {
@@ -324,6 +363,7 @@ mod tests {
         held_bytes: Arc<AtomicUsize>,
         input_backing: Arc<Mutex<Option<std::sync::Weak<Int32Array>>>>,
         released_live_backing: Arc<AtomicBool>,
+        panic_in_state: AtomicBool,
     }
     impl Session {
         fn new() -> Arc<Self> {
@@ -350,6 +390,7 @@ mod tests {
                 held_bytes: Arc::new(AtomicUsize::new(0)),
                 input_backing: Arc::new(Mutex::new(None)),
                 released_live_backing: Arc::new(AtomicBool::new(false)),
+                panic_in_state: AtomicBool::new(false),
             })
         }
         fn complete_input(&self) {
@@ -421,6 +462,10 @@ mod tests {
             Ok(())
         }
         fn producer_state(&self) -> RootProducerState {
+            assert!(
+                !self.panic_in_state.load(Ordering::SeqCst),
+                "host state panic"
+            );
             self.state.lock().unwrap().clone()
         }
         fn producer_exited(&self) -> bool {
@@ -875,6 +920,347 @@ mod tests {
         assert_eq!(
             driver.process(Duration::from_millis(100)),
             DriverState::Failed("root producer failed".to_string())
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum QuantumExit {
+        Chunk,
+        Empty,
+        Error,
+        Panic,
+    }
+    struct QuantumSource {
+        session: Arc<Session>,
+        pulls: Arc<AtomicUsize>,
+        generation: Arc<AtomicU64>,
+        workspace: Option<Arc<Int32Array>>,
+        exit: QuantumExit,
+        pulled_this_turn: bool,
+        done: bool,
+    }
+    impl Operator for QuantumSource {
+        fn name(&self) -> &str {
+            "ROOT_QUANTUM_PROOF_SOURCE"
+        }
+        fn is_finished(&self) -> bool {
+            self.done
+        }
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+    impl ProcessorOperator for QuantumSource {
+        fn begin_turn(&mut self) {
+            self.pulled_this_turn = false;
+        }
+        fn need_input(&self) -> bool {
+            false
+        }
+        fn has_output(&self) -> bool {
+            !self.done && !self.pulled_this_turn && self.workspace.is_none()
+        }
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
+            Err("source cannot accept input".into())
+        }
+        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+            panic!("protected source must borrow the original root grant")
+        }
+        fn pull_chunk_with_root_input(
+            &mut self,
+            _: &RuntimeState,
+            input: &RootInputPermit,
+        ) -> Result<crate::exec::pipeline::operator::RootPreparedPull, String> {
+            use crate::exec::pipeline::operator::RootPreparedPull;
+            assert_eq!(input.task(), self.session.spec.task);
+            assert_eq!(
+                input.retained_bytes(),
+                self.session.authority.required_bytes()
+            );
+            assert_eq!(
+                self.session.held_bytes.load(Ordering::SeqCst),
+                input.retained_bytes()
+            );
+            let turn = self.pulls.fetch_add(1, Ordering::SeqCst);
+            if turn == 0 {
+                self.generation.store(input.generation(), Ordering::SeqCst);
+                let array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+                *self.session.input_backing.lock().unwrap() = Some(Arc::downgrade(&array));
+                self.workspace = Some(array);
+            }
+            assert_eq!(input.generation(), self.generation.load(Ordering::SeqCst));
+            self.pulled_this_turn = true;
+            if turn < 2 {
+                return Ok(RootPreparedPull::Yielded);
+            }
+            self.done = true;
+            match self.exit {
+                QuantumExit::Empty => Ok(RootPreparedPull::Empty),
+                QuantumExit::Error => Err("protected materializer failed".into()),
+                QuantumExit::Panic => panic!("protected materializer panic"),
+                QuantumExit::Chunk => {
+                    let schema = Arc::new(
+                        ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                            SlotId::new(1),
+                            arrow::datatypes::Field::new("input", DataType::Int32, false),
+                            None,
+                            None,
+                        )])
+                        .unwrap(),
+                    );
+                    let batch = arrow::record_batch::RecordBatch::try_new(
+                        schema.arrow_schema_ref(),
+                        vec![self.workspace.as_ref().unwrap().clone()],
+                    )
+                    .unwrap();
+                    // Keep construction scratch until the driver synchronously
+                    // clears it before transferring the grant into the host.
+                    Ok(RootPreparedPull::Chunk(Chunk::new_with_chunk_schema(
+                        batch, schema,
+                    )))
+                }
+            }
+        }
+        fn release_root_pull_workspace(&mut self) {
+            if self.workspace.is_some() {
+                assert_eq!(
+                    self.session.held_bytes.load(Ordering::SeqCst),
+                    self.session.authority.required_bytes()
+                );
+                drop(self.workspace.take());
+            }
+        }
+        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    fn quantum_driver(
+        session: &Arc<Session>,
+        exit: QuantumExit,
+    ) -> (PipelineDriver, Arc<AtomicUsize>, Arc<AtomicU64>) {
+        let factory = factory(session, 1);
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let generation = Arc::new(AtomicU64::new(0));
+        let driver = PipelineDriver::new(
+            1,
+            vec![
+                Box::new(QuantumSource {
+                    session: session.clone(),
+                    pulls: pulls.clone(),
+                    generation: generation.clone(),
+                    workspace: None,
+                    exit,
+                    pulled_this_turn: false,
+                    done: false,
+                }),
+                factory.create(1, 0),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+        (driver, pulls, generation)
+    }
+    fn assert_workspace_exited_before_credit(session: &Session) {
+        assert!(
+            session
+                .input_backing
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_none(),
+            "the actual Arrow workspace must have exited"
+        );
+        assert!(
+            !session.released_live_backing.load(Ordering::SeqCst),
+            "returning the original credit cannot precede actual backing exit"
+        );
+        assert_eq!(session.held_bytes.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn yielded_root_pull_keeps_the_same_original_grant_until_host_input_exit() {
+        let session = Session::new();
+        let (mut driver, pulls, generation) = quantum_driver(&session, QuantumExit::Chunk);
+        for turn in 1..=2 {
+            assert_eq!(
+                driver.process(Duration::from_millis(100)),
+                DriverState::Ready
+            );
+            assert_eq!(pulls.load(Ordering::SeqCst), turn);
+            assert_eq!(
+                session.held_bytes.load(Ordering::SeqCst),
+                session.authority.required_bytes()
+            );
+            assert!(
+                session
+                    .input_backing
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .is_some()
+            );
+            assert!(session.input.lock().unwrap().is_none());
+        }
+        assert_eq!(
+            driver.process(Duration::from_millis(100)),
+            DriverState::PendingFinish
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            session
+                .input
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1
+                .generation(),
+            generation.load(Ordering::SeqCst)
+        );
+        session.complete_input();
+        assert_workspace_exited_before_credit(&session);
+        session.actual_exit();
+        assert_eq!(
+            driver.process(Duration::from_millis(100)),
+            DriverState::Finished
+        );
+    }
+    #[test]
+    fn empty_and_failed_quantum_drop_workspace_before_returning_original_grant() {
+        for exit in [QuantumExit::Empty, QuantumExit::Error] {
+            let session = Session::new();
+            let (mut driver, pulls, _) = quantum_driver(&session, exit);
+            assert_eq!(
+                driver.process(Duration::from_millis(100)),
+                DriverState::Ready
+            );
+            assert_eq!(
+                driver.process(Duration::from_millis(100)),
+                DriverState::Ready
+            );
+            let mut state = driver.process(Duration::from_millis(100));
+            if state == DriverState::Ready {
+                state = driver.process(Duration::from_millis(100));
+            }
+            assert_eq!(state, DriverState::PendingFinish);
+            assert_eq!(pulls.load(Ordering::SeqCst), 3);
+            assert_workspace_exited_before_credit(&session);
+            session.actual_exit();
+            let state = driver.process(Duration::from_millis(100));
+            match exit {
+                QuantumExit::Empty => assert_eq!(state, DriverState::Finished),
+                QuantumExit::Error => assert!(matches!(state,
+                    DriverState::Failed(error) if error.ends_with("protected materializer failed"))),
+                QuantumExit::Chunk | QuantumExit::Panic => unreachable!(),
+            }
+        }
+    }
+    #[test]
+    fn cancelled_and_dropped_driver_clear_yielded_workspace_before_original_grant() {
+        for cancel in [true, false] {
+            let session = Session::new();
+            let (mut driver, _, _) = quantum_driver(&session, QuantumExit::Chunk);
+            assert_eq!(
+                driver.process(Duration::from_millis(100)),
+                DriverState::Ready
+            );
+            if cancel {
+                assert_eq!(
+                    driver.cancel_for_fragment_abort(),
+                    DriverState::PendingFinish
+                );
+                assert_workspace_exited_before_credit(&session);
+                session.actual_exit();
+                assert_eq!(
+                    driver.process(Duration::from_millis(100)),
+                    DriverState::Canceled
+                );
+            } else {
+                drop(driver);
+                assert_workspace_exited_before_credit(&session);
+            }
+        }
+    }
+
+    #[test]
+    fn host_state_panic_drops_original_chunk_before_edge_input_grant() {
+        let session = Session::new();
+        let factory = factory(&session, 1);
+        let mut sink = factory.create(1, 0);
+        let processor = sink.as_processor_mut().unwrap();
+        assert!(processor.prepare_upstream_pull().unwrap());
+        let input = processor.take_prepared_root_input().unwrap();
+        let array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        *session.input_backing.lock().unwrap() = Some(Arc::downgrade(&array));
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                arrow::datatypes::Field::new("input", DataType::Int32, false),
+                None,
+                None,
+            )])
+            .unwrap(),
+        );
+        let batch =
+            arrow::record_batch::RecordBatch::try_new(schema.arrow_schema_ref(), vec![array])
+                .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        session.panic_in_state.store(true, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            processor.push_chunk_with_root_input(&RuntimeState::default(), chunk, input)
+        }));
+        assert!(result.is_err());
+        assert_workspace_exited_before_credit(&session);
+        session.panic_in_state.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn pull_panic_retains_original_grant_until_executor_failure_cleanup() {
+        let session = Session::new();
+        let (mut driver, _, _) = quantum_driver(&session, QuantumExit::Panic);
+        assert_eq!(
+            driver.process(Duration::from_millis(100)),
+            DriverState::Ready
+        );
+        assert_eq!(
+            driver.process(Duration::from_millis(100)),
+            DriverState::Ready
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.process(Duration::from_millis(100))
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            session.held_bytes.load(Ordering::SeqCst),
+            session.authority.required_bytes()
+        );
+        assert!(
+            session
+                .input_backing
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_some()
+        );
+        assert_eq!(
+            driver.fail_after_panic("protected materializer panic".into()),
+            DriverState::PendingFinish
+        );
+        assert_workspace_exited_before_credit(&session);
+        session.actual_exit();
+        assert_eq!(
+            driver.process(Duration::from_millis(100)),
+            DriverState::Failed("protected materializer panic".into())
         );
     }
 }

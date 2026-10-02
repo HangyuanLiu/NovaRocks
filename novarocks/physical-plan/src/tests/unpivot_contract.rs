@@ -20,6 +20,12 @@ use super::*;
 #[derive(Clone, Copy)]
 enum UnpivotShape {
     Valid,
+    Permuted,
+    MissingOutput,
+    ExtraOutput,
+    DuplicateOutput,
+    DuplicateReusedInput,
+    WrongOutputOrdinal,
     MappingOutsideChild,
     MappingTypeDrift,
     ConstantTypeDrift,
@@ -98,23 +104,36 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
             ty(DataType::Int64, false),
             ValueOrigin::NodeOutput {
                 node: unpivot,
-                output_ordinal: 1,
+                output_ordinal: if matches!(shape, UnpivotShape::DuplicateReusedInput) {
+                    2
+                } else {
+                    1
+                },
             },
         )
         .unwrap();
-    let literal_output = builder
-        .add_value(
-            ty(DataType::Utf8, false),
-            ValueOrigin::NodeOutput {
-                node: unpivot,
-                output_ordinal: 2,
-            },
-        )
-        .unwrap();
+    let literal_output = if matches!(shape, UnpivotShape::DuplicateReusedInput) {
+        text
+    } else {
+        builder
+            .add_value(
+                ty(DataType::Utf8, false),
+                ValueOrigin::NodeOutput {
+                    node: unpivot,
+                    output_ordinal: if matches!(shape, UnpivotShape::Permuted) {
+                        0
+                    } else {
+                        2
+                    },
+                },
+            )
+            .unwrap()
+    };
+
     let mapping_input = match shape {
         UnpivotShape::MappingOutsideChild => value_output,
         UnpivotShape::MappingTypeDrift => text,
-        UnpivotShape::Valid | UnpivotShape::ConstantTypeDrift => number,
+        _ => number,
     };
     builder
         .insert_node_unchecked(PhysicalNode {
@@ -124,13 +143,32 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
             output_properties: singleton(),
             output: OutputPort {
                 node: unpivot,
-                columns: Box::from([text, value_output, literal_output]),
+                columns: match shape {
+                    UnpivotShape::Permuted | UnpivotShape::WrongOutputOrdinal => {
+                        Box::from([literal_output, value_output, text])
+                    }
+                    UnpivotShape::MissingOutput => Box::from([text, value_output]),
+                    UnpivotShape::ExtraOutput => {
+                        Box::from([text, value_output, literal_output, number])
+                    }
+                    UnpivotShape::DuplicateOutput => Box::from([text, value_output, value_output]),
+                    UnpivotShape::DuplicateReusedInput => Box::from([number, number, value_output]),
+                    _ => Box::from([text, value_output, literal_output]),
+                },
             },
             kind: NodeKind::Unpivot {
                 spec: UnpivotSpec {
-                    passthrough: Box::from([(text, text)]),
+                    passthrough: if matches!(shape, UnpivotShape::DuplicateReusedInput) {
+                        Box::from([(number, number)])
+                    } else {
+                        Box::from([(text, text)])
+                    },
                     value_output,
-                    literal_outputs: Box::from([literal_output]),
+                    literal_outputs: if matches!(shape, UnpivotShape::DuplicateReusedInput) {
+                        Box::from([text])
+                    } else {
+                        Box::from([literal_output])
+                    },
                     mappings: Box::from([UnpivotValueMapping {
                         input: mapping_input,
                         constants: Box::from([UnpivotConstant::Scalar(constant)]),
@@ -179,5 +217,57 @@ fn ordinary_unpivot_rejects_literal_constant_type_drift() {
         error
             .message()
             .contains("constant type differs from its literal output")
+    }));
+}
+
+#[test]
+fn ordinary_unpivot_preserves_the_explicit_port_order_of_distinct_roles() {
+    let fragment = finish_unpivot(UnpivotShape::Permuted)
+        .expect("Unpivot's explicit port may order its exact roles independently");
+    let root = fragment.nodes().get(&fragment.root()).unwrap();
+    let NodeKind::Unpivot { spec } = &root.kind else {
+        panic!("expected Unpivot")
+    };
+    assert_eq!(
+        root.output.columns.as_ref(),
+        &[
+            spec.literal_outputs[0],
+            spec.value_output,
+            spec.passthrough[0].1
+        ]
+    );
+}
+
+#[test]
+fn ordinary_unpivot_port_permutation_does_not_allow_missing_extra_or_duplicate_roles() {
+    for shape in [
+        UnpivotShape::MissingOutput,
+        UnpivotShape::ExtraOutput,
+        UnpivotShape::DuplicateOutput,
+    ] {
+        finish_unpivot(shape).expect_err("the port must cover each output role exactly once");
+    }
+}
+
+#[test]
+fn ordinary_unpivot_port_order_still_binds_produced_value_origin_ordinals() {
+    let errors = finish_unpivot(UnpivotShape::WrongOutputOrdinal)
+        .expect_err("permuting a port cannot preserve stale value-origin ordinals");
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|error| error.message().contains("is not produced by this node"))
+    );
+}
+
+#[test]
+fn ordinary_unpivot_rejects_duplicate_reused_input_even_when_all_origins_are_valid() {
+    let errors = finish_unpivot(UnpivotShape::DuplicateReusedInput)
+        .expect_err("a repeated passthrough cannot substitute for a missing child-backed literal");
+    assert!(errors.errors().iter().any(|error| {
+        error
+            .message()
+            .contains("output roles do not exactly cover the node output port")
     }));
 }

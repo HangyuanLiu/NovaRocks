@@ -30,7 +30,7 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::FragmentEventSink;
+use crate::runtime::fragment::io::{FragmentEventSink, RootInputPermit};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
@@ -214,6 +214,16 @@ impl FinishingWait {
 }
 
 /// Extended operator contract for processor stages with push/pull semantics.
+pub enum RootPreparedPull {
+    Chunk(Chunk),
+    /// A bounded CPU quantum completed. Workspace and its original grant
+    /// remain on the same driver edge while the driver yields Ready for its
+    /// next turn. No external readiness event is required to resume.
+    Yielded,
+    /// No root-covered workspace remains after this pull.
+    Empty,
+}
+
 pub trait ProcessorOperator: Operator {
     fn need_input(&self) -> bool;
 
@@ -227,6 +237,49 @@ pub trait ProcessorOperator: Operator {
     /// An empty or failed pull must return an unused root position. A
     /// successful pull keeps it while the chunk is retained on this edge.
     fn finish_upstream_pull(&self, _produced_chunk: bool) {}
+
+    /// Move the original terminal admission onto its exact driver edge.
+    /// No upstream allocation may run while a sink's permit lock is held.
+    fn take_prepared_root_input(&mut self) -> Option<RootInputPermit> {
+        None
+    }
+
+    /// Borrow the unique original grant while producing the final batch.
+    /// Ordinary upstream owners retain their own source responsibility;
+    /// a protected materializer can yield without returning this coverage.
+    fn pull_chunk_with_root_input(
+        &mut self,
+        state: &RuntimeState,
+        _input: &RootInputPermit,
+    ) -> Result<RootPreparedPull, String> {
+        self.pull_chunk(state).map(|chunk| match chunk {
+            Some(chunk) => RootPreparedPull::Chunk(chunk),
+            None => RootPreparedPull::Empty,
+        })
+    }
+
+    /// Synchronously destroy only root-covered unpublished workspace before
+    /// its driver edge can return the permit. This API starts no async work.
+    fn release_root_pull_workspace(&mut self) {}
+
+    fn can_accept_root_input(
+        &self,
+        chunk: &Chunk,
+        _input: &RootInputPermit,
+    ) -> Result<bool, String> {
+        self.can_accept_input(chunk)
+    }
+
+    fn push_chunk_with_root_input(
+        &mut self,
+        _state: &RuntimeState,
+        chunk: Chunk,
+        input: RootInputPermit,
+    ) -> Result<(), String> {
+        drop(chunk);
+        drop(input);
+        Err("processor cannot consume an original root input grant".to_string())
+    }
 
     /// A host-owned asynchronous terminal processor can fail while its source is
     /// parked. The driver observes that failure before deciding completion;

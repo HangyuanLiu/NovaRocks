@@ -33,13 +33,14 @@ use std::time::{Duration, Instant};
 
 use super::operator::{
     BlockedReason, DictionaryCarrierStats, DriverBlockDeadline, FinishWatch, Operator,
-    ProcessorOperator, dictionary_carrier_stats, forward_observable, hydrate_for_downstream,
+    ProcessorOperator, RootPreparedPull, dictionary_carrier_stats, forward_observable,
+    hydrate_for_downstream,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::{
-    FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink,
+    FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink, RootInputPermit,
 };
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -237,6 +238,9 @@ pub struct PipelineDriver {
     operator_terminal_signal: Option<DriverState>,
 
     edge_chunks: Vec<Option<Chunk>>,
+    // One terminal root edge per pipeline. Operators and actual edge Chunks
+    // precede this move-only grant in both cleanup and struct Drop order.
+    edge_root_input: Option<(usize, RootInputPermit)>,
     edge_closed: Vec<bool>,
     operator_finishing_set: Vec<bool>,
     operator_mem_trackers: Vec<Option<Arc<MemTracker>>>,
@@ -498,6 +502,7 @@ impl PipelineDriver {
             operator_terminal_signal: None,
 
             edge_chunks: vec![None; edge_count],
+            edge_root_input: None,
             edge_closed: vec![false; edge_count],
             operator_finishing_set: vec![false; operator_count],
             operator_mem_trackers,
@@ -776,10 +781,17 @@ impl PipelineDriver {
             if let Err(err) = self.drive_set_finishing(&mut made_progress) {
                 return self.finish_with_state(DriverState::Failed(err));
             }
-            if let Err(err) = self.drive_dataflow(&mut made_progress) {
-                return self.finish_with_state(DriverState::Failed(err));
-            }
+            let root_yielded = match self.drive_dataflow(&mut made_progress) {
+                Ok(yielded) => yielded,
+                Err(err) => return self.finish_with_state(DriverState::Failed(err)),
+            };
             self.sync_source_backpressure();
+            if root_yielded {
+                // A CPU quantum exhausted no external readiness condition.
+                // Keep its original edge grant and schedule the next turn.
+                self.state = DriverState::Ready;
+                return self.state.clone();
+            }
 
             if made_progress {
                 continue;
@@ -1370,6 +1382,12 @@ impl PipelineDriver {
         for idx in 0..self.edge_chunks.len() {
             let _ = self.edge_chunks[idx].take();
         }
+        if let Some((edge, _)) = self.edge_root_input.as_ref()
+            && let Some(upstream) = self.operators[*edge].as_processor_mut()
+        {
+            upstream.release_root_pull_workspace();
+        }
+        drop(self.edge_root_input.take());
     }
 
     fn update_operator_mem_counters(&self, operator_idx: usize) {
@@ -1391,16 +1409,11 @@ impl PipelineDriver {
         counters.mem_allocated.set(tracker.allocated());
     }
 
-    fn drive_dataflow(&mut self, made_progress: &mut bool) -> Result<(), String> {
-        let edge_count = self.edge_chunks.len();
-        if edge_count == 0 {
-            return Ok(());
-        }
-
+    fn drive_dataflow(&mut self, made_progress: &mut bool) -> Result<bool, String> {
         self.drive_push_edges(made_progress)?;
-        self.drive_pull_edges(made_progress)?;
+        let root_yielded = self.drive_pull_edges(made_progress)?;
         self.drive_push_edges(made_progress)?;
-        Ok(())
+        Ok(root_yielded)
     }
 
     fn drive_push_edges(&mut self, made_progress: &mut bool) -> Result<(), String> {
@@ -1426,7 +1439,13 @@ impl PipelineDriver {
                     )
                 })?;
                 let chunk = self.edge_chunks[e].as_ref().expect("checked is_some");
-                if !downstream.can_accept_input(chunk)? {
+                let accepted = match self.edge_root_input.as_ref() {
+                    Some((edge, input)) if *edge == e => {
+                        downstream.can_accept_root_input(chunk, input)?
+                    }
+                    _ => downstream.can_accept_input(chunk)?,
+                };
+                if !accepted {
                     continue;
                 }
                 downstream_name
@@ -1477,6 +1496,19 @@ impl PipelineDriver {
             } else {
                 0
             };
+            // Construction scratch cannot follow a grant into the host. Its
+            // Chunk has moved onto this edge, and the same grant still covers
+            // both owners while unpublished upstream workspace is destroyed.
+            if self
+                .edge_root_input
+                .as_ref()
+                .is_some_and(|(edge, _)| *edge == e)
+            {
+                self.operators[e]
+                    .as_processor_mut()
+                    .expect("root upstream is a processor")
+                    .release_root_pull_workspace();
+            }
             let start = Instant::now();
             let result = {
                 let Some(downstream_op) = self.operators.get_mut(downstream_idx) else {
@@ -1488,7 +1520,17 @@ impl PipelineDriver {
                         downstream_name
                     )
                 })?;
-                downstream.push_chunk(self.runtime_state.as_ref(), chunk)
+                match self.edge_root_input.as_ref() {
+                    Some((edge, _)) if *edge == e => {
+                        let (_, input) = self.edge_root_input.take().expect("checked root edge");
+                        downstream.push_chunk_with_root_input(
+                            self.runtime_state.as_ref(),
+                            chunk,
+                            input,
+                        )
+                    }
+                    _ => downstream.push_chunk(self.runtime_state.as_ref(), chunk),
+                }
             };
             let elapsed = start.elapsed();
             if self.profiler.is_some() {
@@ -1532,12 +1574,13 @@ impl PipelineDriver {
         Ok(())
     }
 
-    fn drive_pull_edges(&mut self, made_progress: &mut bool) -> Result<(), String> {
+    fn drive_pull_edges(&mut self, made_progress: &mut bool) -> Result<bool, String> {
         let edge_count = self.edge_chunks.len();
         if edge_count == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut root_yielded = false;
         for e in 0..edge_count {
             if self.edge_chunks[e].is_some() {
                 continue;
@@ -1564,13 +1607,31 @@ impl PipelineDriver {
                 )
             })?;
 
-            let has_output = upstream.has_output();
-            let need_input = has_output && downstream.prepare_upstream_pull()?;
+            let retained_root_input = self
+                .edge_root_input
+                .as_ref()
+                .is_some_and(|(edge, _)| *edge == e);
+            // With no edge Chunk, a retained grant is precisely a yielded
+            // CPU continuation. Ordinary has_output need not report a
+            // complete Chunk before that continuation can run.
+            let has_output = retained_root_input || upstream.has_output();
+            let need_input = has_output
+                && if retained_root_input {
+                    downstream.need_input()
+                } else {
+                    downstream.prepare_upstream_pull()?
+                };
             if e == 0 {
                 self.source_output_refused = has_output && !need_input;
             }
             if !need_input {
                 continue;
+            }
+            if !retained_root_input && let Some(input) = downstream.take_prepared_root_input() {
+                if self.edge_root_input.is_some() {
+                    return Err("pipeline acquired more than one terminal root edge".to_string());
+                }
+                self.edge_root_input = Some((e, input));
             }
 
             let (before_io, before_wait, before_recv_total, before_net) = if self.profiler.is_some()
@@ -1601,8 +1662,32 @@ impl PipelineDriver {
                 (0, 0, 0, 0)
             };
             let start = Instant::now();
-            let maybe = upstream.pull_chunk(self.runtime_state.as_ref());
-            downstream.finish_upstream_pull(matches!(&maybe, Ok(Some(_))));
+            let (maybe, yielded) = match self.edge_root_input.as_ref() {
+                Some((edge, input)) if *edge == e => {
+                    match upstream.pull_chunk_with_root_input(self.runtime_state.as_ref(), input) {
+                        Ok(RootPreparedPull::Chunk(chunk)) => (Ok(Some(chunk)), false),
+                        Ok(RootPreparedPull::Yielded) => (Ok(None), true),
+                        Ok(RootPreparedPull::Empty) => (Ok(None), false),
+                        Err(error) => (Err(error), false),
+                    }
+                }
+                _ => (upstream.pull_chunk(self.runtime_state.as_ref()), false),
+            };
+            downstream.finish_upstream_pull(yielded || matches!(&maybe, Ok(Some(_))));
+            if !yielded
+                && !matches!(&maybe, Ok(Some(_)))
+                && self
+                    .edge_root_input
+                    .as_ref()
+                    .is_some_and(|(edge, _)| *edge == e)
+            {
+                upstream.release_root_pull_workspace();
+                drop(self.edge_root_input.take());
+            }
+            if yielded {
+                *made_progress = true;
+                root_yielded = true;
+            }
             let elapsed = start.elapsed();
             if self.profiler.is_some() {
                 let elapsed_ns = i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
@@ -1673,7 +1758,7 @@ impl PipelineDriver {
             }
         }
 
-        Ok(())
+        Ok(root_yielded)
     }
 
     fn propagate_edge_closure(&mut self, made_progress: &mut bool) -> Result<(), String> {

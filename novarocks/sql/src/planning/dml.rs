@@ -2493,52 +2493,21 @@ fn build_statistics_connector_physical(
             },
         )
         .collect::<Vec<_>>();
-    let unpivot_columns = vec![
-        root_columns[2].clone(),
-        root_columns[0].clone(),
-        root_columns[1].clone(),
-        root_columns[3].clone(),
-    ];
+    // Emit the domain's frozen four-column order directly. A reorder Project
+    // would put the allocation-producing Unpivot before the root's last edge.
     let unpivot = crate::planner::payload::PlanUnpivotNode::try_new(
         &final_columns,
         Vec::new(),
         body,
         vec![input_fields, blob_type, properties],
         value_mappings,
-        unpivot_columns.clone(),
+        root_columns.clone(),
         4096,
         novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
     )?;
-    let unpivot = crate::planner::physical::PhysicalPlanNode {
+    let physical = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
         children: vec![global],
-        output_columns: unpivot_columns,
-        stats: stats.clone(),
-        probe_runtime_filters: Vec::new(),
-    };
-    let physical = crate::planner::physical::PhysicalPlanNode {
-        kind: crate::planner::physical::PhysicalPlanKind::Project(
-            crate::planner::payload::PlanProjectNode {
-                items: root_columns
-                    .iter()
-                    .map(|column| crate::analysis::ProjectItem {
-                        expr: crate::analysis::TypedExpr {
-                            kind: crate::analysis::ExprKind::ColumnRef {
-                                column_id: column.column_id,
-                                qualifier: None,
-                                column: column.name.clone(),
-                            },
-                            data_type: column.data_type.clone(),
-                            nullable: column.nullable,
-                        },
-                        output_name: column.name.clone(),
-                        output_column_id: column.column_id,
-                    })
-                    .collect(),
-                output_qualifier: None,
-            },
-        ),
-        children: vec![unpivot],
         output_columns: root_columns,
         stats,
         probe_runtime_filters: Vec::new(),
@@ -2723,6 +2692,21 @@ mod tests {
         let mut exchange = 0;
         let mut global = 0;
         let mut unpivot = 0;
+        let result_fragment = plan
+            .fragments()
+            .get(&plan.result_port().expect("result port").fragment)
+            .expect("result fragment");
+        assert!(
+            matches!(
+                result_fragment
+                    .nodes()
+                    .get(&result_fragment.root())
+                    .expect("result root")
+                    .kind,
+                NodeKind::Unpivot { .. }
+            ),
+            "the materializer must be the direct root upstream"
+        );
         for fragment in plan.fragments().values() {
             for node in fragment.nodes().values() {
                 match &node.kind {

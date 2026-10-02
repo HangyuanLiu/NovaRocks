@@ -418,14 +418,10 @@ pub(crate) fn validate_node_output_closure(
                     .collect(),
             )
         }
-        NodeKind::Unpivot { spec } => Some(
-            spec.passthrough
-                .iter()
-                .map(|(_, output)| *output)
-                .chain(std::iter::once(spec.value_output))
-                .chain(spec.literal_outputs.iter().copied())
-                .collect(),
-        ),
+        // The explicit output port orders Unpivot's independently assigned
+        // roles. validate_unpivot proves exact, distinct role coverage; the
+        // value-origin checks below still bind every produced port ordinal.
+        NodeKind::Unpivot { .. } => None,
         NodeKind::TableFunction { outputs, .. } => {
             Some(outputs.iter().map(|output| output.value()).collect())
         }
@@ -2440,13 +2436,8 @@ pub(crate) fn validate_unpivot(
             ));
         }
     }
-    if output_roles.len() != node.output.columns.len()
-        || !node
-            .output
-            .columns
-            .iter()
-            .all(|output| output_roles.contains(output))
-    {
+    let port_values = node.output.columns.iter().copied().collect::<BTreeSet<_>>();
+    if port_values.len() != node.output.columns.len() || port_values != output_roles {
         errors.push(ValidationError::new(
             path,
             "unpivot output roles do not exactly cover the node output port",
