@@ -40,6 +40,8 @@ pub enum CoverageError {
     RecordStoreExhausted,
     RecordStorageUnavailable,
     AccountClosed,
+    ScopeRefused,
+    BindingUnavailable,
 }
 #[derive(Debug)]
 pub struct RecordStore {
@@ -256,6 +258,13 @@ impl RecordStore {
             }
         }
         reclaimed
+    }
+    pub const fn capacity(&self) -> u32 {
+        self.capacity
+    }
+    /// Hook-external diagnostic; sampling may overlap owner release/reclaim.
+    pub fn draining_len(&self) -> usize {
+        self.draining.lock().unwrap().len()
     }
     /// Skips an observation spanning reclamation/reuse. Values within the
     /// same generation remain independent atomic samples, not a transaction.

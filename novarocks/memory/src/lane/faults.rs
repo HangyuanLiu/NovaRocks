@@ -28,6 +28,7 @@ struct FaultShard {
     reclaim_nonzero: AtomicU64,
     generation_exhausted: AtomicU64,
     scope_refused: AtomicU64,
+    binding_failed: AtomicU64,
     pins_added: AtomicU64,
     pins_removed: AtomicU64,
 }
@@ -40,6 +41,7 @@ impl FaultShard {
             reclaim_nonzero: AtomicU64::new(0),
             generation_exhausted: AtomicU64::new(0),
             scope_refused: AtomicU64::new(0),
+            binding_failed: AtomicU64::new(0),
             pins_added: AtomicU64::new(0),
             pins_removed: AtomicU64::new(0),
         }
@@ -53,6 +55,7 @@ pub struct FaultSnapshot {
     pub reclaim_nonzero_events: u64,
     pub generation_exhaustions: u64,
     pub scope_refusals: u64,
+    pub binding_failures: u64,
     /// Approximate cross-shard sample, exact after writers quiesce. It is not
     /// an instantaneous global bound during concurrent sampling.
     pub pinned_slots: u64,
@@ -95,6 +98,9 @@ impl FaultCounters {
     pub(crate) fn scope_refused(&self) {
         self.shard().scope_refused.fetch_add(1, Ordering::Relaxed);
     }
+    pub(crate) fn binding_failed(&self) {
+        self.shard().binding_failed.fetch_add(1, Ordering::Relaxed);
+    }
     pub(crate) fn pin_added(&self) {
         self.shard().pins_added.fetch_add(1, Ordering::Relaxed);
     }
@@ -124,6 +130,9 @@ impl FaultCounters {
             s.scope_refusals = s
                 .scope_refusals
                 .wrapping_add(shard.scope_refused.load(Ordering::Relaxed));
+            s.binding_failures = s
+                .binding_failures
+                .wrapping_add(shard.binding_failed.load(Ordering::Relaxed));
             added = added.wrapping_add(shard.pins_added.load(Ordering::Relaxed));
             removed = removed.wrapping_add(shard.pins_removed.load(Ordering::Relaxed));
         }

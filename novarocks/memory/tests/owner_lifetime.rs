@@ -154,7 +154,7 @@ fn retired_funding_domain_releases_its_record_after_last_free() {
     let token = scope.record_allocation(600);
     scope.finish();
     let reference = token.reference();
-    domain.retire_lane().unwrap();
+    domain.stop_producing().unwrap();
     drop(domain);
     a.maintain(usize::MAX);
     assert!(

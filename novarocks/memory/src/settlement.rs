@@ -19,7 +19,7 @@
 use crate::sync::Ordering;
 use crate::{
     account::{MAX_DEPTH, Path, node_publish},
-    domain::{DomainState, FundingDomain},
+    domain::{FundingDomain, FundingState},
     error::CapacityError,
 };
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,14 +40,17 @@ impl FundingDomain {
             let desired = s
                 .authorized
                 .max(live.checked_add(s.external).expect("valid live+external"));
-            if desired == s.committed && (s.blocked.is_none() || s.sealed) {
+            if desired == s.committed
+                && (s.blocked.is_none()
+                    || self.0.lane.production_state() != crate::lane::ProductionState::Producing)
+            {
                 s.settled_live = live;
                 return receipt(
                     &s,
                     live,
-                    if s.sealed {
+                    if self.0.lane.production_state() != crate::lane::ProductionState::Producing {
                         Err(CapacityError::Closed {
-                            account: s.account.id(),
+                            account: self.affiliation().id(),
                         })
                     } else {
                         s.blocked.clone().map_or(Ok(()), Err)
@@ -61,7 +64,7 @@ impl FundingDomain {
             let path = Path::new(&account);
             let _gates = path.exclusive_gates();
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != account.id() {
+            if self.affiliation().id() != account.id() {
                 continue;
             }
             let mut states = path.locks();
@@ -72,7 +75,8 @@ impl FundingDomain {
             adjust_commitment(&path, &mut states, s.committed, desired);
             s.committed = desired;
             s.settled_live = live;
-            let next = if s.sealed {
+            let next = if self.0.lane.production_state() != crate::lane::ProductionState::Producing
+            {
                 Err(CapacityError::Closed {
                     account: account.id(),
                 })
@@ -108,7 +112,7 @@ impl FundingDomain {
             let path = Path::new(&account);
             let _gates = path.exclusive_gates();
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != account.id() {
+            if self.affiliation().id() != account.id() {
                 continue;
             }
             let mut states = path.locks();
@@ -147,10 +151,10 @@ impl FundingDomain {
                 && account.local_free_bytes() >= bytes;
             crate::account::qualify(&account, &path, bytes, !protected)?;
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != account.id() {
+            if self.affiliation().id() != account.id() {
                 continue;
             }
-            if s.sealed || s.residual {
+            if self.0.lane.production_state() != crate::lane::ProductionState::Producing {
                 return Err(CapacityError::Closed {
                     account: account.id(),
                 });
@@ -204,7 +208,7 @@ pub(crate) fn adjust_commitment(
         path.node(i).0.interactions.fetch_add(1, Ordering::Relaxed);
     }
 }
-fn receipt(s: &DomainState, live: u64, next_step: Result<(), CapacityError>) -> StepReceipt {
+fn receipt(s: &FundingState, live: u64, next_step: Result<(), CapacityError>) -> StepReceipt {
     StepReceipt {
         generation: s.generation,
         accepted_live: live,
@@ -233,7 +237,7 @@ impl FundingDomain {
             if free >= required_free {
                 return Ok(());
             }
-            s.account
+            self.affiliation()
                 .0
                 .shared
                 .top_up

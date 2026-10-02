@@ -121,8 +121,8 @@ impl AuthoritySnapshot {
     }
 }
 
-/// Disjoint classifications of one accounting version. Root C already
-/// includes residual; handoff alone is never reclaim benefit. Consumers must
+/// Disjoint classifications of one accounting version. Root commitment retains
+/// residual liability; query pressure follows only executing Work accounts. Consumers must
 /// reject incomplete classification before using query pressure for policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PressureProjection {
@@ -158,7 +158,7 @@ pub struct PressureProjection {
 }
 impl PressureProjection {
     pub fn query_pressure(&self) -> u64 {
-        self.query_committed + self.residual_query_committed
+        self.query_committed
     }
     pub fn non_evictable(&self, evictable_cache: u64) -> Option<u64> {
         self.root_committed.checked_sub(evictable_cache)
@@ -320,15 +320,15 @@ fn capture_locked(
         let state = domain.state.lock().unwrap();
         let total = state.committed + domain.metadata;
         pressure.classified_committed += total;
-        if state.residual {
+        if domain.lane.responsibility_class() == crate::lane::ResponsibilityClass::Residual {
             pressure.residual_committed += total;
             pressure.residual_metadata += domain.metadata;
-            if state.query_origin {
+            if domain.lane.0.query_origin {
                 pressure.residual_query_committed += total;
             }
         } else {
             pressure.active_metadata += domain.metadata;
-            if state.query_origin {
+            if domain.lane.responsibility_class() == crate::lane::ResponsibilityClass::Query {
                 pressure.query_committed += total;
             }
         }
@@ -356,7 +356,7 @@ fn capture_locked(
         pressure.changing_live_samples += is_changing;
         pressure.settled_debt += domain_settled_debt;
         pressure.sampled_debt += domain_sampled_debt;
-        if state.account.is_descendant_of(account) {
+        if domain.lane.affiliation().is_descendant_of(account) {
             metadata += domain.metadata;
             settled_live += state.settled_live;
             sampled_live += live;

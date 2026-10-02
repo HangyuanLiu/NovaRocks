@@ -38,9 +38,9 @@ impl FundingDomain {
         threshold_bytes: u64,
     ) -> Result<ScopeLease, CapacityError> {
         let mut s = self.0.state.lock().unwrap();
-        if s.sealed || s.residual {
+        if self.0.lane.production_state() != crate::lane::ProductionState::Producing {
             return Err(CapacityError::Closed {
-                account: s.account.id(),
+                account: self.affiliation().id(),
             });
         }
         if s.drain_requested {
@@ -59,6 +59,11 @@ impl FundingDomain {
         if stock_bytes > available {
             return Err(CapacityError::Invalid {
                 detail: "stock exceeds domain workset",
+            });
+        }
+        if !self.0.lane.enter() {
+            return Err(CapacityError::Closed {
+                account: self.affiliation().id(),
             });
         }
         s.active = true;
@@ -106,6 +111,7 @@ impl ScopeLease {
     fn detach(&mut self) {
         let mut s = self.domain.0.state.lock().unwrap();
         s.active = false;
+        self.domain.0.lane.leave();
         self.domain
             .0
             .lane

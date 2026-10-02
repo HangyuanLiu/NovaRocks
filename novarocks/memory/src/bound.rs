@@ -26,9 +26,9 @@ pub struct ExternalBound {
 impl FundingDomain {
     pub fn external_bound(&self, bytes: u64) -> Result<ExternalBound, CapacityError> {
         let mut s = self.0.state.lock().unwrap();
-        if s.sealed || s.residual {
+        if self.0.lane.production_state() != crate::lane::ProductionState::Producing {
             return Err(CapacityError::Closed {
-                account: s.account.id(),
+                account: self.affiliation().id(),
             });
         }
         if s.active {

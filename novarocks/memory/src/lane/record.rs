@@ -167,6 +167,44 @@ impl LaneRecord {
             _ => ResponsibilityClass::Unattributed,
         }
     }
+    pub(crate) fn seal(&self) {
+        let _ = self
+            .flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+                (flags & PRODUCTION_MASK == 0).then_some(flags | ProductionState::Sealed as u32)
+            });
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn stop(&self) {
+        let _ = self
+            .flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+                Some((flags & !PRODUCTION_MASK) | ProductionState::Stopped as u32)
+            });
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn set_class(&self, class: ResponsibilityClass) {
+        let _ = self
+            .flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+                Some((flags & !CLASS_MASK) | ((class as u32) << CLASS_SHIFT))
+            });
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn enter(&self) -> bool {
+        self.flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+                (flags & (PRODUCTION_MASK | ACTIVE_SCOPE) == 0).then_some(flags | ACTIVE_SCOPE)
+            })
+            .is_ok()
+    }
+    pub(crate) fn leave(&self) {
+        self.flags.fetch_and(!ACTIVE_SCOPE, Ordering::Release);
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn scope_active(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & ACTIVE_SCOPE != 0
+    }
     pub(crate) fn reset_for_owner(&self, origin: u64, class: ResponsibilityClass) {
         self.tagged.store(0, Ordering::Release);
         self.r1_small.store(0, Ordering::Release);

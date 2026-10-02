@@ -29,8 +29,11 @@ use crate::{
 
 pub(crate) const MAX_DEPTH: usize = 16;
 /// Physical account boxes are common accounting storage, not workload rights.
-pub const ACCOUNT_METADATA_BYTES: u64 =
+pub(crate) const ROOT_ACCOUNT_METADATA_BYTES: u64 =
     (std::mem::size_of::<Account>() + 2 * std::mem::size_of::<usize>()) as u64;
+pub const ACCOUNT_METADATA_BYTES: u64 = (std::mem::size_of::<Account>()
+    + std::mem::size_of::<crate::membership::MemberNode>()
+    + 4 * std::mem::size_of::<usize>()) as u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpPolicy {
     small_threshold_bytes: u64,
@@ -156,6 +159,9 @@ pub(crate) struct Ledger {
 }
 #[derive(Debug)]
 pub(crate) struct Account {
+    pub members: crate::membership::Membership,
+    pub membership: Mutex<Option<Arc<crate::membership::MemberNode>>>,
+    pub retired: AtomicU64,
     pub id: AccountId,
     pub kind: AccountKind,
     pub external: ExternalRef,
@@ -353,6 +359,9 @@ impl AccountHandle {
     }
     pub(crate) fn new_root(shared: Arc<Shared>) -> Self {
         Self(Arc::new(Account {
+            members: crate::membership::Membership::default(),
+            membership: Mutex::new(None),
+            retired: AtomicU64::new(0),
             id: AccountId::new(1),
             kind: AccountKind::Process,
             external: ExternalRef::NONE,
@@ -393,6 +402,9 @@ impl AccountHandle {
         // Allocation precedes admission locks. Only a weak entry is published
         // while the parent lifecycle gate prevents closing underneath it.
         let child = Self(Arc::new(Account {
+            members: crate::membership::Membership::default(),
+            membership: Mutex::new(None),
+            retired: AtomicU64::new(0),
             id: AccountId::new(self.0.shared.next_identity()?),
             kind,
             external,
@@ -411,6 +423,7 @@ impl AccountHandle {
             slot: AtomicU64::new(u64::MAX),
             storage_backed: AtomicU64::new(0),
         }));
+        let member = crate::membership::MemberNode::account(&child);
         let path = Path::new(self);
         let _gates = path.shared_gates();
         for i in 0..path.len {
@@ -456,8 +469,9 @@ impl AccountHandle {
             .membership_revision
             .fetch_add(1, Ordering::Release);
         drop(registry);
-        // Child membership is discovered through the preallocated registry;
-        // there is no allocating parent-side index in the transaction.
+        self.0.members.insert(&member);
+        *child.0.membership.lock().unwrap() = Some(member);
+        // The node was allocated before admission; linking creates no allocation.
         Ok(child)
     }
     pub fn install_policy(&self, bytes: u64, dimension: LimitDimension) -> PolicyInstallOutcome {
@@ -476,6 +490,9 @@ impl AccountHandle {
         }
     }
     pub fn close_to_growth(&self) {
+        self.close_members();
+    }
+    pub(crate) fn close_members(&self) -> crate::membership::Subtree {
         {
             let path = Path::new(self);
             let _gates = path.exclusive_gates();
@@ -484,18 +501,30 @@ impl AccountHandle {
             s.revision += 1;
             self.0.closed.store(1, Ordering::Release);
         }
-        // Publish close first, then seal every issued lane without holding any
-        // parent lock. Domain activation and sealing use the same local gate.
-        let upper = self.0.shared.domains.lock().unwrap().upper;
-        for index in 0..upper {
-            let domain = self.0.shared.domains.lock().unwrap().records[index].clone();
-            if let Some(domain) = domain {
-                let mut s = domain.state.lock().unwrap();
-                if s.account.is_descendant_of(self) {
-                    s.sealed = true;
-                }
-            }
+        // Publication excludes new subtree admission before collection; no
+        // global owner/account history is visited by this lifecycle operation.
+        let members = {
+            // Handoffs/reclaim take an exclusive gate along their path. A
+            // read gate here freezes moves throughout this closed subtree;
+            // growth is already refused by the published ancestor close.
+            // Release before sealing or acquiring descendant write gates.
+            let _stable_membership = self.0.gate.read().unwrap();
+            crate::membership::Subtree::collect(self)
+        };
+        for lane in &members.lanes {
+            lane.seal();
         }
+        for domain in &members.domains {
+            domain.seal();
+        }
+        for account in &members.accounts {
+            let path = Path::new(account);
+            let _gates = path.exclusive_gates();
+            let mut s = account.0.ledger.lock().unwrap();
+            s.closed = true;
+            account.0.closed.store(1, Ordering::Release);
+        }
+        members
     }
     pub fn is_closed_to_growth(&self) -> bool {
         self.0.ledger.lock().unwrap().closed
@@ -710,6 +739,11 @@ pub(crate) fn qualify(
 
 impl Drop for Account {
     fn drop(&mut self) {
+        if let Some(parent) = &self.parent {
+            if let Some(member) = self.membership.lock().unwrap().take() {
+                parent.0.members.remove(&member);
+            }
+        }
         let slot = self.slot.load(Ordering::Relaxed);
         if slot != u64::MAX && slot != 0 {
             let mut registry = self.shared.accounts.lock().unwrap();

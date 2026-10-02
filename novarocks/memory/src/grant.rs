@@ -51,7 +51,7 @@ impl Drop for ExplicitGrant {
     fn drop(&mut self) {
         self.scope.take().unwrap().finish();
         self.lane
-            .retire_lane()
+            .stop_producing()
             .expect("explicit lane has no active publisher or external bound");
     }
 }

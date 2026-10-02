@@ -153,3 +153,87 @@ fn l5_true_token_access_prevents_reuse_then_old_generation_is_rejected() {
         assert_eq!(store.store().reclaim(1), 1);
     });
 }
+
+#[test]
+fn l4_query_handoff_late_free_flush_and_control_reclaim_keep_one_record() {
+    model(|| {
+        use crate::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence};
+        let mut config = AuthorityConfig::new(65_536, 65_536, 0);
+        config.max_accounts = 2;
+        config.max_active_owners = 1;
+        config.metadata_budget_bytes = 4_096;
+        let authority = loom::sync::Arc::new(MemoryAuthority::new(config).unwrap());
+        let query = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let lane = query.create_lane().unwrap();
+        let reference = lane.reference();
+        let store = authority.shared.record_store.clone();
+        let producer_store = store.clone();
+        let release_store = store.clone();
+        let (send, receive) = loom::sync::mpsc::channel();
+        let (published, await_publication) = loom::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            let mut slot = SlotCore::new();
+            // SAFETY: held owner publishes a successful allocation; an outer
+            // service step's pending slot retains its independent lifetime pin.
+            unsafe {
+                slot.add(producer_store.store(), reference, 600, 0, 1, true);
+            }
+            published.send(()).unwrap();
+            drop(lane);
+            send.send(reference).unwrap();
+            thread::yield_now();
+            // SAFETY: this exact pending slot uniquely owns its final pin.
+            unsafe {
+                slot.flush(producer_store.store());
+            }
+        });
+        let retiring = authority.clone();
+        let retire = thread::spawn(move || {
+            await_publication.recv().unwrap();
+            query
+                .retire(&TeardownEvidence {
+                    tasks_exited: true,
+                    operators_destroyed: true,
+                    io: &[],
+                    now_ns: 1,
+                })
+                .unwrap();
+            assert_eq!(
+                retiring
+                    .shared
+                    .record_store
+                    .store()
+                    .resolve(reference)
+                    .unwrap()
+                    .responsibility_class(),
+                ResponsibilityClass::Residual
+            );
+            retiring.maintain(32);
+        });
+        let free = thread::spawn(move || {
+            let reference = receive.recv().unwrap();
+            // SAFETY: this is the producer's genuine distinct allocation,
+            // released once; source slot/count retains backing to final access.
+            unsafe {
+                SlotCore::direct(release_store.store(), reference, -600, 0, -1);
+            }
+        });
+        producer.join().unwrap();
+        retire.join().unwrap();
+        free.join().unwrap();
+        authority.maintain(32);
+        assert!(store.store().snapshot_ref(reference).is_none());
+        let faults = store.store().faults.snapshot();
+        assert_eq!(
+            (
+                faults.orphan_events,
+                faults.reclaim_nonzero_events,
+                faults.pinned_slots,
+                faults.residual_growth_events
+            ),
+            (0, 0, 0, 0)
+        );
+    });
+}

@@ -149,6 +149,7 @@ impl MemoryAuthority {
             cursor += 1;
             scanned += 1;
         }
+        self.shared.prune_observations(budget);
         self.shared.record_store.store().reclaim(budget);
         let mut m = self.shared.maintenance.lock().unwrap();
         assert_eq!(
@@ -167,10 +168,10 @@ impl MemoryAuthority {
             let path = Path::new(&affiliation);
             let _gates = path.exclusive_gates();
             let mut state = domain.0.state.lock().unwrap();
-            if state.account.id() != affiliation.id() {
+            if domain.affiliation().id() != affiliation.id() {
                 continue;
             }
-            if !state.residual || state.external != 0 || !domain.0.lane.reclaimable() {
+            if state.registered_active || state.external != 0 || !domain.0.lane.reclaimable() {
                 return;
             }
             // A final free can occur after this batch's settle/idle sample but
@@ -200,11 +201,13 @@ impl MemoryAuthority {
             state.authorized = 0;
             state.committed = 0;
             state.settled_live = 0;
+            let member = domain.0.lane.detach_member();
             let removed = {
                 let mut registry = self.shared.domains.lock().unwrap();
                 // Recheck while index publication is excluded: a concurrent
                 // observer may have pinned the record after the first sample.
                 if Arc::strong_count(&domain.0) != 2 || !domain.0.lane.reclaimable() {
+                    domain.0.lane.restore_member(&member);
                     return;
                 }
                 let removed = registry.records[index].take();
@@ -220,6 +223,7 @@ impl MemoryAuthority {
             drop(state);
             drop(removed);
             drop(domain);
+            drop(member);
             assert!(
                 self.shared.record_store.store().reclaim_exact(reference),
                 "final funding owner must complete exact record reclamation"
@@ -353,7 +357,7 @@ impl FundingDomain {
             let path = Path::new(&account);
             let _gates = path.exclusive_gates();
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != account.id() {
+            if self.affiliation().id() != account.id() {
                 continue;
             }
             if s.active {

@@ -84,6 +84,7 @@ impl AuthorityConfig {
 #[derive(Debug)]
 pub(crate) struct Shared {
     pub record_store: crate::lane::StoreHandle,
+    pub observation_lanes: Mutex<crate::lane::registry::ObservationRegistry>,
     pub ceiling: u64,
     pub top_up: TopUpPolicy,
     pub target: AtomicU64,
@@ -119,6 +120,13 @@ impl MemoryAuthority {
             record_store: crate::lane::StoreHandle::Global,
             #[cfg(loom)]
             record_store: crate::lane::StoreHandle::owned(256),
+            observation_lanes: Mutex::new(crate::lane::registry::ObservationRegistry::new(
+                if cfg!(loom) {
+                    256
+                } else {
+                    crate::lane::MAX_RECORDS as usize
+                },
+            )),
             ceiling: config.capacity_bytes,
             top_up: config.top_up,
             target: AtomicU64::new(config.capacity_bytes),
@@ -157,7 +165,7 @@ impl MemoryAuthority {
         // Index backing is allocated once and belongs to storage, not to an
         // individual execution account or to an uncounted residual count cap.
         let storage = (std::mem::size_of::<Shared>() + 2 * std::mem::size_of::<usize>()) as u64
-            + crate::account::ACCOUNT_METADATA_BYTES
+            + crate::account::ROOT_ACCOUNT_METADATA_BYTES
             + {
                 let registry = shared.domains.lock().unwrap();
                 (registry.records.capacity()
@@ -190,6 +198,17 @@ impl MemoryAuthority {
             root,
             control: OnceLock::new(),
         })
+    }
+    /// S1 observation storage is diagnostic metadata, independent of funding C.
+    pub fn observation_metadata_bytes(&self) -> u64 {
+        let registry = self.shared.observation_lanes.lock().unwrap();
+        (registry.records.capacity() * std::mem::size_of::<Option<crate::LaneHandle>>()) as u64
+            + registry
+                .records
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count() as u64
+                * crate::lane::OBSERVATION_LANE_METADATA_BYTES
     }
     pub const fn config(&self) -> AuthorityConfig {
         self.config
@@ -354,6 +373,12 @@ impl Drop for MemoryAuthority {
             records
         };
         drop(detached);
+        let observations = {
+            let mut registry = self.shared.observation_lanes.lock().unwrap();
+            registry.upper = 0;
+            std::mem::take(&mut registry.records)
+        };
+        drop(observations);
         self.shared.record_store.store().reclaim(usize::MAX);
     }
 }
@@ -378,7 +403,7 @@ impl MemoryAuthority {
                 let detached = registry.records[index].take();
                 registry.free_slots.push(index);
                 registry.metadata -= record.metadata;
-                if !state.residual {
+                if state.registered_active {
                     registry.active -= 1;
                 }
                 detached

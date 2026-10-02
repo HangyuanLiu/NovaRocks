@@ -20,7 +20,6 @@ use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
 use crate::{
     account::{AccountHandle, Path, grow_locked, qualify},
     error::{CapacityError, MetadataRegistryLabel},
-    ids::AccountKind,
     lane::LaneHandle,
 };
 
@@ -38,17 +37,14 @@ pub struct DomainSnapshot {
     pub metadata_bytes: u64,
 }
 #[derive(Debug)]
-pub(crate) struct DomainState {
-    pub account: AccountHandle,
+pub(crate) struct FundingState {
     pub authorized: u64,
     pub settled_live: u64,
     pub external: u64,
     pub external_handles: u64,
     pub committed: u64,
     pub active: bool,
-    pub sealed: bool,
-    pub residual: bool,
-    pub query_origin: bool,
+    pub registered_active: bool,
     pub generation: u64,
     pub blocked: Option<CapacityError>,
     pub drain_requested: bool,
@@ -59,17 +55,18 @@ pub(crate) struct Domain {
     pub lane: LaneHandle,
     pub covered_sequence: AtomicU64,
     pub covered_epoch: AtomicU64,
-    pub state: Mutex<DomainState>,
+    pub state: Mutex<FundingState>,
     pub metadata: u64,
 }
 /// A reusable local lane; cloning it cannot create a second concurrent scope.
 #[derive(Debug, Clone)]
 pub struct FundingDomain(pub(crate) Arc<Domain>);
-/// Storage fee includes stable state and both Arc counters. Registry backing
+/// Storage fee includes funding, lane, membership node and their Arc counters. Registry backing
 /// is charged separately at assembly, so its slot is not counted twice here.
 pub const OWNER_METADATA_BYTES: u64 = (std::mem::size_of::<Domain>()
     + std::mem::size_of::<crate::lane::handle::LaneShared>()
-    + 4 * std::mem::size_of::<usize>()
+    + std::mem::size_of::<crate::membership::MemberNode>()
+    + 6 * std::mem::size_of::<usize>()
     + 64) as u64;
 
 impl AccountHandle {
@@ -91,31 +88,29 @@ impl AccountHandle {
             covered_sequence: AtomicU64::new(0),
             covered_epoch: AtomicU64::new(0),
             metadata: OWNER_METADATA_BYTES,
-            state: Mutex::new(DomainState {
-                account: self.clone(),
+            state: Mutex::new(FundingState {
                 authorized,
                 settled_live: 0,
                 external: 0,
                 external_handles: 0,
                 committed: authorized,
                 active: false,
-                sealed: false,
-                residual: false,
+                registered_active: true,
                 generation: 0,
                 blocked: None,
                 drain_requested: false,
-                query_origin: Path::new(self)
-                    .nodes
-                    .iter()
-                    .flatten()
-                    .any(|n| n.kind() == AccountKind::Work),
             }),
         });
+        let member = crate::membership::MemberNode::lane(&record.lane.0, Some(&record));
         let path = Path::new(self);
         let _gates = path.shared_gates();
         let mut source_state = source.map(|d| d.0.state.lock().unwrap());
         if let Some(s) = &source_state {
-            if s.account.id() != self.id() || s.active || s.sealed || s.residual {
+            if source.unwrap().affiliation().id() != self.id()
+                || s.active
+                || source.unwrap().lane().production_state()
+                    != crate::lane::ProductionState::Producing
+            {
                 return Err(CapacityError::Invalid {
                     detail: "split requires an inactive open source in this account",
                 });
@@ -187,6 +182,7 @@ impl AccountHandle {
             .pop()
             .expect("available byte-backed index slot");
         registry.records[slot] = Some(record.clone());
+        record.lane.publish_member(member);
         registry.upper = registry.upper.max(slot + 1);
         shared.membership_revision.fetch_add(1, Ordering::Release);
         Ok(FundingDomain(record))
@@ -216,22 +212,17 @@ impl FundingDomain {
             debt: obligation.saturating_sub(s.authorized),
             free: s.authorized.saturating_sub(obligation),
             active: s.active,
-            sealed: s.sealed,
-            residual: s.residual,
+            sealed: self.lane().production_state() != crate::lane::ProductionState::Producing,
+            residual: self.lane().responsibility_class()
+                == crate::lane::ResponsibilityClass::Residual,
             metadata_bytes: self.0.metadata,
         }
     }
     pub fn seal(&self) {
-        let mut s = self.0.state.lock().unwrap();
-        s.sealed = true;
-        self.0
-            .lane
-            .record()
-            .sequence
-            .fetch_add(1, Ordering::Release);
+        self.0.lane.seal();
     }
     pub(crate) fn affiliation(&self) -> AccountHandle {
-        self.0.state.lock().unwrap().account.clone()
+        self.0.lane.affiliation()
     }
     pub fn lane(&self) -> &LaneHandle {
         &self.0.lane

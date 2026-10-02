@@ -300,7 +300,7 @@ fn assemble(o: &Options, m: &Value) -> BenchResult<Assembly> {
                 .map_err(|e| e.to_string())?;
             historical_origins.push(scope.record_allocation(o.bytes));
             scope.finish().next_step.map_err(|e| e.to_string())?;
-            lane.retire_lane()
+            lane.stop_producing()
                 .map_err(|e| format!("historical lane retirement: {e:?}"))?;
         }
         history
@@ -849,7 +849,7 @@ fn run_round(o: &Options, m: &Value, round: usize) -> BenchResult<Value> {
     for domains in &a.domains {
         for domain in domains {
             domain
-                .retire_lane()
+                .stop_producing()
                 .map_err(|e| format!("lane retirement: {e:?}"))?;
         }
     }
@@ -1265,7 +1265,7 @@ fn dynamic_round(o: &Options, m: &Value, round: usize) -> BenchResult<Value> {
     writer.set_capacity(high).map_err(|e| e.to_string())?;
     for domain in a.domains.iter().flatten() {
         domain
-            .retire_lane()
+            .stop_producing()
             .map_err(|e| format!("dynamic lane retirement: {e:?}"))?;
     }
     release_history(std::mem::take(&mut a.historical_origins), o.bytes)?;

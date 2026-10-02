@@ -101,6 +101,13 @@ impl SlotCore {
             store.faults.orphan();
             return;
         }
+        // Diagnose the actual event, not a delayed publication: teardown may
+        // reclassify this record while its earlier positive delta is buffered.
+        if (i128::from(tagged) + i128::from(r1_small)) > 0
+            && record.responsibility_class() == ResponsibilityClass::Residual
+        {
+            store.faults.residual_growth();
+        }
         self.tagged = self.tagged.wrapping_add(tagged);
         self.r1_small = self.r1_small.wrapping_add(r1_small);
         self.count = self.count.wrapping_add(count);
@@ -129,8 +136,6 @@ impl SlotCore {
             store.faults.pin_removed();
             return;
         }
-        let residual_growth = (tagged > 0 || small > 0)
-            && record.responsibility_class() == ResponsibilityClass::Residual;
         record.tagged.fetch_add(tagged, Ordering::AcqRel);
         record.r1_small.fetch_add(small, Ordering::AcqRel);
         record.sequence.fetch_add(1, Ordering::Release);
@@ -139,9 +144,6 @@ impl SlotCore {
         record
             .state
             .fetch_add(LifetimeState::delta(count, -1), Ordering::Release);
-        if residual_growth {
-            store.faults.residual_growth();
-        }
         store.faults.pin_removed();
     }
     /// # Safety
@@ -161,7 +163,7 @@ impl SlotCore {
         let Some(record) = store.resolve_hook(reference) else {
             return;
         };
-        let residual_growth = (tagged > 0 || r1_small > 0)
+        let residual_growth = (i128::from(tagged) + i128::from(r1_small)) > 0
             && record.responsibility_class() == ResponsibilityClass::Residual;
         record.tagged.fetch_add(tagged, Ordering::AcqRel);
         record.r1_small.fetch_add(r1_small, Ordering::AcqRel);

@@ -26,6 +26,8 @@ use crate::{
 pub(crate) struct LaneShared {
     pub record: RecordOwner,
     pub affiliation: Mutex<AccountHandle>,
+    pub member: Mutex<Option<Arc<crate::membership::MemberNode>>>,
+    pub query_origin: bool,
 }
 /// Sharing a lane retains access responsibility; it mints no authorization.
 #[derive(Clone, Debug)]
@@ -36,7 +38,10 @@ impl LaneHandle {
             .nodes
             .iter()
             .flatten()
-            .any(|node| node.kind() == crate::AccountKind::Work);
+            .any(|node| {
+                node.kind() == crate::AccountKind::Work
+                    && node.0.retired.load(Ordering::Acquire) == 0
+            });
         let record = account.0.shared.record_store.acquire(
             account.id().get(),
             if query {
@@ -47,6 +52,8 @@ impl LaneHandle {
         )?;
         Ok(Self(Arc::new(LaneShared {
             record,
+            member: Mutex::new(None),
+            query_origin: query,
             affiliation: Mutex::new(account.clone()),
         })))
     }
@@ -63,7 +70,67 @@ impl LaneHandle {
         self.0.affiliation.lock().unwrap().clone()
     }
     pub(crate) fn set_affiliation(&self, account: AccountHandle) {
+        let member = self.detach_member();
         *self.0.affiliation.lock().unwrap() = account;
+        if let Some(member) = &member {
+            self.affiliation().0.members.insert(member);
+        }
+        let query = crate::account::Path::new(&self.affiliation())
+            .nodes
+            .iter()
+            .flatten()
+            .any(|node| {
+                node.kind() == crate::AccountKind::Work
+                    && node.0.retired.load(Ordering::Acquire) == 0
+            });
+        self.record().set_class(if query {
+            ResponsibilityClass::Query
+        } else {
+            ResponsibilityClass::Residual
+        });
+    }
+    pub(crate) fn publish_member(&self, member: Arc<crate::membership::MemberNode>) {
+        self.affiliation().0.members.insert(&member);
+        *self.0.member.lock().unwrap() = Some(member);
+    }
+    pub(crate) fn detach_member(&self) -> Option<Arc<crate::membership::MemberNode>> {
+        let member = self.0.member.lock().unwrap().clone();
+        if let Some(member) = &member {
+            self.affiliation().0.members.remove(member);
+        }
+        member
+    }
+    pub(crate) fn restore_member(&self, member: &Option<Arc<crate::membership::MemberNode>>) {
+        if let Some(member) = member {
+            self.affiliation().0.members.insert(member);
+        }
+    }
+    pub fn seal(&self) {
+        self.record().seal();
+    }
+    pub(crate) fn enter(&self) -> bool {
+        let entered = self.record().enter();
+        if !entered {
+            self.store().faults.scope_refused();
+        }
+        entered
+    }
+    pub(crate) fn leave(&self) {
+        self.record().leave();
+    }
+    pub fn stop_producing(&self) -> Result<(), CoverageError> {
+        self.seal();
+        if self.record().scope_active() {
+            return Err(CoverageError::ScopeRefused);
+        }
+        self.record().stop();
+        Ok(())
+    }
+    pub fn production_state(&self) -> super::ProductionState {
+        self.record().production_state()
+    }
+    pub fn responsibility_class(&self) -> ResponsibilityClass {
+        self.record().responsibility_class()
     }
     pub(crate) fn store(&self) -> &super::RecordStore {
         self.0.record.store()
@@ -78,8 +145,11 @@ impl LaneHandle {
         sum.max(0) as u64
     }
     pub(crate) fn reclaimable(&self) -> bool {
+        self.reclaimable_with_handles(1)
+    }
+    pub(crate) fn reclaimable_with_handles(&self, handles: usize) -> bool {
         let life = self.record().lifetime();
-        life.outstanding() == 0 && life.pins() == 0 && Arc::strong_count(&self.0) == 1
+        life.outstanding() == 0 && life.pins() == 0 && Arc::strong_count(&self.0) == handles
     }
     /// Publishes one proven allocation that was not already published by the
     /// attribution wrapper/helper. The exact physical request size accompanies
@@ -157,3 +227,33 @@ impl FactToken {
 }
 #[cfg(not(loom))]
 const _: () = assert!(std::mem::size_of::<FactToken>() == 8);
+
+impl Drop for LaneShared {
+    fn drop(&mut self) {
+        if let Some(member) = self.member.lock().unwrap().take() {
+            self.affiliation.lock().unwrap().0.members.remove(&member);
+        }
+    }
+}
+impl AccountHandle {
+    /// Creates attribution access only. This performs no capacity qualification,
+    /// stock consumption or funding-ledger commitment.
+    pub fn create_lane(&self) -> Result<LaneHandle, CoverageError> {
+        self.0.shared.prune_observations(16);
+        let lane = LaneHandle::new(self)?;
+        let member = crate::membership::MemberNode::lane(&lane.0, None);
+        let path = crate::account::Path::new(self);
+        let _gates = path.shared_gates();
+        if path
+            .nodes
+            .iter()
+            .flatten()
+            .any(|a| a.0.closed.load(Ordering::Acquire) != 0)
+        {
+            return Err(CoverageError::AccountClosed);
+        }
+        lane.publish_member(member);
+        self.0.shared.retain_observation(&lane);
+        Ok(lane)
+    }
+}

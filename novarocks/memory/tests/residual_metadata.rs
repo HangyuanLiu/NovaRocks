@@ -50,7 +50,7 @@ fn many_historical_residuals_do_not_exhaust_concurrent_owner_admission() {
             pressure.residual_committed,
             (generation + 1) * (128 + OWNER_METADATA_BYTES)
         );
-        assert_eq!(pressure.query_pressure(), pressure.residual_query_committed);
+        assert_eq!(pressure.query_pressure(), 0);
     }
     assert_eq!(a.live_accounts(), 1);
     for origin in origins.into_iter().rev() {
@@ -90,9 +90,15 @@ fn multiple_ancestor_retirements_keep_metadata_and_payload_on_one_live_branch() 
         account.retire(&exited()).unwrap();
         let pressure = a.pressure_projection();
         assert_eq!(pressure.root_committed, before.root_committed);
-        assert_eq!(pressure.query_pressure(), before.query_pressure());
-        assert_eq!(pressure.residual_metadata, OWNER_METADATA_BYTES);
-        assert_eq!(pressure.residual_committed, 512 + OWNER_METADATA_BYTES);
+        if account.id() == task.id() {
+            assert_eq!(pressure.query_pressure(), before.query_pressure());
+            assert_eq!(pressure.residual_metadata, 0);
+            assert_eq!(pressure.residual_committed, 0);
+        } else {
+            assert_eq!(pressure.query_pressure(), 0);
+            assert_eq!(pressure.residual_metadata, OWNER_METADATA_BYTES);
+            assert_eq!(pressure.residual_committed, 512 + OWNER_METADATA_BYTES);
+        }
         assert_eq!(account.committed_bytes(), 0);
     }
     assert_eq!(a.live_accounts(), 1);

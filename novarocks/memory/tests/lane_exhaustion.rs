@@ -17,30 +17,27 @@
 
 mod common;
 use common::*;
+use novarocks_memory::lane::{CoverageError, ResponsibilityClass, StoreHandle, global_store};
+
 #[test]
-fn retire_preserves_payload_metadata_but_ends_query_pressure() {
-    let a = authority(32_768);
-    let q = work(&a);
-    let d = q.create_domain(1_024).unwrap();
-    let mut l = d.activate(1_024, 0).unwrap();
-    let o = l.record_allocation(1_024);
-    l.finish();
+fn real_process_record_exhaustion_is_a_coverage_error_without_funding_change() {
+    let a = authority(65_536);
+    let query = work(&a);
     let before = a.pressure_projection();
-    let r = q.retire(&exited()).unwrap();
-    assert_eq!(r.transferred_payload, 1_024);
+    let mut held = Vec::new();
+    loop {
+        match StoreHandle::Global.acquire(1, ResponsibilityClass::Service) {
+            Ok(owner) => held.push(owner),
+            Err(CoverageError::RecordStoreExhausted) => break,
+            Err(error) => panic!("unexpected coverage failure: {error:?}"),
+        }
+    }
     assert_eq!(
-        r.transferred_metadata,
-        novarocks_memory::OWNER_METADATA_BYTES
+        query.create_lane().unwrap_err(),
+        CoverageError::RecordStoreExhausted
     );
-    let after = a.pressure_projection();
-    assert_eq!(after.root_committed, before.root_committed);
-    assert_eq!(after.query_pressure(), 0);
-    assert!(q.is_retired());
-    assert!(d.activate(0, 0).is_err());
-    drop(q);
-    drop(d);
-    free(o, 1_024);
-    a.request_maintenance(novarocks_memory::MaintenanceReason::ExplicitLocalReclaim);
-    while !a.maintain(64).complete {}
-    assert_eq!(a.pressure_projection().residual_committed, 0);
+    assert_eq!(a.pressure_projection(), before);
+    drop(held);
+    global_store().reclaim(usize::MAX);
+    assert!(query.create_lane().is_ok());
 }
