@@ -73,7 +73,10 @@ impl fmt::Write for Output<'_> {
         Ok(())
     }
 }
-fn formatted(pool: &HeaderFieldAllocationPool, args: fmt::Arguments<'_>) -> Result<Bytes, Status> {
+pub(super) fn formatted(
+    pool: &HeaderFieldAllocationPool,
+    args: fmt::Arguments<'_>,
+) -> Result<Bytes, Status> {
     let mut count = Count(0);
     count.write_fmt(args).map_err(|_| capacity_error())?;
     pool.try_fill(count.0, |output| {

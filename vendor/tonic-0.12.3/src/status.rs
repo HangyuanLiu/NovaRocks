@@ -187,6 +187,28 @@ impl Status {
         }
     }
 
+    /// Preserve existing diagnostic text in the original arena when installed.
+    /// Ordinary callers retain their owned formatter behavior. Exhaustion never
+    /// falls back to an owned String; the static refusal uses control capacity.
+    pub(crate) fn formatted_with_pool(
+        code: Code,
+        args: fmt::Arguments<'_>,
+        pool: Option<&http::header::HeaderFieldAllocationPool>,
+    ) -> Self {
+        let Some(pool) = pool else {
+            return Self::new(code, args.to_string());
+        };
+        match field::formatted(pool, args) {
+            Ok(message) => {
+                let mut status = Self::from_static(code, "");
+                status.message = field::Message::Shared(message);
+                status.field_pool = Some(pool.clone());
+                status
+            }
+            Err(status) => status,
+        }
+    }
+
     /// The operation completed successfully.
     pub fn ok(message: impl Into<String>) -> Status {
         Status::new(Code::Ok, message)

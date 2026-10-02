@@ -179,15 +179,18 @@ struct Funded {
 }
 impl Funded {
     fn new(capacity: usize, positions: usize) -> Self {
+        Self::with_maximum(capacity, positions, capacity)
+    }
+    fn with_maximum(capacity: usize, positions: usize, maximum: usize) -> Self {
         let map_bound = HeaderMapAllocationPool::allocation_capacity_bound(1, 4, 2).unwrap();
         let field_bound =
-            HeaderFieldAllocationPool::allocation_capacity_bound(capacity, positions, capacity)
+            HeaderFieldAllocationPool::allocation_capacity_bound(capacity, positions, maximum)
                 .unwrap();
         let total = map_bound + field_bound + 2 * carrier();
         let budget = ResultRetainedBudget::new(NonZeroUsize::new(total).unwrap());
         let field_owner = owner(&budget, field_bound + carrier(), 1);
         let (fields, calls, requested) = measure(1, || {
-            HeaderFieldAllocationPool::new(capacity, positions, capacity, field_owner).unwrap()
+            HeaderFieldAllocationPool::new(capacity, positions, maximum, field_owner).unwrap()
         });
         assert_eq!(calls, 3);
         assert!(requested <= field_bound);
@@ -388,7 +391,9 @@ fn source_error_consumes_same_map_and_only_escaped_transformed_value_keeps_field
 
 #[test]
 fn encoder_error_discards_partial_data_and_terminates_before_following_source_item() {
-    let funded = Funded::new(256, 4);
+    // Raw formatted diagnostic and percent-transformed output coexist during
+    // serialization. Their 128B + 192B rounded extents require this real arena.
+    let funded = Funded::new(512, 4);
     let (source, polls, exits) = source(
         [
             Ok(Bytes::from_static(b"partial")),
@@ -397,18 +402,89 @@ fn encoder_error_discards_partial_data_and_terminates_before_following_source_it
         false,
     );
     let mut body = body(funded.map(), source, true);
-    let trailers = frame(&mut body).into_trailers().unwrap();
+    // Constructor/source/codec staging are prepared before measurement. The
+    // only two requested allocations are original-field owner wrappers: the
+    // raw formatted Status Display diagnostic and its transformed wire value.
+    let wrapper_bytes = HeaderFieldAllocationPool::allocation_capacity_bound(512, 4, 512).unwrap()
+        - HeaderFieldAllocationPool::allocation_capacity_bound(512, 3, 512).unwrap();
+    let (result, calls, bytes) = measure(1, || poll(&mut body));
+    assert_eq!((calls, bytes), (2, 2 * wrapper_bytes));
+    let trailers = match result {
+        Poll::Ready(Some(Ok(frame))) => frame.into_trailers().unwrap(),
+        other => panic!("expected bounded encoder diagnostic: {other:?}"),
+    };
     assert_eq!(trailers[Status::GRPC_STATUS], "13");
     assert_eq!(
         trailers[Status::GRPC_MESSAGE].as_bytes(),
         b"Error%20encoding:%20status:%20InvalidArgument,%20message:%20%22bad%20%%22,%20details:%20[],%20metadata:%20MetadataMap%20%7B%20headers:%20%7B%7D%20%7D"
     );
+    assert_eq!(
+        funded.fields.available_positions(),
+        3,
+        "raw formatted diagnostic has actually exited"
+    );
+    let alias = no_allocation(|| trailers[Status::GRPC_MESSAGE].clone());
     terminal(&mut body, &polls);
     assert_eq!(polls.load(Ordering::SeqCst), 1);
     drop((body, trailers));
     assert_eq!(exits.load(Ordering::SeqCst), 1);
     let (budget, total) = funded.detach();
+    held(&budget, total);
+    drop(alias);
     drop(grant(&budget, total));
+}
+
+#[test]
+fn formatted_encoder_diagnostic_maximum_or_positions_refuse_without_heap_fallback() {
+    for exhausted_position in [false, true] {
+        let funded = if exhausted_position {
+            Funded::new(512, 1)
+        } else {
+            // Neither the raw diagnostic nor the static refusal's wire message
+            // fits. The terminal error retains the cleared original map rather
+            // than attempting heap-backed recursive status serialization.
+            Funded::with_maximum(512, 4, 32)
+        };
+        let blocker = if exhausted_position {
+            Some(
+                funded
+                    .fields
+                    .try_fill::<std::convert::Infallible>(1, |bytes| {
+                        bytes[0] = b'x';
+                        Ok(())
+                    })
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let (source, polls, exits) = source(
+            [
+                Ok(Bytes::from_static(b"partial")),
+                Ok(Bytes::from_static(b"must not escape")),
+            ],
+            false,
+        );
+        let mut body = body(funded.map(), source, true);
+        let (budget, total) = funded.detach();
+        let error = match no_allocation(|| poll(&mut body)) {
+            Poll::Ready(Some(Err(error))) => error,
+            other => panic!("expected static formatted-input refusal: {other:?}"),
+        };
+        assert_eq!(error.code(), Code::ResourceExhausted);
+        assert_eq!(error.message(), "HTTP status field capacity exhausted");
+        assert!(
+            error.metadata().is_empty(),
+            "no partial status or DATA escaped"
+        );
+        terminal(&mut body, &polls);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        drop((body, blocker));
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        held(&budget, total);
+        drop(error);
+        drop(grant(&budget, total));
+    }
 }
 
 #[test]
@@ -514,4 +590,77 @@ fn ordinary_server_and_client_constructors_preserve_default_eof_roles() {
     let (src, _, _) = source([], false);
     let mut client = EncodeBody::new_client(ActualEncoder { fail: false }, src, None, None);
     assert!(matches!(poll(&mut client), Poll::Ready(None)));
+}
+
+#[test]
+fn size_limit_diagnostic_uses_two_original_wrappers_and_matches_legacy_wire_bytes() {
+    const EXPECTED: &[u8] = b"Error,%20encoded%20message%20length%20too%20large:%20found%207%20bytes,%20the%20limit%20is:%202%20bytes";
+    let funded = Funded::new(512, 4);
+    let (src, polls, exits) = source(
+        [
+            Ok(Bytes::from_static(b"partial")),
+            Ok(Bytes::from_static(b"must not escape")),
+        ],
+        false,
+    );
+    let mut bounded = EncodeBody::new_server_with_trailers(
+        ActualEncoder { fail: false },
+        src,
+        None,
+        Default::default(),
+        Some(2),
+        funded.map(),
+    );
+    let wrapper_bytes = HeaderFieldAllocationPool::allocation_capacity_bound(512, 4, 512).unwrap()
+        - HeaderFieldAllocationPool::allocation_capacity_bound(512, 3, 512).unwrap();
+    // All source/body/staging construction is outside this operation. Real
+    // finish_encoding rejects after seven bytes are encoded, before DATA can
+    // escape; only the raw formatted and percent-output wrappers may allocate.
+    let (result, calls, bytes) = measure(1, || poll(&mut bounded));
+    assert_eq!((calls, bytes), (2, 2 * wrapper_bytes));
+    let trailers = match result {
+        Poll::Ready(Some(Ok(frame))) => frame.into_trailers().unwrap(),
+        other => panic!("expected bounded size-limit diagnostic: {other:?}"),
+    };
+    assert_eq!(trailers[Status::GRPC_STATUS], "11");
+    assert_eq!(trailers[Status::GRPC_MESSAGE].as_bytes(), EXPECTED);
+    assert_eq!(funded.fields.available_positions(), 3);
+    let alias = no_allocation(|| trailers[Status::GRPC_MESSAGE].clone());
+    assert_eq!(
+        alias.as_bytes().as_ptr(),
+        trailers[Status::GRPC_MESSAGE].as_bytes().as_ptr()
+    );
+    terminal(&mut bounded, &polls);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    drop((bounded, trailers));
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
+    let (budget, total) = funded.detach();
+    held(&budget, total);
+    assert_eq!(alias.as_bytes(), EXPECTED);
+    drop(alias);
+    drop(grant(&budget, total));
+
+    // Preserve ordinary finish_encoding's code/text policy. Its independent
+    // String/payload allocations are outside the bounded operation's ledger.
+    let (src, polls, exits) = source(
+        [
+            Ok(Bytes::from_static(b"partial")),
+            Ok(Bytes::from_static(b"must not escape")),
+        ],
+        false,
+    );
+    let mut legacy = EncodeBody::new_server(
+        ActualEncoder { fail: false },
+        src,
+        None,
+        Default::default(),
+        Some(2),
+    );
+    let trailers = frame(&mut legacy).into_trailers().unwrap();
+    assert_eq!(trailers[Status::GRPC_STATUS], "11");
+    assert_eq!(trailers[Status::GRPC_MESSAGE].as_bytes(), EXPECTED);
+    terminal(&mut legacy, &polls);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    drop((legacy, trailers));
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
 }

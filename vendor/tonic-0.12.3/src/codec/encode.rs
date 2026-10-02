@@ -4,7 +4,7 @@ use super::compression::{
 use super::{BufferSettings, EncodeBuf, Encoder, DEFAULT_MAX_SEND_MESSAGE_SIZE, HEADER_SIZE};
 use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
-use http::HeaderMap;
+use http::{header::HeaderFieldAllocationPool, HeaderMap};
 use http_body::{Body, Frame};
 use pin_project::pin_project;
 use std::{
@@ -29,6 +29,7 @@ struct EncodedBytes<T, U> {
     buf: BytesMut,
     uncompression_buf: BytesMut,
     error: Option<Status>,
+    diagnostic_fields: Option<HeaderFieldAllocationPool>,
 }
 
 impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
@@ -63,6 +64,7 @@ impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
             buf,
             uncompression_buf,
             error: None,
+            diagnostic_fields: None,
         }
     }
 }
@@ -83,6 +85,7 @@ where
             buf,
             uncompression_buf,
             error,
+            diagnostic_fields,
         } = self.project();
         let buffer_settings = encoder.buffer_settings();
 
@@ -106,9 +109,12 @@ where
                         encoder,
                         buf,
                         uncompression_buf,
-                        *compression_encoding,
-                        *max_message_size,
-                        buffer_settings,
+                        EncodeItemSettings {
+                            compression_encoding: *compression_encoding,
+                            max_message_size: *max_message_size,
+                            buffer_settings,
+                            diagnostic_fields: diagnostic_fields.as_ref(),
+                        },
                         item,
                     ) {
                         return Poll::Ready(Some(Err(status)));
@@ -130,18 +136,29 @@ where
     }
 }
 
+struct EncodeItemSettings<'a> {
+    compression_encoding: Option<CompressionEncoding>,
+    max_message_size: Option<usize>,
+    buffer_settings: BufferSettings,
+    diagnostic_fields: Option<&'a HeaderFieldAllocationPool>,
+}
+
 fn encode_item<T>(
     encoder: &mut T,
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
-    compression_encoding: Option<CompressionEncoding>,
-    max_message_size: Option<usize>,
-    buffer_settings: BufferSettings,
+    settings: EncodeItemSettings<'_>,
     item: T::Item,
 ) -> Result<(), Status>
 where
     T: Encoder<Error = Status>,
 {
+    let EncodeItemSettings {
+        compression_encoding,
+        max_message_size,
+        buffer_settings,
+        diagnostic_fields,
+    } = settings;
     let offset = buf.len();
 
     buf.reserve(HEADER_SIZE);
@@ -154,7 +171,13 @@ where
 
         encoder
             .encode(item, &mut EncodeBuf::new(uncompression_buf))
-            .map_err(|err| Status::internal(format!("Error encoding: {}", err)))?;
+            .map_err(|err| {
+                Status::formatted_with_pool(
+                    crate::Code::Internal,
+                    format_args!("Error encoding: {}", err),
+                    diagnostic_fields,
+                )
+            })?;
 
         let uncompressed_len = uncompression_buf.len();
 
@@ -167,35 +190,59 @@ where
             buf,
             uncompressed_len,
         )
-        .map_err(|err| Status::internal(format!("Error compressing: {}", err)))?;
+        .map_err(|err| {
+            Status::formatted_with_pool(
+                crate::Code::Internal,
+                format_args!("Error compressing: {}", err),
+                diagnostic_fields,
+            )
+        })?;
     } else {
         encoder
             .encode(item, &mut EncodeBuf::new(buf))
-            .map_err(|err| Status::internal(format!("Error encoding: {}", err)))?;
+            .map_err(|err| {
+                Status::formatted_with_pool(
+                    crate::Code::Internal,
+                    format_args!("Error encoding: {}", err),
+                    diagnostic_fields,
+                )
+            })?;
     }
 
     // now that we know length, we can write the header
-    finish_encoding(compression_encoding, max_message_size, &mut buf[offset..])
+    finish_encoding(
+        compression_encoding,
+        max_message_size,
+        diagnostic_fields,
+        &mut buf[offset..],
+    )
 }
 
 fn finish_encoding(
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
+    diagnostic_fields: Option<&HeaderFieldAllocationPool>,
     buf: &mut [u8],
 ) -> Result<(), Status> {
     let len = buf.len() - HEADER_SIZE;
     let limit = max_message_size.unwrap_or(DEFAULT_MAX_SEND_MESSAGE_SIZE);
     if len > limit {
-        return Err(Status::out_of_range(format!(
-            "Error, encoded message length too large: found {} bytes, the limit is: {} bytes",
-            len, limit
-        )));
+        return Err(Status::formatted_with_pool(
+            crate::Code::OutOfRange,
+            format_args!(
+                "Error, encoded message length too large: found {} bytes, the limit is: {} bytes",
+                len, limit
+            ),
+            diagnostic_fields,
+        ));
     }
 
     if len > u32::MAX as usize {
-        return Err(Status::resource_exhausted(format!(
-            "Cannot return body with more than 4GB of data but got {len} bytes"
-        )));
+        return Err(Status::formatted_with_pool(
+            crate::Code::ResourceExhausted,
+            format_args!("Cannot return body with more than 4GB of data but got {len} bytes"),
+            diagnostic_fields,
+        ));
     }
     {
         let mut buf = &mut buf[..HEADER_SIZE];
@@ -303,6 +350,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
             compression_override,
             max_message_size,
         );
+        body.inner.diagnostic_fields = trailers.field_allocation_pool().cloned();
         body.state.trailers = Some(trailers);
         body
     }
