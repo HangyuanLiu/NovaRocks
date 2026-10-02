@@ -24,8 +24,6 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use axum::Router;
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::IntoResponse;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -39,6 +37,7 @@ use tower::ServiceExt;
 
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::native_ingress::NativeIngressService;
+use crate::native_response::respond_from_request;
 
 /// How long a stopping listener lets its already-accepted connections finish.
 ///
@@ -573,28 +572,27 @@ where
     fn call(&mut self, request: axum::http::Request<Body>) -> Self::Future {
         if self.admission.admit_headers(request.headers()).is_err() {
             (self.on_authentication_failure)();
-            return Box::pin(async {
-                Ok(
-                    tonic::Status::unauthenticated("native caller authentication failed")
-                        .into_http(),
-                )
-            });
+            let response = respond_from_request(
+                request,
+                tonic::Status::from_static(
+                    tonic::Code::Unauthenticated,
+                    "native caller authentication failed",
+                ),
+            );
+            return Box::pin(async move { Ok(response) });
         }
         Box::pin(self.inner.call(request))
     }
 }
 
-async fn grpc_unimplemented_fallback() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            (tonic::Status::GRPC_STATUS, HeaderValue::from_static("12")),
-            (
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            ),
-        ],
+async fn grpc_unimplemented_fallback(
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::http::Response<axum::body::Body> {
+    respond_from_request(
+        request,
+        tonic::Status::from_static(tonic::Code::Unimplemented, ""),
     )
+    .map(axum::body::Body::new)
 }
 
 #[derive(Clone)]
@@ -634,6 +632,156 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    struct FundedHeaders {
+        maps: axum::http::header::HeaderMapAllocationPool,
+        fields: axum::http::header::HeaderFieldAllocationPool,
+        budget: Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
+        bytes: usize,
+    }
+
+    impl FundedHeaders {
+        fn new() -> Self {
+            use axum::http::header::{HeaderFieldAllocationPool, HeaderMapAllocationPool};
+            use novarocks_execution::runtime::fragment::io::{
+                ResultWriteAdmission, ResultWriteCredit,
+            };
+            use novarocks_worker::result_buffer::ResultRetainedBudget;
+            let carrier = bytes::Bytes::owner_with_exit_guard_metadata_size::<
+                bytes::Bytes,
+                ResultWriteCredit,
+            >();
+            let map_bytes =
+                HeaderMapAllocationPool::allocation_capacity_bound(1, 8, 2).unwrap() + carrier;
+            let field_bytes = HeaderFieldAllocationPool::allocation_capacity_bound(1024, 8, 256)
+                .unwrap()
+                + carrier;
+            let bytes = map_bytes + field_bytes;
+            let budget = ResultRetainedBudget::new(std::num::NonZeroUsize::new(bytes).unwrap());
+            let owner = |capacity| {
+                let ResultWriteAdmission::Granted(credit) =
+                    budget.try_reserve_process(capacity).unwrap()
+                else {
+                    panic!("complete original pregrant required");
+                };
+                bytes::Bytes::from_owner_with_exit_guard(bytes::Bytes::new(), credit)
+            };
+            let fields = HeaderFieldAllocationPool::new(1024, 8, 256, owner(field_bytes)).unwrap();
+            let maps = HeaderMapAllocationPool::new(1, 8, 2, owner(map_bytes)).unwrap();
+            fields.try_bind_once().unwrap();
+            maps.try_bind_connection_with_fields(&fields).unwrap();
+            Self {
+                maps,
+                fields,
+                budget,
+                bytes,
+            }
+        }
+
+        fn request(&self) -> axum::http::Request<axum::body::Body> {
+            let mut request = axum::http::Request::new(axum::body::Body::empty());
+            *request.headers_mut() =
+                axum::http::HeaderMap::try_from_allocation_pool(&self.maps).unwrap();
+            request.headers_mut().insert(
+                "private-request",
+                axum::http::HeaderValue::from_static("secret"),
+            );
+            request
+        }
+
+        fn original(&self, headers: &axum::http::HeaderMap) {
+            assert!(headers.allocation_pool().unwrap().same_pool(&self.maps));
+            assert!(
+                headers
+                    .field_allocation_pool()
+                    .unwrap()
+                    .same_pool(&self.fields)
+            );
+            assert!(headers.get("private-request").is_none());
+        }
+
+        fn retire(self) {
+            use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
+            let Self {
+                maps,
+                fields,
+                budget,
+                bytes,
+            } = self;
+            assert_eq!(maps.available_maps(), 1);
+            assert!(matches!(
+                budget.try_reserve_process(bytes).unwrap(),
+                ResultWriteAdmission::Blocked
+            ));
+            drop(maps);
+            drop(fields);
+            assert!(matches!(
+                budget.try_reserve_process(bytes).unwrap(),
+                ResultWriteAdmission::Granted(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_refusal_reuses_input_capacity_before_polling_its_future() {
+        use std::sync::atomic::AtomicUsize;
+        let fixture = FundedHeaders::new();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let observed = entered.clone();
+        let inner = tower::service_fn(move |_request: axum::http::Request<axum::body::Body>| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, std::convert::Infallible>(tonic::Status::ok("").into_http()) }
+        });
+        let rejected = failures.clone();
+        let mut service = NativeListenerAuthService::new(
+            inner,
+            crate::backend_test_support::test_backend_native_trust().server_admission(),
+            Arc::new(move || {
+                rejected.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let future = service.call(fixture.request());
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.maps.available_maps(), 0);
+        let response = future.await.unwrap();
+        fixture.original(response.headers());
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["grpc-status"], "16");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "native%20caller%20authentication%20failed"
+        );
+        drop(response);
+        let cancelled = service.call(fixture.request());
+        assert_eq!(fixture.maps.available_maps(), 0);
+        drop(cancelled);
+        fixture.retire();
+    }
+
+    #[tokio::test]
+    async fn unknown_route_refusal_consumes_the_actual_original_request_map() {
+        let fixture = FundedHeaders::new();
+        let response = grpc_unimplemented_fallback(fixture.request()).await;
+        fixture.original(response.headers());
+        assert_eq!(fixture.maps.available_maps(), 0);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["grpc-status"], "12");
+        assert_eq!(response.headers()["content-type"], "application/grpc");
+        drop(response);
+        fixture.retire();
+    }
+
+    #[tokio::test]
+    async fn unknown_route_without_original_fields_preserves_legacy_response() {
+        let response =
+            grpc_unimplemented_fallback(axum::http::Request::new(axum::body::Body::empty())).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["grpc-status"], "12");
+        assert!(response.headers().allocation_pool().is_none());
+        assert!(response.headers().field_allocation_pool().is_none());
+    }
 
     /// A service that reports when it has been entered and answers only when
     /// it is released, so a test can hold one request in flight.

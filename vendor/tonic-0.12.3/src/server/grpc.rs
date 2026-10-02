@@ -13,15 +13,6 @@ use http_body::Body;
 use std::{fmt, pin::pin};
 use tokio_stream::{Stream, StreamExt};
 
-macro_rules! t {
-    ($result:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(status) => return status.into_http(),
-        }
-    };
-}
-
 /// Two already-claimed response maps from the same original field arena.
 ///
 /// Prepare this value before decoding or awaiting a service. Each call consumes
@@ -255,6 +246,9 @@ where
     }
 
     /// Handle a single unary gRPC request.
+    /// If the request carries an original map and field family, acquire both
+    /// response maps before decoding. Exhaustion never falls back to ordinary
+    /// map allocation. Requests without field capability retain legacy behavior.
     pub async fn unary<S, B>(
         &mut self,
         service: S,
@@ -265,7 +259,11 @@ where
         B: Body + Send + 'static,
         B::Error: Into<crate::Error> + Send,
     {
-        self.unary_inner(service, req, None).await
+        let headers = match prepare_response_headers(&req) {
+            Ok(headers) => headers,
+            Err(status) => return response_header_refusal(req, status),
+        };
+        self.unary_inner(service, req, headers).await
     }
 
     /// Handle one unary request with its already-claimed initial/trailer maps.
@@ -344,6 +342,10 @@ where
         B: Body + Send + 'static,
         B::Error: Into<crate::Error> + Send,
     {
+        let headers = match prepare_response_headers(&req) {
+            Ok(headers) => headers,
+            Err(status) => return response_header_refusal(req, status),
+        };
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
             self.send_compression_encodings,
@@ -352,24 +354,26 @@ where
         let request = match self.map_request_unary(req).await {
             Ok(r) => r,
             Err(status) => {
-                return self.map_response::<S::ResponseStream>(
+                return self.map_response_with_headers::<S::ResponseStream>(
                     Err(status),
                     accept_encoding,
                     SingleMessageCompressionOverride::default(),
                     self.max_encoding_message_size,
+                    headers,
                 );
             }
         };
 
         let response = service.call(request).await;
 
-        self.map_response(
+        self.map_response_with_headers(
             response,
             accept_encoding,
             // disabling compression of individual stream items must be done on
             // the items themselves
             SingleMessageCompressionOverride::default(),
             self.max_encoding_message_size,
+            headers,
         )
     }
 
@@ -384,12 +388,28 @@ where
         B: Body + Send + 'static,
         B::Error: Into<crate::Error> + Send + 'static,
     {
+        let headers = match prepare_response_headers(&req) {
+            Ok(headers) => headers,
+            Err(status) => return response_header_refusal(req, status),
+        };
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
             self.send_compression_encodings,
         );
 
-        let request = t!(self.map_request_streaming(req));
+        let request = match self.map_request_streaming(req) {
+            Ok(request) => request,
+            Err(status) => {
+                return self
+                    .map_response_with_headers::<tokio_stream::Once<Result<T::Encode, Status>>>(
+                        Err(status),
+                        accept_encoding,
+                        SingleMessageCompressionOverride::default(),
+                        self.max_encoding_message_size,
+                        headers,
+                    );
+            }
+        };
 
         let response = service
             .call(request)
@@ -398,11 +418,12 @@ where
 
         let compression_override = compression_override_from_response(&response);
 
-        self.map_response(
+        self.map_response_with_headers(
             response,
             accept_encoding,
             compression_override,
             self.max_encoding_message_size,
+            headers,
         )
     }
 
@@ -418,20 +439,36 @@ where
         B: Body + Send + 'static,
         B::Error: Into<crate::Error> + Send,
     {
+        let headers = match prepare_response_headers(&req) {
+            Ok(headers) => headers,
+            Err(status) => return response_header_refusal(req, status),
+        };
         let accept_encoding = CompressionEncoding::from_accept_encoding_header(
             req.headers(),
             self.send_compression_encodings,
         );
 
-        let request = t!(self.map_request_streaming(req));
+        let request = match self.map_request_streaming(req) {
+            Ok(request) => request,
+            Err(status) => {
+                return self.map_response_with_headers::<S::ResponseStream>(
+                    Err(status),
+                    accept_encoding,
+                    SingleMessageCompressionOverride::default(),
+                    self.max_encoding_message_size,
+                    headers,
+                );
+            }
+        };
 
         let response = service.call(request).await;
 
-        self.map_response(
+        self.map_response_with_headers(
             response,
             accept_encoding,
             SingleMessageCompressionOverride::default(),
             self.max_encoding_message_size,
+            headers,
         )
     }
 
@@ -488,25 +525,6 @@ where
         });
 
         Ok(Request::from_http(request))
-    }
-
-    fn map_response<B>(
-        &mut self,
-        response: Result<crate::Response<B>, Status>,
-        accept_encoding: Option<CompressionEncoding>,
-        compression_override: SingleMessageCompressionOverride,
-        max_message_size: Option<usize>,
-    ) -> http::Response<BoxBody>
-    where
-        B: Stream<Item = Result<T::Encode, Status>> + Send + 'static,
-    {
-        self.map_response_with_headers(
-            response,
-            accept_encoding,
-            compression_override,
-            max_message_size,
-            None,
-        )
     }
 
     fn map_response_with_headers<B>(
@@ -634,4 +652,42 @@ fn compression_override_from_response<B, E>(
                 .copied()
         })
         .unwrap_or_default()
+}
+
+/// A funded incoming map is the structural proof of the installed field family.
+/// Claim both response positions before any decoder/service work. These claims
+/// allocate only from the original complete map-family capacity, never a wallet.
+fn prepare_response_headers<B>(
+    request: &http::Request<B>,
+) -> Result<Option<ResponseHeaderMaps>, Status> {
+    if request.headers().field_allocation_pool().is_none() {
+        return Ok(None);
+    }
+    let pool = request.headers().allocation_pool().ok_or_else(|| {
+        Status::from_static(
+            crate::Code::Internal,
+            "missing original response map family",
+        )
+    })?;
+    let refused = |_| {
+        Status::from_static(
+            crate::Code::ResourceExhausted,
+            "HTTP response header capacity exhausted",
+        )
+    };
+    let initial = http::HeaderMap::try_from_allocation_pool(pool).map_err(refused)?;
+    let trailers = http::HeaderMap::try_from_allocation_pool(pool).map_err(refused)?;
+    ResponseHeaderMaps::new(initial, trailers).map(Some)
+}
+
+/// Keep the actual incoming map on an early refusal; partially acquired output
+/// positions have already exited. The body is dropped without being polled.
+fn response_header_refusal<B>(
+    request: http::Request<B>,
+    status: Status,
+) -> http::Response<BoxBody> {
+    let (mut parts, body) = request.into_parts();
+    drop(body);
+    parts.headers.clear();
+    status.into_http_with_headers(parts.headers)
 }

@@ -31,23 +31,55 @@ use axum::http::{Request, Response, header};
 use bytes::Bytes;
 use hyper::body::Frame;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::Status;
 use tonic::codegen::Body as HttpBody;
+use tonic::{Code, Status};
 use tower::{Service, ServiceExt};
 
 use crate::backend_metrics;
+use crate::native_response::{NativeResponseHeaders, respond_from_request};
 use crate::native_server::NativeIngressConfig;
 
 const LOCAL_ENTRY_CAP: Duration = Duration::from_secs(300);
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
 
 fn ingress_capacity_status(detail: &'static str, reason: &'static str) -> Status {
-    let mut status = Status::resource_exhausted(detail);
+    let mut status = Status::from_static(Code::ResourceExhausted, detail);
     status.metadata_mut().insert(
         "x-novarocks-ingress-rejection",
         tonic::metadata::MetadataValue::from_static(reason),
     );
     status
+}
+
+#[derive(Debug)]
+struct IngressFailure {
+    status: Status,
+    reason: Option<&'static str>,
+}
+
+impl IngressFailure {
+    fn capacity(detail: &'static str, reason: &'static str) -> Self {
+        Self {
+            status: Status::from_static(Code::ResourceExhausted, detail),
+            reason: Some(reason),
+        }
+    }
+
+    fn respond(self, headers: NativeResponseHeaders) -> Response<tonic::body::BoxBody> {
+        match self.reason {
+            Some(reason) => headers.respond_with_static_reason(self.status, reason),
+            None => headers.respond(self.status),
+        }
+    }
+}
+
+impl From<Status> for IngressFailure {
+    fn from(status: Status) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
 }
 
 /// A request's original arrival and its locally bounded header deadline.
@@ -124,21 +156,29 @@ impl Gate {
         }
     }
 
-    async fn acquire(&self, deadline: Instant) -> Result<RunningPermit, Status> {
+    async fn acquire(&self, deadline: Instant) -> Result<RunningPermit, IngressFailure> {
         if Instant::now() >= deadline {
             self.reject("waiting_deadline");
-            return Err(Status::deadline_exceeded("native ingress deadline elapsed"));
+            return Err(Status::from_static(
+                Code::DeadlineExceeded,
+                "native ingress deadline elapsed",
+            )
+            .into());
         }
         if let Ok(permit) = Arc::clone(&self.running).try_acquire_owned() {
             if Instant::now() >= deadline {
                 self.reject("waiting_deadline");
-                return Err(Status::deadline_exceeded("native ingress deadline elapsed"));
+                return Err(Status::from_static(
+                    Code::DeadlineExceeded,
+                    "native ingress deadline elapsed",
+                )
+                .into());
             }
             return Ok(RunningPermit::new(permit, self.class, self.metrics));
         }
         let wait_permit = Arc::clone(&self.waiting).try_acquire_owned().map_err(|_| {
             self.reject("waiting_capacity");
-            ingress_capacity_status(
+            IngressFailure::capacity(
                 "native ingress waiting capacity exhausted",
                 "waiting_capacity",
             )
@@ -149,15 +189,22 @@ impl Gate {
                 .await
                 .map_err(|_| {
                     self.reject("waiting_deadline");
-                    Status::deadline_exceeded("native ingress waiting deadline elapsed")
+                    Status::from_static(
+                        Code::DeadlineExceeded,
+                        "native ingress waiting deadline elapsed",
+                    )
                 })?
                 .map_err(|_| {
                     self.reject("closed");
-                    Status::unavailable("native ingress admission closed")
+                    Status::from_static(Code::Unavailable, "native ingress admission closed")
                 })?;
         if Instant::now() >= deadline {
             self.reject("waiting_deadline");
-            return Err(Status::deadline_exceeded("native ingress deadline elapsed"));
+            return Err(Status::from_static(
+                Code::DeadlineExceeded,
+                "native ingress deadline elapsed",
+            )
+            .into());
         }
         drop(_wait);
         Ok(RunningPermit::new(permit, self.class, self.metrics))
@@ -350,8 +397,17 @@ where
         }
         // Record arrival synchronously: an async worker may not poll the
         // returned future immediately, and that delay consumes the request's
-        // original ingress deadline.
+        // original ingress deadline, including response capacity preparation.
         let arrival = Instant::now();
+        // Acquire one original error position before any gate wait or decoder
+        // work. Timeout may cancel a future that already owns the input map.
+        let error_headers = match NativeResponseHeaders::prepare(&request) {
+            Ok(headers) => headers,
+            Err(status) => {
+                let response = respond_from_request(request, status);
+                return Box::pin(async move { Ok(response) });
+            }
+        };
         let class = self.classify(request.uri().path());
         let gate = match class {
             MethodClass::Control => self.control.clone(),
@@ -368,12 +424,12 @@ where
                 Ok(deadline) => deadline,
                 Err(status) => {
                     gate.reject("invalid_deadline");
-                    return Ok(status.into_http());
+                    return Ok(error_headers.respond(status));
                 }
             };
             let permit = match gate.acquire(deadline).await {
                 Ok(permit) => permit,
-                Err(status) => return Ok(status.into_http()),
+                Err(failure) => return Ok(failure.respond(error_headers)),
             };
             let ownership = Arc::new(NativeIngressOwnership {
                 _permit: permit,
@@ -388,7 +444,10 @@ where
             let mut request = request;
             if let Some(limit) = body_limit {
                 let Some(total_limit) = limit.checked_add(GRPC_FRAME_HEADER_BYTES) else {
-                    return Ok(Status::internal("native ingress frame limit overflow").into_http());
+                    return Ok(error_headers.respond(Status::from_static(
+                        Code::Internal,
+                        "native ingress frame limit overflow",
+                    )));
                 };
                 if request
                     .headers()
@@ -398,11 +457,13 @@ where
                     .is_some_and(|length| length > total_limit)
                 {
                     gate.reject("body_limit");
-                    return Ok(ingress_capacity_status(
-                        "native request body exceeds method limit",
+                    return Ok(error_headers.respond_with_static_reason(
+                        Status::from_static(
+                            Code::ResourceExhausted,
+                            "native request body exceeds method limit",
+                        ),
                         "body_limit",
-                    )
-                    .into_http());
+                    ));
                 }
                 let (parts, body) = request.into_parts();
                 request = Request::from_parts(
@@ -426,9 +487,10 @@ where
                 Ok(result) => result?,
                 Err(_) => {
                     gate.reject("running_deadline");
-                    return Ok(
-                        Status::deadline_exceeded("native ingress deadline elapsed").into_http()
-                    );
+                    return Ok(error_headers.respond(Status::from_static(
+                        Code::DeadlineExceeded,
+                        "native ingress deadline elapsed",
+                    )));
                 }
             };
             if class == MethodClass::Stream {
@@ -449,35 +511,45 @@ where
 }
 
 fn entry_deadline(headers: &axum::http::HeaderMap, arrival: Instant) -> Result<Instant, Status> {
-    let timeout = match headers
-        .get_all("grpc-timeout")
-        .iter()
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [] => LOCAL_ENTRY_CAP,
-        [value] => parse_grpc_timeout(value)?.min(LOCAL_ENTRY_CAP),
-        _ => return Err(Status::invalid_argument("duplicate grpc-timeout header")),
+    let mut timeouts = headers.get_all("grpc-timeout").iter();
+    let timeout = match (timeouts.next(), timeouts.next()) {
+        (None, None) => LOCAL_ENTRY_CAP,
+        (Some(value), None) => parse_grpc_timeout(value)?.min(LOCAL_ENTRY_CAP),
+        _ => {
+            return Err(Status::from_static(
+                Code::InvalidArgument,
+                "duplicate grpc-timeout header",
+            ));
+        }
     };
-    arrival
-        .checked_add(timeout)
-        .ok_or_else(|| Status::invalid_argument("grpc-timeout exceeds local time range"))
+    arrival.checked_add(timeout).ok_or_else(|| {
+        Status::from_static(
+            Code::InvalidArgument,
+            "grpc-timeout exceeds local time range",
+        )
+    })
 }
 
 fn parse_grpc_timeout(value: &axum::http::HeaderValue) -> Result<Duration, Status> {
     let text = value
         .to_str()
-        .map_err(|_| Status::invalid_argument("invalid grpc-timeout header"))?;
+        .map_err(|_| Status::from_static(Code::InvalidArgument, "invalid grpc-timeout header"))?;
     if !(2..=9).contains(&text.len()) {
-        return Err(Status::invalid_argument("invalid grpc-timeout header"));
+        return Err(Status::from_static(
+            Code::InvalidArgument,
+            "invalid grpc-timeout header",
+        ));
     }
     let (digits, unit) = text.split_at(text.len() - 1);
     if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Status::invalid_argument("invalid grpc-timeout header"));
+        return Err(Status::from_static(
+            Code::InvalidArgument,
+            "invalid grpc-timeout header",
+        ));
     }
     let amount = digits
         .parse::<u64>()
-        .map_err(|_| Status::invalid_argument("invalid grpc-timeout header"))?;
+        .map_err(|_| Status::from_static(Code::InvalidArgument, "invalid grpc-timeout header"))?;
     let nanos = match unit {
         "H" => 3_600_000_000_000_u64,
         "M" => 60_000_000_000_u64,
@@ -485,11 +557,16 @@ fn parse_grpc_timeout(value: &axum::http::HeaderValue) -> Result<Duration, Statu
         "m" => 1_000_000_u64,
         "u" => 1_000_u64,
         "n" => 1_u64,
-        _ => return Err(Status::invalid_argument("invalid grpc-timeout header")),
+        _ => {
+            return Err(Status::from_static(
+                Code::InvalidArgument,
+                "invalid grpc-timeout header",
+            ));
+        }
     };
     let duration = amount
         .checked_mul(nanos)
-        .ok_or_else(|| Status::invalid_argument("grpc-timeout is too large"))?;
+        .ok_or_else(|| Status::from_static(Code::InvalidArgument, "grpc-timeout is too large"))?;
     Ok(Duration::from_nanos(duration))
 }
 
@@ -740,7 +817,7 @@ mod tests {
     async fn expired_deadline_never_takes_an_available_running_slot() {
         let gate = Gate::new(1, 0, "ordinary", false, 1024);
         assert!(
-            matches!(gate.acquire(Instant::now()).await, Err(status) if status.code() == tonic::Code::DeadlineExceeded)
+            matches!(gate.acquire(Instant::now()).await, Err(failure) if failure.status.code() == tonic::Code::DeadlineExceeded)
         );
         assert_eq!(gate.running.available_permits(), 1);
     }
