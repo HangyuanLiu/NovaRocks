@@ -26,6 +26,7 @@ mod comparison;
 mod content;
 mod function;
 mod largeint;
+pub mod logical_type;
 mod partition;
 
 pub use arithmetic::{
@@ -50,4 +51,8 @@ pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
     PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
+};
+
+pub use logical_type::{
+    LogicalField, LogicalType, LogicalTypeLimits, LogicalTypeUsage, LogicalValue,
 };
