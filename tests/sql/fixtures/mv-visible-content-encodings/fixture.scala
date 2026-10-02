@@ -505,7 +505,7 @@ object RecursiveTypeFixture {
               require(t.getId()!=null,"Raw Parquet semantic field lacks a real ID")
               val id=t.getId().intValue(); require(id>0 && seen.add(id),"Raw Parquet semantic field ID invalid or duplicate")
               rawIds+=obj("path"->currentPath().mkString("."),"id"->id,"repetition"->t.getRepetition().toString,
-                "primitive_type"->(if(t.isPrimitive) t.asPrimitiveType().getPrimitiveTypeName().toString else null))
+                "primitive_type"->(if(t.isPrimitive) t.asPrimitiveType().getPrimitiveTypeName().toString() else null))
               java.lang.Integer.valueOf(0)
             }
             override def message(t: MessageType,fields: java.util.List[java.lang.Integer]): java.lang.Integer = java.lang.Integer.valueOf(0)
