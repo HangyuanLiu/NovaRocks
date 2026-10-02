@@ -34,7 +34,7 @@ use crate::catalog_application::query_bindings::{
 use crate::catalog_application::query_catalog::{
     CatalogResolutionError, CatalogResolutionResult, ConnectorQueryTableMaterialization,
     QueryCatalogService, load_connector_table_alias_materialization_with_lease_typed,
-    load_connector_table_materialization_with_lease_typed,
+    load_connector_table_materialization_for_read_with_lease_typed,
 };
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::catalog::{
@@ -667,17 +667,18 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(table)
                 .map(|(base_table, snapshot_id)| (base_table, Some(snapshot_id)))
                 .unwrap_or((table, None));
-        let mut materialization = load_connector_table_materialization_with_lease_typed(
+        let selector = snapshot_id.map_or(
+            novarocks_spi::connector::ConnectorReadSelector::Current,
+            novarocks_spi::connector::ConnectorReadSelector::SnapshotId,
+        );
+        let materialization = load_connector_table_materialization_for_read_with_lease_typed(
             self.controls,
             self.connector_context.clone(),
             catalog,
             namespace,
             base_table,
+            selector,
         )?;
-        if let Some(snapshot_id) = snapshot_id {
-            materialization.read_selector =
-                novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id);
-        }
         connector_query_binding_from_materialization(
             materialization,
             catalog,
@@ -1256,3 +1257,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "query_materializer/historical_schema_tests.rs"]
+mod historical_schema_tests;

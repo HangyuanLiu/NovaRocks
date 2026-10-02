@@ -562,10 +562,24 @@ impl ConnectorMetadata for IcebergMetadata {
         &self,
         request: ConnectorTableRequest,
     ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        self.load_table_for_read(request, ConnectorReadSelector::Current)
+    }
+
+    fn load_table_for_read(
+        &self,
+        request: ConnectorTableRequest,
+        selector: ConnectorReadSelector,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.table.instance_id)?;
         let (table_name, metadata_table_type) =
             resolve_table_request(&request.table.table, request.resolution)?;
+        if metadata_table_type.is_some() && selector != ConnectorReadSelector::Current {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg metadata aliases do not support historical schema materialization",
+            ));
+        }
         // A metadata load is the Provider's observation boundary for catalog
         // truth. External engines can evolve a REST/Hadoop table without going
         // through this process, so a process-lifetime physical cache entry must
@@ -583,10 +597,23 @@ impl ConnectorMetadata for IcebergMetadata {
             )
             .map_err(classified_control_error)?;
         let metadata = loaded.table.metadata();
-        let definition_schema = metadata.current_schema().clone();
+        let snapshot_id = select_snapshot(metadata, selector)?;
+        // Schema, field domains and all planning facts come from this one
+        // loaded metadata generation. Use the reader's existing historical
+        // projection policy, including its identity-preserving rename case.
+        let definition_schema = match selector {
+            ConnectorReadSelector::Current => metadata.current_schema().clone(),
+            ConnectorReadSelector::SnapshotId(_) | ConnectorReadSelector::TimestampMicros(_) => {
+                crate::typed_boundary::projection_schema_for_pinned_snapshot(
+                    metadata,
+                    snapshot_id
+                        .ok_or_else(|| corrupt("historical Iceberg read has no snapshot"))?,
+                )?
+            }
+        };
         let table_comment = metadata.properties().get("comment").cloned();
         let mut base_schema =
-            crate::field_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+            crate::field_domain::metadata_sql_schema(metadata, &definition_schema)?;
         let hidden_columns = hidden_internal_columns(metadata.properties());
         base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
         // Carry the same frozen field facts a scan output schema carries, so the
@@ -594,7 +621,7 @@ impl ConnectorMetadata for IcebergMetadata {
         // field-for-field identical.
         base_schema = crate::schema_mapping::annotate_read_schema_from_scan_model(
             &base_schema,
-            &iceberg_schema_def(metadata.current_schema()),
+            &iceberg_schema_def(&definition_schema),
         )
         .map_err(corrupt)?;
         let logical_type_columns = logical_type_columns(metadata.properties());
@@ -605,10 +632,10 @@ impl ConnectorMetadata for IcebergMetadata {
                 namespace: request.table.namespace.to_string(),
                 table: table_name.clone(),
                 table_uuid: Some(metadata.uuid().to_string()),
-                current_snapshot_id: metadata.current_snapshot_id(),
-                schema_id: metadata.current_schema_id(),
+                current_snapshot_id: snapshot_id,
+                schema_id: definition_schema.schema_id(),
                 location: metadata.location().to_string(),
-                schema: iceberg_schema_def(metadata.current_schema()),
+                schema: iceberg_schema_def(&definition_schema),
                 serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
                     corrupt(format!("serialize Iceberg table metadata: {error}"))
                 })?),
@@ -732,7 +759,7 @@ impl ConnectorMetadata for IcebergMetadata {
         };
         let statistics_data_version = crate::statistics_codec::statistics_data_version(
             &metadata.uuid().to_string(),
-            metadata.current_snapshot_id(),
+            snapshot_id,
         )?;
         Ok(ConnectorTableMetadata {
             identity: ConnectorTableIdentity {
@@ -744,7 +771,7 @@ impl ConnectorMetadata for IcebergMetadata {
             planning_facts,
             definition_facts,
             version: Some(Bytes::copy_from_slice(
-                &metadata.current_schema_id().to_le_bytes(),
+                &definition_schema.schema_id().to_le_bytes(),
             )),
             statistics_data_version: Some(statistics_data_version),
             table: ConnectorTableHandle::try_new(
@@ -2241,6 +2268,446 @@ mod plan_splits_pruning_tests {
             encode_payload(&payload, "test exact revision", 64 * 1024).unwrap(),
         )
         .unwrap()
+    }
+
+    fn historical_metadata_request() -> ConnectorTableRequest {
+        ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        }
+    }
+
+    fn write_historical_metadata(
+        warehouse: &std::path::Path,
+        rename_only: bool,
+    ) -> (crate::iceberg::spec::TableMetadata, i64) {
+        use crate::iceberg::spec::StructType;
+        let location = warehouse.join("db/orders");
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "payload",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::optional(
+                        2,
+                        "note",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        3,
+                        "reused",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                ])),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            location.display().to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let initial = metadata.current_schema().clone();
+        let root = initial.as_struct().fields()[0].as_ref();
+        let Type::Struct(inner) = root.field_type.as_ref() else {
+            panic!("struct");
+        };
+        let note = inner.fields()[0].as_ref();
+        let reused = inner.fields()[1].as_ref();
+        let declaration = crate::field_domain::encode(&BTreeMap::from([
+            (note.id, crate::field_domain::FieldDomain::Json),
+            (reused.id, crate::field_domain::FieldDomain::Int16),
+        ]))
+        .unwrap();
+        let timestamp = metadata.last_updated_ms();
+        let snapshot = |id, schema_id, timestamp, parent| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_parent_snapshot_id(parent)
+                .with_sequence_number(id)
+                .with_timestamp_ms(timestamp)
+                .with_manifest_list(
+                    location
+                        .join(format!("metadata/manifest-{id}.avro"))
+                        .display()
+                        .to_string(),
+                )
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(schema_id)
+                .build()
+        };
+        let mut next_root = root.clone();
+        let mut next_note = note.clone();
+        if rename_only {
+            next_note.name = "renamed_note".to_string();
+        }
+        let next_reused = if rename_only {
+            reused.clone()
+        } else {
+            NestedField::optional(
+                metadata.last_column_id() + 1,
+                "reused",
+                Type::Primitive(PrimitiveType::Int),
+            )
+        };
+        next_root.field_type = Box::new(Type::Struct(StructType::new(vec![
+            Arc::new(next_note),
+            Arc::new(next_reused),
+        ])));
+        let next_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(next_root)])
+            .build()
+            .unwrap();
+        let metadata = metadata
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                crate::field_domain::PROPERTY.to_string(),
+                declaration,
+            )]))
+            .unwrap()
+            .add_snapshot(snapshot(101, initial.schema_id(), timestamp, None))
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(101, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        // Main activation history records committed transitions, not every
+        // intermediate set_ref in one builder transaction.
+        let activation = metadata
+            .history()
+            .iter()
+            .find(|entry| entry.snapshot_id == 101)
+            .expect("first committed main activation")
+            .timestamp_ms();
+        let metadata = metadata
+            .into_builder(None)
+            .add_current_schema(next_schema)
+            .unwrap()
+            .add_snapshot(snapshot(102, 1, activation + 1, Some(101)))
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(102, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let activations = metadata
+            .history()
+            .iter()
+            .map(|entry| (entry.snapshot_id, entry.timestamp_ms()))
+            .collect::<Vec<_>>();
+        assert_eq!(activations.len(), 2);
+        assert_eq!(activations[0], (101, activation));
+        assert_eq!(activations[1].0, 102);
+        assert!(activations[1].1 > activation);
+        let directory = location.join("metadata");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("v1.metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("version-hint.text"), b"1\n").unwrap();
+        (metadata, activation)
+    }
+
+    #[test]
+    fn historical_load_table_for_read_preserves_nested_domains_payload_and_snapshot_statistics() {
+        use arrow::datatypes::DataType;
+        let (_runtime, warehouse, provider) = provider();
+        let (stored, timestamp) = write_historical_metadata(warehouse.path(), false);
+        let current = provider.load_table(historical_metadata_request()).unwrap();
+        let historical = provider
+            .load_table_for_read(
+                historical_metadata_request(),
+                ConnectorReadSelector::SnapshotId(101),
+            )
+            .unwrap();
+        let timestamp_read = provider
+            .load_table_for_read(
+                historical_metadata_request(),
+                ConnectorReadSelector::TimestampMicros(timestamp * 1000),
+            )
+            .unwrap();
+        let DataType::Struct(current_fields) = current.schema.field(0).data_type() else {
+            panic!("struct");
+        };
+        let DataType::Struct(old_fields) = historical.schema.field(0).data_type() else {
+            panic!("struct");
+        };
+        assert_eq!(current_fields[1].data_type(), &DataType::Int32);
+        assert_eq!(old_fields[1].data_type(), &DataType::Int16);
+        assert_eq!(
+            old_fields[0]
+                .metadata()
+                .get("nr_logical_type")
+                .map(String::as_str),
+            Some("json")
+        );
+        assert_eq!(timestamp_read.schema, historical.schema);
+        assert_ne!(current.version, historical.version);
+        assert_eq!(
+            historical.version.as_ref().unwrap().as_ref(),
+            &0_i32.to_le_bytes()
+        );
+        assert_ne!(
+            current.statistics_data_version,
+            historical.statistics_data_version
+        );
+        assert_eq!(
+            historical.statistics_data_version,
+            Some(
+                crate::statistics_codec::statistics_data_version(
+                    &stored.uuid().to_string(),
+                    Some(101)
+                )
+                .unwrap()
+            )
+        );
+        let payload = provider.table_payload(&historical.table).unwrap();
+        let info = payload.table_info.as_ref().unwrap();
+        assert_eq!(info.current_snapshot_id, Some(101));
+        assert_eq!(info.schema_id, 0);
+        assert_eq!(
+            info.schema,
+            iceberg_schema_def(stored.schema_by_id(0).unwrap())
+        );
+        assert_eq!(
+            projected_schema(&payload, &[0]).unwrap().field(0),
+            historical.schema.field(0)
+        );
+        let decoded = crate::schema_preflight::decode_table_metadata(
+            info.serialized_metadata.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.current_schema_id(),
+            stored.current_schema_id(),
+            "complete metadata stays intact while read projection is historical"
+        );
+        assert_eq!(
+            historical.planning_facts.column_facts().len(),
+            historical.schema.fields().len()
+        );
+        assert_eq!(historical.definition_facts.columns().len(), 1);
+        assert!(
+            provider
+                .load_table_for_read(
+                    historical_metadata_request(),
+                    ConnectorReadSelector::SnapshotId(999)
+                )
+                .is_err()
+        );
+        assert!(
+            provider
+                .load_table_for_read(
+                    historical_metadata_request(),
+                    ConnectorReadSelector::TimestampMicros(0)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn historical_load_table_for_read_retains_existing_pure_rename_projection_and_rejects_aliases()
+    {
+        use arrow::datatypes::DataType;
+        let (_runtime, warehouse, provider) = provider();
+        let (stored, _) = write_historical_metadata(warehouse.path(), true);
+        let historical = provider
+            .load_table_for_read(
+                historical_metadata_request(),
+                ConnectorReadSelector::SnapshotId(101),
+            )
+            .unwrap();
+        let DataType::Struct(fields) = historical.schema.field(0).data_type() else {
+            panic!("struct");
+        };
+        assert_eq!(fields[0].name(), "renamed_note");
+        assert_eq!(fields[1].data_type(), &DataType::Int16);
+        let payload = provider.table_payload(&historical.table).unwrap();
+        assert_eq!(
+            payload.table_info.as_ref().unwrap().schema_id,
+            stored.current_schema_id()
+        );
+        assert_eq!(
+            payload.table_info.as_ref().unwrap().current_snapshot_id,
+            Some(101)
+        );
+        assert_eq!(
+            projected_schema(&payload, &[0]).unwrap().field(0),
+            historical.schema.field(0)
+        );
+        let mut alias = historical_metadata_request();
+        alias.table.table = Arc::from("orders$files");
+        alias.resolution = ConnectorTableResolution::ProviderReadAlias;
+        assert_eq!(
+            provider
+                .load_table_for_read(alias, ConnectorReadSelector::SnapshotId(101))
+                .err()
+                .expect("historical metadata alias must be rejected")
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn historical_load_table_for_read_and_typed_factory_share_the_exact_request_observation() {
+        use crate::typed_boundary::{IcebergTypedBoundary, IcebergTypedRequestControlFactory};
+        use crate::typed_read::{HiveTransactionHandle, IcebergRuntimeRelation};
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadRelationVersion, ConnectorReadRequestControlFactory, ConnectorSession,
+            SchemaTableName,
+        };
+        use novarocks_spi::connector::{CatalogHandle, CatalogVersion, ConnectorPlanningContext};
+        let (_runtime, warehouse, provider) = provider();
+        let (original, _) = write_historical_metadata(warehouse.path(), false);
+        let request = historical_metadata_request();
+        let same_scope = request.context.clone().without_attempt_capabilities();
+        let admitted = provider
+            .load_table_for_read(request, ConnectorReadSelector::SnapshotId(102))
+            .unwrap();
+
+        // Advance only catalog metadata after the SQL schema was admitted.
+        // A fresh request sees the rename; the same request must retain its
+        // successful provider observation even before typed control exists.
+        let mut root = original.current_schema().as_struct().fields()[0]
+            .as_ref()
+            .clone();
+        root.name = "renamed_payload".to_string();
+        let next_schema = Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![Arc::new(root)])
+            .build()
+            .unwrap();
+        let newer = original
+            .clone()
+            .into_builder(None)
+            .add_current_schema(next_schema)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(newer.uuid(), original.uuid());
+        assert_eq!(newer.current_snapshot_id(), original.current_snapshot_id());
+        let directory = warehouse.path().join("db/orders/metadata");
+        std::fs::write(
+            directory.join("v2.metadata.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("version-hint.text"), b"2\n").unwrap();
+
+        let template = Arc::new(IcebergTypedBoundary::new(
+            provider.descriptor.clone(),
+            provider.incarnation,
+            CatalogHandle::new(
+                provider.descriptor.instance_id.clone(),
+                CatalogVersion::from_bytes([1; 32]),
+            ),
+            HiveTransactionHandle::new(true, [2; 16]),
+            Arc::clone(&provider.runtime),
+        ));
+        let inspection = novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::new(
+            template.clone(),
+        );
+        let factory = IcebergTypedRequestControlFactory::new(template);
+        let session = ConnectorSession::try_new(
+            "same-scope-history",
+            "root",
+            "UTC",
+            "en-US",
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let name = SchemaTableName::try_new("db", "orders").unwrap();
+        let control = factory
+            .for_planning(&ConnectorPlanningContext::try_from_request(same_scope).unwrap())
+            .unwrap();
+        let metadata = control.metadata();
+        let handle = metadata
+            .get_table_handle(
+                &session,
+                &name,
+                ConnectorReadRelationVersion::SnapshotId(102),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let IcebergRuntimeRelation::Table(old) = inspection.table(&handle).unwrap() else {
+            panic!("table");
+        };
+        assert_eq!(old.parse_table_schema().unwrap().schema_id(), 1);
+        assert_eq!(
+            old.read_domain().unwrap().endpoint().table_uuid(),
+            original.uuid()
+        );
+        let columns = metadata.get_column_bindings(&session, &handle).unwrap();
+        let old_column = columns
+            .iter()
+            .find(|column| column.name() == "payload")
+            .unwrap();
+        let column = inspection.column(old_column.column()).unwrap();
+        let old_schema = old.parse_table_schema().unwrap();
+        let physical = crate::schema_mapping::sql_read_schema_from_iceberg(&old_schema).unwrap();
+        let logical =
+            crate::field_domain::apply_schema(physical, &old_schema, column.field_domains())
+                .unwrap();
+        assert_eq!(logical.field(0), admitted.schema.field(0));
+        assert!(
+            columns
+                .iter()
+                .all(|column| column.name() != "renamed_payload")
+        );
+
+        let fresh = factory
+            .for_planning(&ConnectorPlanningContext::try_from_request(context()).unwrap())
+            .unwrap();
+        let fresh_metadata = fresh.metadata();
+        let fresh_handle = fresh_metadata
+            .get_table_handle(
+                &session,
+                &name,
+                ConnectorReadRelationVersion::SnapshotId(102),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let IcebergRuntimeRelation::Table(new) = inspection.table(&fresh_handle).unwrap() else {
+            panic!("table");
+        };
+        assert_eq!(new.parse_table_schema().unwrap().schema_id(), 2);
+        let new_columns = fresh_metadata
+            .get_column_bindings(&session, &fresh_handle)
+            .unwrap();
+        assert!(
+            new_columns
+                .iter()
+                .any(|column| column.name() == "renamed_payload")
+        );
+        assert!(new_columns.iter().all(|column| column.name() != "payload"));
     }
 
     #[test]
