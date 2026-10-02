@@ -4919,6 +4919,45 @@ mod tests {
         .unwrap()
     }
 
+    fn assert_single_row_end_without_ack(
+        fixture: &OwnerFixture,
+        root: TaskIdentity,
+        data: &novarocks_execution_contract::root_result::RootResultData,
+        runtime: &tokio::runtime::Runtime,
+    ) {
+        use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+        use novarocks_result_contract::RootProfileId;
+        use novarocks_worker::root_result_channel::ContextRootRoute;
+        assert_eq!(data.sequence().get(), 1);
+        if let Some(end) = data.end_after_data() {
+            assert_eq!(end.output_rows, 1);
+            assert_eq!(end.sequence.get(), 2);
+        }
+        // A complete small row may precede knowledge of EOS. Published Data
+        // is immutable, so a separate End is equally valid. Read it without
+        // ACKing Data; FINISHED was already observed before either read.
+        let request = RootResultRead::try_new(
+            root,
+            RootProfileId::V1,
+            data.kind(),
+            Some(NonZeroU64::new(2).unwrap()),
+            0,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let ContextRootRoute::Read(read) = fixture.registry.context_root_result_route(&request)
+        else {
+            panic!("finished root must retain its independent End");
+        };
+        let delivery = runtime.block_on(read.read()).unwrap();
+        assert_eq!(delivery.reply().accepted_consumed, 0);
+        let RootReadOutcome::End(end) = &delivery.reply().outcome else {
+            panic!("finished root must offer End: {:?}", delivery.reply());
+        };
+        assert_eq!(end.output_rows, 1);
+        assert_eq!(end.sequence.get(), 2);
+    }
+
     #[test]
     fn bounded_root_count_finishes_before_read_and_survives_task_retirement() {
         use novarocks_execution_contract::root_result::RootReadOutcome;
@@ -5090,10 +5129,7 @@ mod tests {
             panic!("root did not encode client bytes")
         };
         assert_eq!(data.body().as_ref(), &[3, 0, 0, 0, 2, b'4', b'2']);
-        assert!(
-            data.end_after_data()
-                .is_some_and(|end| end.output_rows == 1 && end.sequence.get() == 2)
-        );
+        assert_single_row_end_without_ack(&fixture, root, data, &runtime);
         assert!(
             matches!(
                 runtime.block_on(novarocks_worker::result_buffer::wait_fetch_task_typed(
@@ -5154,10 +5190,7 @@ mod tests {
                 0, 0, 116, 104, 101, 116, 97, 255, 0, 3
             ]
         );
-        assert!(
-            data.end_after_data()
-                .is_some_and(|end| end.output_rows == 1 && end.sequence.get() == 2)
-        );
+        assert_single_row_end_without_ack(&fixture, root, data, &runtime);
         drop(delivery);
         fixture.registry.abort_query_context(
             &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
@@ -5222,7 +5255,8 @@ mod tests {
         };
         assert!(
             format!("{error:?}")
-                .contains("statistics materializer roles or bounds differ from its frozen domain")
+                .contains("statistics materializer roles or bounds differ from its frozen domain"),
+            "unexpected Statistics preparation refusal: {error:?}"
         );
         assert!(host.task_runtime(root).is_none());
         // Prepare rollback activates asynchronous producer cleanup. Joining
