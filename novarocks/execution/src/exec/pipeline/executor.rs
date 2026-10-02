@@ -1030,6 +1030,8 @@ mod tests {
             arena,
             root: ExecNode {
                 kind: ExecNodeKind::Project(ProjectNode {
+                    retention_admission:
+                        novarocks_local_program::ProjectRetentionAdmission::Existing,
                     input: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
                     }),

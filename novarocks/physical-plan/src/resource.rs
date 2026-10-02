@@ -133,6 +133,16 @@ impl CutResourcePreflight {
         validate_value_type(ty, path, &mut self.usage, errors);
     }
 
+    pub(crate) fn add_cut_value_type(
+        &mut self,
+        ty: &ValueType,
+        path: &str,
+        errors: &mut ValidationContext,
+    ) {
+        self.add_bytes(std::mem::size_of::<Option<crate::ValueLogicalKind>>());
+        self.add_value_type(ty, path, errors);
+    }
+
     pub(crate) fn validate(self, path: &str, errors: &mut ValidationContext) -> CutResourceUsage {
         let result = CutResourceUsage {
             items: self.usage.items,
@@ -254,6 +264,7 @@ pub(crate) fn validate_fragment_cut_resources(
             );
         }
         for (ordinal, import) in cut.imports.iter().enumerate() {
+            usage.add_bytes(std::mem::size_of::<Option<crate::ValueLogicalKind>>());
             if usage.exhausted() {
                 break;
             }
@@ -298,6 +309,7 @@ pub(crate) fn validate_fragment_cut_resources(
             );
         }
         for (ordinal, value) in cut.projection.iter().enumerate() {
+            usage.add_bytes(std::mem::size_of::<Option<crate::ValueLogicalKind>>());
             if usage.exhausted() {
                 break;
             }
@@ -309,6 +321,7 @@ pub(crate) fn validate_fragment_cut_resources(
             );
         }
         for (ordinal, import) in cut.destination_imports.iter().enumerate() {
+            usage.add_bytes(std::mem::size_of::<Option<crate::ValueLogicalKind>>());
             if usage.exhausted() {
                 break;
             }
@@ -521,6 +534,7 @@ fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> Resour
         fragment.runtime_filters().len(),
     ]);
     for (id, value) in fragment.values() {
+        usage.add_bytes(std::mem::size_of::<Option<crate::ValueLogicalKind>>());
         if usage.exhausted() {
             return usage;
         }
@@ -780,7 +794,13 @@ fn add_node_usage(
             }
             add_relation_usage(relation, &format!("{path}.relation"), usage, errors);
         }
-        NodeKind::Project { expressions } => usage.add_items(expressions.len()),
+        NodeKind::Project { expressions, .. } => {
+            usage.add_items(expressions.len());
+            usage.add_bytes(std::mem::size_of::<crate::ProjectRetentionAdmission>());
+        }
+        NodeKind::Membership { .. } => {
+            usage.add_bytes(std::mem::size_of::<crate::MembershipSpec>())
+        }
         NodeKind::Aggregate {
             group_by, calls, ..
         } => {
@@ -1712,6 +1732,46 @@ mod tests {
 
         assert!(errors.is_empty());
         assert_eq!(usage.bytes, 3 * 1024);
+    }
+
+    #[test]
+    fn membership_cut_logical_fact_refuses_at_the_preflight_byte_boundary() {
+        let mut usage = CutResourcePreflight::new();
+        let mut errors = ValidationContext::new();
+        usage.add_bytes(MAX_FRAGMENT_DYNAMIC_BYTES);
+        usage.add_cut_value_type(
+            &ValueType::new(DataType::Utf8, true),
+            "cut.value",
+            &mut errors,
+        );
+        usage.validate("cut.resources", &mut errors);
+        assert!(errors.iter().any(|error| error.category()
+            == crate::ValidationErrorCategory::ResourceLimit
+            && error.message().contains("dynamic bytes")));
+    }
+
+    #[test]
+    fn membership_facts_obey_the_same_resource_refusal_gate() {
+        let kind = NodeKind::Membership {
+            spec: crate::MembershipSpec {
+                probe: crate::ValueId::new(0),
+                build: crate::ValueId::new(1),
+                result: crate::ValueId::new(2),
+                negated: false,
+                comparison: crate::MembershipComparison::JsonInListV1,
+                distribution: crate::MembershipDistribution::BroadcastBuild,
+            },
+        };
+        let mut usage = ResourceUsage::limited(100, 1);
+        let mut errors = ValidationContext::new();
+        add_node_usage(&kind, "membership", &mut usage, &mut errors);
+        validate_usage("membership.resources", usage, 100, 1, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].category(),
+            crate::ValidationErrorCategory::ResourceLimit
+        );
+        assert!(errors[0].message().contains("dynamic bytes"));
     }
 
     #[test]

@@ -297,7 +297,7 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                 };
                 pending.push(((source.id(), source.root()), values));
             }
-            NodeKind::Project { expressions } => {
+            NodeKind::Project { expressions, .. } => {
                 let Some(input) = node.inputs.first().copied() else {
                     return false;
                 };

@@ -474,6 +474,7 @@ pub(crate) fn validate_edge(
                 // may not declare the reverse.
                 if source_value.ty.data_type != destination_value.ty.data_type
                     || (source_value.ty.nullable && !destination_value.ty.nullable)
+                    || source_value.logical_kind != destination_value.logical_kind
                 {
                     errors.push(ValidationError::new(
                         &path,

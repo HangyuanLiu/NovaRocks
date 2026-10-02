@@ -89,6 +89,55 @@ pub struct ValueDef {
     pub id: ValueId,
     pub ty: ValueType,
     pub origin: ValueOrigin,
+    /// An analyzed root logical kind, independent of the physical carrier.
+    /// Unmarked Utf8 never supplies evidence for JSON membership.
+    pub logical_kind: Option<ValueLogicalKind>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueLogicalKind {
+    Json,
+}
+
+impl ValueLogicalKind {
+    pub fn admits_carrier(self, carrier: &arrow_schema::DataType) -> bool {
+        match self {
+            Self::Json => carrier == &arrow_schema::DataType::Utf8,
+        }
+    }
+}
+
+/// The existing JSON IN-list pair policy, including its syntax fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipComparison {
+    JsonInListV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipDistribution {
+    Singleton,
+    BroadcastBuild,
+}
+
+/// Slot-only value membership. Children are probe then build; no build value
+/// is published, and the result is one fresh nullable Boolean per probe row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipSpec {
+    pub probe: ValueId,
+    pub build: ValueId,
+    pub result: ValueId,
+    pub negated: bool,
+    pub comparison: MembershipComparison,
+    pub distribution: MembershipDistribution,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProjectRetentionAdmission {
+    #[default]
+    Existing,
+    /// Check task capacity before exposing the materialized output. This is
+    /// retention admission, not a claim about expression temporary heaps.
+    CheckedTask,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -760,6 +809,10 @@ pub enum NodeKind {
     },
     Project {
         expressions: Box<[(ExprId, ValueId)]>,
+        retention_admission: ProjectRetentionAdmission,
+    },
+    Membership {
+        spec: MembershipSpec,
     },
     Aggregate {
         group_by: Box<[(ExprId, ValueId)]>,
@@ -886,7 +939,7 @@ impl NodeKind {
                 output.extend(residuals.iter().copied());
             }
             Self::Filter { predicates } => output.extend(predicates.iter().copied()),
-            Self::Project { expressions } => {
+            Self::Project { expressions, .. } => {
                 output.extend(expressions.iter().map(|(expr, _)| *expr));
             }
             Self::Aggregate {
@@ -958,6 +1011,7 @@ impl NodeKind {
                 }
             }
             Self::QuotaPreclaim { .. }
+            | Self::Membership { .. }
             | Self::QuotaTrim { .. }
             | Self::Limit { .. }
             | Self::SetOp { .. }
@@ -1108,6 +1162,7 @@ pub struct EdgePartitioning {
 pub struct CutValue {
     pub value: ValueId,
     pub ty: ValueType,
+    pub logical_kind: Option<ValueLogicalKind>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -540,6 +540,45 @@ pub(crate) fn validate_node_output_properties(
         ordering: Box::default(),
     };
     let expected = match &node.kind {
+        NodeKind::Membership { spec } => {
+            let Some(probe) = node.inputs.first().and_then(|id| fragment.nodes().get(id)) else {
+                return;
+            };
+            let Some(build) = node.inputs.get(1).and_then(|id| fragment.nodes().get(id)) else {
+                return;
+            };
+            let singleton = crate::PhysicalProperties {
+                distribution: Distribution::Singleton,
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            };
+            let broadcast = crate::PhysicalProperties {
+                distribution: Distribution::Broadcast,
+                row_multiplicity: RowMultiplicity::Replicated,
+                ordering: Box::default(),
+            };
+            let requirements = match spec.distribution {
+                crate::MembershipDistribution::Singleton => [singleton.clone(), singleton],
+                crate::MembershipDistribution::BroadcastBuild => [
+                    crate::passthrough_requirement(&probe.output_properties),
+                    broadcast,
+                ],
+            };
+            if node.required_inputs.as_ref() != requirements
+                || probe.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
+                || probe.output_properties.distribution == Distribution::Broadcast
+                || (spec.distribution == crate::MembershipDistribution::Singleton
+                    && (probe.output_properties.distribution != Distribution::Singleton
+                        || build.output_properties.distribution != Distribution::Singleton
+                        || build.output_properties.row_multiplicity != RowMultiplicity::SingleCopy))
+                || (spec.distribution == crate::MembershipDistribution::BroadcastBuild
+                    && (build.output_properties.distribution != Distribution::Broadcast
+                        || build.output_properties.row_multiplicity != RowMultiplicity::Replicated))
+            {
+                errors.push(ValidationError::new(path, "membership requires single-copy probe and its exact singleton or broadcast build placement"));
+            }
+            Some(&probe.output_properties)
+        }
         NodeKind::QuotaPreclaim { spec: _ } => {
             if node.required_inputs.len() != 2
                 || node.required_inputs[0].distribution != Distribution::Broadcast
@@ -645,7 +684,7 @@ pub(crate) fn validate_node_output_properties(
             }
             return;
         }
-        NodeKind::Project { expressions } => {
+        NodeKind::Project { expressions, .. } => {
             let Some(input) = node
                 .inputs
                 .first()

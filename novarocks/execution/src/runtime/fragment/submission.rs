@@ -901,6 +901,10 @@ pub(crate) mod tests {
 
     fn scan_ids(node: &ExecNode, ids: &mut Vec<i32>) {
         match &node.kind {
+            ExecNodeKind::Membership(n) => {
+                scan_ids(&n.probe, ids);
+                scan_ids(&n.build, ids);
+            }
             ExecNodeKind::Scan(scan) => {
                 if let Some(id) = scan.node_id() {
                     ids.push(id);

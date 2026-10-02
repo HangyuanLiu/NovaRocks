@@ -456,6 +456,7 @@ fn join_output_pass_through(
 /// What one lowered node is called, for a message that names it.
 const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
     match kind {
+        NodeKind::Membership { .. } => "Membership",
         NodeKind::QuotaPreclaim { .. } => "QuotaPreclaim",
         NodeKind::QuotaTrim { .. } => "QuotaTrim",
         NodeKind::Scan { .. } => "Scan",
@@ -539,7 +540,7 @@ fn runtime_filter_scan_lineage(
                 },
                 (position.0, node.inputs[0], position.2),
             )],
-            NodeKind::Project { expressions } if node.inputs.len() == 1 => node
+            NodeKind::Project { expressions, .. } if node.inputs.len() == 1 => node
                 .output
                 .columns
                 .iter()

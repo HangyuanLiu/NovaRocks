@@ -41,6 +41,7 @@ pub struct RuntimeState {
     fragment_instance_id: Option<UniqueId>,
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
+    provided_mem_tracker: bool,
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
     execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
 }
@@ -68,6 +69,10 @@ struct RuntimeFailure {
 }
 
 impl RuntimeErrorState {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.error.lock().expect("runtime error lock").is_some()
+    }
+
     pub fn set_error(&self, err: String) {
         let mut guard = self.error.lock().expect("runtime error lock");
         if guard.is_none() {
@@ -147,6 +152,7 @@ impl Default for RuntimeState {
             fragment_instance_id: None,
             backend_num: None,
             mem_tracker: None,
+            provided_mem_tracker: false,
             runtime_filter_session: None,
             execution_runtime: None,
         }
@@ -167,6 +173,7 @@ impl Clone for RuntimeState {
             fragment_instance_id: self.fragment_instance_id,
             backend_num: self.backend_num,
             mem_tracker: self.mem_tracker.clone(),
+            provided_mem_tracker: self.provided_mem_tracker,
             runtime_filter_session: self.runtime_filter_session.clone(),
             execution_runtime: self.execution_runtime.clone(),
         }
@@ -197,6 +204,7 @@ impl RuntimeState {
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
         execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
     ) -> Self {
+        let provided_mem_tracker = mem_tracker.is_some();
         let mem_tracker = mem_tracker.or_else(|| {
             // An execution runtime still gates host-owned query accounting, so
             // a runtime-less RuntimeState stays untracked exactly as before.
@@ -232,6 +240,7 @@ impl RuntimeState {
             fragment_instance_id,
             backend_num,
             mem_tracker,
+            provided_mem_tracker,
             runtime_filter_session: None,
             execution_runtime,
         }
@@ -253,6 +262,23 @@ impl RuntimeState {
 
     pub fn cache_options(&self) -> Option<&ExecutionCacheOptions> {
         self.cache_options.as_ref()
+    }
+
+    /// Requires both an explicitly supplied task tracker and native task identity.
+    /// Legacy query/fragment fallback accounting is not membership admission.
+    pub(crate) fn exact_task_tracker(
+        &self,
+    ) -> Option<(
+        novarocks_execution_contract::TaskIdentity,
+        std::sync::Arc<MemTracker>,
+    )> {
+        if !self.provided_mem_tracker {
+            return None;
+        }
+        Some((
+            self.verification.as_ref()?.identity(),
+            self.mem_tracker.as_ref()?.clone(),
+        ))
     }
 
     pub(crate) fn mem_tracker(&self) -> Option<std::sync::Arc<MemTracker>> {

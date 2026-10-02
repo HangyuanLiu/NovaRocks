@@ -264,9 +264,9 @@ pub(crate) fn preflight_fragment_cut_resources(
         }
         for (source_value, _) in &edge.destination.receive_mapping {
             let ty = &source.values().get(source_value)?.ty;
-            usage.add_value_type(ty, &path, errors);
+            usage.add_cut_value_type(ty, &path, errors);
             if is_outbound {
-                usage.add_value_type(ty, &path, errors);
+                usage.add_cut_value_type(ty, &path, errors);
             }
         }
         if let Some(proof) = derivation.change_stream_writer(edge.id) {
@@ -340,6 +340,7 @@ pub(crate) fn fragment_cuts_with_provenance(
                         source: CutValue {
                             value: *source_value,
                             ty: source.values().get(source_value)?.ty.clone(),
+                            logical_kind: source.values().get(source_value)?.logical_kind,
                         },
                         destination: *destination,
                     })
@@ -375,6 +376,7 @@ pub(crate) fn fragment_cuts_with_provenance(
                     Some(CutValue {
                         value: *value,
                         ty: fragment.values().get(value)?.ty.clone(),
+                        logical_kind: fragment.values().get(value)?.logical_kind,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -392,6 +394,7 @@ pub(crate) fn fragment_cuts_with_provenance(
                             source: CutValue {
                                 value: *source,
                                 ty: fragment.values().get(source)?.ty.clone(),
+                                logical_kind: fragment.values().get(source)?.logical_kind,
                             },
                             destination: *destination,
                         })
@@ -949,6 +952,7 @@ pub(crate) fn validate_fragment_cuts_into(
                 Some(value)
                     if value.ty.data_type == import.source.ty.data_type
                         && (value.ty.nullable || !import.source.ty.nullable)
+                        && value.logical_kind == import.source.logical_kind
                         && import_origin_matches(
                             &value.origin,
                             cut.edge,
@@ -1083,10 +1087,14 @@ pub(crate) fn validate_fragment_cuts_into(
         }
         for projected in &cut.projection {
             match fragment.values().get(&projected.value) {
-                Some(value) if value.ty != projected.ty => errors.push(ValidationError::new(
-                    &path,
-                    "outbound cut type differs from its source value",
-                )),
+                Some(value)
+                    if value.ty != projected.ty || value.logical_kind != projected.logical_kind =>
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "outbound cut type differs from its source value",
+                    ))
+                }
                 Some(_) => {}
                 None => errors.push(ValidationError::new(
                     &path,

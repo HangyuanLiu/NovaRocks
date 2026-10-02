@@ -105,6 +105,15 @@ pub(crate) fn validate_value(
         fragment.id().get(),
         value.id.get()
     );
+    if value
+        .logical_kind
+        .is_some_and(|kind| !kind.admits_carrier(&value.ty.data_type))
+    {
+        errors.push(ValidationError::new(
+            &path,
+            "logical kind does not admit the physical carrier",
+        ));
+    }
     match &value.origin {
         ValueOrigin::ProviderField { scan_node, field } => {
             match fragment.nodes().get(scan_node) {
@@ -123,6 +132,15 @@ pub(crate) fn validate_value(
         ValueOrigin::Expr { node, expr } => {
             require_node(fragment, *node, &path, errors);
             if let Some(expression) = fragment.expressions().get(*expr) {
+                if let crate::ExprKind::Value(source) = expression.kind
+                    && let Some(source) = fragment.values().get(&source)
+                    && source.logical_kind != value.logical_kind
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "identity expression must preserve the source logical kind",
+                    ));
+                }
                 // The value names what the expression produces, and may admit
                 // null where the expression does not: an exact value standing
                 // where null is admitted is sound. The reverse is not.
@@ -157,7 +175,10 @@ pub(crate) fn validate_value(
                 None => require_node(fragment, *node, &path, errors),
             }
             if let Some(source) = fragment.values().get(of) {
-                if source.ty.data_type != value.ty.data_type || !value.ty.nullable {
+                if source.ty.data_type != value.ty.data_type
+                    || !value.ty.nullable
+                    || source.logical_kind != value.logical_kind
+                {
                     errors.push(ValidationError::new(
                         &path,
                         "null-extended value must preserve the data type and be nullable",
@@ -385,9 +406,16 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::TopN { .. }
         | NodeKind::Limit { .. }
         | NodeKind::AssertOneRow(_) => Some(input_columns.to_vec()),
-        NodeKind::Project { expressions } => {
+        NodeKind::Project { expressions, .. } => {
             Some(expressions.iter().map(|(_, value)| *value).collect())
         }
+        NodeKind::Membership { spec } => Some(
+            input_columns
+                .iter()
+                .copied()
+                .chain(std::iter::once(spec.result))
+                .collect(),
+        ),
         NodeKind::Aggregate {
             group_by, calls, ..
         } => Some(
@@ -669,6 +697,17 @@ pub(crate) fn value_origin_allowed(
                     == Some(&definition.id)
         }
         (
+            NodeKind::Membership { spec },
+            ValueOrigin::NodeOutput {
+                node: owner,
+                output_ordinal,
+            },
+        ) => {
+            *owner == node.id
+                && definition.id == spec.result
+                && usize::try_from(*output_ordinal).ok() == Some(ordinal)
+        }
+        (
             NodeKind::Values { .. }
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
@@ -694,6 +733,7 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
         NodeKind::HashJoin { .. }
         | NodeKind::NestLoopJoin { .. }
+        | NodeKind::Membership { .. }
         | NodeKind::QuotaPreclaim { .. }
         | NodeKind::QuotaTrim { .. } => node.inputs.len() == 2,
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
@@ -788,7 +828,7 @@ pub(crate) fn validate_node_semantics(
             }
             require_passthrough_output(fragment, node, path, errors);
         }
-        NodeKind::Project { expressions } => {
+        NodeKind::Project { expressions, .. } => {
             let input = node.inputs.first().and_then(|id| fragment.nodes().get(id));
             let input_values = input.and_then(|input| indexes.output(input.id));
             for (expression, value) in expressions {
@@ -1282,7 +1322,8 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && (input_value.ty.data_type != output_value.ty.data_type
+                        && (input_value.logical_kind != output_value.logical_kind
+                            || input_value.ty.data_type != output_value.ty.data_type
                             || (input_value.ty.nullable && !output_value.ty.nullable))
                     {
                         // A set operation's column admits null when any branch
@@ -2011,7 +2052,64 @@ pub(crate) fn validate_node_semantics(
         NodeKind::QuotaPreclaim { .. } | NodeKind::QuotaTrim { .. } => {
             validate_quota(fragment, node, path, errors)
         }
+        NodeKind::Membership { spec } => validate_membership(fragment, node, spec, path, errors),
         NodeKind::Unpivot { spec } => validate_unpivot(fragment, node, indexes, spec, path, errors),
+    }
+}
+
+fn validate_membership(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    spec: &crate::MembershipSpec,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let inputs = node
+        .inputs
+        .iter()
+        .filter_map(|id| fragment.nodes().get(id))
+        .collect::<Vec<_>>();
+    let [probe, build] = inputs.as_slice() else {
+        return;
+    };
+    for (child, slot) in [(*probe, spec.probe), (*build, spec.build)] {
+        require_value(fragment, slot, path, errors);
+        if child
+            .output
+            .columns
+            .iter()
+            .filter(|value| **value == slot)
+            .count()
+            != 1
+        {
+            errors.push(ValidationError::new(
+                path,
+                "membership operand is not one exact child output occurrence",
+            ));
+        }
+        if !fragment.values().get(&slot).is_some_and(|value| {
+            value.logical_kind == Some(crate::ValueLogicalKind::Json)
+                && value.ty.data_type == DataType::Utf8
+        }) {
+            errors.push(ValidationError::new(
+                path,
+                "membership requires declared JSON Utf8 operands",
+            ));
+        }
+    }
+    require_value(fragment, spec.result, path, errors);
+    let fresh = !probe.output.columns.contains(&spec.result)
+        && !build.output.columns.contains(&spec.result);
+    let exact_result = fragment.values().get(&spec.result).is_some_and(|value| {
+        value.ty.data_type == DataType::Boolean && value.ty.nullable && value.logical_kind.is_none()
+            && matches!(value.origin, ValueOrigin::NodeOutput { node: owner, output_ordinal }
+                if owner == node.id && usize::try_from(output_ordinal).ok() == Some(probe.output.columns.len()))
+    });
+    if !fresh || !exact_result {
+        errors.push(ValidationError::new(
+            path,
+            "membership result must be a fresh node-owned nullable Boolean",
+        ));
     }
 }
 
@@ -2426,7 +2524,7 @@ pub(crate) fn validate_unpivot(
         }
         if let (Some(input), Some(output)) =
             (fragment.values().get(input), fragment.values().get(output))
-            && input.ty != output.ty
+            && (input.ty != output.ty || input.logical_kind != output.logical_kind)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2476,7 +2574,9 @@ pub(crate) fn validate_unpivot(
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
         ) {
-            if input.ty.data_type != output.ty.data_type {
+            if input.ty.data_type != output.ty.data_type
+                || input.logical_kind != output.logical_kind
+            {
                 errors.push(ValidationError::new(
                     path,
                     "unpivot mapping input type differs from its value output",

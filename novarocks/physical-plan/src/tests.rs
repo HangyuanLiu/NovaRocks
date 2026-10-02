@@ -29,6 +29,7 @@ mod aggregate_sequence_contract;
 mod artifact_provenance_contract;
 mod contract_regressions;
 mod exchange_occurrence_contract;
+mod membership_contract;
 mod ordering_window_assertion_contract;
 mod partition_scan_contract;
 mod runtime_filter_wait_contract;
@@ -496,6 +497,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
                 columns: Box::from([destination_value, destination_value]),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: Box::from([
                     (result_expression, destination_value),
                     (result_expression, destination_value),
@@ -1059,6 +1061,7 @@ fn duplicate_builder_insert_does_not_replace_the_existing_definition() {
     let id = ValueId::new(3);
     builder
         .insert_value(ValueDef {
+            logical_kind: None,
             id,
             ty: ty(DataType::Int64, false),
             origin: ValueOrigin::WriterDerived {
@@ -1070,6 +1073,7 @@ fn duplicate_builder_insert_does_not_replace_the_existing_definition() {
     assert_eq!(
         builder
             .insert_value(ValueDef {
+                logical_kind: None,
                 id,
                 ty: ty(DataType::Utf8, true),
                 origin: ValueOrigin::WriterDerived {
@@ -1609,6 +1613,7 @@ fn project_cannot_publish_an_uncomputed_output() {
                 columns: Box::from([fabricated]),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: Box::default(),
             },
         })
@@ -2054,6 +2059,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
                 columns: Box::from([b]),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: Box::from([(project_b, b)]),
             },
         })
@@ -2498,6 +2504,7 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
             kind: EdgeKind::Stream,
             destination_fragment: FragmentId::new(34),
             projection: Box::from([CutValue {
+                logical_kind: None,
                 value,
                 ty: ty(DataType::Decimal128(0, 0), false),
             }]),

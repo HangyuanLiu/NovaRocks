@@ -831,6 +831,10 @@ impl TreeContext<'_> {
         let prefix = format!("{pad}{}:", self.display_id(fragment.id(), node.id));
         let stats = self.stats_suffix(fragment.id(), node.id);
         match &node.kind {
+            NodeKind::Membership { spec } => out.push(format!(
+                "{prefix}MEMBERSHIP [{:?}, negated={}]{stats}",
+                spec.comparison, spec.negated
+            )),
             NodeKind::QuotaPreclaim { spec } => {
                 out.push(format!("{prefix}QUOTA PRECLAIM{stats}"));
                 out.push(format!(
@@ -936,7 +940,7 @@ impl TreeContext<'_> {
                     .collect::<Vec<_>>();
                 out.push(format!("{pad}  predicate: {}", text.join(" AND ")));
             }
-            NodeKind::Project { expressions } => {
+            NodeKind::Project { expressions, .. } => {
                 let items = expressions
                     .iter()
                     .map(|(expression, value)| {

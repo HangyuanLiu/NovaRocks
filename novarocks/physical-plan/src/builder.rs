@@ -26,7 +26,7 @@ use crate::{
     FragmentParts, FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan,
     PhysicalPlanParts, PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts,
     ResultPort, RuntimeFilter, RuntimeFilterId, SealedArtifactRef, ValidationErrors, ValueDef,
-    ValueId, ValueOrigin, ValueType, validate_fragment_definition, validate_plan,
+    ValueId, ValueLogicalKind, ValueOrigin, ValueType, validate_fragment_definition, validate_plan,
 };
 
 /// Mutable construction state. It cannot be encoded, scheduled or viewed as a
@@ -88,17 +88,35 @@ impl FragmentBuilder {
     }
 
     pub fn add_value(&mut self, ty: ValueType, origin: ValueOrigin) -> Result<ValueId, BuildError> {
+        self.add_value_with_logical_kind(ty, origin, None)
+    }
+
+    /// Defines the analyzed logical kind together with the exact value. There
+    /// is deliberately no operation that marks an already-defined Utf8 value.
+    pub fn add_value_with_logical_kind(
+        &mut self,
+        ty: ValueType,
+        origin: ValueOrigin,
+        logical_kind: Option<ValueLogicalKind>,
+    ) -> Result<ValueId, BuildError> {
         let id = ValueId::new(self.next_value);
-        self.next_value = self
-            .next_value
-            .checked_add(1)
-            .ok_or(BuildError::IdentitySpaceExhausted("value"))?;
-        self.insert_value(ValueDef { id, ty, origin })?;
+        self.insert_value(ValueDef {
+            id,
+            ty,
+            origin,
+            logical_kind,
+        })?;
         Ok(id)
     }
 
     pub fn insert_value(&mut self, value: ValueDef) -> Result<(), BuildError> {
         let id = value.id;
+        if value
+            .logical_kind
+            .is_some_and(|kind| !kind.admits_carrier(&value.ty.data_type))
+        {
+            return Err(BuildError::InvalidLogicalKind(id));
+        }
         let next_value = self.next_value.max(
             id.get()
                 .checked_add(1)
@@ -389,6 +407,23 @@ impl FragmentBuilder {
         expressions: Box<[(ExprId, ValueId)]>,
         output: Box<[ValueId]>,
     ) -> Result<(), BuildError> {
+        self.add_project_with_retention(
+            node,
+            input,
+            expressions,
+            output,
+            crate::ProjectRetentionAdmission::Existing,
+        )
+    }
+
+    pub fn add_project_with_retention(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        expressions: Box<[(ExprId, ValueId)]>,
+        output: Box<[ValueId]>,
+        retention_admission: crate::ProjectRetentionAdmission,
+    ) -> Result<(), BuildError> {
         let source = self
             .nodes
             .get(&input)
@@ -424,7 +459,62 @@ impl FragmentBuilder {
                 node,
                 columns: output,
             },
-            kind: NodeKind::Project { expressions },
+            kind: NodeKind::Project {
+                expressions,
+                retention_admission,
+            },
+        })
+    }
+
+    /// Adds slot-only membership without changing probe occurrences or properties.
+    pub fn add_membership(
+        &mut self,
+        node: NodeId,
+        probe: NodeId,
+        build: NodeId,
+        spec: crate::MembershipSpec,
+    ) -> Result<(), BuildError> {
+        let probe_node = self
+            .nodes
+            .get(&probe)
+            .ok_or(BuildError::UndefinedInput { node, input: probe })?;
+        if !self.nodes.contains_key(&build) {
+            return Err(BuildError::UndefinedInput { node, input: build });
+        }
+        for value in [spec.probe, spec.build, spec.result] {
+            if !self.values.contains_key(&value) {
+                return Err(BuildError::UndefinedValue(value));
+            }
+        }
+        let output_properties = probe_node.output_properties.clone();
+        let mut output = probe_node.output.columns.to_vec();
+        output.push(spec.result);
+        let singleton = crate::PhysicalProperties {
+            distribution: crate::Distribution::Singleton,
+            row_multiplicity: crate::RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        let required_inputs = match spec.distribution {
+            crate::MembershipDistribution::Singleton => [singleton.clone(), singleton],
+            crate::MembershipDistribution::BroadcastBuild => [
+                crate::passthrough_requirement(&output_properties),
+                crate::PhysicalProperties {
+                    distribution: crate::Distribution::Broadcast,
+                    row_multiplicity: crate::RowMultiplicity::Replicated,
+                    ordering: Box::default(),
+                },
+            ],
+        };
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::from([probe, build]),
+            required_inputs: Box::from(required_inputs),
+            output_properties,
+            output: OutputPort {
+                node,
+                columns: output.into_boxed_slice(),
+            },
+            kind: NodeKind::Membership { spec },
         })
     }
 
@@ -1154,6 +1244,7 @@ pub enum BuildError {
     },
     UndefinedExpression(ExprId),
     UndefinedValue(ValueId),
+    InvalidLogicalKind(ValueId),
     /// Expressions belong to exactly one node's evaluation scope, so using one
     /// under a different node is a scope violation rather than a type error.
     ExpressionOutsideOwner {
@@ -1248,6 +1339,11 @@ impl fmt::Display for BuildError {
                 write!(formatter, "expression {} is not defined", id.get())
             }
             Self::UndefinedValue(id) => write!(formatter, "value {} is not defined", id.get()),
+            Self::InvalidLogicalKind(id) => write!(
+                formatter,
+                "logical kind does not admit the carrier of value {}",
+                id.get()
+            ),
             Self::ExpressionOutsideOwner { expr, owner, node } => write!(
                 formatter,
                 "expression {} belongs to node {}, not node {}",

@@ -1805,7 +1805,7 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                 }
                 let fragment = plan.fragments().get(&fragment)?;
                 let node = fragment.nodes().get(&node)?;
-                let NodeKind::Project { expressions } = &node.kind else {
+                let NodeKind::Project { expressions, .. } = &node.kind else {
                     return None;
                 };
                 if node.inputs.len() != 1
@@ -2129,7 +2129,7 @@ fn quota_content_key_has_exact_tuple(
             return false;
         }
         match &node.kind {
-            NodeKind::Project { expressions } if node.inputs.len() == 1 => {
+            NodeKind::Project { expressions, .. } if node.inputs.len() == 1 => {
                 let Some(input) = fragment.nodes().get(&node.inputs[0]) else {
                     return false;
                 };

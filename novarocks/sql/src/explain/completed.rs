@@ -2787,6 +2787,7 @@ fn render_node_contract(
         ));
     }
     match &node.kind {
+        NodeKind::Membership { spec } => lines.push(format_args!("{pad}  probe=v{}, build=v{}, result=v{}, negated={}, comparison={:?}, distribution={:?}", spec.probe.get(), spec.build.get(), spec.result.get(), spec.negated, spec.comparison, spec.distribution)),
         NodeKind::QuotaPreclaim { spec } => lines.push(format_args!(
             "{pad}  domain=n{}, need={:?}, entry=v{}, key=v{}, target-file=v{}, target-position=v{}, content={:?}, max-state-bytes={}",
             spec.preselection_domain.get(), spec.demand_need, spec.demand_entry_id.get(), spec.demand_key.get(),
@@ -2905,7 +2906,7 @@ fn render_node_contract(
                 ));
             }
         }
-        NodeKind::Project { expressions } => lines.push(format_args!(
+        NodeKind::Project { expressions, .. } => lines.push(format_args!(
             "{pad}  expressions=[{}]",
             joined(expressions, ", ", |(expression, output): &(ExprId, ValueId), formatter: &mut fmt::Formatter<'_>| write!(
                     formatter,
@@ -3652,6 +3653,7 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
         let context = self.context;
         let node = self.node;
         match &node.kind {
+            NodeKind::Membership { .. } => formatter.write_str("MEMBERSHIP")?,
             NodeKind::QuotaPreclaim { .. } => formatter.write_str("QUOTA PRECLAIM")?,
             NodeKind::QuotaTrim { .. } => formatter.write_str("QUOTA TRIM")?,
             NodeKind::Scan { .. } => {

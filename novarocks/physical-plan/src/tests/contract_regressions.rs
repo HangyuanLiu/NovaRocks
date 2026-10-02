@@ -197,6 +197,7 @@ fn null_safe_join_filter(
                 columns: Box::from([left_value, other_left_value]),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: Box::from([
                     (left_identity, left_value),
                     (other_expression, other_left_value),
@@ -474,6 +475,7 @@ fn scan_lineage_filter(
                     columns: Box::from([projected, projected, other]),
                 },
                 kind: NodeKind::Project {
+                    retention_admission: crate::ProjectRetentionAdmission::Existing,
                     expressions: Box::from([
                         (identity, projected),
                         (identity, projected),
@@ -2222,6 +2224,7 @@ fn higher_order_function_fragment(
                 columns: outputs.into_boxed_slice(),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: projections.into_boxed_slice(),
             },
         })
@@ -3198,6 +3201,7 @@ fn quota_content_filter(
                 columns: projected.into_boxed_slice(),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: expressions.into_boxed_slice(),
             },
         })

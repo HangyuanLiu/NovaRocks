@@ -459,8 +459,42 @@ pub struct QuotaContentFilter {
     pub producer: StaticFilterProducer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipComparison {
+    JsonInListV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipDistribution {
+    Singleton,
+    BroadcastBuild,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipSpec {
+    pub probe: SlotId,
+    pub build: SlotId,
+    pub result: SlotId,
+    pub negated: bool,
+    pub comparison: MembershipComparison,
+    pub distribution: MembershipDistribution,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProjectRetentionAdmission {
+    #[default]
+    Existing,
+    /// Capacity admission of final materialized buffers, before publication.
+    CheckedTask,
+}
+
 #[derive(Clone, Debug)]
 pub enum ProgramNodeKind {
+    Membership {
+        probe: ProgramNodeId,
+        build: ProgramNodeId,
+        spec: MembershipSpec,
+    },
     QuotaPreclaim {
         demand: ProgramNodeId,
         target: ProgramNodeId,
@@ -480,6 +514,7 @@ pub enum ProgramNodeKind {
         values: StaticValues,
     },
     Project {
+        retention_admission: ProjectRetentionAdmission,
         input: ProgramNodeId,
         is_subordinate: bool,
         exprs: Vec<ProgramExprId>,
@@ -641,6 +676,7 @@ impl ProgramNodeKind {
             Self::UnionAll { inputs }
             | Self::SetOp { inputs, .. }
             | Self::TableFinish { inputs, .. } => inputs.clone(),
+            Self::Membership { probe, build, .. } => vec![*probe, *build],
             Self::QuotaPreclaim { demand, target, .. } => vec![*demand, *target],
             Self::QuotaTrim {
                 seeds, candidates, ..
@@ -661,7 +697,8 @@ impl ProgramNodeKind {
             | Self::TableFunction { .. }
             | Self::SetOp { .. }
             | Self::TableFinish { .. }
-            | Self::QuotaTrim { .. } => Vec::new(),
+            | Self::QuotaTrim { .. }
+            | Self::Membership { .. } => Vec::new(),
             Self::QuotaPreclaim {
                 runtime_filters, ..
             } => runtime_filters.iter().map(|f| f.demand_expr).collect(),
@@ -869,6 +906,7 @@ impl LocalProgram {
             if matches!(
                 node.kind,
                 ProgramNodeKind::Scan { .. }
+                    | ProgramNodeKind::Membership { .. }
                     | ProgramNodeKind::QuotaPreclaim { .. }
                     | ProgramNodeKind::QuotaTrim { .. }
                     | ProgramNodeKind::ExchangeSource { .. }
@@ -1215,6 +1253,14 @@ fn validate_relationships(
         )
     };
     match &node.kind {
+        ProgramNodeKind::Membership { probe, build, spec } => {
+            validate_membership_layout(
+                spec,
+                &nodes[probe.index()].output_layout,
+                &nodes[build.index()].output_layout,
+                &node.output_layout,
+            )?;
+        }
         ProgramNodeKind::QuotaPreclaim { spec, .. }
             if spec.preselection_domain.get() != node.native_node_id =>
         {
@@ -1291,6 +1337,59 @@ fn validate_relationships(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_membership_layout(
+    spec: &MembershipSpec,
+    probe: &StaticLayout,
+    build: &StaticLayout,
+    output: &StaticLayout,
+) -> Result<(), LocalProgramError> {
+    use novarocks_types::logical::LogicalType;
+    let json_slot = |layout: &StaticLayout, slot: SlotId| {
+        layout
+            .slots()
+            .iter()
+            .position(|value| *value == slot)
+            .is_some_and(|index| {
+                layout.schema().field(index).data_type() == &DataType::Utf8
+                    && layout
+                        .slot_metadata_at(index)
+                        .is_some_and(|(field, _)| field.logical_type() == Some(LogicalType::Json))
+            })
+    };
+    if !probe.has_exact_slot_metadata()
+        || !build.has_exact_slot_metadata()
+        || !output.has_exact_slot_metadata()
+        || !json_slot(probe, spec.probe)
+        || !json_slot(build, spec.build)
+        || probe.slots().contains(&spec.result)
+        || build.slots().contains(&spec.result)
+        || output.slots().len() != probe.slots().len() + 1
+        || &output.slots()[..probe.slots().len()] != probe.slots()
+        || output.slots().last() != Some(&spec.result)
+        || output.schema().metadata() != probe.schema().metadata()
+    {
+        return Err(LocalProgramError::LayoutMismatch);
+    }
+    for index in 0..probe.slots().len() {
+        if output.schema().field(index) != probe.schema().field(index)
+            || output.slot_metadata_at(index) != probe.slot_metadata_at(index)
+        {
+            return Err(LocalProgramError::LayoutMismatch);
+        }
+    }
+    let index = probe.slots().len();
+    let field = output.schema().field(index);
+    if field.data_type() != &DataType::Boolean
+        || !field.is_nullable()
+        || !output.slot_metadata_at(index).is_some_and(|(schema, _)| {
+            schema.logical_type().is_none() && schema.children().is_empty()
+        })
+    {
+        return Err(LocalProgramError::LayoutMismatch);
     }
     Ok(())
 }
@@ -1932,3 +2031,6 @@ mod tests {
         assert_eq!(KernelAbiVersion::CURRENT.get(), 2);
     }
 }
+
+#[cfg(test)]
+mod membership_tests;

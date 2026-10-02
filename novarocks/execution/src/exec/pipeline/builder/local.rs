@@ -193,6 +193,7 @@ fn validate_runtime_binding_shape(
         let effectful = matches!(
             node.kind(),
             lp::ProgramNodeKind::Scan { .. }
+                | lp::ProgramNodeKind::Membership { .. }
                 | lp::ProgramNodeKind::QuotaPreclaim { .. }
                 | lp::ProgramNodeKind::QuotaTrim { .. }
                 | lp::ProgramNodeKind::ExchangeSource { .. }
@@ -222,6 +223,10 @@ fn validate_runtime_binding_shape(
             | lp::ProgramNodeKind::TableWriter { input, .. }
             | lp::ProgramNodeKind::Sort { input, .. }
             | lp::ProgramNodeKind::TableFunction { input, .. } => stack.push(*input),
+            lp::ProgramNodeKind::Membership { probe, build, .. } => {
+                stack.push(*probe);
+                stack.push(*build);
+            }
             lp::ProgramNodeKind::QuotaPreclaim { demand, target, .. } => {
                 stack.push(*demand);
                 stack.push(*target);
@@ -711,6 +716,9 @@ fn build_pipeline_for_program_node(
         .ok_or_else(|| format!("missing local program node {}", id.index()))?;
     let node_id = node.native_node_id();
     match node.kind() {
+        lp::ProgramNodeKind::Membership { .. } => {
+            Err("membership runtime integration is not installed".into())
+        }
         lp::ProgramNodeKind::QuotaPreclaim {
             demand,
             target,
@@ -1592,6 +1600,7 @@ fn build_pipeline_for_program_node(
             }
         }
         lp::ProgramNodeKind::Project {
+            retention_admission,
             input,
             is_subordinate,
             exprs,
@@ -1599,6 +1608,11 @@ fn build_pipeline_for_program_node(
             expr_slot_schemas,
             output_indices,
         } => {
+            if *retention_admission != lp::ProjectRetentionAdmission::Existing {
+                return Err(
+                    "checked Project retention runtime integration is not installed".into(),
+                );
+            }
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             let schemas = expr_slot_schemas
                 .as_ref()
@@ -2291,6 +2305,7 @@ mod tests {
         };
         let root = ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission: novarocks_local_program::ProjectRetentionAdmission::Existing,
                 input: Box::new(filter),
                 node_id: 3,
                 is_subordinate: false,

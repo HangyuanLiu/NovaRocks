@@ -25,6 +25,7 @@ mod dict_decode;
 pub mod dict_peel;
 pub mod function;
 mod in_pred;
+pub(crate) mod json_in_pair;
 mod literal;
 mod slot;
 pub(crate) mod static_program;

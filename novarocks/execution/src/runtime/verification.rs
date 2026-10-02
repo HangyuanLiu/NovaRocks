@@ -48,6 +48,10 @@ impl TaskVerificationHolder {
         }
     }
 
+    pub fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+
     pub fn register(&self, instance: VerificationInstance) -> Result<(), String> {
         let mut facts = self.facts.lock().expect("task verification lock");
         if facts.sealed || instance.plan_node_id < 0 {
