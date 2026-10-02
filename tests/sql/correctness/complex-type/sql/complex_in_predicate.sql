@@ -1351,7 +1351,7 @@ WITH sc2 AS (
     END AS st1
   FROM ${case_db}.sc2_seed
 )
-select js not in (select js from sc2 where v1>3) from sc2;
+select js not in (select js from sc2 where v1>3) AS `js NOT IN (((SELECT js FROM ${case_db}.sc2 WHERE v1 > 3)))` from sc2;
 
 -- query 17
 
@@ -1439,7 +1439,7 @@ WITH sc2 AS (
     END AS st1
   FROM ${case_db}.sc2_seed
 )
-select js in (select js from sc2 where v1>3) from sc2;
+select js in (select js from sc2 where v1>3) AS `js IN (((SELECT js FROM ${case_db}.sc2 WHERE v1 > 3)))` from sc2;
 
 -- query 18
 

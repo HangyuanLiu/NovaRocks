@@ -3232,6 +3232,111 @@ fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
 }
 
 #[test]
+fn real_prepare_and_begin_accept_exact_and_read_recursive_map_carriers() {
+    use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+    use novarocks_spi::connector::{
+        ConnectorProviderBindingKey, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+        ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    };
+    let incarnation = ProviderBindingEpoch::new();
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let metadata = super::control::statistics_contract_tests::recursive_statistics_metadata();
+    let read =
+        crate::field_domain::metadata_sql_schema(&metadata, metadata.current_schema()).unwrap();
+    let table = crate::iceberg::table::Table::builder()
+        .identifier(crate::iceberg::TableIdent::from_strs(["db", "staged"]).unwrap())
+        .file_io(crate::fs_io::build_file_io_for_location(
+            metadata.location(),
+            runtime.resources().planning_binding().clone(),
+        ))
+        .metadata(metadata)
+        .build()
+        .unwrap();
+    let provider = crate::metadata::IcebergMetadata::new(
+        descriptor("unit"),
+        incarnation,
+        Arc::clone(&runtime),
+    );
+    let target = provider
+        .staged_write_table_handle(
+            &table,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            &request_context(),
+        )
+        .unwrap();
+    let read_fields = read
+        .fields()
+        .iter()
+        .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+        .collect::<Vec<_>>();
+    let mut request = staged_begin_request(target.clone());
+    request.input = ConnectorWriteInputRequest::Data {
+        fields: read_fields.clone(),
+    };
+    let ConnectorWritePreparationOutcome::Prepared(prepared) =
+        crate::commit::write_preparation::prepare_write(
+            ConnectorWritePreparationRequest {
+                table: target,
+                target_ref: request.target_ref.clone(),
+                intent: request.intent,
+                purpose: request.purpose,
+                input: request.input.clone(),
+                context: request_context(),
+            },
+            &ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("unit").unwrap(),
+                incarnation,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("prepared")
+    };
+    let exact = prepared
+        .input()
+        .fields()
+        .iter()
+        .map(|binding| ConnectorWriteFieldRequest::new(binding.field().clone()))
+        .collect::<Vec<_>>();
+    assert_ne!(
+        read_fields[1].field().data_type(),
+        exact[1].field().data_type(),
+        "read Map key is widened; exact write key is required"
+    );
+    let control = super::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        Arc::clone(&runtime),
+    );
+    for fields in [exact, read_fields] {
+        request.input = ConnectorWriteInputRequest::Data {
+            fields: fields.clone(),
+        };
+        let session = control.begin_write(request.clone()).unwrap();
+        assert_eq!(session.targets().len(), 1);
+        assert_eq!(
+            session.targets()[0]
+                .input()
+                .fields()
+                .iter()
+                .map(|binding| binding.field().clone())
+                .collect::<Vec<_>>(),
+            fields
+                .iter()
+                .map(|request| request.field().clone())
+                .collect::<Vec<_>>()
+        );
+        // Staged CREATE has no collect-on-write output, but it still validates
+        // the complete declared recursive carrier before freezing its recipe.
+        assert!(session.targets()[0].statistics().is_empty());
+    }
+}
+
+#[test]
 fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
     use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
     use novarocks_spi::connector::{
