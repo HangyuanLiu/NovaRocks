@@ -1,0 +1,119 @@
+//! Fresh owned HTTP/2 builder settings for one actual connection attempt.
+
+use hyper::client::conn::http2::Builder;
+use std::{io, sync::Arc};
+
+pub(crate) type Http2ConnectionFactory =
+    Arc<dyn Fn() -> Result<Http2ConnectionConfig, crate::Error> + Send + Sync>;
+
+/// Owned configuration returned afresh for one physical connection attempt.
+///
+/// A factory is shared by Endpoint clones; these once-bound pools are not.
+/// Obtain their original allocation grants before constructing them. This
+/// carrier neither funds socket/TLS/task/queue metadata nor proves a complete
+/// connection budget or deadline. Default options preserve existing settings.
+#[derive(Debug, Default)]
+pub struct Http2ConnectionConfig {
+    /// Local maximum inbound frame payload. This is not an outbound ceiling.
+    pub max_frame_size: Option<u32>,
+    /// Local maximum inbound decoded header list; overrides the Endpoint value.
+    pub max_header_list_size: Option<u32>,
+    /// Complete HPACK block and literal allocation precheck limit.
+    pub max_receive_header_block_size: Option<usize>,
+    /// Connection-wide count of buffered DATA/header/trailer events.
+    pub max_receive_buffered_events: Option<usize>,
+    /// Maximum per-stream outbound DATA write buffering.
+    pub max_send_buffer_size: Option<usize>,
+    /// Keep original DATA objects through successful upstream flush.
+    pub retain_data_payloads: bool,
+    /// Fresh fixed escaped DATA backing, requiring an explicit event count.
+    pub receive_buffer_pool: Option<h2::ReceiveBufferPool>,
+    /// Fresh fixed raw frame input, independent of decoded frame copies.
+    pub receive_frame_buffer: Option<h2::ReceiveFrameBuffer>,
+    /// Fresh independent GOAWAY debug backing through the last error alias.
+    pub receive_goaway_buffer_pool: Option<h2::ReceiveBufferPool>,
+}
+
+impl Http2ConnectionConfig {
+    pub(crate) fn apply<E: Clone>(self, builder: &mut Builder<E>) -> io::Result<()> {
+        let max_frame = self.max_frame_size.unwrap_or(16384) as usize;
+        if !(16384..=16777215).contains(&max_frame) {
+            return Err(invalid("invalid per-connection HTTP/2 frame maximum"));
+        }
+        if self.max_receive_buffered_events == Some(0) {
+            return Err(invalid(
+                "per-connection HTTP/2 event count must be positive",
+            ));
+        }
+        if let Some(max) = self.max_receive_header_block_size {
+            if max == 0 || max > u32::MAX as usize {
+                return Err(invalid(
+                    "invalid per-connection HTTP/2 header block maximum",
+                ));
+            }
+        }
+        if self
+            .max_send_buffer_size
+            .is_some_and(|max| max > u32::MAX as usize)
+        {
+            return Err(invalid("invalid per-connection HTTP/2 send buffer maximum"));
+        }
+        if self.receive_buffer_pool.is_some() && self.max_receive_buffered_events.is_none() {
+            return Err(invalid("per-connection DATA pool requires an event count"));
+        }
+        for pool in [
+            self.receive_buffer_pool.as_ref(),
+            self.receive_goaway_buffer_pool.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if max_frame > pool.buffer_capacity_bytes() {
+                return Err(invalid(
+                    "per-connection frame maximum exceeds pool capacity",
+                ));
+            }
+        }
+        if self
+            .receive_frame_buffer
+            .as_ref()
+            .is_some_and(|raw| max_frame > raw.max_payload_bytes())
+        {
+            return Err(invalid(
+                "per-connection frame maximum exceeds raw input capacity",
+            ));
+        }
+        // Validate every scalar/geometry before changing the builder or calling
+        // the connector. Reuse is checked by h2 bind before its handshake I/O.
+        if let Some(max) = self.max_frame_size {
+            builder.max_frame_size(max);
+        }
+        if let Some(max) = self.max_header_list_size {
+            builder.max_header_list_size(max);
+        }
+        if let Some(max) = self.max_receive_header_block_size {
+            builder.max_receive_header_block_size(max);
+        }
+        if let Some(max) = self.max_receive_buffered_events {
+            builder.max_receive_buffered_events(max);
+        }
+        if let Some(max) = self.max_send_buffer_size {
+            builder.max_send_buf_size(max);
+        }
+        builder.retain_data_payloads(self.retain_data_payloads);
+        if let Some(pool) = self.receive_buffer_pool {
+            builder.receive_buffer_pool(pool);
+        }
+        if let Some(raw) = self.receive_frame_buffer {
+            builder.receive_frame_buffer(raw);
+        }
+        if let Some(pool) = self.receive_goaway_buffer_pool {
+            builder.receive_goaway_buffer_pool(pool);
+        }
+        Ok(())
+    }
+}
+
+fn invalid(detail: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, detail)
+}

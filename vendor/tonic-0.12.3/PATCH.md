@@ -1,0 +1,17 @@
+# NovaRocks patches to Tonic 0.12.3
+
+The exact pinned registry source is vendored. UPSTREAM.json records its crate checksum and hashes of all 73 original source files. Package version and dependency versions are unchanged. The channel feature enables the existing optional h2 dependency because the additive configuration contains its owned types.
+
+## Fresh HTTP/2 configuration per physical attempt
+
+Endpoint::http2_connection_factory accepts a shared synchronous factory. Endpoint clones, lazy connections, balanced endpoints and reconnect retain the factory, while every MakeSendRequestService::call obtains a fresh Http2ConnectionConfig. The result is deliberately not Clone. It forwards frame/header/event/send bounds, original DATA retention and fresh DATA/raw-input/GOAWAY backings to the paired patched Hyper builder.
+
+Scalar and independent backing geometry are validated before builder mutation and connector.call. Factory or configuration refusal creates no dial future. The returned builder moves into the actual attempt future; dial failure or cancellation drops its owners, and a successful handshake transfers their retention to the connection and escaped DATA/error aliases. Once-bound pool reuse is refused by h2 after dial but before its first handshake I/O. A reused pool is not silently replaced.
+
+The default factory is None, preserving upstream behavior. Option fields in a returned configuration override the corresponding Endpoint base settings only when present; retain_data_payloads defaults false, matching the existing base builder. Actual Channel tests exercise reconnect, original Worker grants through late aliases, refusal, dial failure, pending-dial Drop, once-bound reuse and the default path. A separately locked offline channel-only probe checks the public API and feature dependency.
+
+Custom connector.poll_ready can run before the factory and requires its own ownership. A request cancellation does not itself prove that a background connection attempt exited. Tonic connect_timeout covers the connector future, not the subsequent Hyper handshake. Socket/TLS/task/queue/stream/header/error-box metadata, deadlines and the complete Native connection envelope are separate. This patch does not install the factory in Native clients, change listener defaults or advertise a complete connection budget or product/performance acceptance.
+
+## Source preservation
+
+The upstream benchmark README contains trailing spaces and a final blank line. Its bytes remain identical to UPSTREAM.json. A file-specific .gitattributes whitespace setting preserves that original source without disabling checks for patched code. Evidence diffs are stored as lossless gzip files so their unified-diff context prefixes are not interpreted as documentation whitespace.

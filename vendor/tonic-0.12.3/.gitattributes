@@ -1,0 +1,2 @@
+# Preserve the exact upstream benchmark README's existing whitespace.
+benches-disabled/README.md whitespace=-blank-at-eol,-blank-at-eof
