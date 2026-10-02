@@ -309,21 +309,7 @@ fn verify_message(
     verifier: &novarocks_arrow_ipc_frame::VerifierOptions,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    if verifier.max_depth > MAX_SCHEMA_VERIFIER_DEPTH {
-        return Err(TypeCodecError::InvalidShape(
-            "IPC schema verifier depth envelope exceeds supported grammar",
-        ));
-    }
-    // The official verifier adds each in-buffer visit before comparing its
-    // apparent limit. A visit cannot exceed the metadata slice, so this sum
-    // proves that even the first over-limit visit cannot overflow usize.
-    checked_add(verifier.max_apparent_size, metadata.len())?;
-    work.flush()?;
-    let parsed = novarocks_arrow_ipc_frame::verified_message(metadata, verifier);
-    // Observe the opaque verifier even on its ordinary malformed outcome.
-    work.flush()?;
-    let message =
-        parsed.map_err(|_| TypeCodecError::InvalidShape("invalid Arrow IPC schema metadata"))?;
+    let message = verified_message_observed(metadata, verifier, work)?;
     work.step()?;
     if message.version() != arrow::ipc::MetadataVersion::V5
         || message.header_type() != arrow::ipc::MessageHeader::Schema
@@ -362,4 +348,27 @@ fn verify_message(
         ));
     }
     verify::verify_field(expected, fields.get(0), work)
+}
+
+/// Common bounded, borrowed Message verification. The outer owner retains
+/// its exact message profile and completes ordinary-error tails.
+pub(crate) fn verified_message_observed<'a>(
+    metadata: &'a [u8],
+    verifier: &novarocks_arrow_ipc_frame::VerifierOptions,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<arrow::ipc::Message<'a>, TypeCodecError> {
+    if verifier.max_depth > MAX_SCHEMA_VERIFIER_DEPTH {
+        return Err(TypeCodecError::InvalidShape(
+            "IPC schema verifier depth envelope exceeds supported grammar",
+        ));
+    }
+    // The official verifier adds each in-buffer visit before comparing its
+    // apparent limit. A visit cannot exceed the metadata slice, so this sum
+    // proves that even the first over-limit visit cannot overflow usize.
+    checked_add(verifier.max_apparent_size, metadata.len())?;
+    work.flush()?;
+    let parsed = novarocks_arrow_ipc_frame::verified_message(metadata, verifier);
+    // Observe the opaque verifier even on its ordinary malformed outcome.
+    work.flush()?;
+    parsed.map_err(|_| TypeCodecError::InvalidShape("invalid Arrow IPC message metadata"))
 }
