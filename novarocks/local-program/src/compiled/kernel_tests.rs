@@ -168,8 +168,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                     None,
                 ),
                 StaticExprNode::new(
-                    StaticExprKind::FunctionCall {
-                        kind: StaticFunctionKind::Math("rand"),
+                    StaticExprKind::BoundCall {
                         args: vec![ProgramExprId::new(0)],
                     },
                     DataType::Float64,

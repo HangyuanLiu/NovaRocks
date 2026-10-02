@@ -318,8 +318,10 @@ impl ProgramResolvedCalls {
                 let definition = definitions
                     .node(invocation.definition)
                     .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-                let StaticExprKind::FunctionCall { args, .. } = definition.kind() else {
-                    continue;
+                let args = match definition.kind() {
+                    StaticExprKind::FunctionCall { args, .. }
+                    | StaticExprKind::BoundCall { args } => args,
+                    _ => continue,
                 };
                 let occurrence = ProgramUseRef {
                     arena: *arena,

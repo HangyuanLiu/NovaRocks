@@ -88,7 +88,9 @@ mod legacy_string_measure_contract_tests {
             DataType::Int32,
         );
         let frozen = arena.into_immutable().unwrap();
-        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
+        let output = ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
+            .eval(call, &chunk)?;
         assert_eq!(output.data_type(), &DataType::Int32);
         Ok(output)
     }

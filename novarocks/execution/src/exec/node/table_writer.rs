@@ -110,7 +110,7 @@ impl TableWriterInputProjection {
         projection: &novarocks_local_program::StaticWriterProjection,
         runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> Result<Self, String> {
-        let mut arena = ExprArena::from_immutable(&projection.arena);
+        let mut arena = ExprArena::from_immutable(&projection.arena)?;
         arena.bind_runtime_error(runtime_error);
         let exprs = projection
             .expressions

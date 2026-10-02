@@ -362,7 +362,8 @@ mod tests {
             .expect("freeze before runtime binding");
         assert_eq!(immutable.nodes()[source.0].data_type(), &input_type);
         assert_eq!(immutable.nodes()[absolute.0].data_type(), &output);
-        let prepared = ExprArena::from_immutable(&immutable);
+        let prepared =
+            ExprArena::from_immutable(&immutable).expect("legacy frozen expression fixture");
         let result = prepared.eval(absolute, &chunk)?;
         assert_eq!(
             result.data_type(),

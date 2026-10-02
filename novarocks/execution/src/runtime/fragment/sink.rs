@@ -174,7 +174,7 @@ fn materialize_fragment_sink_components_impl(
                 fragment_instance_id,
                 *sender_id,
                 plan_node_id,
-                bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error)),
+                bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error))?,
                 std::sync::Arc::clone(&transmitter),
             );
             // Without the gates a push sink sends the moment it has rows, and
@@ -235,10 +235,10 @@ fn materialize_fragment_sink_components_impl(
 fn bound_sink_arena(
     expressions: &novarocks_local_program::ImmutableExpressions,
     runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-) -> ExprArena {
-    let mut arena = ExprArena::from_immutable(expressions);
+) -> Result<ExprArena, FragmentLaunchError> {
+    let mut arena = ExprArena::from_immutable(expressions).map_err(materialization_error)?;
     arena.bind_runtime_error(runtime_error);
-    arena
+    Ok(arena)
 }
 
 fn materialize_multicast(
@@ -264,7 +264,7 @@ fn materialize_multicast(
         sinks,
         fragment_instance_id,
         sender_id,
-        bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error)),
+        bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error))?,
         plan_node_id,
         transmitter,
     );
@@ -296,7 +296,7 @@ fn materialize_split(
         .zip(groups)
         .map(|(stream, destinations)| branch_input(stream, destinations.clone()))
         .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
-    let runtime_arena = bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error));
+    let runtime_arena = bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error))?;
     let factory = SplitDataStreamSinkFactory::new(
         sinks,
         fragment_instance_id,
@@ -383,11 +383,13 @@ mod runtime_arena_tests {
         let frozen = construction.into_immutable().unwrap();
         let stopped =
             std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
-        let runtime = bound_sink_arena(&frozen, std::sync::Arc::clone(&stopped));
+        let runtime = bound_sink_arena(&frozen, std::sync::Arc::clone(&stopped))
+            .expect("legacy sink fixture");
         let sibling = bound_sink_arena(
             &frozen,
             std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
-        );
+        )
+        .expect("legacy sink fixture");
         assert!(
             runtime
                 .wait_interruptibly(std::time::Duration::ZERO)

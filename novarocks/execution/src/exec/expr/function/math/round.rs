@@ -392,7 +392,9 @@ mod legacy_rounding_contract_tests {
             output_type.clone(),
         );
         let frozen = arena.into_immutable().unwrap();
-        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
+        let output = ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
+            .eval(call, &chunk)?;
         assert_eq!(output.data_type(), &output_type);
         Ok(output)
     }

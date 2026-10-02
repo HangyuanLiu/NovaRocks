@@ -3988,11 +3988,15 @@ dependencies = [
 name = "novarocks-local-compiler"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "arrow-schema",
  "bytes",
  "novarocks-connector-contract",
+ "novarocks-functions",
+ "novarocks-local-program",
  "novarocks-physical-plan",
  "novarocks-type-contract",
+ "novarocks-types",
 ]
 
 [[package]]

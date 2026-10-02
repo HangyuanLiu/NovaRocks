@@ -2643,7 +2643,7 @@ mod tests {
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let frozen = arena.into_immutable().unwrap();
-        let arena = ExprArena::from_immutable(&frozen);
+        let arena = ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.is_null(0));
@@ -2678,7 +2678,8 @@ mod tests {
         let ne = arena.push_typed(ExprNode::Ne(left, right), DataType::Boolean);
         let safe = arena.push_typed(ExprNode::EqForNull(left, right), DataType::Boolean);
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         for (expr, expected) in [
             (
                 eq,
@@ -2765,7 +2766,7 @@ mod tests {
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
         let expr = arena.push_typed(ExprNode::Ne(l, r), DataType::Boolean);
         let frozen = arena.into_immutable().unwrap();
-        let arena = ExprArena::from_immutable(&frozen);
+        let arena = ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.is_null(0));
@@ -2851,7 +2852,7 @@ mod tests {
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), struct_type);
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let frozen = arena.into_immutable().unwrap();
-        let arena = ExprArena::from_immutable(&frozen);
+        let arena = ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.value(0));
@@ -2917,7 +2918,7 @@ mod tests {
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), map_type);
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let frozen = arena.into_immutable().unwrap();
-        let arena = ExprArena::from_immutable(&frozen);
+        let arena = ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.is_null(0));

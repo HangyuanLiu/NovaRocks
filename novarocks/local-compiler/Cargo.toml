@@ -13,8 +13,12 @@ doctest = false
 [dependencies]
 novarocks-connector-contract.workspace = true
 novarocks-physical-plan.workspace = true
+novarocks-local-program.workspace = true
+novarocks-functions.workspace = true
+novarocks-types.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
 novarocks-type-contract.workspace = true
 
 [dev-dependencies]
-arrow-schema.workspace = true
 bytes.workspace = true

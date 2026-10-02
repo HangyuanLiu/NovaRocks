@@ -1178,7 +1178,8 @@ mod tests {
             out,
         );
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let factor = pow10_i256(15).unwrap();
         let scaled = [
             i256::from_i128(i128::MAX).checked_mul(factor).unwrap(),

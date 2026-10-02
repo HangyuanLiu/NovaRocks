@@ -66,18 +66,25 @@ impl ExprArena {
     /// Build the existing expression kernel ABI for one LocalProgramGraph instance.
     /// The source remains the only retained static expression graph; dictionary
     /// bytes stay behind shared Arcs.
-    pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Self {
+    pub(crate) fn from_immutable(expressions: &ImmutableExpressions) -> Result<Self, String> {
+        if expressions
+            .nodes()
+            .iter()
+            .any(|node| matches!(node.kind(), StaticExprKind::BoundCall { .. }))
+        {
+            return Err("compiled calls cannot enter the legacy expression bridge".to_string());
+        }
         let mut arena = Self::default();
         arena.set_allow_throw_exception(expressions.allow_throw_exception());
         arena.set_query_global_dicts(expressions.query_global_dicts().clone());
         arena.set_session_time_zone(expressions.session_time_zone().map(str::to_owned));
         for node in expressions.nodes() {
-            let id = arena.push_typed(thaw_kind(node.kind()), node.data_type().clone());
+            let id = arena.push_typed(thaw_kind(node.kind())?, node.data_type().clone());
             if let Some(schema) = node.field_schema() {
                 arena.set_field_schema(id, thaw_field_schema(schema));
             }
         }
-        arena
+        Ok(arena)
     }
 }
 
@@ -104,9 +111,12 @@ fn old_id(id: ProgramExprId) -> ExprId {
     ExprId(id.index())
 }
 
-fn thaw_kind(kind: &StaticExprKind) -> ExprNode {
+fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
     use StaticExprKind as Static;
-    match kind {
+    Ok(match kind {
+        Static::BoundCall { .. } => {
+            return Err("compiled calls cannot enter the legacy expression bridge".to_string());
+        }
         Static::Literal(value) => ExprNode::Literal(thaw_literal(value)),
         Static::Constant(value) => ExprNode::Constant(value.clone()),
         Static::SlotId(slot) => ExprNode::SlotId(*slot),
@@ -179,7 +189,7 @@ fn thaw_kind(kind: &StaticExprKind) -> ExprNode {
             args: args.iter().copied().map(old_id).collect(),
         },
         Static::Clone(child) => ExprNode::Clone(old_id(*child)),
-    }
+    })
 }
 
 fn thaw_literal(value: &StaticLiteral) -> LiteralValue {
@@ -423,6 +433,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiled_call_cannot_enter_legacy_expression_dispatch() {
+        let expressions = ImmutableExpressions::try_new(
+            vec![StaticExprNode::new(
+                StaticExprKind::BoundCall { args: vec![] },
+                DataType::Float64,
+                None,
+            )],
+            false,
+            HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let error = match ExprArena::from_immutable(&expressions) {
+            Err(error) => error,
+            Ok(_) => panic!("compiled call entered legacy dispatch"),
+        };
+        assert_eq!(
+            error,
+            "compiled calls cannot enter the legacy expression bridge"
+        );
+    }
+
+    #[test]
     fn runtime_bound_arena_cannot_be_frozen_again() {
         let mut arena = ExprArena::default();
         arena.bind_runtime_error(Arc::new(
@@ -508,8 +541,9 @@ mod tests {
                 Some(*policy)
             );
         }
-        let mut first = ExprArena::from_immutable(&frozen);
-        let second = ExprArena::from_immutable(&frozen);
+        let mut first =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
+        let second = ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         first.set_allow_throw_exception(true);
         for (id, policy) in expected {
             assert_eq!(first.decimal_overflow_policy(id), Some(policy));

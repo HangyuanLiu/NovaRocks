@@ -645,7 +645,8 @@ mod tests {
             assert_eq!(stored.value_type(), &ty);
             assert_eq!(stored.field(), value.field());
             assert!(Arc::ptr_eq(stored.pool().array(), value.pool().array()));
-            let thawed = ExprArena::from_immutable(&frozen);
+            let thawed =
+                ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
             let Some(ExprNode::Constant(restored)) = thawed.node(id) else {
                 panic!("thaw must retain the exact constant owner");
             };

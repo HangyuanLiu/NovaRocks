@@ -242,7 +242,9 @@ mod legacy_extrema_contract_tests {
         );
         assert_eq!(arena.decimal_overflow_policy(call), None);
         let frozen = arena.into_immutable().unwrap();
-        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
+        let output = ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
+            .eval(call, &chunk)?;
         assert_eq!(output.data_type(), &result_type);
         Ok(output)
     }
@@ -769,7 +771,8 @@ mod legacy_extrema_contract_tests {
                 DataType::Float64,
             );
             let frozen = arena.into_immutable().unwrap();
-            let arena = ExprArena::from_immutable(&frozen);
+            let arena =
+                ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
             let error = arena.eval(call, &chunk).unwrap_err();
             assert!(
                 error.contains("expects 1 to") && error.contains("got 0"),

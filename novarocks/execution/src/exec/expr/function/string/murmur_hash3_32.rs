@@ -320,7 +320,8 @@ mod tests {
             DataType::Int32,
         );
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let actual_text = prepared.eval(text, &chunk).unwrap();
         let actual_text = actual_text.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(actual_text.iter().collect::<Vec<_>>(), expected_text);

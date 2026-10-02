@@ -746,7 +746,7 @@ fn validate_intrinsic_correspondence(
             .node(invocation.definition)
             .ok_or(ProgramRootBindingError::InvalidDefinition)?;
         let expected = match definition.kind() {
-            StaticExprKind::FunctionCall { .. } => continue,
+            StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => continue,
             StaticExprKind::And(..) => ControlShape::Conjunction,
             StaticExprKind::Or(..) => ControlShape::Disjunction,
             StaticExprKind::LambdaFunction { .. } => ControlShape::LambdaBody,
@@ -871,7 +871,9 @@ fn validate_intrinsic_correspondence(
                     child(*definition)?;
                 }
             }
-            StaticExprKind::FunctionCall { .. } => unreachable!("frozen owner checks calls"),
+            StaticExprKind::FunctionCall { .. } | StaticExprKind::BoundCall { .. } => {
+                unreachable!("frozen owner checks calls")
+            }
         }
         if ordinal != invocation.arguments.len() {
             return Err(ProgramRootBindingError::WrongArguments);

@@ -320,7 +320,9 @@ mod legacy_vector_contract_tests {
             DataType::Float64,
         );
         let frozen = arena.into_immutable().unwrap();
-        ExprArena::from_immutable(&frozen).eval(call, &chunk)
+        ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
+            .eval(call, &chunk)
     }
     fn assert_values(array: &ArrayRef, expected: &[Option<f64>]) {
         assert_eq!(array.data_type(), &DataType::Float64);

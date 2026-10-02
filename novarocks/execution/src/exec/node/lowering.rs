@@ -1294,7 +1294,10 @@ mod tests {
                 nulls_first: key.nulls_first,
             })
             .collect();
-        let runtime_arena = Arc::new(ExprArena::from_immutable(program.expressions()));
+        let runtime_arena = Arc::new(
+            ExprArena::from_immutable(program.expressions())
+                .expect("legacy frozen expression fixture"),
+        );
         let factory = SortProcessorFactory::new_topn(
             2,
             runtime_arena,

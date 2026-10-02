@@ -771,6 +771,33 @@ impl EngineFunctionCatalog {
         finish_binding_work(result, work)
     }
 
+    /// Validate a selected definition by its exact installed identity, even
+    /// when it has no runtime occurrence. This does not resolve a user name,
+    /// authenticate frozen effects, prepare an implementation, or create state.
+    /// Legacy semantic metadata is deliberately outside this selected-type port.
+    pub fn validate_frozen_selection(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let definition = self
+                .definition_by_id(function)
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            let binding = exact_definition(definition)?;
+            if kind != binding.declaration.kind {
+                return Err(invalid("frozen function kind differs from the declaration"));
+            }
+            work.step()?;
+            validate_selected_definition(binding, selected, request, &mut work)
+        })();
+        finish_binding_work(result, work)
+    }
+
     /// Check one frozen binding and its already-coerced argument expressions.
     /// The executable implementation is selected by identity by its owner.
     pub fn validate_bound(
@@ -797,23 +824,33 @@ impl EngineFunctionCatalog {
                     "frozen logical argument count differs from the expression",
                 ));
             }
-            validate_selection(&binding.declaration, &bound.selected, request, &mut work)?;
-            for (argument, expected) in request.arguments.iter().zip(&bound.selected.argument_types)
-            {
-                work.step()?;
-                if !argument.matches_type_observed(expected, &mut work)? {
-                    return Err(invalid(
-                        "frozen argument types differ from the already-coerced expressions",
-                    ));
-                }
-            }
-            work.flush()?;
-            binding
-                .resolver
-                .validate_selected(&bound.selected, request, control)
+            validate_selected_definition(binding, &bound.selected, request, &mut work)
         })();
         finish_binding_work(result, work)
     }
+}
+
+/// The selected-type algorithm is shared with legacy validation without
+/// changing that entry's separate semantics/count checks or error order.
+fn validate_selected_definition(
+    binding: &FunctionBindingDefinition,
+    selected: &FunctionBindingSelection,
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
+    validate_selection(&binding.declaration, selected, request, work)?;
+    for (argument, expected) in request.arguments.iter().zip(&selected.argument_types) {
+        work.step()?;
+        if !argument.matches_type_observed(expected, work)? {
+            return Err(invalid(
+                "frozen argument types differ from the already-coerced expressions",
+            ));
+        }
+    }
+    work.flush()?;
+    binding
+        .resolver
+        .validate_selected(selected, request, work.control())
 }
 
 fn exact_definition(

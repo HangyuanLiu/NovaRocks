@@ -89,6 +89,7 @@ mod legacy_elementary_contract_tests {
         );
         let frozen = arena.into_immutable().unwrap();
         let result = ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
             .eval(call, &chunk)
             .unwrap();
         assert_eq!(result.data_type(), &DataType::Float64);

@@ -88,7 +88,7 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
     local_exchange_max_buffered_rows: i64,
 ) -> Result<PipelineGraph, String> {
     validate_runtime_binding_shape(program, bindings)?;
-    let mut arena = ExprArena::from_immutable(program.expressions());
+    let mut arena = ExprArena::from_immutable(program.expressions())?;
     arena.bind_runtime_error(runtime_error);
     let mut ctx = PipelineBuildContext {
         arena: Arc::new(arena),

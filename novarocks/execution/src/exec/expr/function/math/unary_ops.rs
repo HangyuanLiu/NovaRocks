@@ -259,6 +259,7 @@ mod legacy_contract_tests {
         );
         let frozen = arena.into_immutable().unwrap();
         let output = ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
             .eval(call, &chunk)
             .unwrap();
         assert_eq!(output.data_type(), &output_type);

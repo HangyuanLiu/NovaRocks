@@ -180,6 +180,13 @@ pub enum StaticExprKind {
         has_else_expr: bool,
         children: Vec<ProgramExprId>,
     },
+    /// Compiled call shape. Its exact contract, implementation and control
+    /// belong to the mandatory per-use ProgramResolvedCalls table.
+    BoundCall {
+        args: Vec<ProgramExprId>,
+    },
+    /// Legacy construction bridge only. A dispatch tag does not resolve a
+    /// compiled function or confer effects, demand or implementation authority.
     FunctionCall {
         kind: StaticFunctionKind,
         args: Vec<ProgramExprId>,
@@ -256,7 +263,9 @@ impl StaticExprKind {
                     visit(*id)?;
                 }
             }
-            Self::Case { children, .. } | Self::FunctionCall { args: children, .. } => {
+            Self::Case { children, .. }
+            | Self::FunctionCall { args: children, .. }
+            | Self::BoundCall { args: children } => {
                 for id in children {
                     visit(*id)?;
                 }

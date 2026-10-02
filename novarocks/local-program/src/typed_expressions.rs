@@ -170,8 +170,11 @@ impl ProgramTypedExpressions {
             let definition = definitions
                 .node(invocation.definition)
                 .expect("resolved occurrence was checked");
-            let StaticExprKind::FunctionCall { args, .. } = definition.kind() else {
-                unreachable!("checked call site")
+            let args = match definition.kind() {
+                StaticExprKind::FunctionCall { args, .. } | StaticExprKind::BoundCall { args } => {
+                    args
+                }
+                _ => unreachable!("checked call site"),
             };
             let call = resolved.call_contract();
             let FunctionResultType::Scalar(result) = &call.selected().result_type else {

@@ -18,6 +18,11 @@
 //! Pure fragment preparation. Provider validation is a distinct intermediate
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 
+mod expressions;
+mod lowering;
+
+pub use lowering::{FragmentCompileError, LocalCompileOptions, compile_fragment};
+
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use novarocks_connector_contract::{
@@ -145,3 +150,6 @@ pub fn validate_fragment_providers<E: Error + 'static>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lowering_tests;

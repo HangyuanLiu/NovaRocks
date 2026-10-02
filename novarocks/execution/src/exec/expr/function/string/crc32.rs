@@ -154,7 +154,9 @@ mod legacy_crc32_contract_tests {
             DataType::Int64,
         );
         let frozen = arena.into_immutable().unwrap();
-        let output = ExprArena::from_immutable(&frozen).eval(call, &chunk)?;
+        let output = ExprArena::from_immutable(&frozen)
+            .expect("legacy frozen expression fixture")
+            .eval(call, &chunk)?;
         assert_eq!(output.data_type(), &DataType::Int64);
         Ok(output
             .as_any()
