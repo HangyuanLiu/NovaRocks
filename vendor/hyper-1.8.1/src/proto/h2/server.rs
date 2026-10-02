@@ -57,6 +57,7 @@ pub(crate) struct Config {
     pub(crate) max_receive_header_block_size: Option<usize>,
     pub(crate) max_receive_buffered_events: Option<usize>,
     pub(crate) receive_buffer_pool: Option<h2::ReceiveBufferPool>,
+    pub(crate) receive_frame_buffer: Option<h2::ReceiveFrameBuffer>,
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
 }
@@ -79,6 +80,7 @@ impl Default for Config {
             max_receive_header_block_size: None,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
+            receive_frame_buffer: None,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
         }
@@ -147,6 +149,9 @@ where
         builder.retain_data_payloads(config.retain_data_payloads);
         if let Some(max) = config.max_receive_header_block_size {
             builder.max_receive_header_block_size(max);
+        }
+        if let Some(buffer) = &config.receive_frame_buffer {
+            builder.receive_frame_buffer(buffer.clone());
         }
         if let Some(pool) = &config.receive_buffer_pool {
             builder.receive_buffer_pool(pool.clone());

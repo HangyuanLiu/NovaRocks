@@ -256,6 +256,7 @@ pub struct Builder {
     max_receive_header_block_size: Option<usize>,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
+    receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
 
     /// Maximum number of locally reset streams due to protocol error across
     /// the lifetime of the connection.
@@ -412,8 +413,31 @@ where
                 };
             }
         };
+        let receive_frame_buffer = match builder
+            .receive_frame_buffer
+            .as_ref()
+            .map(|buffer| buffer.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
+            .transpose()
+        {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
         // Create the codec.
-        let mut codec = Codec::new(io);
+        let mut codec = match receive_frame_buffer {
+            Some(buffer) => Codec::with_receive_frame_buffer(
+                io,
+                buffer,
+                builder.settings.max_frame_size().unwrap_or(16384) as usize,
+            ),
+            None => Codec::new(io),
+        };
         codec.set_retain_data_payloads(builder.retain_data_payloads);
 
         if let Some(max) = builder.settings.max_frame_size() {
@@ -700,6 +724,7 @@ impl Builder {
             max_receive_header_block_size: None,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
+            receive_frame_buffer: None,
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
@@ -1061,6 +1086,16 @@ impl Builder {
     pub fn max_receive_header_block_size(&mut self, max: usize) -> &mut Self {
         assert!(max > 0 && max <= u32::MAX as usize);
         self.max_receive_header_block_size = Some(max);
+        self
+    }
+
+    /// Supply fixed raw frame input backing under its original owner.
+    /// One buffer binds once, and its capacity must cover the local frame maximum.
+    /// Reuse/geometry conflicts fail before handshake I/O. Decoded frame copies,
+    /// HPACK/header/continuation, retained DATA and other transport owners are
+    /// separate; this alone does not prove complete connection funding.
+    pub fn receive_frame_buffer(&mut self, buffer: crate::ReceiveFrameBuffer) -> &mut Self {
+        self.receive_frame_buffer = Some(buffer);
         self
     }
 

@@ -43,4 +43,4 @@ python3 docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/reproduce.py --m
 
 当前只限制 header 解码增长并去掉 raw/pseudo table pin。原始 read BytesMut、continuation 的 capacity/spare、HeaderMap indices/buckets/duplicate metadata、table VecDeque spare、HTTP name/value/URI 逃逸后的原 carrier 租期，以及 stream/task/socket/握手等仍需准确 owner/原 grant。local header-list 的 `name+value+32` 是逻辑长度，不是 allocator footprint；不能由 16KiB 或 count 推断物理容量。完整 **2MiB connection envelope 尚未证明**。Native listener/FE Tonic Endpoint/Channel 的 owner、预 decode admission、lane 及最后原子切换仍未完成；P04 与 P05–P10 不关闭，无 push/PR/archive。
 
-文档目录检查：当前仓库没有 `docs/design` 或根 `src`，机械执行 docs/AGENTS 模板命令曾报 missing path，不能记为通过。设计/plan 使用已解析的外部 DOC_ROOT；未创建 legacy 目录。对实际 `docs/novarocks/tests` 的遗留引用扫描无命中（rg exit=1），`docs/superpowers` 不存在。
+文档目录检查：当前仓库没有 `docs/design` 或根 `src`，机械执行 docs/AGENTS 模板命令曾报 missing path，不能记为通过。设计/plan 使用已解析的外部 DOC_ROOT；未创建 legacy 目录。对实际 `docs/novarocks/tests` 的遗留引用扫描无命中（rg exit=1），模板禁止的 legacy 目录不存在。

@@ -163,3 +163,6 @@ impl<T, F: FnMut(&mut Context<'_>) -> Poll<T>> Future for PollFn<F> {
 
 mod receive_pool;
 pub use self::receive_pool::ReceiveBufferPool;
+
+mod receive_frame;
+pub use self::receive_frame::ReceiveFrameBuffer;

@@ -495,6 +495,15 @@ where
         self
     }
 
+    /// Supplies fixed raw frame input backing through its original owner.
+    /// One buffer binds once to a connection and must cover its local frame
+    /// maximum. Decoded copies, headers/continuations and other transport
+    /// allocations remain separate. Default None preserves upstream reading.
+    pub fn receive_frame_buffer(&mut self, buffer: h2::ReceiveFrameBuffer) -> &mut Self {
+        self.h2_builder.receive_frame_buffer = Some(buffer);
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

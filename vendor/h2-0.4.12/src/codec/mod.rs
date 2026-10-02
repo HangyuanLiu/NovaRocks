@@ -36,6 +36,16 @@ where
         Self::with_max_recv_frame_size(io, frame::DEFAULT_MAX_FRAME_SIZE as usize)
     }
 
+    pub(crate) fn with_receive_frame_buffer(
+        io: T,
+        buffer: crate::receive_frame::BoundFrameBuffer,
+        max_frame: usize,
+    ) -> Self {
+        let framed_write = FramedWrite::new(io);
+        let inner = FramedRead::with_receive_frame_buffer(framed_write, buffer, max_frame);
+        Codec { inner }
+    }
+
     /// Returns a new `Codec` with the given maximum frame size
     pub fn with_max_recv_frame_size(io: T, max_frame_size: usize) -> Self {
         // Wrap with writer

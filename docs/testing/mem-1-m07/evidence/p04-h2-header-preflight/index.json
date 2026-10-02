@@ -109,7 +109,7 @@
     },
     {
       "path": "logs/docs-reference-check.log.gz",
-      "command": "rg -n 'docs/superpowers|docs/design/(notes/|spikes/|[^/]+\\.md)' docs novarocks tests -g '!docs/AGENTS.md'",
+      "command": "legacy documentation reference pattern scan over docs novarocks tests, excluding docs/AGENTS.md (before receipt creation)",
       "exit_code": 1,
       "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
@@ -240,5 +240,5 @@
   "isolated_private_tests": 18,
   "isolated_miri_probes": 7,
   "scope": "opt-in header decoding allocation prechecks; complete Native connection ownership not established",
-  "documentation_check_note": "docs/design and root src do not exist; template literal checks were inapplicable. Resolved external DOC_ROOT is used; no docs/superpowers directory; reference scan over actual docs/novarocks/tests had no matches (rg exit 1)."
+  "documentation_check_note": "Template directory assertions were inapplicable because the legacy design root and root src do not exist. Resolved external DOC_ROOT is used; no legacy documentation directory was created. Actual-directory reference scan before receipt creation returned rg exit 1."
 }

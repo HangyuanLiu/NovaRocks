@@ -22,3 +22,8 @@ Client/server connection builders forward retain_data_payloads(bool), default fa
 ## Optional header allocation precheck forwarding
 
 Client/server connection builders expose max_receive_header_block_size(max), preserving the default None and cloned private Config before forwarding to h2. The paired decoder counts complete compressed HPACK blocks and prechecks declared literals, Huffman output and combined fields before HTTP copies/table insertion; pseudo backing is compacted. Oversized decode limits close the connection. Actual cloned Hyper tests refuse incomplete oversized request/response literals before a service/body can run. Raw I/O, HTTP metadata/carrier lifetime, complete connection funding and Native setup remain separate; no production default or performance acceptance changes.
+
+
+## Fixed raw input forwarding
+
+Client/server connection builders expose receive_frame_buffer(h2::ReceiveFrameBuffer), default None. Config clones retain the same original strong-only owner; the exact handle is forwarded before h2 handshake and binds once. Native reconnect paths will need a fresh funded buffer per physical connection. Real cloned Hyper tests check the actual first nine-byte header read and fixed input address range, while independent source probes cover physical raw deallocation. The separate emitted frame copy, GOAWAY/header aliases and complete Native connection budget remain outside this forwarding slice. No product setup or performance claim is made.
