@@ -323,6 +323,7 @@ pub struct Builder {
 
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
+    retain_data_payloads: bool,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
 
@@ -657,6 +658,7 @@ impl Builder {
     pub fn new() -> Builder {
         Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+            retain_data_payloads: false,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
@@ -1100,6 +1102,16 @@ impl Builder {
         self
     }
 
+    /// Keep original DATA Buf objects through successful upstream flush.
+    /// Payloads and prefixes are not copied into the codec write buffer.
+    /// Default false preserves upstream batching. Generic Buf implementations
+    /// may release their own inner chunks when advanced; Native Bytes retain
+    /// their original owner. Codec headers/TLS/task backing remain separate.
+    pub fn retain_data_payloads(&mut self, retain: bool) -> &mut Self {
+        self.retain_data_payloads = retain;
+        self
+    }
+
     /// Supply fixed retained DATA backing owned through its last Bytes alias.
     /// One pool binds once to one connection. A reused pool or a local receive
     /// frame maximum exceeding its buffer size is refused before handshake I/O.
@@ -1368,6 +1380,7 @@ where
 
         // Create the codec
         let mut codec = Codec::new(io);
+        codec.set_retain_data_payloads(builder.retain_data_payloads);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);

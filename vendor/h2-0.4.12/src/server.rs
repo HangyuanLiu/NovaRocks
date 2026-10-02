@@ -252,6 +252,7 @@ pub struct Builder {
 
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
+    retain_data_payloads: bool,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
 
@@ -412,6 +413,7 @@ where
         };
         // Create the codec.
         let mut codec = Codec::new(io);
+        codec.set_retain_data_payloads(builder.retain_data_payloads);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
@@ -689,6 +691,7 @@ impl Builder {
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+            retain_data_payloads: false,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
 
@@ -1024,6 +1027,16 @@ impl Builder {
     pub fn max_receive_buffered_events(&mut self, max: usize) -> &mut Self {
         assert!(max > 0, "receive event capacity must be positive");
         self.max_receive_buffered_events = Some(max);
+        self
+    }
+
+    /// Keep original DATA Buf objects through successful upstream flush.
+    /// Payloads and prefixes are not copied into the codec write buffer.
+    /// Default false preserves upstream batching. Generic Buf implementations
+    /// may release their own inner chunks when advanced; Native Bytes retain
+    /// their original owner. Codec headers/TLS/task backing remain separate.
+    pub fn retain_data_payloads(&mut self, retain: bool) -> &mut Self {
+        self.retain_data_payloads = retain;
         self
     }
 

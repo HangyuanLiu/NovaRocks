@@ -73,6 +73,7 @@ pub(crate) struct Config {
     pub(crate) keep_alive_while_idle: bool,
     pub(crate) max_concurrent_reset_streams: Option<usize>,
     pub(crate) max_send_buffer_size: usize,
+    pub(crate) retain_data_payloads: bool,
     pub(crate) max_receive_buffered_events: Option<usize>,
     pub(crate) receive_buffer_pool: Option<h2::ReceiveBufferPool>,
     pub(crate) max_pending_accept_reset_streams: Option<usize>,
@@ -94,6 +95,7 @@ impl Default for Config {
             keep_alive_while_idle: false,
             max_concurrent_reset_streams: None,
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
+            retain_data_payloads: false,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             max_pending_accept_reset_streams: None,
@@ -112,6 +114,7 @@ fn new_builder(config: &Config) -> Builder {
         .max_header_list_size(config.max_header_list_size)
         .max_send_buffer_size(config.max_send_buffer_size)
         .enable_push(false);
+    builder.retain_data_payloads(config.retain_data_payloads);
     if let Some(pool) = &config.receive_buffer_pool {
         builder.receive_buffer_pool(pool.clone());
     }

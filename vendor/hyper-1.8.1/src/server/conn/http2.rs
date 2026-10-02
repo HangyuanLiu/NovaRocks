@@ -270,6 +270,14 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Retains original DATA payloads through successful upstream flush,
+    /// without codec payload/prefix copies. Defaults to false for upstream
+    /// batching. This does not bound header/TLS/task or queued Body backing.
+    pub fn retain_data_payloads(&mut self, retain: bool) -> &mut Self {
+        self.h2_builder.retain_data_payloads = retain;
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

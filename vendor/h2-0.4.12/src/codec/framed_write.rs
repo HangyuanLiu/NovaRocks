@@ -50,6 +50,9 @@ struct Encoder<B> {
     /// Chain payloads bigger than this.
     chain_threshold: usize,
 
+    /// Keep the original DATA Buf through successful upstream flush.
+    retain_data_payloads: bool,
+
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
 }
@@ -98,6 +101,7 @@ where
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
+                retain_data_payloads: false,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
         }
@@ -135,7 +139,7 @@ where
 
         loop {
             while !self.encoder.is_empty() {
-                match self.encoder.next {
+                let written = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
                         let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
@@ -150,6 +154,23 @@ where
                         ))?
                     }
                 };
+                if written == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "H2 writer made no progress with buffered bytes",
+                    )));
+                }
+            }
+
+            if self.encoder.retain_data_payloads && matches!(self.encoder.next, Some(Next::Data(_)))
+            {
+                // A completed frame remains unavailable to poll_ready/reclaim
+                // while upstream flush is Pending or has failed. In Native's
+                // SendBuf<Bytes>, advancing also retains the original owner.
+                ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+                let next = self.encoder.unset_frame();
+                debug_assert!(matches!(next, ControlFlow::Break));
+                return Poll::Ready(Ok(()));
             }
 
             match self.encoder.unset_frame() {
@@ -226,7 +247,12 @@ where
                     return Err(PayloadTooBig);
                 }
 
-                if len >= self.chain_threshold {
+                if self.retain_data_payloads {
+                    // Header backing stays codec-owned; all payload bytes
+                    // come from the original Buf, including tiny/empty DATA.
+                    v.head().encode(len, self.buf.get_mut());
+                    self.next = Some(Next::Data(v));
+                } else if len >= self.chain_threshold {
                     let head = v.head();
 
                     // Encode the frame head to the buffer
@@ -303,7 +329,9 @@ where
 
     fn is_empty(&self) -> bool {
         match self.next {
-            Some(Next::Data(ref frame)) => !frame.payload().has_remaining(),
+            Some(Next::Data(ref frame)) => {
+                !self.buf.has_remaining() && !frame.payload().has_remaining()
+            }
             _ => !self.buf.has_remaining(),
         }
     }
@@ -316,6 +344,10 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    pub fn set_retain_data_payloads(&mut self, retain: bool) {
+        self.encoder.retain_data_payloads = retain;
+    }
+
     /// Returns the max frame size that can be sent
     pub fn max_frame_size(&self) -> usize {
         self.encoder.max_frame_size()

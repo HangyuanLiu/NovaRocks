@@ -13,3 +13,7 @@ This only propagates the connection-wide event-node gate. It neither limits full
 Client and server conn::http2::Builder also expose receive_buffer_pool(pool), forwarding the same strong-only h2::ReceiveBufferPool through Config and builder clone before handshake. Defaults remain None. One supplied pool can bind only once; an explicit event limit is required by h2, and Hyper's client already disables push. This additive API requires the paired patched h2 and bytes sources.
 
 Real Hyper Incoming tests release flow credit when returning a DATA frame, retain that Bytes through body/connection/executor/builder exit, and confirm the original funding remains held until the final alias physically exits. The pool bounds escaped retained DATA backings and wrappers only. Original codec read/header/write allocations and complete Native lane/listener/connection owners remain separate; this forwarding patch does not advertise product support or change listener defaults.
+
+## Original DATA send owner forwarding
+
+Client/server connection builders forward retain_data_payloads(bool), default false, through the cloned H2 Config. The paired h2 mode skips payload/prefix copying and retains original DATA objects through successful upstream flush. Actual partial-write pointer and credit probes cover both Hyper directions; Native SendBuf<Bytes> preserves the original owner on advance. Header/TLS/task backing, queued Body count and Native profile installation remain separate. No product listener default changes or performance claims are made.
