@@ -248,7 +248,7 @@ fn inherited_round_fixture(allow: bool) -> (PureEngineFunctionCatalog, Arc<Fragm
     inherited_round_fixture_with_target(allow, DataType::Int8)
 }
 
-fn inherited_round_fixture_with_target(
+pub(super) fn inherited_round_fixture_with_target(
     allow: bool,
     target: DataType,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {

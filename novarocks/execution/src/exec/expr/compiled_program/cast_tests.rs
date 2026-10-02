@@ -247,6 +247,7 @@ fn fixture(
                 LiteralValue::Null
             } else {
                 match ty.data_type {
+                    DataType::Boolean => LiteralValue::Boolean(false),
                     DataType::Int64 => LiteralValue::Int64(0),
                     DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
                     _ => {
@@ -300,6 +301,7 @@ fn fixture(
                 .unwrap()
         } else {
             let value = match source_type.data_type {
+                DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Int64 => LiteralValue::Int64(71),
                 DataType::Float64 => LiteralValue::Float64Bits((-0.0_f64).to_bits()),
                 _ => panic!("constant fixture requires an implemented exact numeric literal"),
@@ -1043,3 +1045,6 @@ fn cast_compile_preserves_all_original_refusals_and_observes_ordinary_narrowing_
 
 #[path = "cast_float_tests.rs"]
 mod cast_float_tests;
+
+#[path = "cast_bool_tests.rs"]
+mod cast_bool_tests;

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable selected casts for exact Physical signed and floating scalar domains.
+//! Immutable selected casts for exact Physical boolean and numeric scalar domains.
 //! The caller retains original policies and full types; this recipe performs no
 //! output allocation, registry lookup, coercion or memory admission.
 
@@ -26,9 +26,9 @@ use crate::{
     ScopedExpressionEffects,
 };
 use arrow_array::{
-    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
 };
-use arrow_cast::cast::num_cast;
+use arrow_cast::cast::{cast_num_to_bool, num_cast};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
@@ -123,6 +123,7 @@ impl SignedWidth {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
+    Boolean,
     Signed(SignedWidth),
     F32,
     F64,
@@ -130,6 +131,7 @@ enum Source {
 impl Source {
     fn from_type(ty: &DataType) -> Option<Self> {
         SignedWidth::from_type(ty).map(Self::Signed).or(match ty {
+            DataType::Boolean => Some(Self::Boolean),
             DataType::Float32 => Some(Self::F32),
             DataType::Float64 => Some(Self::F64),
             _ => None,
@@ -137,6 +139,7 @@ impl Source {
     }
     fn validate(self, array: &dyn Array) -> bool {
         match self {
+            Self::Boolean => array.as_any().is::<BooleanArray>(),
             Self::Signed(width) => width.validate(array),
             Self::F32 => array.as_any().is::<Float32Array>(),
             Self::F64 => array.as_any().is::<Float64Array>(),
@@ -148,6 +151,7 @@ impl Source {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
+    Boolean,
     Signed(SignedWidth),
     F32,
     F64,
@@ -155,6 +159,7 @@ enum Target {
 impl Target {
     fn from_type(ty: &DataType) -> Option<Self> {
         SignedWidth::from_type(ty).map(Self::Signed).or(match ty {
+            DataType::Boolean => Some(Self::Boolean),
             DataType::Float32 => Some(Self::F32),
             DataType::Float64 => Some(Self::F64),
             _ => None,
@@ -167,6 +172,7 @@ impl Target {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CastRowResult {
     Null,
+    Boolean(bool),
     Signed(i64),
     Float32(f32),
     Float64(f64),
@@ -299,6 +305,7 @@ impl PreparedCastRecipe {
                         .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
                         .value(row);
                     let output = match self.target {
+                        Target::Boolean => Some(CastRowResult::Boolean(cast_num_to_bool(source))),
                         Target::Signed(SignedWidth::I8) => num_cast::<$native, i8>(source)
                             .map(|v| CastRowResult::Signed(i64::from(v))),
                         Target::Signed(SignedWidth::I16) => num_cast::<$native, i16>(source)
@@ -321,6 +328,11 @@ impl PreparedCastRecipe {
                         .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
                         .value(row);
                     let converted = match self.target {
+                        Target::Boolean => {
+                            let value = cast_num_to_bool(source);
+                            work.step()?;
+                            return Ok(CastRowResult::Boolean(value));
+                        }
                         Target::Signed(SignedWidth::I8) => num_cast::<$native, i8>(source).map(i64::from),
                         Target::Signed(SignedWidth::I16) => num_cast::<$native, i16>(source).map(i64::from),
                         Target::Signed(SignedWidth::I32) => num_cast::<$native, i32>(source).map(i64::from),
@@ -367,6 +379,22 @@ impl PreparedCastRecipe {
                 }};
             }
             Ok(match self.source_kind {
+                Source::Boolean => {
+                    let value = argument
+                        .array()
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
+                        .value(row);
+                    let result = match self.target {
+                        Target::Boolean => CastRowResult::Boolean(value),
+                        Target::Signed(_) => CastRowResult::Signed(i64::from(value)),
+                        Target::F32 => CastRowResult::Float32(f32::from(u8::from(value))),
+                        Target::F64 => CastRowResult::Float64(f64::from(u8::from(value))),
+                    };
+                    work.step()?;
+                    result
+                }
                 Source::Signed(SignedWidth::I8) => convert!(Int8Array, i8),
                 Source::Signed(SignedWidth::I16) => convert!(Int16Array, i16),
                 Source::Signed(SignedWidth::I32) => convert!(Int32Array, i32),
@@ -467,3 +495,7 @@ mod float_tests;
 #[cfg(test)]
 #[path = "cast_float_identity_tests.rs"]
 mod float_identity_tests;
+
+#[cfg(test)]
+#[path = "cast_bool_tests.rs"]
+mod bool_tests;

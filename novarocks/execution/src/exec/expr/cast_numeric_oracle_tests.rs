@@ -204,6 +204,7 @@ fn compare_legacy_rows(
             CastRowResult::RowError(error) => {
                 panic!("signed cast must not raise a row error: {error:?}")
             }
+            CastRowResult::Boolean(_) => panic!("signed numeric cast returned a boolean"),
         }
     }
     (legacy, rows)

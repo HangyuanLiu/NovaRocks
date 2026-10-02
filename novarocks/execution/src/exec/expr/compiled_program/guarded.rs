@@ -1228,6 +1228,7 @@ fn evaluate_cast<'a>(
         .ok_or(KernelFailure::ResourceExhausted)?;
     work.flush()?;
     enum Output {
+        Boolean(Vec<Option<bool>>),
         I8(Vec<Option<i8>>),
         I16(Vec<Option<i16>>),
         I32(Vec<Option<i32>>),
@@ -1236,6 +1237,7 @@ fn evaluate_cast<'a>(
         F64(Vec<Option<f64>>),
     }
     let mut output = match ty {
+        DataType::Boolean => Output::Boolean(Vec::new()),
         DataType::Int8 => Output::I8(Vec::new()),
         DataType::Int16 => Output::I16(Vec::new()),
         DataType::Int32 => Output::I32(Vec::new()),
@@ -1245,6 +1247,7 @@ fn evaluate_cast<'a>(
         _ => return Err(internal("cast recipe has a foreign frozen result carrier")),
     };
     match &mut output {
+        Output::Boolean(v) => v.try_reserve_exact(selection.len()),
         Output::I8(v) => v.try_reserve_exact(selection.len()),
         Output::I16(v) => v.try_reserve_exact(selection.len()),
         Output::I32(v) => v.try_reserve_exact(selection.len()),
@@ -1277,6 +1280,7 @@ fn evaluate_cast<'a>(
             other => other,
         };
         match (&mut output, value) {
+            (Output::Boolean(v), R::Boolean(n)) => v.push(Some(n)),
             (Output::I8(v), R::Signed(n)) => v.push(Some(
                 i8::try_from(n).map_err(|_| internal("cast returned an out-of-range Int8"))?,
             )),
@@ -1294,6 +1298,7 @@ fn evaluate_cast<'a>(
             (Output::F32(v), R::Float32(n)) => v.push(Some(n)),
             (Output::F64(v), R::Float64(n)) => v.push(Some(n)),
             (Output::I8(v), R::Null) => v.push(None),
+            (Output::Boolean(v), R::Null) => v.push(None),
             (Output::I16(v), R::Null) => v.push(None),
             (Output::I32(v), R::Null) => v.push(None),
             (Output::I64(v), R::Null) => v.push(None),
@@ -1310,6 +1315,7 @@ fn evaluate_cast<'a>(
     work.flush()?;
     // Arrow construction is an opaque observed boundary, not internally cooperative allocation.
     let array: ArrayRef = match output {
+        Output::Boolean(v) => Arc::new(BooleanArray::from(v)),
         Output::I8(v) => Arc::new(Int8Array::from(v)),
         Output::I16(v) => Arc::new(Int16Array::from(v)),
         Output::I32(v) => Arc::new(Int32Array::from(v)),

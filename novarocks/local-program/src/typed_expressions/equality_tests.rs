@@ -772,6 +772,9 @@ fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null()
 #[path = "nullsafe_tests.rs"]
 mod nullsafe_tests;
 
+#[path = "cast_bool_tests.rs"]
+mod cast_bool_tests;
+
 #[test]
 fn float_integer_cast_all_definitions_use_the_frozen_allow_mode_for_successful_null() {
     use novarocks_functions::CastOperation;

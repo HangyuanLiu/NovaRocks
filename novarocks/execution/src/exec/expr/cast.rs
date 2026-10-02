@@ -5337,3 +5337,7 @@ mod cast_float_identity_oracle_tests;
 #[cfg(test)]
 #[path = "cast_value_conversion_oracle_tests.rs"]
 mod cast_value_conversion_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_bool_oracle_tests.rs"]
+mod cast_bool_oracle_tests;

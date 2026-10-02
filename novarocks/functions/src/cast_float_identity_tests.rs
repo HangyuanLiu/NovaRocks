@@ -354,7 +354,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
         for target in [
             DataType::Float16,
             DataType::UInt64,
-            DataType::Boolean,
+            DataType::Binary,
             DataType::Decimal128(10, 0),
         ] {
             assert_eq!(
