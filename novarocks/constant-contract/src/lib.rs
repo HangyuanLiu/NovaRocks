@@ -320,11 +320,21 @@ impl ConstantPool {
     pub fn field(&self) -> &Field {
         &self.0.field
     }
+    /// Borrows the original immutable source handle without cloning its Field
+    /// metadata or allocating a replacement source representation.
+    pub fn field_ref(&self) -> &Arc<Field> {
+        &self.0.field
+    }
     pub fn value_type(&self) -> &FunctionValueType {
         &self.0.value_type
     }
     pub fn array(&self) -> &ArrayRef {
         &self.0.array
+    }
+    /// Borrows the canonical data already admitted by this sole backing owner.
+    /// Writers can inspect layout before an allocating Array::to_data call.
+    pub fn data(&self) -> &ArrayData {
+        &self.0.data
     }
     pub fn resource_facts(&self) -> ConstantResourceFacts {
         self.0.facts

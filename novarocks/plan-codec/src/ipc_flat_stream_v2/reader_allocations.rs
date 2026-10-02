@@ -21,6 +21,9 @@
 //! error formatting and opaque reader work have separate owners.
 
 use super::{FlatConstantStream, FlatPoolResourceError, FlatPoolResourceProjection};
+#[cfg(test)]
+use crate::resource_source_model::locked_family;
+use crate::resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN};
 use crate::{
     ipc_flat_batch_v2::{Layout as FlatLayout, layout},
     physical_type_v2::TypeCodecError,
@@ -94,84 +97,12 @@ fn bytes_layout() -> Layout {
     argument_layout(Buffer::from_bytes)
 }
 
-const fn at(source: &[u8], position: usize, needle: &[u8]) -> bool {
-    if position > source.len() || needle.len() > source.len() - position {
-        return false;
-    }
-    let mut index = 0;
-    while index < needle.len() {
-        if source[position + index] != needle[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-const fn contains(source: &[u8], needle: &[u8]) -> bool {
-    let mut index = 0;
-    while index < source.len() {
-        if at(source, index, needle) {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
-const fn locked_family(source: &[u8]) -> bool {
-    let names: [&[u8]; 7] = [
-        b"\nname = \"arrow\"\n",
-        b"\nname = \"arrow-array\"\n",
-        b"\nname = \"arrow-buffer\"\n",
-        b"\nname = \"arrow-data\"\n",
-        b"\nname = \"arrow-ipc\"\n",
-        b"\nname = \"arrow-schema\"\n",
-        b"\nname = \"num-bigint\"\n",
-    ];
-    let mut counts = [0usize; 7];
-    let mut index = 0;
-    while index < source.len() {
-        if source[index] == b'\n' && at(source, index, b"\nname = ") {
-            let mut member = 0;
-            while member < names.len() {
-                if at(source, index, names[member]) {
-                    counts[member] += 1;
-                    if !at(
-                        source,
-                        index + names[member].len(),
-                        if member == 6 {
-                            b"version = \"0.4.6\"\n"
-                        } else {
-                            b"version = \"58.2.0\"\n"
-                        },
-                    ) {
-                        return false;
-                    }
-                }
-                member += 1;
-            }
-        }
-        index += 1;
-    }
-    let mut member = 0;
-    while member < counts.len() {
-        if counts[member] != 1 {
-            return false;
-        }
-        member += 1;
-    }
-    true
-}
-const LOCKED_FAMILY: bool = locked_family(include_bytes!("../../../../Cargo.lock"));
-const LOCKED_TOOLCHAIN: bool = contains(
-    include_bytes!("../../../../rust-toolchain.toml"),
-    b"\nchannel = \"1.92.0\"\n",
-);
-
 fn environment(work: &mut CompileCheckpoints<'_>) -> Result<Layout, FlatPoolResourceError> {
     let bytes = bytes_layout();
     let supported = LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == "58.2.0"
+        && cfg!(target_endian = "little")
         && Layout::new::<MutableBuffer>() == Layout::new::<NoPoolMutableBuffer>()
         && bytes == Layout::new::<NoPoolBytes>();
     work.step()?;

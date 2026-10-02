@@ -20,6 +20,7 @@
 //! provider facts. It has no SQL compiler or Frontend runtime dependency.
 
 pub mod ipc_flat_batch_v2;
+pub mod ipc_flat_pool_v2;
 pub mod ipc_flat_stream_v2;
 pub mod ipc_schema_v2;
 pub mod native_type;
@@ -32,6 +33,7 @@ mod physical_type;
 pub mod physical_type_v2;
 mod physical_v1;
 pub mod resource_preflight_v2;
+mod resource_source_model;
 mod write_targets;
 
 pub use physical_encode::{

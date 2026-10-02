@@ -48,9 +48,11 @@ pub struct IpcSchemaProjectionLimits {
     pub max_flatbuffer_bytes: usize,
 }
 
-struct SchemaPreflight {
-    backing: usize,
-    tables: usize,
+pub(crate) struct SchemaPreflight {
+    pub backing: usize,
+    pub tables: usize,
+    pub metadata_entries: usize,
+    pub string_bytes: usize,
 }
 
 #[derive(Default)]
@@ -176,7 +178,7 @@ fn preflight_source(
     Ok(counts)
 }
 
-fn preflight_writer(
+pub(crate) fn preflight_writer(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
@@ -192,7 +194,12 @@ fn preflight_writer(
         checked_add(counts.fields, counts.types)?,
         checked_add(counts.metadata_entries, 2)?,
     )?;
-    Ok(SchemaPreflight { backing, tables })
+    Ok(SchemaPreflight {
+        backing,
+        tables,
+        metadata_entries: counts.metadata_entries,
+        string_bytes: counts.string_bytes,
+    })
 }
 
 /// Emits a V5 schema message, without stream framing or array-buffer encoding.
