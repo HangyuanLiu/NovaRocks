@@ -74,6 +74,101 @@ object FieldDomainInvalidFixture {
       out.toByteArray
     } finally in.close()
   }
+  val OwnerKey = "uea7b3.fixture.owner.v1"
+  val MaxJournalBytes = 4096
+  val Phases = Vector("create_confirmed","file_intent","file_closed","append_confirmed","properties_confirmed")
+  val Reasons = Set("unknown_create","ownership_conflict","incomplete_journal","storage_error","over_budget")
+  def exactKeys(n: JsonNode, keys: Set[String]): Unit =
+    require(n != null && n.isObject && n.fieldNames().asScala.toSet == keys,"Fixture lifecycle record has missing/unknown keys")
+  def text(n: JsonNode,key: String): String = {
+    val v=n.get(key); require(v!=null && v.isTextual && v.asText().nonEmpty && v.asText().getBytes(UTF_8).length<=4096,"Invalid bounded fixture lifecycle text at " + key); v.asText()
+  }
+  def uuid(n: JsonNode,key: String): String = { val v=text(n,key); require(java.util.UUID.fromString(v).toString==v,"Noncanonical fixture UUID"); v }
+  def sha(n: JsonNode,key: String): String = { val v=text(n,key); require(v.matches("[a-f0-9]{64}"),"Invalid fixture SHA256"); v }
+  def number(n: JsonNode,key: String,positive: Boolean=false): Long = {
+    val v=n.get(key); require(v!=null && v.isIntegralNumber && v.canConvertToLong && (if(positive) v.asLong()>0 else v.asLong()>=0),"Invalid fixture lifecycle integer at " + key); v.asLong()
+  }
+  def bool(n: JsonNode,key: String): Boolean = { val v=n.get(key); require(v!=null && v.isBoolean,"Invalid fixture lifecycle boolean"); v.asBoolean() }
+  def canonical(n: JsonNode): Array[Byte] = mapper.writeValueAsBytes(n)
+  def strictBytes(raw: Array[Byte],cap: Int): JsonNode = {
+    require(raw.nonEmpty && raw.length<=cap,"Fixture lifecycle JSON exceeds its byte bound")
+    val scan=mapper.getFactory.createParser(raw); scan.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    try {
+      var depth=0; var nodes=0; var token=scan.nextToken()
+      while(token!=null) {
+        nodes+=1; require(nodes<=8192,"Fixture lifecycle JSON exceeds its node bound")
+        if(token.isStructStart) { depth+=1; require(depth<=16,"Fixture lifecycle JSON exceeds its depth bound") }
+        if(token.isStructEnd) depth-=1
+        if(token==com.fasterxml.jackson.core.JsonToken.VALUE_STRING || token==com.fasterxml.jackson.core.JsonToken.FIELD_NAME)
+          require(scan.getText.getBytes(UTF_8).length<=4096,"Fixture lifecycle JSON string exceeds its text bound")
+        token=scan.nextToken()
+      }
+    } finally scan.close()
+    val parser=mapper.getFactory.createParser(raw); parser.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val n=try { val v=mapper.readTree[JsonNode](parser); require(parser.nextToken()==null,"Fixture lifecycle JSON has trailing input"); v } finally parser.close()
+    require(n!=null && java.util.Arrays.equals(raw,canonical(n)),"Fixture lifecycle JSON is not compact canonical JSON"); n
+  }
+  def decodeLifecycle(encoded: String): JsonNode = {
+    require(encoded.nonEmpty && encoded.length<=((MaxReceiptBytes+2)/3)*4,"Fixture lifecycle Base64 exceeds its byte bound")
+    val raw=java.util.Base64.getDecoder.decode(encoded)
+    require(java.util.Base64.getEncoder.encodeToString(raw)==encoded,"Fixture lifecycle Base64 is not canonical")
+    strictBytes(raw,MaxReceiptBytes)
+  }
+  def owner(encoded: String,ns: String): JsonNode = {
+    val n=decodeLifecycle(encoded)
+    exactKeys(n,Set("record","version","run_token","namespace","cases","publication_identity_sha256"))
+    require(text(n,"record")=="field_domain_fixture_owner" && number(n,"version")==1 && text(n,"namespace")==ns,"Fixture owner identity/version differs")
+    uuid(n,"run_token"); sha(n,"publication_identity_sha256")
+    val cases=n.get("cases"); require(cases.isArray && cases.elements().asScala.toVector.map { v => require(v.isTextual,"Invalid fixture owner case"); v.asText() }==Cases,"Fixture owner table set/order differs")
+    identifier(ns,Cases.head); n
+  }
+  def token(o: JsonNode,name: String): String = text(o,"run_token") + "/" + name
+  def owned(t: Table,o: JsonNode,name: String): Unit =
+    require(Option(t.properties().get(OwnerKey)).contains(token(o,name)),"Fixture ownership token differs")
+  def fresh(ns: String,name: String): Option[Table] = {
+    val c=catalog; val id=identifier(ns,name); c.invalidateTable(id)
+    try { val t=c.loadTable(id); t.refresh(); Some(t) }
+    catch { case _: org.apache.iceberg.exceptions.NoSuchTableException => None }
+  }
+  def location(t: Table): String = {
+    val p=t.location().stripSuffix("/"); require(p.nonEmpty && p.getBytes(UTF_8).length<=4096 && !p.contains("\n") && !p.contains("\r"),"Invalid fixture table location")
+    val uri=new java.net.URI(p); require(Set("s3","s3a","s3n").contains(uri.getScheme) && uri.getHost!=null && uri.getQuery==null && uri.getFragment==null && uri.getUserInfo==null && !uri.getPath.split("/").contains(".."),"Fixture location is not an exact S3 object prefix"); p
+  }
+  def dataPath(loc: String,o: JsonNode,name: String): String = loc + "/data/domain-input-" + text(o,"run_token") + "-" + name + ".parquet"
+  def journalPath(loc: String,o: JsonNode,name: String,phase: String): String = {
+    require(Phases.contains(phase),"Unknown fixture journal phase")
+    loc + "/_uea7b3_fixture/" + text(o,"run_token") + "/" + name + "/" + (Phases.indexOf(phase)+1) + "-" + phase + ".json"
+  }
+  def recoveryIO(): org.apache.iceberg.aws.s3.S3FileIO = {
+    val prefix="spark.sql.catalog.ice_rest."
+    val options=org.apache.spark.sql.SparkSession.active.conf.getAll.iterator.filter { case(k,_) => k.startsWith(prefix) }.map { case(k,v) => k.substring(prefix.length)->v }.toMap
+    require(options.get("io-impl").contains("org.apache.iceberg.aws.s3.S3FileIO"),"Fixture recovery requires the explicitly configured S3FileIO")
+    Vector("s3.endpoint","s3.region","s3.path-style-access","s3.access-key-id","s3.secret-access-key").foreach(k => require(options.get(k).exists(_.nonEmpty),"Fixture recovery lacks explicit static S3 configuration"))
+    val io=new org.apache.iceberg.aws.s3.S3FileIO(); io.initialize(options.asJava); io
+  }
+  def checkpoint(failAfter: String,name: String,phase: String): Unit =
+    if(failAfter==name+":"+phase) throw new IllegalStateException("Explicit field-domain fixture failure after " + name + ":" + phase)
+  def journal(t: Table,io: org.apache.iceberg.io.FileIO,o: JsonNode,name: String,phase: String,previous: Option[String],payload: JsonNode): String = {
+    owned(t,o,name)
+    val n=obj("record" -> "field_domain_fixture_journal","version" -> 1,"run_token" -> text(o,"run_token"),"namespace" -> text(o,"namespace"),"case" -> name,
+      "table_uuid" -> metadata(t).uuid().toString,"table_location" -> location(t),"owner_sha256" -> digest(canonical(o)),"phase" -> phase,"previous_sha256" -> previous.orNull,"payload" -> payload)
+    val raw=canonical(n); require(raw.length<=MaxJournalBytes,"Fixture journal exceeds its fixed byte bound")
+    val path=journalPath(location(t),o,name,phase)
+    if(t.io().newInputFile(path).exists()) require(java.util.Arrays.equals(read(t.io(),path,MaxJournalBytes),raw),"Fixture journal replay conflicts")
+    else { val out=t.io().newOutputFile(path).create(); try out.write(raw) finally out.close() }
+    require(java.util.Arrays.equals(read(t.io(),path,MaxJournalBytes),raw) && java.util.Arrays.equals(read(io,path,MaxJournalBytes),raw),"Fixture journal was not durably verified through both exact IO owners")
+    digest(raw)
+  }
+  def metadataPayload(t: Table): JsonNode = { val m=metadata(t); obj("metadata_path" -> m.metadataFileLocation(),"metadata_sha256" -> digest(read(t.io(),m.metadataFileLocation(),MaxMetadataBytes))) }
+  def terminal(encoded: String,o: JsonNode): JsonNode = {
+    val n=decodeLifecycle(encoded)
+    exactKeys(n,Set("record","version","run_token","phase","job_token","container_id","image_id","image_reference","script_sha256","defaults_sha256","publication_identity_sha256","execution_confirmed","exit_code","confirmed_gone","forced"))
+    require(text(n,"record")=="field_domain_owned_spark_terminal" && number(n,"version")==1 && uuid(n,"run_token")==text(o,"run_token") && text(n,"phase")=="initialize" && sha(n,"publication_identity_sha256")==text(o,"publication_identity_sha256"),"Initializer terminal identity differs")
+    uuid(n,"job_token"); require(text(n,"container_id").matches("[a-f0-9]{64}") && text(n,"image_id").matches("sha256:[a-f0-9]{64}"),"Initializer terminal lacks its exact container/image identity")
+    text(n,"image_reference"); sha(n,"script_sha256"); sha(n,"defaults_sha256"); bool(n,"execution_confirmed"); bool(n,"forced")
+    val code=n.get("exit_code"); require(code!=null && (code.isNull || (code.isIntegralNumber && code.canConvertToInt)),"Initializer terminal has invalid exit code")
+    require(bool(n,"confirmed_gone"),"Initializer has no confirmed remote termination"); n
+  }
   def schema: Schema = new Schema(
     Types.NestedField.required(1,"id",Types.LongType.get()),
     Types.NestedField.optional(2,"j",Types.StringType.get()),
@@ -225,12 +320,16 @@ object FieldDomainInvalidFixture {
         "spec_id" -> task.file().specId(),"data_sequence" -> task.file().dataSequenceNumber(),"file_sequence" -> task.file().fileSequenceNumber(),"deletes" -> task.deletes().asScala.toVector.map(_.location()))),
       "physical_file" -> physical,"sdk_rows" -> actualRows,"expected_provider_failure_kind" -> kind)
   }
-  def initialize(ns: String): Unit = {
+  def initialize(ns: String,ownerBase64: String,failAfter: String=""): Unit = {
+    val o=owner(ownerBase64,ns)
+    require(failAfter.isEmpty || Cases.exists(name => Phases.exists(phase => failAfter==name+":"+phase)),"Invalid closed fixture failure checkpoint")
+    val recovery=recoveryIO()
+    try {
     require(IcebergBuild.version()=="1.11.0","This independent SDK oracle requires Iceberg 1.11.0")
     Cases.foreach { name =>
       require(!catalog.tableExists(identifier(ns,name)),"Fixture refuses to reuse an existing table")
       val t=catalog.createTable(identifier(ns,name),schema,PartitionSpec.unpartitioned(),
-        Map("format-version" -> "3","write.row-lineage" -> "true").asJava)
+        Map("format-version" -> "3","write.row-lineage" -> "true",OwnerKey -> token(o,name)).asJava)
       require(t.currentSnapshot()==null,"Fixture CREATE unexpectedly has a data snapshot")
       val expectedPaths=Vector("id","j","n","s","xs","xs.element","js","js.element")
       val fieldIds=expectedPaths.map(path => { val f=t.schema().findField(path); require(f!=null,"CREATE lost an exact fixture field path"); f.fieldId() })
@@ -239,8 +338,15 @@ object FieldDomainInvalidFixture {
       require(t.schema().findField("id").isRequired && expectedPaths.filterNot(_=="id").forall(path => t.schema().findField(path).isOptional),"CREATE response changed exact requiredness")
       for(path <- Vector("n","s","xs.element")) require(t.schema().findType(path)==Types.IntegerType.get(),"CREATE response lost standard INT carrier at " + path)
       for(path <- Vector("j","js.element")) require(t.schema().findType(path)==Types.StringType.get(),"CREATE response lost standard STRING carrier at " + path)
+      val created=metadataPayload(t)
+      var previous=journal(t,recovery,o,name,"create_confirmed",None,obj("schema_id" -> t.schema().schemaId(),"metadata_path" -> created.get("metadata_path"),"metadata_sha256" -> created.get("metadata_sha256")))
+      checkpoint(failAfter,name,"create_confirmed")
+      val path=dataPath(location(t),o,name)
+      previous=journal(t,recovery,o,name,"file_intent",Some(previous),obj("data_path" -> path))
+      checkpoint(failAfter,name,"file_intent")
+      require(!t.io().newInputFile(path).exists(),"Fixture refuses to reopen an existing registered data object")
       val records=values(name).map { v => val r=GenericRecord.create(t.schema()); Vector("id","j","n","s","xs","js").zip(v).foreach { case(k,value) => r.setField(k,value) }; r }
-      val out=t.io().newOutputFile(t.location().stripSuffix("/")+"/data/domain-input-"+java.util.UUID.randomUUID()+".parquet")
+      val out=t.io().newOutputFile(path)
       val writer=new GenericAppenderFactory(t.schema(),t.spec()).set("write.metadata.metrics.default",if(OverflowCases.contains(name)) "none" else "full")
         .newDataWriter(EncryptedFiles.plainAsEncryptedOutput(out),FileFormat.PARQUET,partition(t,1))
       try records.foreach(writer.write) finally writer.close()
@@ -248,12 +354,22 @@ object FieldDomainInvalidFixture {
       if(OverflowCases.contains(name)) {
         for(bounds <- Vector(file.lowerBounds(),file.upperBounds())) require(bounds==null||bounds.isEmpty,"Overflow file unexpectedly permits a manifest-bound-only rejection")
       }
+      previous=journal(t,recovery,o,name,"file_closed",Some(previous),obj("data_path" -> path,"file_size" -> file.fileSizeInBytes(),"record_count" -> file.recordCount(),"sha256" -> digest(read(t.io(),path,MaxFileBytes))))
+      checkpoint(failAfter,name,"file_closed")
       t.newAppend().appendFile(file).commit(); t.refresh()
+      val appended=metadataPayload(t)
+      previous=journal(t,recovery,o,name,"append_confirmed",Some(previous),obj("snapshot_id" -> t.currentSnapshot().snapshotId(),"sequence_number" -> t.currentSnapshot().sequenceNumber(),"metadata_path" -> appended.get("metadata_path"),"metadata_sha256" -> appended.get("metadata_sha256")))
+      checkpoint(failAfter,name,"append_confirmed")
       val props=properties(name,t.schema()); if(props.nonEmpty) { val update=t.updateProperties(); props.toVector.sortBy(_._1).foreach { case(k,v) => update.set(k,v) }; update.commit(); t.refresh() }
+      val updated=metadataPayload(t)
+      val propertiesBytes=canonical(obj("properties" -> t.properties().asScala.toVector.sortBy(_._1).map { case(k,v) => obj("key" -> k,"value" -> v) }))
+      previous=journal(t,recovery,o,name,"properties_confirmed",Some(previous),obj("snapshot_id" -> t.currentSnapshot().snapshotId(),"sequence_number" -> t.currentSnapshot().sequenceNumber(),"metadata_path" -> updated.get("metadata_path"),"metadata_sha256" -> updated.get("metadata_sha256"),"properties_sha256" -> digest(propertiesBytes)))
+      checkpoint(failAfter,name,"properties_confirmed")
     }
     val frozen=Cases.map(name => fact(name,load(ns,name)))
     emit(obj("record" -> "field_domain_invalid_initial","namespace" -> ns,"tables" -> frozen))
     println("FIELD_DOMAIN_INVALID_READY")
+    } finally recovery.close()
   }
   def before(encoded: String,ns: String): JsonNode = {
     require(encoded.nonEmpty && encoded.length <= ((MaxReceiptBytes+2)/3)*4,"Frozen fixture Base64 exceeds byte bounds")
@@ -287,13 +403,215 @@ object FieldDomainInvalidFixture {
     emit(obj("record" -> "field_domain_invalid_unchanged","namespace" -> ns,"tables" -> current))
     println("FIELD_DOMAIN_INVALID_UNCHANGED")
   }
-  def cleanup(ns: String,encoded: String): Unit = {
-    val frozen=before(encoded,ns)
-    Cases.zipWithIndex.foreach { case(name,index) =>
-      val t=load(ns,name); val recorded=frozen.get("tables").get(index)
-      require(recorded.get("case").asText()==name && recorded.get("table_uuid").asText()==metadata(t).uuid().toString,"Cleanup refuses a replacement/wrong owned table")
-      require(catalog.dropTable(identifier(ns,name),true),"Exact SDK cleanup failed")
+  def objectPath(loc: String,path: String): Unit =
+    require(path.getBytes(UTF_8).length<=4096 && path.startsWith(loc+"/metadata/") && !path.substring(loc.length).split("/").contains("..") && !path.contains("\n") && !path.contains("\r"),"SDK object is outside the exact owned metadata prefix")
+  def validateJournal(n: JsonNode,o: JsonNode,name: String,id: String,loc: String,phase: String,previous: Option[String]): Unit = {
+    exactKeys(n,Set("record","version","run_token","namespace","case","table_uuid","table_location","owner_sha256","phase","previous_sha256","payload"))
+    require(text(n,"record")=="field_domain_fixture_journal" && number(n,"version")==1 && uuid(n,"run_token")==text(o,"run_token") && text(n,"namespace")==text(o,"namespace") && text(n,"case")==name && uuid(n,"table_uuid")==id && text(n,"table_location")==loc && sha(n,"owner_sha256")==digest(canonical(o)) && text(n,"phase")==phase,"Journal exact identity differs")
+    val prior=n.get("previous_sha256")
+    require(prior!=null && (previous match { case None => prior.isNull; case Some(h) => prior.isTextual && prior.asText()==h }),"Journal predecessor differs")
+    val p=n.get("payload")
+    phase match {
+      case "create_confirmed" => exactKeys(p,Set("schema_id","metadata_path","metadata_sha256")); require(number(p,"schema_id")<=Int.MaxValue,"Invalid journal schema ID")
+      case "file_intent" => exactKeys(p,Set("data_path"))
+      case "file_closed" =>
+        exactKeys(p,Set("data_path","file_size","record_count","sha256")); require(number(p,"file_size",true)<=MaxFileBytes && number(p,"record_count",true)==values(name).size,"Closed file facts differ from fixed inputs"); sha(p,"sha256")
+      case "append_confirmed" => exactKeys(p,Set("snapshot_id","sequence_number","metadata_path","metadata_sha256")); number(p,"snapshot_id",true); number(p,"sequence_number")
+      case "properties_confirmed" => exactKeys(p,Set("snapshot_id","sequence_number","metadata_path","metadata_sha256","properties_sha256")); number(p,"snapshot_id",true); number(p,"sequence_number"); sha(p,"properties_sha256")
+      case _ => throw new IllegalArgumentException("Unknown journal phase")
     }
-    println("FIELD_DOMAIN_INVALID_CLEANED")
+    if(p.has("data_path")) require(text(p,"data_path")==dataPath(loc,o,name),"Journal data path differs from its exact intent")
+    if(p.has("metadata_path")) { objectPath(loc,text(p,"metadata_path")); sha(p,"metadata_sha256") }
+  }
+  def readJournals(io: org.apache.iceberg.io.FileIO,o: JsonNode,name: String,id: String,loc: String): Vector[(String,String,JsonNode)] = {
+    val found=scala.collection.mutable.ArrayBuffer.empty[(String,String,JsonNode)]
+    var gap=false; var previous: Option[String]=None
+    Phases.foreach { phase =>
+      val path=journalPath(loc,o,name,phase)
+      if(io.newInputFile(path).exists()) {
+        require(!gap,"Journal chain contains a missing predecessor")
+        val raw=read(io,path,MaxJournalBytes); val n=strictBytes(raw,MaxJournalBytes)
+        validateJournal(n,o,name,id,loc,phase,previous)
+        val h=digest(raw); found += ((phase,h,n)); previous=Some(h)
+      } else gap=true
+    }
+    found.toVector
+  }
+  def knownObjects(t: Table): Vector[JsonNode] = {
+    val m=metadata(t); val loc=location(t)
+    val previous=m.previousFiles().asScala.iterator.take(9).toVector
+    require(previous.size<=8,"SDK metadata history exceeds fixed fixture inventory")
+    val snapshots=m.snapshots().asScala.iterator.take(2).toVector
+    require(snapshots.size<=1,"SDK snapshots exceed the fixed fixture inventory")
+    val paths=scala.collection.mutable.ArrayBuffer.empty[(String,String)]
+    paths += (("metadata",m.metadataFileLocation()))
+    previous.foreach(f => paths += (("metadata",f.file())))
+    snapshots.foreach { s =>
+      val list=s.manifestListLocation(); require(list!=null,"Actual snapshot has no manifest list")
+      read(t.io(),list,MaxMetadataBytes); paths += (("manifest_list",list))
+      val manifests=s.allManifests(t.io()).asScala.iterator.take(2).toVector
+      require(manifests.size<=1,"SDK manifests exceed the fixed fixture inventory")
+      manifests.foreach(f => { require(f.length()>0 && f.length()<=MaxMetadataBytes,"SDK manifest exceeds the fixture byte bound"); paths += (("manifest",f.path())) })
+    }
+    val unique=paths.distinct.sortBy(x => (x._1,x._2)).toVector
+    require(unique.size<=8 && unique.map(_._2).distinct.size==unique.size,"SDK object inventory has duplicate/incompatible roles")
+    unique.map { case(kind,path) => objectPath(loc,path); obj("kind" -> kind,"path" -> path) }
+  }
+  def unresolved(name: String,reason: String): JsonNode = {
+    require(Reasons.contains(reason),"Unknown fixture unresolved reason")
+    obj("case" -> name,"state" -> "unresolved","reason" -> reason)
+  }
+  def prepareCleanup(ns: String,ownerBase64: String,terminalBase64: String,optionalInitialBase64: Option[String]): Unit = {
+    val o=owner(ownerBase64,ns); val ended=terminal(terminalBase64,o)
+    val initial=optionalInitialBase64.map(encoded => before(encoded,ns))
+    val io=recoveryIO()
+    try {
+      val tables=Cases.zipWithIndex.map { case(name,index) =>
+        try {
+          fresh(ns,name) match {
+            case None => unresolved(name,"unknown_create")
+            case Some(t) if !Option(t.properties().get(OwnerKey)).contains(token(o,name)) => unresolved(name,"ownership_conflict")
+            case Some(t) =>
+              val id=metadata(t).uuid().toString; val loc=location(t)
+              initial.foreach(n => require(n.get("tables").get(index).get("table_uuid").asText()==id,"Initial receipt differs from actual table UUID"))
+              val observed=readJournals(io,o,name,id,loc)
+              // Recover an unknown CREATE response from its atomic owner token.
+              // Persist the observed UUID before ACK so post-DROP replay retains it.
+              if(observed.isEmpty) {
+                require(t.currentSnapshot()==null,"Recovered CREATE has no durable data-file intent")
+                val created=metadataPayload(t)
+                journal(t,io,o,name,"create_confirmed",None,obj("schema_id" -> t.schema().schemaId(),"metadata_path" -> created.get("metadata_path"),"metadata_sha256" -> created.get("metadata_sha256")))
+              }
+              val chain=readJournals(io,o,name,id,loc)
+              val intent=chain.find(_._1=="file_intent")
+              val closed=chain.find(_._1=="file_closed")
+              if(t.currentSnapshot()!=null) {
+                require(intent.isDefined,"Actual snapshot has no durable file intent")
+                val current=files(t)
+                require(current.size==1 && current.head.file().location()==dataPath(loc,o,name),"Actual file inventory differs from the registered path")
+              }
+              val registered=intent.toVector.map { _ =>
+                val closedFact=closed.map { x => val p=x._3.get("payload"); obj("file_size" -> p.get("file_size"),"record_count" -> p.get("record_count"),"sha256" -> p.get("sha256")) }.orNull
+                obj("path" -> dataPath(loc,o,name),"closed_fact" -> closedFact)
+              }
+              obj("case" -> name,"state" -> "owned_present","identity" -> obj("table_uuid" -> id,"table_location" -> loc),
+                "create_evidence" -> (if(observed.nonEmpty) "journal" else "recovered_token"),
+                "journal_objects" -> chain.map { x => obj("phase" -> x._1,"path" -> journalPath(loc,o,name,x._1),"sha256" -> x._2) },
+                "registered_data_files" -> registered,"known_sdk_objects" -> knownObjects(t),"unproven_sdk_orphans" -> true)
+          }
+        } catch {
+          case _: IllegalArgumentException => unresolved(name,"incomplete_journal")
+          case scala.util.control.NonFatal(_) => unresolved(name,"storage_error")
+        }
+      }
+      emit(obj("record" -> "field_domain_cleanup_candidate","version" -> 1,"run_token" -> text(o,"run_token"),"namespace" -> ns,"owner_sha256" -> digest(canonical(o)),
+        "terminal_sha256" -> digest(canonical(ended)),"publication_identity_sha256" -> text(o,"publication_identity_sha256"),"tables" -> tables))
+    } finally io.close()
+  }
+  def validateCandidateTable(n: JsonNode,o: JsonNode,name: String): Unit = {
+    require(text(n,"case")==name,"Cleanup candidate case set/order differs")
+    if(text(n,"state")=="unresolved") {
+      exactKeys(n,Set("case","state","reason")); require(Reasons.contains(text(n,"reason")),"Unknown candidate unresolved reason")
+    } else {
+      exactKeys(n,Set("case","state","identity","create_evidence","journal_objects","registered_data_files","known_sdk_objects","unproven_sdk_orphans"))
+      require(Set("owned_present","owned_absent").contains(text(n,"state")) && bool(n,"unproven_sdk_orphans"),"Invalid owned candidate variant")
+      require(Set("journal","recovered_token","durable_candidate").contains(text(n,"create_evidence")),"Invalid CREATE ownership evidence")
+      val identity=n.get("identity"); exactKeys(identity,Set("table_uuid","table_location")); uuid(identity,"table_uuid")
+      val loc=text(identity,"table_location"); val uri=new java.net.URI(loc)
+      require(Set("s3","s3a","s3n").contains(uri.getScheme) && uri.getHost!=null && uri.getQuery==null && uri.getFragment==null && uri.getUserInfo==null && !uri.getPath.split("/").contains("..") && !loc.endsWith("/"),"Invalid frozen exact table location")
+      val journals=n.get("journal_objects"); require(journals.isArray && journals.size()<=Phases.size,"Invalid candidate journal count")
+      journals.elements().asScala.zipWithIndex.foreach { case(j,index) => exactKeys(j,Set("phase","path","sha256")); require(text(j,"phase")==Phases(index) && text(j,"path")==journalPath(loc,o,name,Phases(index)),"Candidate journal path/order differs"); sha(j,"sha256") }
+      val data=n.get("registered_data_files"); require(data.isArray && data.size()<=1,"Invalid candidate registered file count")
+      require((journals.size()>=2)==(data.size()==1),"Candidate file intent/registration differs")
+      data.elements().asScala.foreach { f =>
+        exactKeys(f,Set("path","closed_fact")); require(text(f,"path")==dataPath(loc,o,name),"Candidate data file is outside exact intent")
+        val closed=f.get("closed_fact"); require(closed!=null,"Missing candidate closed fact")
+        if(!closed.isNull) { exactKeys(closed,Set("file_size","record_count","sha256")); require(number(closed,"file_size",true)<=MaxFileBytes && number(closed,"record_count",true)==values(name).size,"Candidate closed file differs"); sha(closed,"sha256") }
+        require((journals.size()>=3)== !closed.isNull,"Candidate closed-file phase differs")
+      }
+      val objects=n.get("known_sdk_objects"); require(objects.isArray && objects.size()<=8,"Candidate SDK inventory exceeds its bound")
+      val seen=scala.collection.mutable.Set.empty[String]
+      objects.elements().asScala.foreach { f => exactKeys(f,Set("kind","path")); require(Set("metadata","manifest_list","manifest").contains(text(f,"kind")),"Invalid SDK object kind"); val p=text(f,"path"); objectPath(loc,p); require(seen.add(p),"Duplicate SDK object path") }
+    }
+  }
+  def verifyCandidateTable(n: JsonNode,o: JsonNode,io: org.apache.iceberg.io.FileIO): Option[Table] = {
+    val name=text(n,"case"); val identity=n.get("identity"); val id=uuid(identity,"table_uuid"); val loc=text(identity,"table_location")
+    val current=fresh(text(o,"namespace"),name)
+    current.foreach { t => owned(t,o,name); require(metadata(t).uuid().toString==id && location(t)==loc,"Cleanup refuses a replacement table UUID/location") }
+    val chain=readJournals(io,o,name,id,loc)
+    val refs=n.get("journal_objects").elements().asScala.toVector
+    require(chain.size==refs.size && chain.zip(refs).forall { case(x,r) => x._1==text(r,"phase") && x._2==sha(r,"sha256") },"Cleanup journal chain changed after durable ACK")
+    require(chain.nonEmpty || current.isDefined,"Absent table lacks an external exact UUID journal")
+    current.foreach { t =>
+      val actual=knownObjects(t).map(n => new String(canonical(n),UTF_8))
+      val expected=n.get("known_sdk_objects").elements().asScala.map(n => new String(canonical(n),UTF_8)).toVector
+      require(actual==expected,"SDK metadata inventory changed after durable ACK")
+      if(t.currentSnapshot()!=null) require(n.get("registered_data_files").size()==1 && files(t).head.file().location()==dataPath(loc,o,name),"Actual file changed after durable ACK")
+    }
+    n.get("registered_data_files").elements().asScala.foreach { f =>
+      val p=chain.find(_._1=="file_closed").map(_._3.get("payload"))
+      val cf=f.get("closed_fact")
+      require(p.isDefined== !cf.isNull,"Closed file fact lacks its authoritative journal")
+      p.foreach(x => require(number(x,"file_size")==number(cf,"file_size") && number(x,"record_count")==number(cf,"record_count") && sha(x,"sha256")==sha(cf,"sha256"),"Closed file fact changed after ACK"))
+    }
+    current
+  }
+  def commitCleanup(ns: String,ownerBase64: String,candidateBase64: String,ackBase64: String): Unit = {
+    val o=owner(ownerBase64,ns); val candidate=decodeLifecycle(candidateBase64); val ack=decodeLifecycle(ackBase64)
+    exactKeys(candidate,Set("record","version","run_token","namespace","owner_sha256","terminal_sha256","publication_identity_sha256","tables"))
+    require(text(candidate,"record")=="field_domain_cleanup_candidate" && number(candidate,"version")==1 && uuid(candidate,"run_token")==text(o,"run_token") && text(candidate,"namespace")==ns && sha(candidate,"owner_sha256")==digest(canonical(o)) && sha(candidate,"publication_identity_sha256")==text(o,"publication_identity_sha256"),"Cleanup candidate identity differs")
+    sha(candidate,"terminal_sha256")
+    exactKeys(ack,Set("record","version","run_token","namespace","owner_sha256","candidate_sha256"))
+    require(text(ack,"record")=="field_domain_cleanup_ack" && number(ack,"version")==1 && uuid(ack,"run_token")==text(o,"run_token") && text(ack,"namespace")==ns && sha(ack,"owner_sha256")==digest(canonical(o)) && sha(ack,"candidate_sha256")==digest(canonical(candidate)),"Cleanup durable ACK identity differs")
+    val tables=candidate.get("tables"); require(tables.isArray && tables.size()==Cases.size,"Cleanup candidate has incomplete table set")
+    val records=tables.elements().asScala.toVector
+    records.zip(Cases).foreach { case(n,name) => validateCandidateTable(n,o,name) }
+    val io=recoveryIO()
+    try {
+      // Validate every known identity and journal before the first deletion.
+      // A conflict never grants deletion for that case; other closed cases may converge.
+      val checked=records.map { n =>
+        if(text(n,"state")=="unresolved") Left(text(n,"reason"))
+        else try { Right(verifyCandidateTable(n,o,io)) } catch {
+          case _: IllegalArgumentException => Left("ownership_conflict")
+          case scala.util.control.NonFatal(_) => Left("storage_error")
+        }
+      }
+      val results=records.zip(checked).map { case(n,check) =>
+        val name=text(n,"case")
+        check match {
+          case Left(reason) => unresolved(name,reason)
+          case Right(_) =>
+            try {
+              // Repeat immediately before DROP: no cached candidate authorizes a replacement.
+              val current=verifyCandidateTable(n,o,io)
+              if(current.isDefined) catalog.dropTable(identifier(ns,name),true)
+              require(fresh(ns,name).isEmpty,"Catalog still has a table after exact cleanup")
+              val data=n.get("registered_data_files").elements().asScala.toVector.map { f =>
+                val path=text(f,"path"); require(fresh(ns,name).isEmpty,"Cleanup refuses a replacement table before object deletion"); if(io.newInputFile(path).exists()) io.deleteFile(path)
+                obj("path" -> path,"absent" -> !io.newInputFile(path).exists())
+              }
+              val objects=n.get("known_sdk_objects").elements().asScala.toVector.map { f =>
+                val path=text(f,"path"); require(fresh(ns,name).isEmpty,"Cleanup refuses a replacement table before object deletion"); if(io.newInputFile(path).exists()) io.deleteFile(path)
+                obj("kind" -> text(f,"kind"),"path" -> path,"absent" -> !io.newInputFile(path).exists())
+              }
+              val journals=n.get("journal_objects").elements().asScala.toVector.map { j =>
+                require(digest(read(io,text(j,"path"),MaxJournalBytes))==sha(j,"sha256"),"Cleanup lost its retained journal")
+                obj("phase" -> text(j,"phase"),"path" -> text(j,"path"),"retained" -> true)
+              }
+              obj("case" -> name,"state" -> "owned","table_uuid" -> uuid(n.get("identity"),"table_uuid"),"catalog_absent" -> true,
+                "registered_data_files" -> data,"known_sdk_objects" -> objects,"journal_objects" -> journals,"unproven_sdk_orphans" -> true,
+                "unresolved" -> (if(data.forall(_.get("absent").asBoolean()) && objects.forall(_.get("absent").asBoolean())) Vector.empty[String] else Vector("storage_error")))
+            } catch {
+              case _: IllegalArgumentException => unresolved(name,"ownership_conflict")
+              case scala.util.control.NonFatal(_) => unresolved(name,"storage_error")
+            }
+        }
+      }
+      val complete=results.forall(n => text(n,"state")=="owned" && n.get("unresolved").isArray && n.get("unresolved").size()==0)
+      emit(obj("record" -> "field_domain_cleanup_result","version" -> 1,"run_token" -> text(o,"run_token"),"namespace" -> ns,
+        "owner_sha256" -> digest(canonical(o)),"candidate_sha256" -> digest(canonical(candidate)),"complete" -> complete,"tables" -> results))
+      if(complete) println("FIELD_DOMAIN_INVALID_CLEANED")
+    } finally io.close()
   }
 }
