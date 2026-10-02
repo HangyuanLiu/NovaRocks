@@ -208,9 +208,6 @@ impl PreparedCastRecipe {
             let target =
                 Target::from_type(&result.data_type).ok_or(CastPrepareError::Unsupported)?;
             work.step()?;
-            if source_kind.is_float() && !matches!(target, Target::Signed(_)) {
-                return Err(CastPrepareError::Unsupported);
-            }
             let successful_null = match (source_kind, target) {
                 (Source::Signed(source), Target::Signed(target)) => target < source,
                 (Source::F32 | Source::F64, Target::Signed(_)) => !allow_throw_exception,
@@ -266,7 +263,9 @@ impl PreparedCastRecipe {
         ScopedExpressionEffects::primitive(
             context,
             ExpressionEffects {
-                may_raise_row_error: self.source_kind.is_float() && self.allow_throw_exception,
+                may_raise_row_error: self.source_kind.is_float()
+                    && matches!(self.target, Target::Signed(_))
+                    && self.allow_throw_exception,
                 ..ExpressionEffects::PURE_VALUE
             },
         )
@@ -317,7 +316,7 @@ impl PreparedCastRecipe {
                 }};
             }
             macro_rules! convert_float {
-                ($array:ty, $native:ty) => {{
+                ($array:ty, $native:ty, $f32:expr, $f64:expr) => {{
                     let source = argument.array().as_any().downcast_ref::<$array>()
                         .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
                         .value(row);
@@ -326,7 +325,18 @@ impl PreparedCastRecipe {
                         Target::Signed(SignedWidth::I16) => num_cast::<$native, i16>(source).map(i64::from),
                         Target::Signed(SignedWidth::I32) => num_cast::<$native, i32>(source).map(i64::from),
                         Target::Signed(SignedWidth::I64) => num_cast::<$native, i64>(source),
-                        _ => return Err(internal("floating cast contains a foreign frozen target")),
+                        Target::F32 => {
+                            // Same-width identity must not quiet a signaling NaN
+                            // by routing it through a different floating width.
+                            let value = ($f32)(source);
+                            work.step()?;
+                            return Ok(CastRowResult::Float32(value));
+                        }
+                        Target::F64 => {
+                            let value = ($f64)(source);
+                            work.step()?;
+                            return Ok(CastRowResult::Float64(value));
+                        }
                     };
                     work.step()?;
                     match converted {
@@ -361,8 +371,16 @@ impl PreparedCastRecipe {
                 Source::Signed(SignedWidth::I16) => convert!(Int16Array, i16),
                 Source::Signed(SignedWidth::I32) => convert!(Int32Array, i32),
                 Source::Signed(SignedWidth::I64) => convert!(Int64Array, i64),
-                Source::F32 => convert_float!(Float32Array, f32),
-                Source::F64 => convert_float!(Float64Array, f64),
+                Source::F32 => {
+                    convert_float!(Float32Array, f32, |value: f32| value, |value: f32| value
+                        as f64)
+                }
+                Source::F64 => convert_float!(
+                    Float64Array,
+                    f64,
+                    |value: f64| value as f32,
+                    |value: f64| value
+                ),
             })
         })();
         // The same work latch returns any original callback cause without replay.
@@ -445,3 +463,7 @@ mod tests;
 #[cfg(test)]
 #[path = "cast_float_tests.rs"]
 mod float_tests;
+
+#[cfg(test)]
+#[path = "cast_float_identity_tests.rs"]
+mod float_identity_tests;

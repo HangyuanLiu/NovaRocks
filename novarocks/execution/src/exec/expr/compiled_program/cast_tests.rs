@@ -222,18 +222,42 @@ fn fixture(
         .unwrap();
     let mut projections = Vec::new();
     for (id, ty) in &columns {
-        let value = if ty.nullable {
-            LiteralValue::Null
+        let definition = if !ty.nullable && ty.data_type == DataType::Float32 {
+            let exact = builder
+                .add_expression(
+                    input_node,
+                    FunctionValueType::new(DataType::Float64, false),
+                    ExprKind::Literal(LiteralValue::Float64Bits(0.0_f64.to_bits())),
+                )
+                .unwrap();
+            builder
+                .add_expression(
+                    input_node,
+                    ty.clone(),
+                    ExprKind::Cast {
+                        expr: exact,
+                        target: DataType::Float32,
+                        decimal_overflow_policy: policy,
+                        allow_throw_exception: allow_ref(),
+                    },
+                )
+                .unwrap()
         } else {
-            match ty.data_type {
-                DataType::Int64 => LiteralValue::Int64(0),
-                DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
-                _ => panic!("nonnullable fixture requires an implemented exact numeric literal"),
-            }
+            let value = if ty.nullable {
+                LiteralValue::Null
+            } else {
+                match ty.data_type {
+                    DataType::Int64 => LiteralValue::Int64(0),
+                    DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
+                    _ => {
+                        panic!("nonnullable fixture requires an implemented exact numeric literal")
+                    }
+                }
+            };
+            builder
+                .add_expression(input_node, ty.clone(), ExprKind::Literal(value))
+                .unwrap()
         };
-        let definition = builder
-            .add_expression(input_node, ty.clone(), ExprKind::Literal(value))
-            .unwrap();
         builder
             .insert_value(ValueDef {
                 id: *id,
@@ -256,7 +280,32 @@ fn fixture(
         .unwrap();
     let mut authors = BTreeMap::new();
     let mut child = if matches!(source, Source::Constant) {
-        literal(&mut builder, &source_type, LiteralValue::Int64(71))
+        if source_type.data_type == DataType::Float32 {
+            let exact = literal(
+                &mut builder,
+                &FunctionValueType::new(DataType::Float64, false),
+                LiteralValue::Float64Bits((-0.0_f64).to_bits()),
+            );
+            builder
+                .add_expression(
+                    output_node,
+                    source_type.clone(),
+                    ExprKind::Cast {
+                        expr: exact,
+                        target: DataType::Float32,
+                        decimal_overflow_policy: policy,
+                        allow_throw_exception: allow_ref(),
+                    },
+                )
+                .unwrap()
+        } else {
+            let value = match source_type.data_type {
+                DataType::Int64 => LiteralValue::Int64(71),
+                DataType::Float64 => LiteralValue::Float64Bits((-0.0_f64).to_bits()),
+                _ => panic!("constant fixture requires an implemented exact numeric literal"),
+            };
+            literal(&mut builder, &source_type, value)
+        }
     } else {
         builder
             .add_expression(

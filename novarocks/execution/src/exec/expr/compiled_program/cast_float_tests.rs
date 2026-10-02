@@ -245,6 +245,13 @@ fn float_nonnullable_source_allows_nonnullable_signed_only_with_actual_allow_tru
 }
 
 fn inherited_round_fixture(allow: bool) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
+    inherited_round_fixture_with_target(allow, DataType::Int8)
+}
+
+fn inherited_round_fixture_with_target(
+    allow: bool,
+    target: DataType,
+) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
     let functions = catalogue(Shape::Decimal);
     let fid = FragmentId::new(214);
     let input_node = NodeId::new(41);
@@ -350,14 +357,14 @@ fn inherited_round_fixture(allow: bool) -> (PureEngineFunctionCatalog, Arc<Fragm
         ),
         vec![condition, left, right],
     );
-    let result_type = FunctionValueType::new(DataType::Int8, true);
+    let result_type = FunctionValueType::new(target.clone(), true);
     let expression = builder
         .add_expression(
             output_node,
             result_type.clone(),
             ExprKind::Cast {
                 expr: child,
-                target: DataType::Int8,
+                target,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 allow_throw_exception: allow_ref(),
             },
@@ -612,3 +619,6 @@ fn float_cast_errors_remain_terminal_under_coalesce_and_is_null_with_full_child_
         }
     }
 }
+
+#[path = "cast_float_identity_tests.rs"]
+mod cast_float_identity_tests;

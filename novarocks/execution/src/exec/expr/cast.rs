@@ -5329,3 +5329,7 @@ mod intrinsic_cast_row_contract_tests {
 #[cfg(test)]
 #[path = "cast_float_numeric_oracle_tests.rs"]
 mod cast_float_numeric_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_float_identity_oracle_tests.rs"]
+mod cast_float_identity_oracle_tests;

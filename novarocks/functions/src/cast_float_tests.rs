@@ -355,8 +355,8 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
             }
         }
         for target in [
-            DataType::Float32,
-            DataType::Float64,
+            DataType::Float16,
+            DataType::Boolean,
             DataType::UInt64,
             DataType::Decimal128(10, 0),
         ] {
