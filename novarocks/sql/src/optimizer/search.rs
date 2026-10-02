@@ -604,6 +604,7 @@ mod tests {
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: project_expr,
                     output_name: "c1".to_string(),

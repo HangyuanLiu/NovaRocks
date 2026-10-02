@@ -2209,6 +2209,7 @@ mod tests {
             .flat_map(|child| child.output_columns.iter().cloned())
             .collect::<Vec<_>>();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                 join_type,
                 eq_conditions,
@@ -2288,7 +2289,9 @@ mod tests {
         child: PhysicalPlanNode,
     ) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: None,
             }),
@@ -2302,6 +2305,7 @@ mod tests {
     fn hash_redistribute_node(cols: Vec<u32>, child: PhysicalPlanNode) -> PhysicalPlanNode {
         let output_columns = child.output_columns.clone();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(RedistributeNode {
                 mode: RedistributeMode::Hash {
                     cols: cols.into_iter().map(ColumnId::new_for_test).collect(),
@@ -2319,6 +2323,7 @@ mod tests {
 
     fn values_node(marker: f64, children: Vec<PhysicalPlanNode>) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],

@@ -149,6 +149,9 @@ pub(crate) struct PreExpandKeyedAssertSpec {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalPlanNode {
+    /// Analyzed root facts for exact output identities; projected once into ValueDef.
+    pub logical_kinds:
+        std::collections::BTreeMap<ColumnId, novarocks_physical_plan::ValueLogicalKind>,
     pub kind: PhysicalPlanKind,
     pub children: Vec<PhysicalPlanNode>,
     pub output_columns: Vec<OutputColumn>,
@@ -269,6 +272,7 @@ pub enum PhysicalPlanKind {
     ChangeEventExpand(DistributedChangeEventExpandNode),
     QuotaPreclaim(PlanQuotaPreclaimNode),
     QuotaTrim(PlanQuotaTrimNode),
+    Membership(crate::planner::membership::PlanMembershipNode),
     FanoutAnchor(PlanFanoutAnchorNode),
     FanoutConsume(PlanFanoutConsumeNode),
     CTEAnchor(PlanCTEAnchorNode),
@@ -301,6 +305,7 @@ impl PhysicalPlanKind {
             "ChangeEventExpand",
             "QuotaPreclaim",
             "QuotaTrim",
+            "Membership",
             "FanoutAnchor",
             "FanoutConsume",
             "CTEAnchor",

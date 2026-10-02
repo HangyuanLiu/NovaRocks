@@ -203,6 +203,7 @@ fn adapt_opt_expr_output_with_qualifier(
 
     Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),
@@ -270,6 +271,7 @@ fn adapt_cte_replacement_output_with_qualifier(
 
     Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),
@@ -326,6 +328,11 @@ fn opt_expr_output_columns(
         Operator::LogicalCTEAnchor(_) => opt_expr_output_columns(expr.child(1), scalars),
         Operator::LogicalCTEProduce(node) => Ok(node.output_columns.clone()),
         Operator::LogicalCTEConsume(node) => Ok(node.output_columns.clone()),
+        Operator::LogicalMembership(node) => {
+            let mut columns = opt_expr_output_columns(expr.left(), scalars)?;
+            columns.push(node.result.clone());
+            Ok(columns)
+        }
         Operator::LogicalApply(node) => {
             let mut columns = opt_expr_output_columns(expr.left(), scalars)?;
             columns.push(node.output_column.clone());

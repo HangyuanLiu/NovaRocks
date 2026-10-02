@@ -378,6 +378,8 @@ impl<'a> ConstantFolder<'a> {
             | Operator::PhysicalGenerateSeries(_)
             | Operator::LogicalRepeat(_)
             | Operator::PhysicalRepeat(_)
+            | Operator::LogicalMembership(_)
+            | Operator::PhysicalMembership(_)
             | Operator::LogicalQuotaPreclaim(_)
             | Operator::PhysicalQuotaPreclaim(_)
             | Operator::LogicalQuotaTrim(_)
@@ -457,6 +459,8 @@ fn operator_has_scalars(op: &Operator) -> bool {
         | Operator::PhysicalGenerateSeries(_)
         | Operator::LogicalRepeat(_)
         | Operator::PhysicalRepeat(_)
+        | Operator::LogicalMembership(_)
+        | Operator::PhysicalMembership(_)
         | Operator::LogicalQuotaPreclaim(_)
         | Operator::PhysicalQuotaPreclaim(_)
         | Operator::LogicalQuotaTrim(_)
@@ -972,6 +976,7 @@ mod tests {
 
     fn project(expr: ScalarId) -> OptExpr {
         OptExpr::leaf(Operator::LogicalProject(ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: vec![ScalarProjectItem {
                 expr,
                 output_name: "c".to_string(),

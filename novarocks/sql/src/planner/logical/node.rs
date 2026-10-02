@@ -63,6 +63,7 @@ pub(crate) enum LogicalPlanKind {
     Except(LogicalExceptNode),
     QuotaPreclaim(PlanQuotaPreclaimNode),
     QuotaTrim(PlanQuotaTrimNode),
+    Membership(crate::planner::membership::PlanMembershipNode),
     FanoutAnchor(PlanFanoutAnchorNode),
     FanoutConsume(PlanFanoutConsumeNode),
     CTEAnchor(PlanCTEAnchorNode),
@@ -94,6 +95,7 @@ impl LogicalPlanKind {
             LogicalPlanKind::Except(_) => "Except",
             LogicalPlanKind::QuotaPreclaim(_) => "QuotaPreclaim",
             LogicalPlanKind::QuotaTrim(_) => "QuotaTrim",
+            LogicalPlanKind::Membership(_) => "Membership",
             LogicalPlanKind::FanoutAnchor(_) => "FanoutAnchor",
             LogicalPlanKind::FanoutConsume(_) => "FanoutConsume",
             LogicalPlanKind::CTEAnchor(_) => "CTEAnchor",
@@ -126,6 +128,7 @@ impl LogicalPlanKind {
             "Except",
             "QuotaPreclaim",
             "QuotaTrim",
+            "Membership",
             "FanoutAnchor",
             "FanoutConsume",
             "CTEAnchor",
@@ -292,6 +295,7 @@ mod plan_tests {
     fn logical_plan_node_exposes_kind_and_children_uniformly() {
         let node = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![],
                 output_qualifier: None,
             }),
@@ -350,6 +354,7 @@ mod plan_tests {
     fn wrapper_required_output_columns_defaults_none() {
         let node = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![],
                 output_qualifier: None,
             }),

@@ -364,6 +364,7 @@ fn normalize_top_level_union_branch_output(
 
     LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: None,
         }),
@@ -749,6 +750,7 @@ mod tests {
         let scan = scan(name, first_id);
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: col_expr(first_id, "k"),

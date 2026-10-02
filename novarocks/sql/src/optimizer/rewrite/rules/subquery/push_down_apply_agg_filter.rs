@@ -189,6 +189,7 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
 
         OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: new_items,
                 output_qualifier: project.output_qualifier,
             }),

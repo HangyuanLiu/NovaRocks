@@ -69,6 +69,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         }),
 
         Operator::LogicalProject(op) => LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: materialize_project_items(arena, &op.items),
             output_qualifier: op.output_qualifier.clone(),
         }),

@@ -773,6 +773,7 @@ mod tests {
         let key = output(1, "key", data_type.clone(), false);
         let source = leaf(1, "key", data_type.clone(), false);
         let aggregate = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
                 mode: AggMode::Local,
                 group_by: vec![column(1, "key", data_type.clone(), false)],
@@ -788,6 +789,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
                 items: vec![sort_item(
                     column(1, "key", data_type, false),
@@ -816,6 +818,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
@@ -921,6 +924,7 @@ mod tests {
     fn leaf(id: u32, name: &str, data_type: DataType, nullable: bool) -> PhysicalPlanNode {
         let output = output(id, name, data_type, nullable);
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Scan(
                 PlanScanNode {
                     database: "db".to_string(),
@@ -956,6 +960,7 @@ mod tests {
 
     fn values_node() -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: Vec::new(),
@@ -970,6 +975,7 @@ mod tests {
     fn values_with_key() -> PhysicalPlanNode {
         let key = output(1, "key", DataType::Int64, false);
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Values(PlanValuesNode {
                 rows: vec![vec![TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -987,6 +993,7 @@ mod tests {
 
     fn filter_node(child: PhysicalPlanNode) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Filter(PlanFilterNode {
                 predicate: column(1, "key", DataType::Int64, false),
             }),
@@ -1000,7 +1007,9 @@ mod tests {
     fn project_node(child: PhysicalPlanNode) -> PhysicalPlanNode {
         let key = child.output_columns[0].clone();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: column(1, &key.name, key.data_type.clone(), key.nullable),
                     output_name: key.name.clone(),
@@ -1027,7 +1036,9 @@ mod tests {
             nullable: key.nullable,
         };
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr,
                     output_name: key.name.clone(),
@@ -1058,6 +1069,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
@@ -1081,6 +1093,7 @@ mod tests {
 
     fn cte_producer_node(child: PhysicalPlanNode) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id: 1,
                 output_columns: child.output_columns.clone(),
@@ -1095,6 +1108,7 @@ mod tests {
     fn cte_consumer_node() -> PhysicalPlanNode {
         let output_columns = vec![output(1, "key", DataType::Int64, false)];
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id: 1,
                 alias: "cte".to_string(),
@@ -1110,6 +1124,7 @@ mod tests {
 
     fn redistribute_node(child: PhysicalPlanNode) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(RedistributeNode {
                 mode: RedistributeMode::Hash {
                     cols: vec![ColumnId::new_for_test(1)],
@@ -1135,6 +1150,7 @@ mod tests {
         output_column: OutputColumn,
     ) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::SetOp(PhysicalSetOpNode {
                 kind: PlanSetOpKind::UnionAll,
                 output_columns: vec![output_column.clone()],
@@ -1159,6 +1175,7 @@ mod tests {
     ) -> PhysicalPlanNode {
         let output_columns = left.output_columns.clone();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::SetOp(PhysicalSetOpNode {
                 kind,
                 output_columns: output_columns.clone(),

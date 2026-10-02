@@ -151,6 +151,7 @@ pub(crate) fn extract_best(
         },
         output_columns: output_columns.clone(),
         execution_props: PlanExecutionProps {
+            logical_kinds: Default::default(),
             output_property: inner_output_property.clone(),
             child_output_properties: winner.child_outputs.clone(),
             join_distribution,
@@ -193,6 +194,7 @@ pub(crate) fn extract_best(
             },
             output_columns,
             execution_props: PlanExecutionProps {
+                logical_kinds: Default::default(),
                 output_property: required.clone(),
                 child_output_properties: vec![inner_output_property],
                 join_distribution: None,
@@ -546,6 +548,7 @@ mod tests {
             })
             .collect();
         let project = ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: columns
                 .iter()
                 .map(|column| ScalarProjectItem {
@@ -630,6 +633,7 @@ mod tests {
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: project_expr,
                     output_name: "__change_op".to_string(),

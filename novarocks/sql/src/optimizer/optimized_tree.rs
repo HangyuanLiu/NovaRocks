@@ -40,6 +40,10 @@ pub(crate) enum JoinExecutionDistribution {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlanExecutionProps {
+    pub logical_kinds: std::collections::BTreeMap<
+        crate::column_id::ColumnId,
+        novarocks_physical_plan::ValueLogicalKind,
+    >,
     pub output_property: PhysicalPropertySet,
     #[allow(
         dead_code,
@@ -56,6 +60,7 @@ pub(crate) struct PlanExecutionProps {
 impl Default for PlanExecutionProps {
     fn default() -> Self {
         Self {
+            logical_kinds: Default::default(),
             output_property: PhysicalPropertySet::any(),
             child_output_properties: Vec::new(),
             join_distribution: None,
@@ -88,6 +93,30 @@ pub(crate) fn attach_scalar_arena(root: &mut OptimizedOperatorNode, arena: Arc<S
     }
 }
 
+/// Freeze proven analyzer facts after all ColumnId remaps/CSE have completed.
+pub(crate) fn attach_logical_kinds(
+    root: &mut OptimizedOperatorNode,
+    factory: &crate::column_id::ColumnRefFactory,
+) -> Result<(), String> {
+    for child in &mut root.children {
+        attach_logical_kinds(child, factory)?;
+    }
+    let mut kinds = std::collections::BTreeMap::new();
+    for column in &root.output_columns {
+        if factory.logical_type(column.column_id) == Some(novarocks_types::schema::SqlType::Json) {
+            if column.data_type != arrow::datatypes::DataType::Utf8 {
+                return Err("analyzed JSON output lost its Utf8 carrier".into());
+            }
+            kinds.insert(
+                column.column_id,
+                novarocks_physical_plan::ValueLogicalKind::Json,
+            );
+        }
+    }
+    root.execution_props.logical_kinds = kinds;
+    Ok(())
+}
+
 #[cfg(test)]
 mod execution_prop_tests {
     use super::*;
@@ -105,6 +134,7 @@ mod execution_prop_tests {
             explain_stats: crate::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![],
             execution_props: PlanExecutionProps {
+                logical_kinds: Default::default(),
                 output_property: crate::optimizer::property::PhysicalPropertySet::broadcast(),
                 child_output_properties: vec![
                     crate::optimizer::property::PhysicalPropertySet::any(),

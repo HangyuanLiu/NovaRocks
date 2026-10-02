@@ -459,6 +459,7 @@ mod tests {
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: None,
             }),

@@ -954,6 +954,7 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: intern_project_items(&mut memo.scalars, &items),
                 output_qualifier: None,
             }),

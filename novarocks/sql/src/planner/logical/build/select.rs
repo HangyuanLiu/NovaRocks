@@ -164,13 +164,35 @@ pub(super) fn plan_select_scoped_with_source(
         }
 
         let aggregate_group_by = dedup_group_by_exprs(&select.group_by);
-        let (project_items, agg_calls, output_columns, rewritten_having) =
+        let mut augmented_projection = select.projection.clone();
+        for spec in &predicate_apply_specs {
+            if matches!(spec.clause, ApplyClause::Having | ApplyClause::Projection)
+                && let PredicateExecutionKind::JsonMembership { probe_column } =
+                    &spec.execution_kind
+            {
+                augmented_projection.push(ProjectItem {
+                    expr: spec.in_lhs.clone().ok_or("JSON membership probe missing")?,
+                    output_name: probe_column.name.clone(),
+                    output_column_id: probe_column.column_id,
+                });
+            }
+        }
+        let (mut project_items, agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
-                &select.projection,
+                &augmented_projection,
                 &aggregate_group_by,
                 select.having.as_ref(),
                 factory,
             );
+        for spec in &mut predicate_apply_specs {
+            if let PredicateExecutionKind::JsonMembership { probe_column } = &spec.execution_kind
+                && let Some(index) = project_items
+                    .iter()
+                    .position(|item| item.output_column_id == probe_column.column_id)
+            {
+                spec.in_lhs = Some(project_items.remove(index).expr);
+            }
+        }
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: aggregate_group_by,
@@ -218,6 +240,13 @@ pub(super) fn plan_select_scoped_with_source(
             factory,
         )?;
 
+        current = wrap_predicate_applies(
+            current,
+            &mut predicate_apply_specs,
+            ApplyClause::Projection,
+            cte_registry,
+            factory,
+        )?;
         current = build_window_and_project(current, project_items, factory)?;
     } else {
         // Projection placement (non-aggregated branch).
@@ -229,6 +258,27 @@ pub(super) fn plan_select_scoped_with_source(
             factory,
         )?;
 
+        current = wrap_predicate_applies(
+            current,
+            &mut predicate_apply_specs,
+            ApplyClause::Having,
+            cte_registry,
+            factory,
+        )?;
+        if let Some(having) = select.having.take() {
+            current = LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode { predicate: having }),
+                vec![current],
+                None,
+            );
+        }
+        current = wrap_predicate_applies(
+            current,
+            &mut predicate_apply_specs,
+            ApplyClause::Projection,
+            cte_registry,
+            factory,
+        )?;
         current = build_window_and_project(current, select.projection.clone(), factory)?;
     }
 

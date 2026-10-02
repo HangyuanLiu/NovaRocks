@@ -350,6 +350,7 @@ mod tests {
         let project_output = add_column(&factory, "a", DataType::Int64, true, false).column_id;
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -392,6 +393,7 @@ mod tests {
         );
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -423,6 +425,7 @@ mod tests {
         scan_node.predicates.push(bool_literal(true));
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -463,6 +466,7 @@ mod tests {
         let project_output = add_column(&factory, "a", DataType::Int64, true, false).column_id;
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -512,6 +516,7 @@ mod tests {
         );
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -550,6 +555,7 @@ mod tests {
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("try_variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -673,6 +679,7 @@ mod tests {
         }));
         let project_op = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: call_id,
                     output_name: "a".to_string(),
@@ -701,6 +708,7 @@ mod tests {
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$", "bigint"),
                     output_name: "root_path".to_string(),
@@ -733,6 +741,7 @@ mod tests {
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "", "bigint"),
                     output_name: "empty_path".to_string(),
@@ -825,6 +834,8 @@ mod tests {
             };
             let plan = LogicalPlanNode::new(
                 LogicalPlanKind::Project(PlanProjectNode {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     items: vec![ProjectItem {
                         expr,
                         output_name: name.to_string(),

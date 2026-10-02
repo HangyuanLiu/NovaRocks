@@ -92,6 +92,7 @@ pub(super) fn build_window_and_project(
         );
         Ok(LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: rewritten_items,
                 output_qualifier: None,
             }),
@@ -101,6 +102,7 @@ pub(super) fn build_window_and_project(
     } else if !project_items.is_empty() {
         Ok(LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: project_items,
                 output_qualifier: None,
             }),

@@ -400,12 +400,14 @@ impl ContractLoweringVisitor {
         let mut columns = BTreeMap::new();
         let mut producer_to_import = BTreeMap::new();
         for (column, (producer_id, value, ty)) in consume.output_columns.iter().zip(&selected) {
-            let imported = self.fragment_mut().add_value(
+            let imported = self.add_inherited_value(
                 ty.clone(),
                 ValueOrigin::ExchangeImport {
                     edge,
                     source_value: *value,
                 },
+                source_fragment,
+                *value,
             )?;
             projection.push(*value);
             mapping.push((*value, imported));

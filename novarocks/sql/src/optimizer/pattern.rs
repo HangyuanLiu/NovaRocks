@@ -48,6 +48,7 @@ pub(crate) enum OpKind {
     CTEConsume,
     AssertOneRow,
     Apply,
+    Membership,
 }
 
 /// Structural match pattern. `Op` matches operator KIND only (not fields).
@@ -80,6 +81,7 @@ pub(crate) fn op_kind(op: &Operator) -> Option<OpKind> {
         Operator::LogicalCTEProduce(_) => Some(OpKind::CTEProduce),
         Operator::LogicalCTEConsume(_) => Some(OpKind::CTEConsume),
         Operator::LogicalAssertOneRow(_) => Some(OpKind::AssertOneRow),
+        Operator::LogicalMembership(_) => Some(OpKind::Membership),
         Operator::LogicalApply(_) => Some(OpKind::Apply),
         Operator::LogicalJoin(_) => Some(OpKind::Join),
         Operator::LogicalLimit(_) => Some(OpKind::Limit),
@@ -334,6 +336,8 @@ mod tests {
             ),
             (
                 Operator::LogicalProject(ProjectOp {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     items: vec![],
                     output_qualifier: None,
                 }),

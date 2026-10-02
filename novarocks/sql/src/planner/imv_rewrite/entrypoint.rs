@@ -63,6 +63,13 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         function_catalog,
     } = input;
 
+    fn contains_membership(plan: &LogicalPlanNode) -> bool {
+        matches!(plan.kind, LogicalPlanKind::Membership(_))
+            || plan.children.iter().any(contains_membership)
+    }
+    if contains_membership(&plan) {
+        return Err("JSON membership is not supported in incremental MV definitions".into());
+    }
     bind_definition_occurrences(&mut plan, &snapshot)?;
     reserve_existing_plan_column_ids(&column_ref_factory, &plan);
     let mut ctx_rw = RewriteContext::for_mv_refresh_with_settings(
@@ -377,6 +384,12 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
             collect_output_columns(&intersect.output_columns, max_id)
         }
         LogicalPlanKind::Except(except) => collect_output_columns(&except.output_columns, max_id),
+        LogicalPlanKind::Membership(node) => {
+            collect_output_columns(&node.output_columns, max_id);
+            for id in [node.probe, node.build, node.result.column_id] {
+                collect_column_id(id, max_id);
+            }
+        }
         LogicalPlanKind::QuotaPreclaim(node) => {
             collect_output_columns(&node.output_columns, max_id);
             for id in [
@@ -897,6 +910,7 @@ pub(crate) mod tests {
         );
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: project_items,
                 output_qualifier: None,
             }),
@@ -938,6 +952,7 @@ pub(crate) mod tests {
         );
         let root = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     normalization_project_item(&group_output, 21, "region"),
                     normalization_project_item(&aggregate_output, 22, "s"),
@@ -1109,6 +1124,7 @@ pub(crate) mod tests {
     fn project_filter_branch(first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: column_ref(first_id, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -1680,6 +1696,7 @@ pub(crate) mod tests {
     fn project_all(input: LogicalPlanNode, first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_expr(first_id, "k", false),
@@ -1797,6 +1814,7 @@ pub(crate) mod tests {
         );
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_expr(1, "k", false),
@@ -2505,6 +2523,7 @@ pub(crate) mod tests {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -2560,6 +2579,7 @@ pub(crate) mod tests {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: column_ref(1, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -2649,6 +2669,7 @@ pub(crate) mod tests {
             assert!(!matches!(
                 &plan.kind,
                 LogicalPlanKind::QuotaPreclaim(_)
+                    | LogicalPlanKind::Membership(_)
                     | LogicalPlanKind::QuotaTrim(_)
                     | LogicalPlanKind::FanoutAnchor(_)
                     | LogicalPlanKind::FanoutConsume(_)
@@ -2682,6 +2703,7 @@ pub(crate) mod tests {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(1, "k", DataType::Int64, false),
@@ -2850,6 +2872,7 @@ pub(crate) mod tests {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: column_ref(1, "k", DataType::Int64, false),
                     output_name: "k".to_string(),

@@ -131,6 +131,7 @@ pub(crate) fn derive_statistics(
                 }
             }
         }
+        Operator::LogicalMembership(_) => child_statistics(memo, &expr.children, 0),
         Operator::LogicalQuotaPreclaim(_) | Operator::LogicalQuotaTrim(_) => {
             child_statistics(memo, &expr.children, 1)
         }
@@ -586,6 +587,7 @@ pub(crate) fn derive_statistics(
             }
         }
 
+        Operator::PhysicalMembership(_) => child_statistics(memo, &expr.children, 0),
         Operator::PhysicalQuotaPreclaim(_) | Operator::PhysicalQuotaTrim(_) => {
             child_statistics(memo, &expr.children, 1)
         }
@@ -2278,6 +2280,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
         Operator::LogicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
+        Operator::LogicalMembership(o) => {
+            let mut cols = child_output_columns(memo, &expr.children, 0);
+            cols.push(o.result.clone());
+            cols
+        }
         Operator::LogicalQuotaPreclaim(o) => o.output_columns.clone(),
         Operator::LogicalQuotaTrim(o) => o.output_columns.clone(),
         Operator::LogicalFanoutConsume(o) => o.output_columns.clone(),
@@ -2358,6 +2365,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
         Operator::PhysicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
+        Operator::PhysicalMembership(o) => {
+            let mut cols = child_output_columns(memo, &expr.children, 0);
+            cols.push(o.result.clone());
+            cols
+        }
         Operator::PhysicalQuotaPreclaim(o) => o.output_columns.clone(),
         Operator::PhysicalQuotaTrim(o) => o.output_columns.clone(),
         Operator::PhysicalFanoutConsume(o) => o.output_columns.clone(),
@@ -5571,6 +5583,7 @@ mod tests {
         let out_id = ColumnId::new_for_test(42);
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),

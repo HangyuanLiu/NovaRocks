@@ -78,6 +78,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             Ok(columns)
         }
         LogicalPlanKind::QuotaPreclaim(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::Membership(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::QuotaTrim(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::FanoutConsume(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::FanoutAnchor(_) => plan_output_columns(plan.child(1)),
@@ -177,6 +178,7 @@ pub(super) fn adapt_plan_output_with_qualifier(
 
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),

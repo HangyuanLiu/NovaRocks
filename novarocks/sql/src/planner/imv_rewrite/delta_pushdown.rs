@@ -246,6 +246,7 @@ mod tests {
     fn project_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {

@@ -160,6 +160,7 @@ fn item(output: &OutputColumn, expr: TypedExpr) -> ProjectItem {
 fn project(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
     node(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: None,
         }),

@@ -656,6 +656,7 @@ mod tests {
             .collect();
         OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: scalar_items,
                 output_qualifier: None,
             }),

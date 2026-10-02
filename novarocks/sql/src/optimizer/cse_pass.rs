@@ -90,6 +90,10 @@ fn rewrite_node(
     for child in &mut node.children {
         rewrite_node(child, scalars, factory, cost_options);
     }
+    // Do not inline or install a CSE Project across a once-only materialization.
+    if contains_checked_materialization(node) {
+        return;
+    }
     match &node.op {
         Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory, cost_options),
         Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory, cost_options),
@@ -107,6 +111,12 @@ fn rewrite_node(
         }
         _ => {}
     }
+}
+
+fn contains_checked_materialization(node: &OptimizedOperatorNode) -> bool {
+    matches!(&node.op, Operator::PhysicalProject(op)
+        if op.retention_admission == novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask)
+        || node.children.iter().any(contains_checked_materialization)
 }
 
 fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
@@ -911,6 +921,7 @@ fn wrap_project_around_child(
             .map(|item| output_column_for_project_item(scalars, item)),
     );
     let op = Operator::PhysicalProject(crate::optimizer::operator::ProjectOp {
+        retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
         items,
         output_qualifier: None,
     });
@@ -1013,7 +1024,25 @@ fn rewrite_project(
         return;
     }
 
+    let proven_json = project
+        .items
+        .iter()
+        .filter(|item| {
+            factory.logical_type(item.output_column_id)
+                == Some(novarocks_types::schema::SqlType::Json)
+        })
+        .map(|item| item.expr)
+        .collect::<HashSet<_>>();
     let (prelude, subst) = build_commons(scalars, factory, &commons);
+    for item in &prelude {
+        if proven_json.contains(&item.expr) {
+            // This is the same analyzed complete expression, remapped by CSE.
+            factory.set_logical_type(
+                item.output_column_id,
+                Some(novarocks_types::schema::SqlType::Json),
+            );
+        }
+    }
     let Operator::PhysicalProject(project) = &mut node.op else {
         unreachable!("checked project operator above");
     };
@@ -1078,6 +1107,7 @@ fn rewrite_project(
     }));
     child_project_items.extend(prelude);
     let op = Operator::PhysicalProject(crate::optimizer::operator::ProjectOp {
+        retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
         items: child_project_items,
         output_qualifier: None,
     });
@@ -1900,6 +1930,7 @@ mod tests {
         };
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     project_item(a_plus_b, 110, "x"),
                     project_item(doubled, 111, "y"),
@@ -1981,6 +2012,7 @@ mod tests {
         let child = values_node(vec![output_column(10, "stale")]);
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![project_item(a, 10, "stale")],
                 output_qualifier: None,
             }),
@@ -2071,6 +2103,7 @@ mod tests {
         };
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     project_item(a_plus_b, 3, "x"),
                     project_item(doubled, 4, "y"),
@@ -2154,6 +2187,7 @@ mod tests {
         };
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     project_item(b_plus_c, 110, "x"),
                     project_item(doubled, 111, "y"),
@@ -2416,6 +2450,7 @@ mod tests {
         };
         let mut child_project = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![project_item(a, 201, "x"), project_item(b, 202, "y")],
                 output_qualifier: None,
             }),
@@ -2486,6 +2521,7 @@ mod tests {
         };
         let mut child_project = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![project_item(a, 101, "a"), project_item(b, 102, "b")],
                 output_qualifier: None,
             }),
@@ -2745,6 +2781,7 @@ mod tests {
         };
         let project = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![project_item(a, 201, "x"), project_item(b, 202, "y")],
                 output_qualifier: None,
             }),

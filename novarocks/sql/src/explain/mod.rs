@@ -105,6 +105,12 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
             }
         }
+        LogicalPlanKind::Membership(node) => {
+            out.push(format!("{pad}JSON MEMBERSHIP comparison={:?} negated={} placement={:?} probe={} build={} result={}", node.comparison, node.negated, node.distribution, node.probe.0, node.build.0, node.result.column_id.0));
+            for child in &plan.children {
+                format_node(child, level, indent + 1, out);
+            }
+        }
         LogicalPlanKind::QuotaPreclaim(node) => {
             out.push(format!(
                 "{pad}QUOTA PRECLAIM domain={} key={} need={:?} budget={}",
@@ -1026,6 +1032,7 @@ mod tests {
         );
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: column_expr(1, Some("t"), "k"),
                     output_name: "k".to_string(),

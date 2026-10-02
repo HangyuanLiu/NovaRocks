@@ -76,6 +76,8 @@ pub(super) fn lift_correlated_inner_opt(
             )?;
             let mut right = OptExpr::new(
                 Operator::LogicalProject(ProjectOp {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     items,
                     output_qualifier: project.output_qualifier,
                 }),
@@ -348,6 +350,8 @@ mod legacy {
                 Some(LiftedInner {
                     right: LogicalPlanNode::new(
                         LogicalPlanKind::Project(PlanProjectNode {
+                            retention_admission:
+                                novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                             items,
                             output_qualifier: p.output_qualifier,
                         }),
@@ -731,6 +735,7 @@ mod tests {
     fn project(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: col_ref(INNER_K, "k"),
                     output_name: "k".to_string(),
@@ -746,6 +751,7 @@ mod tests {
     fn project_literal(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),

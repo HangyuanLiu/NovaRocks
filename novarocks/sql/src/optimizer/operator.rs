@@ -311,6 +311,7 @@ pub(crate) struct FilterOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectOp {
+    pub retention_admission: novarocks_physical_plan::ProjectRetentionAdmission,
     pub items: Vec<ScalarProjectItem>,
     pub output_qualifier: Option<String>,
 }
@@ -698,6 +699,7 @@ pub(crate) enum Operator {
     LogicalChangeEventExpand(ChangeEventExpandOp),
     LogicalQuotaPreclaim(PlanQuotaPreclaimNode),
     LogicalQuotaTrim(PlanQuotaTrimNode),
+    LogicalMembership(crate::planner::membership::PlanMembershipNode),
     LogicalFanoutAnchor(FanoutAnchorOp),
     LogicalFanoutConsume(PlanFanoutConsumeNode),
     LogicalCTEAnchor(CTEAnchorOp),
@@ -725,6 +727,7 @@ pub(crate) enum Operator {
     PhysicalDistribution(PhysicalDistributionOp),
     PhysicalQuotaPreclaim(PlanQuotaPreclaimNode),
     PhysicalQuotaTrim(PlanQuotaTrimNode),
+    PhysicalMembership(crate::planner::membership::PlanMembershipNode),
     PhysicalFanoutAnchor(FanoutAnchorOp),
     PhysicalFanoutConsume(PlanFanoutConsumeNode),
     PhysicalCTEAnchor(CTEAnchorOp),
@@ -764,6 +767,7 @@ impl Operator {
                 | Operator::LogicalChangeEventExpand(_)
                 | Operator::LogicalQuotaPreclaim(_)
                 | Operator::LogicalQuotaTrim(_)
+                | Operator::LogicalMembership(_)
                 | Operator::LogicalFanoutAnchor(_)
                 | Operator::LogicalFanoutConsume(_)
                 | Operator::LogicalCTEAnchor(_)

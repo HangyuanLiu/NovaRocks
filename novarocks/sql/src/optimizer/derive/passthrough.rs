@@ -311,6 +311,7 @@ mod tests {
 
     fn make_minimal_project_op() -> ProjectOp {
         ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: vec![],
             output_qualifier: None,
         }
@@ -390,6 +391,7 @@ mod tests {
     fn project_output_maps_hash_and_keeps_only_the_ordering_prefix() {
         let mut scalars = ScalarArena::new();
         let op = ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: vec![
                 identity_item(&mut scalars, ColumnId(1), ColumnId(11)),
                 identity_item(&mut scalars, ColumnId(2), ColumnId(12)),
@@ -435,6 +437,7 @@ mod tests {
     fn project_output_drops_hash_when_any_key_is_not_an_identity_output() {
         let mut scalars = ScalarArena::new();
         let op = ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: vec![identity_item(&mut scalars, ColumnId(1), ColumnId(11))],
             output_qualifier: None,
         };
@@ -474,6 +477,7 @@ mod tests {
             false,
         );
         let op = ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: vec![ScalarProjectItem {
                 expr: expression,
                 output_name: "computed".to_string(),

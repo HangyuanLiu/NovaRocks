@@ -54,7 +54,56 @@ fn verify_node(
         .map(|child| verify_node(child, scalars))
         .collect::<Result<Vec<_>, _>>()?;
 
+    for (id, kind) in &node.execution_props.logical_kinds {
+        let Some(output) = node.output_columns.iter().find(|c| c.column_id == *id) else {
+            return Err("logical-kind proof refers to a non-output ColumnId".into());
+        };
+        if !kind.admits_carrier(&output.data_type) {
+            return Err("logical-kind proof has an incompatible carrier".into());
+        }
+    }
     let derived = match &node.op {
+        Operator::PhysicalMembership(op) => {
+            if child_outputs.len() != 2 {
+                return Err("Membership requires exact probe/build scopes".into());
+            }
+            verify_scoped_quota_column(op.probe, &child_outputs[0])?;
+            verify_scoped_quota_column(op.build, &child_outputs[1])?;
+            for (child, id) in [(0, op.probe), (1, op.build)] {
+                if node.children[child].execution_props.logical_kinds.get(&id)
+                    != Some(&novarocks_physical_plan::ValueLogicalKind::Json)
+                {
+                    return Err("Membership operand lacks analyzed Json evidence".into());
+                }
+            }
+            verify_output_id(op.result.column_id, "Membership result")?;
+            if op.result.data_type != arrow::datatypes::DataType::Boolean
+                || !op.result.nullable
+                || child_outputs
+                    .iter()
+                    .any(|ids| ids.contains(&op.result.column_id))
+            {
+                return Err("Membership result must be a fresh nullable Boolean".into());
+            }
+            let mut expected = node.children[0].output_columns.clone();
+            expected.push(op.result.clone());
+            for columns in [&node.output_columns, &op.output_columns] {
+                if columns.len() != expected.len()
+                    || columns.iter().zip(&expected).any(|(a, b)| {
+                        a.column_id != b.column_id
+                            || a.data_type != b.data_type
+                            || a.nullable != b.nullable
+                    })
+                {
+                    return Err(
+                        "Membership output differs from exact probe occurrences plus result".into(),
+                    );
+                }
+            }
+            let mut out = child_outputs[0].clone();
+            out.insert(op.result.column_id);
+            Ok(out)
+        }
         Operator::PhysicalQuotaPreclaim(op) => {
             if child_outputs.len() != 2 {
                 return Err("QuotaPreclaim requires two exact input scopes".into());
@@ -805,6 +854,7 @@ mod tests {
         }];
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),

@@ -129,6 +129,7 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         );
         let new_project = OptExpr {
             op: Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: proj.items,
                 output_qualifier: proj.output_qualifier,
             }),
@@ -612,6 +613,7 @@ mod tests {
             .collect();
         OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier,
             }),
@@ -744,6 +746,7 @@ mod tests {
             crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &computed_expr);
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: computed_id,
                     output_name: "x".into(),
@@ -812,6 +815,7 @@ mod tests {
             crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &computed_expr);
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ScalarProjectItem {
                         expr: passthrough_id,

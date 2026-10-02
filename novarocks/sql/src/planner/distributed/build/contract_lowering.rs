@@ -87,6 +87,7 @@ use crate::planner::physical::{
     PhysicalPlanKind, PhysicalPlanNode, PlanSetOpKind, RedistributeMode, TopNPhase as SqlTopNPhase,
 };
 
+mod membership;
 mod quota;
 use quota::{FanoutProducer, PendingQuotaFilter};
 
@@ -1331,6 +1332,49 @@ impl ContractLoweringVisitor {
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
+    fn value_logical_kind_in(
+        &self,
+        fragment: FragmentId,
+        value: ValueId,
+    ) -> Result<Option<novarocks_physical_plan::ValueLogicalKind>, ContractLoweringError> {
+        self.fragments
+            .get(&fragment)
+            .and_then(|f| f.value(value))
+            .map(|v| v.logical_kind)
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
+    }
+
+    fn add_planned_value(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        column: &OutputColumn,
+        ty: ValueType,
+        origin: ValueOrigin,
+    ) -> Result<ValueId, ContractLoweringError> {
+        let kind = plan.logical_kinds.get(&column.column_id).copied();
+        if kind.is_some_and(|kind| !kind.admits_carrier(&ty.data_type)) {
+            return Err(invalid_write(
+                "logical kind has an incompatible output carrier".into(),
+            ));
+        }
+        Ok(self
+            .fragment_mut()
+            .add_value_with_logical_kind(ty, origin, kind)?)
+    }
+
+    fn add_inherited_value(
+        &mut self,
+        ty: ValueType,
+        origin: ValueOrigin,
+        fragment: FragmentId,
+        source: ValueId,
+    ) -> Result<ValueId, ContractLoweringError> {
+        let kind = self.value_logical_kind_in(fragment, source)?;
+        Ok(self
+            .fragment_mut()
+            .add_value_with_logical_kind(ty, origin, kind)?)
+    }
+
     fn attach_runtime_filter(
         &mut self,
         fragment: FragmentId,
@@ -1617,7 +1661,9 @@ impl ContractLoweringVisitor {
             PhysicalPlanKind::Scan(scan) => self.lower_scan(plan, scan),
             PhysicalPlanKind::Values(values) => self.lower_values(plan, values),
             PhysicalPlanKind::Filter(filter) => self.lower_filter(plan, &filter.predicate),
-            PhysicalPlanKind::Project(project) => self.lower_project(plan, &project.items),
+            PhysicalPlanKind::Project(project) => {
+                self.lower_project(plan, &project.items, project.retention_admission)
+            }
             PhysicalPlanKind::Unpivot(unpivot) => self.lower_unpivot(plan, unpivot),
             PhysicalPlanKind::Limit(limit) => self.lower_limit(plan, limit),
             PhysicalPlanKind::Sort(sort) => self.lower_sort(plan, sort),
@@ -1636,6 +1682,7 @@ impl ContractLoweringVisitor {
             PhysicalPlanKind::HashAggregate(aggregate) => {
                 self.lower_hash_aggregate(plan, aggregate)
             }
+            PhysicalPlanKind::Membership(spec) => self.lower_membership(plan, spec),
             PhysicalPlanKind::QuotaPreclaim(spec) => self.lower_quota_preclaim(plan, spec),
             PhysicalPlanKind::QuotaTrim(spec) => self.lower_quota_trim(plan, spec),
             PhysicalPlanKind::FanoutAnchor(anchor) => self.lower_fanout_anchor(plan, anchor),
@@ -1649,6 +1696,28 @@ impl ContractLoweringVisitor {
                 self.lower_change_event_expand(plan, expand)
             }
         }?;
+        for (column, kind) in &plan.logical_kinds {
+            if !plan
+                .output_columns
+                .iter()
+                .any(|output| output.column_id == *column)
+            {
+                return Err(invalid_write(
+                    "logical kind refers to a non-output ColumnId".into(),
+                ));
+            }
+            let value = lowered
+                .columns
+                .get(column)
+                .copied()
+                .ok_or(ContractLoweringError::UnknownColumnReference(*column))?;
+            if self.value_logical_kind_in(lowered.fragment, value)? != Some(*kind) {
+                return Err(invalid_write(format!(
+                    "logical kind proof was lost for ColumnId {}",
+                    column.0
+                )));
+            }
+        }
         self.record_runtime_filter_probes(plan, &lowered)?;
         self.annotate_node(plan, &lowered)?;
         Ok(lowered)
@@ -1815,7 +1884,9 @@ impl ContractLoweringVisitor {
         let mut output = Vec::with_capacity(plan.output_columns.len());
         let mut columns = BTreeMap::new();
         for (ordinal, column) in plan.output_columns.iter().enumerate() {
-            let value = self.fragment_mut().add_value(
+            let value = self.add_planned_value(
+                plan,
+                column,
                 value_type(column),
                 ValueOrigin::NodeOutput {
                     node,
@@ -2112,13 +2183,15 @@ impl ContractLoweringVisitor {
         for (consumer_column, (producer_value, consumer_type)) in
             consume.output_columns.iter().zip(selected_outputs)
         {
-            let imported = self.fragment_mut().add_value(
+            let imported = self.add_inherited_value(
                 consumer_type,
                 ValueOrigin::CteImport {
                     edge,
                     producer_fragment,
                     producer_value,
                 },
+                producer_fragment,
+                producer_value,
             )?;
             projection.push(producer_value);
             receive_mapping.push((producer_value, imported));
@@ -2344,7 +2417,9 @@ impl ContractLoweringVisitor {
                 });
             }
             let provider_column = field.column().clone();
-            let value = self.fragment_mut().add_value(
+            let value = self.add_planned_value(
+                plan,
+                column,
                 engine_type.clone(),
                 ValueOrigin::ProviderField {
                     scan_node: node,
@@ -3720,12 +3795,14 @@ impl ContractLoweringVisitor {
                     // statement was analyzed to expect less.
                     let sent = self.value_declared_type_in(source.fragment, *source_value)?;
                     let ty = published_value_type(&value_type(column), &sent);
-                    let imported = self.fragment_mut().add_value(
+                    let imported = self.add_inherited_value(
                         ty,
                         ValueOrigin::ExchangeImport {
                             edge,
                             source_value: *source_value,
                         },
+                        source.fragment,
+                        *source_value,
                     )?;
                     imported_by_source.insert(*source_value, imported);
                     imported
@@ -4389,9 +4466,11 @@ impl ContractLoweringVisitor {
                 match extensions.get(source).copied() {
                     Some(value) => value,
                     None => {
-                        let value = self.fragment_mut().add_value(
+                        let value = self.add_inherited_value(
                             value_type(column),
                             ValueOrigin::NullExtended { node, of: *source },
+                            self.current_fragment,
+                            *source,
                         )?;
                         extensions.insert(*source, value);
                         null_extended.push(value);
@@ -4568,7 +4647,9 @@ impl ContractLoweringVisitor {
             let value = match columns.get(&column.column_id).copied() {
                 Some(value) => value,
                 None => {
-                    let value = self.fragment_mut().add_value(
+                    let value = self.add_planned_value(
+                        plan,
+                        column,
                         published_types[ordinal].clone(),
                         ValueOrigin::NodeOutput {
                             node,
@@ -5288,7 +5369,9 @@ impl ContractLoweringVisitor {
                     column: column.column_id,
                 });
             }
-            let value = self.fragment_mut().add_value(
+            let value = self.add_planned_value(
+                plan,
+                column,
                 value_type(column),
                 ValueOrigin::NodeOutput {
                     node,
@@ -5555,6 +5638,7 @@ impl ContractLoweringVisitor {
         &mut self,
         plan: &PhysicalPlanNode,
         items: &[crate::analysis::ProjectItem],
+        retention_admission: novarocks_physical_plan::ProjectRetentionAdmission,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
         if items.len() != plan.output_columns.len() {
@@ -5596,17 +5680,25 @@ impl ContractLoweringVisitor {
 
             let expression = self.lower_expression(node, &item.expr, &child.columns)?;
             let value = match identity_column_ref(&item.expr) {
-                Some(column_id) => child
-                    .columns
-                    .get(&column_id)
-                    .copied()
-                    .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?,
-                None => {
+                Some(column_id)
+                    if retention_admission
+                        != novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask
+                        || column_id == column.column_id =>
+                {
+                    child
+                        .columns
+                        .get(&column_id)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?
+                }
+                _ => {
                     let ty = published_value_type(
                         &value_type(column),
                         &self.expression_value_type(expression)?,
                     );
-                    self.fragment_mut().add_value(
+                    self.add_planned_value(
+                        plan,
+                        column,
                         ty,
                         ValueOrigin::Expr {
                             node,
@@ -5628,11 +5720,12 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
 
-        self.fragment_mut().add_project(
+        self.fragment_mut().add_project_with_retention(
             node,
             child.node,
             expressions.into_boxed_slice(),
             output.clone().into_boxed_slice(),
+            retention_admission,
         )?;
         let properties = self
             .fragment_mut()
@@ -5669,7 +5762,9 @@ impl ContractLoweringVisitor {
         let mut output = Vec::with_capacity(plan.output_columns.len());
         let mut columns = BTreeMap::new();
         for (ordinal, column) in plan.output_columns.iter().enumerate() {
-            let value = self.fragment_mut().add_value(
+            let value = self.add_planned_value(
+                plan,
+                column,
                 value_type(column),
                 ValueOrigin::NodeOutput {
                     node,
@@ -6419,9 +6514,11 @@ impl ContractLoweringVisitor {
                 let value = if let Some(value) = grouping_replacements.get(input) {
                     *value
                 } else {
-                    let value = self.fragment_mut().add_value(
+                    let value = self.add_inherited_value(
                         value_type(output_column),
                         ValueOrigin::NullExtended { node, of: *input },
+                        self.current_fragment,
+                        *input,
                     )?;
                     grouping_replacements.insert(*input, value);
                     grouping_values.push((*input, value));
@@ -9868,6 +9965,7 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::NestLoopJoin(_) => "NestLoopJoin",
         PhysicalPlanKind::SetOp(_) => "SetOp",
         PhysicalPlanKind::ChangeEventExpand(_) => "ChangeEventExpand",
+        PhysicalPlanKind::Membership(_) => "Membership",
         PhysicalPlanKind::QuotaPreclaim(_) => "QuotaPreclaim",
         PhysicalPlanKind::QuotaTrim(_) => "QuotaTrim",
         PhysicalPlanKind::FanoutAnchor(_) => "FanoutAnchor",
@@ -10551,6 +10649,7 @@ mod tests {
 
     fn values(columns: Vec<OutputColumn>, rows: Vec<Vec<TypedExpr>>) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Values(PlanValuesNode {
                 rows,
                 columns: columns.clone(),
@@ -10578,6 +10677,7 @@ mod tests {
             RedistributeMode::Gather | RedistributeMode::Broadcast => Vec::new(),
         };
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(crate::planner::physical::RedistributeNode {
                 mode,
                 partition_exprs,
@@ -10628,6 +10728,7 @@ mod tests {
         let left_key = left.output_columns[0].clone();
         let right_key = right.output_columns[0].clone();
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashJoin(Box::new(
                 crate::planner::physical::PhysicalHashJoinNode {
                     join_type,
@@ -10693,6 +10794,7 @@ mod tests {
         child: PhysicalPlanNode,
     ) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id,
                 output_columns: output_columns.clone(),
@@ -10711,6 +10813,7 @@ mod tests {
         producer_column_ids: Vec<ColumnId>,
     ) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id,
                 alias: alias.to_string(),
@@ -10730,6 +10833,7 @@ mod tests {
         body: PhysicalPlanNode,
     ) -> PhysicalPlanNode {
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![produce, body.clone()],
             output_columns: body.output_columns,
@@ -10940,6 +11044,7 @@ mod tests {
         let data = column(2, "order_id", DataType::Int64, false);
         let effect = column(3, "effect", DataType::Int8, false);
         let expanded = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
                 events: vec![DistributedChangeEventSpec {
                     predicate: None,
@@ -11040,6 +11145,7 @@ mod tests {
         let data = column(2, "order_id", DataType::Int64, false);
         let effect = column(3, "effect", DataType::Int8, false);
         let expanded = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
                 events: vec![DistributedChangeEventSpec {
                     predicate: None,
@@ -11164,6 +11270,7 @@ mod tests {
             nullable: false,
         };
         let filter = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Filter(PlanFilterNode { predicate }),
             children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
             output_columns: vec![input.clone()],
@@ -11172,7 +11279,9 @@ mod tests {
         };
         let computed = column(2, "next", DataType::Int64, false);
         let project = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(&input),
@@ -11230,7 +11339,9 @@ mod tests {
     fn identity_project_reuses_value_identity_for_repeated_occurrences() {
         let input = column(1, "number", DataType::Int64, false);
         let project = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(&input),
@@ -11341,6 +11452,7 @@ mod tests {
             string_literal("string"),
         ];
         let plan = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Scan(
                 crate::planner::physical::PhysicalScanNode::from(
                     crate::planner::payload::PlanScanNode {
@@ -11740,7 +11852,9 @@ mod tests {
     fn filter_preserves_repeated_input_occurrences_and_display_names() {
         let input = column(1, "number", DataType::Int64, false);
         let repeated_project = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(&input),
@@ -11761,6 +11875,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let filter = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -11846,6 +11961,7 @@ mod tests {
         )
         .unwrap();
         let plan = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Unpivot(payload),
             children: vec![child],
             output_columns: vec![passthrough_output, value_output, literal_output],
@@ -11877,7 +11993,9 @@ mod tests {
     ) -> PhysicalPlanNode {
         let source = column(1, "source", DataType::Int64, false);
         let project = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: projected_columns
                     .iter()
                     .map(|column| ProjectItem {
@@ -11902,6 +12020,7 @@ mod tests {
         }
         output_columns.push(grouping.clone());
         PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: sets
                     .iter()
@@ -12038,7 +12157,9 @@ mod tests {
     fn repeat_reuses_one_nullable_value_for_repeated_grouping_occurrences() {
         let input = column(1, "k", DataType::Int64, false);
         let repeated = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(&input),
@@ -12061,6 +12182,7 @@ mod tests {
         let nullable_key = column(1, "k", DataType::Int64, true);
         let grouping = column(2, "grouping", DataType::Int64, false);
         let plan = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: vec![vec!["k".to_string()], Vec::new()],
                 repeat_column_ref_ids: vec![vec![input.column_id], Vec::new()],
@@ -12114,6 +12236,7 @@ mod tests {
             &result_types,
         );
         let plan = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
                 function_name: "unnest".to_string(),
                 args: Vec::new(),
@@ -12159,6 +12282,7 @@ mod tests {
         let binding =
             crate::analysis::test_window_binding("row_number", &[], DataType::Int64, false);
         let plan = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Window(PlanWindowNode {
                 window_exprs: vec![WindowExpr {
                     name: "row_number".to_string(),
@@ -12232,6 +12356,7 @@ mod tests {
 
         let unpivot_output = column(2, "value", DataType::Int64, false);
         let unpivot = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Unpivot(PlanUnpivotNode {
                 passthrough_columns: Vec::new(),
                 value_output_column_id: unpivot_output.column_id,
@@ -12255,6 +12380,7 @@ mod tests {
         ));
 
         let repeat = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: vec![vec!["k".to_string()]],
                 repeat_column_ref_ids: vec![vec![input.column_id]],
@@ -12286,6 +12412,7 @@ mod tests {
             novarocks_functions::FunctionVolatility::Immutable,
         );
         let table_function = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
                 function_name: "not_a_table_function".to_string(),
                 args: Vec::new(),
@@ -12306,6 +12433,7 @@ mod tests {
 
         let window_result = column(4, "rn", DataType::Int64, false);
         let window = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Window(PlanWindowNode {
                 window_exprs: vec![WindowExpr {
                     name: "not_a_window_function".to_string(),
@@ -12338,6 +12466,7 @@ mod tests {
     #[test]
     fn malformed_change_event_expand_fails_closed() {
         let unsupported = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
                 events: Vec::new(),
                 output_columns: Vec::new(),
@@ -12851,6 +12980,7 @@ mod tests {
     fn lowers_global_sort_and_limit_with_exact_order_and_row_counts() {
         let input = column(1, "number", DataType::Int64, false);
         let sort = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Sort(PlanSortNode {
                 items: vec![sort_item(&input, false, true)],
                 analytic_partition_by: Vec::new(),
@@ -12865,6 +12995,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let limit = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Limit(PlanLimitNode {
                 limit: Some(5),
                 offset: Some(2),
@@ -12902,6 +13033,7 @@ mod tests {
     fn lowers_unsplit_final_topn_as_a_single_exact_phase() {
         let input = column(1, "number", DataType::Int64, false);
         let topn = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
                 items: vec![sort_item(&input, true, false)],
                 limit: Some(10),
@@ -12935,6 +13067,7 @@ mod tests {
         // The planner splits a TopN into two nodes of its own, the way
         // `SplitTopN` does: a partial that prunes and a final above it.
         let partial = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
                 items: vec![sort_item(&input, true, false)],
                 limit: Some(10),
@@ -12948,6 +13081,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let split = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
                 items: vec![sort_item(&input, true, false)],
                 limit: Some(10),
@@ -12999,6 +13133,7 @@ mod tests {
         let input = column(1, "number", DataType::Int64, false);
 
         let partition_sort = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Sort(PlanSortNode {
                 items: vec![sort_item(&input, true, false)],
                 analytic_partition_by: vec![column_ref(&input)],
@@ -13024,7 +13159,9 @@ mod tests {
     fn gather_edge_preserves_repeated_occurrences_and_import_identity() {
         let input = column(1, "number", DataType::Int64, false);
         let repeated = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(&input),
@@ -13045,6 +13182,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let gather = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(crate::planner::physical::RedistributeNode {
                 mode: RedistributeMode::Gather,
                 partition_exprs: Vec::new(),
@@ -13074,6 +13212,7 @@ mod tests {
     fn hash_edge_carries_one_exact_plan_local_partition_scheme() {
         let input = column(1, "number", DataType::Int64, false);
         let hash = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(crate::planner::physical::RedistributeNode {
                 mode: RedistributeMode::Hash {
                     cols: vec![input.column_id],
@@ -13122,7 +13261,10 @@ mod tests {
         let project = |volatility| {
             let output = column(2, "computed", DataType::Int64, false);
             PhysicalPlanNode {
+                logical_kinds: Default::default(),
                 kind: PhysicalPlanKind::Project(PlanProjectNode {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     items: vec![ProjectItem {
                         expr: scalar_call(
                             "project_value",
@@ -13142,6 +13284,7 @@ mod tests {
             }
         };
         let filter = |volatility| PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Filter(PlanFilterNode {
                 predicate: scalar_call("filter_value", Vec::new(), DataType::Boolean, volatility),
             }),
@@ -13182,7 +13325,9 @@ mod tests {
         let first = column(1, "first", DataType::Int64, false);
         let second = column(2, "second", DataType::Int64, false);
         let project_first = |child| PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: column_ref(&first),
                     output_name: first.name.clone(),
@@ -13213,6 +13358,7 @@ mod tests {
         );
 
         let sort = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Sort(PlanSortNode {
                 items: vec![
                     sort_item(&first, true, false),
@@ -13247,6 +13393,7 @@ mod tests {
         let right = column(2, "right_key", DataType::Int64, false);
         let nullable_right = column(2, "right_key", DataType::Int64, true);
         let broadcast_right = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(crate::planner::physical::RedistributeNode {
                 mode: RedistributeMode::Broadcast,
                 partition_exprs: Vec::new(),
@@ -13258,6 +13405,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let join = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::NestLoopJoin(
                 crate::planner::physical::PhysicalNestLoopJoinNode {
                     join_type: crate::common::JoinKind::LeftOuter,
@@ -13304,7 +13452,9 @@ mod tests {
     fn union_all_preserves_duplicate_output_occurrences() {
         let output = column(1, "number", DataType::Int64, false);
         let repeated_child = || PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: column_ref(&output),
@@ -13325,6 +13475,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let set_op = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
                 kind: PlanSetOpKind::UnionAll,
                 output_columns: vec![output.clone(), output.clone()],
@@ -13355,6 +13506,7 @@ mod tests {
         let right = column(2, "right", DataType::Int64, true);
         let published = column(3, "result", DataType::Int64, false);
         let set_op = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
                 kind: PlanSetOpKind::UnionAll,
                 output_columns: vec![published.clone()],
@@ -13402,6 +13554,7 @@ mod tests {
         };
         let output = column(2, "total", result.data_type.clone(), result.nullable);
         let aggregate = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashAggregate(Box::new(
                 crate::planner::physical::PhysicalHashAggregateNode {
                     mode: AggMode::Single,
@@ -13459,6 +13612,7 @@ mod tests {
         };
         let output = column(3, "total", result.data_type.clone(), result.nullable);
         let local = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashAggregate(Box::new(
                 crate::planner::physical::PhysicalHashAggregateNode {
                     mode: AggMode::Local,
@@ -13486,6 +13640,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let gather = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::Redistribute(crate::planner::physical::RedistributeNode {
                 mode: RedistributeMode::Gather,
                 partition_exprs: Vec::new(),
@@ -13497,6 +13652,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
         let global = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::HashAggregate(Box::new(
                 crate::planner::physical::PhysicalHashAggregateNode {
                     mode: AggMode::Global,
@@ -13542,6 +13698,7 @@ mod tests {
     fn lowers_global_and_keyed_assertions_without_losing_their_subjects() {
         let input = column(1, "account_id", DataType::Int64, false);
         let global = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode {
                 subquery_text: "select account_id from accounts".to_string(),
                 desired_num_rows: Some(1),
@@ -13567,6 +13724,7 @@ mod tests {
         ));
 
         let keyed = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode::per_key_at_most_one(
                 "mutation",
                 vec![input.column_id],
@@ -13594,6 +13752,7 @@ mod tests {
     fn lowers_generate_series_with_explicit_start_stop_and_step() {
         let output = column(1, "n", DataType::Int64, false);
         let series = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::GenerateSeries(PlanGenerateSeriesNode {
                 start: 2,
                 end: 8,
@@ -13722,6 +13881,7 @@ mod tests {
         );
         let result_column = column(30, "combined", DataType::Int64, false);
         let body = PhysicalPlanNode {
+            logical_kinds: Default::default(),
             kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
                 kind: PlanSetOpKind::UnionAll,
                 output_columns: vec![result_column.clone()],
@@ -13910,5 +14070,168 @@ mod tests {
             fragment.expressions().get(rows[0][0]).unwrap().kind,
             ContractExprKind::Literal(ContractLiteralValue::LargeInt(i128::MIN))
         ));
+    }
+    fn membership_fixture(
+        distribution: novarocks_physical_plan::MembershipDistribution,
+    ) -> PhysicalPlanNode {
+        use novarocks_physical_plan::{
+            MembershipComparison, ProjectRetentionAdmission, ValueLogicalKind,
+        };
+        let raw_probe = column(1001, "raw_probe", DataType::Utf8, false);
+        let raw_build = column(1002, "raw_build", DataType::Utf8, false);
+        let probe_slot = column(1011, "probe", DataType::Utf8, false);
+        let build_slot = column(1012, "build", DataType::Utf8, false);
+        let result = column(1013, "membership", DataType::Boolean, true);
+        let marked_values = |column: OutputColumn| {
+            let mut input = values(
+                vec![column.clone()],
+                vec![vec![TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::String("1".into())),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                }]],
+            );
+            input
+                .logical_kinds
+                .insert(column.column_id, ValueLogicalKind::Json);
+            input
+        };
+        let checked = |input: PhysicalPlanNode, output: OutputColumn| {
+            let source = input.output_columns[0].clone();
+            PhysicalPlanNode {
+                logical_kinds: BTreeMap::from([(output.column_id, ValueLogicalKind::Json)]),
+                kind: PhysicalPlanKind::Project(PlanProjectNode {
+                    retention_admission: ProjectRetentionAdmission::CheckedTask,
+                    items: vec![crate::analysis::ProjectItem {
+                        expr: column_ref(&source),
+                        output_name: output.name.clone(),
+                        output_column_id: output.column_id,
+                    }],
+                    output_qualifier: None,
+                }),
+                children: vec![input],
+                output_columns: vec![output],
+                stats: stats(),
+                probe_runtime_filters: Vec::new(),
+            }
+        };
+        let probe = checked(marked_values(raw_probe), probe_slot.clone());
+        let mut build = checked(marked_values(raw_build), build_slot.clone());
+        if distribution == novarocks_physical_plan::MembershipDistribution::BroadcastBuild {
+            build = redistribute(build, RedistributeMode::Broadcast);
+            build
+                .logical_kinds
+                .insert(build_slot.column_id, ValueLogicalKind::Json);
+        }
+        let output_columns = vec![probe_slot.clone(), result.clone()];
+        PhysicalPlanNode {
+            logical_kinds: BTreeMap::from([(probe_slot.column_id, ValueLogicalKind::Json)]),
+            kind: PhysicalPlanKind::Membership(crate::planner::membership::PlanMembershipNode {
+                probe: probe_slot.column_id,
+                build: build_slot.column_id,
+                result,
+                output_columns: output_columns.clone(),
+                negated: true,
+                comparison: MembershipComparison::JsonInListV1,
+                distribution,
+            }),
+            children: vec![probe, build],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn membership_final_lowering_preserves_exact_json_slots_and_real_broadcast_cut() {
+        use novarocks_physical_plan::{
+            MembershipDistribution, ProjectRetentionAdmission, ValueLogicalKind,
+        };
+        for distribution in [
+            MembershipDistribution::Singleton,
+            MembershipDistribution::BroadcastBuild,
+        ] {
+            let plan = finish_for_test(&membership_fixture(distribution)).unwrap();
+            let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let root = fragment.nodes().get(&fragment.root()).unwrap();
+            let NodeKind::Membership { spec } = &root.kind else {
+                panic!("Membership expected");
+            };
+            assert_eq!(root.output.columns.len(), 2);
+            assert_eq!(root.output.columns[1], spec.result);
+            for id in [spec.probe, spec.build] {
+                assert_eq!(
+                    fragment.values().get(&id).unwrap().logical_kind,
+                    Some(ValueLogicalKind::Json)
+                );
+            }
+            assert_eq!(
+                plan.fragments()
+                    .values()
+                    .flat_map(|f| f.nodes().values())
+                    .filter(|node| matches!(
+                        node.kind,
+                        NodeKind::Project {
+                            retention_admission: ProjectRetentionAdmission::CheckedTask,
+                            ..
+                        }
+                    ))
+                    .count(),
+                2
+            );
+            if distribution == MembershipDistribution::BroadcastBuild {
+                let edge = plan.edges().values().next().unwrap();
+                assert_eq!(edge.partitioning.source, Distribution::Broadcast);
+                assert_eq!(edge.partitioning.destination, Distribution::Broadcast);
+                assert_eq!(
+                    edge.partitioning.source_multiplicity,
+                    RowMultiplicity::SingleCopy
+                );
+                assert_eq!(
+                    edge.partitioning.destination_multiplicity,
+                    RowMultiplicity::Replicated
+                );
+                let source = plan.fragments().get(&edge.source.fragment).unwrap();
+                assert!(matches!(
+                    source.nodes().get(&source.root()).unwrap().kind,
+                    NodeKind::Project {
+                        retention_admission: ProjectRetentionAdmission::CheckedTask,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(plan.edges().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn membership_final_lowering_rejects_plain_string_missing_or_wrong_identity_proof() {
+        use novarocks_physical_plan::{MembershipDistribution, ValueLogicalKind};
+        let mut missing = membership_fixture(MembershipDistribution::Singleton);
+        missing.children[1].logical_kinds.clear();
+        missing.children[1].children[0].logical_kinds.clear();
+        assert!(
+            finish_for_test(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("analyzed JSON evidence")
+        );
+        let mut wrong = membership_fixture(MembershipDistribution::Singleton);
+        wrong
+            .logical_kinds
+            .insert(ColumnId(999999), ValueLogicalKind::Json);
+        assert!(
+            finish_for_test(&wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("non-output ColumnId")
+        );
+        let mut result_alias = membership_fixture(MembershipDistribution::Singleton);
+        let PhysicalPlanKind::Membership(op) = &mut result_alias.kind else {
+            unreachable!();
+        };
+        op.result.column_id = op.probe;
+        assert!(finish_for_test(&result_alias).is_err());
     }
 }

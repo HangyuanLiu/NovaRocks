@@ -478,6 +478,7 @@ mod tests {
     fn project_with_items(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: None,
             }),

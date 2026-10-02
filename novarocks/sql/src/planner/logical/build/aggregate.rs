@@ -178,6 +178,7 @@ pub(super) fn prepare_repeat_input(
 
     *current = LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: project_items,
             output_qualifier: None,
         }),

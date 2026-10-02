@@ -326,6 +326,7 @@ mod tests {
 
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: None,
             }),

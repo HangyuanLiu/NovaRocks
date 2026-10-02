@@ -177,6 +177,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalUnion(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalIntersect(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalExcept(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalMembership(op) => op.derive_output(scalars, children_outputs),
         Operator::PhysicalQuotaPreclaim(_) | Operator::PhysicalQuotaTrim(_) => {
             PhysicalPropertySet::any()
         }
@@ -241,6 +242,9 @@ pub(crate) fn derive_required(
         Operator::PhysicalUnion(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalIntersect(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalExcept(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalMembership(op) => {
+            op.derive_required(scalars, parent_required, num_children)
+        }
         Operator::PhysicalQuotaPreclaim(_) => {
             vec![PhysicalPropertySet::broadcast(), PhysicalPropertySet::any()]
         }
@@ -511,6 +515,7 @@ pub(crate) mod cte;
 pub(crate) mod enforcer;
 pub(crate) mod hash_aggregate;
 pub(crate) mod hash_join;
+pub(crate) mod membership;
 pub(crate) mod nest_loop_join;
 pub(crate) mod passthrough;
 pub(crate) mod scan;

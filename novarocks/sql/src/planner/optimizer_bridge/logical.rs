@@ -126,6 +126,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
                 };
                 child = OptExpr::new(
                     Operator::LogicalProject(ProjectOp {
+                        retention_admission: project.retention_admission,
                         items: intern_project_items(scalars, &project.items),
                         output_qualifier: project.output_qualifier.clone(),
                     }),
@@ -207,6 +208,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         LogicalPlanKind::Project(node) => {
             let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
             let op = Operator::LogicalProject(ProjectOp {
+                retention_admission: node.retention_admission,
                 items: intern_project_items(scalars, &node.items),
                 output_qualifier: node.output_qualifier.clone(),
             });
@@ -386,6 +388,13 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
 
         LogicalPlanKind::QuotaPreclaim(node) => OptExpr::new(
             Operator::LogicalQuotaPreclaim(node.clone()),
+            plan.children
+                .iter()
+                .map(|child| to_optimizer_expr_unchecked(child, scalars))
+                .collect(),
+        ),
+        LogicalPlanKind::Membership(node) => OptExpr::new(
+            Operator::LogicalMembership(node.clone()),
             plan.children
                 .iter()
                 .map(|child| to_optimizer_expr_unchecked(child, scalars))
@@ -593,6 +602,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
         .collect();
     let kind = match expr.op {
         Operator::LogicalQuotaPreclaim(op) => LogicalPlanKind::QuotaPreclaim(op),
+        Operator::LogicalMembership(op) => LogicalPlanKind::Membership(op),
         Operator::LogicalQuotaTrim(op) => LogicalPlanKind::QuotaTrim(op),
         Operator::LogicalFanoutConsume(op) => LogicalPlanKind::FanoutConsume(op),
         Operator::LogicalFanoutAnchor(op) => {
@@ -622,6 +632,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
             predicate: materialize(arena, op.predicate),
         }),
         Operator::LogicalProject(op) => LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: op.retention_admission,
             items: materialize_project_items(arena, &op.items),
             output_qualifier: op.output_qualifier,
         }),
@@ -864,6 +875,8 @@ mod tests {
             };
             let plan = LogicalPlanNode::new(
                 LogicalPlanKind::Project(PlanProjectNode {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     items: vec![],
                     output_qualifier: None,
                 }),

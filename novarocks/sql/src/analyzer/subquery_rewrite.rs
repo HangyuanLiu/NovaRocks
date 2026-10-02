@@ -228,6 +228,9 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         for sq_info in subqueries {
+            if self.collect_json_membership_spec(select, scope, &sq_info)? {
+                continue;
+            }
             // Subqueries can appear in three locations:
             //   1. WHERE / HAVING / projection clauses that can be represented
             //      as Apply specs.
@@ -300,6 +303,242 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(())
+    }
+
+    /// JSON value membership has its own owner; it never becomes an Apply.
+    fn collect_json_membership_spec(
+        &self,
+        select: &mut ResolvedSelect,
+        scope: &mut AnalyzerScope,
+        info: &SubqueryInfo,
+    ) -> Result<bool, AnalyzeError> {
+        use novarocks_types::schema::SqlType;
+        let SubqueryKind::InSubquery { negated } = info.kind else {
+            return Ok(false);
+        };
+        let Some(source) = info.in_expr.as_deref() else {
+            return Ok(false);
+        };
+        if matches!(source, ast::Expr::Tuple(_))
+            || matches!(source, ast::Expr::Nested(n) if matches!(n.expression.as_ref(), ast::Expr::Tuple(_)))
+        {
+            return Ok(false);
+        }
+        let probe = self.analyze_expr(source, scope)?;
+        if self.logical_output_type(Some(source), &probe, scope) != Some(SqlType::Json) {
+            return Ok(false);
+        }
+        if !self.json_membership_enabled {
+            return Err(AnalyzeError::unsupported_expression(
+                "In predicate of JSON does not support subquery",
+                source.span(),
+            ));
+        }
+        let clause = locate_scalar_placeholder_clause(select, info.id).ok_or_else(|| {
+            AnalyzeError::unsupported_query_shape(
+                "JSON membership is not supported in JOIN ON",
+                source.span(),
+            )
+        })?;
+        // HAVING is located before projection aggregate-input classification.
+        // A membership inside an aggregate argument is still an input-row
+        // expression, even when an enclosing OR makes HAVING a value clause.
+        if clause == ApplyClause::Having
+            && select
+                .having
+                .as_ref()
+                .is_some_and(|expr| placeholder_is_aggregate_input(expr, info.id))
+        {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "JSON membership is not supported in aggregate arguments",
+                source.span(),
+            ));
+        }
+        let supported = match clause {
+            ApplyClause::Projection => true,
+            ApplyClause::Where => select
+                .filter
+                .as_ref()
+                .is_some_and(|expr| is_placeholder_inside_or(expr, info.id)),
+            ApplyClause::Having => select
+                .having
+                .as_ref()
+                .is_some_and(|expr| is_placeholder_inside_or(expr, info.id)),
+            ApplyClause::AggregateInput => false,
+        };
+        if !supported {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "JSON membership requires SELECT value or WHERE/HAVING OR operand",
+                source.span(),
+            ));
+        }
+        let (inner, inner_scope) = self.analyze_query_in_scope_with_inner(&info.subquery, scope)?;
+        if inner.output_columns.len() != 1 {
+            return Err(AnalyzeError::invalid_query_shape(
+                "JSON membership requires exactly one RHS column",
+                info.subquery.span,
+            ));
+        }
+        let build = &inner.output_columns[0];
+        if probe.data_type != DataType::Utf8
+            || build.data_type != DataType::Utf8
+            || self.factory.borrow().logical_type(build.column_id) != Some(SqlType::Json)
+        {
+            return Err(AnalyzeError::type_mismatch(
+                "JSON membership requires proven JSON operands on both sides",
+                info.subquery.span,
+            ));
+        }
+        if self.membership_query_has_outer_refs(
+            &inner,
+            &inner_scope,
+            scope,
+            &mut std::collections::HashSet::new(),
+        ) {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "correlated JSON membership is not supported",
+                info.subquery.span,
+            ));
+        }
+        let probe_name = format!("__membership_probe_{}", info.id);
+        let probe_id =
+            self.alloc_column_id(None, probe_name.clone(), DataType::Utf8, probe.nullable);
+        self.factory
+            .borrow_mut()
+            .set_logical_type(probe_id, Some(SqlType::Json));
+        let output_name = format!("__membership_result_{}", info.id);
+        let output_id = self.alloc_column_id(None, output_name.clone(), DataType::Boolean, true);
+        let replacement = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: output_id,
+                qualifier: None,
+                column: output_name.clone(),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+        Self::replace_placeholder_in_filter(&mut select.filter, info.id, &replacement);
+        Self::replace_placeholder_in_filter(&mut select.having, info.id, &replacement);
+        Self::replace_placeholder_in_projection(&mut select.projection, info.id, &replacement);
+        select.predicate_apply_specs.push(ApplyPredicateSpec {
+            execution_kind: PredicateExecutionKind::JsonMembership {
+                probe_column: OutputColumn {
+                    column_id: probe_id,
+                    name: probe_name,
+                    data_type: DataType::Utf8,
+                    nullable: probe.nullable,
+                    is_internal: true,
+                },
+            },
+            subquery_id: info.id,
+            kind: SubqueryKind::InSubquery { negated },
+            clause,
+            output_column: OutputColumn {
+                column_id: output_id,
+                name: output_name,
+                data_type: DataType::Boolean,
+                nullable: true,
+                is_internal: true,
+            },
+            inner,
+            correlation_column_ids: Vec::new(),
+            in_lhs: Some(probe),
+            use_semi_anti: false,
+            subquery_text: printer::print_query(&info.subquery),
+        });
+        Ok(true)
+    }
+
+    fn membership_query_has_outer_refs(
+        &self,
+        query: &ResolvedQuery,
+        inner: &AnalyzerScope,
+        outer: &AnalyzerScope,
+        visited_ctes: &mut std::collections::HashSet<crate::analysis::cte::CteId>,
+    ) -> bool {
+        if query_references_outer_scope(query, inner, outer) {
+            return true;
+        }
+        if let QueryBody::Select(select) = &query.body {
+            if select.from.as_ref().is_some_and(|relation| {
+                self.membership_relation_has_outer_refs(relation, inner, outer, visited_ctes)
+            }) {
+                return true;
+            }
+            for spec in &select.apply_specs {
+                if spec
+                    .correlation_column_ids
+                    .iter()
+                    .any(|id| outer.contains_column_id(*id))
+                    || self.membership_query_has_outer_refs(&spec.inner, inner, outer, visited_ctes)
+                {
+                    return true;
+                }
+            }
+            for spec in &select.predicate_apply_specs {
+                if spec
+                    .correlation_column_ids
+                    .iter()
+                    .any(|id| outer.contains_column_id(*id))
+                    || spec
+                        .in_lhs
+                        .as_ref()
+                        .is_some_and(|expr| expr_references_outer_scope(expr, inner, outer))
+                    || self.membership_query_has_outer_refs(&spec.inner, inner, outer, visited_ctes)
+                {
+                    return true;
+                }
+            }
+        }
+        if let QueryBody::SetOperation(set) = &query.body {
+            if self.membership_query_has_outer_refs(&set.left, inner, outer, visited_ctes)
+                || self.membership_query_has_outer_refs(&set.right, inner, outer, visited_ctes)
+            {
+                return true;
+            }
+        }
+        for id in &query.local_cte_ids {
+            if visited_ctes.insert(*id) {
+                let registry = self.cte_registry.borrow();
+                let Some(cte) = registry.get(*id) else {
+                    return true;
+                };
+                if self.membership_query_has_outer_refs(
+                    &cte.resolved_query,
+                    inner,
+                    outer,
+                    visited_ctes,
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn membership_relation_has_outer_refs(
+        &self,
+        relation: &Relation,
+        inner: &AnalyzerScope,
+        outer: &AnalyzerScope,
+        visited: &mut std::collections::HashSet<crate::analysis::cte::CteId>,
+    ) -> bool {
+        match relation {
+            Relation::Subquery { query, .. } => {
+                self.membership_query_has_outer_refs(query, inner, outer, visited)
+            }
+            Relation::Join(join) => {
+                self.membership_relation_has_outer_refs(&join.left, inner, outer, visited)
+                    || self.membership_relation_has_outer_refs(&join.right, inner, outer, visited)
+            }
+            Relation::CTEConsume { cte_id, .. } if visited.insert(*cte_id) => {
+                let registry = self.cte_registry.borrow();
+                registry.get(*cte_id).is_none_or(|cte| {
+                    self.membership_query_has_outer_refs(&cte.resolved_query, inner, outer, visited)
+                })
+            }
+            _ => false,
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -468,6 +707,14 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
+                if self.factory.borrow().logical_type(inner_col.column_id)
+                    == Some(novarocks_types::schema::SqlType::Json)
+                {
+                    return Err(AnalyzeError::type_mismatch(
+                        "JSON membership requires proven JSON operands on both sides",
+                        sq_info.subquery.span,
+                    ));
+                }
                 if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
                     &lhs.data_type,
                     &inner_col.data_type,
@@ -531,6 +778,7 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         select.predicate_apply_specs.push(ApplyPredicateSpec {
+            execution_kind: crate::analysis::PredicateExecutionKind::Apply,
             subquery_id: sq_info.id,
             kind: sq_info.kind.clone(),
             clause,
@@ -1044,6 +1292,14 @@ impl<'a> AnalyzerContext<'a> {
             ));
         }
         let sub_col = resolved_sub.output_columns[0].clone();
+        if self.factory.borrow().logical_type(sub_col.column_id)
+            == Some(novarocks_types::schema::SqlType::Json)
+        {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "JSON membership is not supported in JOIN ON",
+                sq_info.subquery.span,
+            ));
+        }
         let match_col = format!("__match_{}", sq_info.id);
         let source_sub = resolved_sub.clone();
 
@@ -1754,6 +2010,17 @@ impl<'a> AnalyzerContext<'a> {
                     lhs_typed_list.len(),
                     resolved_sub.output_columns.len()
                 ),
+                sq_info.subquery.span,
+            ));
+        }
+        if lhs_typed_list.iter().any(|lhs| {
+            scope.logical_type_of_expr(lhs) == Some(novarocks_types::schema::SqlType::Json)
+        }) || resolved_sub.output_columns.iter().any(|column| {
+            self.factory.borrow().logical_type(column.column_id)
+                == Some(novarocks_types::schema::SqlType::Json)
+        }) {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "JSON operands require single-column value membership",
                 sq_info.subquery.span,
             ));
         }
@@ -2679,6 +2946,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            json_membership_enabled: self.json_membership_enabled,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
