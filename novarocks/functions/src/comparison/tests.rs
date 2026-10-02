@@ -70,8 +70,9 @@ impl KernelEvaluationControl for Control {
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
     FunctionValueType::new(data_type, nullable)
 }
-fn recipe(left: &ArrayRef, right: &ArrayRef) -> PreparedEqualityRecipe {
-    PreparedEqualityRecipe::try_new(
+fn recipe(left: &ArrayRef, right: &ArrayRef) -> PreparedComparisonRecipe {
+    PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
         &ty(left.data_type().clone(), true),
         &ty(right.data_type().clone(), true),
         &CompileControl::default(),
@@ -79,22 +80,101 @@ fn recipe(left: &ArrayRef, right: &ArrayRef) -> PreparedEqualityRecipe {
     .unwrap()
 }
 fn compare_arrays(left: ArrayRef, right: ArrayRef, expected: &[Option<bool>]) {
-    let prepared = recipe(&left, &right);
-    for (row, expected) in expected.iter().enumerate() {
+    for operator in [ComparisonOperator::Eq, ComparisonOperator::Ne] {
+        let prepared = PreparedComparisonRecipe::try_new(
+            operator,
+            &ty(left.data_type().clone(), true),
+            &ty(right.data_type().clone(), true),
+            &CompileControl::default(),
+        )
+        .unwrap();
+        assert_eq!(prepared.operator(), operator);
+        for (row, expected) in expected.iter().enumerate() {
+            let expected = expected.map(|value| {
+                if operator == ComparisonOperator::Eq {
+                    value
+                } else {
+                    !value
+                }
+            });
+            assert_eq!(
+                prepared
+                    .compare_rows(
+                        EvaluatedArgument::Column(&left),
+                        row,
+                        row,
+                        EvaluatedArgument::Column(&right),
+                        row,
+                        row,
+                        &Control::default()
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+}
+const ORDERS: [ComparisonOperator; 4] = [
+    ComparisonOperator::Lt,
+    ComparisonOperator::Le,
+    ComparisonOperator::Gt,
+    ComparisonOperator::Ge,
+];
+fn order_expected(operator: ComparisonOperator, order: Ordering) -> bool {
+    match operator {
+        ComparisonOperator::Lt => matches!(order, Ordering::Less),
+        ComparisonOperator::Le => matches!(order, Ordering::Less | Ordering::Equal),
+        ComparisonOperator::Gt => matches!(order, Ordering::Greater),
+        ComparisonOperator::Ge => matches!(order, Ordering::Greater | Ordering::Equal),
+        _ => panic!("the independent order fixture uses four relational operators"),
+    }
+}
+fn compare_ordered_arrays(left: &ArrayRef, right: &ArrayRef, expected: &[Option<Ordering>]) {
+    for operator in ORDERS {
+        let prepared = PreparedComparisonRecipe::try_new(
+            operator,
+            &ty(left.data_type().clone(), true),
+            &ty(right.data_type().clone(), true),
+            &CompileControl::default(),
+        )
+        .unwrap();
+        assert_eq!(prepared.operator(), operator);
+        let arrow = match operator {
+            ComparisonOperator::Lt => arrow_ord::cmp::lt(&left.as_ref(), &right.as_ref()),
+            ComparisonOperator::Le => arrow_ord::cmp::lt_eq(&left.as_ref(), &right.as_ref()),
+            ComparisonOperator::Gt => arrow_ord::cmp::gt(&left.as_ref(), &right.as_ref()),
+            ComparisonOperator::Ge => arrow_ord::cmp::gt_eq(&left.as_ref(), &right.as_ref()),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|value| value.map(|value| order_expected(operator, value)))
+            .collect();
         assert_eq!(
-            prepared
-                .compare_rows(
-                    EvaluatedArgument::Column(&left),
-                    row,
-                    row,
-                    EvaluatedArgument::Column(&right),
-                    row,
-                    row,
-                    &Control::default()
-                )
-                .unwrap(),
-            *expected
+            arrow.iter().collect::<Vec<_>>(),
+            expected,
+            "{operator:?} {:?}",
+            left.data_type()
         );
+        for (row, expected) in expected.iter().enumerate() {
+            assert_eq!(
+                prepared
+                    .compare_rows(
+                        EvaluatedArgument::Column(left),
+                        row,
+                        row,
+                        EvaluatedArgument::Column(right),
+                        row,
+                        row,
+                        &Control::default()
+                    )
+                    .unwrap(),
+                *expected,
+                "{operator:?} {:?} row {row}",
+                left.data_type()
+            );
+        }
     }
 }
 fn policy() -> ConstantPolicy {
@@ -142,6 +222,11 @@ fn all_flat_primitive_decimal_temporal_interval_profiles_compute_equality() {
                 Arc::new(PrimitiveArray::<$t>::from_iter([Some(a), Some(a), None]));
             let right: ArrayRef =
                 Arc::new(PrimitiveArray::<$t>::from_iter([Some(a), Some(b), None]));
+            compare_ordered_arrays(
+                &left,
+                &right,
+                &[Some(Ordering::Equal), Some(Ordering::Less), None],
+            );
             compare_arrays(left, right, &[Some(true), Some(false), None]);
         }};
     }
@@ -213,6 +298,39 @@ fn all_flat_primitive_decimal_temporal_interval_profiles_compute_equality() {
             .with_precision_and_scale(12, -2)
             .unwrap(),
     );
+    compare_ordered_arrays(
+        &left,
+        &right,
+        &[Some(Ordering::Equal), Some(Ordering::Less)],
+    );
+    let bool_left: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(true), None]));
+    let bool_right: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]));
+    compare_ordered_arrays(
+        &bool_left,
+        &bool_right,
+        &[Some(Ordering::Equal), Some(Ordering::Greater), None],
+    );
+    let null: ArrayRef = Arc::new(NullArray::new(2));
+    compare_ordered_arrays(&null, &null, &[None, None]);
+    let a: ArrayRef = Arc::new(StringArray::from(vec!["z", "a"]));
+    let b: ArrayRef = Arc::new(StringArray::from(vec!["aa", "aa"]));
+    compare_ordered_arrays(&a, &b, &[Some(Ordering::Greater), Some(Ordering::Less)]);
+    let a: ArrayRef = Arc::new(LargeStringArray::from(vec!["z", "a"]));
+    let b: ArrayRef = Arc::new(LargeStringArray::from(vec!["aa", "aa"]));
+    compare_ordered_arrays(&a, &b, &[Some(Ordering::Greater), Some(Ordering::Less)]);
+    let a: ArrayRef = Arc::new(BinaryArray::from(vec![&b"z"[..], &b"a"[..]]));
+    let b: ArrayRef = Arc::new(BinaryArray::from(vec![&b"aa"[..], &b"aa"[..]]));
+    compare_ordered_arrays(&a, &b, &[Some(Ordering::Greater), Some(Ordering::Less)]);
+    let a: ArrayRef = Arc::new(LargeBinaryArray::from(vec![&b"z"[..], &b"a"[..]]));
+    let b: ArrayRef = Arc::new(LargeBinaryArray::from(vec![&b"aa"[..], &b"aa"[..]]));
+    compare_ordered_arrays(&a, &b, &[Some(Ordering::Greater), Some(Ordering::Less)]);
+    let a: ArrayRef = Arc::new(
+        FixedSizeBinaryArray::try_from_iter([&[0xff, 0][..], &[0, 0][..]].into_iter()).unwrap(),
+    );
+    let b: ArrayRef = Arc::new(
+        FixedSizeBinaryArray::try_from_iter([&[0x80, 0][..], &[0, 1][..]].into_iter()).unwrap(),
+    );
+    compare_ordered_arrays(&a, &b, &[Some(Ordering::Greater), Some(Ordering::Less)]);
     compare_arrays(left, right, &[Some(true), Some(false)]);
 }
 
@@ -321,8 +439,13 @@ fn byte_profiles_and_nonzero_constant_compact_slice_addresses_are_independent() 
         let target =
             FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), false, logical)
                 .unwrap();
-        let prepared =
-            PreparedEqualityRecipe::try_new(&source, &target, &CompileControl::default()).unwrap();
+        let prepared = PreparedComparisonRecipe::try_new(
+            ComparisonOperator::Eq,
+            &source,
+            &target,
+            &CompileControl::default(),
+        )
+        .unwrap();
         for (row, expected) in [Some(true), Some(false), None].into_iter().enumerate() {
             assert_eq!(
                 prepared
@@ -340,12 +463,13 @@ fn byte_profiles_and_nonzero_constant_compact_slice_addresses_are_independent() 
             );
         }
         assert_eq!(
-            PreparedEqualityRecipe::try_new(
+            PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
                 &source,
                 &ty(DataType::FixedSizeBinary(16), true),
                 &CompileControl::default()
             ),
-            Err(EqualityPrepareError::TypeMismatch)
+            Err(ComparisonPrepareError::TypeMismatch)
         );
     }
     let source: ArrayRef = Arc::new(StringArray::from(vec![
@@ -366,7 +490,8 @@ fn byte_profiles_and_nonzero_constant_compact_slice_addresses_are_independent() 
     let full: ArrayRef = Arc::new(StringArray::from(vec![
         "unused", "needle", "unused", "other",
     ]));
-    let prepared = PreparedEqualityRecipe::try_new(
+    let prepared = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
         &ty(DataType::Utf8, true),
         &ty(DataType::Utf8, false),
         &CompileControl::default(),
@@ -427,8 +552,13 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
         };
         let value = FunctionValueType::try_with_logical_type(data_type, true, logical).unwrap();
         assert_eq!(
-            PreparedEqualityRecipe::try_new(&value, &value, &CompileControl::default()),
-            Err(EqualityPrepareError::Unsupported)
+            PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
+                &value,
+                &value,
+                &CompileControl::default()
+            ),
+            Err(ComparisonPrepareError::Unsupported)
         );
     }
     for data_type in [
@@ -443,20 +573,31 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
     ] {
         let value = ty(data_type, true);
         assert_eq!(
-            PreparedEqualityRecipe::try_new(&value, &value, &CompileControl::default()),
-            Err(EqualityPrepareError::Unsupported)
+            PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
+                &value,
+                &value,
+                &CompileControl::default()
+            ),
+            Err(ComparisonPrepareError::Unsupported)
         );
     }
     assert_eq!(
-        PreparedEqualityRecipe::try_new(
+        PreparedComparisonRecipe::try_new(
+            ComparisonOperator::Eq,
             &physical,
             &ty(DataType::LargeUtf8, true),
             &CompileControl::default()
         ),
-        Err(EqualityPrepareError::TypeMismatch)
+        Err(ComparisonPrepareError::TypeMismatch)
     );
-    let prepared =
-        PreparedEqualityRecipe::try_new(&physical, &physical, &CompileControl::default()).unwrap();
+    let prepared = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
+        &physical,
+        &physical,
+        &CompileControl::default(),
+    )
+    .unwrap();
     let null: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
     let wrong: ArrayRef = Arc::new(Int64Array::from(vec![1]));
     assert!(matches!(
@@ -529,7 +670,8 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
         ),
         Err(KernelFailure::InvalidProgram(_))
     ));
-    let strict = PreparedEqualityRecipe::try_new(
+    let strict = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
         &ty(DataType::Utf8, false),
         &physical,
         &CompileControl::default(),
@@ -653,7 +795,9 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
     );
     let expected = ty(source.data_type.clone(), true);
     let success = CompileControl::default();
-    let prepared = PreparedEqualityRecipe::try_new(&source, &expected, &success).unwrap();
+    let prepared =
+        PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &source, &expected, &success)
+            .unwrap();
     assert_eq!(prepared.left_type(), &source);
     assert_eq!(prepared.right_type(), &expected);
     assert!(prepared.nullable_result());
@@ -669,7 +813,13 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
                 refusal: Some((refused, cause)),
                 ..CompileControl::default()
             };
-            let error = PreparedEqualityRecipe::try_new(&source, &expected, &control).unwrap_err();
+            let error = PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
+                &source,
+                &expected,
+                &control,
+            )
+            .unwrap_err();
             assert_eq!(error.control_error(), Some(cause));
             assert!(error.source().is_some());
             assert_eq!(*control.trace.lock().unwrap(), trace[..=refused]);
@@ -683,8 +833,8 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
     let wide = ty(DataType::Struct(fields.into()), true);
     let success = CompileControl::default();
     assert_eq!(
-        PreparedEqualityRecipe::try_new(&wide, &wide, &success),
-        Err(EqualityPrepareError::Unsupported)
+        PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &wide, &wide, &success),
+        Err(ComparisonPrepareError::Unsupported)
     );
     let trace = success.trace.into_inner().unwrap();
     assert!(trace.contains(&256));
@@ -698,7 +848,9 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
                 refusal: Some((refused, cause)),
                 ..CompileControl::default()
             };
-            let error = PreparedEqualityRecipe::try_new(&wide, &wide, &control).unwrap_err();
+            let error =
+                PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &wide, &wide, &control)
+                    .unwrap_err();
             assert_eq!(error.control_error(), Some(cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=refused]);
         }
@@ -709,12 +861,13 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
         DataType::Timestamp(TimeUnit::Microsecond, Some("B".repeat(640).into())),
     ] {
         assert!(matches!(
-            PreparedEqualityRecipe::try_new(
+            PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
                 &source,
                 &ty(target, false),
                 &CompileControl::default()
             ),
-            Err(EqualityPrepareError::TypeMismatch)
+            Err(ComparisonPrepareError::TypeMismatch)
         ));
     }
 }
@@ -724,13 +877,24 @@ fn nullable_result_and_source_constant_covariance_do_not_capture_control() {
     let source = ty(DataType::Int64, false);
     let control = Arc::new(CompileControl::default());
     let weak = Arc::downgrade(&control);
-    let prepared = PreparedEqualityRecipe::try_new(&source, &source, control.as_ref()).unwrap();
+    let prepared = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
+        &source,
+        &source,
+        control.as_ref(),
+    )
+    .unwrap();
     drop(control);
     assert!(weak.upgrade().is_none());
     assert!(!prepared.nullable_result());
     let source = ty(DataType::Int64, true);
-    let prepared =
-        PreparedEqualityRecipe::try_new(&source, &source, &CompileControl::default()).unwrap();
+    let prepared = PreparedComparisonRecipe::try_new(
+        ComparisonOperator::Eq,
+        &source,
+        &source,
+        &CompileControl::default(),
+    )
+    .unwrap();
     let array: ArrayRef = Arc::new(Int64Array::from(vec![42, 43]));
     let value = constant(array, false, ValueLogicalType::Physical, 1);
     let scalar: ArrayRef = Arc::new(Int64Array::from(vec![43]));
@@ -751,8 +915,449 @@ fn nullable_result_and_source_constant_covariance_do_not_capture_control() {
     );
     let physical_null = ty(DataType::Null, true);
     assert!(
-        PreparedEqualityRecipe::try_new(&physical_null, &physical_null, &CompileControl::default())
-            .unwrap()
-            .nullable_result()
+        PreparedComparisonRecipe::try_new(
+            ComparisonOperator::Eq,
+            &physical_null,
+            &physical_null,
+            &CompileControl::default()
+        )
+        .unwrap()
+        .nullable_result()
     );
+}
+
+#[test]
+fn null_carrier_is_successful_sql_null_even_with_nonnullable_source_fact() {
+    let source = ty(DataType::Null, false);
+    source.validate().unwrap();
+    let array: ArrayRef = Arc::new(NullArray::new(1));
+    for operator in [
+        ComparisonOperator::Eq,
+        ComparisonOperator::Ne,
+        ComparisonOperator::Lt,
+        ComparisonOperator::Le,
+        ComparisonOperator::Gt,
+        ComparisonOperator::Ge,
+    ] {
+        let prepared = PreparedComparisonRecipe::try_new(
+            operator,
+            &source,
+            &source,
+            &CompileControl::default(),
+        )
+        .unwrap();
+        assert!(prepared.nullable_result());
+        assert_eq!(
+            prepared
+                .compare_rows(
+                    EvaluatedArgument::Column(&array),
+                    0,
+                    0,
+                    EvaluatedArgument::Column(&array),
+                    0,
+                    0,
+                    &Control::default()
+                )
+                .unwrap(),
+            None
+        );
+        let scalar: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
+        let nonnull = ty(DataType::Int64, false);
+        let strict = PreparedComparisonRecipe::try_new(
+            operator,
+            &nonnull,
+            &nonnull,
+            &CompileControl::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            strict.compare_rows(
+                EvaluatedArgument::Scalar(&scalar),
+                0,
+                0,
+                EvaluatedArgument::Scalar(&scalar),
+                0,
+                0,
+                &Control::default()
+            ),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+    }
+}
+
+#[test]
+fn four_float_operators_keep_total_order_bit_oracles_for_float16_32_64() {
+    macro_rules! float {
+        ($ty:ty, $zero:expr, $negative_zero:expr, $nan:expr, $other:expr, $negative_nan:expr, $negative_other:expr, $inf:expr, $negative_inf:expr) => {{
+            let rows = [
+                (Some($zero), Some($negative_zero), Some(Ordering::Greater)),
+                (Some($negative_zero), Some($zero), Some(Ordering::Less)),
+                (Some($nan), Some($nan), Some(Ordering::Equal)),
+                (Some($nan), Some($other), Some(Ordering::Less)),
+                (Some($other), Some($nan), Some(Ordering::Greater)),
+                (
+                    Some($negative_nan),
+                    Some($negative_other),
+                    Some(Ordering::Greater),
+                ),
+                (
+                    Some($negative_other),
+                    Some($negative_nan),
+                    Some(Ordering::Less),
+                ),
+                (Some($nan), Some($inf), Some(Ordering::Greater)),
+                (
+                    Some($negative_nan),
+                    Some($negative_inf),
+                    Some(Ordering::Less),
+                ),
+                (Some($inf), Some($inf), Some(Ordering::Equal)),
+                (None, Some($nan), None),
+            ];
+            let left: ArrayRef = Arc::new(PrimitiveArray::<$ty>::from_iter(
+                rows.iter()
+                    .map(|(a, _, _)| a.map(<$ty as ArrowPrimitiveType>::Native::from_bits)),
+            ));
+            let right: ArrayRef = Arc::new(PrimitiveArray::<$ty>::from_iter(
+                rows.iter()
+                    .map(|(_, a, _)| a.map(<$ty as ArrowPrimitiveType>::Native::from_bits)),
+            ));
+            let expected: Vec<_> = rows.iter().map(|(_, _, order)| *order).collect();
+            compare_ordered_arrays(&left, &right, &expected);
+        }};
+    }
+    float!(
+        Float16Type,
+        0x0000,
+        0x8000,
+        0x7e42,
+        0x7e43,
+        0xfe42,
+        0xfe43,
+        0x7c00,
+        0xfc00
+    );
+    float!(
+        Float32Type,
+        0x0000_0000,
+        0x8000_0000,
+        0x7fc0_0042,
+        0x7fc0_0043,
+        0xffc0_0042,
+        0xffc0_0043,
+        0x7f80_0000,
+        0xff80_0000
+    );
+    float!(
+        Float64Type,
+        0x0000_0000_0000_0000,
+        0x8000_0000_0000_0000,
+        0x7ff8_0000_0000_0042,
+        0x7ff8_0000_0000_0043,
+        0xfff8_0000_0000_0042,
+        0xfff8_0000_0000_0043,
+        0x7ff0_0000_0000_0000,
+        0xfff0_0000_0000_0000
+    );
+}
+
+#[test]
+fn offset_bytes_use_common_prefix_before_length_for_all_four_operators() {
+    let left = [
+        Some("z"),
+        Some("a"),
+        Some("aa"),
+        Some("a\0"),
+        Some("a\0b"),
+        Some("α"),
+        Some("ab"),
+        None,
+    ];
+    let right = [
+        Some("aa"),
+        Some("aa"),
+        Some("a"),
+        Some("a\0"),
+        Some("a\0a"),
+        Some("β"),
+        Some("ac"),
+        Some("a"),
+    ];
+    let expected = [
+        Some(Ordering::Greater),
+        Some(Ordering::Less),
+        Some(Ordering::Greater),
+        Some(Ordering::Equal),
+        Some(Ordering::Greater),
+        Some(Ordering::Less),
+        Some(Ordering::Less),
+        None,
+    ];
+    compare_ordered_arrays(
+        &(Arc::new(StringArray::from(left.to_vec())) as ArrayRef),
+        &(Arc::new(StringArray::from(right.to_vec())) as ArrayRef),
+        &expected,
+    );
+    compare_ordered_arrays(
+        &(Arc::new(LargeStringArray::from(left.to_vec())) as ArrayRef),
+        &(Arc::new(LargeStringArray::from(right.to_vec())) as ArrayRef),
+        &expected,
+    );
+    let left: Vec<_> = left
+        .into_iter()
+        .map(|value| value.map(str::as_bytes))
+        .collect();
+    let right: Vec<_> = right
+        .into_iter()
+        .map(|value| value.map(str::as_bytes))
+        .collect();
+    compare_ordered_arrays(
+        &(Arc::new(BinaryArray::from(left.clone())) as ArrayRef),
+        &(Arc::new(BinaryArray::from(right.clone())) as ArrayRef),
+        &expected,
+    );
+    compare_ordered_arrays(
+        &(Arc::new(LargeBinaryArray::from(left)) as ArrayRef),
+        &(Arc::new(LargeBinaryArray::from(right)) as ArrayRef),
+        &expected,
+    );
+}
+
+#[test]
+fn accurate_largeint_uses_signed_order_while_physical_and_uuid_keep_byte_order() {
+    let values = [i128::MIN, -1, 0, 1, i128::MAX];
+    let bytes = values.map(i128::to_be_bytes);
+    let left_bytes: Vec<_> = (0..5)
+        .flat_map(|i| (0..5).map(move |_| Some(bytes[i])))
+        .chain([None])
+        .collect();
+    let right_bytes: Vec<_> = (0..5)
+        .flat_map(|_| (0..5).map(move |j| Some(bytes[j])))
+        .chain([Some(bytes[0])])
+        .collect();
+    let left: ArrayRef = Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            left_bytes.iter().map(|v| v.as_ref().map(|v| v.as_slice())),
+            16,
+        )
+        .unwrap(),
+    );
+    let right: ArrayRef = Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            right_bytes.iter().map(|v| v.as_ref().map(|v| v.as_slice())),
+            16,
+        )
+        .unwrap(),
+    );
+    let unsigned_rank = [3, 4, 0, 1, 2];
+    for logical in [
+        ValueLogicalType::LargeInt,
+        ValueLogicalType::Physical,
+        ValueLogicalType::Uuid,
+    ] {
+        let value =
+            FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
+                .unwrap();
+        for operator in [
+            ComparisonOperator::Eq,
+            ComparisonOperator::Ne,
+            ComparisonOperator::Lt,
+            ComparisonOperator::Le,
+            ComparisonOperator::Gt,
+            ComparisonOperator::Ge,
+        ] {
+            let prepared = PreparedComparisonRecipe::try_new(
+                operator,
+                &value,
+                &value,
+                &CompileControl::default(),
+            )
+            .unwrap();
+            for i in 0..5 {
+                for j in 0..5 {
+                    let ordering = if logical == ValueLogicalType::LargeInt {
+                        i.cmp(&j)
+                    } else {
+                        unsigned_rank[i].cmp(&unsigned_rank[j])
+                    };
+                    let expected = match operator {
+                        ComparisonOperator::Eq => i == j,
+                        ComparisonOperator::Ne => i != j,
+                        operator => order_expected(operator, ordering),
+                    };
+                    let row = i * 5 + j;
+                    assert_eq!(
+                        prepared
+                            .compare_rows(
+                                EvaluatedArgument::Column(&left),
+                                row,
+                                row,
+                                EvaluatedArgument::Column(&right),
+                                row,
+                                row,
+                                &Control::default()
+                            )
+                            .unwrap(),
+                        Some(expected),
+                        "{logical:?} {operator:?} {} vs {}",
+                        values[i],
+                        values[j]
+                    );
+                }
+            }
+            assert_eq!(
+                prepared
+                    .compare_rows(
+                        EvaluatedArgument::Column(&left),
+                        25,
+                        25,
+                        EvaluatedArgument::Column(&right),
+                        25,
+                        25,
+                        &Control::default()
+                    )
+                    .unwrap(),
+                None
+            );
+            let different = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                if logical == ValueLogicalType::Uuid {
+                    ValueLogicalType::LargeInt
+                } else {
+                    ValueLogicalType::Uuid
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                PreparedComparisonRecipe::try_new(
+                    operator,
+                    &value,
+                    &different,
+                    &CompileControl::default()
+                ),
+                Err(ComparisonPrepareError::TypeMismatch)
+            );
+        }
+    }
+}
+
+#[test]
+fn every_ordering_operator_preserves_exact_addresses_and_long_prefix_primary_controls() {
+    let source: ArrayRef = Arc::new(StringArray::from(vec![
+        None,
+        Some("unused"),
+        Some("needle"),
+    ]));
+    let value = constant(source, true, ValueLogicalType::Physical, 2);
+    let rows = [1, 3];
+    let selection = Selection::try_sparse(4, &rows).unwrap();
+    let selected_array: ArrayRef = Arc::new(StringArray::from(vec![
+        "ignored", "needle", "other", "ignored",
+    ]));
+    let selected_array = selected_array.slice(1, 2);
+    let selected =
+        SelectedValues::try_new(selection, &DataType::Utf8, selected_array, Box::new([])).unwrap();
+    let scalar: ArrayRef = Arc::new(StringArray::from(vec!["needle"]));
+    let full: ArrayRef = Arc::new(StringArray::from(vec![
+        "unused", "needle", "unused", "other",
+    ]));
+    let text = "x".repeat(1024);
+    let later = format!("{}y", "x".repeat(1023));
+    let left: ArrayRef = Arc::new(StringArray::from(vec![text.as_str()]));
+    let right: ArrayRef = Arc::new(StringArray::from(vec![later.as_str()]));
+    for operator in ORDERS {
+        let prepared = PreparedComparisonRecipe::try_new(
+            operator,
+            &ty(DataType::Utf8, true),
+            &ty(DataType::Utf8, false),
+            &CompileControl::default(),
+        )
+        .unwrap();
+        for (ordinal, batch_row, order) in [(0, 1, Ordering::Equal), (1, 3, Ordering::Less)] {
+            assert_eq!(
+                prepared
+                    .compare_rows(
+                        EvaluatedArgument::Constant(&value),
+                        ordinal,
+                        batch_row,
+                        EvaluatedArgument::SelectedColumn(&selected),
+                        ordinal,
+                        batch_row,
+                        &Control::default()
+                    )
+                    .unwrap(),
+                Some(order_expected(operator, order))
+            );
+        }
+        assert_eq!(
+            prepared
+                .compare_rows(
+                    EvaluatedArgument::Scalar(&scalar),
+                    9,
+                    3,
+                    EvaluatedArgument::Column(&full),
+                    1,
+                    3,
+                    &Control::default()
+                )
+                .unwrap(),
+            Some(order_expected(operator, Ordering::Less))
+        );
+        assert!(matches!(
+            prepared.compare_rows(
+                EvaluatedArgument::Scalar(&scalar),
+                0,
+                0,
+                EvaluatedArgument::SelectedColumn(&selected),
+                0,
+                0,
+                &Control::default()
+            ),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        let success = Control::default();
+        assert_eq!(
+            prepared
+                .compare_rows(
+                    EvaluatedArgument::Scalar(&left),
+                    0,
+                    0,
+                    EvaluatedArgument::Scalar(&right),
+                    0,
+                    0,
+                    &success
+                )
+                .unwrap(),
+            Some(order_expected(operator, Ordering::Less))
+        );
+        let trace = success.trace.into_inner().unwrap();
+        assert_eq!(trace[0], 0);
+        assert!(trace.iter().filter(|units| **units == 256).count() >= 4);
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            for refused in 0..trace.len() {
+                let control = Control {
+                    refusal: Some((refused, cause.clone())),
+                    ..Control::default()
+                };
+                assert_eq!(
+                    prepared.compare_rows(
+                        EvaluatedArgument::Scalar(&left),
+                        0,
+                        0,
+                        EvaluatedArgument::Scalar(&right),
+                        0,
+                        0,
+                        &control
+                    ),
+                    Err(cause.clone())
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=refused]);
+            }
+        }
+    }
 }

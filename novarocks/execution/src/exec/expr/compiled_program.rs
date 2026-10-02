@@ -249,7 +249,11 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
                     | StaticExprKind::Eq(..)
-                    | StaticExprKind::Ne(..) => {
+                    | StaticExprKind::Ne(..)
+                    | StaticExprKind::Lt(..)
+                    | StaticExprKind::Le(..)
+                    | StaticExprKind::Gt(..)
+                    | StaticExprKind::Ge(..) => {
                         let mut summary = ScopedExpressionEffects::pure_value(invocation.context);
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
                             let child = *effects
@@ -307,14 +311,14 @@ impl CompiledExpressionInstance {
                 | StaticExprKind::IsNotNull(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1 => {}
-                StaticExprKind::Eq(..) | StaticExprKind::Ne(..)
-                    if invocation.control == ControlShape::Eager
-                        && invocation.arguments.len() == 2
-                        && program
-                            .equality_recipe(novarocks_local_program::ProgramEqualitySite::Binary(
-                                occurrence,
-                            ))
-                            .is_some() => {}
+                kind if kind.ordinary_comparison().is_some()
+                    && invocation.control == ControlShape::Eager
+                    && invocation.arguments.len() == 2
+                    && program
+                        .comparison_recipe(novarocks_local_program::ProgramComparisonSite::Binary(
+                            occurrence,
+                        ))
+                        .is_some() => {}
                 StaticExprKind::Case { .. }
                     if matches!(invocation.control, ControlShape::Case { .. })
                         && guarded::supports_result(node.data_type()) => {}

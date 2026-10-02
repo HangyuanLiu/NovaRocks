@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable equality for already-materialized flat value domains with explicit logical identity.
+//! Immutable six-operator comparison for already-materialized flat value domains with explicit logical identity.
 //! This primitive has no instance state, registry lookup, coercion or memory grant.
 
 use arrow_array::{types::*, *};
@@ -24,20 +24,46 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     ValueLogicalType, arrow_data_types_exact_observed,
 };
-use std::{error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt};
 
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, validate_type_observed};
 use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure};
 
+/// Frozen ordinary scalar operation; never interpreted from a runtime name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComparisonOperator {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+impl ComparisonOperator {
+    fn apply(self, ordering: Ordering) -> bool {
+        match self {
+            Self::Eq => ordering == Ordering::Equal,
+            Self::Ne => ordering != Ordering::Equal,
+            Self::Lt => ordering == Ordering::Less,
+            Self::Le => ordering != Ordering::Greater,
+            Self::Gt => ordering == Ordering::Greater,
+            Self::Ge => ordering != Ordering::Less,
+        }
+    }
+    fn is_ordering(self) -> bool {
+        matches!(self, Self::Lt | Self::Le | Self::Gt | Self::Ge)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EqualityPrepareError {
+pub enum ComparisonPrepareError {
     Control(CompileControlError),
     Kernel(KernelFailure),
     Unsupported,
     TypeMismatch,
 }
-impl EqualityPrepareError {
+impl ComparisonPrepareError {
     pub fn control_error(&self) -> Option<CompileControlError> {
         match self {
             Self::Control(cause) => Some(*cause),
@@ -52,21 +78,21 @@ impl EqualityPrepareError {
         }
     }
 }
-impl fmt::Display for EqualityPrepareError {
+impl fmt::Display for ComparisonPrepareError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::Kernel(error) => error.fmt(f),
             Self::Unsupported => {
-                f.write_str("equality requires its exact supported flat logical domain")
+                f.write_str("comparison requires its exact supported flat logical domain")
             }
             Self::TypeMismatch => {
-                f.write_str("equality arguments differ in their frozen value domain")
+                f.write_str("comparison arguments differ in their frozen value domain")
             }
         }
     }
 }
-impl Error for EqualityPrepareError {
+impl Error for ComparisonPrepareError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Control(error) => Some(error),
@@ -75,24 +101,26 @@ impl Error for EqualityPrepareError {
         }
     }
 }
-impl From<CompileControlError> for EqualityPrepareError {
+impl From<CompileControlError> for ComparisonPrepareError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
     }
 }
-impl From<novarocks_type_contract::ValueTypeError> for EqualityPrepareError {
+impl From<novarocks_type_contract::ValueTypeError> for ComparisonPrepareError {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
         Self::Kernel(error.into())
     }
 }
 
-/// Scalar Arrow equality, including floating-point bit equality. Authored UUID
-/// and LARGEINT compare their exact 16-byte representation, without inferring
-/// either identity from a carrier. Nested and null-safe equality have different
-/// existing algorithms and are not admitted.
+/// Ordinary scalar Arrow comparison, including floating-point total ordering
+/// and bit equality. Authored UUID has the original unsigned 16-byte order;
+/// authored LARGEINT uses signed i128 order decoded from big-endian bytes. Neither
+/// identity is inferred from a carrier. Nested and null-safe comparison retain
+/// their separate existing algorithms and are not admitted.
 /// The compiler retains this checked recipe against the actual expression use.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedEqualityRecipe {
+pub struct PreparedComparisonRecipe {
+    operator: ComparisonOperator,
     left: FunctionValueType,
     right: FunctionValueType,
     leaf: FlatLeaf,
@@ -138,6 +166,7 @@ enum FlatLeaf {
     Binary,
     LargeBinary,
     FixedSizeBinary,
+    LargeInt,
 }
 impl FlatLeaf {
     fn from_type(ty: &DataType) -> Option<Self> {
@@ -189,18 +218,19 @@ impl FlatLeaf {
         })
     }
 }
-impl PreparedEqualityRecipe {
+impl PreparedComparisonRecipe {
     pub fn try_new(
+        operator: ComparisonOperator,
         left: &FunctionValueType,
         right: &FunctionValueType,
         control: &dyn PureCompileControl,
-    ) -> Result<Self, EqualityPrepareError> {
+    ) -> Result<Self, ComparisonPrepareError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result = (|| {
-            validate_type_observed(left, &mut work).map_err(EqualityPrepareError::Kernel)?;
-            validate_type_observed(right, &mut work).map_err(EqualityPrepareError::Kernel)?;
+            validate_type_observed(left, &mut work).map_err(ComparisonPrepareError::Kernel)?;
+            validate_type_observed(right, &mut work).map_err(ComparisonPrepareError::Kernel)?;
             if left.logical_type != right.logical_type {
-                return Err(EqualityPrepareError::TypeMismatch);
+                return Err(ComparisonPrepareError::TypeMismatch);
             }
             let allowed = match left.logical_type {
                 ValueLogicalType::Physical => true,
@@ -211,21 +241,25 @@ impl PreparedEqualityRecipe {
                 _ => false,
             };
             if !allowed {
-                return Err(EqualityPrepareError::Unsupported);
+                return Err(ComparisonPrepareError::Unsupported);
             }
-            let leaf =
-                FlatLeaf::from_type(&left.data_type).ok_or(EqualityPrepareError::Unsupported)?;
-            if !arrow_data_types_exact_observed::<EqualityPrepareError>(
+            let leaf = if left.logical_type == ValueLogicalType::LargeInt {
+                FlatLeaf::LargeInt
+            } else {
+                FlatLeaf::from_type(&left.data_type).ok_or(ComparisonPrepareError::Unsupported)?
+            };
+            if !arrow_data_types_exact_observed::<ComparisonPrepareError>(
                 &left.data_type,
                 &right.data_type,
                 || work.step().map_err(Into::into),
             )? {
-                return Err(EqualityPrepareError::TypeMismatch);
+                return Err(ComparisonPrepareError::TypeMismatch);
             }
             work.step()?;
             // Only flat types remain; timestamp timezone backing is Arc-shared.
             work.flush()?;
             let prepared = Self {
+                operator,
                 left: left.clone(),
                 right: right.clone(),
                 leaf,
@@ -242,6 +276,9 @@ impl PreparedEqualityRecipe {
         }
         work.finish()?;
         result
+    }
+    pub fn operator(&self) -> ComparisonOperator {
+        self.operator
     }
     pub fn left_type(&self) -> &FunctionValueType {
         &self.left
@@ -284,9 +321,11 @@ impl PreparedEqualityRecipe {
             let la = left.array();
             let ra = right.array();
             // Check both operands before a successful SQL NULL can short-circuit.
-            if la.is_null(l) && !self.left.nullable || ra.is_null(r) && !self.right.nullable {
+            if self.leaf != FlatLeaf::Null
+                && (la.is_null(l) && !self.left.nullable || ra.is_null(r) && !self.right.nullable)
+            {
                 return Err(invalid(
-                    "non-null equality argument contains a selected NULL",
+                    "non-null comparison argument contains a selected NULL",
                 ));
             }
             work.step()?;
@@ -314,12 +353,7 @@ impl PreparedEqualityRecipe {
     ) -> Result<Option<bool>, KernelFailure> {
         macro_rules! p {
             ($ty:ty) => {
-                primitive::<$ty>(left, l, right, r, |a, b| a == b, work)
-            };
-        }
-        macro_rules! f {
-            ($ty:ty) => {
-                primitive::<$ty>(left, l, right, r, |a, b| a.to_bits() == b.to_bits(), work)
+                primitive::<$ty>(left, l, right, r, self.operator, work)
             };
         }
         macro_rules! b {
@@ -330,7 +364,7 @@ impl PreparedEqualityRecipe {
                     Ok(None)
                 } else {
                     let bytes: fn(&$ty, usize) -> &[u8] = $bytes;
-                    equal_bytes(bytes(left, l), bytes(right, r), work).map(Some)
+                    compare_bytes(self.operator, bytes(left, l), bytes(right, r), work).map(Some)
                 }
             }};
         }
@@ -346,7 +380,7 @@ impl PreparedEqualityRecipe {
                 if left.is_null(l) || right.is_null(r) {
                     Ok(None)
                 } else {
-                    let eq = left.value(l) == right.value(r);
+                    let eq = self.operator.apply(left.value(l).cmp(&right.value(r)));
                     work.step()?;
                     Ok(Some(eq))
                 }
@@ -359,9 +393,9 @@ impl PreparedEqualityRecipe {
             FlatLeaf::UInt16 => p!(UInt16Type),
             FlatLeaf::UInt32 => p!(UInt32Type),
             FlatLeaf::UInt64 => p!(UInt64Type),
-            FlatLeaf::Float16 => f!(Float16Type),
-            FlatLeaf::Float32 => f!(Float32Type),
-            FlatLeaf::Float64 => f!(Float64Type),
+            FlatLeaf::Float16 => p!(Float16Type),
+            FlatLeaf::Float32 => p!(Float32Type),
+            FlatLeaf::Float64 => p!(Float64Type),
             FlatLeaf::Decimal32 => p!(Decimal32Type),
             FlatLeaf::Decimal64 => p!(Decimal64Type),
             FlatLeaf::Decimal128 => p!(Decimal128Type),
@@ -388,6 +422,25 @@ impl PreparedEqualityRecipe {
             FlatLeaf::Binary => b!(BinaryArray, |a, i| a.value(i)),
             FlatLeaf::LargeBinary => b!(LargeBinaryArray, |a, i| a.value(i)),
             FlatLeaf::FixedSizeBinary => b!(FixedSizeBinaryArray, |a, i| a.value(i)),
+            FlatLeaf::LargeInt => {
+                let left = cast::<FixedSizeBinaryArray>(left)?;
+                let right = cast::<FixedSizeBinaryArray>(right)?;
+                if left.is_null(l) || right.is_null(r) {
+                    Ok(None)
+                } else {
+                    let l =
+                        i128::from_be_bytes(left.value(l).try_into().map_err(|_| {
+                            internal("LARGEINT comparison value is not sixteen bytes")
+                        })?);
+                    let r =
+                        i128::from_be_bytes(right.value(r).try_into().map_err(|_| {
+                            internal("LARGEINT comparison value is not sixteen bytes")
+                        })?);
+                    let result = self.operator.apply(l.cmp(&r));
+                    work.step()?;
+                    Ok(Some(result))
+                }
+            }
         }
     }
 }
@@ -396,14 +449,14 @@ fn cast<T: Array + 'static>(array: &dyn Array) -> Result<&T, KernelFailure> {
     array
         .as_any()
         .downcast_ref::<T>()
-        .ok_or_else(|| internal("exact equality carrier cannot be downcast"))
+        .ok_or_else(|| internal("exact comparison carrier cannot be downcast"))
 }
 fn primitive<T: ArrowPrimitiveType>(
     left: &dyn Array,
     l: usize,
     right: &dyn Array,
     r: usize,
-    equal: impl FnOnce(T::Native, T::Native) -> bool,
+    operator: ComparisonOperator,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<bool>, KernelFailure> {
     let left = cast::<PrimitiveArray<T>>(left)?;
@@ -411,7 +464,7 @@ fn primitive<T: ArrowPrimitiveType>(
     if left.is_null(l) || right.is_null(r) {
         return Ok(None);
     }
-    let equal = equal(left.value(l), right.value(r));
+    let equal = operator.apply(left.value(l).compare(right.value(r)));
     work.step()?;
     Ok(Some(equal))
 }
@@ -420,18 +473,28 @@ fn equal_bytes(
     right: &[u8],
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
-    if left.len() != right.len() {
+    compare_bytes(ComparisonOperator::Eq, left, right, work)
+}
+fn compare_bytes(
+    operator: ComparisonOperator,
+    left: &[u8],
+    right: &[u8],
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<bool, KernelFailure> {
+    if !operator.is_ordering() && left.len() != right.len() {
         work.step()?;
-        return Ok(false);
+        return Ok(operator == ComparisonOperator::Ne);
     }
     for (left, right) in left.iter().zip(right) {
-        let same = left == right;
+        let ordering = left.cmp(right);
         work.step()?;
-        if !same {
-            return Ok(false);
+        if ordering != Ordering::Equal {
+            return Ok(operator.apply(ordering));
         }
     }
-    Ok(true)
+    let ordering = left.len().cmp(&right.len());
+    work.step()?;
+    Ok(operator.apply(ordering))
 }
 fn flat_type_matches(
     expected: &DataType,
@@ -467,36 +530,36 @@ fn checked_row(
         let ty = value.value_type();
         if ty.logical_type != expected.logical_type || (ty.nullable && !expected.nullable) {
             return Err(invalid(
-                "equality constant differs from its frozen value type",
+                "comparison constant differs from its frozen value type",
             ));
         }
     }
     if !flat_type_matches(&expected.data_type, argument.array().data_type(), work)? {
         return Err(invalid(
-            "equality argument differs from its frozen flat carrier",
+            "comparison argument differs from its frozen flat carrier",
         ));
     }
     match argument {
         EvaluatedArgument::Scalar(array) if array.len() != 1 => {
-            return Err(invalid("equality scalar has invalid cardinality"));
+            return Err(invalid("comparison scalar has invalid cardinality"));
         }
         EvaluatedArgument::SelectedColumn(values)
             if values.selection().row(ordinal) != Some(batch_row) =>
         {
             return Err(invalid(
-                "equality compact address differs from its actual selection",
+                "comparison compact address differs from its actual selection",
             ));
         }
         _ => {}
     }
     let row = argument.value_row(ordinal, batch_row);
     if row >= argument.array().len() {
-        return Err(invalid("equality selected address is outside its array"));
+        return Err(invalid("comparison selected address is outside its array"));
     }
     work.step()?;
     Ok(row)
 }
 
 #[cfg(test)]
-#[path = "equality/tests.rs"]
+#[path = "comparison/tests.rs"]
 mod tests;

@@ -24,7 +24,7 @@ use novarocks_functions::{
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
 };
 use novarocks_local_program::{
-    KernelAbiVersion, ProgramEqualitySite, ProgramExpressionArena, ProgramExpressionRootSite,
+    KernelAbiVersion, ProgramComparisonSite, ProgramExpressionArena, ProgramExpressionRootSite,
     ProgramNodeExpressionRole, ProgramNodeId, ProgramUseRef, StaticExprKind,
 };
 use novarocks_physical_plan::{
@@ -642,14 +642,17 @@ fn binary_eq_and_not_eq_have_mandatory_recipes_for_exact_ordered_child_uses() {
                         use_id,
                     };
                     let recipe = program
-                        .equality_recipe(ProgramEqualitySite::Binary(occurrence))
+                        .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
                         .unwrap();
                     assert_eq!(recipe.left_type(), &left);
                     assert_eq!(recipe.right_type(), &right);
                     assert_eq!(recipe.nullable_result(), left_null || right_null);
                     assert!(
                         program
-                            .equality_recipe(ProgramEqualitySite::CaseWhen { occurrence, arm: 0 })
+                            .comparison_recipe(ProgramComparisonSite::CaseWhen {
+                                occurrence,
+                                arm: 0
+                            })
                             .is_none()
                     );
                     assert!(calls.calls().is_empty());
@@ -661,7 +664,7 @@ fn binary_eq_and_not_eq_have_mandatory_recipes_for_exact_ordered_child_uses() {
 }
 
 #[test]
-fn floating_equality_recipe_preserves_exact_source_types_and_literal_bit_patterns() {
+fn floating_comparison_recipe_preserves_exact_source_types_and_literal_bit_patterns() {
     let functions = functions();
     // These are source material, not a runtime comparison oracle: no numeric normalization is permitted.
     let pairs = [
@@ -708,7 +711,7 @@ fn floating_equality_recipe_preserves_exact_source_types_and_literal_bit_pattern
             use_id: snapshot.bindings()[&root(Mode::Project)],
         };
         let recipe = program
-            .equality_recipe(ProgramEqualitySite::Binary(occurrence))
+            .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
             .unwrap();
         assert_eq!(recipe.left_type(), &ty);
         assert_eq!(recipe.right_type(), &ty);
@@ -774,7 +777,7 @@ fn simple_case_has_one_exact_recipe_per_ordered_when_and_keeps_actual_rand_effec
     };
     for (arm, rhs) in [(0, &right), (1, &left)] {
         let recipe = program
-            .equality_recipe(ProgramEqualitySite::CaseWhen { occurrence, arm })
+            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
             .unwrap();
         assert_eq!(recipe.left_type(), &left);
         assert_eq!(recipe.right_type(), rhs);
@@ -782,17 +785,17 @@ fn simple_case_has_one_exact_recipe_per_ordered_when_and_keeps_actual_rand_effec
     }
     assert!(
         program
-            .equality_recipe(ProgramEqualitySite::CaseWhen { occurrence, arm: 2 })
+            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm: 2 })
             .is_none()
     );
     assert!(
         program
-            .equality_recipe(ProgramEqualitySite::Binary(occurrence))
+            .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
             .is_none()
     );
     assert!(
         program
-            .equality_recipe(ProgramEqualitySite::CaseWhen {
+            .comparison_recipe(ProgramComparisonSite::CaseWhen {
                 occurrence: ProgramUseRef {
                     arena: ProgramExpressionArena::Main,
                     use_id: invocation.arguments[1],
@@ -950,17 +953,20 @@ fn nullable_null_domain_keeps_a_checked_recipe_instead_of_a_nonnullable_boolean_
             use_id: snapshot.bindings()[&root(Mode::Project)],
         };
         let sites = match shape {
-            Shape::Binary(_) => vec![ProgramEqualitySite::Binary(occurrence)],
+            Shape::Binary(_) => vec![ProgramComparisonSite::Binary(occurrence)],
             Shape::SimpleCase => vec![
-                ProgramEqualitySite::CaseWhen { occurrence, arm: 0 },
-                ProgramEqualitySite::CaseWhen { occurrence, arm: 1 },
+                ProgramComparisonSite::CaseWhen { occurrence, arm: 0 },
+                ProgramComparisonSite::CaseWhen { occurrence, arm: 1 },
             ],
         };
         for site in sites {
-            let recipe = program.equality_recipe(site).unwrap();
+            let recipe = program.comparison_recipe(site).unwrap();
             assert_eq!(recipe.left_type(), &ty);
             assert_eq!(recipe.right_type(), &ty);
             assert!(recipe.nullable_result());
         }
     }
 }
+
+#[path = "ordered_comparison_lowering_tests.rs"]
+mod ordered_comparison_lowering_tests;

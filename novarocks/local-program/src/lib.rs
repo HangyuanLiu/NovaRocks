@@ -61,7 +61,7 @@ pub use novarocks_connector_contract::{
     ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
     StaticScanDynamicFilter,
 };
-pub use primitives::{ProgramEqualitySite, ProgramPrimitiveError};
+pub use primitives::{ProgramComparisonSite, ProgramPrimitiveError};
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,

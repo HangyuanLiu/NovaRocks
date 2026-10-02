@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use novarocks_local_program::{ProgramEqualitySite, ProgramUseRef};
+use novarocks_local_program::{ProgramComparisonSite, ProgramUseRef};
 use novarocks_physical_plan::BinaryOperator;
 
 #[derive(Clone, Copy)]
@@ -323,14 +323,14 @@ fn assert_case_recipes(program: &LocalProgram, ty: DataType) {
     let occurrence = root_use(program);
     for arm in 0..2 {
         let recipe = program
-            .equality_recipe(ProgramEqualitySite::CaseWhen { occurrence, arm })
+            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
             .unwrap();
         assert_eq!(recipe.left_type().data_type, ty);
         assert_eq!(recipe.right_type().data_type, ty);
     }
     assert!(
         program
-            .equality_recipe(ProgramEqualitySite::CaseWhen { occurrence, arm: 2 })
+            .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm: 2 })
             .is_none()
     );
 }
@@ -369,7 +369,7 @@ fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() 
     for kind in [EqualityCase::Eq, EqualityCase::NotEq] {
         let program = equality_program(kind);
         let recipe = program
-            .equality_recipe(ProgramEqualitySite::Binary(root_use(&program)))
+            .comparison_recipe(ProgramComparisonSite::Binary(root_use(&program)))
             .unwrap();
         assert_eq!(
             recipe.left_type(),
@@ -621,3 +621,6 @@ fn every_actual_simple_case_callback_preserves_all_seven_primary_failures_and_re
         }
     }
 }
+
+#[path = "ordered_comparison_tests.rs"]
+mod ordered_comparison_tests;

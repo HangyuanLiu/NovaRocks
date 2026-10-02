@@ -20,7 +20,8 @@
 
 use crate::{ProgramLexicalBindings, ProgramUseRef, StaticExprKind};
 use novarocks_functions::{
-    EqualityPrepareError, FunctionArgumentType, FunctionValueType, PreparedEqualityRecipe,
+    ComparisonOperator, ComparisonPrepareError, FunctionArgumentType, FunctionValueType,
+    PreparedComparisonRecipe,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, PureCompileControl,
@@ -29,7 +30,7 @@ use novarocks_type_contract::{
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ProgramEqualitySite {
+pub enum ProgramComparisonSite {
     Binary(ProgramUseRef),
     CaseWhen { occurrence: ProgramUseRef, arm: u32 },
 }
@@ -37,7 +38,7 @@ pub enum ProgramEqualitySite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramPrimitiveError {
     Control(CompileControlError),
-    Equality(EqualityPrepareError),
+    Comparison(ComparisonPrepareError),
     Invalid(&'static str),
 }
 impl From<CompileControlError> for ProgramPrimitiveError {
@@ -45,12 +46,12 @@ impl From<CompileControlError> for ProgramPrimitiveError {
         Self::Control(value)
     }
 }
-impl From<EqualityPrepareError> for ProgramPrimitiveError {
-    fn from(value: EqualityPrepareError) -> Self {
+impl From<ComparisonPrepareError> for ProgramPrimitiveError {
+    fn from(value: ComparisonPrepareError) -> Self {
         if let Some(cause) = value.control_error() {
             Self::Control(cause)
         } else {
-            Self::Equality(value)
+            Self::Comparison(value)
         }
     }
 }
@@ -58,7 +59,7 @@ impl fmt::Display for ProgramPrimitiveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(e) => e.fmt(f),
-            Self::Equality(e) => e.fmt(f),
+            Self::Comparison(e) => e.fmt(f),
             Self::Invalid(message) => f.write_str(message),
         }
     }
@@ -67,16 +68,16 @@ impl std::error::Error for ProgramPrimitiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Control(e) => Some(e),
-            Self::Equality(e) => Some(e),
+            Self::Comparison(e) => Some(e),
             Self::Invalid(_) => None,
         }
     }
 }
 
-pub(crate) fn compile_equalities(
+pub(crate) fn compile_comparisons(
     checked: &ProgramLexicalBindings,
     control: &dyn PureCompileControl,
-) -> Result<BTreeMap<ProgramEqualitySite, PreparedEqualityRecipe>, ProgramPrimitiveError> {
+) -> Result<BTreeMap<ProgramComparisonSite, PreparedComparisonRecipe>, ProgramPrimitiveError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = compile_core(checked, control, &mut work);
     if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
@@ -89,7 +90,7 @@ fn compile_core(
     checked: &ProgramLexicalBindings,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<BTreeMap<ProgramEqualitySite, PreparedEqualityRecipe>, ProgramPrimitiveError> {
+) -> Result<BTreeMap<ProgramComparisonSite, PreparedComparisonRecipe>, ProgramPrimitiveError> {
     let typed = checked.channels().expressions();
     let snapshot = typed.resolved_calls().snapshot();
     let mut recipes = BTreeMap::new();
@@ -115,29 +116,35 @@ fn compile_core(
                 ))?
                 .kind();
             match kind {
-                StaticExprKind::Eq(left, right) | StaticExprKind::Ne(left, right) => {
+                kind if kind.ordinary_comparison().is_some() => {
+                    let (operator, left, right) =
+                        kind.ordinary_comparison().expect("checked comparison kind");
                     if invocation.control != ControlShape::Eager
                         || invocation.arguments.len() != 2
-                        || flow.uses()[&invocation.arguments[0]].definition != *left
-                        || flow.uses()[&invocation.arguments[1]].definition != *right
+                        || flow.uses()[&invocation.arguments[0]].definition != left
+                        || flow.uses()[&invocation.arguments[1]].definition != right
                     {
                         return Err(ProgramPrimitiveError::Invalid(
-                            "equality differs from its actual ordered occurrence",
+                            "comparison differs from its actual ordered occurrence",
                         ));
                     }
                     work.flush()?;
-                    let recipe =
-                        PreparedEqualityRecipe::try_new(value(*left)?, value(*right)?, control)?;
+                    let recipe = PreparedComparisonRecipe::try_new(
+                        operator,
+                        value(left)?,
+                        value(right)?,
+                        control,
+                    )?;
                     let result = value(invocation.definition)?;
                     if result.data_type != arrow_schema::DataType::Boolean
                         || result.logical_type != ValueLogicalType::Physical
                         || (recipe.nullable_result() && !result.nullable)
                     {
                         return Err(ProgramPrimitiveError::Invalid(
-                            "equality result loses successful SQL NULL or its Boolean domain",
+                            "comparison result loses successful SQL NULL or its Boolean domain",
                         ));
                     }
-                    recipes.insert(ProgramEqualitySite::Binary(occurrence), recipe);
+                    recipes.insert(ProgramComparisonSite::Binary(occurrence), recipe);
                     work.step()?;
                 }
                 StaticExprKind::Case {
@@ -178,12 +185,13 @@ fn compile_core(
                     }
                     for arm in 0..arms {
                         work.flush()?;
-                        let recipe = PreparedEqualityRecipe::try_new(
+                        let recipe = PreparedComparisonRecipe::try_new(
+                            ComparisonOperator::Eq,
                             value(children[0])?,
                             value(children[1 + arm as usize * 2])?,
                             control,
                         )?;
-                        recipes.insert(ProgramEqualitySite::CaseWhen { occurrence, arm }, recipe);
+                        recipes.insert(ProgramComparisonSite::CaseWhen { occurrence, arm }, recipe);
                         work.step()?;
                     }
                 }

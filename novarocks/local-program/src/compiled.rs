@@ -23,7 +23,7 @@
 
 use crate::{
     CompiledOriginsError, DiagnosticSourceNodeId, LocalOperatorProvenance, LocalProgramGraph,
-    ProgramCallSite, ProgramEqualitySite, ProgramLexicalBindings, ProgramNodeId,
+    ProgramCallSite, ProgramComparisonSite, ProgramLexicalBindings, ProgramNodeId,
     ProgramPrimitiveError, ProgramProvenance, ProgramStateTemplate, ProviderLinkError,
 };
 use novarocks_connector_contract::ConnectorWriteRecipe;
@@ -38,7 +38,7 @@ pub struct LocalProgram {
     checked: ProgramLexicalBindings,
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
-    equalities: BTreeMap<ProgramEqualitySite, novarocks_functions::PreparedEqualityRecipe>,
+    comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,14 +127,14 @@ impl LocalProgram {
         let provenance =
             crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)?;
         crate::provider_links::validate_provider_links(&checked, &writes, control)?;
-        let equalities = crate::primitives::compile_equalities(&checked, control)?;
+        let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
         // Each delegated author finishes its completed work and propagates a
         // first control refusal directly; no control object enters the product.
         Ok(Self {
             checked,
             provenance,
             writes,
-            equalities,
+            comparisons,
         })
     }
     pub const fn checked(&self) -> &ProgramLexicalBindings {
@@ -154,11 +154,11 @@ impl LocalProgram {
     pub fn write_recipes(&self) -> &BTreeMap<ProgramNodeId, ConnectorWriteRecipe> {
         &self.writes
     }
-    pub fn equality_recipe(
+    pub fn comparison_recipe(
         &self,
-        site: ProgramEqualitySite,
-    ) -> Option<&novarocks_functions::PreparedEqualityRecipe> {
-        self.equalities.get(&site)
+        site: ProgramComparisonSite,
+    ) -> Option<&novarocks_functions::PreparedComparisonRecipe> {
+        self.comparisons.get(&site)
     }
     /// Borrow the exact checked implementation's lifecycle; never rebuild a
     /// second state declaration from a name or legacy expression tag.

@@ -274,7 +274,11 @@ fn lower_core(
                 ExprKind::Binary {
                     op:
                         novarocks_physical_plan::BinaryOperator::Eq
-                        | novarocks_physical_plan::BinaryOperator::NotEq,
+                        | novarocks_physical_plan::BinaryOperator::NotEq
+                        | novarocks_physical_plan::BinaryOperator::Lt
+                        | novarocks_physical_plan::BinaryOperator::LtEq
+                        | novarocks_physical_plan::BinaryOperator::Gt
+                        | novarocks_physical_plan::BinaryOperator::GtEq,
                     left,
                     right,
                     ..
@@ -413,28 +417,29 @@ fn lower_core(
                 ExprKind::Binary {
                     op:
                         novarocks_physical_plan::BinaryOperator::Eq
-                        | novarocks_physical_plan::BinaryOperator::NotEq,
+                        | novarocks_physical_plan::BinaryOperator::NotEq
+                        | novarocks_physical_plan::BinaryOperator::Lt
+                        | novarocks_physical_plan::BinaryOperator::LtEq
+                        | novarocks_physical_plan::BinaryOperator::Gt
+                        | novarocks_physical_plan::BinaryOperator::GtEq,
                     left,
                     right,
                     ..
                 } => {
                     let left = *ids.get(left).ok_or(ExpressionLoweringError::Invalid(
-                        "equality left operand was not lowered",
+                        "comparison left operand was not lowered",
                     ))?;
                     let right = *ids.get(right).ok_or(ExpressionLoweringError::Invalid(
-                        "equality right operand was not lowered",
+                        "comparison right operand was not lowered",
                     ))?;
-                    if matches!(
-                        node.kind,
-                        ExprKind::Binary {
-                            op: novarocks_physical_plan::BinaryOperator::Eq,
-                            ..
-                        }
-                    ) {
-                        StaticExprKind::Eq(left, right)
-                    } else {
-                        StaticExprKind::Ne(left, right)
-                    }
+                    let ExprKind::Binary { op, .. } = &node.kind else {
+                        unreachable!("checked comparison kind")
+                    };
+                    StaticExprKind::from_comparison(
+                        comparison_operator(*op).expect("checked ordinary comparison operator"),
+                        left,
+                        right,
+                    )
                 }
                 ExprKind::Case {
                     operand,
@@ -797,20 +802,20 @@ fn prepare_core(
                     ExprKind::Binary {
                         op, left, right, ..
                     },
-                    StaticExprKind::Eq(local_left, local_right)
-                    | StaticExprKind::Ne(local_left, local_right),
-                ) if (*op == novarocks_physical_plan::BinaryOperator::Eq
-                    && matches!(local.kind(), StaticExprKind::Eq(..)))
-                    || (*op == novarocks_physical_plan::BinaryOperator::NotEq
-                        && matches!(local.kind(), StaticExprKind::Ne(..))) =>
+                    kind,
+                ) if kind.ordinary_comparison().is_some()
+                    && comparison_operator(*op)
+                        == kind.ordinary_comparison().map(|parts| parts.0) =>
                 {
+                    let (_, local_left, local_right) =
+                        kind.ordinary_comparison().expect("checked comparison kind");
                     if invocation.control != ControlShape::Eager
                         || invocation.arguments.len() != 2
-                        || lowered.ids.get(left) != Some(local_left)
-                        || lowered.ids.get(right) != Some(local_right)
+                        || lowered.ids.get(left) != Some(&local_left)
+                        || lowered.ids.get(right) != Some(&local_right)
                     {
                         return Err(ExpressionLoweringError::Invalid(
-                            "actual equality control or operands differ",
+                            "actual comparison control or operands differ",
                         ));
                     }
                     let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
@@ -818,14 +823,14 @@ fn prepare_core(
                         let child_use = invocation.arguments[ordinal];
                         if flow.uses()[&child_use].definition != physical {
                             return Err(ExpressionLoweringError::Invalid(
-                                "actual ordered equality use differs",
+                                "actual ordered comparison use differs",
                             ));
                         }
                         combined = combined.join_control_argument(
                             *effects
                                 .get(&child_use)
                                 .ok_or(ExpressionLoweringError::Invalid(
-                                    "equality child effects were not prepared",
+                                    "comparison child effects were not prepared",
                                 ))?,
                             flow,
                             ordinal,
@@ -1136,17 +1141,30 @@ fn literal_argument(
         | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
         | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
         (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
-        (
-            ExprKind::Binary {
-                op:
-                    novarocks_physical_plan::BinaryOperator::Eq
-                    | novarocks_physical_plan::BinaryOperator::NotEq,
-                ..
-            },
-            StaticExprKind::Eq(..) | StaticExprKind::Ne(..),
-        ) => Ok(None),
+        (ExprKind::Binary { op, .. }, kind)
+            if kind.ordinary_comparison().is_some()
+                && comparison_operator(*op) == kind.ordinary_comparison().map(|parts| parts.0) =>
+        {
+            Ok(None)
+        }
         _ => Err(ExpressionLoweringError::Invalid(
             "unsupported call argument projection",
         )),
     }
+}
+
+fn comparison_operator(
+    operator: novarocks_physical_plan::BinaryOperator,
+) -> Option<novarocks_functions::ComparisonOperator> {
+    use novarocks_functions::ComparisonOperator;
+    use novarocks_physical_plan::BinaryOperator;
+    Some(match operator {
+        BinaryOperator::Eq => ComparisonOperator::Eq,
+        BinaryOperator::NotEq => ComparisonOperator::Ne,
+        BinaryOperator::Lt => ComparisonOperator::Lt,
+        BinaryOperator::LtEq => ComparisonOperator::Le,
+        BinaryOperator::Gt => ComparisonOperator::Gt,
+        BinaryOperator::GtEq => ComparisonOperator::Ge,
+        _ => return None,
+    })
 }

@@ -320,13 +320,13 @@ impl Frame {
                 let recipe = if simple {
                     Some(
                         program
-                            .equality_recipe(
-                                novarocks_local_program::ProgramEqualitySite::CaseWhen {
+                            .comparison_recipe(
+                                novarocks_local_program::ProgramComparisonSite::CaseWhen {
                                     occurrence: self.occurrence,
                                     arm: ((ordinal - offset) / 2) as u32,
                                 },
                             )
-                            .ok_or_else(|| invalid("missing exact CASE WHEN equality recipe"))?,
+                            .ok_or_else(|| invalid("missing exact CASE WHEN comparison recipe"))?,
                     )
                 } else {
                     None
@@ -667,29 +667,28 @@ pub(super) fn evaluate_tree<'a>(
                         || work.step(),
                     )?)
                 }
-                StaticExprKind::Eq(..) | StaticExprKind::Ne(..) => {
+                kind if kind.ordinary_comparison().is_some() => {
                     if frame.children.len() != 2 {
-                        return Err(invalid("equality requires its exact ordered operands"));
+                        return Err(invalid("comparison requires its exact ordered operands"));
                     }
                     let mut children = std::mem::take(&mut frame.children).into_iter();
                     let left = children
                         .next()
-                        .ok_or_else(|| internal("missing equality left operand"))?
+                        .ok_or_else(|| internal("missing comparison left operand"))?
                         .value
                         .into_value(local_selection, work)?;
                     let right = children
                         .next()
-                        .ok_or_else(|| internal("missing equality right operand"))?
+                        .ok_or_else(|| internal("missing comparison right operand"))?
                         .value
                         .into_value(local_selection, work)?;
                     let recipe = program
-                        .equality_recipe(novarocks_local_program::ProgramEqualitySite::Binary(
+                        .comparison_recipe(novarocks_local_program::ProgramComparisonSite::Binary(
                             frame.occurrence,
                         ))
-                        .ok_or_else(|| invalid("missing exact equality recipe"))?;
-                    OwnedValue::from_selected(evaluate_equality(
+                        .ok_or_else(|| invalid("missing exact comparison recipe"))?;
+                    OwnedValue::from_selected(evaluate_comparison(
                         recipe,
-                        matches!(definition.kind(), StaticExprKind::Ne(..)),
                         &left,
                         &right,
                         local_selection,
@@ -860,9 +859,8 @@ fn assemble(
     )?))
 }
 
-fn evaluate_equality<'a>(
-    recipe: &novarocks_functions::PreparedEqualityRecipe,
-    negate: bool,
+fn evaluate_comparison<'a>(
+    recipe: &novarocks_functions::PreparedComparisonRecipe,
     left: &Value<'_>,
     right: &Value<'_>,
     selection: Selection<'a>,
@@ -894,7 +892,7 @@ fn evaluate_equality<'a>(
             values.push(None);
         } else {
             work.flush()?;
-            let equal = recipe.compare_rows(
+            let compared = recipe.compare_rows(
                 left.argument(),
                 ordinal,
                 row,
@@ -903,7 +901,7 @@ fn evaluate_equality<'a>(
                 row,
                 work.control,
             )?;
-            values.push(equal.map(|value| if negate { !value } else { value }));
+            values.push(compared);
         }
         work.step()?;
     }

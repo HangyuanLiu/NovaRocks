@@ -163,9 +163,12 @@ fn assembled(
     ) -> ExpressionUseId {
         let id = ExpressionUseId::new(uses.len() as u32);
         let (control, children) = match arena.node(definition).unwrap().kind() {
-            StaticExprKind::Eq(left, right) | StaticExprKind::Ne(left, right) => {
-                (ControlShape::Eager, vec![*left, *right])
-            }
+            StaticExprKind::Eq(left, right)
+            | StaticExprKind::Ne(left, right)
+            | StaticExprKind::Lt(left, right)
+            | StaticExprKind::Le(left, right)
+            | StaticExprKind::Gt(left, right)
+            | StaticExprKind::Ge(left, right) => (ControlShape::Eager, vec![*left, *right]),
             StaticExprKind::LambdaFunction { body, .. } => (ControlShape::LambdaBody, vec![*body]),
             _ => (ControlShape::Eager, vec![]),
         };
@@ -615,3 +618,6 @@ fn invalid_eq_ordinary_error_observes_completed_tail_and_preserves_primary_contr
         assert_eq!(*control.seen.lock().unwrap(), expected);
     }
 }
+
+#[path = "ordered_comparison_tests.rs"]
+mod ordered_comparison_tests;

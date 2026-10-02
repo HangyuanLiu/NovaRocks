@@ -148,10 +148,8 @@ impl ProgramTypedExpressions {
                         if let StaticExprKind::Constant(constant) = definition.kind() {
                             same_value(constant.value_type(), value, false, work)?;
                         }
-                        if let StaticExprKind::Eq(left, right) | StaticExprKind::Ne(left, right) =
-                            definition.kind()
-                        {
-                            validate_equality_types(*left, *right, value, entries, work)?;
+                        if let Some((_, left, right)) = definition.kind().ordinary_comparison() {
+                            validate_comparison_types(left, right, value, entries, work)?;
                         }
                         if let StaticExprKind::Case {
                             has_case_expr,
@@ -349,7 +347,7 @@ impl ProgramTypedExpressions {
 /// must not decide whether a static expression has a coherent value domain.
 /// This check covers root SQL NULL. Nested successful-NULL capabilities still
 /// require their comparison author before those recipes can be admitted.
-fn validate_equality_types(
+fn validate_comparison_types(
     left: ProgramExprId,
     right: ProgramExprId,
     result: &FunctionValueType,
