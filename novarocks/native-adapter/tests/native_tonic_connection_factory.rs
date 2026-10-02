@@ -228,6 +228,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
             FRAME_BYTES,
             owner.clone(),
         )?),
+        receive_header_field_pool: None,
         send_frame_buffer: Some(SendFrameBuffer::new(65536, FRAME_BYTES, owner.clone())?),
         receive_goaway_buffer_pool: Some(ReceiveBufferPool::new(2, FRAME_BYTES, owner)?),
     })
@@ -446,6 +447,90 @@ async fn invalid_scalar_or_owned_geometry_rejects_before_dial_and_returns_grant(
             "case {case} must not dial"
         );
         reserve_all(&original_budget, attempt_bytes());
+    }
+}
+
+#[tokio::test]
+async fn header_field_pool_validates_dependencies_and_effective_endpoint_cap_before_dial() {
+    let field_bytes =
+        h2::ReceiveHeaderFieldPool::allocation_capacity_bound(65536, 1024, FRAME_BYTES).unwrap()
+            + Bytes::owner_with_exit_guard_metadata_size::<Bytes, ResultWriteCredit>();
+    let total = attempt_bytes() + field_bytes;
+    for case in 0..10 {
+        let original_budget = ResultRetainedBudget::new(NonZeroUsize::new(total).unwrap());
+        let factory_budget = original_budget.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut endpoint = Endpoint::from_static("http://localhost");
+        if matches!(case, 5 | 6) {
+            endpoint = endpoint.http2_max_header_list_size(32768);
+        } else if case == 8 {
+            endpoint = endpoint.http2_max_header_list_size(31);
+        } else if case == 9 {
+            endpoint = endpoint.http2_max_header_list_size(FRAME_BYTES as u32);
+        }
+        let endpoint = endpoint.http2_connection_factory(move || {
+            let mut config = funded_config(&factory_budget)?;
+            let ResultWriteAdmission::Granted(credit) = factory_budget
+                .try_reserve_process(field_bytes)
+                .map_err(io::Error::other)?
+            else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            config.receive_header_field_pool = Some(h2::ReceiveHeaderFieldPool::new(
+                65536,
+                1024,
+                FRAME_BYTES,
+                Bytes::from_owner_with_exit_guard(Bytes::new(), credit),
+            )?);
+            match case {
+                0 => config.receive_frame_buffer = None,
+                1 => config.receive_header_block_buffer = None,
+                2 => config.max_receive_header_block_size = None,
+                3 => config.max_header_list_size = Some(31),
+                4 => config.max_header_list_size = Some(32768),
+                5 | 7 | 8 | 9 => config.max_header_list_size = None,
+                6 => config.max_header_list_size = Some(FRAME_BYTES as u32),
+                _ => unreachable!(),
+            }
+            Ok::<_, io::Error>(config)
+        });
+        let error = endpoint
+            .connect_with_connector(connector(
+                Arc::new(Mutex::new(VecDeque::new())),
+                calls.clone(),
+            ))
+            .await
+            .unwrap_err();
+        let valid = matches!(case, 6 | 7 | 9);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            usize::from(valid),
+            "case {case}: {error:?}"
+        );
+        if !valid {
+            assert!(
+                format!("{error:?}").contains("per-connection"),
+                "case {case}: {error:?}"
+            );
+            if !matches!(case, 0 | 2) {
+                assert!(
+                    format!("{error:?}").contains("header field pool requires"),
+                    "case {case}: {error:?}"
+                );
+            }
+        } else {
+            // A deliberate empty connector queue proves valid geometry passed
+            // the pre-dial gate. It is not a successful native deployment.
+            let mut cause: &(dyn StdError + 'static) = &error;
+            loop {
+                if let Some(cause) = cause.downcast_ref::<io::Error>() {
+                    assert_eq!(cause.kind(), io::ErrorKind::ConnectionRefused);
+                    break;
+                }
+                cause = cause.source().expect("actual dial refusal source");
+            }
+        }
+        reserve_all(&original_budget, total);
     }
 }
 

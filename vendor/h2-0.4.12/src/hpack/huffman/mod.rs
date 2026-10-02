@@ -43,6 +43,23 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
 /// Validate and count the complete Huffman string before allocating output.
 /// The bounded path never reserves from the compressed length heuristic.
 pub fn decode_bounded(src: &[u8], max: usize) -> Result<bytes::Bytes, DecoderError> {
+    let len = decoded_length(src, max)?;
+    let mut output = Vec::with_capacity(len);
+    let mut decoder = Decoder::new();
+    for &b in src {
+        for nibble in [b >> 4, b & 0xf] {
+            if let Some(byte) = decoder.decode4(nibble)? {
+                output.push(byte);
+            }
+        }
+    }
+    debug_assert_eq!(output.len(), len);
+    debug_assert_eq!(output.capacity(), len);
+    Ok(bytes::Bytes::from(output))
+}
+
+/// Validate and count before acquiring an immutable field extent.
+pub(crate) fn decoded_length(src: &[u8], max: usize) -> Result<usize, DecoderError> {
     let mut decoder = Decoder::new();
     let mut len = 0usize;
     for &b in src {
@@ -58,18 +75,31 @@ pub fn decode_bounded(src: &[u8], max: usize) -> Result<bytes::Bytes, DecoderErr
     if !decoder.is_final() {
         return Err(DecoderError::InvalidHuffmanCode);
     }
-    let mut output = Vec::with_capacity(len);
+    Ok(len)
+}
+
+/// Decode directly into an already-claimed exact field extent.
+pub(crate) fn decode_into(src: &[u8], output: &mut [u8]) -> Result<(), DecoderError> {
     let mut decoder = Decoder::new();
+    let mut offset = 0;
     for &b in src {
         for nibble in [b >> 4, b & 0xf] {
             if let Some(byte) = decoder.decode4(nibble)? {
-                output.push(byte);
+                let slot = output
+                    .get_mut(offset)
+                    .ok_or(DecoderError::HeaderFieldTooLarge)?;
+                *slot = byte;
+                offset += 1;
             }
         }
     }
-    debug_assert_eq!(output.len(), len);
-    debug_assert_eq!(output.capacity(), len);
-    Ok(bytes::Bytes::from(output))
+    if !decoder.is_final() {
+        return Err(DecoderError::InvalidHuffmanCode);
+    }
+    if offset != output.len() {
+        return Err(DecoderError::HeaderFieldTooLarge);
+    }
+    Ok(())
 }
 
 pub fn encode<B: BufMut>(src: &[u8], dst: &mut B) {

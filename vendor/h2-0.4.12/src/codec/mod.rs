@@ -5,6 +5,7 @@ mod framed_write;
 pub use self::error::{SendError, UserError};
 
 use self::framed_read::FramedRead;
+pub(crate) use self::framed_read::HeaderBuffers;
 use self::framed_write::FramedWrite;
 
 use crate::frame::{self, Data, Frame};
@@ -41,12 +42,15 @@ where
         receive: Option<crate::receive_frame::BoundFrameBuffer>,
         send: Option<crate::send_frame_buffer::BoundSendFrameBuffer>,
         max_frame: usize,
+        headers: Option<HeaderBuffers>,
     ) -> Self {
         // Construct the selected writer directly: no ungranted temporary
         // default write Vec precedes the fixed buffer.
         let framed_write = FramedWrite::with_send_frame_buffer(io, send);
         let inner = match receive {
-            Some(buffer) => FramedRead::with_receive_frame_buffer(framed_write, buffer, max_frame),
+            Some(buffer) => {
+                FramedRead::with_receive_frame_buffer(framed_write, buffer, max_frame, headers)
+            }
             None => {
                 let delimited = length_delimited::Builder::new()
                     .big_endian()
@@ -55,7 +59,7 @@ where
                     .num_skip(0)
                     .max_frame_length(max_frame)
                     .new_read(framed_write);
-                FramedRead::new(delimited)
+                FramedRead::with_headers(delimited, headers)
             }
         };
         Codec { inner }
@@ -95,13 +99,6 @@ impl<T, B> Codec<T, B> {
 
     pub(crate) fn set_goaway_pool(&mut self, pool: crate::ReceiveBufferPool) {
         self.inner.set_goaway_pool(pool);
-    }
-
-    pub(crate) fn set_receive_header_block_buffer(
-        &mut self,
-        buffer: crate::receive_header::BoundHeaderBlockBuffer,
-    ) {
-        self.inner.set_header_buffer(buffer);
     }
 
     /// Updates the max received frame size.

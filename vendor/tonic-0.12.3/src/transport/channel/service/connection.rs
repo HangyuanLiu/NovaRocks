@@ -73,6 +73,7 @@ impl Connection {
             endpoint.executor.clone(),
             settings,
             endpoint.http2_connection_factory.clone(),
+            endpoint.http2_max_header_list_size,
         );
 
         let conn = Reconnect::new(make_service, endpoint.uri.clone(), is_lazy);
@@ -162,6 +163,7 @@ struct MakeSendRequestService<C> {
     executor: SharedExec,
     settings: Builder<SharedExec>,
     factory: Option<Http2ConnectionFactory>,
+    inherited_max_header_list_size: Option<u32>,
 }
 
 impl<C> MakeSendRequestService<C> {
@@ -170,12 +172,14 @@ impl<C> MakeSendRequestService<C> {
         executor: SharedExec,
         settings: Builder<SharedExec>,
         factory: Option<Http2ConnectionFactory>,
+        inherited_max_header_list_size: Option<u32>,
     ) -> Self {
         Self {
             connector,
             executor,
             settings,
             factory,
+            inherited_max_header_list_size,
         }
     }
 }
@@ -198,8 +202,11 @@ where
     fn call(&mut self, req: Uri) -> Self::Future {
         let mut builder = self.settings.clone();
         if let Some(factory) = &self.factory {
-            let configured =
-                factory().and_then(|config| config.apply(&mut builder).map_err(Into::into));
+            let configured = factory().and_then(|config| {
+                config
+                    .apply(&mut builder, self.inherited_max_header_list_size)
+                    .map_err(Into::into)
+            });
             if let Err(error) = configured {
                 // No dial future or handshake is created on factory refusal.
                 return Box::pin(async move { Err(error) });

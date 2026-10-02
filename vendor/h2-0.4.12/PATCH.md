@@ -111,3 +111,27 @@ Pseudo-header conversion and error rules remain shared and unchanged. This is
 an ownership-preserving seam, not proof that the original decoded plain/Huffman
 string allocations, table/HeaderMap storage, Method/Scheme metadata, Status or
 whole Native connection have been funded; those scopes remain open.
+
+## Original decoded-field arena
+
+The opt-in ReceiveHeaderFieldPool uses a fixed aggregate byte arena and atomic
+64-byte extent map, with a separately bounded number of simultaneous owner
+wrappers. Its checked original allocation bound includes arena, extent map,
+Core/Arc and every possible Bytes wrapper. No per-field maximum-sized Vec or
+implicit Mutex allocation is used. Checkout is nonwaiting, including reentry;
+fragmentation/capacity/position refusal is a connection decode error, with no
+heap fallback. The final Bytes wrapper exits before its extent/position returns;
+all fields and clones retain the original pool until physical exit.
+
+Both builders require fixed raw and encoded input, a valid explicit block
+maximum and explicit header-list cap fitting the pool's single-field maximum.
+The selected FramedRead constructs a bounded Decoder directly, before legacy
+4096-byte scratch allocation. Plain fields copy directly to claimed extents.
+Pooled Huffman markers validate/count without output allocation; both name/value
+markers and their combined field bound pass before either checkout. The existing
+Huffman state table decodes into the exact claimed slice. NeedMore does not
+acquire a pooled field. Existing default owned decoding is unchanged.
+
+This covers original decoded string backing and wrappers only. Dynamic table
+storage, HeaderMap containers, Method/Scheme/Status and complete connection
+metadata remain independently required; Native has not installed this profile.

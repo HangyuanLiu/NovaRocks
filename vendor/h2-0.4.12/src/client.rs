@@ -332,6 +332,7 @@ pub struct Builder {
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
     receive_header_block_buffer: Option<crate::ReceiveHeaderBlockBuffer>,
+    receive_header_field_pool: Option<crate::ReceiveHeaderFieldPool>,
     receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams to keep at a time.
@@ -674,6 +675,7 @@ impl Builder {
             receive_buffer_pool: None,
             receive_frame_buffer: None,
             receive_header_block_buffer: None,
+            receive_header_field_pool: None,
             receive_goaway_buffer_pool: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
@@ -1208,6 +1210,14 @@ impl Builder {
         self
     }
 
+    /// Original aggregate backing for decoded plain/Huffman fields.
+    /// Requires fixed raw/encoded input and an explicit fitting header-list
+    /// maximum. Exhaustion fails decoding without waiting or heap fallback.
+    pub fn receive_header_field_pool(&mut self, pool: crate::ReceiveHeaderFieldPool) -> &mut Self {
+        self.receive_header_field_pool = Some(pool);
+        self
+    }
+
     /// Supply fixed retained DATA backing owned through its last Bytes alias.
     /// One pool binds once to one connection. A reused pool or a local receive
     /// frame maximum exceeding its buffer size is refused before handshake I/O.
@@ -1449,6 +1459,16 @@ where
         mut io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
+        if let Some(pool) = &builder.receive_header_field_pool {
+            if builder.receive_header_block_buffer.is_none()
+                || builder
+                    .settings
+                    .max_header_list_size()
+                    .is_none_or(|max| max < 32 || pool.max_field_bytes() < max as usize - 32)
+            {
+                return Err(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header field pool requires fixed encoded input and an explicit fitting header-list maximum")));
+            }
+        }
         if let Some(buffer) = &builder.receive_header_block_buffer {
             let max = builder.max_receive_header_block_size;
             if builder.receive_frame_buffer.is_none()
@@ -1493,6 +1513,12 @@ where
             })
             .transpose()
             .map_err(crate::Error::from_io)?;
+        let receive_field_pool = builder
+            .receive_header_field_pool
+            .as_ref()
+            .map(crate::ReceiveHeaderFieldPool::bind)
+            .transpose()
+            .map_err(crate::Error::from_io)?;
         let send_header_pool = builder
             .send_header_block_pool
             .as_ref()
@@ -1531,10 +1557,15 @@ where
             receive_frame_buffer,
             send_frame_buffer,
             builder.settings.max_frame_size().unwrap_or(16384) as usize,
+            receive_header_buffer.map(|encoded| crate::codec::HeaderBuffers {
+                encoded,
+                fields: receive_field_pool,
+                max_list: builder.settings.max_header_list_size().unwrap_or(16 << 20) as usize,
+                max_encoded: builder
+                    .max_receive_header_block_size
+                    .expect("validated header block maximum"),
+            }),
         );
-        if let Some(buffer) = receive_header_buffer {
-            codec.set_receive_header_block_buffer(buffer);
-        }
         codec.set_retain_data_payloads(builder.retain_data_payloads);
         if let Some(max) = builder.max_send_header_table_size {
             codec.set_max_send_header_table_size(max as usize);

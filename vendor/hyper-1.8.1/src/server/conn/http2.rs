@@ -348,6 +348,18 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Install original-funded fixed decoded header field backing.
+    ///
+    /// Requires fixed raw input, an encoded header buffer and an explicit block
+    /// maximum. The pool must cover the configured decoded header list minus
+    /// the field overhead. One pool binds once; exhaustion does not wait.
+    /// HeaderMap storage, HPACK tables and other connection owners are separate.
+    /// Default None preserves upstream behavior.
+    pub fn receive_header_field_pool(&mut self, pool: h2::ReceiveHeaderFieldPool) -> &mut Self {
+        self.h2_builder.receive_header_field_pool = Some(pool);
+        self
+    }
+
     /// Supplies fixed retained DATA backing through its final Bytes alias.
     /// The pool binds once to one connection and requires an explicit receive
     /// event limit. A cloned builder retains the same original pool owner.

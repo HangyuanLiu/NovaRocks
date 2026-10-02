@@ -36,6 +36,9 @@ pub struct Http2ConnectionConfig {
     pub receive_frame_buffer: Option<h2::ReceiveFrameBuffer>,
     /// Fresh original encoded input, requiring fixed raw input and block maximum.
     pub receive_header_block_buffer: Option<h2::ReceiveHeaderBlockBuffer>,
+    /// Fresh fixed decoded field backing, requiring raw/encoded input and a
+    /// block maximum. HeaderMap storage and dynamic tables remain separate.
+    pub receive_header_field_pool: Option<h2::ReceiveHeaderFieldPool>,
     /// Fresh fixed outbound storage and local frame cap; HPACK is separate.
     pub send_frame_buffer: Option<h2::SendFrameBuffer>,
     /// Fresh independent GOAWAY debug backing through the last error alias.
@@ -43,7 +46,11 @@ pub struct Http2ConnectionConfig {
 }
 
 impl Http2ConnectionConfig {
-    pub(crate) fn apply<E: Clone>(self, builder: &mut Builder<E>) -> io::Result<()> {
+    pub(crate) fn apply<E: Clone>(
+        self,
+        builder: &mut Builder<E>,
+        inherited_max_header_list_size: Option<u32>,
+    ) -> io::Result<()> {
         if self.send_header_block_pool.is_some() && self.max_send_header_table_size != Some(0) {
             return Err(invalid(
                 "per-connection send header block pool requires explicit max_send_header_table_size(0)",
@@ -58,6 +65,25 @@ impl Http2ConnectionConfig {
                 return Err(invalid("per-connection encoded header buffer requires fixed raw input and a valid explicit block maximum"));
             }
         }
+        let field_header_limit = if let Some(pool) = &self.receive_header_field_pool {
+            // Hyper's client default is 16 KiB. Endpoint settings are already
+            // installed on the base builder; an attempt override takes priority.
+            let max = self
+                .max_header_list_size
+                .or(inherited_max_header_list_size)
+                .unwrap_or(16384);
+            if self.receive_frame_buffer.is_none()
+                || self.receive_header_block_buffer.is_none()
+                || self.max_receive_header_block_size.is_none()
+                || max < 32
+                || pool.max_field_bytes() < (max as usize - 32)
+            {
+                return Err(invalid("per-connection header field pool requires fixed raw/encoded input, an explicit block maximum and sufficient decoded field capacity"));
+            }
+            Some(max)
+        } else {
+            None
+        };
         let max_frame = self.max_frame_size.unwrap_or(16384) as usize;
         if !(16384..=16777215).contains(&max_frame) {
             return Err(invalid("invalid per-connection HTTP/2 frame maximum"));
@@ -110,7 +136,7 @@ impl Http2ConnectionConfig {
         if let Some(max) = self.max_frame_size {
             builder.max_frame_size(max);
         }
-        if let Some(max) = self.max_header_list_size {
+        if let Some(max) = field_header_limit.or(self.max_header_list_size) {
             builder.max_header_list_size(max);
         }
         if let Some(max) = self.max_receive_header_block_size {
@@ -134,6 +160,9 @@ impl Http2ConnectionConfig {
         }
         if let Some(buffer) = self.receive_header_block_buffer {
             builder.receive_header_block_buffer(buffer);
+        }
+        if let Some(pool) = self.receive_header_field_pool {
+            builder.receive_header_field_pool(pool);
         }
         if let Some(raw) = self.receive_frame_buffer {
             builder.receive_frame_buffer(raw);

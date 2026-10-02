@@ -25,3 +25,10 @@ Http2ConnectionConfig also forwards send_header_block_pool for each physical att
 
 
 Http2ConnectionConfig also carries a fresh receive_header_block_buffer per physical attempt. apply validates fixed raw input, explicit positive encoded maximum and workspace capacity before any builder mutation or connector.call, then forwards the buffer. h2 separately enforces once binding before its preface. Encoded input original ownership is separate from decoded header/HPACK metadata, incoming table settings and complete Native connection funding.
+
+Each HTTP/2 connection factory attempt can provide fresh receive_header_field_pool
+backing. Before dialing, its fixed raw/encoded/block dependencies and effective
+header-list cap are checked. The attempt override takes priority over Endpoint's
+explicit cap, then Hyper's existing 16KiB default; the chosen cap is explicitly
+forwarded. A conflicting cap is rejected before a dial future. Default None and
+existing Status/metadata semantics are unchanged.

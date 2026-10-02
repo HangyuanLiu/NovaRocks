@@ -21,6 +21,7 @@ pub struct Decoder {
     buffer: BytesMut,
     max_field_size: Option<usize>,
     max_encoded_string_size: Option<usize>,
+    field_pool: Option<crate::ReceiveHeaderFieldPool>,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -37,6 +38,7 @@ pub enum DecoderError {
     InvalidMaxDynamicSize,
     IntegerOverflow,
     HeaderFieldTooLarge,
+    HeaderFieldPoolExhausted,
     NeedMore(NeedMore),
 }
 
@@ -149,6 +151,7 @@ struct StringMarker {
     offset: usize,
     len: usize,
     string: Option<Bytes>,
+    pooled_huffman_len: Option<usize>,
 }
 
 // ===== impl Decoder =====
@@ -163,6 +166,25 @@ impl Decoder {
             buffer: BytesMut::with_capacity(4096),
             max_field_size: None,
             max_encoded_string_size: None,
+            field_pool: None,
+        }
+    }
+
+    /// Select bounded decoding before any legacy scratch allocation.
+    pub(crate) fn new_bounded(
+        size: usize,
+        max: usize,
+        max_encoded: usize,
+        pool: Option<crate::ReceiveHeaderFieldPool>,
+    ) -> Self {
+        Self {
+            max_size_update: None,
+            last_max_update: size,
+            table: Table::new(size),
+            buffer: BytesMut::new(),
+            max_field_size: Some(max),
+            max_encoded_string_size: Some(max_encoded),
+            field_pool: pool,
         }
     }
 
@@ -324,8 +346,16 @@ impl Decoder {
             self.check_field_size(name_marker.decoded_len(), value_marker.decoded_len())?;
             buf.set_position(old_pos);
             // Read the name as a literal
-            let name = name_marker.consume(buf, self.max_field_size.is_some());
-            let value = value_marker.consume(buf, self.max_field_size.is_some());
+            let name = name_marker.consume(
+                buf,
+                self.max_field_size.is_some(),
+                self.field_pool.as_ref(),
+            )?;
+            let value = value_marker.consume(
+                buf,
+                self.max_field_size.is_some(),
+                self.field_pool.as_ref(),
+            )?;
             buf.make_header(name, value)
         } else {
             let e = self.table.get(table_idx)?;
@@ -333,7 +363,11 @@ impl Decoder {
             let value_marker = self.try_decode_string(buf)?;
             self.check_field_size(e.name().as_slice().len(), value_marker.decoded_len())?;
             buf.set_position(old_pos);
-            let value = value_marker.consume(buf, self.max_field_size.is_some());
+            let value = value_marker.consume(
+                buf,
+                self.max_field_size.is_some(),
+                self.field_pool.as_ref(),
+            )?;
 
             buf.make_indexed_header(e.name(), value)
         }
@@ -374,6 +408,19 @@ impl Decoder {
         if huff {
             let ret = {
                 let raw = &buf.chunk()[..len];
+                if self.field_pool.is_some() {
+                    let decoded = huffman::decoded_length(
+                        raw,
+                        self.max_field_size.unwrap().saturating_sub(32),
+                    )?;
+                    buf.advance(len);
+                    return Ok(StringMarker {
+                        offset,
+                        len,
+                        string: None,
+                        pooled_huffman_len: Some(decoded),
+                    });
+                }
                 let string = if let Some(max) = self.max_field_size {
                     huffman::decode_bounded(raw, max.saturating_sub(32))
                 } else {
@@ -383,6 +430,7 @@ impl Decoder {
                     offset,
                     len,
                     string: Some(string),
+                    pooled_huffman_len: None,
                 })
             };
 
@@ -394,6 +442,7 @@ impl Decoder {
                 offset,
                 len,
                 string: None,
+                pooled_huffman_len: None,
             })
         }
     }
@@ -403,7 +452,7 @@ impl Decoder {
         let old_pos = buf.position();
         let marker = self.try_decode_string(buf)?;
         buf.set_position(old_pos);
-        Ok(marker.consume(buf, self.max_field_size.is_some()))
+        marker.consume(buf, self.max_field_size.is_some(), None)
     }
 }
 
@@ -519,17 +568,32 @@ fn take(buf: &mut Cursor<&mut BytesMut>, n: usize) -> Bytes {
 
 impl StringMarker {
     fn decoded_len(&self) -> usize {
-        self.string.as_ref().map_or(self.len, Bytes::len)
+        self.pooled_huffman_len
+            .unwrap_or_else(|| self.string.as_ref().map_or(self.len, Bytes::len))
     }
 
-    fn consume<S: DecodeSource>(self, buf: &mut S, compact: bool) -> Bytes {
+    fn consume<S: DecodeSource>(
+        self,
+        buf: &mut S,
+        compact: bool,
+        pool: Option<&crate::ReceiveHeaderFieldPool>,
+    ) -> Result<Bytes, DecoderError> {
         buf.advance(self.offset);
+        if let Some(decoded) = self.pooled_huffman_len {
+            let output = pool
+                .expect("pooled Huffman marker")
+                .try_fill(decoded, |dst| {
+                    huffman::decode_into(&buf.chunk()[..self.len], dst)
+                })?;
+            buf.advance(self.len);
+            return Ok(output);
+        }
         match self.string {
             Some(string) => {
                 buf.advance(self.len);
-                string
+                Ok(string)
             }
-            None => buf.take_string(self.len, compact),
+            None => buf.take_string(self.len, compact, pool),
         }
     }
 }
@@ -549,7 +613,12 @@ pub(crate) trait DecodeSource: Buf {
     }
     fn position(&self) -> u64;
     fn set_position(&mut self, pos: u64);
-    fn take_string(&mut self, len: usize, compact: bool) -> Bytes;
+    fn take_string(
+        &mut self,
+        len: usize,
+        compact: bool,
+        pool: Option<&crate::ReceiveHeaderFieldPool>,
+    ) -> Result<Bytes, DecoderError>;
     fn commit(&mut self);
 }
 impl DecodeSource for Cursor<&mut BytesMut> {
@@ -559,13 +628,18 @@ impl DecodeSource for Cursor<&mut BytesMut> {
     fn set_position(&mut self, pos: u64) {
         Cursor::set_position(self, pos);
     }
-    fn take_string(&mut self, len: usize, compact: bool) -> Bytes {
+    fn take_string(
+        &mut self,
+        len: usize,
+        compact: bool,
+        _pool: Option<&crate::ReceiveHeaderFieldPool>,
+    ) -> Result<Bytes, DecoderError> {
         let value = take(self, len);
-        if compact {
+        Ok(if compact {
             Bytes::copy_from_slice(&value)
         } else {
             value
-        }
+        })
     }
     fn commit(&mut self) {
         take(self, 0);
@@ -615,10 +689,22 @@ impl DecodeSource for BorrowedSource<'_> {
     fn set_position(&mut self, pos: u64) {
         self.cursor.set_position(pos);
     }
-    fn take_string(&mut self, len: usize, _compact: bool) -> Bytes {
-        let value = Bytes::copy_from_slice(&self.chunk()[..len]);
+    fn take_string(
+        &mut self,
+        len: usize,
+        _compact: bool,
+        pool: Option<&crate::ReceiveHeaderFieldPool>,
+    ) -> Result<Bytes, DecoderError> {
+        let raw = &self.chunk()[..len];
+        let value = match pool {
+            Some(pool) => pool.try_fill(len, |dst| {
+                dst.copy_from_slice(raw);
+                Ok(())
+            })?,
+            None => Bytes::copy_from_slice(raw),
+        };
         self.advance(len);
-        value
+        Ok(value)
     }
     fn commit(&mut self) {
         self.committed = self.position() as usize;

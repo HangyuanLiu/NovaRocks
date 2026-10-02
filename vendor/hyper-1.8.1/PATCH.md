@@ -50,3 +50,8 @@ Both connection builders expose send_header_block_pool(h2::SendHeaderBlockPool),
 
 
 Both HTTP/2 builders and cloned h2 configs forward receive_header_block_buffer to h2. A fresh original fixed encoded input buffer is supplied per connection, independently of raw frame/DATA/GOAWAY/send owners; h2 validates fixed raw input and an explicit positive block maximum before binding/I/O. Default None preserves the owned decoder. Decoded HTTP/HPACK storage and complete Native profile remain separate.
+
+The additive receive_header_field_pool builder option is cloned and forwarded
+on both H2 directions. It preserves the existing explicit Hyper header-list
+limits and leaves HeaderMap/framework allocations separate. Default None does
+not install a pool.

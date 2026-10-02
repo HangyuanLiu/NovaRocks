@@ -261,6 +261,7 @@ pub struct Builder {
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
     receive_header_block_buffer: Option<crate::ReceiveHeaderBlockBuffer>,
+    receive_header_field_pool: Option<crate::ReceiveHeaderFieldPool>,
     receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams due to protocol error across
@@ -391,6 +392,17 @@ where
         let span = tracing::trace_span!("server_handshake");
         let entered = span.enter();
 
+        if let Some(pool) = &builder.receive_header_field_pool {
+            if builder.receive_header_block_buffer.is_none()
+                || builder
+                    .settings
+                    .max_header_list_size()
+                    .is_none_or(|max| max < 32 || pool.max_field_bytes() < max as usize - 32)
+            {
+                drop(entered);
+                return Handshake { builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header field pool requires fixed encoded input and an explicit fitting header-list maximum")))), span };
+            }
+        }
         if let Some(buffer) = &builder.receive_header_block_buffer {
             let max = builder.max_receive_header_block_size;
             if builder.receive_frame_buffer.is_none()
@@ -436,6 +448,22 @@ where
             .transpose()
         {
             Ok(buffer) => buffer,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
+        let receive_field_pool = match builder
+            .receive_header_field_pool
+            .as_ref()
+            .map(crate::ReceiveHeaderFieldPool::bind)
+            .transpose()
+        {
+            Ok(pool) => pool,
             Err(error) => {
                 drop(entered);
                 return Handshake {
@@ -531,10 +559,15 @@ where
             receive_frame_buffer,
             send_frame_buffer,
             builder.settings.max_frame_size().unwrap_or(16384) as usize,
+            receive_header_buffer.map(|encoded| crate::codec::HeaderBuffers {
+                encoded,
+                fields: receive_field_pool,
+                max_list: builder.settings.max_header_list_size().unwrap_or(16 << 20) as usize,
+                max_encoded: builder
+                    .max_receive_header_block_size
+                    .expect("validated header block maximum"),
+            }),
         );
-        if let Some(buffer) = receive_header_buffer {
-            codec.set_receive_header_block_buffer(buffer);
-        }
         codec.set_retain_data_payloads(builder.retain_data_payloads);
         if let Some(max) = builder.max_send_header_table_size {
             codec.set_max_send_header_table_size(max as usize);
@@ -835,6 +868,7 @@ impl Builder {
             receive_buffer_pool: None,
             receive_frame_buffer: None,
             receive_header_block_buffer: None,
+            receive_header_field_pool: None,
             receive_goaway_buffer_pool: None,
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
@@ -1261,6 +1295,14 @@ impl Builder {
         buffer: crate::ReceiveHeaderBlockBuffer,
     ) -> &mut Self {
         self.receive_header_block_buffer = Some(buffer);
+        self
+    }
+
+    /// Original aggregate backing for decoded plain/Huffman fields.
+    /// Requires fixed raw/encoded input and an explicit fitting header-list
+    /// maximum. Exhaustion fails decoding without waiting or heap fallback.
+    pub fn receive_header_field_pool(&mut self, pool: crate::ReceiveHeaderFieldPool) -> &mut Self {
+        self.receive_header_field_pool = Some(pool);
         self
     }
 
