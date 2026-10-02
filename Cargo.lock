@@ -3992,6 +3992,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-memory-attribution-bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "novarocks-memory",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
+]
+
+[[package]]
 name = "novarocks-mv-application"
 version = "0.1.0"
 dependencies = [
