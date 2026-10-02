@@ -1,0 +1,444 @@
+{
+  "parent_commit": "84b0a4cb137e1951d5e3d8fa1d5f657bed522b5f",
+  "scope": "P04 fresh zero outbound HPACK dynamic table; Native integration and complete connection envelope remain open",
+  "workspace_nonduplicate_tests": 962,
+  "protocol_tests": 75,
+  "native_lib_tests": 574,
+  "worker_lib_tests": 313,
+  "private_ordinary_tests": 35,
+  "private_ignored_tests": 1,
+  "new_private_tests": 7,
+  "miri_new_tests": 7,
+  "negative_mutation_classes": 5,
+  "logs_and_diffs": [
+    {
+      "path": "clippy.log.gz",
+      "raw_sha256": "2eda1dd1e1cdf576594ea456e47335caa6fb787c8044bb184ea9ebe6b5309a41",
+      "gzip_sha256": "ec69f44999ffb6ee4671b317d913caeb623b3a5c151e926549ee7a4e49a72a73"
+    },
+    {
+      "path": "final-run.log.gz",
+      "raw_sha256": "c4783e4d2510fdf80e3fd9c5f7fdd35ecbc0f676b24a153e14de6be79821b424",
+      "gzip_sha256": "727a39070fbbf9916e6d8fa98b4813d0f24ed7465652dd133a8587c5f0e052c1"
+    },
+    {
+      "path": "first-all-and-mutant.log.gz",
+      "raw_sha256": "300c44cc17d85b2808172384863009a3e22f6213f32959cfb88cc7c321217fc9",
+      "gzip_sha256": "df50ea59c0e5b69c04a7a93ea039dc5cfd1fa88bb7f52b1cd1ceddbbf4c2811d"
+    },
+    {
+      "path": "first-seven.log.gz",
+      "raw_sha256": "ace83017efd2bb627996994f5d8edabf953bb0f06a30501dc2cfdcb8b5ddacaf",
+      "gzip_sha256": "d3f56506c174e4036b1298be192d72e0651c9d433bb4654145b8879eead5c41f"
+    },
+    {
+      "path": "isolated-fmt.log.gz",
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "miri-seven.log.gz",
+      "raw_sha256": "bde80278e3816f6c099478ccb1999bc1cdbeb27c9fa39fe95b04454b08a1394f",
+      "gzip_sha256": "ac1b43cda7cef517f816f212613ce429a43f4dfa7cd1f56a6024f53d66c2c037"
+    },
+    {
+      "path": "omit-local-clamp.log.gz",
+      "raw_sha256": "be63219a055f3c3a25bbee372796602e7ec76ac41e486b8fc956bba32c401718",
+      "gzip_sha256": "41d6e7fc47e385c8991c56f8aa59cc09eecfc0d5d74cd9e76d55ce0d26a4a0d8"
+    },
+    {
+      "path": "ordinary.log.gz",
+      "raw_sha256": "e5bbaa75c31ae4a247223d29fbf038034b81f15ffd5bd46e8bc799faadd88ccf",
+      "gzip_sha256": "e50a3162ab0490ee79508b61168c509b6345a92e561e7685001b7598843ced20"
+    },
+    {
+      "path": "probe-fmt.log.gz",
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "restored-ordinary.log.gz",
+      "raw_sha256": "476983fb54158ae0eff34ef22e74ce02ad09beef65fc23a2b39338f7aefca035",
+      "gzip_sha256": "bdb42bafd5d840486daa816fd6134a17d363335e94f5e96e67dac360bd3c2195"
+    },
+    {
+      "path": "v3-quality-wrapper-fmt-failure.log.gz",
+      "raw_sha256": "45e5d632c6d25c1f4f579684c0c3267a71f8555cc4555138cf2f8fd8b4c2e424",
+      "gzip_sha256": "a67dda57ff4e0928462b7c7eecde0218b7b62b0052ef4fdc163e1383fb4583d5"
+    },
+    {
+      "path": "omit-local-clamp.diff.gz",
+      "raw_sha256": "b281d183bafb83988eb625f7c4912972610540def687c93e15ea2db5fcccde1c",
+      "gzip_sha256": "1f388618144f4070aba8d8c35e0f73d18bea067b20f65c70f044e2dfc66f57bc"
+    },
+    {
+      "path": "logs/m07-send-header-table-check-fields-restored.log.gz",
+      "raw_sha256": "834815f2dc193f1e4a581d570148ecad72fa7f8ed16b157b8ed00fffce87897c",
+      "gzip_sha256": "7ee3840179d84bfb738c6f7198fb3af83d9b5ccd49eea8624dce2996249d78c5"
+    },
+    {
+      "path": "logs/m07-send-header-table-check-restored.log.gz",
+      "raw_sha256": "284d2e77d19dbb39af9de64ea7a5507ea84f263925ccb42e2df3288764707c34",
+      "gzip_sha256": "3148cfbb5319566c059fc69f56200beda9eb15fb22b61b26d7350e702229df91"
+    },
+    {
+      "path": "logs/m07-send-header-table-check.log.gz",
+      "raw_sha256": "8e3e928d43b2333b9c2e392497402f665caf7b802e6970dbf6bc1aef8d717f13",
+      "gzip_sha256": "133ba47fd145164472168e0b8f1713b0750e0af0d74d9100a6a5c1ea822939aa"
+    },
+    {
+      "path": "logs/m07-send-header-table-existing-protocol.log.gz",
+      "raw_sha256": "2ab0314fcce7ae334b98c3e37778eb8e7c7fe7760c5da02e14c17710576f0ac6",
+      "gzip_sha256": "3ae7178ae52a4efb0d9747fc4d5d317eafb6d2319a6951455ab50ee5bc58d64f"
+    },
+    {
+      "path": "logs/m07-send-header-table-final-protocol.log.gz",
+      "raw_sha256": "38c89ac332342575ab8ce88172690790784509f58ca2fe29d4d4c185a3273e00",
+      "gzip_sha256": "ad608c1956fe0a1af4a2eaeefd1c024b3d9790e44ad08f24e73054489b4b1ae4"
+    },
+    {
+      "path": "logs/m07-send-header-table-fixture.log.gz",
+      "raw_sha256": "e1c1af09ee2f617bd909384c2f1c2ac946b29a5997b1dacef656b6e61e1a7bda",
+      "gzip_sha256": "bedaace6d0e1942256e3a895325fc84dcb2d83d8ee6476915b32621f0eff250d"
+    },
+    {
+      "path": "logs/m07-send-header-table-libs.log.gz",
+      "raw_sha256": "1975768aa957aba17308c80f411f9614f081756133b519bd75ad12a36c1cf11b",
+      "gzip_sha256": "9dc265b0ae6b22f048de7ae6b1a14a625d7cd26d485728823119b4fa868cc94a"
+    },
+    {
+      "path": "logs/m07-send-header-table-main-replay.log.gz",
+      "raw_sha256": "c43e22d9ddf972cbd22d431aeba7bb372d1e71a1dca2b23f04f672acf2b7fab5",
+      "gzip_sha256": "e54651a204fe004f8c1800e6cf3d46387dd887dbc5b1a8c6188c78025876a2b9"
+    },
+    {
+      "path": "logs/m07-send-header-table-mutant-replay.log.gz",
+      "raw_sha256": "38d5ace36026ef45b00061e976093c57f663d7ae35c26181f994f8cd980412fd",
+      "gzip_sha256": "15b4a1cb5a89e6c9491ef475be92a6d71b72df3a90434e2d340a476c022d1d40"
+    },
+    {
+      "path": "logs/m07-send-header-table-native-clippy.log.gz",
+      "raw_sha256": "cb35f9882f3fa13866feb99fa0c21baabee818614636ec6546339e7c4c175340",
+      "gzip_sha256": "1858c1701482c68e3539c2e2dbe3004f5b7dc07a57cf26f0e3ef8b9c5b951789"
+    },
+    {
+      "path": "logs/m07-send-header-table-negative-hyper-client.log.gz",
+      "raw_sha256": "df333a066c0c4dd10708e0aacdf6610a525effd7f663649219681c4480422df4",
+      "gzip_sha256": "b65757f44d2a95c7c0488e44cf0efe18750e869518fcdf6a0ef58c1c8d1e8d82"
+    },
+    {
+      "path": "logs/m07-send-header-table-negative-hyper-server.log.gz",
+      "raw_sha256": "f2e32ad019667a1a1748150c3248021fea57e8510aa305175729f836e23ddcdc",
+      "gzip_sha256": "e3c08aeb310442889dc0b0759a8cc70a63a56b6f5be13931a70a6d24b504748a"
+    },
+    {
+      "path": "logs/m07-send-header-table-negative-initial-update.log.gz",
+      "raw_sha256": "a7895146aabf73749eff767989e1d6bcfc3b2944d1ec9da6de361976c3655095",
+      "gzip_sha256": "44bc1fbe528ec93c8b38b5813c46d0e2090120e7598700f67a880bec44e28f9f"
+    },
+    {
+      "path": "logs/m07-send-header-table-negative-restored.log.gz",
+      "raw_sha256": "8a82670a56d07e048eb12aa879cc5bfde69f396aee12832b7e3aeae25e61b66e",
+      "gzip_sha256": "cef508a877e9f46f56a0fdd9dcee4b892534869afef20a81a92744b5e1386c0e"
+    },
+    {
+      "path": "logs/m07-send-header-table-negative-tonic.log.gz",
+      "raw_sha256": "602b41678eee6991a6a0cc314ba2fc3bdaefef64bd403f3da603028af730c521",
+      "gzip_sha256": "f4fa6a2b9f3de0bc5428881e77cb675e6f0d72f9e8d6615433e72fdb06529d85"
+    },
+    {
+      "path": "logs/m07-send-header-table-probe-final.log.gz",
+      "raw_sha256": "300c44cc17d85b2808172384863009a3e22f6213f32959cfb88cc7c321217fc9",
+      "gzip_sha256": "df50ea59c0e5b69c04a7a93ea039dc5cfd1fa88bb7f52b1cd1ceddbbf4c2811d"
+    },
+    {
+      "path": "logs/m07-send-header-table-probe-v1.log.gz",
+      "raw_sha256": "ace83017efd2bb627996994f5d8edabf953bb0f06a30501dc2cfdcb8b5ddacaf",
+      "gzip_sha256": "d3f56506c174e4036b1298be192d72e0651c9d433bb4654145b8879eead5c41f"
+    },
+    {
+      "path": "logs/m07-send-header-table-probe-v3.log.gz",
+      "raw_sha256": "45e5d632c6d25c1f4f579684c0c3267a71f8555cc4555138cf2f8fd8b4c2e424",
+      "gzip_sha256": "a67dda57ff4e0928462b7c7eecde0218b7b62b0052ef4fdc163e1383fb4583d5"
+    },
+    {
+      "path": "logs/m07-send-header-table-probe-v4.log.gz",
+      "raw_sha256": "c4783e4d2510fdf80e3fd9c5f7fdd35ecbc0f676b24a153e14de6be79821b424",
+      "gzip_sha256": "727a39070fbbf9916e6d8fa98b4813d0f24ed7465652dd133a8587c5f0e052c1"
+    },
+    {
+      "path": "logs/m07-send-header-table-root-fmt.log.gz",
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "logs/m07-send-header-table-tonic-wire.log.gz",
+      "raw_sha256": "779997102e12b29077a529404224e10892a19121b05370afb399d6e17ea0a9c4",
+      "gzip_sha256": "f91a39a19f6cb8a00e569c53243b92e8272a6fa1ca97b9b3f7256d9fdea7c07b"
+    },
+    {
+      "path": "logs/m07-send-header-table-vendor-clippy.log.gz",
+      "raw_sha256": "153d6f378ca23af55b4018e0a37cc4ad4ee8a2a73bacec1e55bea20363df7c90",
+      "gzip_sha256": "e886768a2f1e684ac1646325ecd1720646fa11cab9c59316c775c9cbcfd29177"
+    },
+    {
+      "path": "logs/m07-send-header-table-vendor-fmt.log.gz",
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "logs/m07-send-header-table-workspace-check.log.gz",
+      "raw_sha256": "9f76a577670516ca21b1fc1a4c765951c166b78cef9384cb7f73c5a018946fd1",
+      "gzip_sha256": "6ba97568ef5bafff481d59a0a9c88a72f584056fa37063f14cd0436f226478ce"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-final-test.log.gz",
+      "raw_sha256": "cfc0ef01eddff99f9710062b748f8281293dedca1fb037df6289478df8cf7db6",
+      "gzip_sha256": "0f37ff9d2a87c8ee74d420f4ec9e154f575e9ba73a1feaef0373706ef64cedf9"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-first-clippy.log.gz",
+      "raw_sha256": "0811f6d537a57d19bbdcd03d6e29b46efcabefbbdbc858a980310cf6716628d9",
+      "gzip_sha256": "5f786e3c90e1e9531deb664117162d28cf82e577c85d7aba3996c021c2ed6f2b"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-first-test.log.gz",
+      "raw_sha256": "1809256ee1488a1368a6709c948f0a4a0f770760183b3e984c73b75d4d499d1e",
+      "gzip_sha256": "38fb153216124a4b6a6f313d55546940e0ec66947d2a7548e1d802b7c785b92e"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-no-deps-clippy.log.gz",
+      "raw_sha256": "4febf85bfe010ba13f174857d273496b5bbfa918a77459f5f9c495bda1c104ac",
+      "gzip_sha256": "5272a2ab61324107dfcdc0bb24688e82c240ed1906b7cd27224344561c89995d"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-rerun1-test.log.gz",
+      "raw_sha256": "7727b50e523053594aadc282619e507aa9e60ce904bc04ea3bf3e2bfbc3b02c2",
+      "gzip_sha256": "1b5efed23bf527e3b16a8847039da3926ef633fb2dc6fa3b427eeb30b69fa9fa"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-rerun2-test.log.gz",
+      "raw_sha256": "fc6e541d3db5243e621d6a08a45c2fd1293683be7ecaabc66ee79d2c41b999d6",
+      "gzip_sha256": "6c6fe2a6b964a9386e9b21670fa7642ab13b58804524c1e5a2fa5c3577a248b6"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-target-clippy-rerun1.log.gz",
+      "raw_sha256": "83507265d8f02414cfecf0801e1aced28ba8db92d2cbae5aa96694b032d632e6",
+      "gzip_sha256": "d1b4ef5a324d214467ab94f1eecc4f92e3c01557d04ac88d1169fccc5e44f3ff"
+    },
+    {
+      "path": "logs/m07-h2-send-header-table-target-clippy.log.gz",
+      "raw_sha256": "f00a1074d91abe1711593f9fbd7e9d49db4bb00ee1924b39e99fe1272f434d62",
+      "gzip_sha256": "6c09102e65ce4f678db1fc1afeaeb797a31817d48a45b9060f3b27c16638721a"
+    },
+    {
+      "path": "mutants/m07-send-header-table-negative-hyper-client.diff.gz",
+      "raw_sha256": "eeecc3889caa3037812971baec166696bbc3e818298125728a508a54256c62b8",
+      "gzip_sha256": "b89ee4b4e0e74605f8daa07f2e41fed116f7b04980cc6f5665d50b642b147eed"
+    },
+    {
+      "path": "mutants/m07-send-header-table-negative-hyper-server.diff.gz",
+      "raw_sha256": "332dc1ced26752c49ec5905547d3b36aba7fe8b59c2c2b464e6ccd01a65cf772",
+      "gzip_sha256": "c349a1d3ba23fd41d72596afb53a92e243726f50bd9db1e53d23204169275aff"
+    },
+    {
+      "path": "mutants/m07-send-header-table-negative-initial-update.diff.gz",
+      "raw_sha256": "5013cc4929be1ce3c8b0bfde447ce5f80bf5758d5606b8eb8e46ca1df0d819cd",
+      "gzip_sha256": "f3ccccc27c0f096ef81eb26b79900a2667f127a761c9c4ac3e169a84a2a27747"
+    },
+    {
+      "path": "mutants/m07-send-header-table-negative-tonic.diff.gz",
+      "raw_sha256": "76e29ade592146d9d70f1a2eec761d5a0e5b58055b74dc9d1504d428f2550c88",
+      "gzip_sha256": "1aaa7a703f16fc54436d67c9f7a6c41afea029a934f844f39a92254ab7911c73"
+    },
+    {
+      "path": "logs/m07-send-header-table-document-scan.log.gz",
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    }
+  ],
+  "commands": [
+    {
+      "path": "logs/m07-send-header-table-final-protocol.log.gz",
+      "command": "All actual H2/Hyper/Tonic targets with production lock --offline --locked --test-threads=1",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-libs.log.gz",
+      "command": "cargo test -p novarocks-native-adapter -p novarocks-worker --lib --offline -- --test-threads=1",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-native-clippy.log.gz",
+      "command": "cargo clippy -p novarocks-native-adapter --all-targets --offline",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-vendor-clippy.log.gz",
+      "command": "cargo clippy -p h2 -p hyper -p tonic --lib --offline -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-workspace-check.log.gz",
+      "command": "cargo check --workspace --all-targets --offline",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-main-replay.log.gz",
+      "command": "reproduce.py --negative-local-clamp --quality --miri",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-mutant-replay.log.gz",
+      "command": "Executed shared-source mutant runner; source restored byteexact",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-root-fmt.log.gz",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-vendor-fmt.log.gz",
+      "command": "rustfmt changed vendor sources --edition 2021 --config skip_children=true --check",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-fixture.log.gz",
+      "command": "DOCKER_CONTEXT=desktop-linux docker/fixture-inputs/verify.sh",
+      "exit_code": 0
+    },
+    {
+      "path": "logs/m07-send-header-table-document-scan.log.gz",
+      "command": "Actual repository documentation reference scan, no matches",
+      "exit_code": 1
+    }
+  ],
+  "source_hashes": {
+    "Cargo.lock": "304e9295831d5b83e34241e10c308e4dc7da221d3061a9c48a18b03ff9bba188",
+    "Cargo.toml": "9e2aea3d19cc4c32821730441c1e4c767d21f36c2c1dc78f345ea3ec24a303d3",
+    "novarocks/native-adapter/tests/native_h2_send_header_table_limit.rs": "f5ec6227dfe2ed22c9b36c1f234e4928939d8b81482bee8be20678775c0a8b13",
+    "novarocks/native-adapter/tests/native_tonic_connection_factory.rs": "6211bf065a8be5dd77227864bfa90593f8a1e7c76943b11143103cd900f4ad6f",
+    "vendor/h2-0.4.12/PATCH.md": "6c872c49e98b8eb5a50c2c24ad7386ec1ec06f862339d333239b1092a9b448b3",
+    "vendor/h2-0.4.12/src/client.rs": "1d2edc6cc812331a4a22d8e7ef33f390e3d7c9bc5213165a5edcc5eec0c0bbc0",
+    "vendor/h2-0.4.12/src/codec/framed_write.rs": "35e6325f2effaecf8da2b6dcfccc9c5a3e78db213e71c9cceed33091a18ed6c8",
+    "vendor/h2-0.4.12/src/codec/mod.rs": "42b98a6a1710cdbb9ec934befc32edeb79520433ff13270cdaab2de157b80b7c",
+    "vendor/h2-0.4.12/src/hpack/encoder.rs": "9502a2f1b6b3941dbc77f72cb45ebe6d657e1f9f1fec7f798b22d3096f17b714",
+    "vendor/h2-0.4.12/src/server.rs": "6e26e15a8a2577c1bc2b68f87721f1cf845b586a71d811dec6957f6e591d90ea",
+    "vendor/hyper-1.8.1/PATCH.md": "23a011132a2c7c6d2b5d27b29644b299c07f718cc969424c3be7d3570544bb39",
+    "vendor/hyper-1.8.1/src/client/conn/http2.rs": "98ae63cf1480d1e5046ab2778a3872e0adefa98e93ba203b046f57e6a0518b5e",
+    "vendor/hyper-1.8.1/src/proto/h2/client.rs": "9bec1c214200f2bd9f0f7eb2bd4ad8668b6cee226f04f303b4c4416d14df6500",
+    "vendor/hyper-1.8.1/src/proto/h2/server.rs": "d3672fb025e63aa940e4c6798215e36b476657141dacbfd8666d38904118103f",
+    "vendor/hyper-1.8.1/src/server/conn/http2.rs": "f23232a6b91082d0a8bbc5591e21d6976f88b135bacd53b12912e91fb3e6e009",
+    "vendor/tonic-0.12.3/PATCH.md": "b82efb320de2bbdee4f3e6758418afadf5fba195e9f470090719d1aa59ef408d",
+    "vendor/tonic-0.12.3/src/transport/channel/http2_connection.rs": "469e674abaad44e84f3a1d178232304e858f1b3555c90b26ac954a09995a06c5"
+  },
+  "upstream": {
+    "h2-0.4.12": {
+      "registry_checksum": "f3c0b69cfcb4e1b9f1bf2f53f95f766e4661169728ec61cd3fe5a0166f2d1386",
+      "verified_original_files": 66,
+      "modified_originals": [
+        "src/client.rs",
+        "src/codec/framed_read.rs",
+        "src/codec/framed_write.rs",
+        "src/codec/mod.rs",
+        "src/frame/go_away.rs",
+        "src/hpack/decoder.rs",
+        "src/hpack/encoder.rs",
+        "src/hpack/huffman/mod.rs",
+        "src/lib.rs",
+        "src/proto/connection.rs",
+        "src/proto/go_away.rs",
+        "src/proto/streams/buffer.rs",
+        "src/proto/streams/mod.rs",
+        "src/proto/streams/recv.rs",
+        "src/proto/streams/streams.rs",
+        "src/server.rs"
+      ]
+    },
+    "hyper-1.8.1": {
+      "registry_checksum": "2ab2d4f250c3d7b1c9fcdff1cece94ea4e2dfbec68614f7b87cb205f24ca9d11",
+      "verified_original_files": 68,
+      "modified_originals": [
+        "src/client/conn/http2.rs",
+        "src/proto/h2/client.rs",
+        "src/proto/h2/server.rs",
+        "src/server/conn/http2.rs"
+      ]
+    },
+    "tonic-0.12.3": {
+      "registry_checksum": "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52",
+      "verified_original_files": 73,
+      "modified_originals": [
+        "Cargo.toml",
+        "src/transport/channel/endpoint.rs",
+        "src/transport/channel/mod.rs",
+        "src/transport/channel/service/connection.rs",
+        "src/transport/mod.rs"
+      ]
+    }
+  },
+  "artifact_hashes": {
+    "README.md": "616e2d1f45baacf305053b62739871055dacf45788a07db6883803d1f1e9dce9",
+    "clippy.log.gz": "ec69f44999ffb6ee4671b317d913caeb623b3a5c151e926549ee7a4e49a72a73",
+    "final-run.log.gz": "727a39070fbbf9916e6d8fa98b4813d0f24ed7465652dd133a8587c5f0e052c1",
+    "first-all-and-mutant.log.gz": "df50ea59c0e5b69c04a7a93ea039dc5cfd1fa88bb7f52b1cd1ceddbbf4c2811d",
+    "first-seven.log.gz": "d3f56506c174e4036b1298be192d72e0651c9d433bb4654145b8879eead5c41f",
+    "h2-0.4.12.patch.gz": "893959465db7838df8e05a084cecdf32fceb30af44697c41719cca0591c06c53",
+    "hyper-1.8.1.patch.gz": "8554660ca9226cbd26f9f9524ffa933e1307ba76457eaa11803f5461e8bdbf44",
+    "isolated-fmt.log.gz": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+    "logs/m07-h2-send-header-table-final-test.log.gz": "0f37ff9d2a87c8ee74d420f4ec9e154f575e9ba73a1feaef0373706ef64cedf9",
+    "logs/m07-h2-send-header-table-first-clippy.log.gz": "5f786e3c90e1e9531deb664117162d28cf82e577c85d7aba3996c021c2ed6f2b",
+    "logs/m07-h2-send-header-table-first-test.log.gz": "38fb153216124a4b6a6f313d55546940e0ec66947d2a7548e1d802b7c785b92e",
+    "logs/m07-h2-send-header-table-no-deps-clippy.log.gz": "5272a2ab61324107dfcdc0bb24688e82c240ed1906b7cd27224344561c89995d",
+    "logs/m07-h2-send-header-table-rerun1-test.log.gz": "1b5efed23bf527e3b16a8847039da3926ef633fb2dc6fa3b427eeb30b69fa9fa",
+    "logs/m07-h2-send-header-table-rerun2-test.log.gz": "6c6fe2a6b964a9386e9b21670fa7642ab13b58804524c1e5a2fa5c3577a248b6",
+    "logs/m07-h2-send-header-table-target-clippy-rerun1.log.gz": "d1b4ef5a324d214467ab94f1eecc4f92e3c01557d04ac88d1169fccc5e44f3ff",
+    "logs/m07-h2-send-header-table-target-clippy.log.gz": "6c09102e65ce4f678db1fc1afeaeb797a31817d48a45b9060f3b27c16638721a",
+    "logs/m07-send-header-table-check-fields-restored.log.gz": "7ee3840179d84bfb738c6f7198fb3af83d9b5ccd49eea8624dce2996249d78c5",
+    "logs/m07-send-header-table-check-restored.log.gz": "3148cfbb5319566c059fc69f56200beda9eb15fb22b61b26d7350e702229df91",
+    "logs/m07-send-header-table-check.log.gz": "133ba47fd145164472168e0b8f1713b0750e0af0d74d9100a6a5c1ea822939aa",
+    "logs/m07-send-header-table-existing-protocol.log.gz": "3ae7178ae52a4efb0d9747fc4d5d317eafb6d2319a6951455ab50ee5bc58d64f",
+    "logs/m07-send-header-table-final-protocol.log.gz": "ad608c1956fe0a1af4a2eaeefd1c024b3d9790e44ad08f24e73054489b4b1ae4",
+    "logs/m07-send-header-table-fixture.log.gz": "bedaace6d0e1942256e3a895325fc84dcb2d83d8ee6476915b32621f0eff250d",
+    "logs/m07-send-header-table-libs.log.gz": "9dc265b0ae6b22f048de7ae6b1a14a625d7cd26d485728823119b4fa868cc94a",
+    "logs/m07-send-header-table-main-replay.log.gz": "e54651a204fe004f8c1800e6cf3d46387dd887dbc5b1a8c6188c78025876a2b9",
+    "logs/m07-send-header-table-mutant-replay.log.gz": "15b4a1cb5a89e6c9491ef475be92a6d71b72df3a90434e2d340a476c022d1d40",
+    "logs/m07-send-header-table-native-clippy.log.gz": "1858c1701482c68e3539c2e2dbe3004f5b7dc07a57cf26f0e3ef8b9c5b951789",
+    "logs/m07-send-header-table-negative-hyper-client.log.gz": "b65757f44d2a95c7c0488e44cf0efe18750e869518fcdf6a0ef58c1c8d1e8d82",
+    "logs/m07-send-header-table-negative-hyper-server.log.gz": "e3c08aeb310442889dc0b0759a8cc70a63a56b6f5be13931a70a6d24b504748a",
+    "logs/m07-send-header-table-negative-initial-update.log.gz": "44bc1fbe528ec93c8b38b5813c46d0e2090120e7598700f67a880bec44e28f9f",
+    "logs/m07-send-header-table-negative-restored.log.gz": "cef508a877e9f46f56a0fdd9dcee4b892534869afef20a81a92744b5e1386c0e",
+    "logs/m07-send-header-table-negative-tonic.log.gz": "f4fa6a2b9f3de0bc5428881e77cb675e6f0d72f9e8d6615433e72fdb06529d85",
+    "logs/m07-send-header-table-probe-final.log.gz": "df50ea59c0e5b69c04a7a93ea039dc5cfd1fa88bb7f52b1cd1ceddbbf4c2811d",
+    "logs/m07-send-header-table-probe-v1.log.gz": "d3f56506c174e4036b1298be192d72e0651c9d433bb4654145b8879eead5c41f",
+    "logs/m07-send-header-table-probe-v3.log.gz": "a67dda57ff4e0928462b7c7eecde0218b7b62b0052ef4fdc163e1383fb4583d5",
+    "logs/m07-send-header-table-probe-v4.log.gz": "727a39070fbbf9916e6d8fa98b4813d0f24ed7465652dd133a8587c5f0e052c1",
+    "logs/m07-send-header-table-root-fmt.log.gz": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+    "logs/m07-send-header-table-tonic-wire.log.gz": "f91a39a19f6cb8a00e569c53243b92e8272a6fa1ca97b9b3f7256d9fdea7c07b",
+    "logs/m07-send-header-table-vendor-clippy.log.gz": "e886768a2f1e684ac1646325ecd1720646fa11cab9c59316c775c9cbcfd29177",
+    "logs/m07-send-header-table-vendor-fmt.log.gz": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+    "logs/m07-send-header-table-workspace-check.log.gz": "6ba97568ef5bafff481d59a0a9c88a72f584056fa37063f14cd0436f226478ce",
+    "miri-seven.log.gz": "ac1b43cda7cef517f816f212613ce429a43f4dfa7cd1f56a6024f53d66c2c037",
+    "mutants/m07-send-header-table-mutants.py.gz": "4fdc9505ddf07a31cada0d0257ef1508f36966c1a53cc4a31dc2e7fa8c563fb7",
+    "mutants/m07-send-header-table-negative-hyper-client.diff.gz": "b89ee4b4e0e74605f8daa07f2e41fed116f7b04980cc6f5665d50b642b147eed",
+    "mutants/m07-send-header-table-negative-hyper-server.diff.gz": "c349a1d3ba23fd41d72596afb53a92e243726f50bd9db1e53d23204169275aff",
+    "mutants/m07-send-header-table-negative-initial-update.diff.gz": "f3ccccc27c0f096ef81eb26b79900a2667f127a761c9c4ac3e169a84a2a27747",
+    "mutants/m07-send-header-table-negative-results.json.gz": "04d1010828b334e7b40418bbadb09357d8f5568fecae9ce92f45f1e961d3724c",
+    "mutants/m07-send-header-table-negative-tonic.diff.gz": "1aaa7a703f16fc54436d67c9f7a6c41afea029a934f844f39a92254ab7911c73",
+    "omit-local-clamp.diff.gz": "1f388618144f4070aba8d8c35e0f73d18bea067b20f65c70f044e2dfc66f57bc",
+    "omit-local-clamp.log.gz": "41d6e7fc47e385c8991c56f8aa59cc09eecfc0d5d74cd9e76d55ce0d26a4a0d8",
+    "ordinary.log.gz": "e50a3162ab0490ee79508b61168c509b6345a92e561e7685001b7598843ced20",
+    "probe-Cargo.lock": "c13d7c12a0a145f2fec7ca2220a302c689390c1afab58c29d5db577bb14baf7e",
+    "probe-fmt.log.gz": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64",
+    "probe-tests.rs": "90268a7ffe693cefe7eedb746b0015d136a3e30bec37b89eb0cc45e32f9b12c2",
+    "receipt.json": "64c22535c7aee11c20c487d7ecc543dd9e79370ec606b5b6238330136d6f8203",
+    "reproduce.py": "ed85c969b9df494b4f62e25fb698215b8c3322867b73f973ac357e1cf47cc4ca",
+    "restore-sha256.json": "5a1ac7acb99ff3de47f43901ce8253c3d7351011665737809bf5f046bad0e3a8",
+    "restored-ordinary.log.gz": "bdb42bafd5d840486daa816fd6134a17d363335e94f5e96e67dac360bd3c2195",
+    "source-sha256.json": "c1028abe2e8f0a95b5c45ecff0f1cf7dec88dd571fe8c5516ced961c97217bd6",
+    "tonic-0.12.3.patch.gz": "7fd7af233ee44284b9dd51e802f85c33af157afc78de905af682291b80bb0ee0",
+    "v3-quality-wrapper-fmt-failure.log.gz": "a67dda57ff4e0928462b7c7eecde0218b7b62b0052ef4fdc163e1383fb4583d5",
+    "logs/m07-send-header-table-document-scan.log.gz": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  }
+}

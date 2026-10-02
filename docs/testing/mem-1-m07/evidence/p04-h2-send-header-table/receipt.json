@@ -1,0 +1,52 @@
+{
+  "scope": "Actual pinned HPACK encoder/decoder algorithms; fresh outbound local zero table and size-update semantics only",
+  "command": "python3 docs/testing/mem-1-m07/evidence/p04-h2-send-header-table/reproduce.py --negative-local-clamp --quality --miri",
+  "final_script_exit": 0,
+  "ordinary": {
+    "exit": 0,
+    "passed": 35,
+    "ignored": 1
+  },
+  "negative": {
+    "exit": 101,
+    "runtime_assertion": "fresh zero encoder allocation calls greater than zero after unclamped peer update",
+    "observed_allocations": 2,
+    "observed_requested_bytes": 576,
+    "log": "omit-local-clamp.log.gz",
+    "diff": "omit-local-clamp.diff.gz"
+  },
+  "restore": {
+    "before": "7f02d9599b07bd8f8e7a2f6b5b5e0bd9190338d34542180c901bcf22cf3522e1",
+    "restored": "7f02d9599b07bd8f8e7a2f6b5b5e0bd9190338d34542180c901bcf22cf3522e1",
+    "byte_exact": true
+  },
+  "restored_ordinary": {
+    "exit": 0,
+    "passed": 35,
+    "ignored": 1
+  },
+  "clippy": {
+    "exit": 0,
+    "strict": false,
+    "warnings": "Copied upstream code and unused fixture reexports; no warning rewrites"
+  },
+  "probe_fmt_exit": 0,
+  "isolated_fmt_exit": 0,
+  "miri": {
+    "exit": 0,
+    "passed": 7,
+    "filtered_out": 29,
+    "installed_toolchain": "rustc 1.101.0-nightly (5c543b0b8 2026-09-29)"
+  },
+  "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+  "source_encoder_sha256": "9502a2f1b6b3941dbc77f72cb45ebe6d657e1f9f1fec7f798b22d3096f17b714",
+  "proof_limits": [
+    "Input HTTP fields and output BytesMut are allocated before the measured encode scope.",
+    "Allocator observations concern actual encoder/table growth, not complete block/frame/connection funding.",
+    "Positive caps bound logical table size only.",
+    "Shrinking an already-populated encoder to zero leaves table container spare capacity.",
+    "External upstream fixture/fuzz module wiring is omitted; inline original tests remain.",
+    "Miri executes only the seven appended probes; ordinary inline tests are not claimed as Miri verified.",
+    "No product source mutation, Linux acceptance, Native profile installation, push or commit."
+  ]
+}

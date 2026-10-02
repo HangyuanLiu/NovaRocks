@@ -116,6 +116,8 @@ async fn drain(executor: &ManualExecutor) {
 struct ExitIo {
     inner: Option<DuplexStream>,
     exit: Option<oneshot::Sender<()>>,
+    // Fixture-only trace; it is not part of the original attempt grant.
+    wire: Arc<Mutex<Vec<u8>>>,
 }
 impl AsyncRead for ExitIo {
     fn poll_read(
@@ -132,7 +134,13 @@ impl AsyncWrite for ExitIo {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(self.inner.as_mut().unwrap()).poll_write(cx, buf)
+        match Pin::new(self.inner.as_mut().unwrap()).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                self.wire.lock().unwrap().extend_from_slice(&buf[..n]);
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(self.inner.as_mut().unwrap()).poll_flush(cx)
@@ -158,6 +166,7 @@ fn io_pair() -> (ExitIo, DuplexStream, oneshot::Receiver<()>) {
         ExitIo {
             inner: Some(client),
             exit: Some(exit),
+            wire: Arc::new(Mutex::new(Vec::new())),
         },
         peer,
         observed,
@@ -203,6 +212,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
         max_frame_size: Some(FRAME_BYTES as u32),
         max_header_list_size: Some(FRAME_BYTES as u32),
         max_receive_header_block_size: Some(FRAME_BYTES),
+        max_send_header_table_size: Some(0),
         max_receive_buffered_events: Some(8),
         max_send_buffer_size: Some(65536),
         retain_data_payloads: true,
@@ -640,5 +650,62 @@ async fn tonic_response_error_can_retain_original_goaway_grant_after_connection_
             .contains("tonic-owned-diagnostic")
     );
     drop(error);
+    reserve_all(&original_budget, attempt_bytes());
+}
+
+#[tokio::test]
+async fn actual_channel_factory_forwards_zero_outbound_table_before_first_headers() {
+    let (input, peer, exit) = io_pair();
+    let wire = input.wire.clone();
+    let (close, join) = response_peer(peer, b"table proof");
+    let executor = ManualExecutor::default();
+    let original_budget = budget(1);
+    let factory_budget = original_budget.clone();
+    let endpoint = Endpoint::from_static("http://localhost")
+        .executor(executor.clone())
+        .http2_connection_factory(move || funded_config(&factory_budget));
+    let channel = endpoint
+        .clone()
+        .connect_with_connector(connector(
+            Arc::new(Mutex::new(VecDeque::from([input]))),
+            Arc::new(AtomicUsize::new(0)),
+        ))
+        .await
+        .unwrap();
+    let response = drive(&executor, channel.clone().oneshot(boxed_request()))
+        .await
+        .unwrap();
+    let data = first_data(&executor, response).await;
+    assert_eq!(&data[..], b"table proof");
+    {
+        let trace = wire.lock().unwrap();
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        assert!(trace.starts_with(preface));
+        let mut frames = &trace[preface.len()..];
+        let mut first = None;
+        while !frames.is_empty() {
+            assert!(frames.len() >= 9);
+            let len =
+                ((frames[0] as usize) << 16) | ((frames[1] as usize) << 8) | frames[2] as usize;
+            assert!(frames.len() >= len + 9);
+            if frames[3] == 1 {
+                first = Some(frames[9]);
+                break;
+            }
+            frames = &frames[9 + len..];
+        }
+        assert_eq!(
+            first,
+            Some(0x20),
+            "actual Tonic factory must emit the initial zero HPACK table update"
+        );
+    }
+    drop(data);
+    close.send(()).unwrap();
+    join.await.unwrap();
+    drive(&executor, exit).await.unwrap();
+    drop(channel);
+    drop(endpoint);
+    drain(&executor).await;
     reserve_all(&original_budget, attempt_bytes());
 }

@@ -293,6 +293,14 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Limit the local outbound HPACK table independently of peer SETTINGS.
+    /// Zero avoids dynamic table storage; complete header blocks are separate.
+    /// The default follows the peer allowance.
+    pub fn max_send_header_table_size(&mut self, max: u32) -> &mut Self {
+        self.h2_builder.max_send_header_table_size = Some(max);
+        self
+    }
+
     /// Supply independent fixed GOAWAY debug backing, retained through its last
     /// error alias. One pool binds once; exhaustion closes before another copy.
     /// Default None preserves upstream behavior. Other connection owners remain

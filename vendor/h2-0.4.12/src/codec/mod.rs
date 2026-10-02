@@ -128,6 +128,11 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_max_frame_size(val)
     }
 
+    /// Set the local outbound header table ceiling.
+    pub fn set_max_send_header_table_size(&mut self, val: usize) {
+        self.framed_write().set_max_header_table_size(val)
+    }
+
     /// Set the peer's header table size size.
     pub fn set_send_header_table_size(&mut self, val: usize) {
         self.framed_write().set_header_table_size(val)

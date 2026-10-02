@@ -37,3 +37,8 @@ Client/server connection builders expose receive_goaway_buffer_pool(h2::ReceiveB
 ## Fixed writer forwarding
 
 Client/server connection builders expose send_frame_buffer(h2::SendFrameBuffer), default None. Private Config clone retains the exact original handle and forwards it before h2 handshake. Actual cloned Hyper connections process a large peer frame setting before DATA, retain the local 16 KiB send maximum, and hold the original Worker grant through actual connection future Drop. The separate h2 allocator probe proves writer Vec/Core physical exit. One buffer binds once; reconnect requires a fresh originally funded buffer. HPACK/queued headers, socket/task/TLS and complete connection ownership remain separate. Native defaults and product/performance acceptance are unchanged.
+
+
+## Local outbound HPACK ceiling forwarding
+
+Both connection builders expose max_send_header_table_size(u32), default None, preserving the value across private Config clones before h2 handshake. This is independent of the inbound table advertisement. Zero on a fresh encoder avoids dynamic table storage; positive values limit logical size and do not prove physical backing funding. Complete header blocks, HTTP metadata and Native profile installation remain separate.

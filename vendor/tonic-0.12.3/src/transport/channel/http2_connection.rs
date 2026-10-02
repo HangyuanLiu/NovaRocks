@@ -20,6 +20,8 @@ pub struct Http2ConnectionConfig {
     pub max_header_list_size: Option<u32>,
     /// Complete HPACK block and literal allocation precheck limit.
     pub max_receive_header_block_size: Option<usize>,
+    /// Local outbound HPACK table ceiling; zero disables dynamic storage.
+    pub max_send_header_table_size: Option<u32>,
     /// Connection-wide count of buffered DATA/header/trailer events.
     pub max_receive_buffered_events: Option<usize>,
     /// Maximum per-stream outbound DATA write buffering.
@@ -95,6 +97,9 @@ impl Http2ConnectionConfig {
         }
         if let Some(max) = self.max_receive_header_block_size {
             builder.max_receive_header_block_size(max);
+        }
+        if let Some(max) = self.max_send_header_table_size {
+            builder.max_send_header_table_size(max);
         }
         if let Some(max) = self.max_receive_buffered_events {
             builder.max_receive_buffered_events(max);

@@ -398,6 +398,10 @@ impl<T, B> FramedWrite<T, B> {
     }
 
     /// Set the peer's header table size.
+    pub fn set_max_header_table_size(&mut self, val: usize) {
+        self.encoder.hpack.set_max_size_limit(val);
+    }
+
     pub fn set_header_table_size(&mut self, val: usize) {
         self.encoder.hpack.update_max_size(val);
     }

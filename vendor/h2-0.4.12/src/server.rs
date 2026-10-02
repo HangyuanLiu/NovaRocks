@@ -255,6 +255,7 @@ pub struct Builder {
     retain_data_payloads: bool,
     send_frame_buffer: Option<crate::SendFrameBuffer>,
     max_receive_header_block_size: Option<usize>,
+    max_send_header_table_size: Option<u32>,
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
@@ -471,6 +472,9 @@ where
             builder.settings.max_frame_size().unwrap_or(16384) as usize,
         );
         codec.set_retain_data_payloads(builder.retain_data_payloads);
+        if let Some(max) = builder.max_send_header_table_size {
+            codec.set_max_send_header_table_size(max as usize);
+        }
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
@@ -758,6 +762,7 @@ impl Builder {
             retain_data_payloads: false,
             send_frame_buffer: None,
             max_receive_header_block_size: None,
+            max_send_header_table_size: None,
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             receive_frame_buffer: None,
@@ -1133,6 +1138,17 @@ impl Builder {
     pub fn max_receive_header_block_size(&mut self, max: usize) -> &mut Self {
         assert!(max > 0 && max <= u32::MAX as usize);
         self.max_receive_header_block_size = Some(max);
+        self
+    }
+
+    /// Limit the local HPACK encoder table independently of the peer allowance.
+    ///
+    /// Defaults to the peer setting. Zero disables dynamic table storage while
+    /// retaining static indices and correct table size updates on the wire.
+    /// Positive limits bound logical table size, not its actual allocation
+    /// capacity or original funding. Complete encoded blocks remain separate.
+    pub fn max_send_header_table_size(&mut self, max: u32) -> &mut Self {
+        self.max_send_header_table_size = Some(max);
         self
     }
 

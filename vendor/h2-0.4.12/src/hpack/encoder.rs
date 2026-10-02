@@ -8,6 +8,8 @@ use http::header::{HeaderName, HeaderValue};
 pub struct Encoder {
     table: Table,
     size_update: Option<SizeUpdate>,
+    peer_max_size: usize,
+    local_max_size: Option<usize>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -21,6 +23,8 @@ impl Encoder {
         Encoder {
             table: Table::new(max_size, capacity),
             size_update: None,
+            peer_max_size: max_size,
+            local_max_size: None,
         }
     }
 
@@ -28,6 +32,21 @@ impl Encoder {
     ///
     /// The next call to `encode` will include a dynamic size update frame.
     pub fn update_max_size(&mut self, val: usize) {
+        self.peer_max_size = val;
+        self.queue_size_update(self.local_max_size.map_or(val, |local| local.min(val)));
+    }
+
+    /// Install the local outbound table ceiling independently of peer settings.
+    /// Installed on a fresh encoder, zero keeps both table containers empty
+    /// and queues the required first size update. Static indexing and sensitive
+    /// fields remain valid. Resizing an already populated table retains spare
+    /// capacity; this setter does not claim to reclaim that backing.
+    pub fn set_max_size_limit(&mut self, limit: usize) {
+        self.local_max_size = Some(limit);
+        self.queue_size_update(self.peer_max_size.min(limit));
+    }
+
+    fn queue_size_update(&mut self, val: usize) {
         match self.size_update {
             Some(SizeUpdate::One(old)) => {
                 if val > old {
