@@ -41,24 +41,36 @@ const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: u32 = 1024 * 16; // 16kb
 const DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS: usize = 1024;
 
 fn try_set_content_length_if_missing(headers: &mut http::HeaderMap, len: u64) -> crate::Result<()> {
+    let fields = headers.field_allocation_pool().cloned();
     if let http::header::Entry::Vacant(entry) = headers
         .try_entry(http::header::CONTENT_LENGTH)
         .map_err(|_| crate::Error::new_user_header())?
     {
+        let value = match fields {
+            Some(fields) => http::HeaderValue::try_from_u64_with_pool(len, &fields)
+                .map_err(|_| crate::Error::new_user_header())?,
+            None => http::HeaderValue::from(len),
+        };
         entry
-            .try_insert(http::HeaderValue::from(len))
+            .try_insert(value)
             .map_err(|_| crate::Error::new_user_header())?;
     }
     Ok(())
 }
 
 fn try_set_date_header_if_missing(headers: &mut http::HeaderMap) -> crate::Result<()> {
+    let fields = headers.field_allocation_pool().cloned();
     if let http::header::Entry::Vacant(entry) = headers
         .try_entry(http::header::DATE)
         .map_err(|_| crate::Error::new_user_header())?
     {
+        let value = match fields {
+            Some(fields) => date::header_value_with_pool(&fields)
+                .map_err(|_| crate::Error::new_user_header())?,
+            None => date::update_and_header_value(),
+        };
         entry
-            .try_insert(date::update_and_header_value())
+            .try_insert(value)
             .map_err(|_| crate::Error::new_user_header())?;
     }
     Ok(())

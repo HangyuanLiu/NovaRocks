@@ -29,15 +29,40 @@ pub(crate) fn update_and_header_value() -> HeaderValue {
     CACHED.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.check();
-        cache.header_value.clone()
+        if cache.header_value.is_none() {
+            cache.header_value = Some(
+                HeaderValue::from_bytes(cache.buffer())
+                    .expect("Date format should be valid HeaderValue"),
+            );
+        }
+        cache.header_value.as_ref().unwrap().clone()
     })
+}
+
+/// Copy the cached fixed bytes directly into the original field arena. Keep
+/// the existing clock/update policy without constructing the ordinary cached
+/// HeaderValue or its independently allocated payload.
+#[cfg(feature = "http2")]
+pub(crate) fn header_value_with_pool(
+    pool: &http::header::HeaderFieldAllocationPool,
+) -> Result<HeaderValue, http::header::HeaderFieldFillError<std::convert::Infallible>> {
+    let bytes = pool.try_fill(DATE_VALUE_LENGTH, |output| {
+        CACHED.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.check();
+            output.copy_from_slice(cache.buffer());
+        });
+        Ok(())
+    })?;
+    // HttpDate emits only visible ASCII in the fixed IMF-fixdate representation.
+    Ok(HeaderValue::from_maybe_shared(bytes).expect("Date format should be valid HeaderValue"))
 }
 
 struct CachedDate {
     bytes: [u8; DATE_VALUE_LENGTH],
     pos: usize,
     #[cfg(feature = "http2")]
-    header_value: HeaderValue,
+    header_value: Option<HeaderValue>,
     next_update: SystemTime,
 }
 
@@ -49,7 +74,7 @@ impl CachedDate {
             bytes: [0; DATE_VALUE_LENGTH],
             pos: 0,
             #[cfg(feature = "http2")]
-            header_value: HeaderValue::from_static(""),
+            header_value: None,
             next_update: SystemTime::now(),
         };
         cache.update(cache.next_update);
@@ -81,17 +106,13 @@ impl CachedDate {
         self.pos = 0;
         let _ = write!(self, "{}", HttpDate::from(now));
         debug_assert!(self.pos == DATE_VALUE_LENGTH);
-        self.render_http2();
+        // Only the ordinary HTTP/2 producer materializes its cached payload.
+        // HTTP/1 and bounded HTTP/2 both use these exact inline cached bytes.
+        #[cfg(feature = "http2")]
+        {
+            self.header_value = None;
+        }
     }
-
-    #[cfg(feature = "http2")]
-    fn render_http2(&mut self) {
-        self.header_value = HeaderValue::from_bytes(self.buffer())
-            .expect("Date format should be valid HeaderValue");
-    }
-
-    #[cfg(not(feature = "http2"))]
-    fn render_http2(&mut self) {}
 }
 
 impl fmt::Write for CachedDate {

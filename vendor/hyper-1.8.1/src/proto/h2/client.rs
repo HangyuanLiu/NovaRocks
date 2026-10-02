@@ -35,12 +35,18 @@ use h2::client::ResponseFuture;
 type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<IncomingBody>>;
 
 fn try_set_content_length_if_missing(headers: &mut http::HeaderMap, len: u64) -> crate::Result<()> {
+    let fields = headers.field_allocation_pool().cloned();
     if let http::header::Entry::Vacant(entry) = headers
         .try_entry(http::header::CONTENT_LENGTH)
         .map_err(|_| crate::Error::new_h2(h2::Reason::INTERNAL_ERROR.into()))?
     {
+        let value = match fields {
+            Some(fields) => http::HeaderValue::try_from_u64_with_pool(len, &fields)
+                .map_err(|_| crate::Error::new_h2(h2::Reason::INTERNAL_ERROR.into()))?,
+            None => http::HeaderValue::from(len),
+        };
         entry
-            .try_insert(http::HeaderValue::from(len))
+            .try_insert(value)
             .map_err(|_| crate::Error::new_h2(h2::Reason::INTERNAL_ERROR.into()))?;
     }
     Ok(())

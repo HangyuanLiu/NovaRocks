@@ -1,0 +1,8 @@
+{
+  "vendor/http-1.4.0/src/header/value.rs": "9ad586c348ed38442f871f744a95498ccdf92d061adc29017f6032a6a64d4600",
+  "vendor/hyper-1.8.1/src/common/date.rs": "2042be30640728bdc6de0e07446fa87bd4a1afc44e7775ca4a45653f03d670df",
+  "vendor/hyper-1.8.1/src/proto/h2/client.rs": "9b276538d99efaec42f1aa631de34150ee130707a73c89127964c6505549bc68",
+  "vendor/hyper-1.8.1/src/proto/h2/server.rs": "d0f2b7ebe6374c011559f13b94cc6c8a33559cbbad15d1d41675e03e1396ff67",
+  "novarocks/native-adapter/tests/native_hyper_generated_field_pool.rs": "e3be6f8c95247aad45b84447c3f41d3660d9904463f89cb37e58c2ad08a4828a",
+  "novarocks/native-adapter/tests/native_http_generated_field_owner.rs": "99d69293d3acadc6d3bfb99caed1314ec63a372dc5ae04d170073bf8bc33a0e2"
+}

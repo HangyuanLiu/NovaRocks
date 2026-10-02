@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::{cmp, fmt, str};
 
 use crate::header::name::HeaderName;
+use crate::header::{HeaderFieldAllocationPool, HeaderFieldFillError};
 
 /// Represents an HTTP header field value.
 ///
@@ -40,6 +41,30 @@ pub struct ToStrError {
 }
 
 impl HeaderValue {
+    /// Format an unsigned decimal value in the exact original field arena.
+    ///
+    /// Uses the same integer formatter as `HeaderValue::from(u64)` without
+    /// allocating an intermediate payload. The actual digit length claims one
+    /// bounded extent; exhaustion refuses without waiting or heap fallback.
+    /// Clones retain the original immutable backing until the last alias exits.
+    /// Obtain the pool's complete allocation bound before constructing it; this
+    /// method does not acquire capacity or cover HeaderMap/carrier metadata.
+    pub fn try_from_u64_with_pool(
+        num: u64,
+        pool: &HeaderFieldAllocationPool,
+    ) -> Result<Self, HeaderFieldFillError<std::convert::Infallible>> {
+        let mut formatter = ::itoa::Buffer::new();
+        let digits = formatter.format(num).as_bytes();
+        let bytes = pool.try_fill(digits.len(), |output| {
+            output.copy_from_slice(digits);
+            Ok(())
+        })?;
+        Ok(Self {
+            inner: bytes,
+            is_sensitive: false,
+        })
+    }
+
     /// Convert a static string to a `HeaderValue`.
     ///
     /// This function will not perform any copying, however the string is
