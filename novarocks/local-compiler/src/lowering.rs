@@ -19,6 +19,7 @@
 
 use crate::{
     ProviderValidatedFragment,
+    channels::{ChannelLoweringError, resolve_linear_channels},
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
 };
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -31,7 +32,6 @@ use novarocks_physical_plan::{
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
-use novarocks_types::SlotId;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -111,6 +111,18 @@ macro_rules! owner_error {
             }
         }
     };
+}
+impl From<ChannelLoweringError> for FragmentCompileError {
+    fn from(error: ChannelLoweringError) -> Self {
+        match error {
+            ChannelLoweringError::Control(cause) => Self::Control(cause),
+            ChannelLoweringError::Invalid(message) => Self::Invalid(message),
+            error => Self::Owner {
+                phase: "input channels",
+                error: Box::new(error),
+            },
+        }
+    }
 }
 owner_error!(ExpressionLoweringError, "expressions");
 owner_error!(LayoutCompileError, "layout");
@@ -230,16 +242,7 @@ fn lower(
             });
         }
         match &node.kind {
-            NodeKind::Project { expressions } if node.inputs.len() == 1 => {
-                let mut produced = BTreeSet::new();
-                for (_, value) in expressions {
-                    work.step()?;
-                    if !produced.insert(*value) {
-                        return Err(FragmentCompileError::Invalid(
-                            "independent project roots share a produced value",
-                        ));
-                    }
-                }
+            NodeKind::Project { .. } if node.inputs.len() == 1 => {
                 next = Some(node.inputs[0]);
             }
             NodeKind::Values { rows }
@@ -269,7 +272,14 @@ fn lower(
         ));
     }
     work.flush()?;
-    let expressions = lower_expressions(package, options.constants, work.control())?;
+    let channels_plan = resolve_linear_channels(package, &order, work.control())?;
+    work.flush()?;
+    let expressions = lower_expressions(
+        package,
+        options.constants,
+        &channels_plan.inputs,
+        work.control(),
+    )?;
     work.flush()?;
     let tokens = prepare_calls(package, &expressions, functions, work.control())?;
     let mut nodes: Vec<ProgramNode> = Vec::new();
@@ -277,11 +287,21 @@ fn lower(
     let mut channels = Vec::new();
     let mut operators = Vec::new();
     let mut allowed = BTreeSet::new();
-    let mut next_slot = 0u32;
     for &source in order.iter().rev() {
         work.step()?;
         let node = &physical.nodes()[&source];
-        let id = ProgramNodeId::new(nodes.len());
+        let planned = channels_plan
+            .nodes
+            .get(&source)
+            .ok_or(FragmentCompileError::Invalid(
+                "missing planned node channels",
+            ))?;
+        let id = planned.local;
+        if id.index() != nodes.len() {
+            return Err(FragmentCompileError::Invalid(
+                "channel schedule differs from node schedule",
+            ));
+        }
         local_ids.insert(source, id);
         let source_id = DiagnosticSourceNodeId::new(source.get());
         allowed.insert(source_id);
@@ -352,7 +372,6 @@ fn lower(
                     let mut fields = Vec::new();
                     let mut slots = Vec::new();
                     let mut exprs = Vec::new();
-                    let mut produced = BTreeSet::new();
                     let mut is_result_output =
                         node.output.columns.len() == result.output.columns.len();
                     if is_result_output {
@@ -368,14 +387,6 @@ fn lower(
                     }
                     for (ordinal, (expr, value)) in projected.iter().enumerate() {
                         work.step()?;
-                        // A ValueId denotes one produced value. Two independent
-                        // invocation roots cannot silently choose its first result.
-                        // Transparent Value(source) publication is a later family.
-                        if !produced.insert(*value) {
-                            return Err(FragmentCompileError::Invalid(
-                                "independent project roots share a produced value",
-                            ));
-                        }
                         let definition = physical.expressions().get(*expr).ok_or(
                             FragmentCompileError::Invalid("missing projection definition"),
                         )?;
@@ -413,10 +424,9 @@ fn lower(
                             }
                         })?);
                         work.flush()?;
-                        slots.push(SlotId::new(next_slot));
-                        next_slot = next_slot
-                            .checked_add(1)
-                            .ok_or(FragmentCompileError::Invalid("channel identity exhausted"))?;
+                        slots.push(*planned.slots.get(ordinal).ok_or(
+                            FragmentCompileError::Invalid("missing planned output occurrence"),
+                        )?);
                         exprs.push(*expressions.ids.get(expr).ok_or(
                             FragmentCompileError::Invalid("missing projection expression"),
                         )?);
@@ -445,7 +455,17 @@ fn lower(
                     ));
                 }
             };
-        if layout.slots().len() != node.output.columns.len() {
+        for (actual, expected) in layout.slots().iter().zip(planned.slots.iter()) {
+            work.step()?;
+            if actual != expected {
+                return Err(FragmentCompileError::Invalid(
+                    "materialized channel order differs from plan",
+                ));
+            }
+        }
+        if layout.slots().len() != planned.slots.len()
+            || layout.slots().len() != node.output.columns.len()
+        {
             return Err(FragmentCompileError::Invalid(
                 "output occurrence width changed",
             ));
@@ -589,7 +609,21 @@ fn lower(
     work.flush()?;
     let channels = ProgramTypedChannels::try_new(typed, channels, work.control())?;
     work.flush()?;
-    let lexical = ProgramLexicalBindings::try_new(channels, vec![], vec![], work.control())?;
+    let mut slot_bindings = Vec::new();
+    for invocation in package.expression_uses().flow().uses().values() {
+        work.step()?;
+        if let Some(input) = channels_plan.inputs.get(&invocation.definition) {
+            slot_bindings.push(ProgramSlotBinding {
+                occurrence: ProgramUseRef {
+                    arena: ProgramExpressionArena::Main,
+                    use_id: invocation.context.use_id,
+                },
+                source: ProgramLexicalSource::Input(input.source),
+            });
+        }
+    }
+    work.flush()?;
+    let lexical = ProgramLexicalBindings::try_new(channels, vec![], slot_bindings, work.control())?;
     work.flush()?;
     LocalProgram::try_new(
         lexical,

@@ -174,16 +174,18 @@ fn finish<T>(
 pub(crate) fn lower_expressions(
     package: &FragmentPackage,
     policy: ConstantPolicy,
+    inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, policy, control, &mut work);
+    let result = lower_core(package, policy, inputs, control, &mut work);
     finish(result, &mut work)
 }
 
 fn lower_core(
     package: &FragmentPackage,
     policy: ConstantPolicy,
+    inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
@@ -218,7 +220,7 @@ fn lower_core(
                 ));
             }
             let args: &[ExprId] = match &node.kind {
-                ExprKind::Literal(_) => &[],
+                ExprKind::Literal(_) | ExprKind::Value(_) => &[],
                 ExprKind::FunctionCall { args, .. } => args,
                 _ => return Err(ExpressionLoweringError::UnsupportedExpression(id)),
             };
@@ -244,6 +246,15 @@ fn lower_core(
                 continue;
             }
             let kind = match &node.kind {
+                ExprKind::Value(_) => {
+                    // The channel owner has validated the exact physical
+                    // Value, child scope and complete source type. A missing
+                    // mapping cannot be repaired by guessing a slot ID.
+                    let input = inputs.get(&id).ok_or(ExpressionLoweringError::Invalid(
+                        "missing resolved physical input",
+                    ))?;
+                    StaticExprKind::SlotId(input.slot)
+                }
                 ExprKind::Literal(literal) => {
                     // The original CV owner performs type/resource preflight
                     // before Arrow construction. Field creation/type clones
@@ -554,6 +565,15 @@ fn prepare_core(
                 .node(local_id)
                 .ok_or(ExpressionLoweringError::Invalid("missing local definition"))?;
             let scoped = match (&source.kind, local.kind()) {
+                (ExprKind::Value(_), StaticExprKind::SlotId(_)) => {
+                    if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "input occurrence has arguments or control",
+                        ));
+                    }
+                    ScopedExpressionEffects::pure_value(invocation.context)
+                }
                 (ExprKind::Literal(_), StaticExprKind::Constant(_)) => {
                     if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
                     {
@@ -700,19 +720,18 @@ fn literal_argument(
     node: &StaticExprNode,
     control: &dyn PureCompileControl,
 ) -> Result<Option<FunctionLiteral>, ExpressionLoweringError> {
-    if let StaticExprKind::Constant(value) = node.kind() {
-        if !source
+    if let StaticExprKind::Constant(value) = node.kind()
+        && !source
             .ty
             .exactly_equals_observed::<ExpressionLoweringError>(value.value_type(), || {
                 control
                     .checkpoint(CompilePhase::FunctionSpecialization, 0)
                     .map_err(ExpressionLoweringError::Control)
             })?
-        {
-            return Err(ExpressionLoweringError::Invalid(
-                "constant full type differs from source",
-            ));
-        }
+    {
+        return Err(ExpressionLoweringError::Invalid(
+            "constant full type differs from source",
+        ));
     }
     match (&source.kind, node.kind()) {
         (ExprKind::Literal(LiteralValue::Null), StaticExprKind::Constant(value)) => {
@@ -739,6 +758,9 @@ fn literal_argument(
             }
             Ok(Some(FunctionLiteral::Int64(*expected)))
         }
+        // A resolved input is not a constant, even if this particular runtime
+        // batch happens to broadcast one scalar value (notably RAND seeds).
+        (ExprKind::Value(_), StaticExprKind::SlotId(_)) => Ok(None),
         (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
         _ => Err(ExpressionLoweringError::Invalid(
             "unsupported call argument projection",

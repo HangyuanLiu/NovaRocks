@@ -18,6 +18,7 @@
 //! Pure fragment preparation. Provider validation is a distinct intermediate
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 
+mod channels;
 mod expressions;
 mod lowering;
 
@@ -153,3 +154,6 @@ mod tests;
 
 #[cfg(test)]
 mod lowering_tests;
+
+#[cfg(test)]
+mod channel_tests;
