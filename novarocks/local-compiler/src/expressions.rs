@@ -286,6 +286,14 @@ fn lower_core(
                             CompilePhase::LowerProgram,
                             control,
                         )?,
+                        LiteralValue::Float64Bits(value) => ConstantValue::from_f64_bits(
+                            field,
+                            node.ty.clone(),
+                            *value,
+                            policy,
+                            CompilePhase::LowerProgram,
+                            control,
+                        )?,
                         _ => return Err(ExpressionLoweringError::UnsupportedLiteral(id)),
                     };
                     work.flush()?;
@@ -331,9 +339,9 @@ fn lower_core(
 }
 
 /// Prepare actual expression occurrences using exact frozen identities and
-/// facts. This initial Main-arena slice handles scalar eager/type-only calls;
-/// guarded, lambda and relational lifecycles are explicit pending compiler
-/// cases, rather than being treated as ordinary scalar calls.
+/// facts. Ordinary eager/type-only and installed IF/COALESCE control calls
+/// keep their exact lifecycle. Other guarded, lambda and relational protocols
+/// remain explicit pending cases rather than becoming ordinary scalar calls.
 pub(crate) fn prepare_calls(
     package: &FragmentPackage,
     lowered: &LoweredExpressions,
@@ -599,11 +607,14 @@ fn prepare_core(
                             "frozen occurrence context differs",
                         ));
                     }
-                    let type_only = match (invocation.control, frozen.effects.argument_control) {
-                        (ControlShape::Eager, ArgumentControl::Eager) => false,
-                        (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => true,
-                        _ => return Err(ExpressionLoweringError::UnsupportedCall(site)),
-                    };
+                    let (type_only, control_intrinsic) =
+                        match (invocation.control, frozen.effects.argument_control) {
+                            (ControlShape::Eager, ArgumentControl::Eager) => (false, false),
+                            (ControlShape::TypeOnly, ArgumentControl::TypeOnly) => (true, false),
+                            (ControlShape::If, ArgumentControl::If)
+                            | (ControlShape::Coalesce, ArgumentControl::Coalesce) => (false, true),
+                            _ => return Err(ExpressionLoweringError::UnsupportedCall(site)),
+                        };
                     if args.len() != local_args.len()
                         || function.argument_types.len() != args.len()
                         || invocation.arguments.len() != if type_only { 0 } else { args.len() }
@@ -641,12 +652,15 @@ fn prepare_core(
                                     "ordered physical call arguments differ",
                                 ));
                             }
-                            children =
-                                children.join_same_domain(*effects.get(&child_use).ok_or(
+                            children = children.join_control_argument(
+                                *effects.get(&child_use).ok_or(
                                     ExpressionLoweringError::Invalid(
                                         "argument effects were not prepared",
                                     ),
-                                )?)?;
+                                )?,
+                                flow,
+                                ordinal,
+                            )?;
                             argument_uses.push(Some(child_use));
                         }
                         work.step()?;
@@ -668,7 +682,7 @@ fn prepare_core(
                         proof_scope: frozen.effects.proof_scope,
                     };
                     work.flush()?;
-                    let options = if type_only {
+                    let options = if control_intrinsic {
                         PureCallPreparation::ControlIntrinsic {
                             arguments: children,
                         }
@@ -757,6 +771,17 @@ fn literal_argument(
                 ));
             }
             Ok(Some(FunctionLiteral::Int64(*expected)))
+        }
+        (
+            ExprKind::Literal(LiteralValue::Float64Bits(expected)),
+            StaticExprKind::Constant(value),
+        ) => {
+            if value.try_f64_bits()? != Some(*expected) {
+                return Err(ExpressionLoweringError::Invalid(
+                    "lowered Float64 bits differ from source",
+                ));
+            }
+            Ok(Some(FunctionLiteral::Float64Bits(*expected)))
         }
         // A resolved input is not a constant, even if this particular runtime
         // batch happens to broadcast one scalar value (notably RAND seeds).

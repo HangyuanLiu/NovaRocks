@@ -157,3 +157,6 @@ mod lowering_tests;
 
 #[cfg(test)]
 mod channel_tests;
+
+#[cfg(test)]
+mod control_call_tests;

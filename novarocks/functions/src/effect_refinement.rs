@@ -525,6 +525,41 @@ impl ScopedExpressionEffects {
             ..self
         })
     }
+    /// Compose the conservative summary of one actual ordered control edge.
+    /// The immutable flow has already checked its guards and child demand using
+    /// the common control owner. Context equality alone does not establish an
+    /// edge: both exact occurrences must also occupy this owner/ordinal pair.
+    /// This summary retains the parent context, never changes the child's
+    /// invocation domain, and grants no permission to hoist or cache that child.
+    pub fn join_control_argument<D: Copy>(
+        self,
+        child: Self,
+        flow: &novarocks_type_contract::ExpressionControlFlow<D>,
+        ordinal: usize,
+    ) -> Result<Self, EffectContractError> {
+        let owner = flow
+            .uses()
+            .get(&self.context.use_id)
+            .ok_or(EffectContractError::ProofScopeMismatch)?;
+        if owner.context != self.context {
+            return Err(EffectContractError::ProofScopeMismatch);
+        }
+        let child_use = owner
+            .arguments
+            .get(ordinal)
+            .ok_or(EffectContractError::ProofScopeMismatch)?;
+        let actual = flow
+            .uses()
+            .get(child_use)
+            .ok_or(EffectContractError::ProofScopeMismatch)?;
+        if actual.context != child.context {
+            return Err(EffectContractError::ProofScopeMismatch);
+        }
+        Ok(Self {
+            effects: self.effects.join(child.effects),
+            ..self
+        })
+    }
     /// Eager children must be in this same evaluation domain. Strong guarded
     /// children require the compiler's separate checked control-domain join.
     pub fn join_same_domain(self, child: Self) -> Result<Self, EffectContractError> {
@@ -956,3 +991,6 @@ mod tests {
         assert_eq!(owner.calls.load(Ordering::Relaxed), 0);
     }
 }
+
+#[cfg(test)]
+mod control_join_tests;
