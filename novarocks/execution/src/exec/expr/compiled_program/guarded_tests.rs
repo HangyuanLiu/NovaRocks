@@ -273,6 +273,10 @@ impl FlowAuthor {
         let (shape, args) = match &definition.kind {
             ExprKind::FunctionCall { args, .. } => (authors[&expr].shape, args.as_ref()),
             ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
+            ExprKind::Binary { left, right, .. } => {
+                case_args.extend([*left, *right]);
+                (ControlShape::Eager, case_args.as_slice())
+            }
             ExprKind::Conjunction { args } => (ControlShape::Conjunction, args.as_ref()),
             ExprKind::Disjunction { args } => (ControlShape::Disjunction, args.as_ref()),
             ExprKind::Unary {
@@ -1055,3 +1059,6 @@ mod case_tests;
 
 #[path = "byte_guarded_tests.rs"]
 mod byte_guarded_tests;
+
+#[path = "equality_tests.rs"]
+mod equality_tests;

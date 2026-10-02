@@ -271,6 +271,14 @@ fn lower_core(
                     expr,
                 }
                 | ExprKind::IsNull { expr, .. } => (next == 0).then_some(*expr),
+                ExprKind::Binary {
+                    op:
+                        novarocks_physical_plan::BinaryOperator::Eq
+                        | novarocks_physical_plan::BinaryOperator::NotEq,
+                    left,
+                    right,
+                    ..
+                } => [*left, *right].get(next).copied(),
                 ExprKind::Case {
                     operand,
                     when_then,
@@ -400,6 +408,32 @@ fn lower_core(
                         ExprKind::IsNull { negated: false, .. } => StaticExprKind::IsNull(child),
                         ExprKind::IsNull { negated: true, .. } => StaticExprKind::IsNotNull(child),
                         _ => unreachable!("checked unary kind"),
+                    }
+                }
+                ExprKind::Binary {
+                    op:
+                        novarocks_physical_plan::BinaryOperator::Eq
+                        | novarocks_physical_plan::BinaryOperator::NotEq,
+                    left,
+                    right,
+                    ..
+                } => {
+                    let left = *ids.get(left).ok_or(ExpressionLoweringError::Invalid(
+                        "equality left operand was not lowered",
+                    ))?;
+                    let right = *ids.get(right).ok_or(ExpressionLoweringError::Invalid(
+                        "equality right operand was not lowered",
+                    ))?;
+                    if matches!(
+                        node.kind,
+                        ExprKind::Binary {
+                            op: novarocks_physical_plan::BinaryOperator::Eq,
+                            ..
+                        }
+                    ) {
+                        StaticExprKind::Eq(left, right)
+                    } else {
+                        StaticExprKind::Ne(left, right)
                     }
                 }
                 ExprKind::Case {
@@ -760,6 +794,47 @@ fn prepare_core(
                     )?
                 }
                 (
+                    ExprKind::Binary {
+                        op, left, right, ..
+                    },
+                    StaticExprKind::Eq(local_left, local_right)
+                    | StaticExprKind::Ne(local_left, local_right),
+                ) if (*op == novarocks_physical_plan::BinaryOperator::Eq
+                    && matches!(local.kind(), StaticExprKind::Eq(..)))
+                    || (*op == novarocks_physical_plan::BinaryOperator::NotEq
+                        && matches!(local.kind(), StaticExprKind::Ne(..))) =>
+                {
+                    if invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 2
+                        || lowered.ids.get(left) != Some(local_left)
+                        || lowered.ids.get(right) != Some(local_right)
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "actual equality control or operands differ",
+                        ));
+                    }
+                    let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
+                    for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
+                        let child_use = invocation.arguments[ordinal];
+                        if flow.uses()[&child_use].definition != physical {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "actual ordered equality use differs",
+                            ));
+                        }
+                        combined = combined.join_control_argument(
+                            *effects
+                                .get(&child_use)
+                                .ok_or(ExpressionLoweringError::Invalid(
+                                    "equality child effects were not prepared",
+                                ))?,
+                            flow,
+                            ordinal,
+                        )?;
+                        work.step()?;
+                    }
+                    combined
+                }
+                (
                     ExprKind::Case {
                         operand,
                         when_then,
@@ -1061,6 +1136,15 @@ fn literal_argument(
         | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
         | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
         (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
+        (
+            ExprKind::Binary {
+                op:
+                    novarocks_physical_plan::BinaryOperator::Eq
+                    | novarocks_physical_plan::BinaryOperator::NotEq,
+                ..
+            },
+            StaticExprKind::Eq(..) | StaticExprKind::Ne(..),
+        ) => Ok(None),
         _ => Err(ExpressionLoweringError::Invalid(
             "unsupported call argument projection",
         )),

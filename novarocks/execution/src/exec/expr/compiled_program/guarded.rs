@@ -24,7 +24,7 @@ use arrow::{
     array::{Array, BooleanArray},
     compute::interleave,
 };
-use novarocks_local_program::{ProgramLexicalBindings, ProgramNodeId};
+use novarocks_local_program::ProgramNodeId;
 use novarocks_type_contract::EvaluationDemand;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
@@ -83,6 +83,7 @@ struct Frame {
     routes: Vec<Option<bool>>,
     remaining: Vec<usize>,
     matched: Vec<usize>,
+    operand: Option<ArrayRef>,
     choices: Vec<Option<(usize, usize)>>,
     errors: BTreeMap<usize, RowDataError>,
     boolean: Option<BooleanRows>,
@@ -140,6 +141,7 @@ impl Frame {
             routes: Vec::new(),
             remaining,
             matched: Vec::new(),
+            operand: None,
             choices,
             errors: BTreeMap::new(),
             boolean: None,
@@ -173,12 +175,11 @@ impl Frame {
         }
         let mut ordinals = Vec::new();
         match shape {
-            ControlShape::Case {
-                simple: false,
-                arms,
-                ..
-            } => {
-                let then = self.next < arms as usize * 2 && !self.next.is_multiple_of(2);
+            ControlShape::Case { simple, arms, .. } => {
+                let offset = usize::from(simple);
+                let then = self.next >= offset
+                    && self.next < offset + arms as usize * 2
+                    && !(self.next - offset).is_multiple_of(2);
                 let domain = if then { &self.matched } else { &self.remaining };
                 if domain.is_empty() && self.remaining.is_empty() {
                     return Ok(None);
@@ -187,9 +188,6 @@ impl Frame {
                     ordinals.push(ordinal);
                     work.step()?;
                 }
-            }
-            ControlShape::Case { simple: true, .. } => {
-                return Err(invalid("simple CASE requires its exact equality author"));
             }
             ControlShape::If if self.next != 0 => {
                 let desired = self.next == 1;
@@ -215,9 +213,14 @@ impl Frame {
         }
         Ok(Some(ordinals))
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the immutable recipe owner, selected child, parent semantics and work scope explicit"
+    )]
     fn attach(
         &mut self,
         child: Child,
+        program: &novarocks_local_program::LocalProgram,
         shape: ControlShape,
         demand: EvaluationDemand,
         child_is_pure: bool,
@@ -245,24 +248,89 @@ impl Frame {
         let value = child.value.into_value(selection, work)?;
         let ty = value.argument().array().data_type().clone();
         let output = value.materialize(selection, &ty, work)?;
-        if let ControlShape::Case {
-            simple: false,
-            arms,
-            ..
-        } = shape
-        {
+        if let ControlShape::Case { simple, arms, .. } = shape {
             let ordinal = self
                 .next
                 .checked_sub(1)
                 .ok_or_else(|| internal("CASE child completed before its continuation"))?;
-            if ordinal < arms as usize * 2 && ordinal.is_multiple_of(2) {
-                let booleans = output
-                    .values()
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        invalid("searched CASE WHEN differs from its frozen Boolean carrier")
-                    })?;
+            let offset = usize::from(simple);
+            if simple && ordinal == 0 {
+                let mut errors = output.errors().iter().peekable();
+                let mut remaining = Vec::with_capacity(child.ordinals.len());
+                for (local, &parent) in child.ordinals.iter().enumerate() {
+                    if errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == local)
+                    {
+                        let error = errors
+                            .next()
+                            .ok_or_else(|| internal("missing CASE operand error"))?;
+                        self.errors
+                            .insert(parent, RowDataError::new(parent, error.message()));
+                    } else {
+                        remaining.push(parent);
+                    }
+                    work.step()?;
+                }
+                self.remaining = remaining;
+                self.operand = Some(Arc::clone(output.values()));
+                // The compact operand is retained once. Its errors are now
+                // terminal parent evidence, excluded from all later labels.
+                work.flush()?;
+                drop(output);
+                work.flush()?;
+                return Ok(());
+            }
+            if ordinal >= offset
+                && ordinal < offset + arms as usize * 2
+                && (ordinal - offset).is_multiple_of(2)
+            {
+                let booleans = if simple {
+                    None
+                } else {
+                    Some(
+                        output
+                            .values()
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| {
+                                invalid(
+                                    "searched CASE WHEN differs from its frozen Boolean carrier",
+                                )
+                            })?,
+                    )
+                };
+                let parent_selection =
+                    Selection::try_sparse_observed(batch_rows, &self.rows, || work.step())?;
+                let operand = if simple {
+                    let array = self
+                        .operand
+                        .as_ref()
+                        .ok_or_else(|| internal("missing once-evaluated simple CASE operand"))?;
+                    Some(SelectedValues::try_new_observed(
+                        parent_selection,
+                        array.data_type(),
+                        Arc::clone(array),
+                        Box::default(),
+                        || work.step(),
+                    )?)
+                } else {
+                    None
+                };
+                let recipe = if simple {
+                    Some(
+                        program
+                            .equality_recipe(
+                                novarocks_local_program::ProgramEqualitySite::CaseWhen {
+                                    occurrence: self.occurrence,
+                                    arm: ((ordinal - offset) / 2) as u32,
+                                },
+                            )
+                            .ok_or_else(|| invalid("missing exact CASE WHEN equality recipe"))?,
+                    )
+                } else {
+                    None
+                };
                 let mut errors = output.errors().iter().peekable();
                 let mut remaining = Vec::with_capacity(child.ordinals.len());
                 self.matched.clear();
@@ -276,10 +344,30 @@ impl Frame {
                             .ok_or_else(|| internal("missing CASE WHEN error"))?;
                         self.errors
                             .insert(parent, RowDataError::new(parent, error.message()));
-                    } else if !booleans.is_null(local) && booleans.value(local) {
-                        self.matched.push(parent);
                     } else {
-                        remaining.push(parent);
+                        let matches = if let (Some(recipe), Some(operand)) =
+                            (recipe, operand.as_ref())
+                        {
+                            work.flush()?;
+                            recipe.compare_rows(
+                                EvaluatedArgument::SelectedColumn(operand),
+                                parent,
+                                self.rows[parent],
+                                EvaluatedArgument::SelectedColumn(&output),
+                                local,
+                                self.rows[parent],
+                                work.control,
+                            )? == Some(true)
+                        } else {
+                            let booleans = booleans
+                                .ok_or_else(|| internal("missing searched CASE Boolean carrier"))?;
+                            !booleans.is_null(local) && booleans.value(local)
+                        };
+                        if matches {
+                            self.matched.push(parent);
+                        } else {
+                            remaining.push(parent);
+                        }
                     }
                     work.step()?;
                 }
@@ -306,7 +394,7 @@ impl Frame {
                 work.step()?;
             }
             self.matched.clear();
-            if ordinal == arms as usize * 2 {
+            if ordinal == offset + arms as usize * 2 {
                 self.remaining.clear();
             }
             self.children.push(Child {
@@ -404,7 +492,7 @@ impl Frame {
     reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
 )]
 pub(super) fn evaluate_tree<'a>(
-    checked: &ProgramLexicalBindings,
+    program: &novarocks_local_program::LocalProgram,
     root: ProgramExpressionRootSite,
     input: &RecordBatch,
     input_node: ProgramNodeId,
@@ -413,6 +501,7 @@ pub(super) fn evaluate_tree<'a>(
     effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     work: &mut Work<'_>,
 ) -> Result<Value<'a>, KernelFailure> {
+    let checked = program.checked();
     let typed = checked.channels().expressions();
     let resolved = typed.resolved_calls();
     let snapshot = resolved.snapshot();
@@ -578,10 +667,36 @@ pub(super) fn evaluate_tree<'a>(
                         || work.step(),
                     )?)
                 }
-                StaticExprKind::Case {
-                    has_case_expr: false,
-                    ..
-                } => assemble(
+                StaticExprKind::Eq(..) | StaticExprKind::Ne(..) => {
+                    if frame.children.len() != 2 {
+                        return Err(invalid("equality requires its exact ordered operands"));
+                    }
+                    let mut children = std::mem::take(&mut frame.children).into_iter();
+                    let left = children
+                        .next()
+                        .ok_or_else(|| internal("missing equality left operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let right = children
+                        .next()
+                        .ok_or_else(|| internal("missing equality right operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let recipe = program
+                        .equality_recipe(novarocks_local_program::ProgramEqualitySite::Binary(
+                            frame.occurrence,
+                        ))
+                        .ok_or_else(|| invalid("missing exact equality recipe"))?;
+                    OwnedValue::from_selected(evaluate_equality(
+                        recipe,
+                        matches!(definition.kind(), StaticExprKind::Ne(..)),
+                        &left,
+                        &right,
+                        local_selection,
+                        work,
+                    )?)
+                }
+                StaticExprKind::Case { .. } => assemble(
                     &frame.children,
                     &frame.choices,
                     &mut frame.errors,
@@ -639,6 +754,11 @@ pub(super) fn evaluate_tree<'a>(
                 _ => return Err(invalid("unsupported compiled root definition")),
             }
         };
+        if let Some(operand) = frame.operand.take() {
+            work.flush()?;
+            drop(operand);
+            work.flush()?;
+        }
         if let Some(parent) = frames.last_mut() {
             let parent_invocation = &flow.uses()[&parent.occurrence.use_id];
             let shape = parent_invocation.control;
@@ -653,6 +773,7 @@ pub(super) fn evaluate_tree<'a>(
                     ordinals: frame.parent_ordinals,
                     value,
                 },
+                program,
                 shape,
                 parent_invocation.context.demand,
                 child_is_pure,
@@ -737,4 +858,63 @@ fn assemble(
         errors.into_boxed_slice(),
         || work.step(),
     )?))
+}
+
+fn evaluate_equality<'a>(
+    recipe: &novarocks_functions::PreparedEqualityRecipe,
+    negate: bool,
+    left: &Value<'_>,
+    right: &Value<'_>,
+    selection: Selection<'a>,
+    work: &mut Work<'_>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    let mut left_errors = left.errors().iter().peekable();
+    let mut right_errors = right.errors().iter().peekable();
+    let mut errors = Vec::new();
+    let mut values = Vec::with_capacity(selection.len());
+    for (ordinal, row) in selection.iter().enumerate() {
+        let l = if left_errors
+            .peek()
+            .is_some_and(|error| error.selected_ordinal() == ordinal)
+        {
+            left_errors.next()
+        } else {
+            None
+        };
+        let r = if right_errors
+            .peek()
+            .is_some_and(|error| error.selected_ordinal() == ordinal)
+        {
+            right_errors.next()
+        } else {
+            None
+        };
+        if let Some(error) = l.or(r) {
+            errors.push(error.clone());
+            values.push(None);
+        } else {
+            work.flush()?;
+            let equal = recipe.compare_rows(
+                left.argument(),
+                ordinal,
+                row,
+                right.argument(),
+                ordinal,
+                row,
+                work.control,
+            )?;
+            values.push(equal.map(|value| if negate { !value } else { value }));
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    let array = Arc::new(BooleanArray::from(values));
+    work.flush()?;
+    SelectedValues::try_new_observed(
+        selection,
+        &DataType::Boolean,
+        array,
+        errors.into_boxed_slice(),
+        || work.step(),
+    )
 }

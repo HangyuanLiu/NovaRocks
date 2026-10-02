@@ -169,3 +169,6 @@ mod unary_lowering_tests;
 
 #[cfg(test)]
 mod case_lowering_tests;
+
+#[cfg(test)]
+mod equality_lowering_tests;

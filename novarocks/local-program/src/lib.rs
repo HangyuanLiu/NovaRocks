@@ -29,6 +29,7 @@ mod expression_roots;
 mod expressions;
 mod layout;
 mod lexical_bindings;
+mod primitives;
 mod program;
 mod provenance;
 mod provider_links;
@@ -60,6 +61,7 @@ pub use novarocks_connector_contract::{
     ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
     StaticScanDynamicFilter,
 };
+pub use primitives::{ProgramEqualitySite, ProgramPrimitiveError};
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,

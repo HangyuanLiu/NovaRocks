@@ -247,7 +247,9 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::Not(_)
                     | StaticExprKind::IsNull(_)
                     | StaticExprKind::IsNotNull(_)
-                    | StaticExprKind::Case { .. } => {
+                    | StaticExprKind::Case { .. }
+                    | StaticExprKind::Eq(..)
+                    | StaticExprKind::Ne(..) => {
                         let mut summary = ScopedExpressionEffects::pure_value(invocation.context);
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
                             let child = *effects
@@ -305,11 +307,17 @@ impl CompiledExpressionInstance {
                 | StaticExprKind::IsNotNull(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1 => {}
-                StaticExprKind::Case {
-                    has_case_expr: false,
-                    ..
-                } if matches!(invocation.control, ControlShape::Case { simple: false, .. })
-                    && guarded::supports_result(node.data_type()) => {}
+                StaticExprKind::Eq(..) | StaticExprKind::Ne(..)
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 2
+                        && program
+                            .equality_recipe(novarocks_local_program::ProgramEqualitySite::Binary(
+                                occurrence,
+                            ))
+                            .is_some() => {}
+                StaticExprKind::Case { .. }
+                    if matches!(invocation.control, ControlShape::Case { .. })
+                        && guarded::supports_result(node.data_type()) => {}
                 StaticExprKind::BoundCall { .. } => {
                     let call = checked
                         .channels()
@@ -466,7 +474,7 @@ impl CompiledExpressionInstance {
         }
         let flow = &snapshot.flows()[&self.root.arena()];
         let result = guarded::evaluate_tree(
-            checked,
+            &self.program,
             self.root,
             input,
             input_node,

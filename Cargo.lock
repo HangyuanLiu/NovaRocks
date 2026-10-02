@@ -3977,6 +3977,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
+ "arrow-ord",
  "arrow-schema",
  "chrono",
  "novarocks-constant-contract",

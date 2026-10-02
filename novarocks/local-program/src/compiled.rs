@@ -23,8 +23,8 @@
 
 use crate::{
     CompiledOriginsError, DiagnosticSourceNodeId, LocalOperatorProvenance, LocalProgramGraph,
-    ProgramCallSite, ProgramLexicalBindings, ProgramNodeId, ProgramProvenance,
-    ProgramStateTemplate, ProviderLinkError,
+    ProgramCallSite, ProgramEqualitySite, ProgramLexicalBindings, ProgramNodeId,
+    ProgramPrimitiveError, ProgramProvenance, ProgramStateTemplate, ProviderLinkError,
 };
 use novarocks_connector_contract::ConnectorWriteRecipe;
 use novarocks_type_contract::{CompileControlError, PureCompileControl};
@@ -38,14 +38,24 @@ pub struct LocalProgram {
     checked: ProgramLexicalBindings,
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
+    equalities: BTreeMap<ProgramEqualitySite, novarocks_functions::PreparedEqualityRecipe>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalProgramCompileError {
     Control(CompileControlError),
     MissingSink,
     Origins(CompiledOriginsError),
     Provider(ProviderLinkError),
+    Primitive(ProgramPrimitiveError),
+}
+impl From<ProgramPrimitiveError> for LocalProgramCompileError {
+    fn from(error: ProgramPrimitiveError) -> Self {
+        match error {
+            ProgramPrimitiveError::Control(cause) => Self::Control(cause),
+            other => Self::Primitive(other),
+        }
+    }
 }
 impl From<CompiledOriginsError> for LocalProgramCompileError {
     fn from(error: CompiledOriginsError) -> Self {
@@ -69,6 +79,7 @@ impl fmt::Display for LocalProgramCompileError {
             Self::Control(error) => error.fmt(f),
             Self::Origins(error) => error.fmt(f),
             Self::Provider(error) => error.fmt(f),
+            Self::Primitive(error) => error.fmt(f),
             Self::MissingSink => f.write_str("compiled local program requires an exact sink"),
         }
     }
@@ -79,6 +90,7 @@ impl std::error::Error for LocalProgramCompileError {
             Self::Control(error) => Some(error),
             Self::Origins(error) => Some(error),
             Self::Provider(error) => Some(error),
+            Self::Primitive(error) => Some(error),
             Self::MissingSink => None,
         }
     }
@@ -115,12 +127,14 @@ impl LocalProgram {
         let provenance =
             crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)?;
         crate::provider_links::validate_provider_links(&checked, &writes, control)?;
+        let equalities = crate::primitives::compile_equalities(&checked, control)?;
         // Each delegated author finishes its completed work and propagates a
         // first control refusal directly; no control object enters the product.
         Ok(Self {
             checked,
             provenance,
             writes,
+            equalities,
         })
     }
     pub const fn checked(&self) -> &ProgramLexicalBindings {
@@ -139,6 +153,12 @@ impl LocalProgram {
     }
     pub fn write_recipes(&self) -> &BTreeMap<ProgramNodeId, ConnectorWriteRecipe> {
         &self.writes
+    }
+    pub fn equality_recipe(
+        &self,
+        site: ProgramEqualitySite,
+    ) -> Option<&novarocks_functions::PreparedEqualityRecipe> {
+        self.equalities.get(&site)
     }
     /// Borrow the exact checked implementation's lifecycle; never rebuild a
     /// second state declaration from a name or legacy expression tag.
