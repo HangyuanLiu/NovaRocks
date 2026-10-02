@@ -38,6 +38,17 @@ use std::{
 };
 
 const EOS: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
+
+#[test]
+#[allow(deprecated)] // Its argument type is the public opaque layout seam; no constructor is called.
+fn public_buffer_constructor_exposes_opaque_owner_layout_without_allocation() {
+    fn argument_layout<T>(_: fn(T) -> arrow_buffer::Buffer) -> std::alloc::Layout {
+        std::alloc::Layout::new::<T>()
+    }
+    let layout = argument_layout(arrow_buffer::Buffer::from_bytes);
+    assert!(layout.size() >= 5 * std::mem::size_of::<usize>());
+    assert!(layout.align() >= std::mem::align_of::<usize>());
+}
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
     CompileControlError::DeadlineExceeded,
@@ -311,6 +322,87 @@ fn actual_writer_alignments_preserve_borrowed_input_field_and_scalar_bits() {
         let trace = control.trace();
         prefixes(&input, &field, limits(), &trace, 0..trace.len());
     }
+}
+
+// A small independent public-reader oracle, not production allocation admission.
+fn read_checked_header(projected: &FlatConstantStream<'_, '_>, field: Arc<Field>) -> RecordBatch {
+    assert!(std::ptr::eq(projected.field(), field.as_ref()));
+    let schema = Arc::new(Schema::new([Arc::clone(&field)]));
+    let body = arrow_buffer::Buffer::from(projected.batch_body());
+    let batch = ipc::reader::read_record_batch(
+        &body,
+        projected.record_batch(),
+        schema,
+        &HashMap::new(),
+        None,
+        &projected.metadata_version(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&batch.schema().fields()[0], &field));
+    batch
+}
+
+#[test]
+fn verified_header_reuse_reads_exact_original_field_without_schema_conversion() {
+    let field = Arc::new(
+        Field::new("exact", DataType::Float32, true)
+            .with_metadata(HashMap::from([("provider".into(), "untouched".into())])),
+    );
+    let array: ArrayRef = Arc::new(Float32Array::from(vec![
+        Some(f32::from_bits(0xffc00071)),
+        None,
+        Some(f32::from_bits(0x80000000)),
+    ]));
+    for alignment in [8, 16, 32, 64] {
+        let input = stream(array.clone(), &field, alignment);
+        let control = Control::good();
+        let projected = preflight(&input, &field, &control).unwrap();
+        let trace = control.trace();
+        assert_eq!(projected.record_batch().length(), 3);
+        assert_eq!(projected.metadata_version(), ipc::MetadataVersion::V5);
+        let batch = read_checked_header(&projected, Arc::clone(&field));
+        let actual = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(actual.value(0).to_bits(), 0xffc00071);
+        assert!(actual.is_null(1));
+        assert_eq!(actual.value(2).to_bits(), 0x80000000);
+        // Accessing the retained safe header introduces no re-verification or
+        // synthetic control callbacks into the completed stream projection.
+        assert_eq!(control.trace(), trace);
+    }
+}
+
+#[test]
+fn verified_header_reuse_preserves_present_empty_timezone_on_original_field_arc() {
+    let zone = Some(Arc::<str>::from(""));
+    let field = Arc::new(Field::new(
+        "exact",
+        DataType::Timestamp(TimeUnit::Nanosecond, zone.clone()),
+        true,
+    ));
+    let array: ArrayRef = Arc::new(
+        TimestampNanosecondArray::from(vec![Some(-1), None, Some(71)]).with_timezone_opt(zone),
+    );
+    let standard = stream(array, &field, 8);
+    let (_, batch, eos) = frames(&standard);
+    let schema =
+        crate::ipc_schema_v2::encode_single_field_schema(&field, limits().schema, &Control::good())
+            .unwrap();
+    let input = assembled(&frame(&schema, &[]), batch, eos);
+    let projected = preflight(&input, &field, &Control::good()).unwrap();
+    let decoded = read_checked_header(&projected, Arc::clone(&field));
+    assert_eq!(decoded.column(0).data_type(), field.data_type());
+    let actual = decoded
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(actual.value(0), -1);
+    assert!(actual.is_null(1));
+    assert_eq!(actual.value(2), 71);
 }
 
 #[test]
@@ -688,4 +780,374 @@ fn real_view_stream_has_repeated_work_extent_and_original_quantum_control() {
         .collect();
     positions.extend([0, trace.len() - 1]);
     prefixes(&input, &field, bound, &trace, positions);
+}
+
+fn constant_policy() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 4096,
+        max_array_nodes: 4096,
+        max_logical_elements: 16384,
+        max_retained_buffer_bytes: 1024 * 1024,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1024 * 1024,
+        max_library_validation_work: 4 * 1024 * 1024,
+        max_library_validation_bytes: 4 * 1024 * 1024,
+    }
+}
+
+fn pool_prefixes(
+    projected: &FlatConstantStream<'_, '_>,
+    ty: &novarocks_type_contract::FunctionValueType,
+    policy: novarocks_constant_contract::ConstantPolicy,
+    trace: &[(CompilePhase, u32)],
+) {
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let control = Control::refusing(at, cause);
+            assert!(matches!(
+                projected.preflight_pool_resources(ty, policy, &control),
+                Err(FlatPoolResourceError::Control(actual)) if actual == cause
+            ));
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+}
+
+#[test]
+fn real_flat_stream_pool_projection_dominates_actual_owner_facts() {
+    use novarocks_constant_contract::ConstantPool;
+    use novarocks_type_contract::FunctionValueType;
+    for array in [
+        Arc::new(Float32Array::from(vec![Some(-0.0), None, Some(f32::NAN)])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("first"), None, Some("last")])),
+        Arc::new(StringArray::from(Vec::<&str>::new())),
+        Arc::new(StringViewArray::from(vec![
+            Some("long repeated string"),
+            None,
+            Some("long repeated string"),
+        ])),
+        Arc::new(NullArray::new(4)),
+    ] {
+        let field = Arc::new(Field::new("exact", array.data_type().clone(), true));
+        let ty = FunctionValueType::new(array.data_type().clone(), true);
+        let input = stream(array, &field, 8);
+        let checked = preflight(&input, &field, &Control::good()).unwrap();
+        let control = Control::good();
+        let bounds = checked
+            .preflight_pool_resources(&ty, constant_policy(), &control)
+            .unwrap();
+        let decoded = read_checked_header(&checked, Arc::clone(&field));
+        let pool = ConstantPool::try_new(
+            Arc::clone(&field),
+            ty.clone(),
+            decoded.column(0).to_data(),
+            constant_policy(),
+            CompilePhase::Decode,
+            &Control::good(),
+        )
+        .unwrap();
+        let actual = pool.resource_facts();
+        assert_eq!(actual.metadata_bytes, bounds.constant.metadata_bytes);
+        assert!(
+            actual.retained_buffer_capacity_bytes
+                <= (bounds.owned_body_capacity_bytes
+                    + bounds.alignment_repair_capacity_bytes_upper_bound
+                    + bounds.empty_offset_capacity_bytes) as u64
+        );
+        assert!(
+            actual.library_validation_work_upper_bound
+                <= bounds.constant.library_validation_work_upper_bound
+        );
+        assert!(
+            actual.library_validation_bytes_upper_bound
+                <= bounds.constant.library_validation_bytes_upper_bound
+        );
+        assert!(
+            actual.library_validation_temporary_bytes_upper_bound
+                <= bounds
+                    .constant
+                    .library_validation_temporary_bytes_upper_bound
+        );
+        if matches!(field.data_type(), DataType::Null) {
+            assert_eq!(actual.retained_buffer_capacity_bytes, 0);
+        }
+        if actual.rows > 1 {
+            let value = pool.value(1).unwrap();
+            assert_eq!(value.ordinal(), 1);
+            assert!(std::ptr::eq(value.field(), field.as_ref()));
+        }
+        let trace = control.trace();
+        assert!(
+            trace
+                .iter()
+                .all(|(phase, units)| *phase == CompilePhase::Decode && *units <= 256)
+        );
+        pool_prefixes(&checked, &ty, constant_policy(), &trace);
+    }
+}
+
+#[test]
+fn pool_projection_checks_original_fvt_policy_and_ordinary_failure_tails() {
+    use novarocks_type_contract::FunctionValueType;
+    let field = Arc::new(Field::new("exact", DataType::Float32, true));
+    let input = stream(Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0])), &field, 8);
+    let checked = preflight(&input, &field, &Control::good()).unwrap();
+    let ty = FunctionValueType::new(DataType::Float32, true);
+    let good = checked
+        .preflight_pool_resources(&ty, constant_policy(), &Control::good())
+        .unwrap();
+    let exact = novarocks_constant_contract::ConstantPolicy {
+        max_rows: 3,
+        max_retained_buffer_bytes: good.owned_body_capacity_bytes as u64,
+        max_library_validation_work: good.constant.library_validation_work_upper_bound,
+        max_library_validation_bytes: good.constant.library_validation_bytes_upper_bound,
+        ..constant_policy()
+    };
+    assert_eq!(
+        checked
+            .preflight_pool_resources(&ty, exact, &Control::good())
+            .unwrap(),
+        good
+    );
+    let wrong = FunctionValueType::new(DataType::Float32, false);
+    for (value_type, policy) in [
+        (&wrong, exact),
+        (
+            &ty,
+            novarocks_constant_contract::ConstantPolicy {
+                max_rows: 2,
+                ..exact
+            },
+        ),
+        (
+            &ty,
+            novarocks_constant_contract::ConstantPolicy {
+                max_retained_buffer_bytes: exact.max_retained_buffer_bytes - 1,
+                ..exact
+            },
+        ),
+        (
+            &ty,
+            novarocks_constant_contract::ConstantPolicy {
+                max_library_validation_work: exact.max_library_validation_work - 1,
+                ..exact
+            },
+        ),
+        (
+            &ty,
+            novarocks_constant_contract::ConstantPolicy {
+                max_library_validation_bytes: exact.max_library_validation_bytes - 1,
+                ..exact
+            },
+        ),
+    ] {
+        let control = Control::good();
+        assert!(matches!(
+            checked.preflight_pool_resources(value_type, policy, &control),
+            Err(FlatPoolResourceError::Constant(_))
+        ));
+        let trace = control.trace();
+        assert!(trace.len() >= 4);
+        assert_eq!(trace.last(), Some(&(CompilePhase::Decode, 0)));
+        pool_prefixes(&checked, value_type, policy, &trace);
+    }
+}
+
+#[test]
+fn intrinsic_null_false_reader_oracle_keeps_final_pool_value_obligation() {
+    use novarocks_constant_contract::{ConstantError, ConstantPool};
+    use novarocks_type_contract::FunctionValueType;
+    let field = Arc::new(Field::new("exact", DataType::Null, false));
+    let input = stream(Arc::new(NullArray::new(4)), &field, 8);
+    let checked = preflight(&input, &field, &Control::good()).unwrap();
+    let ty = FunctionValueType::new(DataType::Null, false);
+    let projected = checked
+        .preflight_pool_resources(&ty, constant_policy(), &Control::good())
+        .unwrap();
+    assert_eq!(projected.owned_body_capacity_bytes, 0);
+    let decoded = read_checked_header(&checked, Arc::clone(&field));
+    assert_eq!(decoded.column(0).null_count(), 0);
+    assert_eq!(decoded.column(0).logical_null_count(), 4);
+    assert!(matches!(
+        ConstantPool::try_new(
+            field,
+            ty,
+            decoded.column(0).to_data(),
+            constant_policy(),
+            CompilePhase::Decode,
+            &Control::good(),
+        ),
+        Err(ConstantError::Invalid(
+            "non-null constant contains SQL NULL"
+        ))
+    ));
+}
+
+fn raw_flat_batch(rows: i64, nulls: i64, buffers: &[(i64, i64)], body: &[u8]) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let nodes = builder.create_vector(&[ipc::FieldNode::new(rows, nulls)]);
+    let buffers: Vec<_> = buffers
+        .iter()
+        .map(|&(offset, len)| ipc::Buffer::new(offset, len))
+        .collect();
+    let buffers = builder.create_vector(&buffers);
+    let batch = ipc::RecordBatch::create(
+        &mut builder,
+        &ipc::RecordBatchArgs {
+            length: rows,
+            nodes: Some(nodes),
+            buffers: Some(buffers),
+            ..Default::default()
+        },
+    );
+    let message = ipc::Message::create(
+        &mut builder,
+        &ipc::MessageArgs {
+            version: ipc::MetadataVersion::V5,
+            header_type: ipc::MessageHeader::RecordBatch,
+            header: Some(batch.as_union_value()),
+            bodyLength: body.len() as i64,
+            ..Default::default()
+        },
+    );
+    ipc::finish_message_buffer(&mut builder, message);
+    frame(builder.finished_data(), body)
+}
+
+#[test]
+fn pool_projection_includes_synthesized_empty_offset_backing_and_inspection() {
+    use novarocks_constant_contract::ConstantPool;
+    use novarocks_type_contract::FunctionValueType;
+    for (ty, width) in [(DataType::Utf8, 4), (DataType::LargeBinary, 8)] {
+        let field = Arc::new(Field::new("exact", ty.clone(), true));
+        let schema = crate::ipc_schema_v2::encode_single_field_schema(
+            &field,
+            limits().schema,
+            &Control::good(),
+        )
+        .unwrap();
+        let batch = raw_flat_batch(0, 0, &[(0, 0), (0, 0), (0, 0)], &[]);
+        let input = assembled(&frame(&schema, &[]), &batch, &EOS);
+        let checked = preflight(&input, &field, &Control::good()).unwrap();
+        let ty = FunctionValueType::new(ty, true);
+        let control = Control::good();
+        let bounds = checked
+            .preflight_pool_resources(&ty, constant_policy(), &control)
+            .unwrap();
+        assert_eq!(bounds.owned_body_capacity_bytes, 0);
+        assert_eq!(bounds.empty_offset_capacity_bytes, width);
+        let decoded = read_checked_header(&checked, Arc::clone(&field));
+        let pool = ConstantPool::try_new(
+            Arc::clone(&field),
+            ty.clone(),
+            decoded.column(0).to_data(),
+            constant_policy(),
+            CompilePhase::Decode,
+            &Control::good(),
+        )
+        .unwrap();
+        let actual = pool.resource_facts();
+        assert_eq!(actual.rows, 0);
+        assert_eq!(actual.retained_buffer_capacity_bytes, width as u64);
+        assert!(
+            actual.library_validation_work_upper_bound
+                <= bounds.constant.library_validation_work_upper_bound
+        );
+        assert!(
+            actual.library_validation_bytes_upper_bound
+                <= bounds.constant.library_validation_bytes_upper_bound
+        );
+        pool_prefixes(&checked, &ty, constant_policy(), &control.trace());
+    }
+}
+
+#[test]
+fn pool_projection_covers_full_unaligned_typed_descriptor_and_utf8_fallback() {
+    use novarocks_constant_contract::ConstantPool;
+    use novarocks_type_contract::FunctionValueType;
+    for (ty, buffers, body, repair) in [
+        (
+            DataType::Int64,
+            vec![(0, 0), (1, 80)],
+            {
+                let mut body = vec![0; 88];
+                body[1..9].copy_from_slice(&71i64.to_le_bytes());
+                body
+            },
+            128,
+        ),
+        (
+            DataType::Utf8,
+            vec![(0, 0), (0, 8), (8, 4)],
+            {
+                let mut body = vec![0; 16];
+                body[4..8].copy_from_slice(&3i32.to_le_bytes());
+                body[8..12].copy_from_slice(b"abc\xff");
+                body
+            },
+            0,
+        ),
+    ] {
+        let field = Arc::new(Field::new("exact", ty.clone(), true));
+        let schema = crate::ipc_schema_v2::encode_single_field_schema(
+            &field,
+            limits().schema,
+            &Control::good(),
+        )
+        .unwrap();
+        let input = assembled(
+            &frame(&schema, &[]),
+            &raw_flat_batch(1, 0, &buffers, &body),
+            &EOS,
+        );
+        let checked = preflight(&input, &field, &Control::good()).unwrap();
+        let ty = FunctionValueType::new(ty, true);
+        let control = Control::good();
+        let bounds = checked
+            .preflight_pool_resources(&ty, constant_policy(), &control)
+            .unwrap();
+        assert_eq!(bounds.alignment_repair_capacity_bytes_upper_bound, repair);
+        let decoded = read_checked_header(&checked, Arc::clone(&field));
+        let pool = ConstantPool::try_new(
+            Arc::clone(&field),
+            ty.clone(),
+            decoded.column(0).to_data(),
+            constant_policy(),
+            CompilePhase::Decode,
+            &Control::good(),
+        )
+        .unwrap();
+        let actual = pool.resource_facts();
+        assert!(
+            actual.library_validation_work_upper_bound
+                <= bounds.constant.library_validation_work_upper_bound
+        );
+        assert!(
+            actual.library_validation_bytes_upper_bound
+                <= bounds.constant.library_validation_bytes_upper_bound
+        );
+        if repair == 0 {
+            assert_eq!(
+                pool.array()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "abc"
+            );
+        } else {
+            assert!(bounds.alignment_repair_possible);
+            assert_eq!(
+                pool.array()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                71
+            );
+        }
+        pool_prefixes(&checked, &ty, constant_policy(), &control.trace());
+    }
 }

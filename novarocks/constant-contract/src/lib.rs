@@ -22,6 +22,8 @@
 //! including retained capacity, and are not allocation authorization.
 
 #[cfg(test)]
+mod flat_resource_tests;
+#[cfg(test)]
 mod scalar_factory_tests;
 #[cfg(test)]
 mod tests;
@@ -75,6 +77,109 @@ pub struct ConstantResourceFacts {
     /// This is the exact derived input to the library-validation byte gate,
     /// distinct from deduplicated retained backing or allocation authorization.
     pub library_validation_bytes_upper_bound: u64,
+}
+
+/// Conservative numeric inputs from a checked flat carrier projection and its
+/// real backing-allocation recipe. These are not ArrayData or allocation grants.
+/// The caller must cover discarded descriptors, full retained backing and
+/// repeated view inspection; byte length alone does not establish these bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlatConstantResourceInput {
+    pub rows: u64,
+    pub buffer_count_upper_bound: u64,
+    /// Includes additional successful UTF8 fallback scans of the values
+    /// descriptor, as well as each visited buffer (including validity).
+    pub buffer_visits_bytes_upper_bound: u64,
+    pub retained_buffer_capacity_bytes_upper_bound: u64,
+    pub view_validation_bytes_upper_bound: u64,
+}
+
+/// The same ConstantPolicy validation envelope before array materialization.
+/// Reader/schema/container/error allocation admission remains the caller's duty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlatConstantResourceBounds {
+    pub metadata_bytes: u64,
+    pub library_validation_work_upper_bound: u64,
+    pub library_validation_temporary_bytes_upper_bound: u64,
+    pub library_validation_bytes_upper_bound: u64,
+}
+
+/// Reuses the complete Field/FVT author and the post-array numerical envelope.
+/// No schema, array, backing or value is constructed. All limits and control
+/// originate with the caller; ordinary failures observe the completed tail.
+pub fn preflight_flat_pool_resources(
+    field: &Field,
+    value_type: &FunctionValueType,
+    input: FlatConstantResourceInput,
+    policy: ConstantPolicy,
+    phase: CompilePhase,
+    control: &dyn PureCompileControl,
+) -> Result<FlatConstantResourceBounds, ConstantError> {
+    let mut work = CompileCheckpoints::try_new(control, phase)?;
+    let checked = (|| {
+        let metadata_bytes = validate_type(field, value_type, policy, &mut work)?;
+        work.step()?;
+        let flat = matches!(
+            field.data_type(),
+            DataType::Null
+                | DataType::Boolean
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8View
+                | DataType::BinaryView
+        ) || field.data_type().primitive_width().is_some();
+        if !flat {
+            return Err(ConstantError::Invalid(
+                "constant resource projection is not flat",
+            ));
+        }
+        limit(input.rows, policy.max_rows, "constant row limit exceeded")?;
+        limit(
+            1,
+            policy.max_array_nodes,
+            "constant array node limit exceeded",
+        )?;
+        limit(
+            1,
+            u64::from(policy.max_type_depth),
+            "constant array depth limit exceeded",
+        )?;
+        limit(
+            input.rows,
+            policy.max_logical_elements,
+            "constant stored element limit exceeded",
+        )?;
+        limit(
+            input.retained_buffer_capacity_bytes_upper_bound,
+            policy.max_retained_buffer_bytes,
+            "constant retained buffer limit exceeded",
+        )?;
+        let counts = ValidationCounts {
+            nodes: 1,
+            storage_elements: input.rows,
+            buffer_count: input.buffer_count_upper_bound,
+            buffer_visits: input.buffer_visits_bytes_upper_bound,
+            view_validation_bytes: input.view_validation_bytes_upper_bound,
+            utf8_fallback_validation_bytes: 0,
+            masks: 0,
+            depth: 1,
+        };
+        let envelope = validation_envelope(counts, metadata_bytes, policy)?;
+        Ok(FlatConstantResourceBounds {
+            metadata_bytes,
+            library_validation_work_upper_bound: envelope.work,
+            library_validation_temporary_bytes_upper_bound: envelope.temporary,
+            library_validation_bytes_upper_bound: envelope.bytes,
+        })
+    })();
+    if matches!(&checked, Err(ConstantError::Control(_))) {
+        return checked;
+    }
+    work.finish()?;
+    checked
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +241,16 @@ pub struct ConstantValue {
 }
 
 impl ConstantPool {
+    /// Locked Rust Arc allocation request for this owner's actual backing.
+    /// This is a layout input, not allocator usable size, RSS or a MEM grant.
+    /// Rust 1.92 ArcInner is repr(C): two AtomicUsize counters then the payload.
+    pub fn backing_allocation_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<PoolBacking>())
+            .expect("fixed ConstantPool Arc layout is representable")
+            .0
+            .pad_to_align()
+    }
     /// Inputs are immutable ArrayData, with no caller Array implementation to
     /// execute. Inputs already own Arrow allocations; this is not first-allocation
     /// admission. Standard Arrow validation runs only after observed resource
@@ -423,6 +538,33 @@ fn validate_type(
     Ok(bytes)
 }
 
+/// The flat IPC path retains at most body, alignment repair and empty offsets.
+/// Keep those allocation identities inline; arbitrary ArrayData may have more
+/// independent owners and spills to the same ordered set on the fourth one.
+#[derive(Default)]
+struct AllocationSet {
+    inline: [Option<(usize, usize)>; 3],
+    spill: BTreeSet<(usize, usize)>,
+}
+impl AllocationSet {
+    fn insert(&mut self, allocation: (usize, usize)) -> bool {
+        if !self.spill.is_empty() {
+            return self.spill.insert(allocation);
+        }
+        if self.inline.contains(&Some(allocation)) {
+            return false;
+        }
+        if let Some(slot) = self.inline.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(allocation);
+            return true;
+        }
+        for old in self.inline.iter().flatten() {
+            self.spill.insert(*old);
+        }
+        self.spill.insert(allocation)
+    }
+}
+
 #[derive(Default)]
 struct ScanFacts {
     nodes: u64,
@@ -430,48 +572,67 @@ struct ScanFacts {
     buffer_visits: u64,
     buffer_count: u64,
     view_validation_bytes: u64,
+    utf8_fallback_validation_bytes: u64,
     retained: u64,
     masks: u64,
     depth: u64,
-    allocations: BTreeSet<(usize, usize)>,
+    allocations: AllocationSet,
 }
-fn preflight(
-    data: &ArrayData,
+
+#[derive(Clone, Copy)]
+struct ValidationCounts {
+    nodes: u64,
+    storage_elements: u64,
+    buffer_count: u64,
+    buffer_visits: u64,
+    view_validation_bytes: u64,
+    utf8_fallback_validation_bytes: u64,
+    masks: u64,
+    depth: u64,
+}
+impl From<&ScanFacts> for ValidationCounts {
+    fn from(scanned: &ScanFacts) -> Self {
+        Self {
+            nodes: scanned.nodes,
+            storage_elements: scanned.storage_elements,
+            buffer_count: scanned.buffer_count,
+            buffer_visits: scanned.buffer_visits,
+            view_validation_bytes: scanned.view_validation_bytes,
+            utf8_fallback_validation_bytes: scanned.utf8_fallback_validation_bytes,
+            masks: scanned.masks,
+            depth: scanned.depth,
+        }
+    }
+}
+struct ValidationEnvelope {
+    work: u64,
+    temporary: u64,
+    bytes: u64,
+}
+fn validation_envelope(
+    scanned: ValidationCounts,
     metadata: u64,
     policy: ConstantPolicy,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ConstantResourceFacts, ConstantError> {
-    limit(
-        data.len() as u64,
-        policy.max_rows,
-        "constant row limit exceeded",
-    )?;
-    let mut scanned = ScanFacts::default();
-    let max_value = scan_data(data, 1, 0, policy, &mut scanned, work)?;
-    let logical = scanned
-        .storage_elements
-        .max(checked_mul(data.len() as u64, max_value)?);
-    limit(
-        logical,
-        policy.max_logical_elements,
-        "constant logical element limit exceeded",
-    )?;
-    // validate_full calls validate_data at every node; validate itself revisits
-    // descendants and exact child types. Include repeated ancestor/fanout work,
-    // bytes inspected and FixedSizeList's expanded parent-null masks.
+) -> Result<ValidationEnvelope, ConstantError> {
+    // This is the sole numerical author for both actual ArrayData facts and
+    // flat pre-reader upper bounds. It does not model reader allocations.
     let structural = checked_mul(checked_mul(scanned.nodes, scanned.nodes)?, scanned.depth)?;
     let rows = checked_mul(
         checked_add(scanned.storage_elements, scanned.buffer_count)?,
         scanned.depth,
     )?;
-    let inspected = checked_add(scanned.buffer_visits, scanned.view_validation_bytes)?;
+    // Arrow first scans the whole UTF8 values descriptor. An invalid unused
+    // suffix triggers a successful scan of all monotone referenced ranges,
+    // totaling at most one more complete descriptor, including NULL rows.
+    let inspected = checked_add(
+        checked_add(scanned.buffer_visits, scanned.view_validation_bytes)?,
+        scanned.utf8_fallback_validation_bytes,
+    )?;
     let bytes = checked_mul(checked_add(inspected, metadata)?, scanned.depth)?;
     let library_work = checked_add(
         checked_add(structural, rows)?,
         checked_add(bytes, scanned.masks)?,
     )?;
-    // Vec<Buffer> headers matter even when every variadic buffer is empty.
-    // Recursive error formatting can repeat type metadata through ancestors.
     let headers = checked_add(
         checked_mul(scanned.nodes, std::mem::size_of::<ArrayData>() as u64)?,
         checked_mul(
@@ -498,6 +659,37 @@ fn preflight(
         policy.max_library_validation_bytes,
         "opaque Arrow validation byte limit exceeded",
     )?;
+    Ok(ValidationEnvelope {
+        work: library_work,
+        temporary,
+        bytes: library_bytes,
+    })
+}
+fn preflight(
+    data: &ArrayData,
+    metadata: u64,
+    policy: ConstantPolicy,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantResourceFacts, ConstantError> {
+    limit(
+        data.len() as u64,
+        policy.max_rows,
+        "constant row limit exceeded",
+    )?;
+    let mut scanned = ScanFacts::default();
+    let max_value = scan_data(data, 1, 0, policy, &mut scanned, work)?;
+    let logical = scanned
+        .storage_elements
+        .max(checked_mul(data.len() as u64, max_value)?);
+    limit(
+        logical,
+        policy.max_logical_elements,
+        "constant logical element limit exceeded",
+    )?;
+    // validate_full calls validate_data at every node; validate itself revisits
+    // descendants and exact child types. Include repeated ancestor/fanout work,
+    // bytes inspected and FixedSizeList's expanded parent-null masks.
+    let envelope = validation_envelope(ValidationCounts::from(&scanned), metadata, policy)?;
     Ok(ConstantResourceFacts {
         rows: data.len() as u64,
         array_nodes: scanned.nodes,
@@ -505,9 +697,9 @@ fn preflight(
         logical_elements_upper_bound: logical,
         retained_buffer_capacity_bytes: scanned.retained,
         metadata_bytes: metadata,
-        library_validation_work_upper_bound: library_work,
-        library_validation_temporary_bytes_upper_bound: temporary,
-        library_validation_bytes_upper_bound: library_bytes,
+        library_validation_work_upper_bound: envelope.work,
+        library_validation_temporary_bytes_upper_bound: envelope.temporary,
+        library_validation_bytes_upper_bound: envelope.bytes,
     })
 }
 fn scan_data(
@@ -597,6 +789,13 @@ fn scan_data(
             facts.view_validation_bytes =
                 checked_add(facts.view_validation_bytes, u64::from(length))?;
         }
+    }
+    if matches!(data.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        let values = data.buffers().get(1).ok_or(ConstantError::Invalid(
+            "constant UTF8 lacks its values buffer",
+        ))?;
+        facts.utf8_fallback_validation_bytes =
+            checked_add(facts.utf8_fallback_validation_bytes, values.len() as u64)?;
     }
     let dict_depth = dict_depth + u32::from(matches!(data.data_type(), DataType::Dictionary(_, _)));
     limit(

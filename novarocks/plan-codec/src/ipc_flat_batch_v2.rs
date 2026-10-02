@@ -56,7 +56,7 @@ pub struct FlatBatchGeometry {
     pub view_validation_bytes: usize,
 }
 
-enum Layout {
+pub(crate) enum Layout {
     Null,
     Bits,
     Fixed(usize),
@@ -64,7 +64,7 @@ enum Layout {
     Views,
 }
 
-fn layout(ty: &DataType) -> Result<Layout, TypeCodecError> {
+pub(crate) fn layout(ty: &DataType) -> Result<Layout, TypeCodecError> {
     match ty {
         DataType::Null => Ok(Layout::Null),
         DataType::Boolean => Ok(Layout::Bits),

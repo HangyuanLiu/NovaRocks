@@ -31,6 +31,7 @@ doctest = false
 flatbuffers.workspace = true
 novarocks-arrow-ipc-frame.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-constant-contract.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
 novarocks-functions.workspace = true

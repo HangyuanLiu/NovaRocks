@@ -36,6 +36,9 @@ use novarocks_arrow_ipc_frame::{
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
+mod pool_resources;
+pub use pool_resources::{FlatPoolResourceError, FlatPoolResourceProjection};
+
 /// All limits originate with the admitted caller, not the stream or defaults.
 #[derive(Clone, Copy, Debug)]
 pub struct FlatStreamProjectionLimits {
@@ -52,6 +55,8 @@ pub struct FlatConstantStream<'a, 'f> {
     field: &'f Field,
     batch_metadata: &'a [u8],
     batch_body: &'a [u8],
+    batch: arrow::ipc::RecordBatch<'a>,
+    version: arrow::ipc::MetadataVersion,
     geometry: FlatBatchGeometry,
 }
 impl<'a, 'f> FlatConstantStream<'a, 'f> {
@@ -69,6 +74,14 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
     }
     pub fn geometry(&self) -> FlatBatchGeometry {
         self.geometry
+    }
+    /// Reuses the safe header from the sole official verification. This does
+    /// not admit reader allocations, work or ConstantPool construction.
+    pub fn record_batch(&self) -> arrow::ipc::RecordBatch<'a> {
+        self.batch
+    }
+    pub fn metadata_version(&self) -> arrow::ipc::MetadataVersion {
+        self.version
     }
 }
 
@@ -186,6 +199,11 @@ fn preflight<'a, 'f>(
     let batch_body = &input[range];
     let geometry =
         preflight_verified_flat_record_batch(message, batch_body, expected, limits.batch, work)?;
+    let batch = message
+        .header_as_record_batch()
+        .ok_or(TypeCodecError::InvalidShape(
+            "constant IPC batch header is missing",
+        ))?;
     let end = continuation_prefix(input, body_end);
     work.step()?;
     let end =
@@ -200,6 +218,8 @@ fn preflight<'a, 'f>(
         field: expected,
         batch_metadata,
         batch_body,
+        batch,
+        version: message.version(),
         geometry,
     })
 }

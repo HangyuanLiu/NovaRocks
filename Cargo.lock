@@ -4192,6 +4192,7 @@ dependencies = [
  "hex",
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
+ "novarocks-constant-contract",
  "novarocks-functions",
  "novarocks-physical-plan",
  "novarocks-proto-codec",
