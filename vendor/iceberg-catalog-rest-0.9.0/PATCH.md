@@ -167,8 +167,8 @@ Diff base: upstream `iceberg-catalog-rest` 0.9.0 and 0.9.1 ship a
 byte-identical `src/`, so either release can be used as the comparison base
 for this directory and the whole `src/` diff is NovaRocks patches. The
 vendored `Cargo.toml` keeps `version = "0.9.0"` and `iceberg = "0.9.0"`, and
-adds the `staged_create_probe` test target; nothing else in the manifest
-diverges.
+adds the `staged_create_probe` test target and the gated metadata decoder
+`serde_json/unbounded_depth` feature.
 
 This extracted crate's manifest resolves `iceberg = "0.9.0"` from crates.io
 unless the NovaRocks vendor patch is supplied explicitly. Run from this
@@ -193,3 +193,15 @@ env -u CARGO_TARGET_DIR cargo test \
 
 The `cargo tree` output must identify both crates by their worktree paths,
 not a registry source.
+
+## Provider-preflighted table response decode
+
+`RestCatalogBuilder::with_table_response_preflight` installs an optional
+provider callback retained across server config merging. Only table
+load/create/register/staged/commit responses use it; unconfigured catalogs
+keep default serde recursion handling. The configured provider checks every
+retained schema and ordinary envelope recursion before the table response
+decoder disables its recursion limit. Other REST responses are unchanged.
+HTTP-success commit decode failures remain `CommittedResponseInvalid`.
+`serde_json` enables `unbounded_depth` for this explicitly gated decoder.
+Two existing update-table tests now await the vendored SDK's async `apply`.

@@ -294,6 +294,45 @@ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     })
 }
 
+pub(crate) async fn deserialize_table_response<R: DeserializeOwned>(
+    response: Response,
+    preflight: Option<fn(&[u8]) -> std::result::Result<(), String>>,
+) -> Result<R> {
+    let bytes = response.bytes().await?;
+    decode_table_response(&bytes, preflight)
+}
+
+fn decode_table_response<R: DeserializeOwned>(
+    bytes: &[u8],
+    preflight: Option<fn(&[u8]) -> std::result::Result<(), String>>,
+) -> Result<R> {
+    let Some(preflight) = preflight else {
+        return serde_json::from_slice(bytes).map_err(table_response_decode_error);
+    };
+    preflight(bytes).map_err(|message| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Table response schema preflight failed",
+        )
+        .with_context("preflight", message)
+        .with_context("response_body", "[REDACTED]")
+    })?;
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    decoder.disable_recursion_limit();
+    let response = R::deserialize(&mut decoder).map_err(table_response_decode_error)?;
+    decoder.end().map_err(table_response_decode_error)?;
+    Ok(response)
+}
+
+fn table_response_decode_error(source: serde_json::Error) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        "Failed to parse response from rest catalog server",
+    )
+    .with_context("response_body", "[REDACTED]")
+    .with_source(source)
+}
+
 /// Returns response header names only. Error paths must not make arbitrary
 /// REST response values observable because servers may return credentials in
 /// a non-success response body or extension header.
@@ -455,5 +494,27 @@ mod tests {
             })
             .expect_err("invalid response must fail");
         assert!(!format!("{error:?}").contains(canary));
+    }
+    #[test]
+    fn table_response_preflight_runs_before_decode_and_scopes_recursion_handling() {
+        fn reject(_: &[u8]) -> std::result::Result<(), String> {
+            Err("schema rejected".into())
+        }
+        let error = decode_table_response::<crate::types::LoadTableResult>(
+            b"storage-secret-canary",
+            Some(reject),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("schema rejected"));
+        assert!(!format!("{error:?}").contains("storage-secret-canary"));
+        let json = format!("{}0{}", "[".repeat(130), "]".repeat(130));
+        assert!(decode_table_response::<serde_json::Value>(json.as_bytes(), None).is_err());
+        fn checked(bytes: &[u8]) -> std::result::Result<(), String> {
+            if bytes.len() != 261 {
+                return Err("unexpected frozen fixture".into());
+            }
+            Ok(())
+        }
+        assert!(decode_table_response::<serde_json::Value>(json.as_bytes(), Some(checked)).is_ok());
     }
 }

@@ -482,7 +482,7 @@ impl HadoopFileSystemCatalog {
             hinted
         };
         check_active()?;
-        let metadata = TableMetadata::read_from(&file_io, &metadata_location)
+        let metadata = crate::schema_preflight::read_table_metadata(&file_io, &metadata_location)
             .await
             .map_err(|error| {
                 Error::new(
@@ -521,7 +521,7 @@ impl HadoopFileSystemCatalog {
             if !self.file_io.exists(&v1).await? {
                 return Ok(None);
             }
-            TableMetadata::read_from(&self.file_io, &v1)
+            crate::schema_preflight::read_table_metadata(&self.file_io, &v1)
                 .await
                 .map_err(|error| {
                     Error::new(
@@ -543,7 +543,7 @@ impl HadoopFileSystemCatalog {
                     format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
                 ));
             }
-            TableMetadata::read_from(&self.file_io, &hinted)
+            crate::schema_preflight::read_table_metadata(&self.file_io, &hinted)
                 .await
                 .map_err(|error| {
                     Error::new(
@@ -769,7 +769,8 @@ impl HadoopFileSystemCatalog {
             let read_result = async {
                 let input = self.file_io.new_input(&attempt.facts.metadata_location)?;
                 let bytes = input.read().await?;
-                let metadata = serde_json::from_slice::<TableMetadata>(&bytes)?;
+                let metadata = crate::schema_preflight::decode_table_metadata_bytes(&bytes)
+                    .map_err(|message| Error::new(ErrorKind::DataInvalid, message))?;
                 Ok::<_, Error>((metadata, hex_digest(&bytes)))
             }
             .await;
@@ -833,7 +834,7 @@ impl HadoopFileSystemCatalog {
             .read()
             .await
             .map_err(|error| format!("read authoritative Hadoop v1 metadata: {error}"))?;
-        let metadata: TableMetadata = serde_json::from_slice(&bytes)
+        let metadata: TableMetadata = crate::schema_preflight::decode_table_metadata_bytes(&bytes)
             .map_err(|error| format!("decode authoritative Hadoop v1 metadata: {error}"))?;
         if metadata.uuid().to_string() != expected_uuid
             || hex_digest(&bytes) != expected_metadata_digest
@@ -997,14 +998,15 @@ impl Catalog for HadoopFileSystemCatalog {
             }
         };
 
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
+        let metadata =
+            crate::schema_preflight::read_table_metadata(&self.file_io, &metadata_location)
+                .await
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("read metadata from {}: {}", metadata_location, e),
+                    )
+                })?;
 
         self.build_table(table.clone(), metadata, metadata_location)
     }
@@ -1073,14 +1075,15 @@ impl Catalog for HadoopFileSystemCatalog {
     /// Register an existing table that already has metadata written at
     /// `metadata_location`.
     async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
+        let metadata =
+            crate::schema_preflight::read_table_metadata(&self.file_io, &metadata_location)
+                .await
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("read metadata from {}: {}", metadata_location, e),
+                    )
+                })?;
 
         let key = Self::table_key(table);
         self.tables

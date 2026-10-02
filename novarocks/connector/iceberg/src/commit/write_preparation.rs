@@ -79,12 +79,13 @@ pub(crate) fn prepare_write(
             "admitted Iceberg write table is missing frozen metadata",
         )
     })?;
-    let metadata: TableMetadata = serde_json::from_str(serialized_metadata).map_err(|error| {
-        ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            format!("decode admitted Iceberg write metadata: {error}"),
-        )
-    })?;
+    let metadata: TableMetadata =
+        crate::schema_preflight::decode_table_metadata(serialized_metadata).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode admitted Iceberg write metadata: {error}"),
+            )
+        })?;
     if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml) {
         let managed = match crate::document_storage::observation::managed_marker(&metadata) {
             Ok(_) => true,
@@ -1552,8 +1553,9 @@ mod tests {
             ConnectorWriteAdmissionPurpose::OrdinaryDml,
         );
         let error = expect_error(prepare_write(request, &owner));
-        let decode_error = serde_json::from_str::<TableMetadata>("{\"not\":\"table metadata\"}")
-            .expect_err("fixture must not decode");
+        let decode_error =
+            crate::schema_preflight::decode_table_metadata("{\"not\":\"table metadata\"}")
+                .expect_err("fixture must not decode");
         assert_eq!(
             error,
             ConnectorError::new(

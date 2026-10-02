@@ -468,7 +468,7 @@ async fn read_observed_metadata(
     location: &str,
     expected: &CommittedVersionV1,
 ) -> Result<crate::iceberg::spec::TableMetadata, crate::iceberg::Error> {
-    let metadata = crate::iceberg::spec::TableMetadata::read_from(file_io, location).await?;
+    let metadata = crate::schema_preflight::read_table_metadata(file_io, location).await?;
     if metadata.uuid().to_string() != expected.table_uuid
         || metadata.last_updated_ms() != expected.last_updated_ms
         || metadata.current_snapshot_id() != expected.current_snapshot_id
