@@ -246,7 +246,8 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::NaryOr { .. }
                     | StaticExprKind::Not(_)
                     | StaticExprKind::IsNull(_)
-                    | StaticExprKind::IsNotNull(_) => {
+                    | StaticExprKind::IsNotNull(_)
+                    | StaticExprKind::Case { .. } => {
                         let mut summary = ScopedExpressionEffects::pure_value(invocation.context);
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
                             let child = *effects
@@ -304,6 +305,11 @@ impl CompiledExpressionInstance {
                 | StaticExprKind::IsNotNull(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1 => {}
+                StaticExprKind::Case {
+                    has_case_expr: false,
+                    ..
+                } if matches!(invocation.control, ControlShape::Case { simple: false, .. })
+                    && guarded::supports_result(node.data_type()) => {}
                 StaticExprKind::BoundCall { .. } => {
                     let call = checked
                         .channels()

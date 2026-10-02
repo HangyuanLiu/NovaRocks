@@ -269,6 +269,7 @@ impl FlowAuthor {
         let id = ExpressionUseId::new(self.next_use);
         self.next_use += 17;
         let definition = fragment.expressions().get(expr).unwrap();
+        let mut case_args = Vec::new();
         let (shape, args) = match &definition.kind {
             ExprKind::FunctionCall { args, .. } => (authors[&expr].shape, args.as_ref()),
             ExprKind::Value(_) | ExprKind::Literal(_) => (ControlShape::Eager, &[][..]),
@@ -279,6 +280,29 @@ impl FlowAuthor {
                 op: novarocks_physical_plan::UnaryOperator::Not,
             }
             | ExprKind::IsNull { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    case_args.push(*operand);
+                }
+                for (when, then) in when_then {
+                    case_args.extend([*when, *then]);
+                }
+                if let Some(otherwise) = else_expr {
+                    case_args.push(*otherwise);
+                }
+                (
+                    ControlShape::Case {
+                        simple: operand.is_some(),
+                        arms: u32::try_from(when_then.len()).unwrap(),
+                        has_else: else_expr.is_some(),
+                    },
+                    case_args.as_slice(),
+                )
+            }
             other => panic!("fixture lacks exact control author for {other:?}"),
         };
         let mut children = vec![];
@@ -1025,3 +1049,6 @@ fn every_guarded_evaluation_callback_preserves_primary_failure_and_never_replays
 
 #[path = "unary_tests.rs"]
 mod unary_tests;
+
+#[path = "case_tests.rs"]
+mod case_tests;

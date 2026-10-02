@@ -182,6 +182,48 @@ pub(crate) fn lower_expressions(
     finish(result, &mut work)
 }
 
+fn case_arity(
+    operand: Option<ExprId>,
+    when_then: &[(ExprId, ExprId)],
+    else_expr: Option<ExprId>,
+) -> Result<usize, ExpressionLoweringError> {
+    when_then
+        .len()
+        .checked_mul(2)
+        .and_then(|count| {
+            count.checked_add(usize::from(operand.is_some()) + usize::from(else_expr.is_some()))
+        })
+        .filter(|count| {
+            !when_then.is_empty() && *count <= novarocks_type_contract::MAX_CONTROL_USE_REFERENCES
+        })
+        .ok_or(ExpressionLoweringError::Invalid(
+            "CASE arity is invalid or exceeds the expression bound",
+        ))
+}
+
+// Constant-time access preserves the physical tuple order without cloning its
+// edge list on every dependency continuation (which would be quadratic).
+fn case_child(
+    operand: Option<ExprId>,
+    when_then: &[(ExprId, ExprId)],
+    else_expr: Option<ExprId>,
+    ordinal: usize,
+) -> Option<ExprId> {
+    if operand.is_some() && ordinal == 0 {
+        return operand;
+    }
+    let ordinal = ordinal.checked_sub(usize::from(operand.is_some()))?;
+    match when_then.get(ordinal / 2) {
+        Some(&(when, then)) => Some(if ordinal.is_multiple_of(2) {
+            when
+        } else {
+            then
+        }),
+        None if when_then.len().checked_mul(2) == Some(ordinal) => else_expr,
+        _ => None,
+    }
+}
+
 fn lower_core(
     package: &FragmentPackage,
     policy: ConstantPolicy,
@@ -219,19 +261,24 @@ fn lower_core(
                     "physical expression key differs from ID",
                 ));
             }
-            let args: &[ExprId] = match &node.kind {
-                ExprKind::Literal(_) | ExprKind::Value(_) => &[],
+            let child = match &node.kind {
+                ExprKind::Literal(_) | ExprKind::Value(_) => None,
                 ExprKind::FunctionCall { args, .. }
                 | ExprKind::Conjunction { args }
-                | ExprKind::Disjunction { args } => args,
+                | ExprKind::Disjunction { args } => args.get(next).copied(),
                 ExprKind::Unary {
                     op: novarocks_physical_plan::UnaryOperator::Not,
                     expr,
                 }
-                | ExprKind::IsNull { expr, .. } => std::slice::from_ref(expr),
+                | ExprKind::IsNull { expr, .. } => (next == 0).then_some(*expr),
+                ExprKind::Case {
+                    operand,
+                    when_then,
+                    else_expr,
+                } => case_child(*operand, when_then, *else_expr, next),
                 _ => return Err(ExpressionLoweringError::UnsupportedExpression(id)),
             };
-            if let Some(&child) = args.get(next) {
+            if let Some(child) = child {
                 let frame = stack
                     .last_mut()
                     .ok_or(ExpressionLoweringError::Invalid("missing dependency frame"))?;
@@ -353,6 +400,28 @@ fn lower_core(
                         ExprKind::IsNull { negated: false, .. } => StaticExprKind::IsNull(child),
                         ExprKind::IsNull { negated: true, .. } => StaticExprKind::IsNotNull(child),
                         _ => unreachable!("checked unary kind"),
+                    }
+                }
+                ExprKind::Case {
+                    operand,
+                    when_then,
+                    else_expr,
+                } => {
+                    let count = case_arity(*operand, when_then, *else_expr)?;
+                    let mut children = Vec::with_capacity(count);
+                    for ordinal in 0..count {
+                        let child = case_child(*operand, when_then, *else_expr, ordinal).ok_or(
+                            ExpressionLoweringError::Invalid("missing actual CASE child"),
+                        )?;
+                        children.push(*ids.get(&child).ok_or(ExpressionLoweringError::Invalid(
+                            "CASE child was not lowered",
+                        ))?);
+                        work.step()?;
+                    }
+                    StaticExprKind::Case {
+                        has_case_expr: operand.is_some(),
+                        has_else_expr: else_expr.is_some(),
+                        children,
                     }
                 }
                 ExprKind::FunctionCall { args, .. } => {
@@ -690,6 +759,63 @@ fn prepare_core(
                         0,
                     )?
                 }
+                (
+                    ExprKind::Case {
+                        operand,
+                        when_then,
+                        else_expr,
+                    },
+                    StaticExprKind::Case {
+                        has_case_expr,
+                        has_else_expr,
+                        children,
+                    },
+                ) => {
+                    let count = case_arity(*operand, when_then, *else_expr)?;
+                    let expected = ControlShape::Case {
+                        simple: operand.is_some(),
+                        arms: u32::try_from(when_then.len()).map_err(|_| {
+                            ExpressionLoweringError::Invalid("CASE arm count is not representable")
+                        })?,
+                        has_else: else_expr.is_some(),
+                    };
+                    if invocation.control != expected
+                        || *has_case_expr != operand.is_some()
+                        || *has_else_expr != else_expr.is_some()
+                        || children.len() != count
+                        || invocation.arguments.len() != count
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "actual CASE control or children differ",
+                        ));
+                    }
+                    let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
+                    for (ordinal, local_child) in children.iter().enumerate() {
+                        let source_child = case_child(*operand, when_then, *else_expr, ordinal)
+                            .ok_or(ExpressionLoweringError::Invalid(
+                                "missing actual CASE operand",
+                            ))?;
+                        let child_use = invocation.arguments[ordinal];
+                        if lowered.ids.get(&source_child) != Some(local_child)
+                            || flow.uses()[&child_use].definition != source_child
+                        {
+                            return Err(ExpressionLoweringError::Invalid(
+                                "ordered CASE occurrence differs",
+                            ));
+                        }
+                        combined = combined.join_control_argument(
+                            *effects
+                                .get(&child_use)
+                                .ok_or(ExpressionLoweringError::Invalid(
+                                    "CASE child effects were not prepared",
+                                ))?,
+                            flow,
+                            ordinal,
+                        )?;
+                        work.step()?;
+                    }
+                    combined
+                }
                 (ExprKind::Conjunction { args }, StaticExprKind::NaryAnd { args: local_args })
                 | (ExprKind::Disjunction { args }, StaticExprKind::NaryOr { args: local_args }) => {
                     let expected = if matches!(source.kind, ExprKind::Conjunction { .. }) {
@@ -934,6 +1060,7 @@ fn literal_argument(
         )
         | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
         | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
+        (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
         _ => Err(ExpressionLoweringError::Invalid(
             "unsupported call argument projection",
         )),

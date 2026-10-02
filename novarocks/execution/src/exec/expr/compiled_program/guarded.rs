@@ -75,6 +75,7 @@ struct Frame {
     children: Vec<Child>,
     routes: Vec<Option<bool>>,
     remaining: Vec<usize>,
+    matched: Vec<usize>,
     choices: Vec<Option<(usize, usize)>>,
     errors: BTreeMap<usize, RowDataError>,
     boolean: Option<BooleanRows>,
@@ -95,9 +96,15 @@ impl Frame {
         }
         let tracks_remaining = matches!(
             shape,
-            ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction
+            ControlShape::Coalesce
+                | ControlShape::Conjunction
+                | ControlShape::Disjunction
+                | ControlShape::Case { .. }
         );
-        let tracks_choices = matches!(shape, ControlShape::If | ControlShape::Coalesce);
+        let tracks_choices = matches!(
+            shape,
+            ControlShape::If | ControlShape::Coalesce | ControlShape::Case { .. }
+        );
         let mut remaining = Vec::new();
         let mut choices = Vec::new();
         if tracks_remaining {
@@ -125,6 +132,7 @@ impl Frame {
             children: Vec::new(),
             routes: Vec::new(),
             remaining,
+            matched: Vec::new(),
             choices,
             errors: BTreeMap::new(),
             boolean: None,
@@ -158,6 +166,24 @@ impl Frame {
         }
         let mut ordinals = Vec::new();
         match shape {
+            ControlShape::Case {
+                simple: false,
+                arms,
+                ..
+            } => {
+                let then = self.next < arms as usize * 2 && !self.next.is_multiple_of(2);
+                let domain = if then { &self.matched } else { &self.remaining };
+                if domain.is_empty() && self.remaining.is_empty() {
+                    return Ok(None);
+                }
+                for &ordinal in domain {
+                    ordinals.push(ordinal);
+                    work.step()?;
+                }
+            }
+            ControlShape::Case { simple: true, .. } => {
+                return Err(invalid("simple CASE requires its exact equality author"));
+            }
             ControlShape::If if self.next != 0 => {
                 let desired = self.next == 1;
                 for (ordinal, &route) in self.routes.iter().enumerate() {
@@ -197,6 +223,7 @@ impl Frame {
                 | ControlShape::Coalesce
                 | ControlShape::Conjunction
                 | ControlShape::Disjunction
+                | ControlShape::Case { .. }
         ) {
             self.children.push(child);
             return Ok(());
@@ -211,6 +238,76 @@ impl Frame {
         let value = child.value.into_value(selection, work)?;
         let ty = value.argument().array().data_type().clone();
         let output = value.materialize(selection, &ty, work)?;
+        if let ControlShape::Case {
+            simple: false,
+            arms,
+            ..
+        } = shape
+        {
+            let ordinal = self
+                .next
+                .checked_sub(1)
+                .ok_or_else(|| internal("CASE child completed before its continuation"))?;
+            if ordinal < arms as usize * 2 && ordinal.is_multiple_of(2) {
+                let booleans = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        invalid("searched CASE WHEN differs from its frozen Boolean carrier")
+                    })?;
+                let mut errors = output.errors().iter().peekable();
+                let mut remaining = Vec::with_capacity(child.ordinals.len());
+                self.matched.clear();
+                for (local, &parent) in child.ordinals.iter().enumerate() {
+                    if errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == local)
+                    {
+                        let error = errors
+                            .next()
+                            .ok_or_else(|| internal("missing CASE WHEN error"))?;
+                        self.errors
+                            .insert(parent, RowDataError::new(parent, error.message()));
+                    } else if !booleans.is_null(local) && booleans.value(local) {
+                        self.matched.push(parent);
+                    } else {
+                        remaining.push(parent);
+                    }
+                    work.step()?;
+                }
+                self.remaining = remaining;
+                work.flush()?;
+                drop(output);
+                work.flush()?;
+                return Ok(());
+            }
+            let mut errors = output.errors().iter().peekable();
+            for (local, &parent) in child.ordinals.iter().enumerate() {
+                if errors
+                    .peek()
+                    .is_some_and(|error| error.selected_ordinal() == local)
+                {
+                    let error = errors
+                        .next()
+                        .ok_or_else(|| internal("missing CASE result error"))?;
+                    self.errors
+                        .insert(parent, RowDataError::new(parent, error.message()));
+                } else {
+                    self.choices[parent] = Some((child_index, local));
+                }
+                work.step()?;
+            }
+            self.matched.clear();
+            if ordinal == arms as usize * 2 {
+                self.remaining.clear();
+            }
+            self.children.push(Child {
+                ordinals: child.ordinals,
+                value: OwnedValue::from_selected(output),
+            });
+            return Ok(());
+        }
         if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) {
             self.remaining = self
                 .boolean
@@ -474,6 +571,17 @@ pub(super) fn evaluate_tree<'a>(
                         || work.step(),
                     )?)
                 }
+                StaticExprKind::Case {
+                    has_case_expr: false,
+                    ..
+                } => assemble(
+                    &frame.children,
+                    &frame.choices,
+                    &mut frame.errors,
+                    &result_type.data_type,
+                    local_selection,
+                    work,
+                )?,
                 StaticExprKind::Not(_)
                 | StaticExprKind::IsNull(_)
                 | StaticExprKind::IsNotNull(_) => {

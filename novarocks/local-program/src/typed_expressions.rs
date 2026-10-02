@@ -136,6 +136,21 @@ impl ProgramTypedExpressions {
                         if let StaticExprKind::Constant(constant) = definition.kind() {
                             same_value(constant.value_type(), value, false, &mut work)?;
                         }
+                        if let StaticExprKind::Case {
+                            has_case_expr,
+                            has_else_expr,
+                            children,
+                        } = definition.kind()
+                        {
+                            validate_case_types(
+                                *has_case_expr,
+                                *has_else_expr,
+                                children,
+                                value,
+                                entries,
+                                &mut work,
+                            )?;
+                        }
                         if let StaticExprKind::Not(argument)
                         | StaticExprKind::IsNull(argument)
                         | StaticExprKind::IsNotNull(argument) = definition.kind()
@@ -313,6 +328,60 @@ impl ProgramTypedExpressions {
         self.types.get(&arena)?.get(definition.index())
     }
 }
+/// CASE consumes only values. Its common result domain is frozen by the
+/// source type author; this check neither coerces operands nor admits a runtime
+/// carrier implementation. Simple labels ignore only outer NULL admission.
+fn validate_case_types(
+    simple: bool,
+    has_else: bool,
+    children: &[ProgramExprId],
+    result: &FunctionValueType,
+    types: &[FunctionArgumentType],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramExpressionTypeError> {
+    let offset = usize::from(simple);
+    let pairs = children
+        .len()
+        .checked_sub(offset + usize::from(has_else))
+        .filter(|count| *count >= 2 && count % 2 == 0)
+        .ok_or(ProgramExpressionTypeError::TypeMismatch)?;
+    work.step()?;
+    let value = |id: ProgramExprId| -> Result<&FunctionValueType, ProgramExpressionTypeError> {
+        match types.get(id.index()) {
+            Some(FunctionArgumentType::Value(value)) => Ok(value),
+            _ => Err(ProgramExpressionTypeError::WrongKind),
+        }
+    };
+    let operand = if simple {
+        Some(value(children[0])?)
+    } else {
+        None
+    };
+    for arm in 0..pairs / 2 {
+        let when = value(children[offset + arm * 2])?;
+        if let Some(operand) = operand {
+            if operand.logical_type != when.logical_type {
+                return Err(ProgramExpressionTypeError::TypeMismatch);
+            }
+            same_carrier(&operand.data_type, &when.data_type, work)?;
+        } else if when.data_type != arrow_schema::DataType::Boolean
+            || when.logical_type != ValueLogicalType::Physical
+        {
+            return Err(ProgramExpressionTypeError::TypeMismatch);
+        }
+        let then = value(children[offset + arm * 2 + 1])?;
+        same_value(then, result, true, work)?;
+        work.step()?;
+    }
+    if has_else {
+        let otherwise = value(children[offset + pairs])?;
+        same_value(otherwise, result, true, work)?;
+    } else if !result.nullable {
+        return Err(ProgramExpressionTypeError::TypeMismatch);
+    }
+    Ok(())
+}
+
 fn validate(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
@@ -371,3 +440,6 @@ mod call_tests;
 
 #[cfg(test)]
 mod nary_tests;
+
+#[cfg(test)]
+mod case_tests;
