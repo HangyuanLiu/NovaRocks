@@ -29,8 +29,9 @@ use arrow::{
 };
 use novarocks_functions::{
     EvaluatedArgument, FunctionArgumentType, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PreparedPureKernel, RowDataError, ScalarEvaluationInstance, SelectedValues,
-    Selection, validate_evaluated_argument_observed, visit_selected_nulls,
+    KernelFailure, PreparedPureKernel, RowDataError, ScalarEvaluationInstance,
+    ScopedExpressionEffects, SelectedValues, Selection, validate_evaluated_argument_observed,
+    visit_selected_nulls,
 };
 use novarocks_local_program::{
     LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
@@ -53,6 +54,7 @@ pub struct CompiledExpressionInstance {
     program: Arc<LocalProgram>,
     root: ProgramExpressionRootSite,
     instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
 }
 
@@ -216,6 +218,7 @@ impl CompiledExpressionInstance {
             .ok_or_else(|| invalid("missing actual root definitions"))?;
         let mut stack = vec![(root_use, false)];
         let mut seen = BTreeSet::new();
+        let mut effects = BTreeMap::<ProgramUseRef, ScopedExpressionEffects>::new();
         while let Some((use_id, exiting)) = stack.pop() {
             work.step()?;
             let invocation = flow
@@ -224,6 +227,45 @@ impl CompiledExpressionInstance {
                 .ok_or_else(|| invalid("missing actual expression occurrence"))?;
             let occurrence = ProgramUseRef { arena, use_id };
             if exiting {
+                let node = definitions
+                    .node(invocation.definition)
+                    .ok_or_else(|| invalid("missing actual expression definition"))?;
+                let summary = match node.kind() {
+                    StaticExprKind::BoundCall { .. } => {
+                        let call = &checked.channels().expressions().resolved_calls().calls()
+                            [&ProgramCallSite::Expression(occurrence)];
+                        let summary = call.effects();
+                        summary.for_use(invocation.context).map_err(|_| {
+                            invalid("prepared call effects differ from actual occurrence")
+                        })?;
+                        summary
+                    }
+                    StaticExprKind::Constant(_)
+                    | StaticExprKind::SlotId(_)
+                    | StaticExprKind::NaryAnd { .. }
+                    | StaticExprKind::NaryOr { .. } => {
+                        let mut summary = ScopedExpressionEffects::pure_value(invocation.context);
+                        for (ordinal, child) in invocation.arguments.iter().enumerate() {
+                            let child = *effects
+                                .get(&ProgramUseRef {
+                                    arena,
+                                    use_id: *child,
+                                })
+                                .ok_or_else(|| {
+                                    invalid("missing prepared ordered operand effects")
+                                })?;
+                            summary = summary
+                                .join_control_argument(child, flow.shared_flow(), ordinal)
+                                .map_err(|_| {
+                                    invalid("operand effects differ from actual ordered context")
+                                })?;
+                            work.step()?;
+                        }
+                        summary
+                    }
+                    _ => return Err(invalid("expression has no admitted own-effect author")),
+                };
+                effects.insert(occurrence, summary);
                 continue;
             }
             if !seen.insert(use_id) {
@@ -247,6 +289,13 @@ impl CompiledExpressionInstance {
                 StaticExprKind::Constant(_) | StaticExprKind::SlotId(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.is_empty() => {}
+                StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. }
+                    if invocation.control
+                        == (if matches!(node.kind(), StaticExprKind::NaryAnd { .. }) {
+                            ControlShape::Conjunction
+                        } else {
+                            ControlShape::Disjunction
+                        }) => {}
                 StaticExprKind::BoundCall { .. } => {
                     let call = checked
                         .channels()
@@ -295,6 +344,7 @@ impl CompiledExpressionInstance {
             program,
             root,
             instances: BTreeMap::new(),
+            effects,
             failed: false,
         })
     }
@@ -408,6 +458,7 @@ impl CompiledExpressionInstance {
             input_node,
             selection,
             &mut self.instances,
+            &self.effects,
             work,
         )?;
         let root_use = snapshot.bindings()[&self.root];
@@ -453,7 +504,11 @@ fn evaluate_scalar<'a>(
     instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     work: &mut Work<'_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
-    let mut blocked = vec![false; selection.len()];
+    let mut blocked = Vec::with_capacity(selection.len());
+    for _ in 0..selection.len() {
+        blocked.push(false);
+        work.step()?;
+    }
     let mut inherited = BTreeMap::<usize, RowDataError>::new();
     for child in children {
         for error in child.errors() {
@@ -569,7 +624,11 @@ fn evaluate_scalar<'a>(
     let array = if full_call {
         array
     } else {
-        let mut indices = vec![None; selection.len()];
+        let mut indices = Vec::with_capacity(selection.len());
+        for _ in 0..selection.len() {
+            indices.push(None);
+            work.step()?;
+        }
         for (call_ordinal, &original) in active_ordinals.iter().enumerate() {
             indices[original] =
                 Some(u64::try_from(call_ordinal).map_err(|_| KernelFailure::ResourceExhausted)?);
@@ -640,3 +699,8 @@ mod guarded;
 
 #[cfg(test)]
 mod guarded_tests;
+
+mod boolean_region;
+
+#[cfg(test)]
+mod nary_tests;

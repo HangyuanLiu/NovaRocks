@@ -860,6 +860,8 @@ fn literal_argument(
         // batch happens to broadcast one scalar value (notably RAND seeds).
         (ExprKind::Value(_), StaticExprKind::SlotId(_)) => Ok(None),
         (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
+        (ExprKind::Conjunction { .. }, StaticExprKind::NaryAnd { .. })
+        | (ExprKind::Disjunction { .. }, StaticExprKind::NaryOr { .. }) => Ok(None),
         _ => Err(ExpressionLoweringError::Invalid(
             "unsupported call argument projection",
         )),

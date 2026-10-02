@@ -666,7 +666,7 @@ pub(super) fn preflight_take(
 
 // Arrow's MutableBuffer rounds bitmap reservations to 64-byte alignment.
 // This is a format/layout check, not an allocation grant or byte invoice.
-fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
+pub(super) fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
     if let Some(width) = ty.primitive_width() {
         buffer_extent(rows, width)?;
     } else if *ty != DataType::Boolean {

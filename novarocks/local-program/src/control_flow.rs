@@ -53,6 +53,13 @@ impl ProgramControlFlow {
         )
         .map(Self)
     }
+    /// Borrow the original checked neutral author for scoped effect composition.
+    /// No second flow or evaluation-use identities are reconstructed here.
+    pub const fn shared_flow(
+        &self,
+    ) -> &novarocks_type_contract::ExpressionControlFlow<ProgramExprId> {
+        &self.0
+    }
     pub fn root_use_ids(&self) -> &[ExpressionUseId] {
         self.0.root_use_ids()
     }

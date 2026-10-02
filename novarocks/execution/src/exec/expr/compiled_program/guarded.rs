@@ -18,12 +18,14 @@
 //! Iterative actual-use continuations. Owned row domains never borrow a moving
 //! frame. Kernel calls temporarily borrow one stable domain, then erase that
 //! borrow into owned values before resuming the parent continuation.
+use super::boolean_region::BooleanRows;
 use super::*;
 use arrow::{
     array::{Array, BooleanArray},
     compute::interleave,
 };
 use novarocks_local_program::{ProgramLexicalBindings, ProgramNodeId};
+use novarocks_type_contract::EvaluationDemand;
 
 pub(super) fn supports_result(ty: &DataType) -> bool {
     *ty == DataType::Boolean || ty.primitive_width().is_some()
@@ -75,20 +77,45 @@ struct Frame {
     remaining: Vec<usize>,
     choices: Vec<Option<(usize, usize)>>,
     errors: BTreeMap<usize, RowDataError>,
+    boolean: Option<BooleanRows>,
 }
 impl Frame {
     fn new(
         occurrence: ProgramUseRef,
+        shape: ControlShape,
+        result_type: &DataType,
         rows: Vec<usize>,
         parent_ordinals: Vec<usize>,
         work: &mut Work<'_>,
     ) -> Result<Self, KernelFailure> {
-        let mut remaining = Vec::with_capacity(rows.len());
-        let mut choices = Vec::with_capacity(rows.len());
-        for ordinal in 0..rows.len() {
-            remaining.push(ordinal);
-            choices.push(None);
+        if supports_result(result_type) {
+            super::super::constant_eval::fixed_interleave_extent(result_type, rows.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
             work.step()?;
+        }
+        let tracks_remaining = matches!(
+            shape,
+            ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction
+        );
+        let tracks_choices = matches!(shape, ControlShape::If | ControlShape::Coalesce);
+        let mut remaining = Vec::new();
+        let mut choices = Vec::new();
+        if tracks_remaining {
+            remaining.reserve(rows.len());
+        }
+        if tracks_choices {
+            choices.reserve(rows.len());
+        }
+        if tracks_remaining || tracks_choices {
+            for ordinal in 0..rows.len() {
+                if tracks_remaining {
+                    remaining.push(ordinal);
+                }
+                if tracks_choices {
+                    choices.push(None);
+                }
+                work.step()?;
+            }
         }
         Ok(Self {
             occurrence,
@@ -100,15 +127,33 @@ impl Frame {
             remaining,
             choices,
             errors: BTreeMap::new(),
+            boolean: None,
         })
     }
     fn next_ordinals(
-        &self,
+        &mut self,
         shape: ControlShape,
         arity: usize,
+        next_is_pure: bool,
         work: &mut Work<'_>,
     ) -> Result<Option<Vec<usize>>, KernelFailure> {
-        if self.next >= arity || (shape == ControlShape::Coalesce && self.remaining.is_empty()) {
+        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction)
+            && self.boolean.is_none()
+        {
+            self.boolean = Some(BooleanRows::new(self.rows.len(), work)?);
+        }
+        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) && !next_is_pure {
+            self.boolean
+                .as_mut()
+                .ok_or_else(|| internal("missing Boolean continuation"))?
+                .boundary(&mut self.errors, &mut self.remaining, work)?;
+        }
+        if self.next >= arity
+            || (matches!(
+                shape,
+                ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction
+            ) && self.remaining.is_empty())
+        {
             return Ok(None);
         }
         let mut ordinals = Vec::new();
@@ -122,7 +167,7 @@ impl Frame {
                     work.step()?;
                 }
             }
-            ControlShape::Coalesce => {
+            ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction => {
                 for &ordinal in &self.remaining {
                     ordinals.push(ordinal);
                     work.step()?;
@@ -141,10 +186,18 @@ impl Frame {
         &mut self,
         child: Child,
         shape: ControlShape,
+        demand: EvaluationDemand,
+        child_is_pure: bool,
         batch_rows: usize,
         work: &mut Work<'_>,
     ) -> Result<(), KernelFailure> {
-        if !matches!(shape, ControlShape::If | ControlShape::Coalesce) {
+        if !matches!(
+            shape,
+            ControlShape::If
+                | ControlShape::Coalesce
+                | ControlShape::Conjunction
+                | ControlShape::Disjunction
+        ) {
             self.children.push(child);
             return Ok(());
         }
@@ -158,6 +211,27 @@ impl Frame {
         let value = child.value.into_value(selection, work)?;
         let ty = value.argument().array().data_type().clone();
         let output = value.materialize(selection, &ty, work)?;
+        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) {
+            self.remaining = self
+                .boolean
+                .as_mut()
+                .ok_or_else(|| internal("missing Boolean continuation"))?
+                .consume(
+                    &output,
+                    &child.ordinals,
+                    shape,
+                    demand,
+                    child_is_pure,
+                    &mut self.errors,
+                    work,
+                )?;
+            // A wide Boolean region retains only row state, not every operand's
+            // selected array. Drop the consumed backing at an opaque boundary.
+            work.flush()?;
+            drop(output);
+            work.flush()?;
+            return Ok(());
+        }
         let mut child_errors = output.errors().iter().peekable();
         let mut remaining = Vec::new();
         if shape == ControlShape::If && child_index == 0 {
@@ -221,6 +295,10 @@ impl Frame {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
+)]
 pub(super) fn evaluate_tree<'a>(
     checked: &ProgramLexicalBindings,
     root: ProgramExpressionRootSite,
@@ -228,6 +306,7 @@ pub(super) fn evaluate_tree<'a>(
     input_node: ProgramNodeId,
     selection: Selection<'a>,
     instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
+    effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     work: &mut Work<'_>,
 ) -> Result<Value<'a>, KernelFailure> {
     let typed = checked.channels().expressions();
@@ -257,7 +336,19 @@ pub(super) fn evaluate_tree<'a>(
         rows.push(row);
         work.step()?;
     }
-    let mut frames = vec![Frame::new(root_use, rows, Vec::new(), work)?];
+    let root_invocation = &flow.uses()[&root_use.use_id];
+    let root_type = definitions
+        .node(root_invocation.definition)
+        .ok_or_else(|| invalid("missing actual root definition"))?
+        .data_type();
+    let mut frames = vec![Frame::new(
+        root_use,
+        root_invocation.control,
+        root_type,
+        rows,
+        Vec::new(),
+        work,
+    )?];
     while let Some(mut frame) = frames.pop() {
         work.step()?;
         let invocation = &flow.uses()[&frame.occurrence.use_id];
@@ -276,7 +367,29 @@ pub(super) fn evaluate_tree<'a>(
         let next = if frame.rows.is_empty() {
             None
         } else {
-            frame.next_ordinals(invocation.control, invocation.arguments.len(), work)?
+            let next_is_pure = invocation
+                .arguments
+                .get(frame.next)
+                .map(|child| {
+                    let occurrence = ProgramUseRef {
+                        arena: frame.occurrence.arena,
+                        use_id: *child,
+                    };
+                    effects
+                        .get(&occurrence)
+                        .ok_or_else(|| invalid("missing exact operand effects"))?
+                        .for_use(flow.uses()[child].context)
+                        .map_err(|_| invalid("operand effect context differs"))
+                        .map(|summary| summary.permits_boolean_reordering())
+                })
+                .transpose()?
+                .unwrap_or(true);
+            frame.next_ordinals(
+                invocation.control,
+                invocation.arguments.len(),
+                next_is_pure,
+                work,
+            )?
         };
         if let Some(ordinals) = next {
             let child_use = invocation.arguments[frame.next];
@@ -291,6 +404,11 @@ pub(super) fn evaluate_tree<'a>(
                     arena: frame.occurrence.arena,
                     use_id: child_use,
                 },
+                flow.uses()[&child_use].control,
+                definitions
+                    .node(flow.uses()[&child_use].definition)
+                    .ok_or_else(|| invalid("missing actual child definition"))?
+                    .data_type(),
                 rows,
                 ordinals,
                 work,
@@ -337,6 +455,25 @@ pub(super) fn evaluate_tree<'a>(
                             .ok_or_else(|| invalid("slot source ordinal is absent"))?,
                     ))
                 }
+                StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => {
+                    let state = frame
+                        .boolean
+                        .take()
+                        .ok_or_else(|| internal("missing Boolean continuation"))?;
+                    let (array, errors) = state.finish(
+                        invocation.control,
+                        invocation.context.demand,
+                        std::mem::take(&mut frame.errors),
+                        work,
+                    )?;
+                    OwnedValue::from_selected(SelectedValues::try_new_observed(
+                        local_selection,
+                        &result_type.data_type,
+                        array,
+                        errors,
+                        || work.step(),
+                    )?)
+                }
                 StaticExprKind::BoundCall { .. } => {
                     let call = &resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)];
                     match call.specialization().prepared() {
@@ -370,13 +507,22 @@ pub(super) fn evaluate_tree<'a>(
             }
         };
         if let Some(parent) = frames.last_mut() {
-            let shape = flow.uses()[&parent.occurrence.use_id].control;
+            let parent_invocation = &flow.uses()[&parent.occurrence.use_id];
+            let shape = parent_invocation.control;
+            let child_is_pure = effects
+                .get(&frame.occurrence)
+                .ok_or_else(|| invalid("missing actual child effects"))?
+                .for_use(invocation.context)
+                .map_err(|_| invalid("child effects differ from actual occurrence"))?
+                .permits_boolean_reordering();
             parent.attach(
                 Child {
                     ordinals: frame.parent_ordinals,
                     value,
                 },
                 shape,
+                parent_invocation.context.demand,
+                child_is_pure,
                 input.num_rows(),
                 work,
             )?;
