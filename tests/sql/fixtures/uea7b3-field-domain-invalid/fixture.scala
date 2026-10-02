@@ -182,7 +182,7 @@ object FieldDomainInvalidFixture {
             val field=t.schema().findField(id); require(field!=null,"Raw Parquet field is absent from the exact SDK schema")
             require(node.getRepetition().toString == (if(field.isRequired) "REQUIRED" else "OPTIONAL"),"Raw Parquet requiredness differs for exact field ID " + id)
             observed+=obj("id" -> id,"path" -> currentPath().mkString("."),"repetition" -> node.getRepetition().toString,
-              "primitive" -> (if(node.isPrimitive) node.asPrimitiveType().getPrimitiveTypeName().toString else null))
+              "primitive" -> (if(node.isPrimitive) node.asPrimitiveType().getPrimitiveTypeName().toString() else null))
             java.lang.Integer.valueOf(0)
           }
           override def message(t: MessageType,fields: java.util.List[java.lang.Integer]): java.lang.Integer = java.lang.Integer.valueOf(0)
@@ -268,7 +268,7 @@ object FieldDomainInvalidFixture {
     } finally parser.close()
     require(n!=null && java.util.Arrays.equals(mapper.writeValueAsBytes(n),bytes),"Frozen fixture receipt is not canonical compact JSON")
     require(n.isObject && n.get("record")!=null && n.get("record").asText()=="field_domain_invalid_initial" && n.get("namespace")!=null && n.get("namespace").asText()==ns && n.get("tables")!=null && n.get("tables").isArray && n.get("tables").size()==Cases.size,"Invalid exact initial fixture receipt")
-    n.get("tables").elements().asScala.zip(Cases).foreach { case(t,name) =>
+    n.get("tables").elements().asScala.zip(Cases.iterator).foreach { case(t,name) =>
       require(t.isObject && t.get("case")!=null && t.get("case").isTextual && t.get("case").asText()==name,"Frozen fixture table set/order differs")
       require(t.get("table_uuid")!=null && t.get("table_uuid").isTextual && java.util.UUID.fromString(t.get("table_uuid").asText()).toString==t.get("table_uuid").asText(),"Invalid exact frozen table UUID")
       require(t.get("snapshot")!=null && t.get("snapshot").isIntegralNumber && t.get("snapshot").canConvertToLong && t.get("snapshot").asLong()>0,"Invalid exact frozen positive snapshot")

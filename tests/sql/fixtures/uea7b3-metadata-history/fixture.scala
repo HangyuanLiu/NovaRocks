@@ -175,7 +175,7 @@ object MetadataHistoryFixture {
             val actual = RecursiveTypeFixture.facts(schema)
             actual == fields
           }, "Raw Parquet IDs/required/names/types do not match any exact retained write schema")
-          val primitive = scala.collection.mutable.Map.empty[Int, String]
+          val primitiveKindsById = scala.collection.mutable.Map.empty[Int, String]
           val visitor = new org.apache.iceberg.parquet.ParquetTypeVisitor[java.lang.Integer]() {
             import org.apache.iceberg.shaded.org.apache.parquet.schema.{GroupType, PrimitiveType, MessageType}
             override def message(t: MessageType, children: java.util.List[java.lang.Integer]): java.lang.Integer = java.lang.Integer.valueOf(0)
@@ -184,13 +184,13 @@ object MetadataHistoryFixture {
             override def map(t: GroupType, key: java.lang.Integer, value: java.lang.Integer): java.lang.Integer = java.lang.Integer.valueOf(0)
             override def primitive(t: PrimitiveType): java.lang.Integer = {
               require(t.getId() != null && t.getId().intValue() > 0)
-              primitive.put(t.getId().intValue(), t.getPrimitiveTypeName().toString()); java.lang.Integer.valueOf(0)
+              primitiveKindsById.put(t.getId().intValue(), t.getPrimitiveTypeName().toString()); java.lang.Integer.valueOf(0)
             }
           }
           org.apache.iceberg.parquet.ParquetTypeVisitor.visit(raw, visitor)
-          fields.filter(_.kind == "INTEGER").foreach(f => require(primitive.get(f.id).contains("INT32"),
+          fields.filter(_.kind == "INTEGER").foreach(f => require(primitiveKindsById.get(f.id).contains("INT32"),
             "A narrow/ordinary INTEGER leaf is not physically standard INT32"))
-          fields.filter(_.kind == "STRING").foreach(f => require(primitive.get(f.id).contains("BINARY"),
+          fields.filter(_.kind == "STRING").foreach(f => require(primitiveKindsById.get(f.id).contains("BINARY"),
             "A Json/ordinary STRING leaf is not physically standard Parquet BINARY"))
         } finally reader.close()
       } finally java.nio.file.Files.deleteIfExists(local)
