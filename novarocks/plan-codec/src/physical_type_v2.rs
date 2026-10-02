@@ -203,7 +203,10 @@ fn clone_carrier(
     })
 }
 
-fn validate_field(field: &Field, work: &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError> {
+pub(crate) fn validate_field(
+    field: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
     use novarocks_type_contract::{
         MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
         MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
@@ -245,7 +248,10 @@ fn validate_field(field: &Field, work: &mut CompileCheckpoints<'_>) -> Result<()
     Ok(())
 }
 
-fn validate_type(ty: &DataType, work: &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError> {
+pub(crate) fn validate_type(
+    ty: &DataType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
     validate_value_type_structure_observed(ty, |visit| {
         work.step()?;
         match visit {

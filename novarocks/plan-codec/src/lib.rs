@@ -19,6 +19,7 @@
 //! boundary. The encoder consumes a completed physical plan and exact frozen
 //! provider facts. It has no SQL compiler or Frontend runtime dependency.
 
+pub mod ipc_schema_v2;
 pub mod native_type;
 mod native_type_encode;
 pub mod physical_control_v2;
