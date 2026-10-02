@@ -257,6 +257,7 @@ pub struct Builder {
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
+    receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams due to protocol error across
     /// the lifetime of the connection.
@@ -413,6 +414,22 @@ where
                 };
             }
         };
+        let goaway_pool = match builder
+            .receive_goaway_buffer_pool
+            .as_ref()
+            .map(|pool| pool.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
+            .transpose()
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
         let receive_frame_buffer = match builder
             .receive_frame_buffer
             .as_ref()
@@ -446,6 +463,9 @@ where
 
         if let Some(pool) = receive_pool {
             codec.set_receive_pool(pool);
+        }
+        if let Some(pool) = goaway_pool {
+            codec.set_goaway_pool(pool);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {
@@ -725,6 +745,7 @@ impl Builder {
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             receive_frame_buffer: None,
+            receive_goaway_buffer_pool: None,
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
@@ -1086,6 +1107,18 @@ impl Builder {
     pub fn max_receive_header_block_size(&mut self, max: usize) -> &mut Self {
         assert!(max > 0 && max <= u32::MAX as usize);
         self.max_receive_header_block_size = Some(max);
+        self
+    }
+
+    /// Supply independent retained GOAWAY diagnostic backing under its original
+    /// owner. One pool binds once before I/O and must cover the local frame max.
+    /// Debug bytes are preserved exactly. Exhaustion requests ENHANCE_YOUR_CALM
+    /// before copying, without waiting for errors still retained by this connection
+    /// or callers. Existing remote-error precedence is unchanged. Empty debug uses
+    /// no pool position. Default None is unchanged.
+    /// This does not bound other transport/error allocations or physical close time.
+    pub fn receive_goaway_buffer_pool(&mut self, pool: crate::ReceiveBufferPool) -> &mut Self {
+        self.receive_goaway_buffer_pool = Some(pool);
         self
     }
 

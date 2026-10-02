@@ -495,6 +495,15 @@ where
         self
     }
 
+    /// Supply independent fixed GOAWAY debug backing, retained through its last
+    /// error alias. One pool binds once; exhaustion closes before another copy.
+    /// Default None preserves upstream behavior. Other connection owners remain
+    /// separate; cloned builders retain the same original pool.
+    pub fn receive_goaway_buffer_pool(&mut self, pool: h2::ReceiveBufferPool) -> &mut Self {
+        self.h2_builder.receive_goaway_buffer_pool = Some(pool);
+        self
+    }
+
     /// Supplies fixed raw frame input backing through its original owner.
     /// One buffer binds once to a connection and must cover its local frame
     /// maximum. Decoded copies, headers/continuations and other transport

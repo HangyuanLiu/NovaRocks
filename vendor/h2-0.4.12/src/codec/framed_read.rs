@@ -35,6 +35,7 @@ pub struct FramedRead<T> {
     partial: Option<Partial>,
     max_header_block_size: Option<usize>,
     receive_pool: Option<crate::ReceiveBufferPool>,
+    goaway_pool: Option<crate::ReceiveBufferPool>,
 }
 
 enum ReadKind<T> {
@@ -99,6 +100,7 @@ impl<T> FramedRead<T> {
             partial: None,
             max_header_block_size: None,
             receive_pool: None,
+            goaway_pool: None,
         }
     }
 
@@ -120,6 +122,11 @@ impl<T> FramedRead<T> {
     pub fn set_receive_pool(&mut self, pool: crate::ReceiveBufferPool) {
         assert!(self.max_frame_size() <= pool.buffer_capacity_bytes());
         self.receive_pool = Some(pool);
+    }
+
+    pub(crate) fn set_goaway_pool(&mut self, pool: crate::ReceiveBufferPool) {
+        assert!(self.max_frame_size() <= pool.buffer_capacity_bytes());
+        self.goaway_pool = Some(pool);
     }
 
     /// Limit a complete encoded block and each decoded field before allocation.
@@ -144,6 +151,9 @@ impl<T> FramedRead<T> {
     #[inline]
     pub fn set_max_frame_size(&mut self, val: usize) {
         if let Some(pool) = &self.receive_pool {
+            assert!(val <= pool.buffer_capacity_bytes());
+        }
+        if let Some(pool) = &self.goaway_pool {
             assert!(val <= pool.buffer_capacity_bytes());
         }
         assert!(DEFAULT_MAX_FRAME_SIZE as usize <= val && val <= MAX_MAX_FRAME_SIZE as usize);
@@ -191,6 +201,7 @@ fn decode_frame(
     max_continuation_frames: usize,
     max_header_block_size: Option<usize>,
     partial_inout: &mut Option<Partial>,
+    goaway_pool: Option<&crate::ReceiveBufferPool>,
     mut bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
@@ -321,7 +332,21 @@ fn decode_frame(
             .into()
         }
         Kind::GoAway => {
-            let res = frame::GoAway::load(&bytes[frame::HEADER_LEN..]);
+            let payload = &bytes[frame::HEADER_LEN..];
+            let res = match goaway_pool {
+                Some(pool) if payload.len() >= 8 => {
+                    let debug = if payload.len() == 8 {
+                        bytes::Bytes::new()
+                    } else {
+                        pool.try_copy_payload(&payload[8..]).ok_or_else(|| {
+                            proto_err!(conn: "retained GO_AWAY diagnostic backing exhausted");
+                            Error::library_go_away(Reason::ENHANCE_YOUR_CALM)
+                        })?
+                    };
+                    frame::GoAway::load_with_debug_data(payload, debug)
+                }
+                _ => frame::GoAway::load(payload),
+            };
             res.map_err(|e| {
                 proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
@@ -488,6 +513,7 @@ where
                 ref mut partial,
                 max_continuation_frames,
                 max_header_block_size,
+                ref goaway_pool,
                 ..
             } = *self;
             if let Some(mut frame) = decode_frame(
@@ -496,6 +522,7 @@ where
                 max_continuation_frames,
                 max_header_block_size,
                 partial,
+                goaway_pool.as_ref(),
                 bytes,
             )? {
                 if let (Some(pool), Frame::Data(data)) = (&self.receive_pool, &mut frame) {

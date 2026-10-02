@@ -45,10 +45,15 @@ impl GoAway {
             return Err(Error::BadFrameSize);
         }
 
+        Self::load_with_debug_data(payload, Bytes::copy_from_slice(&payload[8..]))
+    }
+
+    pub(crate) fn load_with_debug_data(payload: &[u8], debug_data: Bytes) -> Result<GoAway, Error> {
+        if payload.len() < 8 {
+            return Err(Error::BadFrameSize);
+        }
         let (last_stream_id, _) = StreamId::parse(&payload[..4]);
         let error_code = unpack_octets_4!(payload, 4, u32);
-        let debug_data = Bytes::copy_from_slice(&payload[8..]);
-
         Ok(GoAway {
             last_stream_id,
             error_code: error_code.into(),

@@ -78,6 +78,10 @@ impl<T, B> Codec<T, B> {
         self.inner.set_receive_pool(pool);
     }
 
+    pub(crate) fn set_goaway_pool(&mut self, pool: crate::ReceiveBufferPool) {
+        self.inner.set_goaway_pool(pool);
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other

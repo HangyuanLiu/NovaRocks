@@ -27,3 +27,8 @@ Client/server connection builders expose max_receive_header_block_size(max), pre
 ## Fixed raw input forwarding
 
 Client/server connection builders expose receive_frame_buffer(h2::ReceiveFrameBuffer), default None. Config clones retain the same original strong-only owner; the exact handle is forwarded before h2 handshake and binds once. Native reconnect paths will need a fresh funded buffer per physical connection. Real cloned Hyper tests check the actual first nine-byte header read and fixed input address range, while independent source probes cover physical raw deallocation. The separate emitted frame copy, GOAWAY/header aliases and complete Native connection budget remain outside this forwarding slice. No product setup or performance claim is made.
+
+
+## GOAWAY debug pool forwarding
+
+Client/server connection builders expose receive_goaway_buffer_pool(h2::ReceiveBufferPool), default None, forwarding the exact original pool through cloned Config before handshake. A fresh pool is required for each physical reconnect. Real cloned Hyper tests retain the h2 error source after connection/executor/builder/pool exit, and confirm the original Worker grant remains held through the last error alias. Debug bytes are preserved; underlying h2 error precedence is unchanged. Pool refusal does not prove bounded flush or physical connection exit, and this API does not bound error-box/task metadata or install the complete Native profile.

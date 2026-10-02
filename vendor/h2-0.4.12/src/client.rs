@@ -328,6 +328,7 @@ pub struct Builder {
     max_receive_buffered_events: Option<usize>,
     receive_buffer_pool: Option<crate::ReceiveBufferPool>,
     receive_frame_buffer: Option<crate::ReceiveFrameBuffer>,
+    receive_goaway_buffer_pool: Option<crate::ReceiveBufferPool>,
 
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
@@ -665,6 +666,7 @@ impl Builder {
             max_receive_buffered_events: None,
             receive_buffer_pool: None,
             receive_frame_buffer: None,
+            receive_goaway_buffer_pool: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -1134,6 +1136,18 @@ impl Builder {
         self
     }
 
+    /// Supply independent retained GOAWAY diagnostic backing under its original
+    /// owner. One pool binds once before I/O and must cover the local frame max.
+    /// Debug bytes are preserved exactly. Exhaustion requests ENHANCE_YOUR_CALM
+    /// before copying, without waiting for errors still retained by this connection
+    /// or callers. Existing remote-error precedence is unchanged. Empty debug uses
+    /// no pool position. Default None is unchanged.
+    /// This does not bound other transport/error allocations or physical close time.
+    pub fn receive_goaway_buffer_pool(&mut self, pool: crate::ReceiveBufferPool) -> &mut Self {
+        self.receive_goaway_buffer_pool = Some(pool);
+        self
+    }
+
     /// Supply fixed raw frame input backing under its original owner.
     /// One buffer binds once, and its capacity must cover the local frame maximum.
     /// Reuse/geometry conflicts fail before handshake I/O. Decoded frame copies,
@@ -1408,6 +1422,12 @@ where
             .map(|pool| pool.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
             .transpose()
             .map_err(crate::Error::from_io)?;
+        let goaway_pool = builder
+            .receive_goaway_buffer_pool
+            .as_ref()
+            .map(|pool| pool.bind(builder.settings.max_frame_size().unwrap_or(16384) as usize))
+            .transpose()
+            .map_err(crate::Error::from_io)?;
         let receive_frame_buffer = builder
             .receive_frame_buffer
             .as_ref()
@@ -1433,6 +1453,9 @@ where
 
         if let Some(pool) = receive_pool {
             codec.set_receive_pool(pool);
+        }
+        if let Some(pool) = goaway_pool {
+            codec.set_goaway_pool(pool);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {

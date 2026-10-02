@@ -1,4 +1,4 @@
-//! Fixed retained DATA backing for one opt-in HTTP/2 connection.
+//! Fixed retained payload backing for one opt-in HTTP/2 connection.
 
 use atomic_waker::AtomicWaker;
 use bytes::Bytes;
@@ -34,13 +34,15 @@ struct Core {
     _ownership: Bytes,
 }
 
-/// Preallocated, fixed DATA buffers whose positions last through the final
+/// Preallocated, fixed payload buffers whose positions last through the final
 /// escaping Bytes alias and its owner wrapper's actual deallocation.
 ///
 /// One pool binds once to one connection. The caller must obtain funding for
 /// the complete allocation bound before constructing this pool, and supply
 /// its original physical-exit ownership carrier. The carrier is retained until
-/// every buffer, wrapper, pool object and escaping DATA alias physically exits.
+/// every buffer, wrapper, pool object and escaping payload alias physically exits.
+/// DATA and GOAWAY use distinct once-bound pools: DATA waits before another frame
+/// read, whereas nonempty GOAWAY debug refuses before copying when its pool is full.
 /// This does not fund or bound the codec's original read buffer, HPACK, headers,
 /// write buffers, streams, task allocations or caller carrier metadata.
 pub struct ReceiveBufferPool {
@@ -48,7 +50,7 @@ pub struct ReceiveBufferPool {
 }
 
 impl ReceiveBufferPool {
-    /// A conservative Rust allocation bound for the fixed pool, all DATA
+    /// A conservative Rust allocation bound for the fixed pool, all payload
     /// buffers and the maximum simultaneously live/retiring Bytes wrappers.
     /// Caller ownership-carrier metadata and task Waker targets are separate.
     /// No allocator caches or whole-process RSS are included.
@@ -101,7 +103,7 @@ impl ReceiveBufferPool {
         self.core().slots.len()
     }
 
-    /// The complete capacity of each retained DATA buffer, independent of its
+    /// The complete capacity of each retained payload buffer, independent of its
     /// current visible payload length.
     pub fn buffer_capacity_bytes(&self) -> usize {
         self.core().block_bytes
@@ -147,18 +149,24 @@ impl ReceiveBufferPool {
     }
 
     pub(crate) fn copy_data(&self, data: &[u8]) -> Bytes {
+        self.try_copy_payload(data)
+            .expect("DATA parser must have a free backing position before reading")
+    }
+
+    /// The single bound parser may refuse another diagnostic without waiting.
+    /// No payload copy or wrapper allocation occurs until a position is acquired.
+    pub(crate) fn try_copy_payload(&self, data: &[u8]) -> Option<Bytes> {
         assert!(data.len() <= self.buffer_capacity_bytes());
-        let (index, slot) = self
-            .core()
-            .slots
-            .iter()
-            .enumerate()
-            .find(|(_, slot)| {
-                slot.state
-                    .compare_exchange(FREE, CHECKED_OUT, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            })
-            .expect("DATA parser must have a free backing position before reading");
+        // FREE is published before available is incremented by the exit guard.
+        // Observe the count first so that transient FREE cannot underflow it.
+        if self.available_buffers() == 0 {
+            return None;
+        }
+        let (index, slot) = self.core().slots.iter().enumerate().find(|(_, slot)| {
+            slot.state
+                .compare_exchange(FREE, CHECKED_OUT, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })?;
         let previous = self.core().available.fetch_sub(1, Ordering::AcqRel);
         assert!(previous > 0);
         // SAFETY: The successful CAS grants this single parser exclusive
@@ -166,7 +174,7 @@ impl ReceiveBufferPool {
         let mut buffer = unsafe { (&mut *slot.buffer.get()).take().unwrap() };
         buffer.clear();
         buffer.extend_from_slice(data);
-        Bytes::from_owner_with_exit_guard(
+        Some(Bytes::from_owner_with_exit_guard(
             PoolBuffer {
                 buffer: Some(buffer),
                 index,
@@ -176,7 +184,7 @@ impl ReceiveBufferPool {
                 index,
                 pool: Some(self.clone()),
             },
-        )
+        ))
     }
 }
 
