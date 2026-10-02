@@ -40,7 +40,9 @@ use crate::commit::write_shared::{
     exact_requested_write_fields_at_schema, snapshot_token, write_target_schema,
     write_target_snapshot_id,
 };
-use crate::file_reader::execution_payload::{decode_payload, encode_payload};
+use crate::file_reader::execution_payload::{
+    decode_table_payload as decode_payload, encode_payload,
+};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::metadata::{IcebergTablePayload, metadata_arrow_fields, projected_schema};
 
@@ -1512,6 +1514,10 @@ mod tests {
 
     #[test]
     fn real_row_mutation_pins_scalar_domains_to_the_resolved_old_or_current_schema() {
+        let field = |name: &str, id: i32, ty, nullable| {
+            Field::new(name, ty, nullable)
+                .with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())
+        };
         let owner = owner();
         let metadata = scalar_integer_metadata_with_older_base_schema();
         for (target_ref, snapshot, expected) in [
@@ -1519,17 +1525,17 @@ mod tests {
                 "dev",
                 41,
                 vec![
-                    Field::new("id", DataType::Int8, false),
-                    Field::new("name", DataType::Int16, true),
+                    field("id", 1, DataType::Int8, false),
+                    field("name", 2, DataType::Int16, true),
                 ],
             ),
             (
                 "main",
                 42,
                 vec![
-                    Field::new("wide", DataType::Int64, false),
-                    Field::new("renamed", DataType::Int16, true),
-                    Field::new("later", DataType::Int32, true),
+                    field("wide", 1, DataType::Int64, false),
+                    field("renamed", 2, DataType::Int16, true),
+                    field("later", 3, DataType::Int32, true),
                 ],
             ),
         ] {

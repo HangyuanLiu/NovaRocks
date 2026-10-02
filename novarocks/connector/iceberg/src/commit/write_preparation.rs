@@ -42,7 +42,7 @@ use crate::commit::write_shared::{
     exact_requested_write_fields, invalid_write_activation, snapshot_token,
     write_target_snapshot_id,
 };
-use crate::file_reader::execution_payload::decode_payload;
+use crate::file_reader::execution_payload::decode_table_payload as decode_payload;
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::metadata::IcebergTablePayload;
 use crate::row_lineage_synth::{is_iceberg_last_updated_sequence_number, is_iceberg_row_id};

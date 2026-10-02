@@ -24,6 +24,13 @@ const MAX_JSON_VALUES: usize = 131_072;
 
 #[derive(Clone, Copy)]
 enum Role {
+    ProviderEnvelope,
+    ProviderTableValue,
+    ProviderTableInfo,
+    ProviderSchema,
+    ProviderSchemaRoot,
+    ProviderFields(usize),
+    ProviderField(usize),
     RestTable,
     Metadata,
     Schemas,
@@ -67,6 +74,22 @@ pub(crate) fn preflight_rest_table_response(bytes: &[u8]) -> Result<(), String> 
     let json = std::str::from_utf8(bytes)
         .map_err(|_| "Iceberg table response preflight: invalid UTF-8".to_string())?;
     preflight(json, Role::RestTable, false)
+}
+
+/// Frozen provider handles carry a field-ID/name tree independently of the
+/// serialized SDK metadata. Check that tree before serde allocates its nodes.
+/// Ordinary envelope values retain serde's existing recursion boundary.
+pub(crate) fn decode_provider_payload<T: for<'de> serde::Deserialize<'de>>(
+    bytes: &[u8],
+) -> Result<T, String> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|_| "Iceberg provider payload preflight: invalid UTF-8".to_string())?;
+    preflight(json, Role::ProviderEnvelope, false)?;
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    decoder.disable_recursion_limit();
+    let payload = T::deserialize(&mut decoder).map_err(|error| error.to_string())?;
+    decoder.end().map_err(|error| error.to_string())?;
+    Ok(payload)
 }
 
 pub(crate) fn decode_table_metadata(
@@ -119,12 +142,18 @@ fn preflight(json: &str, root: Role, count_root: bool) -> Result<(), String> {
         nodes: 0,
         names: 0,
         values: 0,
-        json_depth_limit: if matches!(root, Role::Metadata | Role::RestTable) {
+        json_depth_limit: if matches!(
+            root,
+            Role::Metadata | Role::RestTable | Role::ProviderEnvelope
+        ) {
             127
         } else {
             MAX_JSON_DEPTH
         },
-        json_value_limit: if matches!(root, Role::Metadata | Role::RestTable) {
+        json_value_limit: if matches!(
+            root,
+            Role::Metadata | Role::RestTable | Role::ProviderEnvelope
+        ) {
             None
         } else {
             Some(MAX_JSON_VALUES)
@@ -328,7 +357,7 @@ impl<'a> Scan<'a> {
     fn value(&mut self, role: Role, json_depth: usize) -> Result<(), String> {
         // The envelope may contain optional V1 `schema`/`schemas`. Every
         // non-null schema restarts the existing independent shape budgets.
-        if matches!(role, Role::OptionalSchema) {
+        if matches!(role, Role::OptionalSchema | Role::ProviderSchema) {
             self.space();
             if self.bytes.get(self.offset) != Some(&b'n') {
                 let saved = (
@@ -343,7 +372,12 @@ impl<'a> Scan<'a> {
                 self.values = 0;
                 self.json_depth_limit = MAX_JSON_DEPTH;
                 self.json_value_limit = Some(MAX_JSON_VALUES);
-                let result = self.value(Role::Root, 0);
+                let root = if matches!(role, Role::ProviderSchema) {
+                    Role::ProviderSchemaRoot
+                } else {
+                    Role::Root
+                };
+                let result = self.value(root, 0);
                 (
                     self.nodes,
                     self.names,
@@ -364,7 +398,7 @@ impl<'a> Scan<'a> {
         {
             return Err("Iceberg schema preflight: independent JSON budget exceeded".into());
         }
-        if let Role::Field(depth) = role {
+        if let Role::Field(depth) | Role::ProviderField(depth) = role {
             self.node(depth, 0)?;
         }
         self.space();
@@ -372,6 +406,14 @@ impl<'a> Scan<'a> {
             .bytes
             .get(self.offset)
             .ok_or("Iceberg schema preflight: missing value")?;
+        let role = match (role, byte) {
+            (Role::ProviderTableValue, b'{') => Role::ProviderEnvelope,
+            (Role::ProviderTableValue, b'"') | (Role::ProviderTableInfo, b'n') => Role::Opaque,
+            (Role::ProviderTableValue, _) => {
+                return Err("Iceberg provider payload preflight: invalid table shape".into());
+            }
+            _ => role,
+        };
         if self.json_value_limit.is_none()
             && matches!(byte, b'{' | b'[')
             && json_depth >= self.json_depth_limit
@@ -382,9 +424,16 @@ impl<'a> Scan<'a> {
         }
         if matches!(
             role,
-            Role::RestTable | Role::Metadata | Role::Root | Role::Field(_)
+            Role::RestTable
+                | Role::Metadata
+                | Role::Root
+                | Role::Field(_)
+                | Role::ProviderSchemaRoot
+                | Role::ProviderField(_)
+                | Role::ProviderEnvelope
+                | Role::ProviderTableInfo
         ) && byte != b'{'
-            || matches!(role, Role::Fields(_)) && byte != b'['
+            || matches!(role, Role::Fields(_) | Role::ProviderFields(_)) && byte != b'['
             || matches!(role, Role::Schemas) && byte != b'[' && byte != b'n'
         {
             return Err("Iceberg schema preflight: invalid semantic shape".into());
@@ -401,12 +450,39 @@ impl<'a> Scan<'a> {
                 }
                 loop {
                     let (key, escaped, _) = self.string()?;
-                    if escaped && !matches!(role, Role::Opaque | Role::Metadata | Role::RestTable) {
+                    if escaped
+                        && !matches!(
+                            role,
+                            Role::Opaque
+                                | Role::Metadata
+                                | Role::RestTable
+                                | Role::ProviderEnvelope
+                                | Role::ProviderTableInfo
+                                | Role::ProviderSchemaRoot
+                                | Role::ProviderField(_)
+                        )
+                    {
                         return Err("Iceberg schema preflight: noncanonical grammar key".into());
                     }
                     // Keys borrow the input, so no field vector or SDK index
                     // exists while semantic child budgets are being checked.
                     let next = match (role, key) {
+                        (Role::ProviderEnvelope, _) if metadata_key_eq(key, b"table_info") => {
+                            Role::ProviderTableInfo
+                        }
+                        (Role::ProviderEnvelope, _) if metadata_key_eq(key, b"table") => {
+                            Role::ProviderTableValue
+                        }
+                        (Role::ProviderTableInfo, _) if metadata_key_eq(key, b"schema") => {
+                            Role::ProviderSchema
+                        }
+                        (Role::ProviderSchemaRoot, _) if metadata_key_eq(key, b"fields") => {
+                            Role::ProviderFields(1)
+                        }
+                        (Role::ProviderField(depth), _) if metadata_key_eq(key, b"children") => {
+                            Role::ProviderFields(depth + 1)
+                        }
+                        (Role::ProviderField(_), _) if metadata_key_eq(key, b"name") => Role::Name,
                         (Role::RestTable, _) if metadata_key_eq(key, b"metadata") => Role::Metadata,
                         (Role::Metadata, _) if legacy_schema && metadata_key_eq(key, b"schema") => {
                             Role::OptionalSchema
@@ -456,6 +532,7 @@ impl<'a> Scan<'a> {
                     let next = match role {
                         Role::Schemas => Role::OptionalSchema,
                         Role::Fields(depth) => Role::Field(depth),
+                        Role::ProviderFields(depth) => Role::ProviderField(depth),
                         _ => Role::Opaque,
                     };
                     self.value(next, json_depth + 1)?;
@@ -543,6 +620,100 @@ fn metadata_key_eq(raw: &[u8], expected: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider_info(depth: usize) -> String {
+        let mut field = r#"{"field_id":64,"name":"leaf","initial_default_json":null,"write_default_json":null,"children":[]}"#.to_string();
+        for id in (1..depth).rev() {
+            field = format!(
+                r#"{{"field_id":{id},"name":"n{id}","initial_default_json":null,"write_default_json":null,"children":[{field}]}}"#
+            );
+        }
+        format!(
+            r#"{{"catalog":"c","namespace":"n","table":"t","table_uuid":null,"current_snapshot_id":null,"schema_id":0,"location":"s3://bucket/table","schema":{{"fields":[{field}]}},"serialized_metadata":null,"serialized_metadata_rows":null}}"#
+        )
+    }
+
+    #[test]
+    fn provider_payload_preflight_accepts_exact_depth64_table_and_scan_trees() {
+        #[derive(serde::Deserialize)]
+        struct Table {
+            table_info: crate::scan_model::IcebergTableInfo,
+        }
+        #[derive(serde::Deserialize)]
+        struct Scan {
+            table: Table,
+        }
+        let table = format!(r#"{{"table":"t","table_info":{}}}"#, provider_info(64));
+        assert!(serde_json::from_str::<Table>(&table).is_err());
+        let decoded: Table = decode_provider_payload(table.as_bytes()).unwrap();
+        assert_eq!(decoded.table_info.schema.fields[0].field_id, 1);
+        let scan = format!(r#"{{"table":{table}}}"#);
+        let decoded: Scan = decode_provider_payload(scan.as_bytes()).unwrap();
+        assert_eq!(decoded.table.table_info.schema.fields[0].name, "n1");
+        for payload in [
+            format!(r#"{{"table_info":{}}}"#, provider_info(65)),
+            format!(r#"{{"table":{{"table_info":{}}}}}"#, provider_info(65)),
+        ] {
+            assert!(
+                decode_provider_payload::<serde_json::Value>(payload.as_bytes())
+                    .unwrap_err()
+                    .contains("semantic budget")
+            );
+        }
+    }
+
+    #[test]
+    fn provider_payload_preflight_bounds_fields_and_preserves_opaque_recursion() {
+        let leaf = r#"{"field_id":1,"name":"n","children":[]}"#;
+        for (count, accepted) in [(4096, true), (4097, false)] {
+            let fields = vec![leaf; count].join(",");
+            let payload = format!(r#"{{"table_info":{{"schema":{{"fields":[{fields}]}}}}}}"#);
+            assert_eq!(
+                preflight(&payload, Role::ProviderEnvelope, false).is_ok(),
+                accepted
+            );
+        }
+        for (depth, accepted) in [(126, true), (127, false)] {
+            let opaque = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let payload = format!(r#"{{"ignored":{opaque}}}"#);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&payload).is_ok(),
+                accepted
+            );
+            assert_eq!(
+                decode_provider_payload::<serde_json::Value>(payload.as_bytes()).is_ok(),
+                accepted
+            );
+        }
+        let escaped = format!(r#"{{"table_\u0069nfo":{}}}"#, provider_info(64));
+        assert!(decode_provider_payload::<serde_json::Value>(escaped.as_bytes()).is_ok());
+        let mut trailing = escaped.into_bytes();
+        trailing.extend_from_slice(b" false");
+        assert!(decode_provider_payload::<serde_json::Value>(&trailing).is_err());
+        assert!(decode_provider_payload::<serde_json::Value>(b"\xff").is_err());
+    }
+
+    #[test]
+    fn provider_payload_preflight_rejects_sequence_form_budget_bypasses() {
+        let field = r#"{"field_id":1,"name":"n","initial_default_json":null,"write_default_json":null,"children":[]}"#;
+        let fields = vec![field; 4097].join(",");
+        let info =
+            format!(r#"["c","n","t",null,null,0,"s3://b/t",{{"fields":[{fields}]}},null,null]"#);
+        // Derived serde permits positional structs, but our frozen producer
+        // emits named objects. Positional data must not evade shape budgets.
+        assert!(serde_json::from_str::<crate::scan_model::IcebergTableInfo>(&info).is_ok());
+        for payload in [
+            format!(r#"{{"table_info":{info}}}"#),
+            format!(r#"{{"table":{{"table_info":{info}}}}}"#),
+            format!(r#"[{info}]"#),
+            format!(r#"{{"table":[{info}]}}"#),
+            r#"{"table_info":{"schema":[[]]}}"#.to_string(),
+            r#"{"table_info":{"schema":{"fields":[[1,"n",null,null,[]]]}}}"#.to_string(),
+        ] {
+            assert!(decode_provider_payload::<serde_json::Value>(payload.as_bytes()).is_err());
+        }
+        assert!(decode_provider_payload::<serde_json::Value>(b"{\"table_info\":null}").is_ok());
+    }
 
     fn table_metadata_json(depth: usize) -> String {
         table_metadata_json_version(depth, crate::iceberg::spec::FormatVersion::V2)

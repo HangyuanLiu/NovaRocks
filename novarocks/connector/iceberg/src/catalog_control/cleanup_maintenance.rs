@@ -451,7 +451,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             ));
         }
         let target: IcebergTablePayload =
-            serde_json::from_slice(request.operation().table().payload())
+            crate::schema_preflight::decode_provider_payload(request.operation().table().payload())
                 .map_err(|error| invalid(format!("decode Iceberg cleanup table: {error}")))?;
         if request.operation().table().owner() != &self.key.instance_id
             || target.metadata_table_type.is_some()

@@ -913,12 +913,14 @@ fn decoded_table_generation(
             "Iceberg storage inspection metadata does not belong to the retained generation",
         ));
     }
-    let payload: TableHandlePayload =
-        serde_json::from_slice(metadata.table.payload()).map_err(|error| {
-            corrupt(format!(
-                "decode Iceberg table handle for storage inspection: {error}"
-            ))
-        })?;
+    let payload: TableHandlePayload = crate::schema_preflight::decode_provider_payload(
+        metadata.table.payload(),
+    )
+    .map_err(|error| {
+        corrupt(format!(
+            "decode Iceberg table handle for storage inspection: {error}"
+        ))
+    })?;
     if payload.namespace != metadata.identity.namespace.as_ref()
         || payload.table != metadata.identity.table.as_ref()
     {

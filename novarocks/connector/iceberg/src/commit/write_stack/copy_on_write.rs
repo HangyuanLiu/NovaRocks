@@ -483,7 +483,7 @@ fn validate_match_contract(
         ));
     }
     let payload: crate::metadata::IcebergTablePayload =
-        crate::file_reader::execution_payload::decode_payload(
+        crate::file_reader::execution_payload::decode_table_payload(
             contract.table().payload(),
             "copy-on-write match contract table",
         )?;

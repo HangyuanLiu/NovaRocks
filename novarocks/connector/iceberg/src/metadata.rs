@@ -2067,7 +2067,7 @@ fn decode_payload<T: for<'de> Deserialize<'de>>(
     payload: &[u8],
     subject: &str,
 ) -> Result<T, ConnectorError> {
-    serde_json::from_slice(payload).map_err(|error| {
+    crate::schema_preflight::decode_provider_payload(payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             format!("decode Iceberg {subject}: {error}"),
