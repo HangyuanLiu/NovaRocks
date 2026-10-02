@@ -978,3 +978,31 @@ fn unused_incoming_dictionary_field_id_and_order_drift_is_rejected_even_for_empt
         ));
     }
 }
+
+#[test]
+fn oversized_actual_empty_port_domain_is_refused_before_controller_allocation() {
+    let program = program(SeedMode::DirectConstant, false);
+    let root = ProgramExpressionRootSite::Node {
+        node: ProgramNodeId::new(1),
+        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    };
+    let schema = program.graph().nodes()[0].output_layout().schema().clone();
+    assert!(schema.fields().is_empty());
+    let input = RecordBatch::try_new_with_options(
+        schema,
+        vec![],
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(usize::MAX)),
+    )
+    .unwrap();
+    let mut evaluator =
+        CompiledExpressionInstance::try_new(program, root, &RuntimeControl).unwrap();
+    assert!(matches!(
+        evaluator.evaluate(&input, Selection::all(usize::MAX), &RuntimeControl),
+        Err(KernelFailure::ResourceExhausted)
+    ));
+    assert!(evaluator.instances.is_empty());
+    assert!(matches!(
+        evaluator.evaluate(&input, Selection::all(usize::MAX), &RuntimeControl),
+        Err(KernelFailure::InstanceFailed)
+    ));
+}

@@ -16,10 +16,10 @@
 // under the License.
 //! Evaluation of actual checked root occurrences, without thawing ExprArena.
 //!
-//! This ordinary-scalar controller keeps state per root use and driver. The
+//! This selected expression controller keeps state per root use and driver. The
 //! host must install its memory scopes and allocation admission before calling
 //! it, as required by the neutral kernel ABI. These controls do not mint a
-//! memory grant. Guarded and higher-order protocols have separate controllers.
+//! memory grant. Higher-order and encoded guarded-result protocols remain separate.
 
 use arrow::{
     array::{ArrayRef, UInt64Array, new_empty_array, new_null_array},
@@ -52,7 +52,6 @@ use std::{
 pub struct CompiledExpressionInstance {
     program: Arc<LocalProgram>,
     root: ProgramExpressionRootSite,
-    order: Vec<ProgramUseRef>,
     instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     failed: bool,
 }
@@ -217,7 +216,6 @@ impl CompiledExpressionInstance {
             .ok_or_else(|| invalid("missing actual root definitions"))?;
         let mut stack = vec![(root_use, false)];
         let mut seen = BTreeSet::new();
-        let mut order = Vec::new();
         while let Some((use_id, exiting)) = stack.pop() {
             work.step()?;
             let invocation = flow
@@ -226,7 +224,6 @@ impl CompiledExpressionInstance {
                 .ok_or_else(|| invalid("missing actual expression occurrence"))?;
             let occurrence = ProgramUseRef { arena, use_id };
             if exiting {
-                order.push(occurrence);
                 continue;
             }
             if !seen.insert(use_id) {
@@ -258,17 +255,27 @@ impl CompiledExpressionInstance {
                         .calls()
                         .get(&ProgramCallSite::Expression(occurrence))
                         .ok_or_else(|| invalid("missing actual prepared scalar occurrence"))?;
-                    if !matches!(
-                        invocation.control,
-                        ControlShape::Eager | ControlShape::TypeOnly
-                    ) || !matches!(
-                        call.specialization().prepared(),
-                        PreparedPureKernel::Scalar(_)
-                    ) || call.call_contract().effects().null_behavior
-                        == FunctionNullBehavior::ControlDefined
-                    {
+                    let supported = match (invocation.control, call.specialization().prepared()) {
+                        (
+                            ControlShape::Eager | ControlShape::TypeOnly,
+                            PreparedPureKernel::Scalar(_),
+                        ) => {
+                            call.call_contract().effects().null_behavior
+                                != FunctionNullBehavior::ControlDefined
+                        }
+                        (
+                            ControlShape::If | ControlShape::Coalesce,
+                            PreparedPureKernel::ControlIntrinsic(_),
+                        ) => {
+                            call.call_contract().effects().null_behavior
+                                == FunctionNullBehavior::ControlDefined
+                                && guarded::supports_result(node.data_type())
+                        }
+                        _ => false,
+                    };
+                    if !supported {
                         return Err(invalid(
-                            "expression requires its dedicated control or lifecycle protocol",
+                            "expression requires its dedicated control or carrier protocol",
                         ));
                     }
                 }
@@ -287,7 +294,6 @@ impl CompiledExpressionInstance {
         Ok(Self {
             program,
             root,
-            order,
             instances: BTreeMap::new(),
             failed: false,
         })
@@ -395,98 +401,16 @@ impl CompiledExpressionInstance {
             work.step()?;
         }
         let flow = &snapshot.flows()[&self.root.arena()];
-        let definitions = &snapshot.roots().arenas()[&self.root.arena()];
-        let mut values = BTreeMap::<ProgramUseRef, Value<'a>>::new();
-        for &occurrence in &self.order {
-            work.step()?;
-            let invocation = &flow.uses()[&occurrence.use_id];
-            let definition = definitions
-                .node(invocation.definition)
-                .ok_or_else(|| invalid("missing compiled definition"))?;
-            let FunctionArgumentType::Value(result_type) = typed
-                .definition_type(occurrence.arena, invocation.definition)
-                .ok_or_else(|| invalid("missing exact compiled definition type"))?
-            else {
-                return Err(invalid(
-                    "ordinary root cannot materialize a lambda definition",
-                ));
-            };
-            let value = match definition.kind() {
-                StaticExprKind::Constant(constant) => {
-                    work.flush()?;
-                    validate_evaluated_argument_observed(
-                        EvaluatedArgument::Constant(constant),
-                        selection,
-                        result_type,
-                        work.control,
-                    )?;
-                    Value::Constant(constant.clone())
-                }
-                StaticExprKind::SlotId(_) => {
-                    let Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                        node,
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal,
-                    })) = checked.slots().get(&occurrence)
-                    else {
-                        return Err(invalid("slot requires its actual compiled input source"));
-                    };
-                    if *node != input_node {
-                        return Err(invalid("slot source differs from actual root input port"));
-                    }
-                    let array = input
-                        .columns()
-                        .get(*ordinal as usize)
-                        .ok_or_else(|| invalid("slot source ordinal is absent"))?;
-                    Value::Column(Arc::clone(array))
-                }
-                StaticExprKind::BoundCall { .. } => {
-                    let call = &resolved.calls()[&ProgramCallSite::Expression(occurrence)];
-                    let PreparedPureKernel::Scalar(prepared) = call.specialization().prepared()
-                    else {
-                        return Err(invalid("ordinary occurrence has a different lifecycle"));
-                    };
-                    let mut arguments = Vec::with_capacity(invocation.arguments.len());
-                    for &child in invocation.arguments.iter() {
-                        arguments.push(
-                            values
-                                .remove(&ProgramUseRef {
-                                    arena: occurrence.arena,
-                                    use_id: child,
-                                })
-                                .ok_or_else(|| {
-                                    invalid("required ordered child was not evaluated")
-                                })?,
-                        );
-                        work.step()?;
-                    }
-                    // Every Eager child has already run in the original domain.
-                    // Only the ordinary parent call is narrowed below.
-                    Value::Selected(evaluate_scalar(
-                        occurrence,
-                        prepared,
-                        &arguments,
-                        selection,
-                        &mut self.instances,
-                        work,
-                    )?)
-                }
-                _ => return Err(invalid("unsupported compiled root definition")),
-            };
-            values.insert(occurrence, value);
-        }
+        let result = guarded::evaluate_tree(
+            checked,
+            self.root,
+            input,
+            input_node,
+            selection,
+            &mut self.instances,
+            work,
+        )?;
         let root_use = snapshot.bindings()[&self.root];
-        let result = values
-            .remove(&ProgramUseRef {
-                arena: self.root.arena(),
-                use_id: root_use,
-            })
-            .ok_or_else(|| internal("actual compiled root result is absent"))?;
-        if !values.is_empty() {
-            return Err(internal(
-                "ordinary root left unrelated evaluated occurrences",
-            ));
-        }
         let invocation = &flow.uses()[&root_use];
         let FunctionArgumentType::Value(ty) = typed
             .definition_type(self.root.arena(), invocation.definition)
@@ -711,3 +635,8 @@ mod tests;
 
 #[cfg(test)]
 mod copy_tests;
+
+mod guarded;
+
+#[cfg(test)]
+mod guarded_tests;

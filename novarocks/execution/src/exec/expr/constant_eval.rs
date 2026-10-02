@@ -663,3 +663,76 @@ pub(super) fn preflight_take(
         &mut work,
     )
 }
+
+// Arrow's MutableBuffer rounds bitmap reservations to 64-byte alignment.
+// This is a format/layout check, not an allocation grant or byte invoice.
+fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
+    if let Some(width) = ty.primitive_width() {
+        buffer_extent(rows, width)?;
+    } else if *ty != DataType::Boolean {
+        return Err(CopyError::Unsupported(ty.clone()));
+    }
+    let bitmap_bytes = add(rows / 8, usize::from(!rows.is_multiple_of(8)))?;
+    let bitmap_blocks = add(
+        bitmap_bytes / 64,
+        usize::from(!bitmap_bytes.is_multiple_of(64)),
+    )?;
+    buffer_extent(bitmap_blocks, 64)
+}
+
+/// Check the actual fixed-width source-choice plan before opaque Arrow interleave.
+/// Choices address compact source array rows, independently of the outer batch.
+/// The caller has already admitted the frozen type and owns both allocations and
+/// the control checkpoints immediately before and after the library copy.
+pub(super) fn preflight_fixed_interleave(
+    ty: &DataType,
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+) -> Result<(), CopyError> {
+    let mut work = CopyObservation(&mut observe);
+    work.boundary()?;
+    let result = (|| {
+        fixed_interleave_extent(ty, choices.len())?;
+        work.step()?;
+        if sources.is_empty() {
+            return Err(CopyError::Invalid(
+                "Arrow interleave requires a source array",
+            ));
+        }
+        for source in sources {
+            let equal = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                ty,
+                source.data_type(),
+                || (work.0)(false),
+            )
+            .map_err(CopyError::Control)?;
+            work.step()?;
+            if !equal {
+                return Err(CopyError::Invalid(
+                    "interleave source differs from its exact frozen carrier",
+                ));
+            }
+        }
+        for &(source, row) in choices {
+            let valid = sources.get(source).is_some_and(|array| row < array.len());
+            work.step()?;
+            if !valid {
+                return Err(CopyError::Invalid(
+                    "interleave choice has an invalid source or row",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    // An observer refusal is primary and must not trigger another callback.
+    if matches!(&result, Err(CopyError::Control(_))) {
+        return result;
+    }
+    work.boundary()?;
+    result
+}
+
+#[cfg(test)]
+#[path = "constant_eval/preflight_interleave_tests.rs"]
+mod preflight_interleave_tests;
