@@ -98,3 +98,16 @@ HEADERS and PUSH_PROMISE now share borrowed prefix/padding/dependency parsing wi
 The encoded workspace can physically exit while escaped header/URI/table aliases remain, because none refer to it. Those decoded compact strings, Huffman output, HeaderMap/table storage, initial decoder scratch, Method/URI metadata and whole Native connection funding are separate unresolved scopes. Installing the workspace does not change incoming SETTINGS_HEADER_TABLE_SIZE or its ACK transition, and does not claim the complete connection 2 MiB envelope. Default None retains the existing owned path. Native profile/lane/deadline installation and performance acceptance remain separate.
 
 The shared HeaderBlock also persists malformed-field evidence across NeedMore. Previously a complete illegal field followed by an incomplete literal could lose its local malformed flag on the next continuation. Both owned and fixed inputs now finish decoding the block for connection-level HPACK consistency, then refuse the malformed stream instead of publishing it. This fixes existing invalid-input acceptance; successful header behavior is unchanged.
+
+## Preserve independent decoded field owners
+
+BorrowedSource converts regular literal names with the patched HTTP owned
+lowercase constructor and values with the existing from_maybe_shared(Bytes).
+Literal values with indexed regular names use the same owned value seam.
+These paths retain their independently owned decoded bytes through HeaderMap,
+dynamic-table and field clones instead of making a second unowned HTTP payload
+copy. The owned compatibility source retains its original copying constructors.
+Pseudo-header conversion and error rules remain shared and unchanged. This is
+an ownership-preserving seam, not proof that the original decoded plain/Huffman
+string allocations, table/HeaderMap storage, Method/Scheme metadata, Status or
+whole Native connection have been funded; those scopes remain open.

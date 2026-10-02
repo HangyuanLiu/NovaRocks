@@ -326,7 +326,7 @@ impl Decoder {
             // Read the name as a literal
             let name = name_marker.consume(buf, self.max_field_size.is_some());
             let value = value_marker.consume(buf, self.max_field_size.is_some());
-            Header::new(name, value)
+            buf.make_header(name, value)
         } else {
             let e = self.table.get(table_idx)?;
             let old_pos = buf.position();
@@ -335,7 +335,7 @@ impl Decoder {
             buf.set_position(old_pos);
             let value = value_marker.consume(buf, self.max_field_size.is_some());
 
-            e.name().into_entry(value)
+            buf.make_indexed_header(e.name(), value)
         }
     }
 
@@ -537,6 +537,16 @@ impl StringMarker {
 // Both inputs use the same HPACK algorithm. Only the owned compatibility
 // input can split backing; borrowed strings always acquire independent owners.
 pub(crate) trait DecodeSource: Buf {
+    fn make_header(&self, name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+        Header::new(name, value)
+    }
+    fn make_indexed_header(
+        &self,
+        name: super::header::Name<'_>,
+        value: Bytes,
+    ) -> Result<Header, DecoderError> {
+        name.into_entry(value)
+    }
     fn position(&self) -> u64;
     fn set_position(&mut self, pos: u64);
     fn take_string(&mut self, len: usize, compact: bool) -> Bytes;
@@ -589,6 +599,16 @@ impl Buf for BorrowedSource<'_> {
     }
 }
 impl DecodeSource for BorrowedSource<'_> {
+    fn make_header(&self, name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+        Header::new_shared(name, value)
+    }
+    fn make_indexed_header(
+        &self,
+        name: super::header::Name<'_>,
+        value: Bytes,
+    ) -> Result<Header, DecoderError> {
+        name.into_entry_shared(value)
+    }
     fn position(&self) -> u64 {
         self.cursor.position()
     }

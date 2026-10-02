@@ -102,6 +102,18 @@ impl Header {
         }
     }
 
+    pub(crate) fn new_shared(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+        if name.first().is_none_or(|b| *b == b':') {
+            // Preserve every pseudo-header conversion and error rule. Their
+            // Method/Scheme metadata is a separate ownership obligation.
+            return Self::new(name, value);
+        }
+        Ok(Header::Field {
+            name: HeaderName::from_lowercase_bytes(name)?,
+            value: HeaderValue::from_maybe_shared(value)?,
+        })
+    }
+
     pub fn len(&self) -> usize {
         match *self {
             Header::Field {
@@ -227,6 +239,16 @@ impl From<Header> for Header<Option<HeaderName>> {
 }
 
 impl<'a> Name<'a> {
+    pub(crate) fn into_entry_shared(self, value: Bytes) -> Result<Header, DecoderError> {
+        match self {
+            Name::Field(name) => Ok(Header::Field {
+                name: name.clone(),
+                value: HeaderValue::from_maybe_shared(value)?,
+            }),
+            other => other.into_entry(value),
+        }
+    }
+
     pub fn into_entry(self, value: Bytes) -> Result<Header, DecoderError> {
         match self {
             Name::Field(name) => Ok(Header::Field {

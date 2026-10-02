@@ -1,0 +1,140 @@
+{
+  "parent": "f49f4528e2f8547e79f5c050bfcb6c4a2e525a98",
+  "workspace_passed": 1002,
+  "protocol_passed": 115,
+  "native_passed": 574,
+  "worker_passed": 313,
+  "private_ordinary": 10,
+  "private_miri": 10,
+  "private_runtime_negative": 4,
+  "production_negative": {
+    "runtime_exit": 101,
+    "runtime_failed": true,
+    "oracle": "HTTP field operation allocated",
+    "restored_exit": 0,
+    "byte_exact_restore": true,
+    "source_sha256": "7ff5b63859bdf24481cd92c0c02f1778dfd4df81f45cc6680f85b59f7f6814b2"
+  },
+  "final_commands": {
+    "protocol": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "--test",
+        "native_h2_borrowed_frame",
+        "--test",
+        "native_h2_bounded_receive",
+        "--test",
+        "native_h2_fixed_raw_input",
+        "--test",
+        "native_h2_fixed_write_buffer",
+        "--test",
+        "native_h2_goaway_backing",
+        "--test",
+        "native_h2_header_preflight",
+        "--test",
+        "native_h2_retained_backing",
+        "--test",
+        "native_h2_retained_send",
+        "--test",
+        "native_h2_send_header_block",
+        "--test",
+        "native_h2_send_header_table_limit",
+        "--test",
+        "native_hyper_bounded_receive",
+        "--test",
+        "native_hyper_fixed_write_buffer",
+        "--test",
+        "native_tonic_connection_factory",
+        "--test",
+        "native_h2_receive_header_block",
+        "--test",
+        "native_http_header_owner"
+      ],
+      "exit": 0,
+      "log": "/tmp/m07-shared-header-final-protocol.log"
+    },
+    "libs": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "-p",
+        "novarocks-worker",
+        "--lib"
+      ],
+      "exit": 101,
+      "log": "/tmp/m07-shared-header-final-libs.log"
+    },
+    "libs-replay": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "-p",
+        "novarocks-worker",
+        "--lib"
+      ],
+      "exit": 0,
+      "log": "/tmp/m07-shared-header-final-libs-replay.log"
+    },
+    "vendor-clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "http",
+        "-p",
+        "h2",
+        "-p",
+        "hyper",
+        "-p",
+        "tonic",
+        "--lib",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log": "/tmp/m07-shared-header-final-vendor-clippy.log"
+    },
+    "native-clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "novarocks-native-adapter",
+        "--all-targets"
+      ],
+      "exit": 0,
+      "log": "/tmp/m07-shared-header-final-native-clippy.log"
+    },
+    "workspace-check": {
+      "command": [
+        "cargo",
+        "check",
+        "--workspace",
+        "--all-targets"
+      ],
+      "exit": 0,
+      "log": "/tmp/m07-shared-header-final-workspace-check.log"
+    },
+    "fmt": {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit": 0,
+      "log": "/tmp/m07-shared-header-final-fmt.log"
+    }
+  },
+  "fixture_exit": 0,
+  "scope": "Owned custom HeaderName and regular borrowed HPACK field conversion; compact output funding and full Native connection envelope remain open"
+}

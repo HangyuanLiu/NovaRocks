@@ -1,0 +1,2 @@
+# Preserve the exact upstream changelog ending.
+CHANGELOG.md whitespace=-blank-at-eof
