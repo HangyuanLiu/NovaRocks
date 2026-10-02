@@ -1172,12 +1172,42 @@ fn spi_codec_error(error: ConnectorWriteCodecError) -> ConnectorCodecError {
         }
         ProtocolErrorKind::VersionMismatch => ConnectorCodecErrorKind::VersionMismatch,
         ProtocolErrorKind::InvalidValue => ConnectorCodecErrorKind::InvalidValue,
+        ProtocolErrorKind::CompileControl(cause) => ConnectorCodecErrorKind::CompileControl(cause),
     };
     ConnectorCodecError::new(path, kind, protocol.detail())
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn write_codec_bridge_keeps_pure_compile_control_cause() {
+        use novarocks_type_contract::CompileControlError;
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let protocol = novarocks_proto_codec::ProtocolError::new(
+                novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause),
+                cause.to_string(),
+            );
+            let error = super::spi_codec_error(
+                novarocks_proto_codec::connector_write::ConnectorWriteCodecError::new(
+                    "iceberg", protocol,
+                ),
+            );
+            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.path().to_string(), "provider_payload[7]");
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+        }
+    }
     use super::*;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;

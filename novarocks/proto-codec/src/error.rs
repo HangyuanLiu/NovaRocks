@@ -87,6 +87,7 @@ pub enum ProtocolErrorKind {
     Conflict,
     Capacity,
     VersionMismatch,
+    CompileControl(novarocks_type_contract::CompileControlError),
 }
 
 impl fmt::Display for ProtocolErrorKind {
@@ -102,6 +103,7 @@ impl fmt::Display for ProtocolErrorKind {
             Self::Conflict => f.write_str("conflict"),
             Self::Capacity => f.write_str("capacity"),
             Self::VersionMismatch => f.write_str("version mismatch"),
+            Self::CompileControl(error) => fmt::Display::fmt(error, f),
         }
     }
 }
@@ -145,7 +147,14 @@ impl fmt::Display for ProtocolError {
     }
 }
 
-impl Error for ProtocolError {}
+impl Error for ProtocolError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            ProtocolErrorKind::CompileControl(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -197,5 +206,73 @@ mod tests {
             error.to_string(),
             "native protocol error at plan_fragment.root (missing field): root is required"
         );
+    }
+
+    #[test]
+    fn nested_protocol_errors_preserve_each_typed_compile_control_cause() {
+        use novarocks_type_contract::CompileControlError;
+
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = ProtocolError::new(
+                FieldPath::root("provider_payload")
+                    .field("columns")
+                    .index(17),
+                ProtocolErrorKind::CompileControl(cause),
+                "decoder stopped before publishing a column",
+            );
+            // Exercise the actual nested connector adapter, including the
+            // existing reconstruction from kind, detail and path segments.
+            let nested =
+                crate::connector_read::nest(FieldPath::root("fragment").field("scan"), error);
+            assert_eq!(nested.path().to_string(), "fragment.scan.columns[17]");
+            assert_eq!(nested.kind(), ProtocolErrorKind::CompileControl(cause));
+            assert_eq!(
+                nested.detail(),
+                "decoder stopped before publishing a column"
+            );
+            assert_eq!(
+                nested
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+            let cloned = nested.clone();
+            assert_eq!(cloned, nested);
+            assert_eq!(
+                cloned
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_diagnostics_cannot_infer_compile_control_during_nesting() {
+        use novarocks_type_contract::CompileControlError;
+
+        for diagnostic in [
+            CompileControlError::Cancelled.to_string(),
+            CompileControlError::DeadlineExceeded.to_string(),
+            CompileControlError::ResourceExhausted.to_string(),
+        ] {
+            let error = ProtocolError::new(
+                FieldPath::root("payload").field("header"),
+                ProtocolErrorKind::Capacity,
+                diagnostic.clone(),
+            );
+            let nested =
+                crate::connector_read::nest(FieldPath::root("fragment").field("scan"), error);
+            assert_eq!(nested.path().to_string(), "fragment.scan.header");
+            assert_eq!(nested.kind(), ProtocolErrorKind::Capacity);
+            assert_eq!(nested.detail(), diagnostic);
+            assert!(nested.source().is_none());
+        }
     }
 }

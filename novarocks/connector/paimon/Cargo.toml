@@ -42,6 +42,7 @@ novarocks-connector-contract.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true
+novarocks-type-contract.workspace = true
 
 [dev-dependencies]
 paimon = { workspace = true, features = ["storage-memory"] }

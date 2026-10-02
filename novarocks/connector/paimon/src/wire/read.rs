@@ -190,24 +190,32 @@ impl ConnectorPrivateDecoder<PaimonTable> for PaimonReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<PaimonTable, ConnectorCodecError> {
-        let raw = decode_root::<dto::PaimonTablePayload>(
-            payload,
-            context,
-            "paimon_read_table",
-            &[1, 2, 3, 4, 5],
-            &[6, 7],
-        )?;
-        let value = PaimonTable::try_new(
-            SchemaTableName::try_new(&raw.schema_name, &raw.table_name).map_err(domain_error)?,
-            &raw.table_location,
-            decode_merge(raw.merge_engine)?,
-            decode_bucket(raw.bucket_mode)?,
-            raw.primary_key_field_ids,
-            raw.partition_field_ids,
-        )
-        .map_err(domain_error)?;
-        charge(context, payload.len(), size_of::<PaimonTable>())?;
-        Ok(value)
+        let result = (|| {
+            let raw = decode_root::<dto::PaimonTablePayload>(
+                payload,
+                context,
+                "paimon_read_table",
+                &[1, 2, 3, 4, 5],
+                &[6, 7],
+            )?;
+            // Existing domain validation/allocation is opaque.
+            context.flush_compile_control()?;
+            let value = PaimonTable::try_new(
+                SchemaTableName::try_new(&raw.schema_name, &raw.table_name)
+                    .map_err(domain_error)?,
+                &raw.table_location,
+                decode_merge(raw.merge_engine)?,
+                decode_bucket(raw.bucket_mode)?,
+                raw.primary_key_field_ids,
+                raw.partition_field_ids,
+            )
+            .map_err(domain_error)?;
+            charge(context, payload.len(), size_of::<PaimonTable>())?;
+            Ok(value)
+        })();
+        // The public decode attempt (including ordinary refusal) is complete.
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -232,28 +240,36 @@ impl ConnectorPrivateDecoder<PaimonColumn> for PaimonReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<PaimonColumn, ConnectorCodecError> {
-        let raw = decode_strict_root::<dto::PaimonColumnPayload>(payload, context, &COLUMN_SCHEMA)?;
-        let data_type = raw
-            .data_type
-            .as_ref()
-            .ok_or_else(|| missing("paimon_read_column.data_type"))?;
-        let value = PaimonColumn::try_new(
-            raw.field_id
-                .ok_or_else(|| missing("paimon_read_column.field_id"))?,
-            &raw.name,
-            decode_type(data_type)?,
-            raw.nullable
-                .ok_or_else(|| missing("paimon_read_column.nullable"))?,
-            raw.output_ordinal
-                .ok_or_else(|| missing("paimon_read_column.output_ordinal"))?,
-        )
-        .map_err(domain_error)?;
-        charge(
-            context,
-            payload.len(),
-            size_of::<PaimonColumn>() + raw.name.len(),
-        )?;
-        Ok(value)
+        let result = (|| {
+            let raw =
+                decode_strict_root::<dto::PaimonColumnPayload>(payload, context, &COLUMN_SCHEMA)?;
+            let data_type = raw
+                .data_type
+                .as_ref()
+                .ok_or_else(|| missing("paimon_read_column.data_type"))?;
+            // Existing domain validation/allocation is opaque.
+            context.flush_compile_control()?;
+            let value = PaimonColumn::try_new(
+                raw.field_id
+                    .ok_or_else(|| missing("paimon_read_column.field_id"))?,
+                &raw.name,
+                decode_type(data_type)?,
+                raw.nullable
+                    .ok_or_else(|| missing("paimon_read_column.nullable"))?,
+                raw.output_ordinal
+                    .ok_or_else(|| missing("paimon_read_column.output_ordinal"))?,
+            )
+            .map_err(domain_error)?;
+            charge(
+                context,
+                payload.len(),
+                size_of::<PaimonColumn>() + raw.name.len(),
+            )?;
+            Ok(value)
+        })();
+        // The public decode attempt (including ordinary refusal) is complete.
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -279,37 +295,44 @@ impl ConnectorPrivateDecoder<PaimonReadView> for PaimonReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<PaimonReadView, ConnectorCodecError> {
-        let raw = decode_root::<dto::PaimonReadViewPayload>(
-            payload,
-            context,
-            "paimon_read_view",
-            &[1, 2, 3, 4, 5, 6],
-            &[],
-        )?;
-        let schema_fingerprint = fixed_32(
-            &raw.schema_fingerprint,
-            "paimon_read_view.schema_fingerprint",
-        )?;
-        let read_recipe_digest = fixed_32(
-            &raw.read_recipe_digest,
-            "paimon_read_view.read_recipe_digest",
-        )?;
-        let value = PaimonReadView::try_new(
-            &raw.table_location,
-            raw.snapshot_id,
-            raw.schema_id
-                .ok_or_else(|| missing("paimon_read_view.schema_id"))?,
-            schema_fingerprint,
-            read_recipe_digest,
-            raw.sequence_field_id,
-        )
-        .map_err(domain_error)?;
-        charge(
-            context,
-            payload.len(),
-            size_of::<PaimonReadView>() + raw.table_location.len(),
-        )?;
-        Ok(value)
+        let result = (|| {
+            let raw = decode_root::<dto::PaimonReadViewPayload>(
+                payload,
+                context,
+                "paimon_read_view",
+                &[1, 2, 3, 4, 5, 6],
+                &[],
+            )?;
+            let schema_fingerprint = fixed_32(
+                &raw.schema_fingerprint,
+                "paimon_read_view.schema_fingerprint",
+            )?;
+            let read_recipe_digest = fixed_32(
+                &raw.read_recipe_digest,
+                "paimon_read_view.read_recipe_digest",
+            )?;
+            // Existing domain validation/allocation is opaque.
+            context.flush_compile_control()?;
+            let value = PaimonReadView::try_new(
+                &raw.table_location,
+                raw.snapshot_id,
+                raw.schema_id
+                    .ok_or_else(|| missing("paimon_read_view.schema_id"))?,
+                schema_fingerprint,
+                read_recipe_digest,
+                raw.sequence_field_id,
+            )
+            .map_err(domain_error)?;
+            charge(
+                context,
+                payload.len(),
+                size_of::<PaimonReadView>() + raw.table_location.len(),
+            )?;
+            Ok(value)
+        })();
+        // The public decode attempt (including ordinary refusal) is complete.
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -366,56 +389,65 @@ impl PaimonReadWireCodec {
         facts: &ConnectorReadSplitFacts,
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<PaimonSplit, ConnectorCodecError> {
-        if !facts.remotely_accessible() || !facts.addresses().is_empty() {
-            return Err(invalid(
-                "paimon_read_split.facts",
-                "Paimon object-store split must be remotely accessible without node addresses",
-            ));
-        }
-        let raw =
-            decode_strict_root::<dto::PaimonReadSplitPayload>(payload, context, &SPLIT_SCHEMA)?;
-        let files = raw
-            .files
-            .iter()
-            .map(decode_file)
-            .collect::<Result<Vec<_>, _>>()?;
-        let split = PaimonSplit::try_new(
-            raw.snapshot_id
-                .ok_or_else(|| missing("paimon_read_split.snapshot_id"))?,
-            raw.schema_id
-                .ok_or_else(|| missing("paimon_read_split.schema_id"))?,
-            raw.partition_arity
-                .ok_or_else(|| missing("paimon_read_split.partition_arity"))?,
-            raw.partition,
-            raw.bucket
-                .ok_or_else(|| missing("paimon_read_split.bucket"))?,
-            &raw.bucket_path,
-            raw.total_buckets
-                .ok_or_else(|| missing("paimon_read_split.total_buckets"))?,
-            files,
-            raw.data_deletion_files
-                .map(decode_deletion_files)
-                .transpose()?,
-            raw.row_ranges.map(decode_row_ranges).transpose()?,
-            raw.raw_convertible
-                .ok_or_else(|| missing("paimon_read_split.raw_convertible"))?,
-            raw.contains_delete_rows
-                .ok_or_else(|| missing("paimon_read_split.contains_delete_rows"))?,
-            facts.split_weight(),
-        )
-        .map_err(domain_error)?;
-        if split.retained_size_in_bytes() != facts.retained_size_in_bytes() {
-            return Err(invalid(
-                "paimon_read_split.facts.retained_size",
-                "Paimon split retained size does not match the public carrier",
-            ));
-        }
-        charge(
-            context,
-            payload.len(),
-            usize::try_from(split.retained_size_in_bytes()).unwrap_or(usize::MAX),
-        )?;
-        Ok(split)
+        let result = (|| {
+            if !facts.remotely_accessible() || !facts.addresses().is_empty() {
+                return Err(invalid(
+                    "paimon_read_split.facts",
+                    "Paimon object-store split must be remotely accessible without node addresses",
+                ));
+            }
+            let raw =
+                decode_strict_root::<dto::PaimonReadSplitPayload>(payload, context, &SPLIT_SCHEMA)?;
+            let mut files = Vec::with_capacity(raw.files.len());
+            for file in &raw.files {
+                files.push(decode_file(file, context)?);
+                context.observe_compile_step()?;
+            }
+            // Existing domain validation/allocation is opaque.
+            context.flush_compile_control()?;
+            let split = PaimonSplit::try_new(
+                raw.snapshot_id
+                    .ok_or_else(|| missing("paimon_read_split.snapshot_id"))?,
+                raw.schema_id
+                    .ok_or_else(|| missing("paimon_read_split.schema_id"))?,
+                raw.partition_arity
+                    .ok_or_else(|| missing("paimon_read_split.partition_arity"))?,
+                raw.partition,
+                raw.bucket
+                    .ok_or_else(|| missing("paimon_read_split.bucket"))?,
+                &raw.bucket_path,
+                raw.total_buckets
+                    .ok_or_else(|| missing("paimon_read_split.total_buckets"))?,
+                files,
+                raw.data_deletion_files
+                    .map(|values| decode_deletion_files(values, context))
+                    .transpose()?,
+                raw.row_ranges
+                    .map(|values| decode_row_ranges(values, context))
+                    .transpose()?,
+                raw.raw_convertible
+                    .ok_or_else(|| missing("paimon_read_split.raw_convertible"))?,
+                raw.contains_delete_rows
+                    .ok_or_else(|| missing("paimon_read_split.contains_delete_rows"))?,
+                facts.split_weight(),
+            )
+            .map_err(domain_error)?;
+            if split.retained_size_in_bytes() != facts.retained_size_in_bytes() {
+                return Err(invalid(
+                    "paimon_read_split.facts.retained_size",
+                    "Paimon split retained size does not match the public carrier",
+                ));
+            }
+            charge(
+                context,
+                payload.len(),
+                usize::try_from(split.retained_size_in_bytes()).unwrap_or(usize::MAX),
+            )?;
+            Ok(split)
+        })();
+        // The public decode attempt (including ordinary refusal) is complete.
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -455,26 +487,31 @@ fn encode_file(value: &PaimonDataFile) -> dto::PaimonDataFilePayload {
     }
 }
 
-fn decode_file(raw: &dto::PaimonDataFilePayload) -> Result<PaimonDataFile, ConnectorCodecError> {
-    PaimonDataFile::try_new(PaimonDataFileFacts {
-        file_name: raw.file_name.clone(),
+fn decode_file(
+    raw: &dto::PaimonDataFilePayload,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<PaimonDataFile, ConnectorCodecError> {
+    let facts = PaimonDataFileFacts {
+        file_name: clone_string(&raw.file_name, context)?,
         file_size: raw
             .file_size
             .ok_or_else(|| missing("paimon_read_split.file.file_size"))?,
         row_count: raw
             .row_count
             .ok_or_else(|| missing("paimon_read_split.file.row_count"))?,
-        min_key: raw.min_key.clone(),
-        max_key: raw.max_key.clone(),
+        min_key: clone_bytes(&raw.min_key, context)?,
+        max_key: clone_bytes(&raw.max_key, context)?,
         key_stats: decode_stats(
             raw.key_stats
                 .as_ref()
                 .ok_or_else(|| missing("paimon_read_split.file.key_stats"))?,
+            context,
         )?,
         value_stats: decode_stats(
             raw.value_stats
                 .as_ref()
                 .ok_or_else(|| missing("paimon_read_split.file.value_stats"))?,
+            context,
         )?,
         min_sequence_number: raw
             .min_sequence_number
@@ -488,21 +525,38 @@ fn decode_file(raw: &dto::PaimonDataFilePayload) -> Result<PaimonDataFile, Conne
         level: raw
             .level
             .ok_or_else(|| missing("paimon_read_split.file.level"))?,
-        extra_files: raw.extra_files.clone(),
+        extra_files: clone_strings(&raw.extra_files, context)?,
         creation_time_millis: raw.creation_time_millis,
         delete_row_count: raw.delete_row_count,
-        embedded_index: raw.embedded_index.clone(),
+        embedded_index: raw
+            .embedded_index
+            .as_deref()
+            .map(|value| clone_bytes(value, context))
+            .transpose()?,
         file_source: raw.file_source,
         value_stats_cols: raw
             .value_stats_cols
             .as_ref()
-            .map(|values| values.values.clone()),
-        external_path: raw.external_path.clone(),
+            .map(|values| clone_strings(&values.values, context))
+            .transpose()?,
+        external_path: raw
+            .external_path
+            .as_deref()
+            .map(|value| clone_string(value, context))
+            .transpose()?,
         first_row_id: raw.first_row_id,
-        write_cols: raw.write_cols.as_ref().map(|values| values.values.clone()),
+        write_cols: raw
+            .write_cols
+            .as_ref()
+            .map(|values| clone_strings(&values.values, context))
+            .transpose()?,
         compression: decode_compression(raw.compression)?,
-    })
-    .map_err(domain_error)
+    };
+    // Domain validation and Arc construction are opaque existing operations.
+    context.flush_compile_control()?;
+    let result = PaimonDataFile::try_new(facts).map_err(domain_error);
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_stats(value: &PaimonBinaryTableStats) -> dto::PaimonBinaryTableStatsPayload {
@@ -519,13 +573,20 @@ fn encode_stats(value: &PaimonBinaryTableStats) -> dto::PaimonBinaryTableStatsPa
 
 fn decode_stats(
     raw: &dto::PaimonBinaryTableStatsPayload,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<PaimonBinaryTableStats, ConnectorCodecError> {
-    PaimonBinaryTableStats::try_new(
-        raw.min_values.clone(),
-        raw.max_values.clone(),
-        raw.null_counts.iter().map(|value| value.value).collect(),
-    )
-    .map_err(domain_error)
+    let min_values = clone_bytes(&raw.min_values, context)?;
+    let max_values = clone_bytes(&raw.max_values, context)?;
+    let mut null_counts = Vec::with_capacity(raw.null_counts.len());
+    for value in &raw.null_counts {
+        null_counts.push(value.value);
+        context.observe_compile_step()?;
+    }
+    context.flush_compile_control()?;
+    let result =
+        PaimonBinaryTableStats::try_new(min_values, max_values, null_counts).map_err(domain_error);
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_deletion_file(value: &PaimonDeletionFile) -> dto::PaimonDeletionFilePayload {
@@ -539,36 +600,42 @@ fn encode_deletion_file(value: &PaimonDeletionFile) -> dto::PaimonDeletionFilePa
 
 fn decode_deletion_files(
     raw: dto::PaimonDeletionFilesPayload,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<Vec<Option<PaimonDeletionFile>>, ConnectorCodecError> {
-    raw.values
-        .into_iter()
-        .map(|value| {
-            value
-                .value
-                .map(|value| {
-                    PaimonDeletionFile::try_new(
-                        &value.path,
-                        value
-                            .offset
-                            .ok_or_else(|| missing("paimon_read_split.deletion_file.offset"))?,
-                        value
-                            .length
-                            .ok_or_else(|| missing("paimon_read_split.deletion_file.length"))?,
-                        value.cardinality,
-                    )
-                    .map_err(domain_error)
-                })
-                .transpose()
-        })
-        .collect()
+    let mut values = Vec::with_capacity(raw.values.len());
+    for value in raw.values {
+        let value = value
+            .value
+            .map(|value| {
+                context.flush_compile_control()?;
+                let result = PaimonDeletionFile::try_new(
+                    &value.path,
+                    value
+                        .offset
+                        .ok_or_else(|| missing("paimon_read_split.deletion_file.offset"))?,
+                    value
+                        .length
+                        .ok_or_else(|| missing("paimon_read_split.deletion_file.length"))?,
+                    value.cardinality,
+                )
+                .map_err(domain_error);
+                context.observe_compile_step()?;
+                finish_decode(result, context)
+            })
+            .transpose()?;
+        values.push(value);
+        context.observe_compile_step()?;
+    }
+    Ok(values)
 }
 
 fn decode_row_ranges(
     raw: dto::PaimonRowRangesPayload,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<Vec<PaimonRowRange>, ConnectorCodecError> {
-    raw.values
-        .into_iter()
-        .map(|value| {
+    let mut values = Vec::with_capacity(raw.values.len());
+    for value in raw.values {
+        values.push(
             PaimonRowRange::try_new(
                 value
                     .from
@@ -577,9 +644,11 @@ fn decode_row_ranges(
                     .to
                     .ok_or_else(|| missing("paimon_read_split.row_range.to"))?,
             )
-            .map_err(domain_error)
-        })
-        .collect()
+            .map_err(domain_error)?,
+        );
+        context.observe_compile_step()?;
+    }
+    Ok(values)
 }
 
 fn encode_type(value: PaimonDataType) -> dto::PaimonDataTypePayload {
@@ -778,12 +847,15 @@ fn decode_strict_root<M: Message + Default>(
     }
     context.ledger().charge_raw(payload.len())?;
     scan_strict_message(payload, context, schema, 0)?;
-    M::decode(payload).map_err(|error| {
+    context.flush_compile_control()?;
+    let decoded = M::decode(payload).map_err(|error| {
         invalid(
             schema.name,
             format!("malformed Paimon private protobuf: {error}"),
         )
-    })
+    });
+    context.observe_compile_step()?;
+    finish_decode(decoded, context)
 }
 
 fn scan_strict_message(
@@ -796,9 +868,11 @@ fn scan_strict_message(
     let mut seen = BTreeSet::new();
     while !input.is_empty() {
         context.ledger().charge_items(1)?;
-        let key = read_varint(&mut input, schema.name)?;
+        let key = read_varint(&mut input, context, schema.name)?;
         let field = u32::try_from(key >> 3).map_err(|_| malformed(schema.name))?;
         let wire = u8::try_from(key & 7).map_err(|_| malformed(schema.name))?;
+        // One field key has been parsed; the static schema lookup is bounded.
+        context.observe_compile_step()?;
         let Some((_, expected_wire)) = schema.fields.iter().find(|(number, _)| *number == field)
         else {
             return Err(ConnectorCodecError::new(
@@ -826,7 +900,7 @@ fn scan_strict_message(
             if wire != 2 {
                 return Err(malformed(schema.name));
             }
-            let len = usize::try_from(read_varint(&mut input, schema.name)?)
+            let len = usize::try_from(read_varint(&mut input, context, schema.name)?)
                 .map_err(|_| malformed(schema.name))?;
             let nested = take(&mut input, len, schema.name)?;
             scan_strict_message(nested, context, child, depth + 1)?;
@@ -849,8 +923,11 @@ fn decode_root<M: Message + Default>(
     }
     context.ledger().charge_raw(payload.len())?;
     scan_root(payload, context, name, singular, repeated)?;
-    M::decode(payload)
-        .map_err(|error| invalid(name, format!("malformed Paimon private protobuf: {error}")))
+    context.flush_compile_control()?;
+    let decoded = M::decode(payload)
+        .map_err(|error| invalid(name, format!("malformed Paimon private protobuf: {error}")));
+    context.observe_compile_step()?;
+    finish_decode(decoded, context)
 }
 
 fn scan_root(
@@ -863,9 +940,10 @@ fn scan_root(
     let mut seen = BTreeSet::new();
     while !input.is_empty() {
         context.ledger().charge_items(1)?;
-        let key = read_varint(&mut input, name)?;
+        let key = read_varint(&mut input, context, name)?;
         let field = u32::try_from(key >> 3).map_err(|_| malformed(name))?;
         let wire = u8::try_from(key & 7).map_err(|_| malformed(name))?;
+        context.observe_compile_step()?;
         if field == 0 || (!singular.contains(&field) && !repeated.contains(&field)) {
             return Err(ConnectorCodecError::new(
                 ConnectorFieldPath::root(name).field(format!("field_{field}")),
@@ -891,29 +969,43 @@ fn skip_value(
     context: &mut ConnectorDecodeContext<'_>,
     name: &'static str,
 ) -> Result<(), ConnectorCodecError> {
-    match wire {
-        0 => read_varint(input, name).map(|_| ()),
+    let result = match wire {
+        0 => read_varint(input, context, name).map(|_| ()),
         1 => take(input, 8, name).map(|_| ()),
         2 => {
-            let len = usize::try_from(read_varint(input, name)?).map_err(|_| malformed(name))?;
+            let len =
+                usize::try_from(read_varint(input, context, name)?).map_err(|_| malformed(name))?;
             context.ledger().charge_scalar(len)?;
             take(input, len, name).map(|_| ())
         }
         5 => take(input, 4, name).map(|_| ()),
         _ => Err(malformed(name)),
-    }
+    };
+    // Borrowed fixed/length-delimited skipping and wire dispatch are complete;
+    // scalar varints additionally expose each consumed byte below.
+    context.observe_compile_step()?;
+    result
 }
-fn read_varint(input: &mut &[u8], name: &'static str) -> Result<u64, ConnectorCodecError> {
+fn read_varint(
+    input: &mut &[u8],
+    context: &mut ConnectorDecodeContext<'_>,
+    name: &'static str,
+) -> Result<u64, ConnectorCodecError> {
     let mut value = 0u64;
     for shift in (0..70).step_by(7) {
         let Some((&byte, rest)) = input.split_first() else {
             return Err(malformed(name));
         };
         *input = rest;
-        if shift == 63 && byte > 1 {
+        let overflow = shift == 63 && byte > 1;
+        if !overflow {
+            value |= u64::from(byte & 0x7f) << shift;
+        }
+        // Exactly one byte was consumed and its bounded arithmetic completed.
+        context.observe_compile_step()?;
+        if overflow {
             return Err(malformed(name));
         }
-        value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
         }
@@ -972,4 +1064,537 @@ fn capacity(path: &'static str, detail: &'static str) -> ConnectorCodecError {
 }
 fn domain_error(error: impl std::fmt::Display) -> ConnectorCodecError {
     invalid("paimon_payload", error.to_string())
+}
+
+// These copies expose the work owned by this codec. Allocator growth and the
+// existing domain constructors remain opaque; this is not a memory grant.
+fn clone_bytes(
+    value: &[u8],
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<Vec<u8>, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(value.to_vec());
+    }
+    let mut result = Vec::with_capacity(value.len());
+    for byte in value {
+        result.push(*byte);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn clone_string(
+    value: &str,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<String, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(value.to_owned());
+    }
+    let mut result = String::with_capacity(value.len());
+    for character in value.chars() {
+        result.push(character);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn clone_strings(
+    values: &[String],
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<Vec<String>, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(values.to_vec());
+    }
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        result.push(clone_string(value, context)?);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn finish_decode<T>(
+    result: Result<T, ConnectorCodecError>,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<T, ConnectorCodecError> {
+    // A latched original control cause wins. Otherwise observe ordinary failures
+    // as well as successful values before returning to the caller.
+    if result
+        .as_ref()
+        .is_err_and(|error| error.compile_control_error().is_some())
+    {
+        return result;
+    }
+    context.flush_compile_control()?;
+    result
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use novarocks_spi::connector::read_stack::SplitWeight;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEnvelopeHeader, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+
+    #[derive(Default)]
+    struct Control {
+        trace: Mutex<Vec<(CompilePhase, u32)>>,
+        refuse: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut trace = self.trace.lock().unwrap();
+            trace.push((phase, units));
+            if let Some((index, cause)) = self.refuse
+                && trace.len() == index
+            {
+                return Err(cause);
+            }
+            Ok(())
+        }
+    }
+    fn causes() -> [CompileControlError; 3] {
+        [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ]
+    }
+    fn header() -> ConnectorEnvelopeHeader {
+        ConnectorEnvelopeHeader::new(
+            ConnectorProviderId::parse("paimon").unwrap(),
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("lake").unwrap(),
+                CatalogVersion::from_bytes([9; 32]),
+            ),
+            ConnectorCodecCategory::ReadSplit,
+            ConnectorCodecRevision::try_new(1).unwrap(),
+        )
+    }
+    fn ledger() -> ConnectorDecodeLedger {
+        ConnectorDecodeLedger::new(
+            ConnectorDecodeLimits::try_new(1 << 20, 4 << 20, 1 << 20, 100_000, 32).unwrap(),
+        )
+    }
+    fn stats() -> dto::PaimonBinaryTableStatsPayload {
+        dto::PaimonBinaryTableStatsPayload {
+            min_values: vec![0, 255, 19],
+            max_values: vec![42, 0],
+            null_counts: (0..321)
+                .map(|index| dto::PaimonOptionalInt64Payload {
+                    value: (index % 3 != 0).then_some(index),
+                })
+                .collect(),
+        }
+    }
+    fn file() -> dto::PaimonDataFilePayload {
+        dto::PaimonDataFilePayload {
+            file_name: "part-你好".into(),
+            file_size: Some(1000),
+            schema_id: Some(0),
+            level: Some(0),
+            min_sequence_number: Some(1),
+            max_sequence_number: Some(2),
+            row_count: Some(1000),
+            compression: dto::PaimonDataCompression::Uncompressed as i32,
+            min_key: vec![0, 255],
+            max_key: vec![255, 0],
+            key_stats: Some(stats()),
+            value_stats: Some(stats()),
+            extra_files: vec!["索引".repeat(321)],
+            embedded_index: Some(vec![17; 321]),
+            value_stats_cols: Some(dto::PaimonStringListPayload {
+                values: vec!["column-a".into(), "column-b".into()],
+            }),
+            write_cols: Some(dto::PaimonStringListPayload {
+                values: vec!["column-b".into()],
+            }),
+            ..Default::default()
+        }
+    }
+    fn split_fixture() -> (Vec<u8>, ConnectorReadSplitFacts) {
+        let expected = header();
+        let mut budget = ledger();
+        let mut context = ConnectorDecodeContext::new(&expected, &mut budget);
+        let file = decode_file(&file(), &mut context).unwrap();
+        let split = PaimonSplit::try_new(
+            1,
+            0,
+            0,
+            Vec::new(),
+            0,
+            "s3://warehouse/table/bucket-0",
+            -1,
+            vec![file],
+            None,
+            None,
+            true,
+            false,
+            SplitWeight::STANDARD,
+        )
+        .unwrap();
+        let facts = ConnectorReadSplitFacts::new(
+            true,
+            Vec::new(),
+            None::<&str>,
+            SplitWeight::STANDARD,
+            split.retained_size_in_bytes(),
+        );
+        (
+            PaimonReadWireCodec.encode_private(&split).unwrap().to_vec(),
+            facts,
+        )
+    }
+    fn run_split(
+        payload: &[u8],
+        facts: &ConnectorReadSplitFacts,
+        control: &Control,
+    ) -> Result<PaimonSplit, ConnectorCodecError> {
+        let expected = header();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, control)?;
+        PaimonReadWireCodec.decode_split_private(payload, facts, &mut context)
+    }
+
+    #[test]
+    fn actual_long_split_preserves_legacy_values_and_ledger_charges() {
+        let (payload, facts) = split_fixture();
+        let expected = header();
+        let mut legacy_budget = ledger();
+        let mut legacy = ConnectorDecodeContext::new(&expected, &mut legacy_budget);
+        let old = PaimonReadWireCodec
+            .decode_split_private(&payload, &facts, &mut legacy)
+            .unwrap();
+        let control = Control::default();
+        let mut compile_budget = ledger();
+        let mut compile =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut compile_budget, &control)
+                .unwrap();
+        let new = PaimonReadWireCodec
+            .decode_split_private(&payload, &facts, &mut compile)
+            .unwrap();
+        assert_eq!(
+            PaimonReadWireCodec.encode_private(&old).unwrap().as_ref(),
+            payload
+        );
+        assert_eq!(
+            PaimonReadWireCodec.encode_private(&new).unwrap().as_ref(),
+            payload
+        );
+        assert_eq!(legacy_budget.raw_bytes(), compile_budget.raw_bytes());
+        assert_eq!(legacy_budget.items(), compile_budget.items());
+        assert_eq!(
+            legacy_budget.retained_bytes(),
+            compile_budget.retained_bytes()
+        );
+        assert_eq!(new.files()[0].facts().key_stats.null_counts()[1], Some(1));
+        assert_eq!(new.files()[0].facts().key_stats.null_counts()[0], None);
+        let trace = control.trace.lock().unwrap();
+        assert!(trace.iter().filter(|(_, units)| *units == 256).count() >= 4);
+        assert!(
+            trace
+                .iter()
+                .all(|(phase, units)| *phase == CompilePhase::ProviderValidation && *units <= 256)
+        );
+    }
+
+    #[test]
+    fn actual_long_split_refuses_entry_scanner_conversion_and_publication_each_cause() {
+        let (payload, facts) = split_fixture();
+        let successful = Control::default();
+        run_split(&payload, &facts, &successful).unwrap();
+        let trace = successful.trace.lock().unwrap().clone();
+        assert_eq!(trace[0].1, 0);
+        assert!(trace.iter().any(|(_, units)| *units == 256));
+        // Refuse every actual callback, including scanner/Prost handoffs,
+        // conversion loops, opaque domain handoffs and final publication.
+        for index in 1..=trace.len() {
+            for cause in causes() {
+                let control = Control {
+                    trace: Default::default(),
+                    refuse: Some((index, cause)),
+                };
+                let error = run_split(&payload, &facts, &control).unwrap_err();
+                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.kind(), ConnectorCodecErrorKind::CompileControl(cause));
+                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            }
+        }
+    }
+
+    #[test]
+    fn stats_conversion_observes_actual_count_and_byte_copy_work_and_latches() {
+        let raw = stats();
+        let expected = header();
+        let control = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control).unwrap();
+        let result = decode_stats(&raw, &mut context).unwrap();
+        assert_eq!(result.min_values(), &[0, 255, 19]);
+        assert_eq!(result.max_values(), &[42, 0]);
+        assert_eq!(result.null_counts().len(), 321);
+        assert_eq!(
+            control
+                .trace
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, units)| *units)
+                .collect::<Vec<_>>(),
+            vec![0, 256, 70, 1]
+        );
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((2, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            assert_eq!(
+                decode_stats(&raw, &mut context)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(
+                context
+                    .flush_compile_control()
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(
+                context
+                    .observe_compile_step()
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(control.trace.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn varint_checkpoint_follows_the_consumed_byte_not_a_reservation() {
+        let expected = header();
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((2, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            assert_eq!(clone_bytes(&[1; 255], &mut context).unwrap().len(), 255);
+            let mut input: &[u8] = &[7];
+            let error = read_varint(&mut input, &mut context, "test_varint").unwrap_err();
+            assert_eq!(error.compile_control_error(), Some(cause));
+            assert!(
+                input.is_empty(),
+                "the 256th completed operation consumed its byte"
+            );
+            assert_eq!(control.trace.lock().unwrap()[1].1, 256);
+        }
+    }
+
+    #[test]
+    fn ordinary_domain_error_flushes_original_tail_without_text_classification() {
+        let mut raw = stats();
+        raw.null_counts[320].value = Some(-1);
+        let expected = header();
+        let control = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control).unwrap();
+        let ordinary = decode_stats(&raw, &mut context).unwrap_err();
+        assert_eq!(ordinary.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(ordinary.compile_control_error(), None);
+        let trace = control.trace.lock().unwrap().clone();
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((trace.len(), cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            assert_eq!(
+                decode_stats(&raw, &mut context)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_prost_utf8_flushes_after_the_opaque_decode() {
+        // Structurally valid field 1 String, invalid UTF-8: the private scanner
+        // accepts structure, then Prost owns this ordinary decoding failure.
+        let payload = [0x0a, 1, 0xff];
+        let expected = header();
+        let control = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control).unwrap();
+        let error = <PaimonReadWireCodec as ConnectorPrivateDecoder<PaimonTable>>::decode_private(
+            &PaimonReadWireCodec,
+            &payload,
+            &mut context,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        let trace = control.trace.lock().unwrap().clone();
+        assert!(trace.len() >= 3);
+        for cause in causes() {
+            // Last callback observes the opaque decoding refusal's tail.
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((trace.len(), cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            let error =
+                <PaimonReadWireCodec as ConnectorPrivateDecoder<PaimonTable>>::decode_private(
+                    &PaimonReadWireCodec,
+                    &payload,
+                    &mut context,
+                )
+                .unwrap_err();
+            assert_eq!(error.compile_control_error(), Some(cause));
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_duplicate_and_nested_wire_refusals_remain_ordinary() {
+        let expected = header();
+        for (payload, kind) in [
+            (vec![0x40, 0], ConnectorCodecErrorKind::UnknownField),
+            (
+                vec![0x0a, 0, 0x0a, 0],
+                ConnectorCodecErrorKind::DuplicateField,
+            ),
+        ] {
+            let mut budget = ledger();
+            let mut context = ConnectorDecodeContext::new(&expected, &mut budget);
+            let old =
+                <PaimonReadWireCodec as ConnectorPrivateDecoder<PaimonTable>>::decode_private(
+                    &PaimonReadWireCodec,
+                    &payload,
+                    &mut context,
+                )
+                .unwrap_err();
+            assert_eq!(old.kind(), kind);
+            let control = Control::default();
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            let new =
+                <PaimonReadWireCodec as ConnectorPrivateDecoder<PaimonTable>>::decode_private(
+                    &PaimonReadWireCodec,
+                    &payload,
+                    &mut context,
+                )
+                .unwrap_err();
+            assert_eq!(old.kind(), new.kind());
+            assert_eq!(old.detail(), new.detail());
+            assert_eq!(new.compile_control_error(), None);
+        }
+        let mut budget = ledger();
+        let mut context = ConnectorDecodeContext::new(&expected, &mut budget);
+        assert_eq!(
+            decode_strict_root::<dto::PaimonColumnPayload>(
+                &[0x0a, 0],
+                &mut context,
+                &COLUMN_SCHEMA
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorCodecErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn actual_row_range_and_optional_deletion_conversion_loops_are_observed() {
+        let expected = header();
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((2, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            let raw = dto::PaimonRowRangesPayload {
+                values: (0..321)
+                    .map(|n| dto::PaimonRowRangePayload {
+                        from: Some(n),
+                        to: Some(n + 1),
+                    })
+                    .collect(),
+            };
+            assert_eq!(
+                decode_row_ranges(raw, &mut context)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((2, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            let raw = dto::PaimonDeletionFilesPayload {
+                values: (0..321)
+                    .map(|_| dto::PaimonOptionalDeletionFilePayload { value: None })
+                    .collect(),
+            };
+            assert_eq!(
+                decode_deletion_files(raw, &mut context)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+        }
+        let mut budget = ledger();
+        let mut context = ConnectorDecodeContext::new(&expected, &mut budget);
+        let ranges = decode_row_ranges(
+            dto::PaimonRowRangesPayload {
+                values: vec![dto::PaimonRowRangePayload {
+                    from: Some(2),
+                    to: Some(7),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap();
+        assert_eq!((ranges[0].from(), ranges[0].to()), (2, 7));
+        assert_eq!(
+            decode_deletion_files(
+                dto::PaimonDeletionFilesPayload {
+                    values: vec![dto::PaimonOptionalDeletionFilePayload { value: None }]
+                },
+                &mut context
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
 }

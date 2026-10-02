@@ -87,6 +87,9 @@ where
     }
 
     fn private_rejection(&self, error: ConnectorCodecError) -> ConnectorCodecError {
+        if error.compile_control_error().is_some() {
+            return error.with_path(ConnectorFieldPath::root("provider_payload"));
+        }
         ConnectorCodecError::new(
             ConnectorFieldPath::root("provider_payload"),
             error.kind(),
