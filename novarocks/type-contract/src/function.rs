@@ -58,14 +58,26 @@ impl AggregateStateFormatId {
     /// Validate a borrowed state identity with the constructor's exact grammar.
     /// This performs no allocation and does not retain the input.
     pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
+        Self::validate_str_observed(value, || Ok(()))
+    }
+
+    /// Observe each byte actually inspected by the same identity grammar.
+    /// Length rejection precedes the scan; a callback refusal is returned
+    /// directly before any later byte or identity error is produced.
+    pub fn validate_str_observed<E: From<FunctionIdentityError>>(
+        value: &str,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
         validate_identity("aggregate state format", value)?;
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'|' | b','))
-        {
-            return Err(FunctionIdentityError::InvalidCharacters {
-                kind: "aggregate state format",
-            });
+        for byte in value.bytes() {
+            let allowed = byte.is_ascii_graphic() && !matches!(byte, b'|' | b',');
+            observe()?;
+            if !allowed {
+                return Err(FunctionIdentityError::InvalidCharacters {
+                    kind: "aggregate state format",
+                }
+                .into());
+            }
         }
         Ok(())
     }

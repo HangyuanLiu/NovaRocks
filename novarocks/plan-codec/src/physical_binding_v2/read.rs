@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::{allocation_exit_v2::reserve_exit, physical_type_v2::DecodedTypeTable};
+use crate::{binding_index_v2::BindingIndex, physical_type_v2::DecodedTypeTable};
 use novarocks_type_contract::{FunctionId, FunctionOverloadId, FunctionValueType};
 use std::{alloc::Layout, mem::size_of};
 
@@ -27,8 +27,9 @@ use std::{alloc::Layout, mem::size_of};
 pub struct PreparedFunctionBindingHeaders<'loan> {
     definitions: &'loan [wire::FunctionBindingDefinition],
     types: &'loan DecodedTypeTable,
-    indices: Vec<usize>,
+    indices: BindingIndex,
     facts: BindingProjectionFacts,
+    source_invoice: usize,
     control: &'loan dyn PureCompileControl,
 }
 impl<'loan> PreparedFunctionBindingHeaders<'loan> {
@@ -50,25 +51,30 @@ impl<'loan> PreparedFunctionBindingHeaders<'loan> {
         id: u32,
     ) -> Result<Option<&'loan wire::FunctionBindingDefinition>, BindingCodecError> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
-        let mut lower = 0;
-        let mut upper = self.indices.len();
-        let mut result = None;
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            let definition = &self.definitions[self.indices[middle]];
-            let order = definition.id.cmp(&id);
-            work.step()?;
-            match order {
-                std::cmp::Ordering::Less => lower = middle + 1,
-                std::cmp::Ordering::Greater => upper = middle,
-                std::cmp::Ordering::Equal => {
-                    result = Some(definition);
-                    break;
-                }
-            }
-        }
+        let result = self.definition_observed(id, &mut work)?;
         work.finish()?;
         Ok(result)
+    }
+    pub(crate) fn definition_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'loan wire::FunctionBindingDefinition>, BindingCodecError> {
+        self.indices
+            .find(id, |at| self.definitions[at].id, work)
+            .map(|index| index.map(|at| &self.definitions[at]))
+    }
+    pub(crate) fn original_control(&self) -> &'loan dyn PureCompileControl {
+        self.control
+    }
+    /// Carry the previous caller's source invoice exactly once, plus this
+    /// token and its actual reserved index capacity. This is a declared lower
+    /// floor for the next coexisting stage, not a measured total/MEM grant.
+    pub(crate) fn retained_invoice_floor(&self) -> Result<usize, BindingCodecError> {
+        add(
+            self.source_invoice,
+            add(size_of::<Self>(), self.indices.backing_bytes()?)?,
+        )
     }
 }
 fn invalid(message: &'static str) -> BindingCodecError {
@@ -308,37 +314,6 @@ fn validate(
     }
     Ok(())
 }
-fn sift(
-    index: &mut [usize],
-    mut root: usize,
-    definitions: &[wire::FunctionBindingDefinition],
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), BindingCodecError> {
-    loop {
-        let left = add(mul(root, 2)?, 1)?;
-        work.step()?;
-        if left >= index.len() {
-            return Ok(());
-        }
-        let right = add(left, 1)?;
-        let mut child = left;
-        if right < index.len() {
-            let greater = definitions[index[right]].id > definitions[index[left]].id;
-            work.step()?;
-            if greater {
-                child = right;
-            }
-        }
-        let greater = definitions[index[child]].id > definitions[index[root]].id;
-        work.step()?;
-        if !greater {
-            return Ok(());
-        }
-        index.swap(root, child);
-        root = child;
-        work.step()?;
-    }
-}
 fn prepare<'loan>(
     definitions: &'loan [wire::FunctionBindingDefinition],
     types: &'loan DecodedTypeTable,
@@ -348,34 +323,13 @@ fn prepare<'loan>(
 ) -> Result<PreparedFunctionBindingHeaders<'loan>, BindingCodecError> {
     let facts = preflight(definitions, types, source, limits, work)?;
     validate(definitions, types, work)?;
-    work.flush()?;
-    let mut indices = Vec::new();
-    let reserved = indices.try_reserve_exact(definitions.len());
-    reserve_exit::<BindingCodecError>(reserved, work)?;
-    for index in 0..definitions.len() {
-        indices.push(index);
-        work.step()?;
-    }
-    for root in (0..indices.len() / 2).rev() {
-        sift(&mut indices, root, definitions, work)?;
-    }
-    for end in (1..indices.len()).rev() {
-        indices.swap(0, end);
-        work.step()?;
-        sift(&mut indices[..end], 0, definitions, work)?;
-    }
-    for pair in indices.windows(2) {
-        let duplicate = definitions[pair[0]].id == definitions[pair[1]].id;
-        work.step()?;
-        if duplicate {
-            return Err(invalid("binding header definition ID is duplicated"));
-        }
-    }
+    let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
     Ok(PreparedFunctionBindingHeaders {
         definitions,
         types,
         indices,
         facts,
+        source_invoice: source,
         control: work.control(),
     })
 }

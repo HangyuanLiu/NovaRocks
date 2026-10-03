@@ -32,6 +32,9 @@ use novarocks_proto_models::{physical_control_v2, physical_package_v2 as wire};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, FunctionKind, PureCompileControl};
 use std::{alloc::Layout, mem::size_of};
 
+mod read;
+pub use read::{PreparedAggregateBindingHeaders, prepare_aggregate_binding_headers};
+
 #[derive(Clone, Copy)]
 pub struct AggregateBindingInput<'source> {
     pub id: u32,

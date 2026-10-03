@@ -179,3 +179,67 @@ fn borrowed_state_format_keeps_exact_ascii_graphic_exclusions() {
         );
     }
 }
+
+#[derive(Debug, PartialEq)]
+enum ObservedIdentityError {
+    Identity(FunctionIdentityError),
+    Refused(usize),
+}
+impl From<FunctionIdentityError> for ObservedIdentityError {
+    fn from(error: FunctionIdentityError) -> Self {
+        Self::Identity(error)
+    }
+}
+
+#[test]
+fn observed_state_identity_visits_only_actual_bytes_and_preserves_primary_refusal() {
+    for (value, inspected) in [("valid-v1", 8), ("ab|hidden", 3), ("abéhidden", 3)] {
+        let mut visits = 0;
+        let result =
+            AggregateStateFormatId::validate_str_observed::<ObservedIdentityError>(value, || {
+                visits += 1;
+                Ok(())
+            });
+        assert_eq!(visits, inspected);
+        assert_eq!(
+            result,
+            AggregateStateFormatId::validate_str(value).map_err(ObservedIdentityError::from)
+        );
+        for refuse in 1..=inspected {
+            let mut visited = 0;
+            let result = AggregateStateFormatId::validate_str_observed::<ObservedIdentityError>(
+                value,
+                || {
+                    visited += 1;
+                    if visited == refuse {
+                        Err(ObservedIdentityError::Refused(refuse))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(result, Err(ObservedIdentityError::Refused(refuse)));
+            assert_eq!(visited, refuse);
+        }
+    }
+    for value in [String::new(), "x".repeat(1025)] {
+        let result =
+            AggregateStateFormatId::validate_str_observed::<ObservedIdentityError>(&value, || {
+                panic!("identity length rejection must precede every byte")
+            });
+        assert_eq!(
+            result,
+            AggregateStateFormatId::validate_str(&value).map_err(ObservedIdentityError::from)
+        );
+    }
+    let mut visits = 0;
+    AggregateStateFormatId::validate_str_observed::<ObservedIdentityError>(
+        &"x".repeat(1024),
+        || {
+            visits += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(visits, 1024);
+}
