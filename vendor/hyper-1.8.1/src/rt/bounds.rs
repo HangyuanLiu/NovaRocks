@@ -110,6 +110,16 @@ mod h2_server {
         super::Http2UpgradedExec<B::Data> + sealed::Sealed<(F, B)> + Clone
     {
         #[doc(hidden)]
+        fn stream_task_allocation_capacity_bound() -> std::io::Result<usize>
+        where
+            Self: Sized;
+
+        #[doc(hidden)]
+        fn try_prepare_h2stream(&self) -> std::io::Result<Option<Self>>
+        where
+            Self: Sized;
+
+        #[doc(hidden)]
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, Self>);
     }
 
@@ -122,6 +132,14 @@ mod h2_server {
         H2Stream<F, B, E>: Future<Output = ()>,
         B: Body,
     {
+        fn stream_task_allocation_capacity_bound() -> std::io::Result<usize> {
+            <E as Executor<H2Stream<F, B, E>>>::task_allocation_capacity_bound()
+        }
+
+        fn try_prepare_h2stream(&self) -> std::io::Result<Option<Self>> {
+            <E as Executor<H2Stream<F, B, E>>>::try_prepare_task(self)
+        }
+
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, E>) {
             self.execute(fut)
         }

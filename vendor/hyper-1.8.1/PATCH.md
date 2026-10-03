@@ -67,3 +67,39 @@ remain None; table backing and field payload owners remain independent.
 ## Original connection lifecycle forwarding
 
 Both HTTP/2 builders forward an optional h2 lifecycle capability into the real protocol connection. A configured server yields once immediately after initial SETTINGS completion, before dispatching any application stream, so its acquisition owner can perform the final deadline verdict. The caller must perform that verdict before polling service again; this is not a persistent application dispatch gate. None retains the existing loop. Client initial completion does not itself publish final acquisition. Outer executor/task/socket funding is separate.
+
+## Optional original incoming stream-task dispatch
+
+`rt::Executor<Fut>` adds two default-compatible hooks:
+`task_allocation_capacity_bound()` returns `Unsupported` by default, and
+`try_prepare_task(&self)` returns `Ok(None)` by default. The sealed server
+executor bound forwards both hooks for the actual private
+`H2Stream<S::Future, S::ResBody, E>` type. The static server builder helper
+`Builder::<E>::stream_task_allocation_capacity_bound::<S>()` queries that
+exact type without constructing a future, service, executor, or temporary
+allocation model. Hyper remains independent of Tokio.
+
+Before adapting an accepted request body or calling the service, the server
+asks the executor to prepare that concrete stream task. `Some` supplies an
+executor carrying the caller's previously funded task lease; its clone is
+stored in the actual stream future and the prepared executor performs the
+dispatch. The caller must preserve that original lease until the actual task
+allocation and all surviving task aliases physically exit. Hyper creates no
+budget, task pool, or fallback capability. A preparation error resets only
+that stream with `REFUSED_STREAM`, then drops the original request without
+calling the service or constructing response metadata. `None` retains the
+existing executor clone and dispatch path.
+
+`reject_connect_for_preallocated_tasks(bool)` is a separate server option,
+default false. When installed it refuses CONNECT with `REFUSED_STREAM`
+before upgrade state or the service future is constructed. A prepared stream
+executor does not cover CONNECT's separate upgrade task. The caller installing
+an executor that covers only stream tasks must enable this policy; default
+CONNECT and extended CONNECT negotiation are otherwise unchanged.
+
+This slice changes only `src/rt/mod.rs`, `src/rt/bounds.rs`,
+`src/proto/h2/server.rs`, and `src/server/conn/http2.rs`. Actual Native task-pool
+installation, checked per-stream bookkeeping, outgoing client tasks, shared
+scheduler backing, and the complete connection graph require separate
+composition and evidence. No whole Native/profile or performance acceptance
+is claimed by these hooks.

@@ -86,6 +86,7 @@ pub(crate) struct Config {
     pub(crate) initial_stream_window_size: u32,
     pub(crate) max_frame_size: u32,
     pub(crate) enable_connect_protocol: bool,
+    pub(crate) reject_connect_for_preallocated_tasks: bool,
     pub(crate) max_concurrent_streams: Option<u32>,
     pub(crate) max_pending_accept_reset_streams: Option<usize>,
     pub(crate) max_local_error_reset_streams: Option<usize>,
@@ -121,6 +122,7 @@ impl Default for Config {
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             enable_connect_protocol: false,
+            reject_connect_for_preallocated_tasks: false,
             max_concurrent_streams: Some(200),
             max_pending_accept_reset_streams: None,
             max_local_error_reset_streams: Some(DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS),
@@ -158,6 +160,7 @@ pin_project! {
         service: S,
         state: State<T, B>,
         date_header: bool,
+        reject_connect_for_preallocated_tasks: bool,
         yield_after_initial_settings: bool,
         close_pending: bool
     }
@@ -187,6 +190,7 @@ where
     conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
     date_header: bool,
+    reject_connect_for_preallocated_tasks: bool,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -297,6 +301,7 @@ where
             },
             service,
             date_header: config.date_header,
+            reject_connect_for_preallocated_tasks: config.reject_connect_for_preallocated_tasks,
             yield_after_initial_settings: config.connection_lifecycle.is_some(),
             close_pending: false,
         }
@@ -359,6 +364,8 @@ where
                             conn,
                             closing: None,
                             date_header: me.date_header,
+                            reject_connect_for_preallocated_tasks: me
+                                .reject_connect_for_preallocated_tasks,
                         })
                     }
                 }
@@ -385,6 +392,8 @@ where
                         conn,
                         closing: None,
                         date_header: me.date_header,
+                        reject_connect_for_preallocated_tasks: me
+                            .reject_connect_for_preallocated_tasks,
                     })
                 }
                 State::Serving(ref mut srv) => {
@@ -431,6 +440,25 @@ where
                 match ready!(self.conn.poll_accept(cx)) {
                     Some(Ok((req, mut respond))) => {
                         trace!("incoming request");
+                        if self.reject_connect_for_preallocated_tasks
+                            && req.method() == Method::CONNECT
+                        {
+                            // CONNECT creates an independent upgrade task. Its
+                            // allocations are not covered by a stream-task lease.
+                            respond.send_reset(h2::Reason::REFUSED_STREAM);
+                            drop(req);
+                            continue;
+                        }
+                        let prepared = match exec.try_prepare_h2stream() {
+                            Ok(prepared) => prepared,
+                            Err(_) => {
+                                // Refuse before body adaptation, upgrade state
+                                // or the service future can be constructed.
+                                respond.send_reset(h2::Reason::REFUSED_STREAM);
+                                drop(req);
+                                continue;
+                            }
+                        };
                         let content_length = headers::content_length_parse_all(req.headers());
                         let ping = self
                             .ping
@@ -474,15 +502,26 @@ where
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
 
-                        let fut = H2Stream::new(
-                            service.call(req),
-                            connect_parts,
-                            respond,
-                            self.date_header,
-                            exec.clone(),
-                        );
+                        if let Some(mut prepared) = prepared {
+                            let fut = H2Stream::new(
+                                service.call(req),
+                                connect_parts,
+                                respond,
+                                self.date_header,
+                                prepared.clone(),
+                            );
+                            prepared.execute_h2stream(fut);
+                        } else {
+                            let fut = H2Stream::new(
+                                service.call(req),
+                                connect_parts,
+                                respond,
+                                self.date_header,
+                                exec.clone(),
+                            );
 
-                        exec.execute_h2stream(fut);
+                            exec.execute_h2stream(fut);
+                        }
                     }
                     Some(Err(e)) => {
                         return Poll::Ready(Err(crate::Error::new_h2(e)));

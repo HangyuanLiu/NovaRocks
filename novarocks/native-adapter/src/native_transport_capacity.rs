@@ -68,6 +68,7 @@ struct Dimensions {
     map_extras: usize,
     table_bytes: usize,
     server_task_bound: usize,
+    stream_task_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -382,6 +383,7 @@ impl Dimensions {
             // Required pre-ACK incoming HPACK capacity even when advertising 0.
             table_bytes: 4096,
             server_task_bound: 0,
+            stream_task_bound: 0,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -478,6 +480,20 @@ impl Dimensions {
         dimensions.server_task_bound =
             crate::native_server::native_server_task_allocation_capacity_bound()?;
         bound = add(bound, dimensions.server_task_bound)?;
+        dimensions.stream_task_bound =
+            crate::native_server::native_server_stream_task_allocation_capacity_bound()?;
+        let stream_tasks =
+            crate::native_task_executor::NativeTaskExecutor::allocation_capacity_bound(
+                streams,
+                dimensions.stream_task_bound,
+            )?;
+        // Independently check this actual task/position/carrier subgraph
+        // against the frozen bookkeeping envelope, not just the aggregate
+        // connection ceiling. Other stream scaffolds still need composition.
+        if stream_tasks > mul(streams, value(g.transport_stream_bookkeeping_bytes)?)? {
+            return Err(invalid());
+        }
+        bound = add(bound, stream_tasks)?;
         let stream_extra = add(
             add(
                 value(g.transport_stream_bookkeeping_bytes)?,
@@ -619,6 +635,25 @@ impl NativeTransportCapacityFactory {
             return Err(invalid());
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_stream_task_capacity(&self, actual_bound: usize) -> io::Result<()> {
+        if actual_bound > self.core().dimensions.stream_task_bound {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn server_stream_executor(
+        &self,
+        owner: Bytes,
+    ) -> io::Result<crate::native_task_executor::NativeTaskExecutor> {
+        let d = self.core().dimensions;
+        crate::native_task_executor::NativeTaskExecutor::with_original(
+            d.streams,
+            d.stream_task_bound,
+            owner,
+        )
     }
 
     pub(crate) fn claim_channel_cache(&self) -> io::Result<()> {
@@ -1088,12 +1123,18 @@ mod tests {
     fn checked_stock_receipt_fits_frozen_process_and_connection_envelopes() {
         let d = Dimensions::frozen().unwrap();
         eprintln!(
-            "Checked original stock: connection_pool_bytes={} process_stock_bytes={} data_positions={} control_positions={} server_task_backings_bytes={}",
+            "Checked original stock: connection_pool_bytes={} process_stock_bytes={} data_positions={} control_positions={} server_task_backings_bytes={} stream_task_backings_bytes={} stream_task_pool_bytes={}",
             d.connection_bound,
             d.stock_bound,
             d.data_positions,
             d.control_positions,
-            d.server_task_bound
+            d.server_task_bound,
+            d.stream_task_bound,
+            crate::native_task_executor::NativeTaskExecutor::allocation_capacity_bound(
+                d.streams,
+                d.stream_task_bound,
+            )
+            .unwrap()
         );
         assert_eq!((d.data_positions, d.control_positions), (518, 20));
         assert_eq!(

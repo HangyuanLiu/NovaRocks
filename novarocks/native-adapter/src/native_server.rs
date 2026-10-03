@@ -45,7 +45,7 @@ mod control_listener_tests;
 use axum::Router;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
 use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
 use tokio::net::TcpListener as TokioTcpListener;
@@ -58,6 +58,7 @@ use tower::ServiceExt;
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::native_ingress::NativeIngressService;
 use crate::native_response::respond_from_request;
+use crate::native_task_executor::NativeTaskExecutor;
 use crate::native_transport_capacity::{
     NativeTransportCapacityFactory, TransportClass, configure_server,
 };
@@ -459,11 +460,75 @@ fn box_native_response(
     response.map(boxed)
 }
 
+// The actual service constructor also supplies the static stream-task type.
+fn native_connection_service<S>(
+    app: S,
+) -> impl hyper::service::Service<
+    hyper::Request<hyper::body::Incoming>,
+    Response = axum::http::Response<tonic::body::BoxBody>,
+    Error = std::convert::Infallible,
+    Future: Send,
+> + Clone
++ Send
++ 'static
+where
+    S: Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(request.map(axum::body::Body::new))
+                .await
+                .expect("Native route service is infallible");
+            Ok::<_, std::convert::Infallible>(response)
+        }
+    })
+}
+
+fn stream_capacity_from_service_constructor<P, S>(_: fn(P) -> S) -> io::Result<usize>
+where
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    http2::Builder::<NativeTaskExecutor>::stream_task_allocation_capacity_bound::<S>()
+}
+
+fn native_stream_task_capacity_bound<S>() -> io::Result<usize>
+where
+    S: Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    stream_capacity_from_service_constructor(native_connection_service::<S>)
+}
+
+pub(crate) fn native_server_stream_task_allocation_capacity_bound() -> io::Result<usize> {
+    native_stream_task_capacity_bound::<NativeServerApp>()
+}
+
 struct NativeConnectionTaskInputs<S> {
     stream: tokio::net::TcpStream,
     app: S,
     incoming: NativeIncomingAdapter,
-    builder: http2::Builder<TokioExecutor>,
+    builder: http2::Builder<NativeTaskExecutor>,
     capacity: Option<tonic::transport::Http2ConnectionConfig>,
     initial_settings_deadline: Option<std::time::Instant>,
     acquisition_owner: Option<bytes::Bytes>,
@@ -528,17 +593,7 @@ where
                         drop(stream);
                         return Err("Native acquisition deadline elapsed during TLS".to_owned());
                     }
-                    let service =
-                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                            let app = app.clone();
-                            async move {
-                                let response = app
-                                    .oneshot(request.map(axum::body::Body::new))
-                                    .await
-                                    .expect("Native route service is infallible");
-                                Ok::<_, std::convert::Infallible>(response)
-                            }
-                        });
+                    let service = native_connection_service(app);
                     let mut connection = builder.serve_connection(TokioIo::new(stream), service);
                     if initial_settings_deadline.is_none() {
                         return Ok(AcquiredConnection::Installed(connection, capacity));
@@ -710,6 +765,11 @@ where
         factory
             .validate_server_task_capacity(bound)
             .map_err(|error| format!("validate actual native connection task capacity: {error}"))?;
+        let stream_bound = native_stream_task_capacity_bound::<S>()
+            .map_err(|error| format!("calculate actual native stream task capacity: {error}"))?;
+        factory
+            .validate_stream_task_capacity(stream_bound)
+            .map_err(|error| format!("validate actual native stream task capacity: {error}"))?;
     }
     // Per listener rather than per process: one all-in-one process hosts both
     // role listeners, and a shared counter would report the other one's work.
@@ -789,7 +849,17 @@ where
                     Ok(accepted) => accepted,
                 };
                 consecutive_accept_errors = 0;
-                let mut builder = http2::Builder::new(TokioExecutor::new());
+                let executor = match (&transport_capacity, &capacity) {
+                    (Some((factory, _)), Some(config)) => {
+                        let owner = config.io_owner.as_ref()
+                            .ok_or_else(|| "native stream executor lacks original owner".to_owned())?;
+                        factory.server_stream_executor(owner.clone())
+                            .map_err(|error| format!("construct original native stream executor: {error}"))?
+                    }
+                    (None, None) => NativeTaskExecutor::ordinary(),
+                    _ => return Err("native stream executor capability disagrees with listener".to_owned()),
+                };
+                let mut builder = http2::Builder::new(executor);
                 let initial_settings_deadline = transport_capacity.as_ref().map(|_| {
                     accepted_at + Duration::from_millis(
                         novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
@@ -798,6 +868,7 @@ where
                 // Claim the shared process acquisition position before cloning
                 // application owners, creating tasks or performing TLS/H2 IO.
                 if let Some(config) = &capacity {
+                    builder.reject_connect_for_preallocated_tasks(true);
                     if configure_server(&mut builder, config).is_err() {
                         drop(stream);
                         continue;

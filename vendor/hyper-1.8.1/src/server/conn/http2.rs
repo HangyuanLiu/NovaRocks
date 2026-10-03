@@ -473,6 +473,36 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Refuse CONNECT before constructing upgrade state or calling the service.
+    ///
+    /// This opt-in policy is intended for executors whose original task lease
+    /// covers only the incoming stream future. A CONNECT upgrade creates a
+    /// separate task that requires its own allocation capability. Refusal
+    /// sends `REFUSED_STREAM`; the default is false and preserves CONNECT's
+    /// existing behavior independently of extended CONNECT negotiation.
+    pub fn reject_connect_for_preallocated_tasks(&mut self, enabled: bool) -> &mut Self {
+        self.h2_builder.reject_connect_for_preallocated_tasks = enabled;
+        self
+    }
+
+    /// Query the executor's allocation bound for the concrete service stream task.
+    ///
+    /// This constructs neither a service future nor an executor, and includes
+    /// the actual executor type in the private stream future. The executor
+    /// defines which task allocations its receipt covers. The default executor
+    /// hook returns `Unsupported`; this query does not fund external future
+    /// data, an upgrade task, or the complete connection.
+    pub fn stream_task_allocation_capacity_bound<S>() -> std::io::Result<usize>
+    where
+        S: HttpService<IncomingBody>,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        S::ResBody: Body + 'static,
+        <S::ResBody as Body>::Error: Into<Box<dyn StdError + Send + Sync>>,
+        E: Http2ServerConnExec<S::Future, S::ResBody>,
+    {
+        <E as Http2ServerConnExec<S::Future, S::ResBody>>::stream_task_allocation_capacity_bound()
+    }
+
     /// Bind a connection together with a [`Service`](crate::service::Service).
     ///
     /// This returns a Future that must be polled in order for HTTP to be

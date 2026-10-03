@@ -80,6 +80,8 @@ mod native_fragment_query_tests;
 pub mod native_ingress;
 mod native_response;
 pub mod native_server;
+#[doc(hidden)]
+pub mod native_task_executor;
 mod native_transport_capacity;
 #[cfg(test)]
 mod physical_v1_roundtrip;

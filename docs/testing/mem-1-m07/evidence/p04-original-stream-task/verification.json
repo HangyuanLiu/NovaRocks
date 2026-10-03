@@ -1,0 +1,509 @@
+{
+  "receipt": "P04 original stream task subgraph",
+  "status": "local_stream_task_slice_verified_P04_executing_P05_P10_open_V1_not_advertised",
+  "parent_checkpoint": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+  "language": "zh-CN documentation; English JSON labels",
+  "scope": {
+    "actual_source": true,
+    "generic_task_model": false,
+    "zero_allocation_claim": false,
+    "original_authority": "Existing original connection stock; allocator tests use Worker ResultRetainedBudget",
+    "covered": [
+      "Hyper actual private H2Stream generic type bound and prepare dispatch",
+      "Native fixed task pool Arc and position Vec",
+      "actual Tokio Cell and automatic Future Box",
+      "Bytes prepared carrier physical exit and retained Waker",
+      "single-use prepared alias and actual current Future capacity check",
+      "funded CONNECT refusal before preparation and service"
+    ],
+    "not_covered": [
+      "future/output external heap",
+      "shared scheduler/runtime queues and hooks",
+      "peer IO and fixture allocations",
+      "other HTTP/2 stream scaffolds",
+      "TLS/auth/DNS/header/body/issuer whole graphs",
+      "complete independent 2MiB connection proof",
+      "complete M07 acceptance",
+      "Linux and formal performance"
+    ],
+    "default_none": "Ordinary executor/Hyper behavior retained; actual CONNECT parity test exercises the default path",
+    "v1_advertisement": null
+  },
+  "review_fixes": [
+    {
+      "issue": "Prepared executor clone could submit more than one Cell using one position",
+      "fix": "FREE/PREPARED/EXECUTED AtomicU8; compare_exchange PREPARED to EXECUTED before spawn; aliases retain the same carrier until final physical exit"
+    },
+    {
+      "issue": "Preparation using a small Future could execute a larger generic Future",
+      "fix": "Recalculate actual current F allocation bound before spawn and refuse above the original pool bound without consuming the prepared position"
+    },
+    {
+      "issue": "Aggregate stock arithmetic alone did not prove the stream task bookkeeping sublimit",
+      "fix": "Independent checked task pool total <= max_streams * 4096 before aggregate addition"
+    }
+  ],
+  "results": {
+    "initial_actual_system_allocator": {
+      "passed": 5,
+      "failed": 0,
+      "included_in_final_protocol": true,
+      "log": "/tmp/m07-stream-task-first-tests.log"
+    },
+    "final_protocol": {
+      "targets": [
+        {
+          "target": "native_connection_lifecycle",
+          "passed": 12,
+          "failed": 0
+        },
+        {
+          "target": "native_hyper_bounded_receive",
+          "passed": 9,
+          "failed": 0
+        },
+        {
+          "target": "native_hyper_fixed_write_buffer",
+          "passed": 2,
+          "failed": 0
+        },
+        {
+          "target": "native_initial_settings_kernel",
+          "passed": 7,
+          "failed": 0
+        },
+        {
+          "target": "native_original_io_box",
+          "passed": 6,
+          "failed": 0
+        },
+        {
+          "target": "native_original_socket_registration",
+          "passed": 4,
+          "failed": 0
+        },
+        {
+          "target": "native_original_stream_task",
+          "passed": 5,
+          "failed": 0
+        },
+        {
+          "target": "native_original_task_cell",
+          "passed": 5,
+          "failed": 0
+        },
+        {
+          "target": "native_tonic_acquisition_owner",
+          "passed": 9,
+          "failed": 0
+        },
+        {
+          "target": "native_tonic_attempt_connector",
+          "passed": 9,
+          "failed": 0
+        },
+        {
+          "target": "native_tonic_original_io_owner",
+          "passed": 9,
+          "failed": 0
+        }
+      ],
+      "passed": 77,
+      "failed": 0,
+      "log": "/tmp/m07-stream-task-final-protocol.log"
+    },
+    "native_adapter_lib": {
+      "passed": 673,
+      "failed": 0,
+      "log": "/tmp/m07-stream-task-libs.log"
+    },
+    "std_geometry": {
+      "passed": 1,
+      "failed": 0,
+      "included_in_native_lib": true,
+      "connection_pool_bytes": 6651541,
+      "process_stock_bytes": 3578749354,
+      "data_positions": 518,
+      "control_positions": 20,
+      "outer_server_task_backings_bytes": 9808,
+      "stream_task_backings_bytes": 1408,
+      "stream_task_pool_bytes": 187600,
+      "max_streams": 128,
+      "per_stream_bookkeeping_bytes": 4096,
+      "stream_task_bookkeeping_limit_bytes": 524288,
+      "local_pool_limit_passed": true,
+      "log": "/tmp/m07-stream-task-final-geometry.log"
+    },
+    "negative_regressions": {
+      "passed": 6,
+      "meaning": "Six compiled exact runtime failures; not successful mutant test runs",
+      "scratch": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-stream-negatives-n_3sqmk1",
+      "receipt": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-stream-negatives-n_3sqmk1/verification.json",
+      "source_receipt": {
+        "head": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+        "original_sha256": {
+          "novarocks/native-adapter/src/native_task_executor.rs": "01454c4a59085f878c0cc2b8f8560d095fd9690091317c612304965d2b600160",
+          "vendor/hyper-1.8.1/src/proto/h2/server.rs": "a4d376b576d3575175ab376757e80019075862dcecdb6e2bbed191063aa3d96a"
+        },
+        "cases": [
+          {
+            "name": "ordinary-cell-without-original-owner",
+            "command": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "-p",
+              "novarocks-native-adapter",
+              "--test",
+              "native_original_stream_task",
+              "real_small_stream_cell_waker_holds_position_refuses_before_service_and_recovers",
+              "--",
+              "--exact",
+              "--test-threads=1"
+            ],
+            "mutation_sha256": "9dee976d629a1bab48464700ec04f4d87974877a3423cada706bb16addc5d198",
+            "oracle": "called `Result::unwrap_err()` on an `Ok` value",
+            "exit": 101,
+            "verdict": "exact compiled runtime failure and allocation/lifetime oracle",
+            "log_sha256": "a15efaaf28ab7d5fecda56a8032084fdddcbc9a1e40f954baa86dbc56fd45b9d",
+            "exact_restoration": true
+          },
+          {
+            "name": "prepared-clone-replay",
+            "command": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "-p",
+              "novarocks-native-adapter",
+              "--test",
+              "native_original_stream_task",
+              "public_prepared_alias_cannot_replay_or_spawn_larger_future_and_cannot_reuse_early",
+              "--",
+              "--exact",
+              "--test-threads=1"
+            ],
+            "mutation_sha256": "cbc3ddb3247b123c88f564214d24c61b2d388eb89227dd9825b85930ae6ed61b",
+            "oracle": "same prepared lease cannot spawn a second Cell",
+            "exit": 101,
+            "verdict": "exact compiled runtime failure and allocation/lifetime oracle",
+            "log_sha256": "ed7f7283fc5bc11690ee766a3381f604416b4e5105f97e6e0577590a84f7c33f",
+            "exact_restoration": true
+          },
+          {
+            "name": "oversized-future-bypass",
+            "command": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "-p",
+              "novarocks-native-adapter",
+              "--test",
+              "native_original_stream_task",
+              "public_prepared_alias_cannot_replay_or_spawn_larger_future_and_cannot_reuse_early",
+              "--",
+              "--exact",
+              "--test-threads=1"
+            ],
+            "mutation_sha256": "86183f639820e60f3153f14d2bd89ae69bffe25ab06f3df26fb16ca1dda4ba44",
+            "oracle": "oversized future must not allocate or consume the prepared position",
+            "exit": 101,
+            "verdict": "exact compiled runtime failure and allocation/lifetime oracle",
+            "log_sha256": "77633c4955c6bf3c5a4e799c2d0e59b53f61587f9a749beed3f360929261c1e0",
+            "exact_restoration": true
+          },
+          {
+            "name": "pool-original-before-position-vec",
+            "command": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "-p",
+              "novarocks-native-adapter",
+              "--test",
+              "native_original_stream_task",
+              "real_small_stream_cell_waker_holds_position_refuses_before_service_and_recovers",
+              "--",
+              "--exact",
+              "--test-threads=1"
+            ],
+            "mutation_sha256": "b8fb96c5628e9dfb39f52d02c328bc4d35db8d7576ff9f05e6d195899a02687e",
+            "oracle": "Cell/autoBox/carrier/pool requested backing must physically exit before credit",
+            "exit": 101,
+            "verdict": "exact compiled runtime failure and allocation/lifetime oracle",
+            "log_sha256": "e0e5da9f58126c12afd1b41c46e00ae1c6026422564d6a118ef2530213b84312",
+            "exact_restoration": true
+          },
+          {
+            "name": "hyper-prepare-forwarding-omitted",
+            "command": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "-p",
+              "novarocks-native-adapter",
+              "--test",
+              "native_original_stream_task",
+              "real_small_stream_cell_waker_holds_position_refuses_before_service_and_recovers",
+              "--",
+              "--exact",
+              "--test-threads=1"
+            ],
+            "mutation_sha256": "94f4542cc8fe5ebc142499eff2e8ea5ac25580bff780e720a47c946ce0a8f62a",
+            "oracle": "called `Result::unwrap()` on an `Err` value",
+            "exit": 101,
+            "verdict": "exact compiled runtime failure and allocation/lifetime oracle",
+            "log_sha256": "13dc5614fc4e78cfc983990043fee64cd6ff48618abf575b8d5efea469bdb672",
+            "exact_restoration": true
+          },
+          {
+            "name": "connect-preallocation-gate-omitted",
+            "command": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "-p",
+              "novarocks-native-adapter",
+              "--test",
+              "native_original_stream_task",
+              "connect_is_refused_before_preparation_and_service_while_ordinary_default_dispatches",
+              "--",
+              "--exact",
+              "--test-threads=1"
+            ],
+            "mutation_sha256": "c5ed444738c55d7c7a70b87769e719f4b2a17bfae577e7842e5fac337ffb5a6e",
+            "oracle": "called `Result::unwrap_err()` on an `Ok` value",
+            "exit": 101,
+            "verdict": "exact compiled runtime failure and allocation/lifetime oracle",
+            "log_sha256": "524a95330ad0ee42670b78822a30442ec126a311fcdf09eb5b86582b6ebf40af",
+            "exact_restoration": true
+          }
+        ],
+        "exact_restoration": true
+      },
+      "full_diffs_and_logs_retained": true
+    }
+  },
+  "stable_input_logs": {
+    "initial_allocator": {
+      "path": "/tmp/m07-stream-task-first-tests.log",
+      "sha256": "8b7bc85a5aa29f408716980248552dafd5ef364882577dc3bf434cfaeeb931b1"
+    },
+    "final_protocol": {
+      "path": "/tmp/m07-stream-task-final-protocol.log",
+      "sha256": "eab153a8fdd36a44395f5aecf6eaee8c6c1ab668b3be904512b9956f73c9ace7"
+    },
+    "native_lib": {
+      "path": "/tmp/m07-stream-task-libs.log",
+      "sha256": "b3e0c2d8aca905dc433b4e80c00b4ab85488fecc3178118d6a2b64f8fe48bc81"
+    },
+    "std_geometry": {
+      "path": "/tmp/m07-stream-task-final-geometry.log",
+      "sha256": "69f30cf0b4da8100e189a13a1e8663ddede9401b7d38a05bf76d6fd7a8f85644"
+    },
+    "negative_summary": {
+      "path": "/tmp/m07-stream-task-negatives.log",
+      "sha256": "23399d722f4697d334460854bbdcf6927f580cc65418a28d0d00018a49ee4701"
+    }
+  },
+  "pending": {
+    "new_full_ci": {
+      "status": "PASS",
+      "log": "/tmp/m07-stream-task-full-ci.log",
+      "prior_ci_11947_is_not_current_wave_evidence": true
+    },
+    "new_seven_native_system_scenarios": {
+      "status": "PASS"
+    },
+    "final_source_pins": {
+      "status": "published"
+    },
+    "published_logs_and_negative_artifacts": {
+      "status": "published"
+    },
+    "final_checkpoint": {
+      "status": "not_yet_created_after_this_receipt"
+    }
+  },
+  "execution_limits": {
+    "new_stream_slice_miri": "not_run_by_this_receipt",
+    "cargo_or_source_mutation_by_receipt_writer": false,
+    "linux": "user_manual",
+    "push_pr_archive": false
+  },
+  "cargo_only_ci": {
+    "status": "PASS",
+    "artifact": "logs/ci-full/20261003-184228",
+    "duration_seconds": 490,
+    "component_passed": 11775,
+    "server_owner_passed": 173,
+    "server_smoke_passed": 4,
+    "passed": 11952,
+    "ignored": 7,
+    "profile": "dev",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_INCREMENTAL": "0",
+    "source_identity": "parent 79c1d417fd2dd43907021c8f8e90e78f48e35564 dirty candidate; actual pins separate"
+  },
+  "system": [
+    {
+      "scenario": "native-ingress/blocking-saturation-control",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024749756,
+      "ended_unix_millis": 1791024749996,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-ingress-blocking-saturation-control/scenario-evidence.json",
+      "artifact_sha256": "f1f9ab3328755c5df5d260846d9ded1613185a4a5295748f45d2e7283f5d35a8"
+    },
+    {
+      "scenario": "native-ingress/outer-preflight-rejection",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024749298,
+      "ended_unix_millis": 1791024749509,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-ingress-outer-preflight-rejection/scenario-evidence.json",
+      "artifact_sha256": "37c0846e95e058be01533139854455c880cbab6801db59a40ca068d7225623c2"
+    },
+    {
+      "scenario": "native-ingress/partial-body-deadline",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024750247,
+      "ended_unix_millis": 1791024750573,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-ingress-partial-body-deadline/scenario-evidence.json",
+      "artifact_sha256": "8f38c8a8c4f673f3ad0cd2372f18443838b6d508473d49478dc8903e0d84d069"
+    },
+    {
+      "scenario": "native-ingress/registry-contention-control",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024750822,
+      "ended_unix_millis": 1791024751040,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-ingress-registry-contention-control/scenario-evidence.json",
+      "artifact_sha256": "c42c0f9a0f9527cf7b8c97b27990e52f138b1a427e854b4690d6b486901445e8"
+    },
+    {
+      "scenario": "native-trust/automatic-dns",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024747818,
+      "ended_unix_millis": 1791024748256,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-trust-automatic-dns/scenario-evidence.json",
+      "artifact_sha256": "821cb48c4f36927df27ce0bf4d2171fbca01c186cee1c6dfeebc702d1e10a246"
+    },
+    {
+      "scenario": "native-trust/pem-ip",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024748616,
+      "ended_unix_millis": 1791024749042,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-trust-pem-ip/scenario-evidence.json",
+      "artifact_sha256": "848252ba6f01263a90cdee69568114e3c9250e0089e6a3ef552c2b4299aebbf4"
+    },
+    {
+      "scenario": "native-trust/plaintext-ip",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "source_dirty": true,
+      "source_tree_sha256": "8e9aa8e7a7d9dc8883737e0fa874b93517125ce9d583aea5b79c8d58477cfd4a",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "79c1d417fd2dd43907021c8f8e90e78f48e35564",
+      "started_unix_millis": 1791024747095,
+      "ended_unix_millis": 1791024747553,
+      "artifact": "logs/mem-1-m07/p04-original-stream-task-system/native-trust-plaintext-ip/scenario-evidence.json",
+      "artifact_sha256": "f1d01dfa95c94eb51e38edafef6b340597ede449b3e16b0942992b1d3467f381"
+    }
+  ],
+  "workspace_parking_lot_geometry": {
+    "connection_pool_bytes": 6651357,
+    "process_stock_bytes": 3578649978,
+    "server_task_backings_bytes": 9808,
+    "stream_task_backings_bytes": 1408,
+    "stream_task_pool_bytes": 187600,
+    "max_streams": 128
+  },
+  "source_pins": {
+    "file": "source-sha256.json",
+    "count": 639
+  },
+  "published_gzip_artifacts": 66
+}
