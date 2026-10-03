@@ -65,6 +65,8 @@ mod string_case;
 mod string_case_owner;
 mod string_measure;
 mod string_measure_owner;
+mod string_reverse;
+mod string_reverse_owner;
 mod string_trim;
 mod string_trim_owner;
 mod truncate;

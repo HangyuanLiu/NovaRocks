@@ -169,7 +169,7 @@ fn ordinary_selected_fresh_uses_the_actual_abs_attachment_once_without_a_catalog
     assert!(
         fixture
             .catalog
-            .definition("reverse", FunctionKind::Scalar)
+            .definition("initcap", FunctionKind::Scalar)
             .unwrap()
             .binding
             .as_ref()
@@ -222,7 +222,7 @@ fn ordinary_selected_fresh_uses_the_actual_abs_attachment_once_without_a_catalog
         .unwrap();
     let metadata_only = fixture
         .catalog
-        .definition("reverse", FunctionKind::Scalar)
+        .definition("initcap", FunctionKind::Scalar)
         .unwrap();
     let absent = metadata_only.binding_declaration().unwrap().overloads()[0]
         .identity
@@ -242,7 +242,7 @@ fn ordinary_selected_fresh_refuses_missing_owner_binding_and_record_as_typed_err
     let resolved = fixture
         .catalog
         .resolve_bound_user(
-            "reverse",
+            "initcap",
             FunctionKind::Scalar,
             FunctionBindingRequest {
                 arguments: &args,
