@@ -239,6 +239,7 @@ channel = [
     "tower?/util",
     "dep:tokio",
     "tokio?/time",
+    "tokio?/io-util",
     "dep:hyper-timeout",
 ]
 codegen = ["dep:async-trait"]

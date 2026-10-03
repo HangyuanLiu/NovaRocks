@@ -1,0 +1,17 @@
+{
+  "Cargo.lock": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+  "novarocks/native-adapter/src/native_peer_key_capacity_tests.rs": "2e8bccee27f8818a21dcf631b202b0d31fa30834dfc1fa6779a08b345d517c87",
+  "novarocks/native-adapter/src/native_transport_capacity.rs": "4e1510c5137166cf799724d28bab8abf2a49751b6f5da9d1da60b4e06cc550cc",
+  "novarocks/native-adapter/tests/native_tonic_connection_factory.rs": "f2f60ee79784caecbbf3b1cdcbb8de124403fd44a054a5d3d87784e0a7b8ac1f",
+  "novarocks/native-adapter/tests/native_tonic_original_connection_driver.rs": "8e193b1fc83a24c65962d5e3825f597f5f0283083ce8bf5fc18c16cf79827a94",
+  "rust-toolchain.toml": "173362929104368dff5113cbc9c4ce29bb38ae9d90fad19629999b6c2ee99389",
+  "vendor/tonic-0.12.3/Cargo.toml": "22623d95e1d5780fd3b76322cf30116f34c609388097c09d8f973f0a0c3dbbb7",
+  "vendor/tonic-0.12.3/Cargo.toml.orig": "474a595d78a2acd909d97bdd9ba99a20d786825c8eb57c7165536b2034cb261a",
+  "vendor/tonic-0.12.3/PATCH.md": "fd379f1cc1633de716754a193c90993621b0128323163b18bf035a6e5788c451",
+  "vendor/tonic-0.12.3/src/transport/channel/http2_connection.rs": "78f9dc2c64b4c1b12f4e55df60a79e6ae3cbd25fc8e7ee909fdf43ae118f8826",
+  "vendor/tonic-0.12.3/src/transport/channel/mod.rs": "4be04fd9d8b0e525fecc1ed41065d38184aef819b24a7accd6fbd3ae10438d07",
+  "vendor/tonic-0.12.3/src/transport/channel/service/connection.rs": "08fa105a7d2427fc99ca5957a9b209491301c9827c90dc582aa3b7dae23afdd7",
+  "vendor/tonic-0.12.3/src/transport/channel/service/connection_driver.rs": "668017e453e351f2ae06109ad933dd16e6cc520c6b731a971d4128e4f7bef5f2",
+  "vendor/tonic-0.12.3/src/transport/channel/service/mod.rs": "406989930f9e058d43c4d33d2bdbec6d23629f31f3bf00f0b8ace0410ac0a84e",
+  "vendor/tonic-0.12.3/src/transport/mod.rs": "6f339462fd1e33f05a1cf0f34f77e08f3c12dece10543be7f4895e2289920ff3"
+}

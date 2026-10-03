@@ -14,6 +14,10 @@ pub(crate) type Http2ConnectionFactory =
 /// connection budget or deadline. Default options preserve existing settings.
 #[derive(Debug, Default)]
 pub struct Http2ConnectionConfig {
+    /// One original prepaid live driver TaskCell for this physical attempt.
+    /// Reserved before connector creation; clones cannot elect a second driver.
+    /// None preserves the caller-selected executor and ordinary task ownership.
+    pub connection_driver: Option<super::OriginalConnectionDriver>,
     /// Opt-in total acquisition deadline from before factory execution through
     /// TCP/TLS, preface, applied peer initial SETTINGS and actual initial flush.
     /// None preserves legacy acquisition. This never times application streams.

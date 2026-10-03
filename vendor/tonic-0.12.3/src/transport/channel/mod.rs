@@ -8,6 +8,7 @@ mod tls;
 
 pub use endpoint::Endpoint;
 pub use http2_connection::{Http2ConnectionAttempt, Http2ConnectionConfig};
+pub use service::OriginalConnectionDriver;
 #[cfg(feature = "tls")]
 pub use tls::ClientTlsConfig;
 

@@ -346,6 +346,21 @@ async fn actual_same_channel_internal_reconnect_refuses_connecting_gate_before_n
         .unwrap();
     drop(runtime);
     drop(factory);
+    // IO exit precedes the separately scheduled live driver's final Cell exit.
+    // Observe actual original-credit reuse, not the manual protocol queue alone.
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if let ResultWriteAdmission::Granted(credit) =
+                budget.try_reserve_process(bytes).unwrap()
+            {
+                drop(credit);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual driver and original stock must physically exit");
     returned(&budget, bytes);
 }
 

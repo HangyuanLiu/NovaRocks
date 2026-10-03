@@ -72,6 +72,7 @@ struct Dimensions {
     table_bytes: usize,
     server_task_bound: usize,
     stream_task_bound: usize,
+    driver_task_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -446,6 +447,7 @@ impl Dimensions {
             table_bytes: 4096,
             server_task_bound: 0,
             stream_task_bound: 0,
+            driver_task_bound: 0,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -542,6 +544,13 @@ impl Dimensions {
         dimensions.server_task_bound =
             crate::native_server::native_server_task_allocation_capacity_bound()?;
         bound = add(bound, dimensions.server_task_bound)?;
+        dimensions.driver_task_bound =
+            tonic::transport::OriginalConnectionDriver::task_allocation_capacity_bound()?;
+        bound = add(bound, dimensions.driver_task_bound)?;
+        bound = add(
+            bound,
+            tonic::transport::OriginalConnectionDriver::metadata_allocation_capacity_bound()?,
+        )?;
         dimensions.stream_task_bound =
             crate::native_server::native_server_stream_task_allocation_capacity_bound()?;
         let stream_tasks =
@@ -917,7 +926,12 @@ impl NativeTransportCapacityFactory {
         class: TransportClass,
         key: Option<InlineNativeChannelIdentity>,
     ) -> io::Result<Http2ConnectionConfig> {
-        self.try_config_bound(class, key).map(|(config, _)| config)
+        let (mut config, _) = self.try_config_bound(class, key)?;
+        config.connection_driver = Some(tonic::transport::OriginalConnectionDriver::with_original(
+            self.core().dimensions.driver_task_bound,
+            config.io_owner.as_ref().ok_or_else(invalid)?.clone(),
+        )?);
+        Ok(config)
     }
 
     fn try_config_bound(
@@ -945,6 +959,7 @@ impl NativeTransportCapacityFactory {
         };
         Ok((
             Http2ConnectionConfig {
+                connection_driver: None,
                 acquisition_owner: Some(acquisition_owner),
                 io_owner: Some(owner.clone()),
                 connection_lifecycle: Some(connection_lifecycle),
@@ -1240,7 +1255,7 @@ mod tests {
     fn checked_stock_receipt_fits_frozen_process_and_connection_envelopes() {
         let d = Dimensions::frozen().unwrap();
         eprintln!(
-            "Checked original stock: connection_pool_bytes={} process_stock_bytes={} data_positions={} control_positions={} server_task_backings_bytes={} stream_task_backings_bytes={} stream_task_pool_bytes={}",
+            "Checked original stock: connection_pool_bytes={} process_stock_bytes={} data_positions={} control_positions={} server_task_backings_bytes={} stream_task_backings_bytes={} stream_task_pool_bytes={} driver_task_backings_bytes={} driver_metadata_bytes={}",
             d.connection_bound,
             d.stock_bound,
             d.data_positions,
@@ -1251,7 +1266,10 @@ mod tests {
                 d.streams,
                 d.stream_task_bound,
             )
-            .unwrap()
+            .unwrap(),
+            d.driver_task_bound,
+            tonic::transport::OriginalConnectionDriver::metadata_allocation_capacity_bound()
+                .unwrap()
         );
         assert_eq!((d.data_positions, d.control_positions), (518, 20));
         assert_eq!(

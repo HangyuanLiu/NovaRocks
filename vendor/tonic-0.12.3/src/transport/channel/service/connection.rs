@@ -267,6 +267,11 @@ where
         let mut initial_settings_deadline = None;
         let mut acquisition_owner = None;
         let mut io_owner = None;
+        let mut connection_driver = None;
+        let mut driver_lifecycle = AcquisitionLifecycle {
+            lifecycle: None,
+            completed: false,
+        };
         let mut connection_lifecycle = AcquisitionLifecycle {
             lifecycle: None,
             completed: false,
@@ -280,6 +285,12 @@ where
                 acquisition_owner = config.acquisition_owner.take();
                 io_owner = config.io_owner.take();
                 connection_lifecycle.lifecycle = config.connection_lifecycle.clone();
+                if let Some(driver) = config.connection_driver.take() {
+                    // Claim exactly once before creating the connector future.
+                    // The actual response type is checked, even for custom IO.
+                    connection_driver = Some(driver.reserve::<C::Response>()?);
+                    driver_lifecycle.lifecycle = config.connection_lifecycle.clone();
+                }
                 if (acquisition_owner.is_some() || connection_lifecycle.lifecycle.is_some())
                     && config.initial_settings_timeout.is_none_or(|d| d.is_zero())
                 {
@@ -398,14 +409,17 @@ where
             let (send_request, conn) = acquisition.await?;
             // The ordered acquisition future has now exited and released its
             // position. The live connection retains its independent pools.
-            Executor::<BoxFuture<'static, ()>>::execute(
-                &executor,
-                Box::pin(async move {
-                    if let Err(e) = conn.await {
-                        tracing::debug!("connection task error: {:?}", e);
-                    }
-                }) as _,
-            );
+            if let Some(driver) = connection_driver {
+                // Same concrete constructor as the static layout query; bypass
+                // both legacy type-erasure Boxes with the original task owner.
+                driver.spawn(conn)?;
+                driver_lifecycle.complete();
+            } else {
+                Executor::<BoxFuture<'static, ()>>::execute(
+                    &executor,
+                    Box::pin(super::connection_driver::run_driver(conn)) as _,
+                );
+            }
             Ok(SendRequest::from(send_request))
         })
     }

@@ -81,3 +81,38 @@ TLS buffers, enclosing futures/tasks, or the whole Native connection envelope.
 The optional private `cfg(tls)` parity tests and separate public TLS parity
 probe have distinct execution receipts and are not implied by the Native
 transport-only target's results.
+
+## Originally owned live connection driver
+
+A factory may supply `Http2ConnectionConfig.connection_driver`. Its strong-only
+`OriginalConnectionDriver` carries a single prepaid task position and the same
+physical IO capability. Construction prewarms its handle mutex; metadata queries
+cover the actual Arc and supported platform mutex allocation. The static task
+query uses the real `run_driver` constructor for both Endpoint connector output
+types, including the legacy timeout wrapper through its exact associated type.
+No future, task, or IO is constructed by that query.
+
+Before connector.call, make-service checks the actual response's driver bound
+and reserves the once-only token. Clones cannot create a second physical task.
+Cancellation, refusal, and unwind abandon that reservation. After successful
+acquisition the actual future goes directly to Tokio's original-owner spawn,
+without either legacy executor erasure Box. Spawn occurs without the handle
+mutex held, so synchronous runtime hooks can inspect the token. Publication
+stores one JoinHandle; its optional observation/control API creates no task.
+A separate lifecycle guard retires failed or unwinding dispatch and disarms
+only after successful spawn. The acquisition position does not move into the
+live task.
+
+The original owner stays in the real TaskCell through its final handle/Waker
+alias and actual deallocation, beyond future completion and IO exit. The last
+strong metadata holder deallocates its Arc before dropping its mutex/handle and
+physical capability. Default None keeps the caller-selected executor. This
+closes only the live driver Cell and its ordinary automatic Future Box; Hyper
+protocol tasks, Channel buffer workers, queues, TimeoutStream allocations,
+TLS/authentication, DNS, scheduler metadata, and whole-connection limits remain
+separate. Native outgoing factories install this token from their existing
+prepaid physical stock; incoming server configurations do not create it.
+
+The channel feature explicitly enables Tokio io-util, which owns the pinned
+original-task API. Workspace feature unification is not required for the
+standalone channel consumer to compile this opt-in carrier.

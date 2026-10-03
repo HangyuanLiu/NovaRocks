@@ -1,0 +1,15 @@
+# P04 出站实际 Tonic live driver 原授切片
+
+parent `3eee5bad6868918aeac115ea3e3fd4fc4b47884e` 上的冻结 dirty candidate；不是最终 M07 SHA。Native outgoing factory 从既有 physical stock 的同一 original Bytes 构造一次性 driver 能力，incoming config 不构造。startup checked 加入真正 `run_driver(Connection<OwnedConnectionIo<I>,BoxBody,SharedExec>)` 的 Tokio TaskCell/普通自动 FutureBox bound 与 Core Arc/PAL，静态查询不构造 future/IO/task；direct 与 legacy timeout 的真实关联输出类型都覆盖。单 package geometry 每连接6,669,213 B、stock3,588,329,666 B，outerTask10,304 B、streamTask1,536 B、streamPool203,984 B、driverTask640 B、driverMetadata152 B；不是完整独立2MiB子图证明。
+
+connector.call 前校验实际 C::Response bound、UNBOUND→RESERVED 单选；cloned grant 不允许第二连接，取消/错误/panic 后 ABANDONED 不重选。成功 acquisition 后同一真实 constructor 直接 original-owner spawn，绕过旧两层 type-erasure Box；spawn 不持 handle Mutex，随后短锁发布实际 JoinHandle。outer lifecycle guard 在成功 spawn 后才 disarm，错误/取消/unwind 退休同原连接，不把 acquisition position 带进 live TaskCell。Core 无 Weak/IO/Channel 或 Stock 反向持有；最后 strong 先实际 Arc free，再 Mutex/PAL/JoinHandle，最后 original。真正 TaskCell 单独保留同原能力到最后真实 handle/Waker alias 与 Cell dealloc。None 保持 customexecutor 原路径。
+
+最终 focused Native686、protocol60（包含新actual7）、FE native95通过；4窄源码反例分别漏 TaskCell 原 owner、允许 token 再选、漏 predial bound、提前退 original，均编译成功且精确单例 runtime FAILED(101)，finally byte-exact restore 后完整60/95复跑。不是 compile error、zero tests、abort 或 watchdog timeout oracle。7新测试使用实际 TCP/H2：准确 Core/PAL System allocator及clone零分配、short bound 零connector、重复token零第二dial、拨号失败退休、无SETTINGS取消后真实TCP EOF、完成但未poll的JoinHandle再AbortHandle持原预算至最后真实Cell退出、None customexecutor roundtrip。新allocator scope只证明Core/PAL，未捕获driver Cell/FutureBox地址/Layout；这两者使用相同真实constructor静态API组合与上述真实预算寿命，不混作独立allocator地址证明。
+
+最终 Cargo-only 全量 `logs/ci-full/20261003-212122` PASS **11983/7ignored、392s**（component11806/7、serverowner173、binarysmoke4），fmt/guards/check/warning-onlyClippy/build全通过，无新增driver lint。此前 `20261003-211821` 正在build时由root中断，补上Tonic channel→Tokio io-util 显式feature后重新全量；不是acceptance FAIL/PASS。独立只启用channel的offline probe实际run通过，62个非probe package name/version/source/checksum全部匹配production lock；没有workspace feature偶然补足、没有下载/升级。probe原执行manifest/lock保存；portable helper仅syntax检查，未另外执行。
+
+本波 frozen primary binary 与两个最终兼容性 fixture，实际独立1FE+3BE **8场景全PASS**：三transport profile、outerpreflight、blockingControl、partialbodydeadline、registrycontentionControl、islanddrain/replacement。canonical binary逐字hash等primary，harness退出清理通过。System只保存safe whitelist元数据/原artifact定位hash，不复制effective config、keys、JWT或private诊断。源pin/32 lossless logs/反例/二进制hash详见manifest。
+
+初轮库test发现旧manual reconnect fixture只等IO+manualexecutor，不等新实际scheduled driver Cell，单跑也失败；现在等待真实full-budget可复用事件再断言，不放宽原额度/peer/oracle，不归负载噪声。新target初两次Rust2024 implTrait生命周期捕获编译失败，改成connector ownedArc入参；初查询直接命名私有TimeoutStream和generic helper漏trait bound导致编译错误，改用真实关联输出类型与明确bounds。日志均保留，不计有效negative。
+
+approvedv5/P04executing/P05–P10open/V1None；DNS重大方案仍待用户，Linux由用户手测。Hyper内部ConnTask/Pipe/Send、Channelbufferworker/queue、TimeoutStream原heap、TLS/auth/sharedscheduler及完整graph另未闭合。无最终SQL/defaultSystem/release性能/Miri或完整M07结论；无push/PR/archive。下一独立切片闭合Hyper内部连接任务，不能把本live driver当其原授证明。

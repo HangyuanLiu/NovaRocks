@@ -29,3 +29,6 @@ pub(super) use self::tls::TlsConnector;
 
 mod attempt_connector;
 pub(crate) use self::attempt_connector::AttemptTimeoutConnector;
+
+mod connection_driver;
+pub use connection_driver::OriginalConnectionDriver;
