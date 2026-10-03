@@ -668,7 +668,8 @@ mod tests {
 
     #[test]
     fn resolve_concat_is_variadic() {
-        // `concat(...)` accepts any number of Utf8 args.
+        assert!(resolve_scalar_function("concat", &[]).is_err());
+        // CONCAT requires one Utf8 argument before its repeated tail.
         for n in 1..5 {
             let args = vec![DataType::Utf8; n];
             assert_eq!(

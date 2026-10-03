@@ -63,6 +63,8 @@ mod round_owner;
 mod rounding_binding;
 mod string_case;
 mod string_case_owner;
+mod string_concat;
+mod string_concat_owner;
 mod string_measure;
 mod string_measure_owner;
 mod string_reverse;

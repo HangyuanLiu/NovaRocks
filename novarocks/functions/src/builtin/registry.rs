@@ -327,7 +327,14 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
 
     // (Utf8, ...) -> Utf8 — variadic concat / format family.
-    for name in ["concat", "concat_ws", "elt", "format"] {
+    // CONCAT requires one string before the repeated tail. A single repeated
+    // spec alone permits zero arguments in the signature grammar.
+    add(
+        m,
+        "concat",
+        Signature::variadic(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    for name in ["concat_ws", "elt", "format"] {
         add(
             m,
             name,

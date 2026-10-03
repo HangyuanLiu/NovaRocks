@@ -2366,6 +2366,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_case_owner::operation(name).is_some() => {
                         Some(super::string_case_owner::effects())
                     }
+                    name if super::string_concat_owner::operation(name).is_some() => {
+                        Some(super::string_concat_owner::effects())
+                    }
                     name if super::string_trim_owner::operation(name).is_some() => {
                         Some(super::string_trim_owner::effects())
                     }
@@ -2525,6 +2528,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_case_owner::operation(name).is_some() => {
                 super::string_case_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_concat_owner::operation(name).is_some() => {
+                super::string_concat_owner::definition(name, declaration, resolver)?
             }
             name if super::string_trim_owner::operation(name).is_some() => {
                 super::string_trim_owner::definition(name, declaration, resolver)?
