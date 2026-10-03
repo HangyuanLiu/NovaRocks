@@ -14,10 +14,26 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Original numeric calendar-literal conversion, shared by pure and legacy owners.
-//! This accepts compact calendar encodings; it is not an epoch conversion.
+//! Original numeric calendar algorithms, shared by pure and legacy owners.
+//! Compact calendar literals and year/day ordinals are not epoch conversions.
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Days, NaiveDate, NaiveDateTime, NaiveTime};
+
+/// Original MAKEDATE range checks: ordinal overflow never rolls into another year.
+pub fn makedate_from_year_day(year: i64, day: i64) -> Option<NaiveDate> {
+    let year = i32::try_from(year).ok()?;
+    let day = i32::try_from(day).ok()?;
+    if day <= 0 || !(0..=9999).contains(&year) {
+        return None;
+    }
+    let base = NaiveDate::from_ymd_opt(year, 1, 1);
+    let leap = NaiveDate::from_ymd_opt(year, 2, 29).is_some();
+    let max_day = if leap { 366 } else { 365 };
+    if day > max_day {
+        return None;
+    }
+    base.and_then(|date| date.checked_add_days(Days::new((day - 1) as u64)))
+}
 
 fn standardize_numeric_datetime_literal(value: i64) -> Option<i64> {
     const YY_PART_YEAR: i64 = 70;

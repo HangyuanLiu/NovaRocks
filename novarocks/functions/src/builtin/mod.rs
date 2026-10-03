@@ -55,6 +55,8 @@ mod date;
 mod date_owner;
 mod dround;
 mod dround_owner;
+mod makedate;
+mod makedate_owner;
 mod numeric_binary;
 mod numeric_binary_owner;
 mod numeric_elementary;
