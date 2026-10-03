@@ -1,4 +1,4 @@
-//! Original ownership for the real Tonic live connection driver only.
+//! Separate original positions for the real Tonic and Hyper connection tasks.
 use super::{
     io::{BoxedIo, OwnedConnectionIo},
     SharedExec,
@@ -213,4 +213,135 @@ pub(super) fn endpoint_driver_task_bound() -> io::Result<usize> {
     > as tower_service::Service<http::Uri>>::Response;
     let timeout = driver_task_bound::<LegacyOutput>()?;
     Ok(direct.max(timeout))
+}
+
+/// Query only the real Hyper internal client future's TaskCell and automatic
+/// Future Box for Endpoint's closed IO set. The query alone does not fund a
+/// dispatch; OriginalHttp2ProtocolTask installs that separate original position.
+pub fn http2_protocol_task_allocation_capacity_bound() -> io::Result<usize> {
+    use hyper::client::conn::http2::Builder;
+    type LegacyOutput = <hyper_timeout::TimeoutConnector<
+        super::Connector<hyper_util::client::legacy::connect::HttpConnector>,
+    > as tower_service::Service<http::Uri>>::Response;
+    let direct = Builder::<SharedExec>::client_task_allocation_capacity_bound::<
+        OwnedConnectionIo<BoxedIo>,
+        BoxBody,
+    >()?;
+    let timeout = Builder::<SharedExec>::client_task_allocation_capacity_bound::<
+        OwnedConnectionIo<LegacyOutput>,
+        BoxBody,
+    >()?;
+    Ok(direct.max(timeout))
+}
+
+const PROTOCOL_PREPARED: u8 = 4;
+const PROTOCOL_SPAWNING: u8 = 5;
+/// One prepaid original internal HTTP/2 connection task position. This uses
+/// the same private strong-only position metadata as the separate live driver;
+/// each constructor creates its own one-shot position from the same IO owner.
+#[derive(Clone, Debug)]
+pub struct OriginalHttp2ProtocolTask {
+    position: OriginalConnectionDriver,
+}
+impl OriginalHttp2ProtocolTask {
+    /// Query the actual internal client task for Endpoint's closed IO set.
+    pub fn task_allocation_capacity_bound() -> io::Result<usize> {
+        http2_protocol_task_allocation_capacity_bound()
+    }
+    /// Query the same private position's Arc and prewarmed handle mutex backing.
+    pub fn metadata_allocation_capacity_bound() -> io::Result<usize> {
+        OriginalConnectionDriver::metadata_allocation_capacity_bound()
+    }
+    /// Construct only after pregranting the actual task and metadata backing.
+    /// Bytes retains the original physical capability; no new wallet is minted.
+    pub fn with_original(task_bound: usize, owner: Bytes) -> io::Result<Self> {
+        Ok(Self {
+            position: OriginalConnectionDriver::with_original(task_bound, owner)?,
+        })
+    }
+    /// Take the actual internal task handle without returning its original credit.
+    pub fn take_task_handle(&self) -> Option<JoinHandle<()>> {
+        self.position.take_task_handle()
+    }
+    /// Completion is an observation, not proof of physical Cell deallocation.
+    pub fn task_finished(&self) -> bool {
+        self.position.task_finished()
+    }
+    pub(super) fn reserve<I>(&self) -> io::Result<()>
+    where
+        I: rt::Read + rt::Write + Unpin + Send + 'static,
+    {
+        let bound = hyper::client::conn::http2::Builder::<SharedExec>::client_task_allocation_capacity_bound::<OwnedConnectionIo<I>,BoxBody>()?;
+        if bound > self.position.core().task_bound {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.position
+            .core()
+            .phase
+            .compare_exchange(UNBOUND, RESERVED, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
+        Ok(())
+    }
+    pub(super) fn prepare<F>(&self) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if tokio::runtime::Handle::task_allocation_capacity_bound::<F>()?
+            > self.position.core().task_bound
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.position
+            .core()
+            .phase
+            .compare_exchange(
+                RESERVED,
+                PROTOCOL_PREPARED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
+        Ok(())
+    }
+    pub(super) fn spawn<F>(&self, future: F) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if tokio::runtime::Handle::task_allocation_capacity_bound::<F>()?
+            > self.position.core().task_bound
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| io::ErrorKind::NotConnected)?;
+        let core = self.position.core();
+        core.phase
+            .compare_exchange(
+                PROTOCOL_PREPARED,
+                PROTOCOL_SPAWNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
+        struct Dispatch<'a>(&'a Core);
+        impl Drop for Dispatch<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.phase.compare_exchange(
+                    PROTOCOL_SPAWNING,
+                    ABANDONED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        }
+        let dispatch = Dispatch(core);
+        // Runtime hooks may inspect the position before handle publication.
+        let task = runtime.spawn_with_task_owner(future, core.original.clone())?;
+        let mut slot = core.task.lock().map_err(|_| io::ErrorKind::InvalidData)?;
+        *slot = Some(task);
+        core.phase.store(SPAWNED, Ordering::Release);
+        drop(slot);
+        drop(dispatch);
+        Ok(())
+    }
 }

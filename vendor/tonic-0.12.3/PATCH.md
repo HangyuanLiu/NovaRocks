@@ -116,3 +116,27 @@ prepaid physical stock; incoming server configurations do not create it.
 The channel feature explicitly enables Tokio io-util, which owns the pinned
 original-task API. Workspace feature unification is not required for the
 standalone channel consumer to compile this opt-in carrier.
+
+
+## Separate original Hyper internal connection task
+
+A factory may also supply `Http2ConnectionConfig.protocol_task`, an
+`OriginalHttp2ProtocolTask` with a fresh one-shot position independent of the
+live Tonic driver. Before connector.call it checks the actual connector
+response type and reserves that position. Hyper extracts a prepared executor
+before dispatch/H2 allocations and sends the same actual internal enum future
+directly to Tokio original-owner spawn. The base executor loses this token,
+so request Pipe/Send tasks cannot consume or replay the connection position.
+None retains the selected legacy executor path.
+
+Its metadata reuses the strong-only Core and prewarmed handle mutex backing,
+with no IO/Channel/Weak backlink. Clones share the once-only election. Errors
+and cancellation never reset a reserved/prepared position; spawn unwind marks
+it abandoned. Completion alone returns no credit: the actual unpolled Join,
+Abort or Waker alias retains the TaskCell original owner through deallocation.
+The handle is published under a short lock after spawn, without holding that
+lock across runtime hooks. Queries cover the same closed Endpoint IO set as
+the real factory. Native outgoing factories pregrant the task and metadata
+from their existing physical stock; incoming configurations leave it None.
+Pipe/Send, Channel worker/queues, DNS/TLS/auth, shared scheduler and the complete
+connection budget remain separate.

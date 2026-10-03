@@ -75,6 +75,24 @@ pub trait Executor<Fut> {
         Ok(None)
     }
 
+    /// Take an original prepared executor for an internal client task. The
+    /// default delegates the optional preparation hook; ordinary None changes
+    /// neither executor nor dispatch. A client executor can move its one-shot
+    /// capability out so later request tasks retain the ordinary base executor.
+    fn try_take_prepared_task(&mut self) -> std::io::Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        self.try_prepare_task()
+    }
+
+    /// Fallible opt-in dispatch of the same concrete future. Default execution
+    /// delegates unchanged; original-capability refusals must never fall back.
+    fn try_execute(&self, fut: Fut) -> std::io::Result<()> {
+        self.execute(fut);
+        Ok(())
+    }
+
     /// Check an incoming HTTP/2 head before stream task preparation, body
     /// adaptation or service construction. The default preserves dispatch.
     /// An error terminates this connection rather than only resetting a stream.

@@ -633,6 +633,28 @@ where
         self
     }
 
+    /// Replace only the executor for this caller-owned builder, preserving its
+    /// current settings. Original clients install it before connector creation.
+    pub fn executor(&mut self, executor: Ex) -> &mut Self {
+        self.exec = executor;
+        self
+    }
+
+    /// Query the executor's allocation bound for the actual internal HTTP/2
+    /// client task future. This constructs no IO, future, channel or task, and
+    /// covers neither its external backing nor the separate live driver.
+    /// The default executor hook explicitly refuses unsupported queries.
+    pub fn client_task_allocation_capacity_bound<T, B>() -> std::io::Result<usize>
+    where
+        T: Read + Write + Unpin,
+        B: Body + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+        Ex: Http2ClientConnExec<B, T> + Unpin,
+    {
+        Ex::client_task_allocation_capacity_bound()
+    }
+
     /// Constructs a connection with the configured options and IO.
     /// See [`client::conn`](crate::client::conn) for more.
     ///
@@ -649,14 +671,27 @@ where
         B::Error: Into<Box<dyn Error + Send + Sync>>,
         Ex: Http2ClientConnExec<B, T> + Unpin,
     {
-        let opts = self.clone();
+        let mut opts = self.clone();
 
         async move {
             trace!("client handshake HTTP/2");
 
+            // Original internal task refusal precedes dispatch/H2 allocation.
+            // Taking the capability leaves the base request executor unchanged.
+            let prepared = opts
+                .exec
+                .try_take_prepared_client_task()
+                .map_err(crate::Error::new_user_service)?;
             let (tx, rx) = dispatch::channel();
-            let h2 = proto::h2::client::handshake(io, rx, &opts.h2_builder, opts.exec, opts.timer)
-                .await?;
+            let h2 = proto::h2::client::handshake(
+                io,
+                rx,
+                &opts.h2_builder,
+                opts.exec,
+                prepared,
+                opts.timer,
+            )
+            .await?;
             Ok((
                 SendRequest {
                     dispatch: tx.unbound(),

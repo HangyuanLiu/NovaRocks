@@ -214,6 +214,7 @@ fn funded_config(budget: &Arc<ResultRetainedBudget>) -> io::Result<Http2Connecti
     };
     let owner = Bytes::from_owner_with_exit_guard(Bytes::new(), credit);
     Ok(Http2ConnectionConfig {
+        protocol_task: None,
         connection_driver: None,
         initial_settings_timeout: None,
         acquisition_owner: None,

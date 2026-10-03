@@ -102,7 +102,8 @@ mod tls;
 #[doc(inline)]
 #[cfg(feature = "channel")]
 pub use self::channel::{
-    Channel, Endpoint, Http2ConnectionAttempt, Http2ConnectionConfig, OriginalConnectionDriver,
+    http2_protocol_task_allocation_capacity_bound, Channel, Endpoint, Http2ConnectionAttempt,
+    Http2ConnectionConfig, OriginalConnectionDriver, OriginalHttp2ProtocolTask,
 };
 pub use self::error::Error;
 #[doc(inline)]

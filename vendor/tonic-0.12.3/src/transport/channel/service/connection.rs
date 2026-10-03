@@ -285,6 +285,10 @@ where
                 acquisition_owner = config.acquisition_owner.take();
                 io_owner = config.io_owner.take();
                 connection_lifecycle.lifecycle = config.connection_lifecycle.clone();
+                if let Some(task) = config.protocol_task.take() {
+                    task.reserve::<C::Response>()?;
+                    builder.executor(self.executor.clone().with_protocol_task(task));
+                }
                 if let Some(driver) = config.connection_driver.take() {
                     // Claim exactly once before creating the connector future.
                     // The actual response type is checked, even for custom IO.

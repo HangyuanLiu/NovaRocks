@@ -112,3 +112,23 @@ installation, checked per-stream bookkeeping, outgoing client tasks, shared
 scheduler backing, and the complete connection graph require separate
 composition and evidence. No whole Native/profile or performance acceptance
 is claimed by these hooks.
+
+
+## Optional original internal client connection task
+
+The client builder queries the executor for the actual private
+`H2ClientFuture<B,T,E>` allocation bound without constructing IO, a future,
+or a task. The sealed forwarding trait keeps its existing enum executor bound;
+no extra Send bound or individual-future executor implementation is required.
+The additive same-type `executor` setter preserves the builder settings.
+
+At handshake entry, before dispatch-channel or H2 allocation,
+`try_take_prepared_task` extracts an optional caller-prepaid executor. The
+base executor remains with ClientTask for later Pipe/Send tasks. The actual
+ConnTask enum future uses `try_execute` when prepared; a refusal propagates
+as an error with no ordinary-dispatch fallback. Default hooks preserve None
+and the existing selected executor. Hyper remains independent of Tokio.
+
+This closes only the opt-in internal connection task dispatch seam. Pipe,
+Send, CONNECT, queues, protocol backing and the complete transport graph need
+separate original-owner composition and evidence.

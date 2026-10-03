@@ -56,6 +56,18 @@ mod h2_client {
         T: Read + Write + Unpin,
     {
         #[doc(hidden)]
+        fn client_task_allocation_capacity_bound() -> std::io::Result<usize>;
+
+        #[doc(hidden)]
+        fn try_take_prepared_client_task(&mut self) -> std::io::Result<Option<Self>>;
+
+        #[doc(hidden)]
+        fn try_execute_h2_future(
+            &mut self,
+            future: H2ClientFuture<B, T, Self>,
+        ) -> std::io::Result<()>;
+
+        #[doc(hidden)]
         fn execute_h2_future(&mut self, future: H2ClientFuture<B, T, Self>);
     }
 
@@ -69,6 +81,21 @@ mod h2_client {
         H2ClientFuture<B, T, E>: Future<Output = ()>,
         T: Read + Write + Unpin,
     {
+        fn client_task_allocation_capacity_bound() -> std::io::Result<usize> {
+            <E as Executor<H2ClientFuture<B, T, E>>>::task_allocation_capacity_bound()
+        }
+
+        fn try_take_prepared_client_task(&mut self) -> std::io::Result<Option<Self>> {
+            <E as Executor<H2ClientFuture<B, T, E>>>::try_take_prepared_task(self)
+        }
+
+        fn try_execute_h2_future(
+            &mut self,
+            future: H2ClientFuture<B, T, E>,
+        ) -> std::io::Result<()> {
+            <E as Executor<H2ClientFuture<B, T, E>>>::try_execute(self, future)
+        }
+
         fn execute_h2_future(&mut self, future: H2ClientFuture<B, T, E>) {
             self.execute(future)
         }

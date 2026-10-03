@@ -73,6 +73,7 @@ struct Dimensions {
     server_task_bound: usize,
     stream_task_bound: usize,
     driver_task_bound: usize,
+    protocol_task_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -448,6 +449,7 @@ impl Dimensions {
             server_task_bound: 0,
             stream_task_bound: 0,
             driver_task_bound: 0,
+            protocol_task_bound: 0,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -550,6 +552,13 @@ impl Dimensions {
         bound = add(
             bound,
             tonic::transport::OriginalConnectionDriver::metadata_allocation_capacity_bound()?,
+        )?;
+        dimensions.protocol_task_bound =
+            tonic::transport::OriginalHttp2ProtocolTask::task_allocation_capacity_bound()?;
+        bound = add(bound, dimensions.protocol_task_bound)?;
+        bound = add(
+            bound,
+            tonic::transport::OriginalHttp2ProtocolTask::metadata_allocation_capacity_bound()?,
         )?;
         dimensions.stream_task_bound =
             crate::native_server::native_server_stream_task_allocation_capacity_bound()?;
@@ -931,6 +940,10 @@ impl NativeTransportCapacityFactory {
             self.core().dimensions.driver_task_bound,
             config.io_owner.as_ref().ok_or_else(invalid)?.clone(),
         )?);
+        config.protocol_task = Some(tonic::transport::OriginalHttp2ProtocolTask::with_original(
+            self.core().dimensions.protocol_task_bound,
+            config.io_owner.as_ref().ok_or_else(invalid)?.clone(),
+        )?);
         Ok(config)
     }
 
@@ -959,6 +972,7 @@ impl NativeTransportCapacityFactory {
         };
         Ok((
             Http2ConnectionConfig {
+                protocol_task: None,
                 connection_driver: None,
                 acquisition_owner: Some(acquisition_owner),
                 io_owner: Some(owner.clone()),
@@ -1270,6 +1284,10 @@ mod tests {
             d.driver_task_bound,
             tonic::transport::OriginalConnectionDriver::metadata_allocation_capacity_bound()
                 .unwrap()
+        );
+        eprintln!(
+            "Original actual Hyper connection protocol task backings bytes={}",
+            d.protocol_task_bound
         );
         assert_eq!((d.data_positions, d.control_positions), (518, 20));
         assert_eq!(

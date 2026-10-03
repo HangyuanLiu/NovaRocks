@@ -1,0 +1,13 @@
+# P04 实际 Hyper 内部连接任务原授切片
+
+本收据对应 parent `1088727d3b82d701604322a9b76aa083ab82b3c5` 上的冻结 dirty candidate，不是最终 M07 SHA。Native outgoing factory 从既有 physical stock 的同一 original Bytes 构造独立 `OriginalHttp2ProtocolTask`；live Tonic driver 有自己的 position，incoming 两项均 None。startup 查询真实 `H2ClientFuture<BoxBody,OwnedConnectionIo<I>,SharedExec>` 枚举 TaskCell/普通自动 FutureBox 与 Core/PAL，覆盖 Endpoint direct/legacy timeout 真实关联输出类型，不构造 future/IO/task。单package查询每连接6,671,477 B/process stock3,589,547,706 B，outer10368/stream1536/pool203984/driver640/protocol2048/每position metadata152；不是完整独立2MiB子图证明。
+
+connector.call 前实际 C::Response bound 与 UNBOUND→RESERVED 单选；Hyper 在 dispatch/H2 构造前 take/prepare，同一实际 ConnTask enum 直接原授 spawn。准备的 token 从 base executor 移出，后续 Pipe/Send 不误用本连接位置；fallible 派发失败直接传播，不回退普通 spawn。默认 None 保持旧 enum executor合同和选择的执行器，不添加非Send限制。reserved/prepared 错误和取消不重置到 UNBOUND，spawn unwind 显式转 ABANDONED；不声称每种取消均观察到同一 ABANDONED phase。Core无Weak/IO/Channel，actual ConnTask variant不反持SharedExec；spawn hook期间不持handle锁，随后短锁保存真实JoinHandle。最终strong先退Arc，再PAL/handle，最后original；实际Cell独立保留同原能力直到最后真实Join/Abort/Waker退出。
+
+最终686 Native lib、75 related protocol（包含新7）、132 FE native通过。新7覆盖真实TCP/H2、短容量零connector、cloned token零第二dial、真实拨号失败、不完整SETTINGS取消与TCP EOF、完成但未poll Join再Abort持预算直到最后actualCell、None customexecutor roundtrip及Core/PAL exactSystem地址/Layout/clone零alloc。新allocator只证明Core/PAL，未捕获TaskCell/FutureBox地址；它们由同真实enum静态API和真实句柄credit寿命组合证明。第一FE filter只选39，最终native filter132涵盖更宽相关面，不累加重复计数。
+
+四窄actual source negatives：漏TaskCell original owner、允许reserve重选、漏predial bound、绕过Hyper original dispatch。全部编译成功且精确单例 runtime FAILED101，再finally byte-exact restore。首次公开exports遗漏和创建中target旧field造成编译失败保留，但不作为有效反例。恢复并格式化后75/132复跑通过；portable两反例helper仅syntax检查，原执行日志/diff/result保存。
+
+全量Cargo-only CI `logs/ci-full/20261003-220506` PASS **11990/7ignored，492s**（component11813/7、serverowner173、binarysmoke4），fmt/guards/check/仓库warning-onlyClippy/build通过。仅启用channel的独立offline实际probe通过，62依赖name/version/source/checksum全部匹配production lock，未下载/升级；其portable helper仅syntax检查。最终冻结源码18pins未变，三兼容binary下实际独立1FE+3BE八场景全PASS（三transport profiles、四Control/ingress、island drain/replacement），canonical binary hash等primary。System只复制安全allowlist证据及原artifact定位hash，不复制effective config、JWT/key/private诊断。
+
+P04executing/P05–P10open/V1None。Pipe/Send请求任务对、Channelbufferworker/queues、TimeoutStream、DNS/TLS/auth/scheduler与完整graph另open。两份2048B enum已占满每stream4096B，后续须查询/派发独立actualfuture并纳入carrier/position/channel账，不提额或以aggregate覆盖。DNS重大选择待用户，Linux用户手测；无最终SQL/defaultSystem/release性能/Miri/完整M07或push/PR/archive结论。24lossless日志、sourcepins、反例与安全System投影详见manifest。

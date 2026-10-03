@@ -1,0 +1,35 @@
+{
+  "parent": "1088727d3b82d701604322a9b76aa083ab82b3c5",
+  "evidence_state": "frozen dirty candidate before checkpoint, not final M07 SHA",
+  "focused": {
+    "native_lib": 686,
+    "protocol": 75,
+    "fe_native": 132,
+    "new_actual_protocol_tests": 7,
+    "new_tests_included_in_protocol": true
+  },
+  "negative_cases": 4,
+  "mutations_byte_exact_restored": true,
+  "full_cargo_ci": {
+    "path": "logs/ci-full/20261003-220506",
+    "status": "PASS",
+    "passed": 11990,
+    "ignored": 7,
+    "seconds": 492
+  },
+  "system": {
+    "path": "logs/mem-1-m07/p04-original-protocol-task-system",
+    "passed": 8,
+    "topology": "independent 1FE+3BE",
+    "profile": "dev",
+    "platform": "macos aarch64"
+  },
+  "standalone_channel": {
+    "status": "PASS",
+    "production_lock_matching_dependencies": 62
+  },
+  "source_pins": 18,
+  "logs": 24,
+  "allocator_scope": "Core/PAL exact address/Layout only; actual enum query plus real Join/Abort credit lifetime; no new task Cell address/Layout claim",
+  "remaining": "P04 executing/P05-P10 open/V1 None; DNS decision pending/Linux user manual; no final SQL/default System/release/performance/Miri/push/PR/archive claim"
+}

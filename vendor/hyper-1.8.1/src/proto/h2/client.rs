@@ -240,6 +240,7 @@ pub(crate) async fn handshake<T, B, E>(
     req_rx: ClientRx<B>,
     config: &Config,
     mut exec: E,
+    prepared: Option<E>,
     timer: Time,
 ) -> crate::Result<ClientTask<B, E, T>>
 where
@@ -283,9 +284,16 @@ where
         is_terminated: false,
     };
 
-    exec.execute_h2_future(H2ClientFuture::Task {
+    let task = H2ClientFuture::Task {
         task: ConnTask::new(conn, conn_drop_rx, cancel_tx),
-    });
+    };
+    if let Some(mut executor) = prepared {
+        executor
+            .try_execute_h2_future(task)
+            .map_err(crate::Error::new_user_service)?;
+    } else {
+        exec.execute_h2_future(task);
+    }
 
     Ok(ClientTask {
         ping,
