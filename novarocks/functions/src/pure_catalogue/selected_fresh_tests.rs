@@ -27,6 +27,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+const METADATA_ONLY: &str = "metadata_only_fixture";
+
 #[derive(Default)]
 struct Control {
     trace: Mutex<Vec<u32>>,
@@ -91,8 +93,36 @@ impl Fixture {
             }
             builder.register(definition).unwrap();
         }
-        // This is the actual ordinary builtin catalogue, including entries
-        // without a pure CPU. No pure seal or invented installation inventory.
+        // Keep the negative fixture independent of builtin migration progress:
+        // its exact existing Utf8 binder stays real, while missing effect and
+        // CPU attachments are explicit test inputs rather than claimed installs.
+        let mut metadata_only = original
+            .definition("initcap", FunctionKind::Scalar)
+            .unwrap()
+            .clone();
+        metadata_only.canonical_name = METADATA_ONLY.into();
+        let binding = metadata_only.binding.as_mut().unwrap();
+        let overloads = binding
+            .declaration
+            .overloads()
+            .iter()
+            .cloned()
+            .map(|mut overload| {
+                overload.effects = None;
+                overload
+            });
+        binding.declaration = Arc::new(
+            crate::FunctionBindingDeclaration::try_new(
+                FunctionId::try_new("fixture/scalar/metadata-only/v1").unwrap(),
+                FunctionKind::Scalar,
+                overloads,
+            )
+            .unwrap(),
+        );
+        binding.pure = None;
+        builder.register(metadata_only).unwrap();
+        // Actual builtins and one explicit metadata-only negative fixture.
+        // No complete pure seal or invented installation inventory.
         let catalog = builder.seal_bound().unwrap();
         let arguments = vec![FunctionArgument::Value {
             value_type: FunctionValueType::new(DataType::Int32, false),
@@ -169,7 +199,7 @@ fn ordinary_selected_fresh_uses_the_actual_abs_attachment_once_without_a_catalog
     assert!(
         fixture
             .catalog
-            .definition("initcap", FunctionKind::Scalar)
+            .definition(METADATA_ONLY, FunctionKind::Scalar)
             .unwrap()
             .binding
             .as_ref()
@@ -222,7 +252,7 @@ fn ordinary_selected_fresh_uses_the_actual_abs_attachment_once_without_a_catalog
         .unwrap();
     let metadata_only = fixture
         .catalog
-        .definition("initcap", FunctionKind::Scalar)
+        .definition(METADATA_ONLY, FunctionKind::Scalar)
         .unwrap();
     let absent = metadata_only.binding_declaration().unwrap().overloads()[0]
         .identity
@@ -242,7 +272,7 @@ fn ordinary_selected_fresh_refuses_missing_owner_binding_and_record_as_typed_err
     let resolved = fixture
         .catalog
         .resolve_bound_user(
-            "initcap",
+            METADATA_ONLY,
             FunctionKind::Scalar,
             FunctionBindingRequest {
                 arguments: &args,
