@@ -1974,11 +1974,15 @@ impl<'a> super::AnalyzerContext<'a> {
         let mut name = name;
         if name == "element_at" {
             // Analyze the first argument lazily to learn its type.
-            let first_arg_ty = func.arguments.first().and_then(|argument| {
-                self.analyze_expr(argument, scope)
-                    .ok()
-                    .map(|typed| typed.value_type.data_type)
-            });
+            let first_arg_ty = if let Some(argument) = func.arguments.first() {
+                match self.analyze_expr(argument, scope) {
+                    Ok(typed) => Some(typed.value_type.data_type),
+                    Err(error) if error.control_error().is_some() => return Err(error),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
             match first_arg_ty {
                 Some(DataType::Map(_, _)) => name = "__map_element_at".to_string(),
                 Some(DataType::List(_)) => name = "__array_element_at".to_string(),
