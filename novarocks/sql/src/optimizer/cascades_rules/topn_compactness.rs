@@ -764,46 +764,78 @@ fn remap_sort_keys_through_union(
     branch_outputs: &[OutputColumn],
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<Vec<ScalarSortKey>>, crate::compiler::SqlCompileError> {
-    let mut remapped = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(union_column_id) = scalar_expr_to_column_id(scalars, item.expr) else {
-            return Ok(None);
-        };
-        let Some(output_position) = union_outputs
-            .iter()
-            .position(|column| column.column_id == union_column_id)
-        else {
-            return Ok(None);
-        };
-        let Some(union_output) = union_outputs.get(output_position) else {
-            return Ok(None);
-        };
-        let Some(branch_output) = branch_outputs.get(output_position) else {
-            return Ok(None);
-        };
-        if scalars.data_type(item.expr) != &union_output.value_type.data_type
-            || scalars.nullable(item.expr) != union_output.value_type.nullable
-            || branch_output.value_type.data_type != union_output.value_type.data_type
-            || branch_output.value_type.nullable != union_output.value_type.nullable
-        {
-            return Ok(None);
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
+    let result = (|| {
+        let mut remapped = Vec::with_capacity(items.len());
+        for item in items {
+            work.step()?;
+            let Some(union_column_id) = scalar_expr_to_column_id(scalars, item.expr) else {
+                return Ok(None);
+            };
+            let mut output_position = None;
+            for (position, column) in union_outputs.iter().enumerate() {
+                work.step()?;
+                if column.column_id == union_column_id {
+                    output_position = Some(position);
+                    break;
+                }
+            }
+            let Some(output_position) = output_position else {
+                return Ok(None);
+            };
+            let Some(union_output) = union_outputs.get(output_position) else {
+                return Ok(None);
+            };
+            let Some(branch_output) = branch_outputs.get(output_position) else {
+                return Ok(None);
+            };
+            if !scalars
+                .value_type(item.expr)
+                .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                    &union_output.value_type,
+                    || work.step().map_err(Into::into),
+                )?
+                || !branch_output
+                    .value_type
+                    .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                        &union_output.value_type,
+                        || work.step().map_err(Into::into),
+                    )?
+            {
+                return Ok(None);
+            }
+            work.flush()?;
+            let expr = scalars.intern_observed(
+                ScalarNode::ColumnRef(branch_output.column_id),
+                branch_output.value_type.clone(),
+                control,
+            )?;
+            remapped.push(ScalarSortKey {
+                expr,
+                asc: item.asc,
+                nulls_first: item.nulls_first,
+                display: Some(ColumnDisplay {
+                    qualifier: None,
+                    column: branch_output.name.clone(),
+                }),
+            });
+            work.step()?;
         }
-        let expr = scalars.intern_observed(
-            ScalarNode::ColumnRef(branch_output.column_id),
-            branch_output.value_type.clone(),
-            control,
-        )?;
-        remapped.push(ScalarSortKey {
-            expr,
-            asc: item.asc,
-            nulls_first: item.nulls_first,
-            display: Some(ColumnDisplay {
-                qualifier: None,
-                column: branch_output.name.clone(),
-            }),
-        });
+        Ok(Some(remapped))
+    })();
+    if matches!(
+        result,
+        Err(crate::compiler::SqlCompileError::Cancelled
+            | crate::compiler::SqlCompileError::DeadlineExceeded
+            | crate::compiler::SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
-    Ok(Some(remapped))
+    work.finish()?;
+    result
 }
 
 fn group_starts_with_logical_op(memo: &Memo, group_id: usize, op: &Operator) -> bool {
@@ -830,6 +862,10 @@ fn topn_phase_can_merge(outer: &TopNOp, inner: &TopNOp) -> bool {
         (TopNPhase::Final, TopNPhase::Final, false, false)
     )
 }
+
+#[cfg(test)]
+#[path = "topn_compactness_exact_type_tests.rs"]
+mod exact_type_tests;
 
 #[cfg(test)]
 mod tests {
