@@ -25,8 +25,6 @@ mod canonical_call_tests;
 #[cfg(test)]
 mod column_type_control_tests;
 #[cfg(test)]
-mod window_canonical_tests;
-#[cfg(test)]
 mod element_at_control_tests;
 #[cfg(test)]
 mod extract_binding_tests;
@@ -44,7 +42,11 @@ mod logical_output;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+#[cfg(test)]
+mod scalar_rebind_contract_tests;
 mod value_conversion;
+#[cfg(test)]
+mod window_canonical_tests;
 /// The analyzer owns this bound and enforces it; it is named outside the
 /// analyzer only where a test has to build a chain that crosses it.
 #[cfg(test)]

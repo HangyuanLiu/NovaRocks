@@ -5196,10 +5196,29 @@ pub(super) fn resolved_scalar_call_at(
         constant_policy,
         control,
     )?;
+    if !selected_call_shape_matches_observed(
+        binding.resolved(),
+        args.len(),
+        novarocks_functions::FunctionKind::Scalar,
+        control,
+    )? {
+        return Err(AnalyzeError::type_mismatch(
+            format!("function `{name}` selected an invalid call shape"),
+            span,
+        ));
+    }
     let args = args
         .into_iter()
         .zip(binding.selected.argument_types.iter())
         .map(|(argument, target)| match target {
+            novarocks_functions::FunctionArgumentType::Value(_)
+                if matches!(argument.kind, ExprKind::LambdaFunction { .. }) =>
+            {
+                Err(AnalyzeError::type_mismatch(
+                    format!("function `{name}` selected a value target for a lambda argument"),
+                    span,
+                ))
+            }
             novarocks_functions::FunctionArgumentType::Value(target) => {
                 coerce_selected_function_argument(
                     function_catalog,
@@ -5210,7 +5229,17 @@ pub(super) fn resolved_scalar_call_at(
                     control,
                 )
             }
-            novarocks_functions::FunctionArgumentType::Lambda { .. } => Ok(argument),
+            novarocks_functions::FunctionArgumentType::Lambda { .. }
+                if matches!(argument.kind, ExprKind::LambdaFunction { .. }) =>
+            {
+                Ok(argument)
+            }
+            novarocks_functions::FunctionArgumentType::Lambda { .. } => {
+                Err(AnalyzeError::type_mismatch(
+                    format!("function `{name}` selected a lambda target for a value argument"),
+                    span,
+                ))
+            }
         })
         .collect::<Result<Vec<_>, AnalyzeError>>()
         .map_err(|error| error.at_type_mismatch(span))?;
@@ -5223,9 +5252,7 @@ pub(super) fn resolved_scalar_call_at(
         constant_policy,
         control,
     )?;
-    if exact.function_id != binding.function_id
-        || exact.selected.overload != binding.selected.overload
-    {
+    if !rebound_call_matches_observed(binding.resolved(), exact.resolved(), &args, control)? {
         return Err(AnalyzeError::type_mismatch(
             format!("function `{name}` changed selected identity after argument coercion"),
             span,
@@ -5538,6 +5565,113 @@ fn normalize_field_arguments(
         .collect()
 }
 
+fn selected_call_shape_matches_observed(
+    binding: &novarocks_functions::ResolvedFunctionBinding,
+    arity: usize,
+    kind: novarocks_functions::FunctionKind,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, AnalyzeError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+    )
+    .map_err(AnalyzeError::control)?;
+    let matches = binding.kind == kind
+        && binding.selected.argument_types.len() == arity
+        && matches!(
+            binding.selected.result_type,
+            novarocks_functions::FunctionResultType::Scalar(_)
+        );
+    work.step().map_err(AnalyzeError::control)?;
+    work.finish().map_err(AnalyzeError::control)?;
+    Ok(matches)
+}
+
+/// Rebinding cannot change the call identity or the already-coerced argument
+/// facts. The exact binding still owns its result and constant specialization.
+fn rebound_call_matches_observed(
+    first: &novarocks_functions::ResolvedFunctionBinding,
+    exact: &novarocks_functions::ResolvedFunctionBinding,
+    args: &[TypedExpr],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, AnalyzeError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+    )
+    .map_err(AnalyzeError::control)?;
+    let matches = (|| -> Result<bool, novarocks_functions::FunctionBindingError> {
+        work.step()?;
+        if exact.function_id != first.function_id
+            || exact.selected.overload != first.selected.overload
+            || exact.kind != first.kind
+            || exact.selected.argument_types.len() != args.len()
+            || !matches!(
+                exact.selected.result_type,
+                novarocks_functions::FunctionResultType::Scalar(_)
+            )
+        {
+            return Ok(false);
+        }
+        for (target, arg) in exact.selected.argument_types.iter().zip(args.iter()) {
+            work.step()?;
+            match (target, &arg.kind) {
+                (
+                    novarocks_functions::FunctionArgumentType::Value(_),
+                    ExprKind::LambdaFunction { .. },
+                ) => return Ok(false),
+                (novarocks_functions::FunctionArgumentType::Value(value), _) => {
+                    if !value.exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                        &arg.value_type,
+                        || work.step().map_err(Into::into),
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                (
+                    novarocks_functions::FunctionArgumentType::Lambda {
+                        parameter_types,
+                        result_type,
+                    },
+                    ExprKind::LambdaFunction { params, body },
+                ) => {
+                    if parameter_types.len() != params.len() {
+                        return Ok(false);
+                    }
+                    for (target, parameter) in parameter_types.iter().zip(params.iter()) {
+                        work.step()?;
+                        if !target
+                            .exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                                &parameter.value_type,
+                                || work.step().map_err(Into::into),
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    if !result_type
+                        .exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                            &body.value_type,
+                            || work.step().map_err(Into::into),
+                        )?
+                    {
+                        return Ok(false);
+                    }
+                }
+                (novarocks_functions::FunctionArgumentType::Lambda { .. }, _) => return Ok(false),
+            }
+        }
+        Ok(true)
+    })();
+    if let Err(error) = &matches
+        && let Some(cause) = error.control_error()
+    {
+        return Err(AnalyzeError::control(cause));
+    }
+    work.finish().map_err(AnalyzeError::control)?;
+    Ok(matches!(matches, Ok(true)))
+}
+
 /// Window-only selected arguments use the same carrier/domain conversion
 /// author as ordinary calls, then retain the exact window selection.
 pub(super) fn bind_window_function_call_with_catalog(
@@ -5573,13 +5707,12 @@ pub(super) fn bind_window_function_call_with_catalog(
             })
     };
     let binding = resolve(&args)?;
-    if binding.kind != novarocks_functions::FunctionKind::Window
-        || binding.selected.argument_types.len() != args.len()
-        || !matches!(
-            binding.selected.result_type,
-            novarocks_functions::FunctionResultType::Scalar(_)
-        )
-    {
+    if !selected_call_shape_matches_observed(
+        &binding,
+        args.len(),
+        novarocks_functions::FunctionKind::Window,
+        control,
+    )? {
         return Err(AnalyzeError::type_mismatch(
             format!("window function `{name}` selected an invalid call shape"),
             span,
@@ -5610,45 +5743,7 @@ pub(super) fn bind_window_function_call_with_catalog(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let exact = resolve(&args)?;
-    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-        control,
-        novarocks_type_contract::CompilePhase::FunctionSpecialization,
-    )
-    .map_err(AnalyzeError::control)?;
-    let matches = (|| -> Result<bool, novarocks_functions::FunctionBindingError> {
-        work.step()?;
-        if exact.function_id != binding.function_id
-            || exact.selected.overload != binding.selected.overload
-            || exact.kind != binding.kind
-            || exact.selected.argument_types.len() != args.len()
-            || !matches!(
-                exact.selected.result_type,
-                novarocks_functions::FunctionResultType::Scalar(_)
-            )
-        {
-            return Ok(false);
-        }
-        for (target, arg) in exact.selected.argument_types.iter().zip(args.iter()) {
-            work.step()?;
-            let novarocks_functions::FunctionArgumentType::Value(value) = target else {
-                return Ok(false);
-            };
-            if !value.exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
-                &arg.value_type,
-                || work.step().map_err(Into::into),
-            )? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    })();
-    if let Err(error) = &matches
-        && let Some(cause) = error.control_error()
-    {
-        return Err(AnalyzeError::control(cause));
-    }
-    work.finish().map_err(AnalyzeError::control)?;
-    if !matches!(matches, Ok(true)) {
+    if !rebound_call_matches_observed(&binding, &exact, &args, control)? {
         return Err(AnalyzeError::type_mismatch(
             format!("window function `{name}` changed selected identity after argument coercion"),
             span,
@@ -5687,10 +5782,28 @@ pub(super) fn bind_scalar_function_call_with_catalog(
         control,
     ) {
         Ok(binding) => {
+            if !selected_call_shape_matches_observed(
+                binding.resolved(),
+                args.len(),
+                novarocks_functions::FunctionKind::Scalar,
+                control,
+            )? {
+                return Err(AnalyzeError::internal(format!(
+                    "function `{name}` selected an invalid call shape"
+                )));
+            }
+
             let args = args
                 .into_iter()
                 .zip(binding.selected.argument_types.iter())
                 .map(|(arg, target)| match target {
+                    novarocks_functions::FunctionArgumentType::Value(_)
+                        if matches!(arg.kind, ExprKind::LambdaFunction { .. }) =>
+                    {
+                        Err(AnalyzeError::internal(format!(
+                            "function `{name}` selected a value target for a lambda argument"
+                        )))
+                    }
                     novarocks_functions::FunctionArgumentType::Value(value) => {
                         coerce_selected_function_argument(
                             function_catalog,
@@ -5722,8 +5835,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                 constant_policy,
                 control,
             )?;
-            if exact.function_id != binding.function_id
-                || exact.selected.overload != binding.selected.overload
+            if !rebound_call_matches_observed(binding.resolved(), exact.resolved(), &args, control)?
             {
                 return Err(AnalyzeError::internal(format!(
                     "function `{name}` changed selected identity after argument coercion"

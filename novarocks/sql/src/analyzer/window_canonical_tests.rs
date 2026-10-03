@@ -767,24 +767,18 @@ fn window_wide_rebound_gate_observes_original_nested_source_and_terminal_control
         );
         let trace = control.recorded();
 
-        // The actual two catalogue resolutions are an independent prefix.
-        // The helper's later suffix must belong to the new exact-FVT gate,
-        // including its original entry, real nested quantum, and final tail.
-        let resolving = Trace::default();
-        for _ in 0..2 {
-            let argument = crate::analysis::function_argument(
-                original,
-                crate::constant::test_constant_policy(),
-                &resolving,
-            )
-            .unwrap();
-            crate::functions::builtin_sql_function_catalog()
-                .resolve_window_binding(name, &[argument], &resolving)
-                .unwrap();
-        }
-        let prefix = resolving.recorded();
-        assert_eq!(&trace[..prefix.len()], prefix.as_slice());
-        let gate = &trace[prefix.len()..];
+        // The final zero-unit entry is the actual shared rebound gate's
+        // scope. Earlier selection/shape/conversion scopes remain in the
+        // full trace and every refusal prefix below; no synthetic two-call
+        // prefix is assumed as shared gates evolve.
+        assert!(trace.last().unwrap().1 > 0);
+        let gate_entry = trace
+            .iter()
+            .rposition(|(phase, units)| {
+                *phase == CompilePhase::FunctionSpecialization && *units == 0
+            })
+            .expect("actual final shared gate entry");
+        let gate = &trace[gate_entry..];
         assert_eq!(
             gate.first(),
             Some(&(CompilePhase::FunctionSpecialization, 0))
