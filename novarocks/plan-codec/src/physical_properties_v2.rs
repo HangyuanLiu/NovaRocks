@@ -238,12 +238,14 @@ fn exact32(input: &[u8]) -> Result<[u8; 32], Error> {
         .map_err(|_| invalid("physical property identity or digest is not exactly 32 bytes"))
 }
 
-pub(crate) fn encode_observed(
+/// Allocation-free same-author admission for composing a larger namespace.
+/// The caller meters this pass and any later emission separately.
+pub(crate) fn preflight_encode_observed(
     input: &physical::PhysicalProperties,
     source: usize,
     limits: PhysicalPropertyProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(wire::PhysicalProperties, PhysicalPropertyProjectionFacts), Error> {
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let keys = match &input.distribution {
         physical::Distribution::Hash { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
@@ -281,7 +283,21 @@ pub(crate) fn encode_observed(
             if keyed { 2 } else { 0 },
         )?,
     )?;
-    let facts = facts(references, requests, requested, source, limits, work)?;
+    facts(references, requests, requested, source, limits, work)
+}
+
+pub(crate) fn encode_observed(
+    input: &physical::PhysicalProperties,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::PhysicalProperties, PhysicalPropertyProjectionFacts), Error> {
+    let facts = preflight_encode_observed(input, source, limits, work)?;
+    let keys = match &input.distribution {
+        physical::Distribution::Hash { keys, .. }
+        | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
+        _ => &[],
+    };
     let mut output_keys = reserve(keys.len(), work)?;
     for key in keys {
         output_keys.push(key.get());
@@ -436,18 +452,9 @@ fn decode_header(
     work.step()?;
     Ok(header)
 }
-pub(crate) fn decode_observed(
-    input: &wire::PhysicalProperties,
-    source: usize,
-    limits: PhysicalPropertyProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    (
-        physical::PhysicalProperties,
-        PhysicalPropertyProjectionFacts,
-    ),
-    Error,
-> {
+/// Allocation-free resource admission through the sole wire-property grammar.
+/// Exact header/ordering validation still occurs before decoder reservations.
+fn decode_source(input: &wire::PhysicalProperties) -> Result<(&[u32], usize), Error> {
     let kind = input
         .distribution
         .as_ref()
@@ -455,7 +462,7 @@ pub(crate) fn decode_observed(
         .kind
         .as_ref()
         .ok_or_else(|| invalid("physical property distribution kind is absent"))?;
-    let (keys, extra_source) = match kind {
+    let source = match kind {
         wire::distribution::Kind::Hash(hash) => {
             let scheme = hash
                 .scheme
@@ -498,6 +505,16 @@ pub(crate) fn decode_observed(
         | wire::distribution::Kind::RoundRobin(_)
         | wire::distribution::Kind::Broadcast(_) => (&[][..], 0),
     };
+    Ok(source)
+}
+
+pub(crate) fn preflight_decode_observed(
+    input: &wire::PhysicalProperties,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let (keys, extra_source) = decode_source(input)?;
     floor(
         source,
         add(
@@ -524,14 +541,35 @@ pub(crate) fn decode_observed(
         )?,
         2,
     )?;
-    let facts = facts(
+    facts(
         add(keys.len(), input.ordering.len())?,
         requests,
         requested,
         source,
         limits,
         work,
-    )?;
+    )
+}
+
+pub(crate) fn decode_observed(
+    input: &wire::PhysicalProperties,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        physical::PhysicalProperties,
+        PhysicalPropertyProjectionFacts,
+    ),
+    Error,
+> {
+    let facts = preflight_decode_observed(input, source, limits, work)?;
+    let kind = input
+        .distribution
+        .as_ref()
+        .and_then(|distribution| distribution.kind.as_ref())
+        .ok_or_else(|| invalid("prepared physical property distribution kind is absent"))?;
+    let (keys, _) = decode_source(input)?;
     let row_multiplicity = decode_multiplicity(input.row_multiplicity)?;
     let header = decode_header(kind, work)?;
     // Validate the complete ordering grammar before the first reserve; the

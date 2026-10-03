@@ -835,3 +835,105 @@ fn many_independent_valid_values_do_not_acquire_a_global_4096_type_table_limit()
     assert_eq!(dto.value_types.len(), 4100);
     assert_eq!(decoded.value_types().len(), 4100);
 }
+
+#[test]
+fn composing_value_clone_counts_only_actual_owned_dictionary_edges_and_preserves_flags() {
+    use std::mem::size_of;
+    let nested = Arc::new(Field::new(
+        "shared",
+        DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+        false,
+    ));
+    let carriers = [
+        (DataType::Int32, 0usize),
+        (DataType::List(nested.clone()), 0),
+        (
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::List(nested.clone())),
+            ),
+            2,
+        ),
+        (
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Utf8),
+                )),
+            ),
+            4,
+        ),
+    ];
+    for (carrier, requests) in carriers {
+        let original = FunctionValueType::new(carrier, true);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let facts = preflight_value_type_clone(&original, &mut work).unwrap();
+        assert_eq!(facts.allocation_requests_upper_bound(), requests);
+        assert_eq!(
+            facts.allocation_request_bytes_upper_bound(),
+            requests * size_of::<DataType>()
+        );
+        let cloned = clone_value_type_observed(&original, &mut work).unwrap();
+        work.finish().unwrap();
+        assert_eq!(cloned, original);
+        if let DataType::List(field) = cloned.data_type {
+            assert!(Arc::ptr_eq(&field, &nested));
+        }
+        let measured = control
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, n)| *n as usize)
+            .sum::<usize>();
+        assert!(measured <= facts.work_upper_bound());
+    }
+    for logical in [ValueLogicalType::LargeInt, ValueLogicalType::Uuid] {
+        let original =
+            FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), false, logical)
+                .unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let facts = preflight_value_type_clone(&original, &mut work).unwrap();
+        assert_eq!(facts.allocation_requests_upper_bound(), 0);
+        let cloned = clone_value_type_observed(&original, &mut work).unwrap();
+        work.finish().unwrap();
+        assert_eq!(cloned.logical_type, logical);
+        assert!(!cloned.nullable);
+    }
+}
+
+#[test]
+fn composing_value_clone_observes_each_original_dictionary_request_boundary() {
+    fn run(control: &Control) -> Result<FunctionValueType, TypeCodecError> {
+        let value = FunctionValueType::new(
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        );
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let result = (|| {
+            preflight_value_type_clone(&value, &mut work)?;
+            clone_value_type_observed(&value, &mut work)
+        })();
+        finish(work, result)
+    }
+    let base = Control::default();
+    run(&base).unwrap();
+    let expected = base.events.lock().unwrap().clone();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 1..=expected.len() {
+            let control = Control {
+                fail: Some((at, cause)),
+                events: Mutex::default(),
+            };
+            assert!(matches!(run(&control), Err(TypeCodecError::Control(got)) if got==cause));
+            assert_eq!(*control.events.lock().unwrap(), expected[..at]);
+        }
+    }
+}

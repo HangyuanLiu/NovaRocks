@@ -285,6 +285,95 @@ fn observe_bytes(bytes: &[u8], work: &mut CompileCheckpoints<'_>) -> Result<(), 
     Ok(())
 }
 
+/// New requests of cloning an already checked value root. Fields and other
+/// Arc-backed carriers are shared; only owned Dictionary children allocate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValueTypeCloneFacts {
+    requests: usize,
+    bytes: usize,
+    work: usize,
+}
+impl ValueTypeCloneFacts {
+    pub(crate) const fn allocation_requests_upper_bound(&self) -> usize {
+        self.requests
+    }
+    pub(crate) const fn allocation_request_bytes_upper_bound(&self) -> usize {
+        self.bytes
+    }
+    pub(crate) const fn work_upper_bound(&self) -> usize {
+        self.work
+    }
+}
+
+/// Fixed borrowed scratch covers only children which the sole clone author
+/// actually clones. Dictionaries underneath shared FieldRef owners allocate
+/// nothing here. This is numerical admission, not a host allocation grant.
+pub(crate) fn preflight_value_type_clone(
+    value: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValueTypeCloneFacts, TypeCodecError> {
+    use novarocks_type_contract::{MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES};
+    let mut pending = [None; MAX_VALUE_TYPE_DEPTH + 1];
+    pending[0] = Some((&value.data_type, 1usize));
+    let mut length = 1usize;
+    let mut nodes = 0usize;
+    let mut requests = 0usize;
+    while length != 0 {
+        length -= 1;
+        let (carrier, depth) = pending[length].take().ok_or(TypeCodecError::InvalidShape(
+            "value type clone scratch is empty",
+        ))?;
+        nodes = nodes.checked_add(1).ok_or(TypeCodecError::InvalidShape(
+            "value type clone node count overflow",
+        ))?;
+        work.step()?;
+        if nodes > MAX_VALUE_TYPE_NODES || depth > MAX_VALUE_TYPE_DEPTH {
+            return Err(TypeCodecError::InvalidShape(
+                "value type clone exceeds the checked carrier grammar",
+            ));
+        }
+        if let DataType::Dictionary(key, item) = carrier {
+            requests = requests.checked_add(2).ok_or(TypeCodecError::InvalidShape(
+                "value type clone request count overflow",
+            ))?;
+            if length + 2 > pending.len() {
+                return Err(TypeCodecError::InvalidShape(
+                    "value type clone scratch capacity exceeded",
+                ));
+            }
+            pending[length] = Some((item.as_ref(), depth + 1));
+            pending[length + 1] = Some((key.as_ref(), depth + 1));
+            length += 2;
+            work.step()?;
+        }
+    }
+    let bytes = std::alloc::Layout::array::<DataType>(requests)
+        .map_err(|_| TypeCodecError::InvalidShape("value type clone layout is unrepresentable"))?
+        .size();
+    let bound = nodes.checked_mul(8).and_then(|n| n.checked_add(16)).ok_or(
+        TypeCodecError::InvalidShape("value type clone work overflow"),
+    )?;
+    work.step()?;
+    Ok(ValueTypeCloneFacts {
+        requests,
+        bytes,
+        work: bound,
+    })
+}
+
+/// Preserve every value-root flag through the same carrier clone author.
+/// The composing caller must first admit preflight_value_type_clone's facts.
+pub(crate) fn clone_value_type_observed(
+    value: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionValueType, TypeCodecError> {
+    Ok(FunctionValueType {
+        data_type: clone_carrier(&value.data_type, work)?,
+        nullable: value.nullable,
+        logical_type: value.logical_type,
+    })
+}
+
 fn clone_carrier(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
@@ -293,10 +382,17 @@ fn clone_carrier(
     // Dictionary boxes are the only recursively owned carrier children.
     // Other nested carriers share Arrow FieldRef/Fields backing on clone.
     Ok(match ty {
-        DataType::Dictionary(key, value) => DataType::Dictionary(
-            Box::new(clone_carrier(key, work)?),
-            Box::new(clone_carrier(value, work)?),
-        ),
+        DataType::Dictionary(key, value) => {
+            let key = clone_carrier(key, work)?;
+            work.flush()?;
+            let key = Box::new(key);
+            work.flush()?;
+            let value = clone_carrier(value, work)?;
+            work.flush()?;
+            let value = Box::new(value);
+            work.flush()?;
+            DataType::Dictionary(key, value)
+        }
         ty => ty.clone(),
     })
 }

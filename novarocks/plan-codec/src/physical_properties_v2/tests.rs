@@ -486,3 +486,79 @@ fn complete_properties_projection_preserves_raw_domains_without_claiming_fragmen
         wire
     );
 }
+
+#[test]
+fn composing_property_preflight_has_same_numerical_author_before_emission() {
+    for original in [
+        properties(physical::Distribution::Unconstrained),
+        properties(physical::Distribution::Singleton),
+        properties(physical::Distribution::RoundRobin),
+        properties(physical::Distribution::Broadcast),
+        hash(),
+        bucket(),
+    ] {
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let admitted = preflight_encode_observed(&original, SOURCE, limits(), &mut work).unwrap();
+        work.finish().unwrap();
+        let (wire, actual) =
+            encode_physical_properties(&original, SOURCE, limits(), &Control::default()).unwrap();
+        assert_eq!(admitted, actual);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let admitted = preflight_decode_observed(&wire, SOURCE, limits(), &mut work).unwrap();
+        work.finish().unwrap();
+        let (decoded, actual) =
+            decode_physical_properties(&wire, SOURCE, limits(), &Control::default()).unwrap();
+        assert_eq!(admitted, actual);
+        assert_eq!(decoded, original);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let cap = PhysicalPropertyProjectionLimits {
+            max_allocation_request_bytes: admitted.allocation_request_bytes_upper_bound - 1,
+            ..limits()
+        };
+        assert!(matches!(
+            preflight_decode_observed(&wire, SOURCE, cap, &mut work),
+            Err(Error::InvalidShape(_))
+        ));
+    }
+}
+
+#[test]
+fn composing_property_preflight_preserves_each_original_callback_cause() {
+    let original = hash();
+    let (wire, _) =
+        encode_physical_properties(&original, SOURCE, limits(), &Control::default()).unwrap();
+    for receiving in [false, true] {
+        let run = |control: &Control| -> Result<PhysicalPropertyProjectionFacts, Error> {
+            let mut work = CompileCheckpoints::try_new(
+                control,
+                if receiving {
+                    CompilePhase::Decode
+                } else {
+                    CompilePhase::Encode
+                },
+            )?;
+            let result = if receiving {
+                preflight_decode_observed(&wire, SOURCE, limits(), &mut work)
+            } else {
+                preflight_encode_observed(&original, SOURCE, limits(), &mut work)
+            };
+            finish(work, result)
+        };
+        let control = Control::default();
+        run(&control).unwrap();
+        let expected = control.trace.lock().unwrap().clone();
+        for cause in CAUSES {
+            for stop in 0..expected.len() {
+                let control = Control {
+                    trace: Mutex::default(),
+                    stop: Some((stop, cause)),
+                };
+                assert!(matches!(run(&control),Err(Error::Control(got)) if got==cause));
+                assert_eq!(*control.trace.lock().unwrap(), expected[..=stop]);
+            }
+        }
+    }
+}
