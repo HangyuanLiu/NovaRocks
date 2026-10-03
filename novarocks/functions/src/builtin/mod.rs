@@ -71,6 +71,8 @@ mod string_reverse;
 mod string_reverse_owner;
 mod string_trim;
 mod string_trim_owner;
+mod string_url_decode;
+mod string_url_decode_owner;
 mod string_url_encode;
 mod string_url_encode_owner;
 mod truncate;
