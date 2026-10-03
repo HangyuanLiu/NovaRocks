@@ -257,7 +257,7 @@ fn decode_state(value: i32) -> Result<FunctionInstanceState, E> {
         _ => Err(E::InvalidShape("unknown or unspecified state")),
     }
 }
-fn encode_policy(value: DecimalOverflowPolicy) -> i32 {
+pub(crate) fn encode_policy(value: DecimalOverflowPolicy) -> i32 {
     match value {
         DecimalOverflowPolicy::OutputNull => wire::DecimalOverflowPolicy::OutputNull as i32,
         DecimalOverflowPolicy::ReportError => wire::DecimalOverflowPolicy::ReportError as i32,

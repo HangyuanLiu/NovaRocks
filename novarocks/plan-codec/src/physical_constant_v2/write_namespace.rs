@@ -69,8 +69,7 @@ impl PreparedConstantNamespaceWrite<'_, '_, '_> {
             work.flush()?;
             let mut output = Vec::new();
             let reserved = output.try_reserve_exact(self.records.len());
-            work.flush()?;
-            reserved.map_err(|_| shape("constant namespace output record allocation failed"))?;
+            crate::allocation_exit_v2::reserve_exit::<Error>(reserved, &mut work)?;
             for record in self.records {
                 work.step()?;
                 work.flush()?;
@@ -244,8 +243,7 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
         work.flush()?;
         let mut prepared = Vec::new();
         let reserved = prepared.try_reserve_exact(count);
-        work.flush()?;
-        reserved.map_err(|_| shape("constant namespace writer preparation allocation failed"))?;
+        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, &mut work)?;
         for ((id, pool), binding) in pools.entries().iter().zip(bindings) {
             let id_matches = *id == binding.pool;
             work.step()?;

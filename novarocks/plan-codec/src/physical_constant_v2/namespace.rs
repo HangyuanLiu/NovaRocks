@@ -316,8 +316,7 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
         work.flush()?;
         let mut prepared = Vec::new();
         let reserved = prepared.try_reserve_exact(records.len());
-        work.flush()?;
-        reserved.map_err(|_| shape("constant namespace prepared storage allocation failed"))?;
+        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, &mut work)?;
         for record in records {
             let (value_type, field) =
                 record_sources(record, types, source_retained_bytes, &mut work)?;

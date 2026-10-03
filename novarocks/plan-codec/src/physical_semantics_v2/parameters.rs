@@ -65,7 +65,7 @@ pub(super) fn decode_key(key: i32) -> Result<SemanticParameterKey, SemanticsCode
     }
 }
 
-pub(super) fn encode_reference(
+pub(crate) fn encode_reference(
     reference: &SemanticParameterRef,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::SemanticParameterRef, SemanticsCodecError> {

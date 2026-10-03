@@ -39,6 +39,9 @@ mod calls;
 mod parameters;
 mod pruning;
 
+pub(crate) use calls::encode_policy as encode_decimal_policy;
+pub(crate) use parameters::encode_reference;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticsCodecError {
     Control(CompileControlError),
