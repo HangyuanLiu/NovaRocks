@@ -344,7 +344,7 @@ async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
     key: NativeChannelKey,
 ) -> Result<Channel, String> {
-    let leader = if runtime.channels().is_bounded() {
+    let mut leader = if runtime.channels().is_bounded() {
         let identity = key
             .inline_identity()
             .map_err(|error| format!("Native channel identity refused: {error}"))?;
@@ -363,6 +363,11 @@ async fn get_or_create_channel(
         }
         None
     };
+    let original_worker = leader
+        .as_mut()
+        .map(|leader| leader.original_channel_worker())
+        .transpose()
+        .map_err(|error| format!("Native channel Worker election refused: {error}"))?;
     let connector = runtime
         .native_transport()
         .connector_for(key.endpoint.clone())?;
@@ -378,11 +383,17 @@ async fn get_or_create_channel(
                 })
         }
     });
-    let channel = capacity_endpoint_for_key(runtime, &key, TransportClass::Data)?
-        .timeout(Duration::from_secs(600))
-        .connect_with_connector(connector)
-        .await
-        .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
+    let endpoint = capacity_endpoint_for_key(runtime, &key, TransportClass::Data)?
+        .timeout(Duration::from_secs(600));
+    let channel = match original_worker {
+        Some(worker) => {
+            endpoint
+                .connect_with_connector_and_original_worker(connector, worker)
+                .await
+        }
+        None => endpoint.connect_with_connector(connector).await,
+    }
+    .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
     match leader {
         Some(leader) => leader
             .publish(channel.clone())

@@ -1,0 +1,18 @@
+{
+  "canonical": {
+    "path": "target/debug/novarocks",
+    "sha256": "2dca14c95e9abaf3ca661ccaa4c3207999128eb615ff4f9a2aaf2cb587a00985"
+  },
+  "primary": {
+    "path": "logs/mem-1-m07/p04-worker-compat-binaries/novarocks-primary",
+    "sha256": "2dca14c95e9abaf3ca661ccaa4c3207999128eb615ff4f9a2aaf2cb587a00985"
+  },
+  "compatible": {
+    "path": "logs/mem-1-m07/p04-worker-compat-binaries/novarocks-compatible",
+    "sha256": "a58e9be2a367fcb38066b80cef4f30d9c133078f001d2cc624cb73d7a0ca056f"
+  },
+  "other_island": {
+    "path": "logs/mem-1-m07/p04-worker-compat-binaries/novarocks-other-island",
+    "sha256": "e1fabb18488633a5e94b322c5c4a9f0f347454b1ebb40dad0ac0f4a13e1347f8"
+  }
+}

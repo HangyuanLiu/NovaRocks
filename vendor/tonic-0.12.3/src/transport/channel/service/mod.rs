@@ -1,4 +1,5 @@
 mod add_origin;
+mod channel_worker;
 use self::add_origin::AddOrigin;
 
 mod user_agent;
@@ -39,3 +40,5 @@ pub use connection_driver::{
     http2_split_client_task_allocation_capacity_bounds, OriginalConnectionDriver,
     OriginalHttp2ProtocolTask,
 };
+
+pub use self::channel_worker::OriginalChannelWorker;

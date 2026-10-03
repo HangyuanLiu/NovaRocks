@@ -24,6 +24,9 @@
 //! connection completion, configuration replacement, or logical cancellation.
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
+use crate::native_channel_worker_capacity::{
+    CacheEpoch, NativeChannelWorkerCapacity, NativeChannelWorkerToken,
+};
 use crate::native_connection_key_capacity::{
     NativeConnectionKeyCapacity, NativeConnectionKeyToken,
 };
@@ -76,6 +79,8 @@ struct Dimensions {
     protocol_task_bound: usize,
     request_pipe_task_bound: usize,
     request_send_task_bound: usize,
+    channel_worker_positions: usize,
+    channel_worker_task_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -99,7 +104,7 @@ struct StockCore {
     dimensions: Dimensions,
     acquisitions: [AtomicUsize; 2],
     listener_registrations: [AtomicBool; 2],
-    channel_cache_claimed: AtomicBool,
+    channel_workers: NativeChannelWorkerCapacity,
     connection_keys: NativeConnectionKeyCapacity,
     incoming_keys: NativeIncomingKeyCapacity,
     credit: ResultWriteCredit,
@@ -145,6 +150,33 @@ struct SlotExit {
     index: usize,
     generation: u64,
     key_token: Option<NativeConnectionKeyToken>,
+}
+
+struct ChannelWorkerExit {
+    factory: NativeTransportCapacityFactory,
+    token: NativeChannelWorkerToken,
+}
+impl Drop for ChannelWorkerExit {
+    fn drop(&mut self) {
+        self.factory
+            .core()
+            .channel_workers
+            .worker_owner_exited(self.token)
+            .expect("exact original Channel Worker owner exited once");
+    }
+}
+
+struct ChannelWorkerRollback {
+    factory: NativeTransportCapacityFactory,
+    token: NativeChannelWorkerToken,
+    armed: bool,
+}
+impl Drop for ChannelWorkerRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            self.factory.detach_channel_worker(self.token);
+        }
+    }
 }
 
 impl Drop for SlotExit {
@@ -454,6 +486,9 @@ impl Dimensions {
             protocol_task_bound: 0,
             request_pipe_task_bound: 0,
             request_send_task_bound: 0,
+            channel_worker_positions: crate::native_channel_cache::entry_positions()?,
+            channel_worker_task_bound:
+                tonic::transport::OriginalChannelWorker::task_allocation_capacity_bound()?,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -656,6 +691,21 @@ impl Dimensions {
             stock,
             crate::native_channel_cache::NativeChannelCache::allocation_capacity_bound()?,
         )?;
+        stock = add(
+            stock,
+            NativeChannelWorkerCapacity::additional_backing_bytes(
+                dimensions.channel_worker_positions,
+            )?,
+        )?;
+        let worker = add(
+            dimensions.channel_worker_task_bound,
+            tonic::transport::OriginalChannelWorker::metadata_allocation_capacity_bound()?,
+        )?;
+        let worker = add(
+            worker,
+            Bytes::owner_with_exit_guard_metadata_size::<Bytes, ChannelWorkerExit>(),
+        )?;
+        stock = add(stock, mul(dimensions.channel_worker_positions, worker)?)?;
         if stock > value(g.root_joint_retained_bytes_per_process)? {
             return Err(invalid());
         }
@@ -716,7 +766,9 @@ impl NativeTransportCapacityFactory {
                 dimensions,
                 acquisitions: [AtomicUsize::new(0), AtomicUsize::new(0)],
                 listener_registrations: [AtomicBool::new(false), AtomicBool::new(false)],
-                channel_cache_claimed: AtomicBool::new(false),
+                channel_workers: NativeChannelWorkerCapacity::new(
+                    dimensions.channel_worker_positions,
+                )?,
                 connection_keys: NativeConnectionKeyCapacity::new()?,
                 incoming_keys: NativeIncomingKeyCapacity::new()?,
                 credit,
@@ -775,21 +827,74 @@ impl NativeTransportCapacityFactory {
         )
     }
 
-    pub(crate) fn claim_channel_cache(&self) -> io::Result<()> {
-        self.core()
-            .channel_cache_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| io::ErrorKind::WouldBlock.into())
+    pub(crate) fn claim_channel_cache(&self) -> io::Result<CacheEpoch> {
+        self.core().channel_workers.claim_cache()
     }
 
-    pub(crate) fn release_channel_cache(&self) {
-        assert!(
-            self.core()
-                .channel_cache_claimed
-                .swap(false, Ordering::AcqRel),
-            "original cache backing exited once"
+    pub(crate) fn release_channel_cache(&self, epoch: CacheEpoch) {
+        self.core()
+            .channel_workers
+            .cache_backing_exited(epoch)
+            .expect("exact original cache backing exited once");
+    }
+
+    pub(crate) fn try_channel_worker(
+        &self,
+        epoch: CacheEpoch,
+        row_generation: u64,
+    ) -> io::Result<(
+        tonic::transport::OriginalChannelWorker,
+        NativeChannelWorkerToken,
+    )> {
+        let token = self
+            .core()
+            .channel_workers
+            .claim_worker(epoch, row_generation)?;
+        self.construct_channel_worker(token)
+    }
+
+    pub(crate) fn try_transient_channel_worker(
+        &self,
+        epoch: CacheEpoch,
+    ) -> io::Result<tonic::transport::OriginalChannelWorker> {
+        let token = self.core().channel_workers.claim_transient_worker(epoch)?;
+        let (worker, token) = self.construct_channel_worker(token)?;
+        self.detach_channel_worker(token);
+        Ok(worker)
+    }
+
+    fn construct_channel_worker(
+        &self,
+        token: NativeChannelWorkerToken,
+    ) -> io::Result<(
+        tonic::transport::OriginalChannelWorker,
+        NativeChannelWorkerToken,
+    )> {
+        let mut rollback = ChannelWorkerRollback {
+            factory: self.clone(),
+            token,
+            armed: true,
+        };
+        let owner = Bytes::from_owner_with_exit_guard(
+            Bytes::new(),
+            ChannelWorkerExit {
+                factory: self.clone(),
+                token,
+            },
         );
+        let worker = tonic::transport::OriginalChannelWorker::with_original(
+            self.core().dimensions.channel_worker_task_bound,
+            owner,
+        )?;
+        rollback.armed = false;
+        Ok((worker, token))
+    }
+
+    pub(crate) fn detach_channel_worker(&self, token: NativeChannelWorkerToken) {
+        self.core()
+            .channel_workers
+            .detach_worker(token)
+            .expect("exact Channel Worker detached once");
     }
 
     /// Checked per-position backing receipt, including its carrier wrapper.
@@ -1314,6 +1419,14 @@ mod tests {
             d.protocol_task_bound
         );
         let split = tonic::transport::http2_split_client_task_allocation_capacity_bounds().unwrap();
+        eprintln!(
+            "Original logical Channel Worker stock: positions={} actual_task_bytes={} metadata_bytes={} record_backing_bytes={}",
+            d.channel_worker_positions,
+            d.channel_worker_task_bound,
+            tonic::transport::OriginalChannelWorker::metadata_allocation_capacity_bound().unwrap(),
+            NativeChannelWorkerCapacity::additional_backing_bytes(d.channel_worker_positions)
+                .unwrap()
+        );
         eprintln!(
             "Original split client task facts: connection={} pipe={} send={} request_pool_bytes={}",
             split.connection,

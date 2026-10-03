@@ -1,0 +1,17 @@
+{
+  "cargo-test-component.log": {
+    "passed": 11847,
+    "failed": 0,
+    "ignored": 7
+  },
+  "cargo-test-server-owner.log": {
+    "passed": 173,
+    "failed": 0,
+    "ignored": 0
+  },
+  "cargo-test-server-smoke.log": {
+    "passed": 4,
+    "failed": 0,
+    "ignored": 0
+  }
+}

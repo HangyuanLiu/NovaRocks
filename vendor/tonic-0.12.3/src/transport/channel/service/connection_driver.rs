@@ -134,7 +134,13 @@ impl OriginalConnectionDriver {
         I: rt::Read + rt::Write + Unpin + Send + 'static,
         E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
     {
-        if driver_task_bound::<I, E>()? > self.core().task_bound {
+        self.reserve_task_bound(driver_task_bound::<I, E>()?)
+    }
+    pub(super) fn reserve_task_bound(
+        &self,
+        actual_bound: usize,
+    ) -> io::Result<PreparedConnectionDriver> {
+        if actual_bound > self.core().task_bound {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         self.core()
@@ -164,12 +170,17 @@ impl Drop for PreparedConnectionDriver {
     }
 }
 impl PreparedConnectionDriver {
-    pub(super) fn spawn<I, E>(mut self, conn: DriverConnection<I, E>) -> io::Result<()>
+    pub(super) fn spawn<I, E>(self, conn: DriverConnection<I, E>) -> io::Result<()>
     where
         I: rt::Read + rt::Write + Unpin + Send + 'static,
         E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
     {
-        let future = run_driver(conn);
+        self.spawn_future(run_driver(conn))
+    }
+    pub(super) fn spawn_future<F>(mut self, future: F) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         // This is the constructor used by the static query, not an erased model.
         fn actual<F: Future<Output = ()> + Send + 'static>(_: &F) -> io::Result<usize> {
             tokio::runtime::Handle::task_allocation_capacity_bound::<F>()

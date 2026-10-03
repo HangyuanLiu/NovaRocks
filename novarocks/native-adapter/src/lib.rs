@@ -63,6 +63,7 @@ pub mod fragment_window;
 pub mod management_http;
 mod native_channel_cache;
 mod native_channel_identity;
+mod native_channel_worker_capacity;
 pub mod native_client;
 mod native_connection_key_capacity;
 pub mod native_fd_capacity;

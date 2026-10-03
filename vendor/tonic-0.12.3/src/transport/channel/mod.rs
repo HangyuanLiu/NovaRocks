@@ -10,8 +10,8 @@ pub use endpoint::Endpoint;
 pub use http2_connection::{Http2ConnectionAttempt, Http2ConnectionConfig};
 pub use service::{
     http2_protocol_task_allocation_capacity_bound,
-    http2_split_client_task_allocation_capacity_bounds, OriginalConnectionDriver,
-    OriginalHttp2ProtocolTask, OriginalHttp2RequestTaskPool,
+    http2_split_client_task_allocation_capacity_bounds, OriginalChannelWorker,
+    OriginalConnectionDriver, OriginalHttp2ProtocolTask, OriginalHttp2RequestTaskPool,
 };
 #[cfg(feature = "tls")]
 pub use tls::ClientTlsConfig;
@@ -176,6 +176,26 @@ impl Channel {
         C::Future: Unpin + Send,
         C::Response: rt::Read + rt::Write + HyperConnection + Unpin + Send + 'static,
     {
+        Self::connect_with_original_worker(connector, endpoint, None).await
+    }
+
+    pub(crate) async fn connect_with_original_worker<C>(
+        connector: C,
+        endpoint: Endpoint,
+        original_worker: Option<OriginalChannelWorker>,
+    ) -> Result<Self, super::Error>
+    where
+        C: Service<Uri> + Send + 'static,
+        C::Error: Into<crate::Error> + Send,
+        C::Future: Unpin + Send,
+        C::Response: rt::Read + rt::Write + HyperConnection + Unpin + Send + 'static,
+    {
+        // Reserve before service/factory/dial/Buffer growth. This capability is
+        // never passed into Connection or SharedExec, preventing a task backlink.
+        let original_worker = original_worker
+            .map(|worker| worker.prepare())
+            .transpose()
+            .map_err(super::Error::from_source)?;
         let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let executor = endpoint.executor.clone();
 
@@ -183,7 +203,10 @@ impl Channel {
             .await
             .map_err(super::Error::from_source)?;
         let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
-        executor.execute(worker);
+        match original_worker {
+            Some(original) => original.spawn(worker).map_err(super::Error::from_source)?,
+            None => executor.execute(worker),
+        }
 
         Ok(Channel { svc })
     }
@@ -213,13 +236,36 @@ impl Channel {
         C::Future: Unpin + Send,
         C::Response: rt::Read + rt::Write + HyperConnection + Unpin + Send + 'static,
     {
+        Self::connect_attempt_with_original_worker(connector, endpoint, None).await
+    }
+
+    pub(crate) async fn connect_attempt_with_original_worker<C>(
+        connector: C,
+        endpoint: Endpoint,
+        original_worker: Option<OriginalChannelWorker>,
+    ) -> Result<Self, super::Error>
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Error: Into<crate::Error> + Send,
+        C::Future: Unpin + Send,
+        C::Response: rt::Read + rt::Write + HyperConnection + Unpin + Send + 'static,
+    {
+        // Reserve before service/factory/dial/Buffer growth. This capability is
+        // never passed into Connection or SharedExec, preventing a task backlink.
+        let original_worker = original_worker
+            .map(|worker| worker.prepare())
+            .transpose()
+            .map_err(super::Error::from_source)?;
         let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let executor = endpoint.executor.clone();
         let svc = Connection::connect_attempt(connector, endpoint)
             .await
             .map_err(super::Error::from_source)?;
         let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
-        executor.execute(worker);
+        match original_worker {
+            Some(original) => original.spawn(worker).map_err(super::Error::from_source)?,
+            None => executor.execute(worker),
+        }
         Ok(Channel { svc })
     }
 

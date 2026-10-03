@@ -402,6 +402,34 @@ impl Endpoint {
         }
     }
 
+    /// Connect eagerly with a separate caller-prepaid logical Channel Worker.
+    /// The original token is elected before the service/factory/dial/Buffer grows;
+    /// the exact Worker is directly dispatched with its original TaskCell owner.
+    /// This token is not installed in Endpoint or its connection executor. Clones
+    /// share its one-shot election. Queue/connector/outer-future backing is separate.
+    pub async fn connect_with_connector_and_original_worker<C>(
+        &self,
+        connector: C,
+        original_worker: super::OriginalChannelWorker,
+    ) -> Result<Channel, Error>
+    where
+        C: Service<Uri> + Send + 'static,
+        C::Response: rt::Read + rt::Write + Send + Unpin,
+        C::Future: Send,
+        crate::Error: From<C::Error> + Send,
+    {
+        let connector = self.connector(connector);
+        if let Some(connect_timeout) = self.connect_timeout {
+            let mut connector = hyper_timeout::TimeoutConnector::new(connector);
+            connector.set_connect_timeout(Some(connect_timeout));
+            Channel::connect_with_original_worker(connector, self.clone(), Some(original_worker))
+                .await
+        } else {
+            Channel::connect_with_original_worker(connector, self.clone(), Some(original_worker))
+                .await
+        }
+    }
+
     /// Connect with a custom connector lazily.
     ///
     /// This allows you to build a [Channel](struct.Channel.html) that uses a non-HTTP transport
@@ -447,6 +475,38 @@ impl Endpoint {
             .await
         } else {
             Channel::connect_attempt(connector, self.clone()).await
+        }
+    }
+
+    /// Typed eager connector with an independently prepaid logical Worker.
+    /// The original token never enters the physical connection executor/factory;
+    /// reconnects do not allocate another logical Channel Worker.
+    pub async fn connect_with_attempt_connector_and_original_worker<C>(
+        &self,
+        connector: C,
+        original_worker: super::OriginalChannelWorker,
+    ) -> Result<Channel, Error>
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Response: rt::Read + rt::Write + Send + Unpin,
+        C::Future: Send,
+        crate::Error: From<C::Error> + Send,
+    {
+        let connector = self.connector(connector);
+        if let Some(timeout) = self.connect_timeout {
+            Channel::connect_attempt_with_original_worker(
+                service::AttemptTimeoutConnector::new(connector, timeout),
+                self.clone(),
+                Some(original_worker),
+            )
+            .await
+        } else {
+            Channel::connect_attempt_with_original_worker(
+                connector,
+                self.clone(),
+                Some(original_worker),
+            )
+            .await
         }
     }
 

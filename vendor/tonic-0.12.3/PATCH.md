@@ -167,3 +167,27 @@ bookkeeping envelope. This closes only these actual Cells and their queried
 metadata/carriers. Callback/channel/queue/body/error/outer-future, Channel worker,
 DNS/TLS/auth and shared-scheduler backing still require separate composition.
 None retains the existing selected-executor path.
+
+## Originally owned eager Channel Worker
+
+`OriginalChannelWorker` is a distinct logical Channel position. The fallible
+`connect_with_connector_and_original_worker` and
+`connect_with_attempt_connector_and_original_worker` APIs reserve it before
+service construction, factory invocation, dialing or Buffer growth. It is never
+installed in Endpoint, Connection or SharedExec, so a retained JoinHandle cannot
+create a Worker-service-executor-capability cycle. Legacy eager, lazy and balance
+paths retain their existing executor behavior. No supplied original capability
+falls back to ordinary dispatch.
+
+The static query infers the actual private Tower Worker return type from the
+actual Buffer::pair constructor's function signature, without constructing a
+service, queue or future. Dispatch checks that exact future again and passes it
+directly to Tokio's original-owner spawn. The same strong capability survives
+completion through the actual TaskCell's Join/Abort/Waker aliases; cancellation
+or a completed future does not imply physical retirement. Metadata uses the
+existing strong-only, prewarmed driver Core geometry, with a separate election.
+
+This closes the actual eager Worker task and metadata slice. It does not fund
+Buffer queue/Handle/Semaphore backings, service futures, socket/TLS owners, or
+prove the complete Native connection allocation envelope. Native logical
+admission and cache attachment retirement belong to the application issuer.

@@ -23,6 +23,10 @@ use novarocks_types::NativeEndpoint;
 
 use crate::BackendDataRuntime;
 
+#[cfg(test)]
+#[path = "backend_readiness_worker_tests.rs"]
+mod worker_tests;
+
 /// Confirms an HTTP/2 channel to this process's advertised Native endpoint.
 ///
 /// The role keeps ownership of listener startup and cleanup. This transport
@@ -34,6 +38,10 @@ pub fn wait_for_backend_native_endpoint_ready(
     class: crate::native_transport_capacity::TransportClass,
     timeout: Duration,
 ) -> Result<(), String> {
+    let original_worker = runtime
+        .channels()
+        .transient_original_channel_worker()
+        .map_err(|error| format!("Native readiness Worker election refused: {error}"))?;
     let connector = runtime.native_transport().connector_for(endpoint.clone())?;
     let channel_endpoint = crate::native_client::capacity_endpoint(runtime, &endpoint, class)?;
     let connector = tower::service_fn(move |_| {
@@ -47,18 +55,27 @@ pub fn wait_for_backend_native_endpoint_ready(
         }
     });
     runtime.block_on(async move {
-        let channel =
-            tokio::time::timeout(timeout, channel_endpoint.connect_with_connector(connector))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "advertised Native endpoint {endpoint} did not become ready within {}ms",
-                        timeout.as_millis()
-                    )
-                })?
-                .map_err(|error| {
-                    format!("advertised Native endpoint {endpoint} readiness failed: {error}")
-                })?;
+        let connect = async move {
+            match original_worker {
+                Some(worker) => {
+                    channel_endpoint
+                        .connect_with_connector_and_original_worker(connector, worker)
+                        .await
+                }
+                None => channel_endpoint.connect_with_connector(connector).await,
+            }
+        };
+        let channel = tokio::time::timeout(timeout, connect)
+            .await
+            .map_err(|_| {
+                format!(
+                    "advertised Native endpoint {endpoint} did not become ready within {}ms",
+                    timeout.as_millis()
+                )
+            })?
+            .map_err(|error| {
+                format!("advertised Native endpoint {endpoint} readiness failed: {error}")
+            })?;
         // The actual connection task retains its pools until physical exit.
         drop(channel);
         Ok(())
