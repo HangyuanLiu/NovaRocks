@@ -91,7 +91,7 @@ pub fn validate_arrow_carrier_parameters_observed<E: From<CarrierParameterError>
         }
         DataType::Map(entries, _) => {
             entries.is_nullable()
-                || !matches!(entries.data_type(), DataType::Struct(fields) if fields.len() == 2 && !fields[0].is_nullable())
+                || !matches!(entries.data_type(), DataType::Struct(fields) if fields.len() == 2)
         }
         DataType::Union(fields, _) => {
             if fields.len() > 128 {
@@ -254,6 +254,10 @@ mod tests {
                 false,
                 vec![field(DataType::Utf8, false), field(DataType::Int32, true)],
             ),
+            map(
+                false,
+                vec![field(DataType::Utf8, true), field(DataType::Int32, true)],
+            ),
             union([0, 127]),
             union([]),
         ] {
@@ -300,10 +304,6 @@ mod tests {
             map(
                 true,
                 vec![field(DataType::Utf8, false), field(DataType::Int32, true)],
-            ),
-            map(
-                false,
-                vec![field(DataType::Utf8, true), field(DataType::Int32, true)],
             ),
             map(false, vec![]),
             map(false, vec![field(DataType::Utf8, false)]),

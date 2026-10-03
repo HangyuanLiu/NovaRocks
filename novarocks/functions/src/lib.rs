@@ -39,6 +39,8 @@ mod binding;
 pub mod builtin;
 pub mod calendar_numeric;
 mod call_contract;
+#[cfg(test)]
+mod carrier_map_tests;
 mod cast;
 mod comparison;
 pub mod datetime_value;
