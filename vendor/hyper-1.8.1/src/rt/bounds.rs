@@ -120,6 +120,13 @@ mod h2_server {
             Self: Sized;
 
         #[doc(hidden)]
+        fn admit_h2_request_head(
+            &self,
+            uri: &http::Uri,
+            headers: &http::HeaderMap,
+        ) -> std::io::Result<()>;
+
+        #[doc(hidden)]
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, Self>);
     }
 
@@ -138,6 +145,14 @@ mod h2_server {
 
         fn try_prepare_h2stream(&self) -> std::io::Result<Option<Self>> {
             <E as Executor<H2Stream<F, B, E>>>::try_prepare_task(self)
+        }
+
+        fn admit_h2_request_head(
+            &self,
+            uri: &http::Uri,
+            headers: &http::HeaderMap,
+        ) -> std::io::Result<()> {
+            <E as Executor<H2Stream<F, B, E>>>::admit_request_head(self, uri, headers)
         }
 
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, E>) {

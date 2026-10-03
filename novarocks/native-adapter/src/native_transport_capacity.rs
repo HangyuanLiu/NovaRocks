@@ -27,6 +27,9 @@ use crate::native_channel_identity::InlineNativeChannelIdentity;
 use crate::native_connection_key_capacity::{
     NativeConnectionKeyCapacity, NativeConnectionKeyToken,
 };
+use crate::native_incoming_key_capacity::{
+    NativeIncomingKey, NativeIncomingKeyCapacity, NativeIncomingKeyToken,
+};
 use bytes::Bytes;
 use hyper::http::header::HeaderMapAllocationPool;
 use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
@@ -36,7 +39,7 @@ use std::alloc::Layout;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use tonic::transport::Http2ConnectionConfig;
 
 /// Independent original stock; Control cannot consume or lend Data positions.
@@ -83,6 +86,7 @@ struct ConnectionRecord {
     claimed: AtomicBool,
     generation: AtomicU64,
     phase: AtomicU8,
+    incoming: Mutex<Option<(NativeIncomingKey, NativeIncomingKeyToken)>>,
 }
 
 struct StockCore {
@@ -93,6 +97,7 @@ struct StockCore {
     listener_registrations: [AtomicBool; 2],
     channel_cache_claimed: AtomicBool,
     connection_keys: NativeConnectionKeyCapacity,
+    incoming_keys: NativeIncomingKeyCapacity,
     credit: ResultWriteCredit,
     // Keep the existing issuer alive through the credit's release callback.
     _budget: Arc<ResultRetainedBudget>,
@@ -157,6 +162,18 @@ impl Drop for SlotExit {
                 .exit(token)
                 .expect("exact physical key generation exited once");
         }
+        if let Some((_, token)) = record
+            .incoming
+            .lock()
+            .expect("original incoming record lock")
+            .take()
+        {
+            self.factory
+                .core()
+                .incoming_keys
+                .exit(token)
+                .expect("exact original incoming key exit");
+        }
         record.phase.store(VACANT, Ordering::Release);
         record.claimed.store(false, Ordering::Release);
     }
@@ -212,7 +229,16 @@ impl h2::ConnectionLifecycleObserver for NativeLifecycleObserver {
     }
 
     fn on_retiring(&self) -> io::Result<()> {
-        self.record()?.phase.store(RETIRING, Ordering::Release);
+        let record = self.record()?;
+        // Serialize seal and retirement on the original physical record.
+        let incoming = record
+            .incoming
+            .lock()
+            .map_err(|_| io::ErrorKind::InvalidData)?;
+        record.phase.store(RETIRING, Ordering::Release);
+        if let Some((_, token)) = *incoming {
+            self.factory.core().incoming_keys.retire(token)?;
+        }
         if let Some(token) = self.key_token {
             self.factory.core().connection_keys.retire(token)?;
         }
@@ -224,6 +250,42 @@ impl Drop for NativeLifecycleObserver {
     fn drop(&mut self) {
         // Includes unpolled attempts that never obtained a bound IO lease.
         let _ = h2::ConnectionLifecycleObserver::on_retiring(self);
+    }
+}
+
+/// Same original carrier and physical generation used by final SlotExit.
+/// This handle owns no independent grant or connection registry.
+#[derive(Clone)]
+pub(crate) struct NativeIncomingConnectionBinding {
+    factory: NativeTransportCapacityFactory,
+    index: usize,
+    generation: u64,
+    _original: Bytes,
+}
+
+impl NativeIncomingConnectionBinding {
+    pub(crate) fn seal(&self, key: NativeIncomingKey) -> io::Result<()> {
+        let record = &self.factory.core().slots[self.index];
+        let mut incoming = record
+            .incoming
+            .lock()
+            .map_err(|_| io::ErrorKind::InvalidData)?;
+        if !record.claimed.load(Ordering::Acquire)
+            || record.generation.load(Ordering::Acquire) != self.generation
+            || record.phase.load(Ordering::Acquire) != LIVE
+        {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        if let Some((existing, _)) = *incoming {
+            return if existing == key {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::ConnectionAborted.into())
+            };
+        }
+        let token = self.factory.core().incoming_keys.claim(key)?;
+        *incoming = Some((key, token));
+        Ok(())
     }
 }
 
@@ -541,6 +603,18 @@ impl Dimensions {
                 Bytes::owner_with_exit_guard_metadata_size::<Bytes, AcquisitionExit>(),
             )?,
         )?;
+        stock = add(
+            stock,
+            NativeIncomingKeyCapacity::additional_backing_bytes()?,
+        )?;
+        // Each fixed physical record owns its lazy platform Mutex backing.
+        stock = add(
+            stock,
+            mul(
+                add(dimensions.data_positions, dimensions.control_positions)?,
+                NativeIncomingKeyCapacity::additional_backing_bytes()?,
+            )?,
+        )?;
         // Exact process-credit callback capture at the existing issuer seam.
         // Callback retirement/observer backing belongs to that existing issuer;
         // this receipt does not claim the issuer's whole allocation graph.
@@ -587,11 +661,22 @@ impl NativeTransportCapacityFactory {
         slots
             .try_reserve_exact(positions)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        slots.resize_with(positions, || ConnectionRecord {
-            claimed: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-            phase: AtomicU8::new(VACANT),
-        });
+        for _ in 0..positions {
+            let record = ConnectionRecord {
+                claimed: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+                phase: AtomicU8::new(VACANT),
+                incoming: Mutex::new(None),
+            };
+            // Initialize the platform backing under the pregranted stock.
+            drop(
+                record
+                    .incoming
+                    .lock()
+                    .map_err(|_| io::ErrorKind::InvalidData)?,
+            );
+            slots.push(record);
+        }
         Ok(Self {
             core: Some(Arc::new(StockCore {
                 slots,
@@ -600,6 +685,7 @@ impl NativeTransportCapacityFactory {
                 listener_registrations: [AtomicBool::new(false), AtomicBool::new(false)],
                 channel_cache_claimed: AtomicBool::new(false),
                 connection_keys: NativeConnectionKeyCapacity::new()?,
+                incoming_keys: NativeIncomingKeyCapacity::new()?,
                 credit,
                 _budget: budget,
             })),
@@ -819,11 +905,26 @@ impl NativeTransportCapacityFactory {
         self.try_config_inner(class, Some(key))
     }
 
+    pub(crate) fn try_incoming_config(
+        &self,
+        class: TransportClass,
+    ) -> io::Result<(Http2ConnectionConfig, NativeIncomingConnectionBinding)> {
+        self.try_config_bound(class, None)
+    }
+
     fn try_config_inner(
         &self,
         class: TransportClass,
         key: Option<InlineNativeChannelIdentity>,
     ) -> io::Result<Http2ConnectionConfig> {
+        self.try_config_bound(class, key).map(|(config, _)| config)
+    }
+
+    fn try_config_bound(
+        &self,
+        class: TransportClass,
+        key: Option<InlineNativeChannelIdentity>,
+    ) -> io::Result<(Http2ConnectionConfig, NativeIncomingConnectionBinding)> {
         let d = self.core().dimensions;
         let acquisition_owner = self.claim_acquisition(class)?;
         let (owner, index, generation, key_token) = self.claim(class, key)?;
@@ -836,58 +937,74 @@ impl NativeTransportCapacityFactory {
             },
             owner.clone(),
         )?;
-        Ok(Http2ConnectionConfig {
-            acquisition_owner: Some(acquisition_owner),
-            io_owner: Some(owner.clone()),
-            connection_lifecycle: Some(connection_lifecycle),
-            stream_store_buffer: Some(h2::StreamStoreBuffer::new(
-                d.streams,
-                d.streams,
-                owner.clone(),
-            )?),
-            initial_settings_timeout: Some(std::time::Duration::from_millis(
-                NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
-            )),
-            max_frame_size: Some(d.frame as u32),
-            max_header_list_size: Some(d.header as u32),
-            max_receive_header_block_size: Some(d.header),
-            header_table_size: Some(0),
-            max_send_header_table_size: Some(0),
-            send_header_block_pool: Some(h2::SendHeaderBlockPool::new(d.header, owner.clone())?),
-            max_receive_buffered_events: Some(d.events),
-            max_send_buffer_size: Some(d.writer),
-            retain_data_payloads: true,
-            receive_buffer_pool: Some(h2::ReceiveBufferPool::new(
-                d.data_buffers,
-                d.frame,
-                owner.clone(),
-            )?),
-            receive_frame_buffer: Some(h2::ReceiveFrameBuffer::new(d.frame, owner.clone())?),
-            receive_header_block_buffer: Some(h2::ReceiveHeaderBlockBuffer::new(
-                d.header,
-                owner.clone(),
-            )?),
-            receive_header_field_pool: Some(h2::ReceiveHeaderFieldPool::new(
-                d.field_bytes,
-                d.field_positions,
-                d.header - 32,
-                owner.clone(),
-            )?),
-            receive_header_table_buffer: Some(h2::ReceiveHeaderTableBuffer::new(
-                d.table_bytes,
-                owner.clone(),
-            )?),
-            receive_header_map_pool: Some(
-                HeaderMapAllocationPool::new(d.maps, d.map_keys, d.map_extras, owner.clone())
-                    .map_err(|_| invalid())?,
-            ),
-            send_frame_buffer: Some(h2::SendFrameBuffer::new(d.writer, d.frame, owner.clone())?),
-            receive_goaway_buffer_pool: Some(h2::ReceiveBufferPool::new(
-                d.goaway_buffers,
-                d.frame,
-                owner,
-            )?),
-        })
+        let binding = NativeIncomingConnectionBinding {
+            factory: self.clone(),
+            index,
+            generation,
+            _original: owner.clone(),
+        };
+        Ok((
+            Http2ConnectionConfig {
+                acquisition_owner: Some(acquisition_owner),
+                io_owner: Some(owner.clone()),
+                connection_lifecycle: Some(connection_lifecycle),
+                stream_store_buffer: Some(h2::StreamStoreBuffer::new(
+                    d.streams,
+                    d.streams,
+                    owner.clone(),
+                )?),
+                initial_settings_timeout: Some(std::time::Duration::from_millis(
+                    NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
+                )),
+                max_frame_size: Some(d.frame as u32),
+                max_header_list_size: Some(d.header as u32),
+                max_receive_header_block_size: Some(d.header),
+                header_table_size: Some(0),
+                max_send_header_table_size: Some(0),
+                send_header_block_pool: Some(h2::SendHeaderBlockPool::new(
+                    d.header,
+                    owner.clone(),
+                )?),
+                max_receive_buffered_events: Some(d.events),
+                max_send_buffer_size: Some(d.writer),
+                retain_data_payloads: true,
+                receive_buffer_pool: Some(h2::ReceiveBufferPool::new(
+                    d.data_buffers,
+                    d.frame,
+                    owner.clone(),
+                )?),
+                receive_frame_buffer: Some(h2::ReceiveFrameBuffer::new(d.frame, owner.clone())?),
+                receive_header_block_buffer: Some(h2::ReceiveHeaderBlockBuffer::new(
+                    d.header,
+                    owner.clone(),
+                )?),
+                receive_header_field_pool: Some(h2::ReceiveHeaderFieldPool::new(
+                    d.field_bytes,
+                    d.field_positions,
+                    d.header - 32,
+                    owner.clone(),
+                )?),
+                receive_header_table_buffer: Some(h2::ReceiveHeaderTableBuffer::new(
+                    d.table_bytes,
+                    owner.clone(),
+                )?),
+                receive_header_map_pool: Some(
+                    HeaderMapAllocationPool::new(d.maps, d.map_keys, d.map_extras, owner.clone())
+                        .map_err(|_| invalid())?,
+                ),
+                send_frame_buffer: Some(h2::SendFrameBuffer::new(
+                    d.writer,
+                    d.frame,
+                    owner.clone(),
+                )?),
+                receive_goaway_buffer_pool: Some(h2::ReceiveBufferPool::new(
+                    d.goaway_buffers,
+                    d.frame,
+                    owner,
+                )?),
+            },
+            binding,
+        ))
     }
 }
 

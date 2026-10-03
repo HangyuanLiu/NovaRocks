@@ -176,6 +176,7 @@ impl Listener {
             Arc::new(|| {}),
             "acquisition-test",
             Some((factory.clone(), class)),
+            None,
         ));
         Self {
             address,

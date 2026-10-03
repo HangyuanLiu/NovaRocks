@@ -440,6 +440,13 @@ where
                 match ready!(self.conn.poll_accept(cx)) {
                     Some(Ok((req, mut respond))) => {
                         trace!("incoming request");
+                        if let Err(error) = exec.admit_h2_request_head(req.uri(), req.headers()) {
+                            // The owner rejected this physical connection. Do
+                            // not construct a body or task, or wait for graceful
+                            // drain: returning releases the actual connection IO.
+                            drop(req);
+                            return Poll::Ready(Err(crate::Error::new_user_service(error)));
+                        }
                         if self.reject_connect_for_preallocated_tasks
                             && req.method() == Method::CONNECT
                         {

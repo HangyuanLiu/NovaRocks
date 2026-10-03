@@ -48,8 +48,8 @@ use novarocks_cluster_harness::LaunchProfile;
 use novarocks_cluster_harness::process_resources::ProcessResourceSampler;
 
 use super::native_compatibility::{
-    RawUnaryResponse, authorization_header, raw_acquire_admission_ticket, raw_establish,
-    raw_operation_envelope, raw_query_context, raw_unary_response, raw_unary_response_with_hold,
+    RawUnaryConnection, RawUnaryResponse, authorization_header, raw_acquire_admission_ticket,
+    raw_establish, raw_operation_envelope, raw_query_context, raw_unary_response,
 };
 
 const REQUIRED_BACKENDS: usize = 3;
@@ -508,19 +508,7 @@ impl Scenario for BlockingSaturationControl {
         wait_ingress_slot(context, "ordinary", "running", 8.0)?;
         context.action("BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full");
 
-        let queued_connector = connector.clone();
-        let queued_authorization = authorization.clone();
-        let queued_operation = operation.clone();
-        let queued = thread::spawn(move || {
-            raw_unary_response::<_, proto::ApplyTaskOperationsResponse>(
-                &queued_connector,
-                ORDINARY_PATH,
-                &queued_authorization,
-                proto::ApplyTaskOperationsRequest {
-                    operations: vec![queued_operation],
-                },
-            )
-        });
+        held.start_waiter(&authorization, operation.clone())?;
         wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
         context.action("ninth ordinary request visibly waited at Native gate");
 
@@ -622,9 +610,7 @@ impl Scenario for BlockingSaturationControl {
         );
 
         held.release_and_join()?;
-        let queued = queued
-            .join()
-            .map_err(|_| anyhow::anyhow!("queued ordinary probe panicked"))??;
+        let queued = held.join_waiter()?;
         ensure!(
             queued.grpc_status == 0,
             "queued ordinary probe failed after release: {:?}",
@@ -1482,6 +1468,9 @@ struct HeldCall {
 struct HeldOrdinary {
     calls: Vec<HeldCall>,
     backend: BackendProcessId,
+    connection: RawUnaryConnection,
+    waiter:
+        Option<thread::JoinHandle<Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>>>>,
 }
 
 impl HeldOrdinary {
@@ -1514,7 +1503,12 @@ impl HeldOrdinary {
         near_limit_first: bool,
     ) -> Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let mut calls = Vec::with_capacity(count);
+        let mut held = Self {
+            calls: Vec::with_capacity(count),
+            backend,
+            connection: RawUnaryConnection::connect(connector)?,
+            waiter: None,
+        };
         for index in 0..count {
             let token = format!("{}-{nonce}-{index}", std::process::id());
             let path = novarocks_failpoint::native_ingress_hold_socket_path(&token)
@@ -1522,7 +1516,7 @@ impl HeldOrdinary {
             let listener = UnixListener::bind(&path)
                 .with_context(|| format!("bind Native hold rendezvous {}", path.display()))?;
             listener.set_nonblocking(true)?;
-            let connector = connector.clone();
+            let client = held.connection.client();
             let authorization = authorization.to_owned();
             let request = if near_limit_first && index == 0 {
                 Some(pad_ordinary(operation.clone(), ORDINARY_BATCH_MAX)?)
@@ -1535,16 +1529,14 @@ impl HeldOrdinary {
             let token_for_request = token.clone();
             let response = thread::spawn(move || {
                 if let Some(request) = request {
-                    raw_unary_response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
-                        &connector,
+                    client.response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
                         ORDINARY_PATH,
                         &authorization,
                         request,
                         Some(&token_for_request),
                     )
                 } else {
-                    raw_unary_response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
-                        &connector,
+                    client.response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
                         ORDINARY_PATH,
                         &authorization,
                         small_request,
@@ -1552,7 +1544,7 @@ impl HeldOrdinary {
                     )
                 }
             });
-            calls.push(HeldCall {
+            held.calls.push(HeldCall {
                 token,
                 path,
                 listener,
@@ -1560,7 +1552,32 @@ impl HeldOrdinary {
                 response: Some(response),
             });
         }
-        Ok(Self { calls, backend })
+        Ok(held)
+    }
+
+    fn start_waiter(&mut self, authorization: &str, operation: proto::TaskOperation) -> Result<()> {
+        ensure!(self.waiter.is_none(), "ordinary waiter already started");
+        let client = self.connection.client();
+        let authorization = authorization.to_owned();
+        self.waiter = Some(thread::spawn(move || {
+            client.response_with_hold(
+                ORDINARY_PATH,
+                &authorization,
+                proto::ApplyTaskOperationsRequest {
+                    operations: vec![operation],
+                },
+                None,
+            )
+        }));
+        Ok(())
+    }
+
+    fn join_waiter(&mut self) -> Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>> {
+        self.waiter
+            .take()
+            .context("ordinary waiter not started")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("queued ordinary probe panicked"))?
     }
 
     fn await_entered(&mut self, scenario_deadline: Instant) -> Result<()> {
@@ -1627,7 +1644,23 @@ impl Drop for HeldOrdinary {
             if let Some(stream) = &mut call.stream {
                 let _ = stream.write_all(b"R");
             }
+            // Failure may leave a rendezvous accepted by BE but not yet
+            // accepted by the runner. Release its pending socket as well.
+            while let Ok((mut stream, _)) = call.listener.accept() {
+                let _ = stream.write_all(b"R");
+            }
             let _ = fs::remove_file(&call.path);
+        }
+        // On an early assertion failure, cancellation wakes every pending H2
+        // response before joining its actor. No fixture thread is detached.
+        self.connection.close();
+        for call in &mut self.calls {
+            if let Some(response) = call.response.take() {
+                let _ = response.join();
+            }
+        }
+        if let Some(waiter) = self.waiter.take() {
+            let _ = waiter.join();
         }
     }
 }

@@ -16,11 +16,13 @@ use novarocks_proto_codec::catalog::{
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId, parse_reported_state,
 };
-use novarocks_proto_codec::native_rpc::{NativeEndpointDomain, NativeRpcMethod};
+use novarocks_proto_codec::native_rpc::{
+    NativeEndpointDomain, NativeRpcMethod, NativeTrafficClass,
+};
 use novarocks_query_application::api::HeartbeatOutcome;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 
-use super::data_runtime::{CachedNativeChannel, FrontendDataRuntime};
+use super::data_runtime::{CachedNativeChannel, FrontendDataRuntime, NativeChannelKey};
 use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const MAX_MESSAGE_BYTES: usize =
@@ -39,12 +41,14 @@ pub(crate) enum CatalogPruneDispatchOutcome {
 pub(crate) fn prune_catalogs(
     data_runtime: &FrontendDataRuntime,
     endpoint: RuntimeEndpoint,
+    peer: BackendProcessId,
     request: &PruneCatalogsRequest,
     timeout: Duration,
 ) -> Result<CatalogPruneDispatchOutcome, String> {
     let client = Client::for_endpoint(
         endpoint.native_endpoint().clone(),
         NativeEndpointDomain::BackendData,
+        peer,
         data_runtime.clone(),
     );
     let response = data_runtime.block_on(async {
@@ -108,6 +112,7 @@ enum FrozenClientEndpoints {
     Single {
         endpoint: NativeEndpoint,
         domain: NativeEndpointDomain,
+        peer: BackendProcessId,
     },
 }
 
@@ -131,10 +136,15 @@ impl Client {
     pub(super) fn for_endpoint(
         endpoint: NativeEndpoint,
         domain: NativeEndpointDomain,
+        peer: BackendProcessId,
         data_runtime: FrontendDataRuntime,
     ) -> Self {
         Self {
-            endpoints: FrozenClientEndpoints::Single { endpoint, domain },
+            endpoints: FrozenClientEndpoints::Single {
+                endpoint,
+                domain,
+                peer,
+            },
             data_runtime,
         }
     }
@@ -162,11 +172,32 @@ impl Client {
             FrozenClientEndpoints::Single {
                 endpoint,
                 domain: frozen_domain,
+                ..
             } if *frozen_domain == domain => Ok(endpoint),
             FrozenClientEndpoints::Single { .. } => Err(ChannelAcquisitionError::fatal(
                 "Native method conflicts with the frozen endpoint domain",
             )),
         }
+    }
+
+    fn channel_key(
+        &self,
+        method: NativeRpcMethod,
+    ) -> Result<NativeChannelKey, ChannelAcquisitionError> {
+        let NativeTrafficClass::Frontend(lane) = method.contract().traffic else {
+            return Err(ChannelAcquisitionError::fatal(
+                "method is not a Frontend Native lane",
+            ));
+        };
+        let peer = match &self.endpoints {
+            FrozenClientEndpoints::Backend(descriptor) => descriptor.process_id(),
+            FrozenClientEndpoints::Single { peer, .. } => *peer,
+        };
+        Ok(NativeChannelKey {
+            endpoint: self.endpoint_for(method)?.clone(),
+            peer,
+            lane,
+        })
     }
 
     async fn grpc(
@@ -192,7 +223,7 @@ impl Client {
         method: NativeRpcMethod,
     ) -> Result<(AuthenticatedNovaRocksGrpcClient, CachedNativeChannel), ChannelAcquisitionError>
     {
-        let acquired = channel(&self.data_runtime, self.endpoint_for(method)?.clone()).await?;
+        let acquired = channel(&self.data_runtime, self.channel_key(method)?).await?;
         let grpc = NovaRocksGrpcClient::with_interceptor(
             acquired.channel.clone(),
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
@@ -207,20 +238,38 @@ impl Client {
         method: NativeRpcMethod,
         acquired: &CachedNativeChannel,
     ) -> bool {
-        self.endpoint_for(method).is_ok_and(|endpoint| {
+        self.channel_key(method).is_ok_and(|key| {
             self.data_runtime
-                .invalidate_channel_if_current(endpoint, acquired)
+                .invalidate_channel_if_current(&key, acquired)
         })
     }
 }
 
 async fn channel(
     data_runtime: &FrontendDataRuntime,
-    endpoint: NativeEndpoint,
+    key: NativeChannelKey,
 ) -> Result<CachedNativeChannel, ChannelAcquisitionError> {
-    if let Some(channel) = data_runtime.cached_channel(&endpoint) {
+    if let Some(channel) = data_runtime.cached_channel(&key) {
         return Ok(channel);
     }
+    // Elect before waiting on the lane. This one generation survives through
+    // every wait; cancellation/retirement returns to the existing retry policy.
+    let reservation = data_runtime
+        .begin_dial(key.clone())
+        .map_err(ChannelAcquisitionError::fatal)?;
+    let _dial = data_runtime.dial_lane(key.lane).await;
+    if let Some(channel) = reservation
+        .ready_channel()
+        .map_err(ChannelAcquisitionError::retryable_network)?
+    {
+        return Ok(channel);
+    }
+    if !reservation.is_leader() {
+        return Err(ChannelAcquisitionError::retryable_network(
+            "Native channel dial leader exited before publication",
+        ));
+    }
+    let endpoint = key.endpoint.clone();
     // The URI only provides Tonic's HTTP/2 origin. The connector below owns
     // the actual TCP/TLS dial using the typed endpoint; this never creates a
     // bare h2c client factory.
@@ -252,7 +301,28 @@ async fn channel(
                 "connect Native endpoint failed: {error}"
             ))
         })?;
-    Ok(data_runtime.cache_channel(endpoint, created))
+    reservation
+        .publish(created)
+        .map_err(ChannelAcquisitionError::retryable_network)
+}
+
+// A failed or cancelled pull must not leave a reconnecting old-process
+// channel occupying the replacement's one live Control connection. This
+// retires only the acquired cache generation; topology and attempt verdicts
+// remain with their existing owners.
+struct HeartbeatChannelAttempt<'a> {
+    client: &'a Client,
+    acquired: CachedNativeChannel,
+    rpc_completed: bool,
+}
+
+impl Drop for HeartbeatChannelAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.rpc_completed {
+            self.client
+                .invalidate_channel_if_current(NativeRpcMethod::Heartbeat, &self.acquired);
+        }
+    }
 }
 
 pub(crate) fn heartbeat(
@@ -266,23 +336,34 @@ pub(crate) fn heartbeat(
         let client = Client::for_endpoint(
             endpoint.native_endpoint().clone(),
             NativeEndpointDomain::BackendControl,
+            process_id,
             data_runtime.clone(),
         );
         data_runtime.block_on(async {
             tokio::time::timeout(timeout, async {
-                let mut grpc = client.grpc(NativeRpcMethod::Heartbeat).await?;
-                grpc.heartbeat(Request::new(
-                    novarocks_proto_models::novarocks::HeartbeatRequest {
-                        expected_process_id: Some(
-                            ProtocolBackendProcessId::from_domain(process_id)
-                                .as_proto()
-                                .clone(),
-                        ),
-                    },
-                ))
-                .await
-                .map(|value| value.into_inner())
-                .map_err(|error| format!("heartbeat rpc failed: {error}"))
+                let (mut grpc, acquired) = client
+                    .grpc_with_channel_identity(NativeRpcMethod::Heartbeat)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut attempt = HeartbeatChannelAttempt {
+                    client: &client,
+                    acquired,
+                    rpc_completed: false,
+                };
+                let response = grpc
+                    .heartbeat(Request::new(
+                        novarocks_proto_models::novarocks::HeartbeatRequest {
+                            expected_process_id: Some(
+                                ProtocolBackendProcessId::from_domain(process_id)
+                                    .as_proto()
+                                    .clone(),
+                            ),
+                        },
+                    ))
+                    .await
+                    .map_err(|error| format!("heartbeat rpc failed: {error}"))?;
+                attempt.rpc_completed = true;
+                Ok(response.into_inner())
             })
             .await
             .map_err(|_| format!("heartbeat did not complete within {timeout:?}"))?
@@ -391,6 +472,7 @@ mod routing_tests {
         let only_data = Client::for_endpoint(
             descriptor.endpoint().native_endpoint().clone(),
             NativeEndpointDomain::BackendData,
+            descriptor.process_id(),
             runtime,
         );
         assert!(matches!(
@@ -399,5 +481,168 @@ mod routing_tests {
                 .await,
             Err(ChannelAcquisitionError::Fatal(_))
         ));
+    }
+    #[tokio::test]
+    async fn exact_process_and_manifest_lane_share_control_and_observation_but_isolate_data() {
+        let descriptor = FrozenBackendDescriptor::try_new(
+            BackendProcessId::new_v7(),
+            RuntimeEndpoint::new("data.test.invalid", 19060).unwrap(),
+            RuntimeEndpoint::new("control.test.invalid", 19061).unwrap(),
+            "lane-test",
+            "lane-test",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            4096,
+        )
+        .unwrap();
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let client = Client::for_backend(descriptor.clone(), runtime.clone());
+        let control = client
+            .channel_key(NativeRpcMethod::ApplyTaskControlOperations)
+            .unwrap();
+        let heartbeat = Client::for_endpoint(
+            descriptor.control_endpoint().native_endpoint().clone(),
+            NativeEndpointDomain::BackendControl,
+            descriptor.process_id(),
+            runtime.clone(),
+        );
+        assert_eq!(
+            control,
+            heartbeat.channel_key(NativeRpcMethod::Heartbeat).unwrap()
+        );
+        let observation = client
+            .channel_key(NativeRpcMethod::SubscribeTaskStatus)
+            .unwrap();
+        assert_eq!(
+            observation,
+            client
+                .channel_key(NativeRpcMethod::FetchTaskDynamicFilters)
+                .unwrap()
+        );
+        assert_eq!(
+            observation,
+            client
+                .channel_key(NativeRpcMethod::GetFinalTaskInfo)
+                .unwrap()
+        );
+        let submission = client
+            .channel_key(NativeRpcMethod::ApplyTaskOperations)
+            .unwrap();
+        assert_eq!(
+            submission,
+            client.channel_key(NativeRpcMethod::PruneCatalogs).unwrap()
+        );
+        assert_ne!(observation, submission);
+        assert_ne!(
+            observation,
+            client
+                .channel_key(NativeRpcMethod::FetchTaskResult)
+                .unwrap()
+        );
+        let replacement = Client::for_endpoint(
+            descriptor.control_endpoint().native_endpoint().clone(),
+            NativeEndpointDomain::BackendControl,
+            BackendProcessId::new_v7(),
+            runtime,
+        );
+        assert_ne!(
+            control,
+            replacement.channel_key(NativeRpcMethod::Heartbeat).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn failed_or_cancelled_heartbeat_retires_only_its_acquired_control_generation() {
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let client = Client::for_endpoint(
+            NativeEndpoint::from_host_port("127.0.0.1", 12345).unwrap(),
+            NativeEndpointDomain::BackendControl,
+            BackendProcessId::new_v7(),
+            runtime.clone(),
+        );
+        let key = client.channel_key(NativeRpcMethod::Heartbeat).unwrap();
+        for rpc_completed in [false, true] {
+            runtime.invalidate_peer(key.peer);
+            let (channel, _) = Channel::balance_channel::<String>(1);
+            let acquired = runtime
+                .begin_dial(key.clone())
+                .unwrap()
+                .publish(channel)
+                .unwrap();
+            drop(HeartbeatChannelAttempt {
+                client: &client,
+                acquired,
+                rpc_completed,
+            });
+            assert_eq!(runtime.cached_channel(&key).is_some(), rpc_completed);
+        }
+        let old = runtime.cached_channel(&key).unwrap();
+        runtime.invalidate_peer(key.peer);
+        let (channel, _) = Channel::balance_channel::<String>(1);
+        let replacement = runtime
+            .begin_dial(key.clone())
+            .unwrap()
+            .publish(channel)
+            .unwrap();
+        drop(HeartbeatChannelAttempt {
+            client: &client,
+            acquired: old,
+            rpc_completed: false,
+        });
+        assert!(runtime.cached_channel(&key).is_some());
+        assert!(client.invalidate_channel_if_current(NativeRpcMethod::Heartbeat, &replacement));
+    }
+
+    #[tokio::test]
+    async fn waiting_and_cancelled_dial_generations_cannot_reopen_a_retired_peer() {
+        use novarocks_proto_codec::native_rpc::FrontendNativeLane::Submission;
+        use std::future::Future;
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let endpoint =
+            NativeEndpoint::from_host_port("127.0.0.1", socket.local_addr().unwrap().port())
+                .unwrap();
+        for cancel_leader in [false, true] {
+            let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+            let peer = BackendProcessId::new_v7();
+            let client = Client::for_endpoint(
+                endpoint.clone(),
+                NativeEndpointDomain::BackendData,
+                peer,
+                runtime.clone(),
+            );
+            let gate = runtime.dial_lane(Submission).await;
+            let mut leader =
+                Box::pin(client.grpc_with_channel_error(NativeRpcMethod::ApplyTaskOperations));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    leader.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            let mut follower =
+                Box::pin(client.grpc_with_channel_error(NativeRpcMethod::PruneCatalogs));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    follower.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            if cancel_leader {
+                drop(leader);
+            } else {
+                runtime.invalidate_peer(peer);
+                drop(leader);
+            }
+            runtime.invalidate_peer(peer);
+            drop(gate);
+            assert!(matches!(
+                follower.await,
+                Err(ChannelAcquisitionError::RetryableNetwork(_))
+            ));
+            assert_eq!(
+                socket.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "retired waiter must not open a TCP connection"
+            );
+        }
     }
 }

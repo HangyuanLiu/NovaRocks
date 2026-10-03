@@ -31,7 +31,7 @@ use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_execution_contract::{
     BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
 };
-use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
+use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
@@ -289,7 +289,7 @@ pub(crate) struct ClusterBackendService {
     heartbeat_interval: Duration,
     announce_lease_ttl: Duration,
     heartbeat_probe: Arc<HeartbeatProbe>,
-    channel_invalidator: Arc<dyn Fn(&NativeEndpoint) + Send + Sync>,
+    channel_invalidator: Arc<dyn Fn(BackendProcessId) + Send + Sync>,
     heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
     heartbeat_round: Mutex<()>,
     heartbeat_signal: Mutex<HeartbeatSignal>,
@@ -323,7 +323,7 @@ impl ClusterBackendService {
             move |endpoint, process_id| {
                 native_heartbeat(&heartbeat_runtime, process_id, endpoint, heartbeat_timeout)
             },
-            move |endpoint| data_runtime.invalidate_channel(endpoint),
+            move |process_id| data_runtime.invalidate_peer(process_id),
         ));
         let _ = runtime;
         // Only a BE can create its immutable ProcessId descriptor through
@@ -335,7 +335,7 @@ impl ClusterBackendService {
     fn new<F, I>(config: &ClusterBackendOpenConfig, probe: F, invalidate_channel: I) -> Self
     where
         F: Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
-        I: Fn(&NativeEndpoint) + Send + Sync + 'static,
+        I: Fn(BackendProcessId) + Send + Sync + 'static,
     {
         let (process_epoch, _) = watch::channel(0);
         Self {
@@ -745,7 +745,7 @@ impl ClusterBackendService {
         let changed = advance_if_membership_changed(&mut state, before).unwrap_or(false);
         drop(state);
         if replaced {
-            (self.channel_invalidator)(endpoint.native_endpoint());
+            (self.channel_invalidator)(old_owner.expect("replaced process has an old owner"));
         }
         if changed {
             self.publish_snapshot();

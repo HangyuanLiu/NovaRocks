@@ -3627,6 +3627,7 @@ mod tests {
         let mut data = super::super::transport::Client::for_endpoint(
             fixture.loopback.endpoint.native_endpoint().clone(),
             NativeEndpointDomain::BackendData,
+            backend,
             fixture.sink.data_runtime.clone(),
         )
         .grpc_with_channel_error(NativeRpcMethod::ApplyTaskOperations)
@@ -3642,6 +3643,7 @@ mod tests {
         let mut control = super::super::transport::Client::for_endpoint(
             fixture.loopback.control_endpoint.native_endpoint().clone(),
             NativeEndpointDomain::BackendControl,
+            backend,
             fixture.sink.data_runtime.clone(),
         )
         .grpc_with_channel_error(NativeRpcMethod::ApplyTaskControlOperations)
@@ -3695,6 +3697,7 @@ mod tests {
         let mut data = Client::for_endpoint(
             loopback.endpoint.native_endpoint().clone(),
             NativeEndpointDomain::BackendData,
+            backend,
             runtime,
         )
         .grpc_with_channel_error(NativeRpcMethod::ApplyTaskOperations)

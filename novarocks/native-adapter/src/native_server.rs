@@ -366,6 +366,7 @@ impl NativeRpcServerHandle {
                             transport_handshake_failure,
                             role_label,
                             transport_capacity,
+                            Some((native_trust.server_admission(), domain)),
                         )
                         .await
                     });
@@ -737,6 +738,10 @@ pub(crate) fn native_server_task_allocation_capacity_bound() -> io::Result<usize
     native_connection_task_capacity_bound::<NativeServerApp>()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Listener composition keeps the original capacity and signed admission inputs explicit."
+)]
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,
@@ -745,6 +750,7 @@ async fn serve_native_listener<S>(
     on_transport_handshake_failure: Arc<dyn Fn() + Send + Sync>,
     role_label: &'static str,
     transport_capacity: Option<(NativeTransportCapacityFactory, TransportClass)>,
+    incoming_admission: Option<(NativeServerAdmission, NativeEndpointDomain)>,
 ) -> Result<(), String>
 where
     S: Service<
@@ -795,7 +801,7 @@ where
                             // The OS has accepted this socket, but Tokio has
                             // not allocated its reactor registration yet.
                             let accepted_at = std::time::Instant::now();
-                            let config = factory.try_config(*class).map_err(|error| {
+                            let (config, binding) = factory.try_incoming_config(*class).map_err(|error| {
                                 capacity_refused = true;
                                 error
                             })?;
@@ -803,10 +809,10 @@ where
                                 capacity_refused = true;
                                 io::Error::from(io::ErrorKind::InvalidInput)
                             })?;
-                            Ok((owner, (config, accepted_at)))
+                            Ok((owner, (config, binding, accepted_at)))
                         }).await;
                         accepted
-                            .map(|(stream, peer, (config, accepted_at))| (stream, peer, accepted_at, Some(config)))
+                            .map(|(stream, peer, (config, binding, accepted_at))| (stream, peer, accepted_at, Some((config, binding))))
                             .map_err(|error| (error, capacity_refused))
                     }
                     None => listener.accept().await
@@ -814,7 +820,7 @@ where
                         .map_err(|error| (error, false)),
                 }
             } => {
-                let (stream, peer, accepted_at, mut capacity) = match accepted {
+                let (stream, peer, accepted_at, configuration) = match accepted {
                     Err((_, true)) => {
                         // The accepted, unregistered socket was closed by
                         // Tokio. Capacity refusal creates no registration or
@@ -849,6 +855,10 @@ where
                     Ok(accepted) => accepted,
                 };
                 consecutive_accept_errors = 0;
+                let (mut capacity, binding) = match configuration {
+                    Some((config, binding)) => (Some(config), Some(binding)),
+                    None => (None, None),
+                };
                 let executor = match (&transport_capacity, &capacity) {
                     (Some((factory, _)), Some(config)) => {
                         let owner = config.io_owner.as_ref()
@@ -858,6 +868,10 @@ where
                     }
                     (None, None) => NativeTaskExecutor::ordinary(),
                     _ => return Err("native stream executor capability disagrees with listener".to_owned()),
+                };
+                let executor = match (binding, &incoming_admission) {
+                    (Some(binding), Some((admission, domain))) => executor.with_incoming_head(binding, admission.clone(), *domain),
+                    _ => executor,
                 };
                 let mut builder = http2::Builder::new(executor);
                 let initial_settings_deadline = transport_capacity.as_ref().map(|_| {
@@ -1329,6 +1343,7 @@ mod tests {
             shutdown_rx,
             Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             "test",
+            None,
             None,
         ));
 

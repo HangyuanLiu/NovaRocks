@@ -75,6 +75,17 @@ pub trait Executor<Fut> {
         Ok(None)
     }
 
+    /// Check an incoming HTTP/2 head before stream task preparation, body
+    /// adaptation or service construction. The default preserves dispatch.
+    /// An error terminates this connection rather than only resetting a stream.
+    fn admit_request_head(
+        &self,
+        _uri: &http::Uri,
+        _headers: &http::HeaderMap,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Place the future into the executor to be run.
     fn execute(&self, fut: Fut);
 }

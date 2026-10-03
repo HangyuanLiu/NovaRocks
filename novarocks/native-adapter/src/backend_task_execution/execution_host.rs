@@ -4771,9 +4771,9 @@ mod tests {
     fn bounded_root_seal_preserves_worker_abort_before_runnable_fanout() {
         use novarocks_execution_contract::task_execution::status::TerminationDetail;
         for (query, cause) in [
-            (91_005, AbortCause::QueryFailed),
-            (91_006, AbortCause::PeerTaskFailed),
-            (91_007, AbortCause::LeaseExpired),
+            (91_205, AbortCause::QueryFailed),
+            (91_206, AbortCause::PeerTaskFailed),
+            (91_207, AbortCause::LeaseExpired),
         ] {
             let fixture = OwnerFixture::new(query);
             let pause = RootWorkerPause::new(&fixture.host.inner.root_producer_pool);

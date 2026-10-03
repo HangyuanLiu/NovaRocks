@@ -13,8 +13,41 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+use crate::native_incoming_key_capacity::NativeIncomingKey;
+use crate::native_transport_capacity::NativeIncomingConnectionBinding;
 use bytes::Bytes;
+use hyper::http;
 use hyper::rt::Executor;
+use novarocks_native_trust::NativeServerAdmission;
+use novarocks_proto_codec::native_rpc::{NativeEndpointDomain, NativeRpcMethod};
+
+#[derive(Clone)]
+struct NativeIncomingHeadAdmission {
+    binding: NativeIncomingConnectionBinding,
+    admission: NativeServerAdmission,
+    domain: NativeEndpointDomain,
+}
+
+impl NativeIncomingHeadAdmission {
+    fn admit(&self, uri: &http::Uri, headers: &http::HeaderMap) -> io::Result<()> {
+        // Preserve authentication errors and unknown/wrong-endpoint fallback.
+        // Only a legal authenticated method can establish a lane authority.
+        let Some(method) = NativeRpcMethod::from_path(uri.path()) else {
+            return Ok(());
+        };
+        if !method.is_allowed_at(self.domain) {
+            return Ok(());
+        }
+        let Ok(caller) = self.admission.admit_headers(headers) else {
+            return Ok(());
+        };
+        let peer = caller
+            .process_identity()
+            .ok_or(io::ErrorKind::PermissionDenied)?;
+        let key = NativeIncomingKey::new(peer, self.domain, method.contract().traffic)?;
+        self.binding.seal(key)
+    }
+}
 
 struct TaskPoolCore {
     // After the strong-only Arc allocation exits, these backings exit before
@@ -99,6 +132,7 @@ impl Drop for TaskExit {
 /// position. Clone does not obtain a new position or create a new grant.
 #[derive(Clone)]
 pub struct NativeTaskExecutor {
+    head: Option<NativeIncomingHeadAdmission>,
     pool: Option<TaskPool>,
     prepared: Option<PreparedTask>,
 }
@@ -118,9 +152,24 @@ impl NativeTaskExecutor {
     /// transport capability. Production funded listeners use `with_original`.
     pub fn ordinary() -> Self {
         Self {
+            head: None,
             pool: None,
             prepared: None,
         }
+    }
+
+    pub(crate) fn with_incoming_head(
+        mut self,
+        binding: NativeIncomingConnectionBinding,
+        admission: NativeServerAdmission,
+        domain: NativeEndpointDomain,
+    ) -> Self {
+        self.head = Some(NativeIncomingHeadAdmission {
+            binding,
+            admission,
+            domain,
+        });
+        self
     }
 
     /// Total requested backing: strong-only pool, its fixed positions, every
@@ -165,6 +214,7 @@ impl NativeTaskExecutor {
         });
         drop(original);
         Ok(Self {
+            head: None,
             pool: Some(TaskPool { core: Some(core) }),
             prepared: None,
         })
@@ -190,9 +240,17 @@ where
         let bound = tokio::runtime::Handle::task_allocation_capacity_bound::<F>()?;
         let prepared = pool.claim(bound)?;
         Ok(Some(Self {
+            head: self.head.clone(),
             pool: Some(pool.clone()),
             prepared: Some(prepared),
         }))
+    }
+
+    fn admit_request_head(&self, uri: &http::Uri, headers: &http::HeaderMap) -> io::Result<()> {
+        match &self.head {
+            Some(head) => head.admit(uri, headers),
+            None => Ok(()),
+        }
     }
 
     fn execute(&self, future: F) {
@@ -232,3 +290,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_task_executor/tests_incoming.rs"]
+mod tests_incoming;

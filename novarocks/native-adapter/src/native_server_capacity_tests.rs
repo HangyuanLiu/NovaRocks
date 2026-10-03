@@ -197,6 +197,7 @@ async fn installed_tcp_listener_decoded_alias_survives_actual_connection_exit() 
         Arc::new(|| {}),
         "capacity-test",
         Some((factory.clone(), TransportClass::Data)),
+        None,
     ));
     let (sender, response, driver) = listener_request(address).await;
     bounded(entered.notified()).await;
@@ -246,6 +247,7 @@ async fn ordinary_tcp_listener_keeps_default_decoded_headers_without_capability(
         shutting_down,
         Arc::new(|| {}),
         "ordinary-capacity-test",
+        None,
         None,
     ));
     let (sender, response, driver) = listener_request(address).await;

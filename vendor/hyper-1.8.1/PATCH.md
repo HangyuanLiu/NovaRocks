@@ -97,6 +97,15 @@ executor does not cover CONNECT's separate upgrade task. The caller installing
 an executor that covers only stream tasks must enable this policy; default
 CONNECT and extended CONNECT negotiation are otherwise unchanged.
 
+`Executor::admit_request_head(&Uri, &HeaderMap)` defaults to `Ok(())` and
+is forwarded for the same concrete stream type. The server calls it on the
+borrowed decoded request head before CONNECT handling, task preparation,
+body adaptation, or service construction. A refusal returns a connection
+error and drops the request; it does not merely reset an individual stream.
+Native uses this hook to seal its original physical connection to an
+authenticated process and manifest lane. Authentication scratch, outgoing
+tasks, and the complete transport allocation graph remain separate.
+
 This slice changes only `src/rt/mod.rs`, `src/rt/bounds.rs`,
 `src/proto/h2/server.rs`, and `src/server/conn/http2.rs`. Actual Native task-pool
 installation, checked per-stream bookkeeping, outgoing client tasks, shared

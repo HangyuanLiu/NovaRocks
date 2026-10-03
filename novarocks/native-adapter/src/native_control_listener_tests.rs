@@ -404,6 +404,11 @@ async fn capacity_returned(budget: &Arc<ResultRetainedBudget>, bytes: usize) {
 async fn saturated(blocked: TransportClass, expected: usize) {
     let (factory, budget, bytes) = stock();
     let trust = crate::backend_test_support::test_backend_native_trust();
+    trust
+        .bind_process_identity(novarocks_native_trust::NativeProcessIdentity::Frontend(
+            novarocks_types::FrontendProcessId::new_v7(),
+        ))
+        .unwrap();
     let data_observation = Arc::new(Observation::default());
     let control_observation = Arc::new(Observation::default());
     let mut data = start(

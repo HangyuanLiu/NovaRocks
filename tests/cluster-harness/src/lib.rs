@@ -37,8 +37,8 @@ use novarocks_failpoint::{
 };
 use novarocks_native_trust::{
     AutomaticTlsMaterial, DeploymentId, NativeCallerSubject, NativeEndpointConnector,
-    NativeTlsMaterial, NativeTransportMode, NativeTrust, PemTransportMaterial,
-    ValidatedSharedSecret,
+    NativeProcessIdentity, NativeTlsMaterial, NativeTransportMode, NativeTrust,
+    PemTransportMaterial, ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
 use novarocks_test_support::{
@@ -479,7 +479,11 @@ impl NativeTrustFixture {
         &self.advertise_host
     }
 
-    fn probe_trust(&self, shared_secret: &str) -> Result<NativeTrust> {
+    fn probe_trust(
+        &self,
+        shared_secret: &str,
+        identity: NativeProcessIdentity,
+    ) -> Result<NativeTrust> {
         let deployment_id = DeploymentId::parse(SYSTEM_NATIVE_TRUST_DEPLOYMENT_ID)
             .map_err(anyhow::Error::msg)
             .context("construct system Native trust probe deployment id")?;
@@ -489,12 +493,12 @@ impl NativeTrustFixture {
         let subject = NativeCallerSubject::parse("system-test-probe@native")
             .map_err(anyhow::Error::msg)
             .context("construct system Native trust probe subject")?;
-        Ok(NativeTrust::new(
-            deployment_id,
-            secret,
-            subject,
-            self.mode.transport_mode(),
-        ))
+        let trust = NativeTrust::new(deployment_id, secret, subject, self.mode.transport_mode());
+        trust
+            .bind_process_identity(identity)
+            .map_err(anyhow::Error::msg)
+            .context("bind system Native probe process identity")?;
+        Ok(trust)
     }
 }
 
@@ -509,6 +513,8 @@ struct NativeTrustPemPaths {
 struct PreparedNativeTrustFixture {
     fixture: NativeTrustFixture,
     shared_secret: String,
+    probe_frontend: novarocks_types::FrontendProcessId,
+    probe_backend: novarocks_types::BackendProcessId,
     pem_paths: NativeTrustPemPaths,
 }
 
@@ -526,6 +532,8 @@ impl PreparedNativeTrustFixture {
         Ok(Self {
             fixture,
             shared_secret: format!("system-native-trust-{}", next_fragment_failure_token(0)),
+            probe_frontend: novarocks_types::FrontendProcessId::new_v7(),
+            probe_backend: novarocks_types::BackendProcessId::new_v7(),
             pem_paths,
         })
     }
@@ -619,7 +627,17 @@ impl PreparedNativeTrustFixture {
     }
 
     fn probe_trust(&self) -> Result<NativeTrust> {
-        self.fixture.probe_trust(&self.shared_secret)
+        self.fixture.probe_trust(
+            &self.shared_secret,
+            NativeProcessIdentity::Frontend(self.probe_frontend),
+        )
+    }
+
+    fn backend_probe_trust(&self) -> Result<NativeTrust> {
+        self.fixture.probe_trust(
+            &self.shared_secret,
+            NativeProcessIdentity::Backend(self.probe_backend),
+        )
     }
 
     fn cleanup_sensitive_material(&self) {
@@ -3691,6 +3709,10 @@ impl CrossProcessServerHandle {
         self.native_trust_fixture.probe_trust()
     }
 
+    pub fn native_backend_probe_trust(&self) -> Result<NativeTrust> {
+        self.native_trust_fixture.backend_probe_trust()
+    }
+
     /// Construct a raw-probe connector for an explicitly selected transport
     /// mode. Negative scenarios use a mode different from `native_trust_mode`
     /// to prove that the listener has no transport fallback.
@@ -6749,6 +6771,8 @@ mod tests {
         PreparedNativeTrustFixture {
             fixture: NativeTrustFixture::plaintext_ip(),
             shared_secret: "test-only-fixture-secret".to_string(),
+            probe_frontend: novarocks_types::FrontendProcessId::new_v7(),
+            probe_backend: novarocks_types::BackendProcessId::new_v7(),
             pem_paths: NativeTrustPemPaths {
                 certificate_chain: PathBuf::from("/tmp/novarocks-test-leaf.pem"),
                 private_key: PathBuf::from("/tmp/novarocks-test-leaf-key.pem"),
@@ -6915,6 +6939,8 @@ access_key_secret = "admin123"
         let fixture = PreparedNativeTrustFixture {
             fixture: NativeTrustFixture::automatic_dns(),
             shared_secret: "test-only-fixture-secret".to_string(),
+            probe_frontend: novarocks_types::FrontendProcessId::new_v7(),
+            probe_backend: novarocks_types::BackendProcessId::new_v7(),
             pem_paths: NativeTrustPemPaths {
                 certificate_chain: PathBuf::from("/not-retained/leaf.pem"),
                 private_key: PathBuf::from("/not-retained/leaf-key.pem"),

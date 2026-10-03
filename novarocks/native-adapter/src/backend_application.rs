@@ -1592,9 +1592,15 @@ mod tests {
             "novarocks_native_authentication_failures_total{reason=\"authentication\"} 1"
         ));
 
+        let frontend_caller = test_backend_native_trust();
+        frontend_caller
+            .bind_process_identity(novarocks_native_trust::NativeProcessIdentity::Frontend(
+                novarocks_types::FrontendProcessId::new_v7(),
+            ))
+            .unwrap();
         let mut authenticated = NovaRocksGrpcClient::with_interceptor(
             connect_live_channel(host.connectable_control_native_endpoint().port()).await,
-            test_backend_native_trust().client_interceptor(),
+            frontend_caller.client_interceptor(),
         );
         let heartbeat = authenticated
             .heartbeat(HeartbeatRequest {
