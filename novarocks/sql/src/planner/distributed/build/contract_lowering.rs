@@ -5726,8 +5726,25 @@ impl<'a> ContractLoweringVisitor<'a> {
         expect_children(plan, 1)?;
         require_output_shape("Unpivot", &plan.output_columns, &unpivot.output_columns)?;
         unpivot
-            .validate_against(&plan.children[0].output_columns)
-            .map_err(|detail| ContractLoweringError::InvalidUnpivot { detail })?;
+            .validate_against(
+                &plan.children[0].output_columns,
+                self.constant_policy,
+                self.control,
+            )
+            .map_err(|error| match error {
+                crate::compiler::SqlCompileError::Cancelled => {
+                    ContractLoweringError::Control(CompileControlError::Cancelled)
+                }
+                crate::compiler::SqlCompileError::DeadlineExceeded => {
+                    ContractLoweringError::Control(CompileControlError::DeadlineExceeded)
+                }
+                crate::compiler::SqlCompileError::ResourceExhausted => {
+                    ContractLoweringError::Control(CompileControlError::ResourceExhausted)
+                }
+                error => ContractLoweringError::InvalidUnpivot {
+                    detail: error.to_string(),
+                },
+            })?;
 
         let child = self.lower_node(&plan.children[0])?;
         let node = self.fragment_mut().reserve_node_id()?;
@@ -12597,6 +12614,8 @@ mod tests {
             ],
             512,
             65_536,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         let plan = PhysicalPlanNode {

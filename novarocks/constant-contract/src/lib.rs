@@ -28,6 +28,9 @@ mod scalar_factory_tests;
 #[cfg(test)]
 mod tests;
 
+mod recursive_resources;
+pub use recursive_resources::{RecursiveConstantResourceInput, preflight_recursive_pool_resources};
+
 mod semantic_key;
 pub use semantic_key::ConstantSemanticKey;
 mod diagnostic;
@@ -121,18 +124,7 @@ pub fn preflight_flat_pool_resources(
     let checked = (|| {
         let metadata_bytes = validate_type(field, value_type, policy, &mut work)?;
         work.step()?;
-        let flat = matches!(
-            field.data_type(),
-            DataType::Null
-                | DataType::Boolean
-                | DataType::FixedSizeBinary(_)
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Binary
-                | DataType::LargeBinary
-                | DataType::Utf8View
-                | DataType::BinaryView
-        ) || field.data_type().primitive_width().is_some();
+        let flat = is_flat_resource_carrier(field.data_type());
         if !flat {
             return Err(ConstantError::Invalid(
                 "constant resource projection is not flat",
@@ -159,6 +151,7 @@ pub fn preflight_flat_pool_resources(
             policy.max_retained_buffer_bytes,
             "constant retained buffer limit exceeded",
         )?;
+        logical_elements_observed(input.rows, input.rows, 1, &mut work)?;
         let counts = ValidationCounts {
             nodes: 1,
             storage_elements: input.rows,
@@ -169,7 +162,7 @@ pub fn preflight_flat_pool_resources(
             masks: 0,
             depth: 1,
         };
-        let envelope = validation_envelope(counts, metadata_bytes, policy)?;
+        let envelope = validation_envelope(counts, metadata_bytes, policy, &mut work)?;
         Ok(FlatConstantResourceBounds {
             metadata_bytes,
             library_validation_work_upper_bound: envelope.work,
@@ -272,6 +265,12 @@ impl ConstantPool {
     /// execute. Inputs already own Arrow allocations; this is not first-allocation
     /// admission. Standard Arrow validation runs only after observed resource
     /// preflight. Its finite opaque call remains an explicit host obligation.
+    /// Actual element-metric Vec entry used by the borrowed ArrayData scanner.
+    /// This layout is not an allocation request, limit or memory grant.
+    pub fn scan_child_metric_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<ElementMetric>()
+    }
+
     pub fn try_new(
         field: Arc<Field>,
         value_type: FunctionValueType,
@@ -649,9 +648,19 @@ fn validation_envelope(
     scanned: ValidationCounts,
     metadata: u64,
     policy: ConstantPolicy,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValidationEnvelope, ConstantError> {
+    let result = validation_envelope_core(scanned, metadata, policy);
+    work.step()?;
+    result
+}
+fn validation_envelope_core(
+    scanned: ValidationCounts,
+    metadata: u64,
+    policy: ConstantPolicy,
 ) -> Result<ValidationEnvelope, ConstantError> {
     // This is the sole numerical author for both actual ArrayData facts and
-    // flat pre-reader upper bounds. It does not model reader allocations.
+    // raw pre-reader upper bounds. It does not model reader allocations.
     let structural = checked_mul(checked_mul(scanned.nodes, scanned.nodes)?, scanned.depth)?;
     let rows = checked_mul(
         checked_add(scanned.storage_elements, scanned.buffer_count)?,
@@ -714,9 +723,8 @@ fn preflight(
     )?;
     let mut scanned = ScanFacts::default();
     let max_value = scan_data(data, 1, 0, policy, &mut scanned, work)?;
-    let logical = scanned
-        .storage_elements
-        .max(checked_mul(data.len() as u64, max_value)?);
+    let logical =
+        logical_elements_observed(data.len() as u64, scanned.storage_elements, max_value, work)?;
     limit(
         logical,
         policy.max_logical_elements,
@@ -725,7 +733,7 @@ fn preflight(
     // validate_full calls validate_data at every node; validate itself revisits
     // descendants and exact child types. Include repeated ancestor/fanout work,
     // bytes inspected and FixedSizeList's expanded parent-null masks.
-    let envelope = validation_envelope(ValidationCounts::from(&scanned), metadata, policy)?;
+    let envelope = validation_envelope(ValidationCounts::from(&scanned), metadata, policy, work)?;
     Ok(ConstantResourceFacts {
         rows: data.len() as u64,
         array_nodes: scanned.nodes,
@@ -877,49 +885,94 @@ fn scan_data(
     let mut children = Vec::new();
     for child in data.child_data() {
         work.step()?;
-        children.push(scan_data(
-            child,
-            depth + 1,
-            dict_depth,
-            policy,
-            facts,
-            work,
-        )?);
+        children.push(ElementMetric {
+            len: child.len() as u64,
+            max_value: scan_data(child, depth + 1, dict_depth, policy, facts, work)?,
+        });
     }
-    let child = |i: usize| {
-        children.get(i).copied().ok_or(ConstantError::Invalid(
+    if let DataType::FixedSizeList(field, width) = data.data_type() {
+        let width = u64::try_from(*width)
+            .map_err(|_| ConstantError::Invalid("negative fixed-size list width"))?;
+        if !field.is_nullable() && data.nulls().is_some() {
+            let bits = checked_mul(data.len() as u64, width)?;
+            facts.masks = checked_add(facts.masks, checked_add(bits, 7)? / 8 + 64)?;
+        }
+    }
+    let elements = value_elements(data.data_type(), children.into_iter().map(Ok));
+    work.step()?;
+    elements
+}
+
+fn is_flat_resource_carrier(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::FixedSizeBinary(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Utf8View
+            | DataType::BinaryView
+    ) || ty.primitive_width().is_some()
+}
+
+#[derive(Clone, Copy)]
+struct ElementMetric {
+    len: u64,
+    max_value: u64,
+}
+
+// The child length is the complete stored extent, including unused list
+// prefix/suffix and NULL payload. This is the original conservative metric.
+fn value_elements(
+    ty: &DataType,
+    mut children: impl Iterator<Item = Result<ElementMetric, ConstantError>>,
+) -> Result<u64, ConstantError> {
+    let child = |children: &mut dyn Iterator<Item = Result<ElementMetric, ConstantError>>| {
+        children.next().ok_or(ConstantError::Invalid(
             "constant array lacks an expected child",
-        ))
+        ))?
     };
-    let elements = match data.data_type() {
-        DataType::Struct(_) => children.iter().try_fold(1, |n, c| checked_add(n, *c))?,
-        DataType::FixedSizeList(field, width) => {
+    match ty {
+        DataType::Struct(_) => children.try_fold(1, |n, c| checked_add(n, c?.max_value)),
+        DataType::FixedSizeList(_, width) => {
             let width = u64::try_from(*width)
                 .map_err(|_| ConstantError::Invalid("negative fixed-size list width"))?;
-            if !field.is_nullable() && data.nulls().is_some() {
-                let bits = checked_mul(data.len() as u64, width)?;
-                facts.masks = checked_add(facts.masks, checked_add(bits, 7)? / 8 + 64)?;
-            }
-            checked_add(1, checked_mul(width, child(0)?)?)?
+            checked_add(1, checked_mul(width, child(&mut children)?.max_value)?)
         }
         DataType::List(_)
         | DataType::LargeList(_)
         | DataType::ListView(_)
         | DataType::LargeListView(_)
         | DataType::Map(_, _) => {
-            let size = data
-                .child_data()
-                .first()
-                .ok_or(ConstantError::Invalid("constant list lacks values"))?
-                .len() as u64;
-            checked_add(1, checked_mul(size, child(0)?)?)?
+            let c = child(&mut children)?;
+            checked_add(1, checked_mul(c.len, c.max_value)?)
         }
-        DataType::Dictionary(_, _) => checked_add(1, child(0)?)?,
-        DataType::RunEndEncoded(_, _) => checked_add(1, child(1)?)?,
-        DataType::Union(_, _) => checked_add(1, children.into_iter().max().unwrap_or(0))?,
-        _ => 1,
-    };
-    Ok(elements)
+        DataType::Dictionary(_, _) => checked_add(1, child(&mut children)?.max_value),
+        DataType::RunEndEncoded(_, _) => {
+            child(&mut children)?;
+            checked_add(1, child(&mut children)?.max_value)
+        }
+        DataType::Union(_, _) => {
+            let max_value =
+                children.try_fold(0, |n, c| Ok::<_, ConstantError>(n.max(c?.max_value)))?;
+            checked_add(1, max_value)
+        }
+        _ => Ok(1),
+    }
+}
+
+fn logical_elements_observed(
+    rows: u64,
+    storage_elements: u64,
+    max_value: u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<u64, ConstantError> {
+    let result = checked_mul(rows, max_value).map(|expanded| storage_elements.max(expanded));
+    work.step()?;
+    result
 }
 
 // All row access below occurs after standard Arrow validation. It uses the

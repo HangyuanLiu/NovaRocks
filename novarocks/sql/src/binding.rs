@@ -23,6 +23,8 @@
 //! layers and are copied into the final physical-plan contract only at its
 //! lowering boundary.
 
+pub(crate) mod observed;
+
 use std::{
     num::{NonZeroU32, NonZeroU64},
     ops::Deref,

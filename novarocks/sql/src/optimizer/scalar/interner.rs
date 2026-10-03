@@ -22,7 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 use arrow::datatypes::DataType;
-use novarocks_functions::{ConstantError, ConstantValue, FunctionArgumentType, FunctionResultType};
+use novarocks_functions::{ConstantError, ConstantValue};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
 };
@@ -143,59 +143,12 @@ impl<'a> Fields<'a, '_, '_> {
     fn value_type(&mut self, ty: &'a FunctionValueType) -> Result<(), InternerError> {
         self.push(Token::ValueType(ty))
     }
-    fn argument_type(&mut self, ty: &'a FunctionArgumentType) -> Result<(), InternerError> {
-        match ty {
-            FunctionArgumentType::Value(ty) => {
-                self.number(0)?;
-                self.value_type(ty)?;
-            }
-            FunctionArgumentType::Lambda {
-                parameter_types,
-                result_type,
-            } => {
-                self.number(1)?;
-                self.number(parameter_types.len() as u128)?;
-                for ty in parameter_types {
-                    self.value_type(ty)?;
-                }
-                self.value_type(result_type)?;
-            }
-        }
-        Ok(())
-    }
     fn binding(&mut self, binding: &'a SqlFunctionBinding) -> Result<(), InternerError> {
-        self.number(binding.decimal_overflow_policy() as u128)?;
-        self.text(binding.function_id.as_str())?;
-        self.number(binding.kind as u128)?;
-        self.number(binding.semantics.volatility as u128)?;
-        self.number(binding.semantics.argument_evaluation as u128)?;
-        self.number(binding.semantics.failure_behavior as u128)?;
-        self.number(binding.semantics.intrinsic_row_error as u128)?;
-        self.number(binding.logical_argument_count as u128)?;
-        self.text(binding.selected.overload.as_str())?;
-        self.number(binding.selected.argument_types.len() as u128)?;
-        for ty in &binding.selected.argument_types {
-            self.argument_type(ty)?;
-        }
-        match &binding.selected.result_type {
-            FunctionResultType::Scalar(ty) => {
-                self.number(0)?;
-                self.value_type(ty)?;
-            }
-            FunctionResultType::Relation(types) => {
-                self.number(1)?;
-                self.number(types.len() as u128)?;
-                for ty in types {
-                    self.value_type(ty)?;
-                }
-            }
-        }
-        self.boolean(binding.selected.aggregate.is_some())?;
-        if let Some(aggregate) = &binding.selected.aggregate {
-            self.value_type(&aggregate.intermediate_type)?;
-            self.text(aggregate.state_format.as_str())?;
-        }
-        Ok(())
+        crate::binding::observed::visit_fields(binding, |field| match field {
+            crate::binding::observed::BindingField::Number(value) => self.number(value),
+            crate::binding::observed::BindingField::Bytes(value) => self.push(Token::Bytes(value)),
+            crate::binding::observed::BindingField::ValueType(value) => self.value_type(value),
+        })
     }
     fn bound(&mut self, bound: &WindowBound) -> Result<(), InternerError> {
         match bound {

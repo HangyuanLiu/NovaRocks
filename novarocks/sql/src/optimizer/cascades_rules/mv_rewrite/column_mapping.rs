@@ -22,245 +22,15 @@
 use std::collections::HashMap;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, OutputColumn, UnOp};
-use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+use crate::common::OutputColumn;
+use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
-/// Canonical, ColumnId-independent expression form. Two exprs over the same
-/// base table (through different ColumnId spaces) compare equal iff they are
-/// structurally identical after base-name resolution.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum NormExpr {
-    Column(String),
-    Literal(String),
-    Call {
-        name: String,
-        distinct: bool,
-        args: Vec<NormExpr>,
-        binding: Option<crate::binding::SqlFunctionBinding>,
-        decimal_overflow_policy: Option<novarocks_type_contract::DecimalOverflowPolicy>,
-        order_by: Vec<NormSortKey>,
-    },
-}
-
-/// Aggregate ordering keeps its authored order, direction and NULL placement.
-/// Display labels are presentation facts, rather than expression identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct NormSortKey {
-    pub(crate) expr: NormExpr,
-    pub(crate) asc: bool,
-    pub(crate) nulls_first: bool,
-}
-
-/// Returns None for unsupported expression kinds (window calls, subqueries,
-/// lambdas, IS TRUE/FALSE) — callers must treat None as "cannot match"
-/// (fail closed).
-pub(crate) fn normalize(
-    arena: &ScalarArena,
-    expr: ScalarId,
-    base_names: &HashMap<ColumnId, String>,
-) -> Option<NormExpr> {
-    let call = |name: &str, args: Vec<NormExpr>| NormExpr::Call {
-        name: name.to_string(),
-        distinct: false,
-        args,
-        binding: None,
-        decimal_overflow_policy: None,
-        order_by: vec![],
-    };
-    Some(match arena.node(expr) {
-        ScalarNode::ColumnRef(column_id) => NormExpr::Column(base_names.get(column_id)?.clone()),
-        // No constant folding (MVP): literals compare by their Debug
-        // representation, so cross-width / cross-encoding constants such as
-        // Int(5) vs LargeInt(5) or Decimal("100.0") vs Decimal("100.00") do
-        // NOT match. This is fail-closed — it can only miss a rewrite, never
-        // produce a wrong one.
-        ScalarNode::Literal(HashableLiteral(value)) => NormExpr::Literal(format!("{value:?}")),
-        ScalarNode::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => {
-            let mut l = normalize(arena, *left, base_names)?;
-            let mut r = normalize(arena, *right, base_names)?;
-            // Canonicalize comparisons: Gt/Ge become flipped Lt/Le.
-            let (name, commutative) = match op {
-                BinOp::Add => ("add", true),
-                BinOp::Mul => ("mul", true),
-                BinOp::Sub => ("sub", false),
-                BinOp::Div => ("div", false),
-                BinOp::Mod => ("mod", false),
-                BinOp::Eq => ("eq", true),
-                BinOp::Ne => ("ne", true),
-                BinOp::EqForNull => ("eq_for_null", true),
-                BinOp::And => ("and", true),
-                BinOp::Or => ("or", true),
-                BinOp::Lt => ("lt", false),
-                BinOp::Le => ("le", false),
-                BinOp::Gt => {
-                    std::mem::swap(&mut l, &mut r);
-                    ("lt", false)
-                }
-                BinOp::Ge => {
-                    std::mem::swap(&mut l, &mut r);
-                    ("le", false)
-                }
-            };
-            let mut args = vec![l, r];
-            if commutative {
-                args.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-            }
-            NormExpr::Call {
-                name: name.to_string(),
-                distinct: false,
-                args,
-                binding: None,
-                decimal_overflow_policy: Some(*decimal_overflow_policy),
-                order_by: vec![],
-            }
-        }
-        ScalarNode::UnaryOp { op, child } => {
-            let name = match op {
-                UnOp::Not => "not",
-                UnOp::Negate => "neg",
-                UnOp::BitwiseNot => "bitnot",
-            };
-            call(name, vec![normalize(arena, *child, base_names)?])
-        }
-        ScalarNode::FunctionCall {
-            name,
-            args,
-            distinct,
-            binding,
-            volatility,
-        } => NormExpr::Call {
-            name: format!("fn:{}", name.to_ascii_lowercase()),
-            distinct: *distinct || volatility.is_volatile(),
-            binding: Some(binding.clone()),
-            decimal_overflow_policy: None,
-            order_by: vec![],
-            args: args
-                .iter()
-                .map(|arg| normalize(arena, *arg, base_names))
-                .collect::<Option<Vec<_>>>()?,
-        },
-        ScalarNode::AggregateCall {
-            name,
-            args,
-            distinct,
-            resolved,
-            order_by,
-        } => NormExpr::Call {
-            name: format!("agg:{}", name.to_ascii_lowercase()),
-            distinct: *distinct,
-            binding: Some(resolved.clone()),
-            decimal_overflow_policy: None,
-            order_by: order_by
-                .iter()
-                .map(|key| {
-                    Some(NormSortKey {
-                        expr: normalize(arena, key.expr, base_names)?,
-                        asc: key.asc,
-                        nulls_first: key.nulls_first,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
-            args: args
-                .iter()
-                .map(|arg| normalize(arena, *arg, base_names))
-                .collect::<Option<Vec<_>>>()?,
-        },
-        ScalarNode::Cast {
-            child,
-            target,
-            decimal_overflow_policy,
-        } => NormExpr::Call {
-            name: format!("cast:{target:?}"),
-            distinct: false,
-            args: vec![normalize(arena, *child, base_names)?],
-            binding: None,
-            decimal_overflow_policy: Some(*decimal_overflow_policy),
-            order_by: vec![],
-        },
-        ScalarNode::IsNull { child, negated } => call(
-            if *negated { "is_not_null" } else { "is_null" },
-            vec![normalize(arena, *child, base_names)?],
-        ),
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            let mut args = vec![normalize(arena, *child, base_names)?];
-            let mut items = list
-                .iter()
-                .map(|item| normalize(arena, *item, base_names))
-                .collect::<Option<Vec<_>>>()?;
-            items.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-            args.extend(items);
-            call(if *negated { "not_in" } else { "in" }, args)
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => call(
-            if *negated { "not_between" } else { "between" },
-            vec![
-                normalize(arena, *child, base_names)?,
-                normalize(arena, *low, base_names)?,
-                normalize(arena, *high, base_names)?,
-            ],
-        ),
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => call(
-            if *negated { "not_like" } else { "like" },
-            vec![
-                normalize(arena, *child, base_names)?,
-                normalize(arena, *pattern, base_names)?,
-            ],
-        ),
-        ScalarNode::Nested(inner) => return normalize(arena, *inner, base_names),
-        // CASE [operand] WHEN .. THEN .. [ELSE ..] END. WHEN/THEN pair order
-        // is semantically significant (first match wins), so args are NOT
-        // sorted. Absent operand/else are encoded with distinct zero-arg
-        // marker calls so `CASE WHEN c THEN a END` can never collide with
-        // `CASE WHEN c THEN a ELSE b END`.
-        ScalarNode::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            let mut args = Vec::with_capacity(when_then.len() * 2 + 2);
-            args.push(match operand {
-                Some(op) => call("case_operand", vec![normalize(arena, *op, base_names)?]),
-                None => call("case_no_operand", vec![]),
-            });
-            for (when, then) in when_then {
-                args.push(normalize(arena, *when, base_names)?);
-                args.push(normalize(arena, *then, base_names)?);
-            }
-            args.push(match else_expr {
-                Some(else_expr) => {
-                    call("case_else", vec![normalize(arena, *else_expr, base_names)?])
-                }
-                None => call("case_no_else", vec![]),
-            });
-            call("case", args)
-        }
-        // IsTruthValue / WindowCall / Lambda* / LambdaParamRef /
-        // SubqueryPlaceholder: not normalizable here -> fail closed.
-        _ => return None,
-    })
-}
-
+pub(crate) use super::semantic_norm::{
+    NormArgumentOrder, NormExpr, NormIndex, NormSortKey, norm_contains, normalize,
+};
 /// Rewrite table: normalized MV dimension expr -> MV-scan column.
 pub(crate) struct MvColumnMap {
-    by_norm: HashMap<NormExpr, OutputColumn>,
+    by_norm: NormIndex<OutputColumn>,
 }
 
 macro_rules! mapped {
@@ -276,10 +46,32 @@ impl MvColumnMap {
     /// `dims`: (normalized MV dimension expr, the MV-scan output column that
     /// materializes it). Built by the rule from candidate outputs + the new
     /// MV-scan column ids.
-    pub(crate) fn new(dims: Vec<(NormExpr, OutputColumn)>) -> Self {
-        Self {
-            by_norm: dims.into_iter().collect(),
+    pub(crate) fn try_new(
+        dims: Vec<(NormExpr, OutputColumn)>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<Self>, crate::compiler::SqlCompileError> {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+        )?;
+        let mut by_norm = NormIndex::new();
+        for (expr, col) in dims {
+            work.step()?;
+            if !expr
+                .value_type()
+                .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                    &col.value_type,
+                    || work.step().map_err(Into::into),
+                )?
+            {
+                work.finish()?;
+                return Ok(None);
+            }
+            work.flush()?;
+            by_norm.insert(expr, col, control)?;
         }
+        work.finish()?;
+        Ok(Some(Self { by_norm }))
     }
 
     /// Rewrite a query-side expression so that every subtree matching an MV
@@ -292,15 +84,16 @@ impl MvColumnMap {
         query_base_names: &HashMap<ColumnId, String>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
-        if let Some(n) = normalize(arena, expr, query_base_names)
-            && let Some(col) = self.by_norm.get(&n)
+        if let Some(n) = normalize(arena, expr, query_base_names, control)?
+            && let Some(col) = self.by_norm.get(&n, control)?
         {
-            arena.remember_project_output_display(col.column_id, None, col.name.clone());
-            return Ok(Some(arena.intern_observed(
+            let mapped = arena.intern_observed(
                 ScalarNode::ColumnRef(col.column_id),
                 col.value_type.clone(),
                 control,
-            )?));
+            )?;
+            arena.remember_project_output_display(col.column_id, None, col.name.clone());
+            return Ok(Some(mapped));
         }
         // Not a whole-tree match: recurse; a remaining bare base ColumnRef
         // means the MV does not materialize this column -> fail.
@@ -547,6 +340,12 @@ mod tests {
             .collect()
     }
 
+    fn test_map(dims: Vec<(NormExpr, OutputColumn)>) -> MvColumnMap {
+        MvColumnMap::try_new(dims, &crate::compiler::SqlCompileControl::unbounded())
+            .unwrap()
+            .expect("exact dimension output type")
+    }
+
     fn normalize(e: &TypedExpr, base_names: &HashMap<ColumnId, String>) -> Option<NormExpr> {
         let mut arena = ScalarArena::new();
         let expr = intern_typed(
@@ -555,7 +354,13 @@ mod tests {
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
-        super::normalize(&arena, expr, base_names)
+        super::normalize(
+            &arena,
+            expr,
+            base_names,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
     }
 
     fn rewrite_typed(
@@ -679,7 +484,7 @@ mod tests {
         let dim_d_expr = col_ref(&mv_date);
         let dim_s_expr = bin(col_ref(&mv_a), BinOp::Add, col_ref(&mv_b));
 
-        let map = MvColumnMap::new(vec![
+        let map = test_map(vec![
             (normalize(&dim_d_expr, &mv_names).expect("d"), mv_d_out),
             (
                 normalize(&dim_s_expr, &mv_names).expect("s"),
@@ -733,7 +538,7 @@ mod tests {
         let mv_s_out = col(102, "mv_s");
         let dim_d_expr = col_ref(&mv_date);
         let dim_s_expr = bin(col_ref(&mv_a), BinOp::Add, col_ref(&mv_b));
-        let map = MvColumnMap::new(vec![
+        let map = test_map(vec![
             (normalize(&dim_d_expr, &mv_names).expect("d"), mv_d_out),
             (normalize(&dim_s_expr, &mv_names).expect("s"), mv_s_out),
         ]);
@@ -801,7 +606,10 @@ mod tests {
                 phase: CompilePhase,
                 units: u32,
             ) -> Result<(), CompileControlError> {
-                assert_eq!(phase, CompilePhase::Validate);
+                assert!(matches!(
+                    phase,
+                    CompilePhase::Validate | CompilePhase::LowerProgram
+                ));
                 self.calls.lock().unwrap().push(units);
                 // Child mappings legitimately flush a short tail before the
                 // wide parent interner starts. Refuse that parent's first
@@ -837,7 +645,13 @@ mod tests {
                 } else {
                     leaf
                 };
-                let map = MvColumnMap::new(vec![(NormExpr::Column("a".into()), col(101, "mv_a"))]);
+                let map = test_map(vec![(
+                    NormExpr::Column {
+                        name: "a".into(),
+                        value_type: input.value_type.clone(),
+                    },
+                    col(101, "mv_a"),
+                )]);
                 let control = Stop {
                     reason,
                     positive_only,
@@ -849,7 +663,7 @@ mod tests {
                 );
                 let calls = control.calls.lock().unwrap();
                 if positive_only {
-                    assert!(calls.iter().any(|&units| units > 0 && units < 256));
+                    assert!(calls.iter().all(|&units| units <= 256));
                     assert_eq!(calls.iter().find(|&&units| units == 256), Some(&256));
                     assert_eq!(
                         calls.last(),
@@ -874,9 +688,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Stop(AtomicUsize);
         impl PureCompileControl for Stop {
-            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                Err(CompileControlError::Cancelled)
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::Validate {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    Err(CompileControlError::Cancelled)
+                } else {
+                    Ok(())
+                }
             }
         }
         let mut arena = ScalarArena::new();
@@ -899,8 +717,11 @@ mod tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let map = MvColumnMap::new(vec![(
-            NormExpr::Column("present".into()),
+        let map = test_map(vec![(
+            NormExpr::Column {
+                name: "present".into(),
+                value_type: present.value_type.clone(),
+            },
             col(101, "mv_present"),
         )]);
         let control = Stop(AtomicUsize::new(0));
@@ -1005,7 +826,7 @@ mod tests {
                 value_type: mv.value_type.clone(),
                 ..col(101, "mv_abs")
             };
-            let map = MvColumnMap::new(vec![(normalize(&mv, &mv_names).unwrap(), output.clone())]);
+            let map = test_map(vec![(normalize(&mv, &mv_names).unwrap(), output.clone())]);
             assert_rewritten_column(
                 rewrite_typed(
                     &map,
@@ -1094,7 +915,7 @@ mod tests {
             };
             let mv_binary = binary(&mv_a, &mv_b, policy);
             let output = col(101, "mv_sum");
-            let map = MvColumnMap::new(vec![(
+            let map = test_map(vec![(
                 normalize(&mv_binary, &mv_names).unwrap(),
                 output.clone(),
             )]);
@@ -1120,7 +941,7 @@ mod tests {
                 value_type: mv_cast.value_type.clone(),
                 ..col(102, "mv_cast")
             };
-            let map = MvColumnMap::new(vec![(
+            let map = test_map(vec![(
                 normalize(&mv_cast, &mv_names).unwrap(),
                 output.clone(),
             )]);
@@ -1158,7 +979,7 @@ mod tests {
                 value_type: mv.value_type.clone(),
                 ..col(101, "mv_array")
             };
-            let map = MvColumnMap::new(vec![(normalize(&mv, &mv_names).unwrap(), output.clone())]);
+            let map = test_map(vec![(normalize(&mv, &mv_names).unwrap(), output.clone())]);
             let same = resolved_ordered_aggregate(
                 &query_a,
                 vec![sort(&query_b, true, false), sort(&query_c, false, true)],
@@ -1228,7 +1049,7 @@ mod tests {
                     output.clone(),
                 )
             });
-        let map = MvColumnMap::new(dims.to_vec());
+        let map = test_map(dims.to_vec());
         let rewritten = rewrite_typed(&map, &expression, &base_names).unwrap();
         let ExprKind::AggregateCall {
             args,
@@ -1259,7 +1080,7 @@ mod tests {
             assert_eq!(key.asc, asc);
             assert_eq!(key.nulls_first, nulls_first);
         }
-        let map = MvColumnMap::new(dims[..2].to_vec());
+        let map = test_map(dims[..2].to_vec());
         assert!(
             rewrite_typed(&map, &expression, &base_names).is_none(),
             "an unmapped ordering expression cannot retain the base ScalarId"

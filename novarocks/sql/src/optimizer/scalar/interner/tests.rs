@@ -359,8 +359,9 @@ fn exact_selected_binding_facts_participate_even_with_identical_call_spelling() 
         first
     );
     let mut different = binding.resolved().clone();
-    different.selected.result_type =
-        FunctionResultType::Scalar(FunctionValueType::new(DataType::Int32, false));
+    different.selected.result_type = novarocks_functions::FunctionResultType::Scalar(
+        FunctionValueType::new(DataType::Int32, false),
+    );
     assert_ne!(
         forced(
             &mut arena,

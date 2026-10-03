@@ -23,9 +23,11 @@ use std::collections::HashMap;
 
 use crate::column_id::ColumnId;
 use crate::common::{BinOp, LiteralValue};
+use crate::compiler::SqlCompileError;
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
-use super::column_mapping::{NormExpr, normalize};
+use super::column_mapping::{NormExpr, norm_contains, normalize};
 
 /// Inclusive/exclusive bound on one column.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,7 +55,8 @@ struct Classified {
     /// base column name -> (merged range, original conjuncts on the column)
     ranges: HashMap<String, (ColumnRange, Vec<ScalarId>)>,
     /// normalized residual -> original conjunct
-    residuals: Vec<(NormExpr, ScalarId)>,
+    residuals: Vec<NormExpr>,
+    residual_ids: Vec<ScalarId>,
 }
 
 /// Classify conjuncts. Returns None when any conjunct cannot be classified
@@ -62,28 +65,48 @@ fn classify(
     arena: &ScalarArena,
     conjuncts: &[ScalarId],
     base_names: &HashMap<ColumnId, String>,
-) -> Option<Classified> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<Classified>, SqlCompileError> {
     let mut ranges: HashMap<String, (ColumnRange, Vec<ScalarId>)> = HashMap::new();
     let mut residuals = Vec::new();
+    let mut residual_ids = Vec::new();
     for c in conjuncts {
-        match as_range_conjunct(arena, *c, base_names) {
+        // The existing legacy-only range helpers retain their exact rules.
+        // Observe their opaque string/map operations at the same scope boundary.
+        work.flush()?;
+        let range = as_range_conjunct(arena, *c, base_names);
+        work.step()?;
+        work.flush()?;
+        match range {
             Some((col, low, high)) => {
                 let entry = ranges.entry(col).or_default();
-                if let Some(b) = low {
-                    tighten_low(&mut entry.0, b)?;
+                let low_ok = low.is_none_or(|b| tighten_low(&mut entry.0, b).is_some());
+                let high_ok =
+                    low_ok && high.is_none_or(|b| tighten_high(&mut entry.0, b).is_some());
+                if high_ok {
+                    entry.1.push(*c);
                 }
-                if let Some(b) = high {
-                    tighten_high(&mut entry.0, b)?;
+                work.step()?;
+                work.flush()?;
+                if !high_ok {
+                    return Ok(None);
                 }
-                entry.1.push(*c);
             }
             None => {
-                let n = normalize(arena, *c, base_names)?;
-                residuals.push((n, *c));
+                let Some(n) = normalize(arena, *c, base_names, work.control())? else {
+                    return Ok(None);
+                };
+                residuals.push(n);
+                residual_ids.push(*c);
+                work.step()?;
             }
         }
     }
-    Some(Classified { ranges, residuals })
+    Ok(Some(Classified {
+        ranges,
+        residuals,
+        residual_ids,
+    }))
 }
 
 /// `col op literal` / `literal op col` / BETWEEN -> (column, low?, high?).
@@ -274,51 +297,76 @@ pub(crate) fn check_containment(
     query_arena: &ScalarArena,
     mv_conjuncts: &[ScalarId],
     mv_arena: &ScalarArena,
-    // base ColumnId -> base column name maps for EACH side
-    // (the two sides allocate different ColumnIds for the same table).
     query_base_names: &HashMap<ColumnId, String>,
     mv_base_names: &HashMap<ColumnId, String>,
-) -> Option<ContainmentResult> {
-    let q = classify(query_arena, query_conjuncts, query_base_names)?;
-    let m = classify(mv_arena, mv_conjuncts, mv_base_names)?;
-
-    let mut compensation: Vec<ScalarId> = Vec::new();
-
-    // Ranges: every MV-constrained column must be at least as wide as the
-    // query's. Query columns unconstrained by MV compensate fully.
-    for (col, (mv_range, _)) in &m.ranges {
-        let (q_range, _) = q.ranges.get(col)?; // MV constrains a column the query doesn't -> fail
-        if !(low_contained(&q_range.low, &mv_range.low)?
-            && high_contained(&q_range.high, &mv_range.high)?)
-        {
-            return None;
+    control: &dyn PureCompileControl,
+) -> Result<Option<ContainmentResult>, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let Some(q) = classify(query_arena, query_conjuncts, query_base_names, &mut work)? else {
+            return Ok(None);
+        };
+        let Some(m) = classify(mv_arena, mv_conjuncts, mv_base_names, &mut work)? else {
+            return Ok(None);
+        };
+        let mut compensation = Vec::new();
+        for (col, (mv_range, _)) in &m.ranges {
+            work.flush()?;
+            let contained = q.ranges.get(col).and_then(|(q_range, _)| {
+                Some(
+                    low_contained(&q_range.low, &mv_range.low)?
+                        && high_contained(&q_range.high, &mv_range.high)?,
+                )
+            });
+            work.step()?;
+            work.flush()?;
+            if contained != Some(true) {
+                return Ok(None);
+            }
         }
-    }
-    for (col, (q_range, originals)) in &q.ranges {
-        match m.ranges.get(col) {
-            // Identical range: fully implied, no compensation.
-            Some((mv_range, _)) if mv_range == q_range => {}
-            // Wider MV range (already verified) or unconstrained: re-apply.
-            _ => compensation.extend(originals.iter().copied()),
+        for (col, (q_range, originals)) in &q.ranges {
+            work.flush()?;
+            let equal = m
+                .ranges
+                .get(col)
+                .is_some_and(|(mv_range, _)| mv_range == q_range);
+            work.step()?;
+            work.flush()?;
+            if !equal {
+                for original in originals {
+                    compensation.push(*original);
+                    work.step()?;
+                }
+            }
         }
-    }
-
-    // Residuals: MV residual set ⊆ query residual set (by normalized form).
-    let q_norms: Vec<&NormExpr> = q.residuals.iter().map(|(n, _)| n).collect();
-    for (mn, _) in &m.residuals {
-        if !q_norms.contains(&mn) {
-            return None;
+        // CV residuals use exact selected-value/type identity. They never enter
+        // the legacy range inference path, and compensation order is unchanged.
+        for mn in &m.residuals {
+            work.flush()?;
+            if !norm_contains(&q.residuals, mn, control)? {
+                return Ok(None);
+            }
+            work.step()?;
         }
-    }
-    // Query residuals not present in the MV compensate.
-    let m_norms: Vec<&NormExpr> = m.residuals.iter().map(|(n, _)| n).collect();
-    for (qn, orig) in &q.residuals {
-        if !m_norms.contains(&qn) {
-            compensation.push(*orig);
+        for (qn, original) in q.residuals.iter().zip(&q.residual_ids) {
+            work.flush()?;
+            if !norm_contains(&m.residuals, qn, control)? {
+                compensation.push(*original);
+            }
+            work.step()?;
         }
+        Ok(Some(ContainmentResult { compensation }))
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
-
-    Some(ContainmentResult { compensation })
+    work.finish()?;
+    result
 }
 
 #[cfg(test)]
@@ -475,7 +523,9 @@ mod tests {
             &mv_arena,
             query_base_names,
             mv_base_names,
+            crate::optimizer::test_optimizer_control(),
         )
+        .unwrap()
     }
 
     #[test]

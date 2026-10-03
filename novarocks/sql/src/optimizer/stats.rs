@@ -22,6 +22,10 @@
 //! properties instead of recursing the `LogicalPlanNode` tree.
 
 #[cfg(test)]
+#[path = "stats/selectivity_constant_tests.rs"]
+mod selectivity_constant_tests;
+
+#[cfg(test)]
 #[path = "stats/values_constant_tests.rs"]
 mod values_constant_tests;
 
@@ -92,7 +96,7 @@ pub(crate) fn derive_statistics(
     let result: Result<Statistics, SqlCompileError> = (|| {
         Ok(match &expr.op {
             // -- Leaf operators (no children) --
-            Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input),
+            Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input, work)?,
             Operator::LogicalValues(vals) => Statistics {
                 output_row_count: vals.rows.len() as f64,
                 row_count_confidence: Confidence::Exact,
@@ -155,7 +159,8 @@ pub(crate) fn derive_statistics(
                     &memo.scalars,
                     filter.predicate,
                     &child_stats.column_statistics,
-                );
+                    work,
+                )?;
                 let (output_rows, row_count_confidence) = apply_filter(
                     child_stats.output_row_count,
                     child_stats.row_count_confidence,
@@ -293,7 +298,7 @@ pub(crate) fn derive_statistics(
             Operator::LogicalJoin(join) => {
                 let left_stats = child_statistics(memo, &expr.children, 0);
                 let right_stats = child_statistics(memo, &expr.children, 1);
-                derive_join(join, &memo.scalars, &left_stats, &right_stats)
+                derive_join(join, &memo.scalars, &left_stats, &right_stats, work)?
             }
 
             Operator::LogicalUnion(union_op) => derive_set_op_statistics(
@@ -318,7 +323,7 @@ pub(crate) fn derive_statistics(
             ),
 
             // -- Physical operators: derive the same way as their logical counterparts --
-            Operator::PhysicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input),
+            Operator::PhysicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input, work)?,
 
             Operator::PhysicalFilter(filter) => {
                 let child_stats = child_statistics(memo, &expr.children, 0);
@@ -326,7 +331,8 @@ pub(crate) fn derive_statistics(
                     &memo.scalars,
                     filter.predicate,
                     &child_stats.column_statistics,
-                );
+                    work,
+                )?;
                 let (output_rows, row_count_confidence) = apply_filter(
                     child_stats.output_row_count,
                     child_stats.row_count_confidence,
@@ -473,16 +479,20 @@ pub(crate) fn derive_statistics(
             Operator::PhysicalNestLoopJoin(join) => {
                 let left_stats = child_statistics(memo, &expr.children, 0);
                 let right_stats = child_statistics(memo, &expr.children, 1);
-                let non_equi_selectivity = join.condition.map(|cond| {
-                    (
-                        estimate_selectivity_scalar(
-                            &memo.scalars,
-                            cond,
-                            &left_stats.column_statistics,
-                        ),
-                        Confidence::Estimated,
-                    )
-                });
+                let non_equi_selectivity = join
+                    .condition
+                    .map(|cond| -> Result<_, SqlCompileError> {
+                        Ok((
+                            estimate_selectivity_scalar(
+                                &memo.scalars,
+                                cond,
+                                &left_stats.column_statistics,
+                                work,
+                            )?,
+                            Confidence::Estimated,
+                        ))
+                    })
+                    .transpose()?;
                 let eq_key_pairs =
                     collect_equi_join_column_pairs_scalar(&memo.scalars, join.condition);
 
@@ -694,9 +704,19 @@ pub(crate) fn derive_statistics(
             }
         })
     })();
-    let statistics = result?;
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    // The caller owns this scope. Flush its actual completed work on ordinary
+    // failure as well as success before publishing any candidate statistics.
+    work.flush()?;
     control.checkpoint(CompilePhase::Validate, 0)?;
-    Ok(statistics)
+    result
 }
 
 pub(crate) fn derive_opt_expr_statistics(
@@ -838,31 +858,42 @@ fn estimate_selectivity_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
-    match arena.node(expr) {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
+    let node = arena.node(expr);
+    work.step()?;
+    Ok(match node {
         ScalarNode::BinaryOp {
             left, op, right, ..
         } => match *op {
             BinOp::And => {
                 let mut conjuncts = Vec::new();
-                flatten_and_scalar(arena, expr, &mut conjuncts);
-                let sels: Vec<f64> = conjuncts
-                    .iter()
-                    .map(|conjunct| estimate_selectivity_scalar(arena, *conjunct, column_stats))
-                    .collect();
-                damped_conjunction(&sels)
+                flatten_and_scalar(arena, expr, &mut conjuncts, work)?;
+                let mut sels = Vec::new();
+                for conjunct in conjuncts {
+                    sels.push(estimate_selectivity_scalar(
+                        arena,
+                        conjunct,
+                        column_stats,
+                        work,
+                    )?);
+                    work.step()?;
+                }
+                observed_damped_conjunction(&sels, work)?
             }
             BinOp::Or => {
-                let l = estimate_selectivity_scalar(arena, *left, column_stats);
-                let r = estimate_selectivity_scalar(arena, *right, column_stats);
+                let l = estimate_selectivity_scalar(arena, *left, column_stats, work)?;
+                let r = estimate_selectivity_scalar(arena, *right, column_stats, work)?;
                 l + r - l * r
             }
             BinOp::Eq | BinOp::EqForNull => {
-                estimate_eq_selectivity_scalar(arena, *left, *right, column_stats)
+                estimate_eq_selectivity_scalar(arena, *left, *right, column_stats, work)?
             }
-            BinOp::Ne => 1.0 - estimate_eq_selectivity_scalar(arena, *left, *right, column_stats),
+            BinOp::Ne => {
+                1.0 - estimate_eq_selectivity_scalar(arena, *left, *right, column_stats, work)?
+            }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                estimate_range_selectivity_scalar(arena, *left, *right, *op, column_stats)
+                estimate_range_selectivity_scalar(arena, *left, *right, *op, column_stats, work)?
             }
             _ => PREDICATE_UNKNOWN_FILTER,
         },
@@ -889,7 +920,6 @@ fn estimate_selectivity_scalar(
             let ndv = col_id
                 .and_then(|column_id| column_stats.get(&column_id))
                 .and_then(ColumnStatistic::trusted_ndv_value);
-
             let sel = if let Some(ndv) = ndv {
                 (list.len() as f64 / ndv).min(1.0)
             } else {
@@ -903,44 +933,86 @@ fn estimate_selectivity_scalar(
             high,
             negated,
         } => {
-            let ge =
-                estimate_range_selectivity_scalar(arena, *child, *low, BinOp::Ge, column_stats);
-            let le =
-                estimate_range_selectivity_scalar(arena, *child, *high, BinOp::Le, column_stats);
+            let ge = estimate_range_selectivity_scalar(
+                arena,
+                *child,
+                *low,
+                BinOp::Ge,
+                column_stats,
+                work,
+            )?;
+            let le = estimate_range_selectivity_scalar(
+                arena,
+                *child,
+                *high,
+                BinOp::Le,
+                column_stats,
+                work,
+            )?;
             let sel = ge * le;
             if *negated { 1.0 - sel } else { sel }
         }
         ScalarNode::Like { negated, .. } => {
-            let sel = PREDICATE_UNKNOWN_FILTER;
-            if *negated { 1.0 - sel } else { sel }
+            if *negated {
+                1.0 - PREDICATE_UNKNOWN_FILTER
+            } else {
+                PREDICATE_UNKNOWN_FILTER
+            }
         }
         ScalarNode::UnaryOp {
             op: UnOp::Not,
             child,
-        } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats),
+        } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats, work)?,
         ScalarNode::IsTruthValue { negated, .. } => {
-            let base = 0.5;
-            if *negated { 1.0 - base } else { base }
+            if *negated {
+                1.0 - 0.5
+            } else {
+                0.5
+            }
         }
-        ScalarNode::Nested(inner) => estimate_selectivity_scalar(arena, *inner, column_stats),
+        ScalarNode::Nested(inner) => {
+            estimate_selectivity_scalar(arena, *inner, column_stats, work)?
+        }
         _ => PREDICATE_UNKNOWN_FILTER,
-    }
+    })
 }
 
-fn flatten_and_scalar(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            op: BinOp::And,
-            left,
-            right,
-            ..
-        } => {
-            flatten_and_scalar(arena, *left, out);
-            flatten_and_scalar(arena, *right, out);
+fn observed_damped_conjunction(
+    selectivities: &[f64],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
+    // Keep the existing sort and arithmetic, including non-finite filtering.
+    // These boundaries do not prove cooperation inside that library helper.
+    work.flush()?;
+    let result = damped_conjunction(selectivities);
+    work.flush()?;
+    Ok(result)
+}
+
+fn flatten_and_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    out: &mut Vec<ScalarId>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match arena.node(expr) {
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left,
+                right,
+                ..
+            } => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            ScalarNode::Nested(inner) => pending.push(*inner),
+            _ => out.push(expr),
         }
-        ScalarNode::Nested(inner) => flatten_and_scalar(arena, *inner, out),
-        _ => out.push(expr),
+        work.step()?;
     }
+    Ok(())
 }
 
 fn estimate_eq_selectivity_scalar(
@@ -948,39 +1020,41 @@ fn estimate_eq_selectivity_scalar(
     left: ScalarId,
     right: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
     if let Some((column_id, column_expr, literal_expr)) =
-        extract_column_literal_pair_scalar(arena, left, right)
+        extract_column_literal_pair_scalar(arena, left, right, work)?
         && let Some(cs) = column_stats.get(&column_id)
     {
         if let Some(ndv) = cs.trusted_ndv_value() {
-            return 1.0 / ndv;
+            return Ok(1.0 / ndv);
         }
         if let Some(selectivity) =
-            discrete_domain_equality_selectivity_scalar(arena, column_expr, literal_expr, cs)
+            discrete_domain_equality_selectivity_scalar(arena, column_expr, literal_expr, cs, work)?
         {
-            return selectivity;
+            return Ok(selectivity);
         }
     }
-    PREDICATE_UNKNOWN_FILTER
+    Ok(PREDICATE_UNKNOWN_FILTER)
 }
 
 fn extract_column_literal_pair_scalar(
     arena: &ScalarArena,
     left: ScalarId,
     right: ScalarId,
-) -> Option<(ColumnId, ScalarId, ScalarId)> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(ColumnId, ScalarId, ScalarId)>, SqlCompileError> {
     if let Some(column_id) = extract_column_id_scalar(arena, left)
-        && scalar_literal_f64(arena, right).is_some()
+        && scalar_literal_f64(arena, right, work)?.is_some()
     {
-        return Some((column_id, left, right));
+        return Ok(Some((column_id, left, right)));
     }
     if let Some(column_id) = extract_column_id_scalar(arena, right)
-        && scalar_literal_f64(arena, left).is_some()
+        && scalar_literal_f64(arena, left, work)?.is_some()
     {
-        return Some((column_id, right, left));
+        return Ok(Some((column_id, right, left)));
     }
-    None
+    Ok(None)
 }
 
 fn discrete_domain_equality_selectivity_scalar(
@@ -988,21 +1062,24 @@ fn discrete_domain_equality_selectivity_scalar(
     column_expr: ScalarId,
     literal_expr: ScalarId,
     stat: &ColumnStatistic,
-) -> Option<f64> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<f64>, SqlCompileError> {
     if !is_discrete_numeric_domain(arena.data_type(column_expr)) {
-        return None;
+        return Ok(None);
     }
     let min = stat.min_value;
     let max = stat.max_value;
     if !min.is_finite() || !max.is_finite() || max < min {
-        return None;
+        return Ok(None);
     }
-    let value = scalar_literal_f64(arena, literal_expr)?;
+    let Some(value) = scalar_literal_f64(arena, literal_expr, work)? else {
+        return Ok(None);
+    };
     if value < min || value > max {
-        return Some(0.0);
+        return Ok(Some(0.0));
     }
     let domain_width = (max.floor() - min.ceil() + 1.0).max(1.0);
-    Some((1.0 / domain_width).clamp(0.0, 1.0))
+    Ok(Some((1.0 / domain_width).clamp(0.0, 1.0)))
 }
 
 fn is_discrete_numeric_domain(data_type: &arrow::datatypes::DataType) -> bool {
@@ -1027,10 +1104,10 @@ fn estimate_range_selectivity_scalar(
     right: ScalarId,
     op: BinOp,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
     let col_id = extract_column_id_scalar(arena, left);
-    let literal_val = scalar_literal_f64(arena, right);
-
+    let literal_val = scalar_literal_f64(arena, right, work)?;
     if let (Some(column_id), Some(val)) = (col_id, literal_val)
         && let Some(cs) = column_stats.get(&column_id)
     {
@@ -1038,32 +1115,33 @@ fn estimate_range_selectivity_scalar(
         let max = cs.max_value;
         if min.is_finite() && max.is_finite() && max > min {
             let range = max - min;
-            return match op {
+            return Ok(match op {
                 BinOp::Lt => ((val - min) / range).clamp(0.01, 0.99),
                 BinOp::Le => ((val - min + 1.0) / range).clamp(0.01, 0.99),
                 BinOp::Gt => ((max - val) / range).clamp(0.01, 0.99),
                 BinOp::Ge => ((max - val + 1.0) / range).clamp(0.01, 0.99),
                 _ => 0.5,
-            };
+            });
         }
     }
-    0.5
+    Ok(0.5)
 }
 
-fn scalar_literal_f64(arena: &ScalarArena, expr: ScalarId) -> Option<f64> {
-    match arena.node(expr) {
-        ScalarNode::Literal(value) => match &value.0 {
-            LiteralValue::Int(v) => Some(*v as f64),
-            LiteralValue::LargeInt(v) => Some(*v as f64),
-            LiteralValue::Float(v) => Some(*v),
-            LiteralValue::Decimal(s) => s.parse::<f64>().ok(),
-            _ => None,
+fn scalar_literal_f64(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<f64>, SqlCompileError> {
+    // Share the sole selected CV/type/NULL author with VALUES statistics.
+    // Cast remains a transparent syntax wrapper, as in the previous estimator;
+    // this is not execution of an implicit numeric cast.
+    let control = work.control();
+    Ok(
+        match values_literal_f64_observed(arena, expr, control, work)? {
+            ValuesLiteral::Number(value) => Some(value),
+            ValuesLiteral::Null | ValuesLiteral::Unsupported => None,
         },
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            scalar_literal_f64(arena, *child)
-        }
-        _ => None,
-    }
+    )
 }
 
 fn aggregate_group_column_statistics_scalar(
@@ -2086,7 +2164,8 @@ fn derive_scan(
     scan: &super::operator::ScanOp,
     scalars: &ScalarArena,
     stats_input: &OptimizerStatsInput,
-) -> Statistics {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Statistics, SqlCompileError> {
     match resolve_scan_table_statistics(scan, stats_input) {
         ScanStatsResolution::Resolved(resolved) => derive_scan_statistics_scalar(
             &scan.columns,
@@ -2095,6 +2174,7 @@ fn derive_scan(
             Some(&resolved.table_stats),
             resolved.row_count_confidence,
             MISSING_BASE_ROW_COUNT_FALLBACK,
+            work,
         ),
         ScanStatsResolution::MissingBoundRef => derive_scan_statistics_scalar(
             &scan.columns,
@@ -2103,6 +2183,7 @@ fn derive_scan(
             None,
             Confidence::Fallback,
             MISSING_BASE_ROW_COUNT_FALLBACK,
+            work,
         ),
     }
 }
@@ -2146,7 +2227,8 @@ fn derive_scan_statistics_scalar(
     table_stats: Option<&TableStatistics>,
     table_row_count_confidence: Confidence,
     default_rows: f64,
-) -> Statistics {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Statistics, SqlCompileError> {
     if let Some(ts) = table_stats {
         let row_count = ts.row_count.max(1) as f64;
 
@@ -2154,7 +2236,9 @@ fn derive_scan_statistics_scalar(
         let mut row_count_confidence = table_row_count_confidence;
         let table_column_statistics = map_table_column_stats_to_ids(columns, ts);
         for pred in predicates {
-            let selectivity = estimate_selectivity_scalar(scalars, *pred, &table_column_statistics);
+            let selectivity =
+                estimate_selectivity_scalar(scalars, *pred, &table_column_statistics, work)?;
+            work.step()?;
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
@@ -2173,11 +2257,11 @@ fn derive_scan_statistics_scalar(
             .collect();
         cap_column_ndvs(&mut column_statistics, output_rows);
 
-        Statistics {
+        Ok(Statistics {
             output_row_count: output_rows,
             row_count_confidence,
             column_statistics,
-        }
+        })
     } else {
         let mut column_statistics: HashMap<ColumnId, ColumnStatistic> = columns
             .iter()
@@ -2186,16 +2270,18 @@ fn derive_scan_statistics_scalar(
         let mut output_rows = default_rows;
         let mut row_count_confidence = Confidence::Fallback;
         for pred in predicates {
-            let selectivity = estimate_selectivity_scalar(scalars, *pred, &column_statistics);
+            let selectivity =
+                estimate_selectivity_scalar(scalars, *pred, &column_statistics, work)?;
+            work.step()?;
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
         cap_column_ndvs(&mut column_statistics, output_rows);
-        Statistics {
+        Ok(Statistics {
             output_row_count: output_rows,
             row_count_confidence,
             column_statistics,
-        }
+        })
     }
 }
 
@@ -2222,9 +2308,10 @@ fn estimate_join_condition_scalar(
     condition: Option<ScalarId>,
     left_stats: &HashMap<ColumnId, ColumnStatistic>,
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> ScalarJoinConditionEstimate {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ScalarJoinConditionEstimate, SqlCompileError> {
     let Some(condition) = condition else {
-        return ScalarJoinConditionEstimate::default();
+        return Ok(ScalarJoinConditionEstimate::default());
     };
 
     let mut estimate = ScalarJoinConditionEstimate::default();
@@ -2236,19 +2323,30 @@ fn estimate_join_condition_scalar(
         right_stats,
         &mut estimate,
         &mut residuals,
-    );
+        work,
+    )?;
 
     if !residuals.is_empty() {
+        work.flush()?;
         let combined_stats = combined_column_statistics(left_stats, right_stats);
-        let selectivities: Vec<_> = residuals
-            .iter()
-            .map(|expr| estimate_join_residual_selectivity_scalar(arena, *expr, &combined_stats))
-            .collect();
-        estimate.residual_selectivity =
-            Some((damped_conjunction(&selectivities), Confidence::Estimated));
+        work.flush()?;
+        let mut selectivities = Vec::new();
+        for expr in residuals {
+            selectivities.push(estimate_join_residual_selectivity_scalar(
+                arena,
+                expr,
+                &combined_stats,
+                work,
+            )?);
+            work.step()?;
+        }
+        estimate.residual_selectivity = Some((
+            observed_damped_conjunction(&selectivities, work)?,
+            Confidence::Estimated,
+        ));
     }
 
-    estimate
+    Ok(estimate)
 }
 
 fn collect_join_conjuncts_scalar(
@@ -2258,47 +2356,36 @@ fn collect_join_conjuncts_scalar(
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut ScalarJoinConditionEstimate,
     residuals: &mut Vec<ScalarId>,
-) {
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-            ..
-        } => {
-            collect_join_conjuncts_scalar(
-                arena,
-                *left,
-                left_stats,
-                right_stats,
-                estimate,
-                residuals,
-            );
-            collect_join_conjuncts_scalar(
-                arena,
-                *right,
-                left_stats,
-                right_stats,
-                estimate,
-                residuals,
-            );
-        }
-        ScalarNode::Nested(inner) => {
-            collect_join_conjuncts_scalar(
-                arena,
-                *inner,
-                left_stats,
-                right_stats,
-                estimate,
-                residuals,
-            );
-        }
-        _ => {
-            if !try_collect_equi_key_scalar(arena, expr, left_stats, right_stats, estimate) {
-                residuals.push(expr);
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match arena.node(expr) {
+            ScalarNode::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+                ..
+            } => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            ScalarNode::Nested(inner) => pending.push(*inner),
+            _ => {
+                // Existing equi-key/NDV extraction stays opaque; do not claim
+                // that these observations bound its internal scalar walks.
+                work.flush()?;
+                let equi =
+                    try_collect_equi_key_scalar(arena, expr, left_stats, right_stats, estimate);
+                work.flush()?;
+                if !equi {
+                    residuals.push(expr);
+                }
             }
         }
+        work.step()?;
     }
+    Ok(())
 }
 
 fn try_collect_equi_key_scalar(
@@ -2362,14 +2449,15 @@ fn estimate_join_residual_selectivity_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
-    let selectivity = estimate_selectivity_scalar(arena, expr, column_stats);
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
+    let selectivity = estimate_selectivity_scalar(arena, expr, column_stats, work)?;
     if (selectivity - PREDICATE_UNKNOWN_FILTER).abs() < f64::EPSILON
-        && is_unknown_column_literal_eq_scalar(arena, expr, column_stats)
+        && is_unknown_column_literal_eq_scalar(arena, expr, column_stats, work)?
     {
-        UNKNOWN_JOIN_RESIDUAL_EQ_FILTER
+        Ok(UNKNOWN_JOIN_RESIDUAL_EQ_FILTER)
     } else {
-        selectivity
+        Ok(selectivity)
     }
 }
 
@@ -2377,7 +2465,8 @@ fn is_unknown_column_literal_eq_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> bool {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
     let ScalarNode::BinaryOp {
         left,
         op: BinOp::Eq | BinOp::EqForNull,
@@ -2385,29 +2474,37 @@ fn is_unknown_column_literal_eq_scalar(
         ..
     } = arena.node(expr)
     else {
-        return false;
+        return Ok(false);
     };
 
     let Some(column_id) =
         extract_column_id_scalar(arena, *left).or_else(|| extract_column_id_scalar(arena, *right))
     else {
-        return false;
+        return Ok(false);
     };
-    if !(scalar_is_literal_like(arena, *left) || scalar_is_literal_like(arena, *right)) {
-        return false;
+    if !(scalar_is_literal_like(arena, *left, work)?
+        || scalar_is_literal_like(arena, *right, work)?)
+    {
+        return Ok(false);
     }
-    column_stats
+    Ok(column_stats
         .get(&column_id)
-        .is_none_or(|cs| cs.trusted_ndv().is_none())
+        .is_none_or(|cs| cs.trusted_ndv().is_none()))
 }
 
-fn scalar_is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {
-    match arena.node(expr) {
-        ScalarNode::Literal(_) | ScalarNode::Constant(_) => true,
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            scalar_is_literal_like(arena, *child)
+fn scalar_is_literal_like(
+    arena: &ScalarArena,
+    mut expr: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    loop {
+        let node = arena.node(expr);
+        work.step()?;
+        match node {
+            ScalarNode::Literal(_) | ScalarNode::Constant(_) => return Ok(true),
+            ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => expr = *child,
+            _ => return Ok(false),
         }
-        _ => false,
     }
 }
 
@@ -2425,13 +2522,15 @@ fn derive_join(
     scalars: &ScalarArena,
     left_stats: &Statistics,
     right_stats: &Statistics,
-) -> Statistics {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Statistics, SqlCompileError> {
     let join_condition = estimate_join_condition_scalar(
         scalars,
         join.condition,
         &left_stats.column_statistics,
         &right_stats.column_statistics,
-    );
+        work,
+    )?;
     let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
         left: (left_stats.output_row_count, left_stats.row_count_confidence),
         right: (
@@ -2452,11 +2551,11 @@ fn derive_join(
         &join_condition.eq_key_pairs,
     );
 
-    Statistics {
+    Ok(Statistics {
         output_row_count: output_rows,
         row_count_confidence,
         column_statistics,
-    }
+    })
 }
 
 /// Widen the nullable flags of `left_cols` and `right_cols` according to the
@@ -6535,7 +6634,13 @@ mod tests {
             Operator::LogicalJoin(j) => {
                 let sid = j.condition.expect("join has a condition");
                 let mut conjuncts = Vec::new();
-                flatten_and_scalar(&memo.scalars, sid, &mut conjuncts);
+                let mut work = CompileCheckpoints::try_new(
+                    crate::optimizer::test_optimizer_control(),
+                    CompilePhase::Validate,
+                )
+                .unwrap();
+                flatten_and_scalar(&memo.scalars, sid, &mut conjuncts, &mut work).unwrap();
+                work.finish().unwrap();
                 assert_eq!(
                     conjuncts.len(),
                     1,

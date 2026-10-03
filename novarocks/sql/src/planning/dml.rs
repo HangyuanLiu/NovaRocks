@@ -2778,6 +2778,8 @@ fn build_statistics_connector_physical(
         unpivot_columns.clone(),
         4096,
         novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
+        constant_policy,
+        control,
     )?;
     let unpivot = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
