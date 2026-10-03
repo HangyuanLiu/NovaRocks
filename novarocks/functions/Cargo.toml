@@ -28,6 +28,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+base64.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-cast.workspace = true

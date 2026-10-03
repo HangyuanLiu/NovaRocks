@@ -3992,6 +3992,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
+ "base64 0.22.1",
  "chrono",
  "md-5 0.10.6",
  "novarocks-constant-contract",
