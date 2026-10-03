@@ -53,20 +53,22 @@ from pathlib import Path
 PACKAGE_NAME = "novarocks-physical-plan"
 TYPE_CONTRACT = "novarocks-type-contract"
 CONNECTOR_CONTRACT = "novarocks-connector-contract"
+RESULT_CONTRACT = "novarocks-result-contract"
 
 # These are allowed direct internal dependencies, not required dependencies.
 # Removing one as the contract gets smaller remains legal.
-DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT})
+DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, RESULT_CONTRACT})
 DIRECT_PACKAGE_ALLOW_LIST = frozenset(
-    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT}
+    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, RESULT_CONTRACT}
 )
 
 # Dependency direction is part of the architecture. The type contract is the
 # lower-level vocabulary; the Connector contract may consume it, but neither
 # contract may acquire physical-plan or application authority.
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
-    TYPE_CONTRACT: frozenset({"arrow-schema"}),
+    TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT}),
     CONNECTOR_CONTRACT: frozenset({"bytes", TYPE_CONTRACT}),
+    RESULT_CONTRACT: frozenset(),
 }
 
 # This vocabulary is used only for declared-edge diagnostics. Resolved closure
@@ -78,6 +80,7 @@ RESOLVED_PACKAGE_ALLOW_LIST = frozenset(
         "bytes",
         "novarocks-connector-contract",
         "novarocks-type-contract",
+        RESULT_CONTRACT,
     }
 )
 
@@ -374,12 +377,30 @@ def resolved_package_allow_list(graph):
     packages = [
         graph.workspace_package(TYPE_CONTRACT),
         graph.workspace_package(CONNECTOR_CONTRACT),
+        graph.workspace_package(RESULT_CONTRACT),
     ]
     packages.extend(
         package
         for name, expected in sorted(EXTERNAL_PACKAGE_ALLOW_LIST.items())
         if (package := graph.external_package(name, expected)) is not None
     )
+    # M07 patches these original producers in this repository. Admit only the
+    # exact version, source, Cargo id and canonical vendor location; a same-name
+    # path dependency elsewhere cannot impersonate the audited original.
+    vendor_root = Path(__file__).resolve().parents[2] / "vendor"
+    for name, expected in sorted(EXTERNAL_PACKAGE_ALLOW_LIST.items()):
+        version = expected["version"]
+        directory = (vendor_root / f"{name}-{version}").resolve()
+        identity = (
+            f"path+{directory.as_uri()}#{name}@{version}",
+            None,
+            version,
+            str(directory / "Cargo.toml"),
+        )
+        packages.extend(
+            package for package in graph.packages_by_name.get(name, [])
+            if package_identity(package) == identity
+        )
     return frozenset(package_identity(package) for package in packages)
 
 def declared_dependencies_by_kind(package):

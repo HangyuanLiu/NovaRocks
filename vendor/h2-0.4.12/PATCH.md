@@ -171,3 +171,20 @@ HPACK/table decoding through END_HEADERS before its stream reset.
 Only typed table backing is funded here. HTTP HeaderMap, pseudo-header and
 framework/stream/socket/TLS metadata, full Native connection capacity and
 production profile/lane/deadline installation remain separate.
+
+
+## Registry advisory identity and pending source audit
+
+The upstream registry `h2 0.4.12` advisory `RUSTSEC-2026-0258` remains
+tracked for source audit/remediation. M07 does not claim to fix that advisory.
+The path-patched lock entry has no registry source/checksum; cargo-deny 0.20.2
+skips RustSec matching for source=None. Its inactive registry ignore was
+removed under the unchanged `unused-ignored-advisory=deny` policy. This is a
+package source identity migration, not a security verdict. Restoring registry
+identity does not restore an advisory waiver.
+
+M07's opt-in bounded event/storage paths have scoped ownership and protocol
+receipts. The default None paths preserve upstream behavior; those receipts
+do not establish a general upstream advisory fix. Original registry provenance
+remains in UPSTREAM.json. A passing registry policy check does not discharge
+local vendor source audit responsibility.

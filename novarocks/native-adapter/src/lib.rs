@@ -292,7 +292,7 @@ pub struct BackendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: BackendNativeTransport,
-    channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
+    channels: Arc<Mutex<HashMap<native_client::NativeChannelKey, Channel>>>,
     transport_capacity: Option<native_transport_capacity::NativeTransportCapacityFactory>,
 }
 
@@ -351,7 +351,9 @@ impl BackendDataRuntime {
     pub fn native_transport(&self) -> &BackendNativeTransport {
         &self.native_transport
     }
-    pub fn channels(&self) -> &Arc<Mutex<HashMap<NativeEndpoint, Channel>>> {
+    pub(crate) fn channels(
+        &self,
+    ) -> &Arc<Mutex<HashMap<native_client::NativeChannelKey, Channel>>> {
         &self.channels
     }
 }

@@ -73,3 +73,10 @@ guarded owner 转为 `Vec<u8>` 时，仍先用 `slice.to_vec()` 创建独立 buf
 前两个文件保持原始 hash；`src/bytes_mut.rs` 与 exact registry 的完整 diff 仅有新增 getter，以上代码未变，只因插入发生行号移动。
 
 `/tmp/m07-bytes-exit-guard-clippy-default.log` 的默认 all-target 检查还遇到三个未修改 bench 的 `#![feature(test)]` 在 stable 上报 `E0554`，以及上游 `tests/test_bytes.rs` 的 `#[should_panic]` 反向 slice `5..3` 触发 `reversed_empty_ranges`。该日志中的其他测试/内建 test-module 告警也来自 hash 未变的上游文件或 `src/bytes_mut.rs` 未改动区域。不能据此称默认 all-target 或严格 Clippy 通过；单独 focused 日志与这些原始失败日志分开保存。
+
+
+## Registry advisory 身份与待审计状态
+
+原 registry `bytes 1.11.0` 的已知 `RUSTSEC-2026-0007` 继续记录为待源代码审计/修复，不宣称 M07 修复此 advisory。当前 path patch 的 lock entry 没有 registry source/checksum；cargo-deny 0.20.2 的 RustSec 匹配跳过 source=None。因此活动 deny ignore 已按 `unused-ignored-advisory=deny` 移除，级别没有降低。这只是 package source 身份迁移，不是安全结论；恢复 registry identity 时无旧 ignore 可以掩盖检查。
+
+`BytesMut::reserve` 的原 `v_capacity >= new_cap + offset` 仍保留。当前 bytes_mut diff 只增加原 Shared metadata getter，exit-guard/Miri 收据不证明此 reserve 分支已修复。原始 registry provenance 仍见 `UPSTREAM.json`；本地 vendor 的源代码责任不由 cargo-deny registry PASS 自动覆盖。

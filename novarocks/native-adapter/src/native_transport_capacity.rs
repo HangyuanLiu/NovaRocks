@@ -377,7 +377,7 @@ impl NativeTransportCapacityFactory {
         let dimensions = Dimensions::frozen()?;
         let admission = budget
             .try_reserve_process(dimensions.stock_bound)
-            .map_err(|_| invalid())?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let ResultWriteAdmission::Granted(credit) = admission else {
             return Err(io::ErrorKind::WouldBlock.into());
         };

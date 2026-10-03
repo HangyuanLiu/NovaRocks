@@ -1135,11 +1135,12 @@ mod tests {
                 .unwrap()
                 .connect_lazy()
         });
+        let key = crate::native_client::NativeChannelKey::membership(endpoint);
         original
             .channels()
             .lock()
             .unwrap()
-            .insert(endpoint.clone(), channel);
+            .insert(key.clone(), channel);
         let bytes = crate::native_transport_capacity::NativeTransportCapacityFactory::allocation_capacity_bound().unwrap();
         let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
             std::num::NonZeroUsize::new(bytes).unwrap(),
@@ -1148,11 +1149,11 @@ mod tests {
             crate::native_transport_capacity::NativeTransportCapacityFactory::try_new(budget)
                 .unwrap();
         let funded = original.with_transport_capacity(capacity);
-        assert!(original.channels().lock().unwrap().contains_key(&endpoint));
-        assert!(!funded.channels().lock().unwrap().contains_key(&endpoint));
+        assert!(original.channels().lock().unwrap().contains_key(&key));
+        assert!(!funded.channels().lock().unwrap().contains_key(&key));
         assert!(!Arc::ptr_eq(original.channels(), funded.channels()));
         assert!(funded.transport_capacity().is_some());
-        original.channels().lock().unwrap().remove(&endpoint);
+        original.channels().lock().unwrap().remove(&key);
     }
 
     async fn connect_live_channel(grpc_port: u16) -> tonic::transport::Channel {

@@ -1307,7 +1307,7 @@ pub struct RuntimeConfig {
     /// Joint Arrow-input plus encoded-output memory allowed per root stream.
     #[serde(default = "default_result_retained_bytes_per_root")]
     pub result_retained_bytes_per_root: usize,
-    /// Joint Arrow-input plus encoded-output memory allowed across the BE.
+    /// Joint root input/output, producer and Native transport capacity across the BE.
     #[serde(default = "default_result_retained_bytes_per_process")]
     pub result_retained_bytes_per_process: usize,
     #[serde(default = "default_lake_publication_max_attempt_duration_ms")]
@@ -2341,7 +2341,11 @@ fn default_result_retained_bytes_per_root() -> usize {
 }
 
 fn default_result_retained_bytes_per_process() -> usize {
-    256 * 1024 * 1024
+    usize::try_from(
+        novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+            .root_joint_retained_bytes_per_process,
+    )
+    .expect("the frozen Native process capacity requires a 64-bit target")
 }
 
 fn default_lake_publication_max_attempt_duration_ms() -> u64 {

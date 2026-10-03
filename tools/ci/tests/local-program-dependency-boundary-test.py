@@ -17,6 +17,7 @@
 
 """Exercise capability mutations using real Cargo metadata, without compiling."""
 
+import copy
 import importlib.util
 import subprocess
 import tempfile
@@ -31,15 +32,22 @@ spec.loader.exec_module(guard)
 
 
 class BoundaryTests(unittest.TestCase):
-    def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False):
+    @classmethod
+    def setUpClass(cls):
+        support = guard.metadata_support()
+        cls.repository_metadata = support.cargo_metadata(guard.REPOSITORY_ROOT / "Cargo.toml")
+
+    def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False,
+                result_dependency=""):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime"]\n')
+            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result"]\n')
         for directory, name, dependencies in (
                 ("program", "novarocks-local-program", root_dependency),
                 ("types", "novarocks-types", types_dependency),
+                ("result", "novarocks-result-contract", result_dependency),
                 ("runtime", "tokio", "")):
             package = root / directory
             (package / "src").mkdir(parents=True)
@@ -62,6 +70,21 @@ class BoundaryTests(unittest.TestCase):
     def test_pure_contract_and_unrelated_workspace_runtime_are_allowed(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dependency_free_result_contract_is_allowed(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_result_contract_cannot_acquire_runtime_even_through_a_pure_root(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                              result_dependency='tokio = { path = "../runtime" }\n')
+        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
+        self.assertIn("runtime/wire/provider/storage capability: tokio", result.stderr)
+
+    def test_result_contract_cannot_add_an_otherwise_pure_dependency(self):
+        result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                              result_dependency='novarocks-types = { path = "../types" }\n')
+        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
 
     def test_transitive_runtime_is_rejected(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n',
@@ -101,6 +124,53 @@ class BoundaryTests(unittest.TestCase):
     def test_arrow_backing_is_allowed_without_exact_closure_snapshot(self):
         for name in ("arrow-array", "arrow-buffer", "arrow-data", "half", "num-traits"):
             self.assertEqual(guard.verify_package(self.external(name), set()), [])
+
+    def actual_vendors(self):
+        packages = {package["name"]: package for package in self.repository_metadata["packages"]
+                    if package["name"] in guard.VENDORED_BACKING_VERSIONS
+                    and package["source"] is None}
+        self.assertEqual(set(packages), set(guard.VENDORED_BACKING_VERSIONS))
+        return packages.values()
+
+    def test_actual_vendored_backings_have_exact_audited_cargo_identities(self):
+        for package in self.actual_vendors():
+            with self.subTest(package=package["name"]):
+                self.assertTrue(guard.audited_vendored_backing(package))
+                self.assertEqual(guard.verify_package(package, set()), [])
+
+    def test_same_named_vendor_at_an_unrelated_path_is_rejected(self):
+        for original in self.actual_vendors():
+            with self.subTest(package=original["name"]):
+                package = copy.deepcopy(original)
+                directory = Path("/tmp/unaudited-vendor") / original["name"]
+                # All fields agree with each other, but none attests the actual
+                # repository vendor. Name/source alone must not allow this.
+                package["manifest_path"] = str(directory / "Cargo.toml")
+                package["id"] = f"path+{directory.as_uri()}#{package['name']}@{package['version']}"
+                self.assertTrue(guard.verify_package(package, set()))
+
+    def test_vendor_manifest_version_source_and_id_cannot_be_mutated(self):
+        for original in self.actual_vendors():
+            mutations = (
+                ("manifest_path", str(Path(original["manifest_path"]).with_name("other.toml"))),
+                ("manifest_path", str(Path(original["manifest_path"]).parent.parent
+                                      / "replacement" / "Cargo.toml")),
+                ("version", "99.0.0"),
+                ("id", original["id"].rsplit("@", 1)[0] + "@99.0.0"),
+                ("id", f"{guard.REGISTRY_SOURCE}#{original['name']}@{original['version']}"),
+                ("source", guard.REGISTRY_SOURCE),
+                ("source", "git+https://example.invalid/backing?rev=other#012345"),
+            )
+            for field, value in mutations:
+                with self.subTest(package=original["name"], field=field, value=value):
+                    package = copy.deepcopy(original)
+                    package[field] = value
+                    self.assertFalse(guard.audited_vendored_backing(package))
+                    self.assertTrue(guard.verify_package(package, set()))
+
+    def test_non_audited_path_backing_does_not_inherit_the_vendor_exception(self):
+        package = self.external("arrow-data", source=None)
+        self.assertTrue(guard.verify_package(package, set()))
 
     def test_same_named_pure_contract_replacement_is_rejected(self):
         package = self.external("novarocks-types")

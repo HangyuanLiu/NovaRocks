@@ -1,0 +1,60 @@
+{
+  "status": "verified-frozen-peer-routing-slice",
+  "parent": "e563352924ee5fd405981c3970aa20ee0d17826c",
+  "cargo_only_ci": {
+    "exit_code": 0,
+    "run": "logs/ci-full/20261003-115649",
+    "profile": "dev",
+    "duration_seconds": 890,
+    "test_groups": {
+      "component": {
+        "passed": 11647,
+        "failed": 0,
+        "ignored": 7,
+        "successful_target_groups": 187
+      },
+      "server_owner": {
+        "passed": 165,
+        "failed": 0,
+        "ignored": 0,
+        "successful_target_groups": 3
+      },
+      "server_smoke": {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0,
+        "successful_target_groups": 1
+      }
+    }
+  },
+  "total_workspace_passed": 11815,
+  "total_workspace_ignored": 7,
+  "new_behavior_tests": 8,
+  "source_runtime_negative_cases": 3,
+  "sources_exactly_restored": true,
+  "local_program_guard_tests": 18,
+  "ncp8_guard_manifest_negative_cases": 16,
+  "product_source_policy_provenance_pins": 25,
+  "vendor_source_pins": 270,
+  "lossless_logs_and_diffs": 140,
+  "server_default_joint_bytes": 4294967296,
+  "process_transport_stock_bytes": 3471280708,
+  "known_vendor_advisory_source_audit": "open; no vulnerability fix or security verdict",
+  "cache_singleflight_installed": false,
+  "physical_generation_installed": false,
+  "per_lane_connection_gates_installed": false,
+  "production_control_lane_installed": false,
+  "native_1fe_3be_acceptance": false,
+  "sql_suites_run": false,
+  "system_scenarios_run": false,
+  "linux_tests": "user-will-run-manually",
+  "p04": "executing",
+  "goal": "active",
+  "first_broad_failures": [
+    "obsolete-registry-advisory-ignores",
+    "server-default-joint-budget",
+    "native-wire-guard",
+    "physical-plan-guard",
+    "ncp8-guard"
+  ]
+}

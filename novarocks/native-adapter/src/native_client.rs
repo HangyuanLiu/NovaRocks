@@ -22,9 +22,10 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
+use novarocks_proto_codec::native_rpc::{NativeRpcMethod, NativeTrafficClass};
 use novarocks_proto_models::{filter, novarocks as proto};
-use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;
+use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
@@ -38,44 +39,85 @@ use crate::native_transport_capacity::TransportClass;
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
+#[cfg(test)]
+#[path = "native_peer_key_tests.rs"]
+mod peer_key_tests;
+
 type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
 
 pub struct NativeRpcClient {
     runtime: BackendDataRuntime,
     endpoint: NativeEndpoint,
+    backend_process_id: Option<BackendProcessId>,
+}
+
+/// Only the three BE-origin methods use this role-local cache. Their manifest
+/// classes are distinct physical lanes. Membership has no BE peer identity.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct NativeChannelKey {
+    backend_process_id: Option<BackendProcessId>,
+    endpoint: NativeEndpoint,
+    method: NativeRpcMethod,
+}
+
+impl NativeChannelKey {
+    fn new(
+        backend_process_id: Option<BackendProcessId>,
+        endpoint: NativeEndpoint,
+        method: NativeRpcMethod,
+    ) -> Result<Self, String> {
+        match (method.contract().traffic, backend_process_id) {
+            (NativeTrafficClass::Exchange | NativeTrafficClass::RuntimeFilter, Some(_))
+            | (NativeTrafficClass::Membership, None) => Ok(Self {
+                backend_process_id,
+                endpoint,
+                method,
+            }),
+            _ => Err("Native outbound method requires its exact frozen peer domain".to_owned()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn membership(endpoint: NativeEndpoint) -> Self {
+        Self::new(None, endpoint, NativeRpcMethod::AnnounceBackend)
+            .expect("the Native manifest assigns announcement to membership")
+    }
 }
 
 impl NativeRpcClient {
-    pub fn new_native_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
-        Self { runtime, endpoint }
+    pub fn new_membership_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
+        Self {
+            runtime,
+            endpoint,
+            backend_process_id: None,
+        }
     }
 
-    pub fn new_host_port(
+    pub fn new_backend_endpoint(
         runtime: BackendDataRuntime,
-        host: String,
-        port: u16,
-    ) -> Result<Self, String> {
-        let endpoint = NativeEndpoint::from_host_port(&host, port)
-            .map_err(|error| format!("invalid BE endpoint: {error}"))?;
-        channel_endpoint(&endpoint)
-            .map_err(|error| format!("invalid BE endpoint {endpoint}: {error}"))?;
-        Ok(Self { runtime, endpoint })
+        endpoint: NativeEndpoint,
+        backend_process_id: BackendProcessId,
+    ) -> Self {
+        Self {
+            runtime,
+            endpoint,
+            backend_process_id: Some(backend_process_id),
+        }
     }
 
     async fn make_deadline_async_client(
         &self,
         operation: &str,
+        method: NativeRpcMethod,
         deadline_at: tokio::time::Instant,
     ) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
-        tokio::time::timeout_at(
-            deadline_at,
-            get_or_create_channel(&self.runtime, self.endpoint.clone()),
-        )
-        .await
-        .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
-        .map(|channel| client_from_channel(channel, self.runtime.native_trust().as_ref()))
-        .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
+        let key = NativeChannelKey::new(self.backend_process_id, self.endpoint.clone(), method)?;
+        tokio::time::timeout_at(deadline_at, get_or_create_channel(&self.runtime, key))
+            .await
+            .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
+            .map(|channel| client_from_channel(channel, self.runtime.native_trust().as_ref()))
+            .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
     }
 
     pub async fn transmit_runtime_filter_envelope_async(
@@ -85,7 +127,11 @@ impl NativeRpcClient {
     ) -> Result<filter::RuntimeFilterEnvelopeResponse, String> {
         let deadline_at = tokio::time::Instant::now() + deadline;
         let mut client = self
-            .make_deadline_async_client("runtime filter envelope", deadline_at)
+            .make_deadline_async_client(
+                "runtime filter envelope",
+                NativeRpcMethod::TransmitRuntimeFilterEnvelope,
+                deadline_at,
+            )
             .await?;
         let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -113,7 +159,11 @@ impl NativeRpcClient {
         self.runtime.block_on(async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
-                .make_deadline_async_client("announce_backend", deadline_at)
+                .make_deadline_async_client(
+                    "announce_backend",
+                    NativeRpcMethod::AnnounceBackend,
+                    deadline_at,
+                )
                 .await?;
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -172,7 +222,7 @@ impl NativeRpcClient {
                 result = async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
-                .make_deadline_async_client("exchange", deadline_at)
+                .make_deadline_async_client("exchange", NativeRpcMethod::ExchangeUnary, deadline_at)
                 .await?;
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -256,18 +306,20 @@ fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNo
 
 async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
-    endpoint: NativeEndpoint,
+    key: NativeChannelKey,
 ) -> Result<Channel, String> {
     if let Some(channel) = runtime
         .channels()
         .lock()
         .expect("native channel cache lock")
-        .get(&endpoint)
+        .get(&key)
         .cloned()
     {
         return Ok(channel);
     }
-    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
+    let connector = runtime
+        .native_transport()
+        .connector_for(key.endpoint.clone())?;
     let connector = service_fn(move |_| {
         let connector = connector.clone();
         async move {
@@ -280,7 +332,7 @@ async fn get_or_create_channel(
                 })
         }
     });
-    let channel = capacity_endpoint(runtime, &endpoint, TransportClass::Data)?
+    let channel = capacity_endpoint(runtime, &key.endpoint, TransportClass::Data)?
         .timeout(Duration::from_secs(600))
         .connect_with_connector(connector)
         .await
@@ -289,7 +341,7 @@ async fn get_or_create_channel(
         .channels()
         .lock()
         .expect("native channel cache lock")
-        .insert(endpoint, channel.clone());
+        .insert(key, channel.clone());
     Ok(channel)
 }
 
@@ -309,12 +361,11 @@ mod tests {
         timeout: Duration,
         stop: CancellationToken,
     ) -> Result<(), String> {
-        let client = NativeRpcClient::new_host_port(
+        let client = NativeRpcClient::new_backend_endpoint(
             crate::backend_test_support::test_backend_data_runtime(),
-            "127.0.0.1".to_string(),
-            port,
-        )
-        .expect("legal endpoint");
+            novarocks_types::NativeEndpoint::from_host_port("127.0.0.1", port).unwrap(),
+            novarocks_types::BackendProcessId::new_v7(),
+        );
         client
             .exchange_unary(
                 UniqueId::new(1, 2),

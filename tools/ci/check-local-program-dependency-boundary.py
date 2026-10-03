@@ -45,10 +45,32 @@ PURE_OWNERS = frozenset({
     "novarocks-connector-contract",
     "novarocks-execution-contract",
     "novarocks-functions",
+    "novarocks-result-contract",
     "novarocks-type-contract",
     "novarocks-types",
 })
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+# The audited local implementations retain only their exact original Cargo
+# identity. A same-named path package is not an authority substitute.
+VENDORED_BACKING_VERSIONS = {
+    "arrow-array": "58.2.0",
+    "arrow-buffer": "58.2.0",
+    "arrow-schema": "58.2.0",
+    "bytes": "1.11.0",
+}
+
+
+def audited_vendored_backing(package):
+    version = VENDORED_BACKING_VERSIONS.get(package["name"])
+    if version is None:
+        return False
+    directory = REPOSITORY_ROOT / "vendor" / f"{package['name']}-{version}"
+    expected_id = f"path+{directory.as_uri()}#{package['name']}@{version}"
+    return (package["source"] is None
+            and package.get("version") == version
+            and package["id"] == expected_id
+            and package.get("manifest_path") == str(directory / "Cargo.toml"))
 
 # These categories name capabilities, not every package currently in the tree.
 FORBIDDEN_EXACT = frozenset({
@@ -78,6 +100,8 @@ def verify_package(package, workspace_ids):
     if internal:
         if package["id"] not in workspace_ids or package["source"] is not None:
             violations.append(f"{name} is not the workspace-owned pure package")
+        if name == "novarocks-result-contract" and package["dependencies"]:
+            violations.append(f"{name} must remain dependency-free")
         # A feature/target variant of a repository-owned contract requires a new
         # audit. Optional dependencies cannot hide outside the selected tree.
         if package.get("features"):
@@ -93,8 +117,16 @@ def verify_package(package, workspace_ids):
                                   + dependency["name"])
         if any("custom-build" in target["kind"] for target in package["targets"]):
             violations.append(f"{name} executes a custom build script")
-    elif package["source"] != REGISTRY_SOURCE:
-        violations.append(f"{name} has unaudited dependency source: {package['source']}")
+    elif package["source"] == REGISTRY_SOURCE:
+        # Preserve registry ownership, but do not let a local Cargo ID borrow
+        # the registry source label to bypass the exact vendor tuple below.
+        if not package["id"].startswith(REGISTRY_SOURCE + "#"):
+            violations.append(f"{name} has unaudited registry Cargo identity: {package['id']}")
+    elif not audited_vendored_backing(package):
+        violations.append(f"{name} has unaudited dependency source or vendor identity: "
+                          f"source={package['source']}, id={package['id']}, "
+                          f"version={package.get('version')}, "
+                          f"manifest={package.get('manifest_path')}")
     return violations
 
 

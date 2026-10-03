@@ -34,7 +34,7 @@ use novarocks_execution::runtime_filter::{
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
-use novarocks_types::UniqueId;
+use novarocks_types::{BackendProcessId, UniqueId};
 
 use crate::runtime_filter_membership::{MembershipContractDecodeError, decode_membership_contract};
 use novarocks_plan_codec::native_type::decode_type;
@@ -1660,8 +1660,22 @@ fn decode_route_peer(
                 path.clone().field("remote").field("participant_id"),
                 "remote participant id",
             )?;
+            let process_path = path.clone().field("remote").field("backend_process_id");
+            let process_bytes = remote
+                .backend_process_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    invalid(
+                        process_path.clone(),
+                        "backend process identity must be exactly 16 bytes",
+                    )
+                })?;
+            let backend_process_id = BackendProcessId::try_from_bytes(process_bytes)
+                .map_err(|error| invalid(process_path, error.to_string()))?;
             Ok(BackendRoutePeer::Remote {
                 participant_id: remote.participant_id,
+                backend_process_id,
                 endpoint: RuntimeEndpoint::parse(&remote.endpoint)
                     .map_err(|error| invalid(path.field("remote").field("endpoint"), error))?,
             })
@@ -1776,7 +1790,8 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        decode_contract, decode_runtime_filter_contribution, validate_participant_install,
+        decode_contract, decode_route_peer, decode_runtime_filter_contribution,
+        validate_participant_install,
     };
     use novarocks_proto_codec::{
         FieldPath, ProtocolErrorKind,
@@ -1973,6 +1988,58 @@ mod tests {
     }
 
     #[test]
+    fn remote_peer_retains_the_frozen_process_even_when_endpoint_is_reused() {
+        use novarocks_worker::runtime_filter::domain::BackendRoutePeer;
+        let original = novarocks_types::BackendProcessId::new_v7();
+        let replacement = novarocks_types::BackendProcessId::new_v7();
+        let peer = |process: novarocks_types::BackendProcessId| filter::RuntimeFilterRoutePeer {
+            peer: Some(filter::runtime_filter_route_peer::Peer::Remote(
+                filter::RuntimeFilterRemotePeer {
+                    participant_id: 4,
+                    endpoint: "127.0.0.1:19040".to_owned(),
+                    backend_process_id: process.to_bytes().to_vec(),
+                },
+            )),
+        };
+        let first = decode_route_peer(Some(&peer(original)), FieldPath::root("peer")).unwrap();
+        let next = decode_route_peer(Some(&peer(replacement)), FieldPath::root("peer")).unwrap();
+        assert_ne!(first, next);
+        let BackendRoutePeer::Remote {
+            backend_process_id, ..
+        } = first
+        else {
+            panic!("remote peer must stay remote");
+        };
+        assert_eq!(backend_process_id, original);
+    }
+
+    #[test]
+    fn remote_peer_refuses_missing_wrong_width_nil_and_non_v7_process() {
+        let mut non_v7 = novarocks_types::BackendProcessId::new_v7().to_bytes();
+        non_v7[6] = (non_v7[6] & 0x0f) | 0x40;
+        for bytes in [
+            Vec::new(),
+            vec![1; 15],
+            vec![1; 17],
+            vec![0; 16],
+            non_v7.to_vec(),
+        ] {
+            let wire = filter::RuntimeFilterRoutePeer {
+                peer: Some(filter::runtime_filter_route_peer::Peer::Remote(
+                    filter::RuntimeFilterRemotePeer {
+                        participant_id: 4,
+                        endpoint: "127.0.0.1:19040".to_owned(),
+                        backend_process_id: bytes,
+                    },
+                )),
+            };
+            let error = decode_route_peer(Some(&wire), FieldPath::root("peer"))
+                .expect_err("unfenced remote process must be refused");
+            assert_eq!(error.path().to_string(), "peer.remote.backend_process_id");
+        }
+    }
+
+    #[test]
     fn rejects_a_routing_edge_that_disagrees_with_the_contribution_participant() {
         let mut wire = empty_contribution_wire();
         wire.install
@@ -1995,6 +2062,9 @@ mod tests {
                             filter::RuntimeFilterRemotePeer {
                                 participant_id: 4,
                                 endpoint: "127.0.0.1:19040".to_string(),
+                                backend_process_id: novarocks_types::BackendProcessId::new_v7()
+                                    .to_bytes()
+                                    .to_vec(),
                             },
                         )),
                     }),

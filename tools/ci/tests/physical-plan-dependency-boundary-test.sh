@@ -60,6 +60,7 @@ members = [
   "crates/hyper",
   "crates/physical-plan",
   "crates/proto-models",
+  "crates/result-contract",
   "crates/serde",
   "crates/sql",
   "crates/tonic",
@@ -82,6 +83,7 @@ EOF
   write_package "$fixture_root" hyper hyper
   write_package "$fixture_root" physical-plan novarocks-physical-plan
   write_package "$fixture_root" proto-models novarocks-proto-models
+  write_package "$fixture_root" result-contract novarocks-result-contract
   write_package "$fixture_root" serde serde
   write_package "$fixture_root" sql novarocks-sql
   write_package "$fixture_root" tonic tonic
@@ -93,10 +95,14 @@ EOF
     'novarocks-connector-contract = { path = "../connector-contract" }'
   append_dependency "$fixture_root" physical-plan \
     'novarocks-type-contract = { path = "../type-contract" }'
+  append_dependency "$fixture_root" physical-plan \
+    'novarocks-result-contract = { path = "../result-contract" }'
   append_dependency "$fixture_root" connector-contract \
     'bytes = "=1.11.0"'
   append_dependency "$fixture_root" type-contract \
     'arrow-schema = "=58.2.0"'
+  append_dependency "$fixture_root" type-contract \
+    'novarocks-result-contract = { path = "../result-contract" }'
 
   # Another workspace member enables a feature on a shared dependency. Cargo
   # metadata's workspace resolve graph sees serde, while physical-plan's own
@@ -194,6 +200,33 @@ assert_rejected() {
 python3 "$CHECKER" --manifest-path "$REPO_ROOT/Cargo.toml" >"$tmpdir/repo-stdout"
 grep -Fq "physical-plan dependency boundary: PASS" "$tmpdir/repo-stdout"
 
+# Exercise each exact vendored identity field independently against real Cargo
+# metadata. The policy must never reduce a patched producer to a name waiver.
+python3 - "$CHECKER" "$REPO_ROOT/Cargo.toml" <<'PY'
+import copy
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("physical_boundary", sys.argv[1])
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+metadata = guard.cargo_metadata(Path(sys.argv[2]))
+for name in ("arrow-schema", "bytes"):
+    original = next(package for package in metadata["packages"]
+                    if package["name"] == name and package["source"] is None)
+    assert guard.package_identity(original) in guard.resolved_package_allow_list(guard.Graph(metadata))
+    for field, value in (
+        ("id", original["id"] + "-foreign"),
+        ("source", "git+https://example.invalid/foreign"),
+        ("version", "99.0.0"),
+        ("manifest_path", "/foreign/vendor/" + name + "/Cargo.toml"),
+    ):
+        mutated = copy.deepcopy(metadata)
+        package = next(package for package in mutated["packages"] if package["id"] == original["id"])
+        package[field] = value
+        assert guard.package_identity(package) not in guard.resolved_package_allow_list(guard.Graph(mutated)), (name, field)
+PY
+
 # The minimal legal graph proves the direct contract allow-list and the neutral
 # Connector contract's bytes carrier edge.
 baseline_root="$tmpdir/baseline"
@@ -230,6 +263,14 @@ append_dependency "$transitive_root" type-contract \
 assert_rejected "$transitive_root" \
   "resolved normal dependency closure contains forbidden application/execution owner" \
   "novarocks-execution"
+
+result_runtime_root="$(new_mutation result-runtime)"
+append_dependency "$result_runtime_root" result-contract \
+  'tonic = { path = "../tonic" }'
+assert_rejected "$result_runtime_root" \
+  "novarocks-result-contract declares normal dependencies outside its exact owner allow-list" \
+  "resolved normal dependency closure contains forbidden wire/RPC capability" \
+  "tonic"
 
 # The foundational type vocabulary cannot depend upward on Connector identity.
 reverse_contract_root="$(new_mutation reverse-contract-direction)"
