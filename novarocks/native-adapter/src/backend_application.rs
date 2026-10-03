@@ -669,7 +669,14 @@ impl BackendApplicationHost {
                 .available_positions(crate::native_transport_capacity::TransportClass::Control),
             "Prepaid original Native HTTP/2 pool stock"
         );
-        let data_runtime = data_runtime.with_transport_capacity(transport_capacity.clone());
+        let data_runtime = data_runtime
+            .with_transport_capacity(transport_capacity.clone())
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("compose original Native channel cache: {error}"),
+                )
+            })?;
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
@@ -1136,11 +1143,7 @@ mod tests {
                 .connect_lazy()
         });
         let key = crate::native_client::NativeChannelKey::membership(endpoint);
-        original
-            .channels()
-            .lock()
-            .unwrap()
-            .insert(key.clone(), channel);
+        original.channels().legacy_insert(key.clone(), channel);
         let bytes = crate::native_transport_capacity::NativeTransportCapacityFactory::allocation_capacity_bound().unwrap();
         let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
             std::num::NonZeroUsize::new(bytes).unwrap(),
@@ -1148,12 +1151,20 @@ mod tests {
         let capacity =
             crate::native_transport_capacity::NativeTransportCapacityFactory::try_new(budget)
                 .unwrap();
-        let funded = original.with_transport_capacity(capacity);
-        assert!(original.channels().lock().unwrap().contains_key(&key));
-        assert!(!funded.channels().lock().unwrap().contains_key(&key));
-        assert!(!Arc::ptr_eq(original.channels(), funded.channels()));
+        let funded = original.with_transport_capacity(capacity).unwrap();
+        assert!(original.channels().legacy_get(&key).is_some());
+        funded.block_on(async {
+            assert!(matches!(
+                funded
+                    .channels()
+                    .acquire(key.inline_identity().unwrap())
+                    .await,
+                Ok(crate::native_channel_cache::Election::Leader(_))
+            ));
+        });
+        assert!(!original.channels().same_cache(funded.channels()));
         assert!(funded.transport_capacity().is_some());
-        original.channels().lock().unwrap().remove(&key);
+        original.channels().remove(&key);
     }
 
     async fn connect_live_channel(grpc_port: u16) -> tonic::transport::Channel {

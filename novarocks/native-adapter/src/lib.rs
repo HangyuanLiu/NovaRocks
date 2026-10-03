@@ -61,7 +61,10 @@ pub mod fragment_validation;
 pub mod fragment_variant_path;
 pub mod fragment_window;
 pub mod management_http;
+mod native_channel_cache;
+mod native_channel_identity;
 pub mod native_client;
+mod native_connection_key_capacity;
 mod root_producer_pool;
 pub mod root_result_reader;
 pub mod root_result_session;
@@ -106,9 +109,8 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
 }
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_native_trust::{
@@ -118,7 +120,6 @@ use novarocks_native_trust::{
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
-use tonic::transport::Channel;
 
 /// Largest root-result payload admitted by the Native task wire.
 pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
@@ -292,7 +293,7 @@ pub struct BackendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: BackendNativeTransport,
-    channels: Arc<Mutex<HashMap<native_client::NativeChannelKey, Channel>>>,
+    channels: native_channel_cache::NativeChannelCache,
     transport_capacity: Option<native_transport_capacity::NativeTransportCapacityFactory>,
 }
 
@@ -306,7 +307,7 @@ impl BackendDataRuntime {
             handle,
             native_trust,
             native_transport,
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channels: native_channel_cache::NativeChannelCache::legacy(),
             transport_capacity: None,
         }
     }
@@ -315,14 +316,15 @@ impl BackendDataRuntime {
     pub(crate) fn with_transport_capacity(
         &self,
         capacity: native_transport_capacity::NativeTransportCapacityFactory,
-    ) -> Self {
-        Self {
+    ) -> std::io::Result<Self> {
+        let channels = native_channel_cache::NativeChannelCache::bounded(capacity.clone())?;
+        Ok(Self {
             handle: self.handle.clone(),
             native_trust: Arc::clone(&self.native_trust),
             native_transport: self.native_transport.clone(),
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channels,
             transport_capacity: Some(capacity),
-        }
+        })
     }
 
     pub(crate) fn transport_capacity(
@@ -351,9 +353,7 @@ impl BackendDataRuntime {
     pub fn native_transport(&self) -> &BackendNativeTransport {
         &self.native_transport
     }
-    pub(crate) fn channels(
-        &self,
-    ) -> &Arc<Mutex<HashMap<native_client::NativeChannelKey, Channel>>> {
+    pub(crate) fn channels(&self) -> &native_channel_cache::NativeChannelCache {
         &self.channels
     }
 }

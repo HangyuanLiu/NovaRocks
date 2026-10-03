@@ -23,6 +23,10 @@
 //! A slot is returned by the final carrier's physical exit, never by a deadline,
 //! connection completion, configuration replacement, or logical cancellation.
 
+use crate::native_channel_identity::InlineNativeChannelIdentity;
+use crate::native_connection_key_capacity::{
+    NativeConnectionKeyCapacity, NativeConnectionKeyToken,
+};
 use bytes::Bytes;
 use hyper::http::header::HeaderMapAllocationPool;
 use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
@@ -84,6 +88,8 @@ struct StockCore {
     slots: Vec<ConnectionRecord>,
     dimensions: Dimensions,
     acquisitions: [AtomicUsize; 2],
+    channel_cache_claimed: AtomicBool,
+    connection_keys: NativeConnectionKeyCapacity,
     credit: ResultWriteCredit,
     // Keep the existing issuer alive through the credit's release callback.
     _budget: Arc<ResultRetainedBudget>,
@@ -126,12 +132,14 @@ struct SlotExit {
     factory: NativeTransportCapacityFactory,
     index: usize,
     generation: u64,
+    key_token: Option<NativeConnectionKeyToken>,
 }
 
 impl Drop for SlotExit {
     fn drop(&mut self) {
         // Bytes first drops its owner and frees its complete wrapper allocation.
-        // No callbacks or waits occur here. Acquire in the next claim observes
+        // The key kernel serializes its bounded physical-exit transition.
+        // Acquire in the next stock claim observes
         // all preceding physical retirement before constructing fresh pools.
         let record = &self.factory.core().slots[self.index];
         assert_eq!(
@@ -139,6 +147,13 @@ impl Drop for SlotExit {
             self.generation,
             "exact physical connection generation"
         );
+        if let Some(token) = self.key_token {
+            self.factory
+                .core()
+                .connection_keys
+                .exit(token)
+                .expect("exact physical key generation exited once");
+        }
         record.phase.store(VACANT, Ordering::Release);
         record.claimed.store(false, Ordering::Release);
     }
@@ -150,6 +165,7 @@ struct NativeLifecycleObserver {
     factory: NativeTransportCapacityFactory,
     index: usize,
     generation: u64,
+    key_token: Option<NativeConnectionKeyToken>,
 }
 
 impl NativeLifecycleObserver {
@@ -182,12 +198,21 @@ impl h2::ConnectionLifecycleObserver for NativeLifecycleObserver {
         self.record()?
             .phase
             .compare_exchange(INITIAL_COMPLETE, LIVE, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| io::ErrorKind::ConnectionAborted.into())
+            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+        if let Some(token) = self.key_token
+            && let Err(error) = self.factory.core().connection_keys.install(token)
+        {
+            let _ = self.on_retiring();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn on_retiring(&self) -> io::Result<()> {
         self.record()?.phase.store(RETIRING, Ordering::Release);
+        if let Some(token) = self.key_token {
+            self.factory.core().connection_keys.retire(token)?;
+        }
         Ok(())
     }
 }
@@ -220,6 +245,10 @@ fn class_index(class: TransportClass) -> usize {
         TransportClass::Control => 1,
     }
 }
+
+#[cfg(test)]
+#[path = "native_key_capacity_owner_tests.rs"]
+mod key_owner_tests;
 
 fn invalid() -> io::Error {
     io::ErrorKind::InvalidInput.into()
@@ -415,6 +444,10 @@ impl Dimensions {
         stock = add(stock, slots)?;
         stock = add(
             stock,
+            NativeConnectionKeyCapacity::additional_backing_bytes()?,
+        )?;
+        stock = add(
+            stock,
             mul(
                 add(
                     dimensions.data_acquisitions,
@@ -427,6 +460,10 @@ impl Dimensions {
         // Callback retirement/observer backing belongs to that existing issuer;
         // this receipt does not claim the issuer's whole allocation graph.
         stock = add(stock, Layout::new::<Weak<ResultRetainedBudget>>().size())?;
+        stock = add(
+            stock,
+            crate::native_channel_cache::NativeChannelCache::allocation_capacity_bound()?,
+        )?;
         if stock > value(g.root_joint_retained_bytes_per_process)? {
             return Err(invalid());
         }
@@ -475,6 +512,8 @@ impl NativeTransportCapacityFactory {
                 slots,
                 dimensions,
                 acquisitions: [AtomicUsize::new(0), AtomicUsize::new(0)],
+                channel_cache_claimed: AtomicBool::new(false),
+                connection_keys: NativeConnectionKeyCapacity::new()?,
                 credit,
                 _budget: budget,
             })),
@@ -484,6 +523,23 @@ impl NativeTransportCapacityFactory {
     /// Startup bytes kept reserved through the final actual pool/carrier exit.
     pub fn reserved_bytes(&self) -> usize {
         self.core().credit.bytes()
+    }
+
+    pub(crate) fn claim_channel_cache(&self) -> io::Result<()> {
+        self.core()
+            .channel_cache_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| io::ErrorKind::WouldBlock.into())
+    }
+
+    pub(crate) fn release_channel_cache(&self) {
+        assert!(
+            self.core()
+                .channel_cache_claimed
+                .swap(false, Ordering::AcqRel),
+            "original cache backing exited once"
+        );
     }
 
     /// Checked per-position backing receipt, including its carrier wrapper.
@@ -547,7 +603,30 @@ impl NativeTransportCapacityFactory {
         ))
     }
 
-    fn claim(&self, class: TransportClass) -> io::Result<(Bytes, usize, u64)> {
+    fn claim(
+        &self,
+        class: TransportClass,
+        key: Option<InlineNativeChannelIdentity>,
+    ) -> io::Result<(Bytes, usize, u64, Option<NativeConnectionKeyToken>)> {
+        struct Rollback<'a> {
+            capacity: &'a NativeConnectionKeyCapacity,
+            token: Option<NativeConnectionKeyToken>,
+        }
+        impl Drop for Rollback<'_> {
+            fn drop(&mut self) {
+                if let Some(token) = self.token.take() {
+                    self.capacity
+                        .exit(token)
+                        .expect("unpublished key claim exits once");
+                }
+            }
+        }
+        let mut rollback = Rollback {
+            capacity: &self.core().connection_keys,
+            token: key
+                .map(|key| self.core().connection_keys.claim(key))
+                .transpose()?,
+        };
         for index in self.range(class) {
             let record = &self.core().slots[index];
             if record
@@ -568,6 +647,7 @@ impl NativeTransportCapacityFactory {
                     }
                 };
                 record.phase.store(ACQUIRING, Ordering::Release);
+                let key_token = rollback.token.take();
                 return Ok((
                     Bytes::from_owner_with_exit_guard(
                         Bytes::new(),
@@ -575,10 +655,12 @@ impl NativeTransportCapacityFactory {
                             factory: self.clone(),
                             index,
                             generation,
+                            key_token,
                         },
                     ),
                     index,
                     generation,
+                    key_token,
                 ));
             }
         }
@@ -590,14 +672,36 @@ impl NativeTransportCapacityFactory {
     /// obtains spare budget or falls back to ordinary unowned storage.
     /// Endpoint windows/adaptive mode/pending queue must be set by its caller.
     pub fn try_config(&self, class: TransportClass) -> io::Result<Http2ConnectionConfig> {
+        self.try_config_inner(class, None)
+    }
+
+    /// Every BE-origin factory invocation, including internal Tonic reconnect,
+    /// obtains its exact peer/lane position before constructing fresh pools.
+    pub(crate) fn try_config_for_key(
+        &self,
+        class: TransportClass,
+        key: InlineNativeChannelIdentity,
+    ) -> io::Result<Http2ConnectionConfig> {
+        if class != TransportClass::Data {
+            return Err(invalid());
+        }
+        self.try_config_inner(class, Some(key))
+    }
+
+    fn try_config_inner(
+        &self,
+        class: TransportClass,
+        key: Option<InlineNativeChannelIdentity>,
+    ) -> io::Result<Http2ConnectionConfig> {
         let d = self.core().dimensions;
         let acquisition_owner = self.claim_acquisition(class)?;
-        let (owner, index, generation) = self.claim(class)?;
+        let (owner, index, generation, key_token) = self.claim(class, key)?;
         let connection_lifecycle = h2::ConnectionLifecycle::new(
             NativeLifecycleObserver {
                 factory: self.clone(),
                 index,
                 generation,
+                key_token,
             },
             owner.clone(),
         )?;
@@ -830,6 +934,7 @@ mod tests {
             factory: factory.clone(),
             index,
             generation: 1,
+            key_token: None,
         };
         drop(first);
         let second = factory.try_config(TransportClass::Control).unwrap();
@@ -928,7 +1033,7 @@ mod tests {
     fn control_and_data_stock_cannot_borrow_or_fall_back() {
         let (factory, budget, bytes) = factory();
         let leases: Vec<_> = (0..518)
-            .map(|_| factory.claim(TransportClass::Data).unwrap())
+            .map(|_| factory.claim(TransportClass::Data, None).unwrap())
             .collect();
         assert_eq!(factory.available_positions(TransportClass::Data), 0);
         assert_eq!(
@@ -956,10 +1061,11 @@ mod tests {
     async fn exhausted_actual_outbound_endpoint_never_calls_connector() {
         let (factory, budget, bytes) = factory();
         let leases: Vec<_> = (0..factory.positions(TransportClass::Data))
-            .map(|_| factory.claim(TransportClass::Data).unwrap())
+            .map(|_| factory.claim(TransportClass::Data, None).unwrap())
             .collect();
         let runtime = crate::backend_test_support::test_backend_data_runtime()
-            .with_transport_capacity(factory.clone());
+            .with_transport_capacity(factory.clone())
+            .unwrap();
         let endpoint = novarocks_types::NativeEndpoint::from_host_port("127.0.0.1", 1).unwrap();
         let endpoint =
             crate::native_client::capacity_endpoint(&runtime, &endpoint, TransportClass::Data)

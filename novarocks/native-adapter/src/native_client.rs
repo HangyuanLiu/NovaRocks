@@ -43,6 +43,10 @@ const GRPC_MAX_MESSAGE_BYTES: usize =
 #[path = "native_peer_key_tests.rs"]
 mod peer_key_tests;
 
+#[cfg(test)]
+#[path = "native_peer_key_capacity_tests.rs"]
+mod peer_key_capacity_tests;
+
 type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
 
@@ -62,6 +66,15 @@ pub(crate) struct NativeChannelKey {
 }
 
 impl NativeChannelKey {
+    pub(crate) fn inline_identity(
+        &self,
+    ) -> io::Result<crate::native_channel_identity::InlineNativeChannelIdentity> {
+        crate::native_channel_identity::InlineNativeChannelIdentity::from_parts(
+            self.backend_process_id,
+            &self.endpoint,
+            self.method,
+        )
+    }
     fn new(
         backend_process_id: Option<BackendProcessId>,
         endpoint: NativeEndpoint,
@@ -270,6 +283,26 @@ pub(crate) fn capacity_endpoint(
     endpoint: &NativeEndpoint,
     class: TransportClass,
 ) -> Result<tonic::transport::Endpoint, String> {
+    capacity_endpoint_inner(runtime, endpoint, class, None)
+}
+
+pub(crate) fn capacity_endpoint_for_key(
+    runtime: &BackendDataRuntime,
+    key: &NativeChannelKey,
+    class: TransportClass,
+) -> Result<tonic::transport::Endpoint, String> {
+    let identity = key
+        .inline_identity()
+        .map_err(|error| format!("Native channel identity refused: {error}"))?;
+    capacity_endpoint_inner(runtime, &key.endpoint, class, Some(identity))
+}
+
+fn capacity_endpoint_inner(
+    runtime: &BackendDataRuntime,
+    endpoint: &NativeEndpoint,
+    class: TransportClass,
+    key: Option<crate::native_channel_identity::InlineNativeChannelIdentity>,
+) -> Result<tonic::transport::Endpoint, String> {
     let endpoint = channel_endpoint(endpoint)
         .map_err(|error| format!("invalid endpoint: {error}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)));
@@ -288,7 +321,10 @@ pub(crate) fn capacity_endpoint(
                 ))
                 .http2_max_header_list_size(profile.transport_h2_header_bytes as u32)
                 .buffer_size(profile.transport_tonic_pending_per_connection as usize)
-                .http2_connection_factory(move || factory.try_config(class)))
+                .http2_connection_factory(move || match key {
+                    Some(key) => factory.try_config_for_key(class, key),
+                    None => factory.try_config(class),
+                }))
         }
         None => Ok(endpoint
             .connect_timeout(Duration::from_secs(10))
@@ -308,15 +344,25 @@ async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
     key: NativeChannelKey,
 ) -> Result<Channel, String> {
-    if let Some(channel) = runtime
-        .channels()
-        .lock()
-        .expect("native channel cache lock")
-        .get(&key)
-        .cloned()
-    {
-        return Ok(channel);
-    }
+    let leader = if runtime.channels().is_bounded() {
+        let identity = key
+            .inline_identity()
+            .map_err(|error| format!("Native channel identity refused: {error}"))?;
+        match runtime
+            .channels()
+            .acquire(identity)
+            .await
+            .map_err(|error| format!("Native channel election refused: {error}"))?
+        {
+            crate::native_channel_cache::Election::Ready(channel) => return Ok(channel),
+            crate::native_channel_cache::Election::Leader(leader) => Some(leader),
+        }
+    } else {
+        if let Some(channel) = runtime.channels().legacy_get(&key) {
+            return Ok(channel);
+        }
+        None
+    };
     let connector = runtime
         .native_transport()
         .connector_for(key.endpoint.clone())?;
@@ -332,16 +378,17 @@ async fn get_or_create_channel(
                 })
         }
     });
-    let channel = capacity_endpoint(runtime, &key.endpoint, TransportClass::Data)?
+    let channel = capacity_endpoint_for_key(runtime, &key, TransportClass::Data)?
         .timeout(Duration::from_secs(600))
         .connect_with_connector(connector)
         .await
         .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
-    runtime
-        .channels()
-        .lock()
-        .expect("native channel cache lock")
-        .insert(key, channel.clone());
+    match leader {
+        Some(leader) => leader
+            .publish(channel.clone())
+            .map_err(|error| format!("Native channel publication refused: {error}"))?,
+        None => runtime.channels().legacy_insert(key, channel.clone()),
+    }
     Ok(channel)
 }
 

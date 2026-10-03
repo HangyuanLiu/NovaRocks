@@ -346,7 +346,8 @@ async fn actual_capacity_endpoint_clones_install_two_fresh_original_configuratio
         crate::backend_test_support::test_backend_native_trust(),
         crate::BackendNativeTransport::Plaintext,
     )
-    .with_transport_capacity(factory.clone());
+    .with_transport_capacity(factory.clone())
+    .unwrap();
     let address = NativeEndpoint::from_host_port("localhost", 9070).unwrap();
     let endpoint =
         crate::native_client::capacity_endpoint(&runtime, &address, TransportClass::Control)

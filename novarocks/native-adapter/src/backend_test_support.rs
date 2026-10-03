@@ -143,8 +143,8 @@ mod tests {
             BackendNativeTransport::Plaintext,
         );
 
-        assert!(std::sync::Arc::ptr_eq(first.channels(), clone.channels()));
-        assert!(!std::sync::Arc::ptr_eq(first.channels(), second.channels()));
+        assert!(first.channels().same_cache(clone.channels()));
+        assert!(!first.channels().same_cache(second.channels()));
     }
 
     #[test]
