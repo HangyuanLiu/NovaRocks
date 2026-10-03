@@ -95,6 +95,8 @@ mod string_replace;
 mod string_replace_owner;
 mod string_reverse;
 mod string_reverse_owner;
+mod string_sha2;
+mod string_sha2_owner;
 mod string_split_part;
 mod string_split_part_owner;
 mod string_substring;

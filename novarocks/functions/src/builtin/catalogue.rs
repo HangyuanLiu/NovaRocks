@@ -2414,6 +2414,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_append_trailing_owner::operation(name).is_some() => {
                         Some(super::string_append_trailing_owner::effects())
                     }
+                    name if super::string_sha2_owner::operation(name).is_some() => {
+                        Some(super::string_sha2_owner::effects())
+                    }
                     name if super::calendar_day_number_owner::operation(name).is_some() => {
                         Some(super::calendar_day_number_owner::effects())
                     }
@@ -2633,6 +2636,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_append_trailing_owner::operation(name).is_some() => {
                 super::string_append_trailing_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_sha2_owner::operation(name).is_some() => {
+                super::string_sha2_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_day_number_owner::operation(name).is_some() => {
                 super::calendar_day_number_owner::definition(name, declaration, resolver)?
