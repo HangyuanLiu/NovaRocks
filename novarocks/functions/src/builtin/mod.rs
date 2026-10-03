@@ -79,6 +79,8 @@ mod string_concat;
 mod string_concat_owner;
 mod string_find_in_set;
 mod string_find_in_set_owner;
+mod string_hex;
+mod string_hex_owner;
 mod string_initcap;
 mod string_initcap_owner;
 mod string_left_right;
