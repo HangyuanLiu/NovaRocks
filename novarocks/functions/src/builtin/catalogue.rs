@@ -2372,6 +2372,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_trim_owner::operation(name).is_some() => {
                         Some(super::string_trim_owner::effects())
                     }
+                    name if super::string_url_encode_owner::operation(name).is_some() => {
+                        Some(super::string_url_encode_owner::effects())
+                    }
                     name if super::string_reverse_owner::operation(name).is_some() => {
                         Some(super::string_reverse_owner::effects())
                     }
@@ -2534,6 +2537,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_trim_owner::operation(name).is_some() => {
                 super::string_trim_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_url_encode_owner::operation(name).is_some() => {
+                super::string_url_encode_owner::definition(name, declaration, resolver)?
             }
             name if super::string_reverse_owner::operation(name).is_some() => {
                 super::string_reverse_owner::definition(name, declaration, resolver)?
