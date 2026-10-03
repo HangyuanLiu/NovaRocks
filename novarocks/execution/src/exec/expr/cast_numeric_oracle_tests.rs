@@ -205,6 +205,7 @@ fn compare_legacy_rows(
                 panic!("signed cast must not raise a row error: {error:?}")
             }
             CastRowResult::Boolean(_) => panic!("signed numeric cast returned a boolean"),
+            CastRowResult::Timestamp(_) => panic!("signed numeric cast returned a timestamp"),
             CastRowResult::Unsigned(_) => {
                 panic!("signed numeric cast returned an unsigned integer")
             }

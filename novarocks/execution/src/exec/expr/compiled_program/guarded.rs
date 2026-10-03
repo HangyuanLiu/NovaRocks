@@ -1233,6 +1233,7 @@ fn evaluate_cast<'a>(
         I16(Vec<Option<i16>>),
         I32(Vec<Option<i32>>),
         I64(Vec<Option<i64>>),
+        Timestamp(Vec<Option<i64>>),
         U8(Vec<Option<u8>>),
         U16(Vec<Option<u16>>),
         U32(Vec<Option<u32>>),
@@ -1246,6 +1247,7 @@ fn evaluate_cast<'a>(
         DataType::Int16 => Output::I16(Vec::new()),
         DataType::Int32 => Output::I32(Vec::new()),
         DataType::Int64 => Output::I64(Vec::new()),
+        DataType::Timestamp(_, None) => Output::Timestamp(Vec::new()),
         DataType::UInt8 => Output::U8(Vec::new()),
         DataType::UInt16 => Output::U16(Vec::new()),
         DataType::UInt32 => Output::U32(Vec::new()),
@@ -1260,6 +1262,7 @@ fn evaluate_cast<'a>(
         Output::I16(v) => v.try_reserve_exact(selection.len()),
         Output::I32(v) => v.try_reserve_exact(selection.len()),
         Output::I64(v) => v.try_reserve_exact(selection.len()),
+        Output::Timestamp(v) => v.try_reserve_exact(selection.len()),
         Output::U8(v) => v.try_reserve_exact(selection.len()),
         Output::U16(v) => v.try_reserve_exact(selection.len()),
         Output::U32(v) => v.try_reserve_exact(selection.len()),
@@ -1307,6 +1310,7 @@ fn evaluate_cast<'a>(
                 })?))
             }
             (Output::I64(v), R::Signed(n)) => v.push(Some(n)),
+            (Output::Timestamp(v), R::Timestamp(n)) => v.push(Some(n)),
             (Output::U8(v), R::Unsigned(n)) => {
                 v.push(Some(u8::try_from(n).map_err(|_| {
                     internal("cast returned an out-of-range UInt8")
@@ -1330,6 +1334,7 @@ fn evaluate_cast<'a>(
             (Output::I16(v), R::Null) => v.push(None),
             (Output::I32(v), R::Null) => v.push(None),
             (Output::I64(v), R::Null) => v.push(None),
+            (Output::Timestamp(v), R::Null) => v.push(None),
             (Output::U8(v), R::Null) => v.push(None),
             (Output::U16(v), R::Null) => v.push(None),
             (Output::U32(v), R::Null) => v.push(None),
@@ -1352,6 +1357,25 @@ fn evaluate_cast<'a>(
         Output::I16(v) => Arc::new(Int16Array::from(v)),
         Output::I32(v) => Arc::new(Int32Array::from(v)),
         Output::I64(v) => Arc::new(Int64Array::from(v)),
+        Output::Timestamp(v) => match ty {
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {
+                Arc::new(arrow::array::TimestampSecondArray::from(v))
+            }
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None) => {
+                Arc::new(arrow::array::TimestampMillisecondArray::from(v))
+            }
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(v))
+            }
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
+                Arc::new(arrow::array::TimestampNanosecondArray::from(v))
+            }
+            _ => {
+                return Err(internal(
+                    "timestamp cast has a foreign frozen result carrier",
+                ));
+            }
+        },
         Output::U8(v) => Arc::new(arrow::array::UInt8Array::from(v)),
         Output::U16(v) => Arc::new(arrow::array::UInt16Array::from(v)),
         Output::U32(v) => Arc::new(arrow::array::UInt32Array::from(v)),

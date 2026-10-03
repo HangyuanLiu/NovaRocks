@@ -178,6 +178,9 @@ fn result_literal(
     result: &FunctionValueType,
     policy: DecimalOverflowPolicy,
 ) -> ExprId {
+    if matches!(result.data_type, DataType::Timestamp(_, None)) {
+        return literal(builder, result, LiteralValue::Timestamp(71));
+    }
     if result.data_type == DataType::Int64 {
         return literal(builder, result, LiteralValue::Int64(71));
     }
@@ -251,6 +254,7 @@ fn fixture(
                     DataType::Boolean => LiteralValue::Boolean(false),
                     DataType::Int64 => LiteralValue::Int64(0),
                     DataType::UInt64 => LiteralValue::UInt64(0),
+                    DataType::Timestamp(_, None) => LiteralValue::Timestamp(0),
                     DataType::Float64 => LiteralValue::Float64Bits(0.0_f64.to_bits()),
                     _ => {
                         panic!("nonnullable fixture requires an implemented exact numeric literal")
@@ -306,6 +310,7 @@ fn fixture(
                 DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Int64 => LiteralValue::Int64(71),
                 DataType::UInt64 => LiteralValue::UInt64(u64::MAX),
+                DataType::Timestamp(_, None) => LiteralValue::Timestamp(71),
                 DataType::Float64 => LiteralValue::Float64Bits((-0.0_f64).to_bits()),
                 _ => panic!("constant fixture requires an implemented exact numeric literal"),
             };
@@ -1054,3 +1059,7 @@ mod cast_bool_tests;
 
 #[path = "cast_unsigned_tests.rs"]
 mod cast_unsigned_tests;
+
+#[cfg(test)]
+#[path = "cast_timestamp_tests.rs"]
+mod cast_timestamp_tests;

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable selected casts for exact Physical boolean and numeric scalar domains.
+//! Immutable selected casts for exact Physical numeric and unzoned timestamp domains.
 //! The caller retains original policies and full types; this recipe performs no
 //! output allocation, registry lookup, coercion or memory admission.
 
@@ -27,10 +27,11 @@ use crate::{
 };
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_cast::cast::{cast_num_to_bool, num_cast};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     ExpressionEffectContext, ExpressionEffects, FunctionValueType, PureCompileControl,
@@ -78,7 +79,7 @@ impl fmt::Display for CastPrepareError {
             Self::Control(error) => error.fmt(f),
             Self::Kernel(error) => error.fmt(f),
             Self::Unsupported => {
-                f.write_str("cast requires an implemented exact Physical numeric domain")
+                f.write_str("cast requires an implemented exact Physical scalar domain")
             }
             Self::TypeMismatch => {
                 f.write_str("cast result violates its frozen successful-NULL contract")
@@ -163,6 +164,19 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
         DataType::UInt64 => Some((false, 64)),
         _ => None,
     };
+    if let (DataType::Timestamp(source, None), DataType::Timestamp(target, None)) = (source, target)
+    {
+        return matches!(
+            (source, target),
+            (
+                TimeUnit::Second,
+                TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+            ) | (
+                TimeUnit::Millisecond,
+                TimeUnit::Microsecond | TimeUnit::Nanosecond
+            )
+        );
+    }
     match (integer(source), integer(target)) {
         (Some((true, _)), Some((false, _))) => true,
         (Some((false, source)), Some((true, target))) => target <= source,
@@ -179,6 +193,7 @@ enum Source {
     Unsigned(UnsignedWidth),
     F32,
     F64,
+    Timestamp(TimeUnit),
 }
 impl Source {
     fn from_type(ty: &DataType) -> Option<Self> {
@@ -189,6 +204,7 @@ impl Source {
                 DataType::Boolean => Some(Self::Boolean),
                 DataType::Float32 => Some(Self::F32),
                 DataType::Float64 => Some(Self::F64),
+                DataType::Timestamp(unit, None) => Some(Self::Timestamp(*unit)),
                 _ => None,
             })
     }
@@ -199,6 +215,12 @@ impl Source {
             Self::Unsigned(width) => width.validate(array),
             Self::F32 => array.as_any().is::<Float32Array>(),
             Self::F64 => array.as_any().is::<Float64Array>(),
+            Self::Timestamp(unit) => match unit {
+                TimeUnit::Second => array.as_any().is::<TimestampSecondArray>(),
+                TimeUnit::Millisecond => array.as_any().is::<TimestampMillisecondArray>(),
+                TimeUnit::Microsecond => array.as_any().is::<TimestampMicrosecondArray>(),
+                TimeUnit::Nanosecond => array.as_any().is::<TimestampNanosecondArray>(),
+            },
         }
     }
     const fn is_float(self) -> bool {
@@ -212,6 +234,7 @@ enum Target {
     Unsigned(UnsignedWidth),
     F32,
     F64,
+    Timestamp(TimeUnit),
 }
 impl Target {
     fn from_type(ty: &DataType) -> Option<Self> {
@@ -222,6 +245,7 @@ impl Target {
                 DataType::Boolean => Some(Self::Boolean),
                 DataType::Float32 => Some(Self::F32),
                 DataType::Float64 => Some(Self::F64),
+                DataType::Timestamp(unit, None) => Some(Self::Timestamp(*unit)),
                 _ => None,
             })
     }
@@ -237,6 +261,7 @@ pub enum CastRowResult {
     Unsigned(u64),
     Float32(f32),
     Float64(f64),
+    Timestamp(i64),
     RowError(RowDataError),
 }
 
@@ -274,7 +299,12 @@ impl PreparedCastRecipe {
                 Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
             let target =
                 Target::from_type(&result.data_type).ok_or(CastPrepareError::Unsupported)?;
+            let source_timestamp = matches!(source_kind, Source::Timestamp(_));
+            let target_timestamp = matches!(target, Target::Timestamp(_));
             work.step()?;
+            if source_timestamp != target_timestamp {
+                return Err(CastPrepareError::Unsupported);
+            }
             let successful_null = carrier_cast_can_produce_null(
                 &source.data_type,
                 &result.data_type,
@@ -285,7 +315,7 @@ impl PreparedCastRecipe {
             if !valid_nullable {
                 return Err(CastPrepareError::TypeMismatch);
             }
-            // All admitted carriers are closed scalar types with no retained graph.
+            // Admitted timestamp zones are None; scalar types retain no owned graph.
             let recipe = Self {
                 operation,
                 source: source.clone(),
@@ -330,9 +360,16 @@ impl PreparedCastRecipe {
         ScopedExpressionEffects::primitive(
             context,
             ExpressionEffects {
-                may_raise_row_error: self.source_kind.is_float()
+                may_raise_row_error: (self.source_kind.is_float()
                     && matches!(self.target, Target::Signed(_) | Target::Unsigned(_))
-                    && self.allow_throw_exception,
+                    && self.allow_throw_exception)
+                    || matches!(
+                        (self.source_kind, self.target),
+                        (
+                            Source::Timestamp(TimeUnit::Microsecond),
+                            Target::Timestamp(TimeUnit::Nanosecond)
+                        )
+                    ),
                 ..ExpressionEffects::PURE_VALUE
             },
         )
@@ -355,6 +392,62 @@ impl PreparedCastRecipe {
                     Ok(CastRowResult::Null)
                 } else {
                     Err(invalid("non-null cast argument contains a selected NULL"))
+                };
+            }
+            if let Source::Timestamp(unit) = self.source_kind {
+                let Target::Timestamp(target) = self.target else {
+                    return Err(internal("timestamp cast contains a foreign frozen target"));
+                };
+                macro_rules! read_timestamp {
+                    ($array:ty) => {
+                        argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<$array>()
+                            .ok_or_else(|| {
+                                internal("cast carrier has a foreign array implementation")
+                            })?
+                            .value(row)
+                    };
+                }
+                let value = match unit {
+                    TimeUnit::Second => read_timestamp!(TimestampSecondArray),
+                    TimeUnit::Millisecond => read_timestamp!(TimestampMillisecondArray),
+                    TimeUnit::Microsecond => read_timestamp!(TimestampMicrosecondArray),
+                    TimeUnit::Nanosecond => read_timestamp!(TimestampNanosecondArray),
+                };
+                work.step()?;
+                let factor = |unit| match unit {
+                    TimeUnit::Second => 1_i64,
+                    TimeUnit::Millisecond => 1_000,
+                    TimeUnit::Microsecond => 1_000_000,
+                    TimeUnit::Nanosecond => 1_000_000_000,
+                };
+                let source_factor = factor(unit);
+                let target_factor = factor(target);
+                // This exact scalar arithmetic is the original Arrow unit conversion.
+                // Narrowing divides toward zero; it is not calendar decomposition.
+                let converted = if source_factor >= target_factor {
+                    Some(value / (source_factor / target_factor))
+                } else {
+                    value.checked_mul(target_factor / source_factor)
+                };
+                work.step()?;
+                return match converted {
+                    Some(value) => Ok(CastRowResult::Timestamp(value)),
+                    None if unit == TimeUnit::Microsecond && target == TimeUnit::Nanosecond => {
+                        work.flush()?;
+                        // Formatting and diagnostic ownership are finite opaque work.
+                        // The original special error precedes ALLOW handling.
+                        let message = format!(
+                            "CAST failed: from {:?} to {:?}: CAST timestamp microsecond->nanosecond overflow: value {} cannot be represented as nanoseconds in i64",
+                            self.source.data_type, self.result.data_type, value,
+                        );
+                        let error = RowDataError::new(ordinal, &message);
+                        work.flush()?;
+                        Ok(CastRowResult::RowError(error))
+                    }
+                    None => Ok(CastRowResult::Null),
                 };
             }
             macro_rules! convert {
@@ -387,6 +480,9 @@ impl PreparedCastRecipe {
                         }
                         Target::F32 => num_cast::<$native, f32>(source).map(CastRowResult::Float32),
                         Target::F64 => num_cast::<$native, f64>(source).map(CastRowResult::Float64),
+                        Target::Timestamp(_) => {
+                            return Err(internal("numeric cast contains a foreign frozen target"));
+                        }
                     };
                     work.step()?;
                     output.unwrap_or(CastRowResult::Null)
@@ -424,6 +520,7 @@ impl PreparedCastRecipe {
                             work.step()?;
                             return Ok(CastRowResult::Float64(value));
                         }
+                        Target::Timestamp(_) => return Err(internal("floating cast contains a foreign frozen target")),
                     };
                     work.step()?;
                     match converted {
@@ -458,6 +555,9 @@ impl PreparedCastRecipe {
                 }};
             }
             Ok(match self.source_kind {
+                Source::Timestamp(_) => {
+                    return Err(internal("timestamp cast escaped its checked operation"));
+                }
                 Source::Boolean => {
                     let value = argument
                         .array()
@@ -471,6 +571,9 @@ impl PreparedCastRecipe {
                         Target::Unsigned(_) => CastRowResult::Unsigned(u64::from(value)),
                         Target::F32 => CastRowResult::Float32(f32::from(u8::from(value))),
                         Target::F64 => CastRowResult::Float64(f64::from(u8::from(value))),
+                        Target::Timestamp(_) => {
+                            return Err(internal("boolean cast contains a foreign frozen target"));
+                        }
                     };
                     work.step()?;
                     result
@@ -587,3 +690,7 @@ mod bool_tests;
 #[cfg(test)]
 #[path = "cast_unsigned_tests.rs"]
 mod unsigned_tests;
+
+#[cfg(test)]
+#[path = "cast_timestamp_tests.rs"]
+mod timestamp_tests;
