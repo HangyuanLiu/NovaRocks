@@ -687,3 +687,125 @@ fn value_origin_real_namespace_floor_and_unique_source_scan_observe_quantum_with
         assert_eq!(trace(&control), positive[..=at]);
     }
 }
+
+#[test]
+fn value_origin_composing_preflight_keeps_provider_unique_until_admitted_emission() {
+    let control = Control::default();
+    let origin = provider(ConnectorCodecCategory::ReadColumn, &[0, 255, 1]);
+    let inputs = [(u32::MAX, original(&origin))];
+    let encoded =
+        encode_connector_payloads(&inputs, NAMESPACE_SOURCE, ns_limits(), &control).unwrap();
+    let mut meter = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let before =
+        preflight_encode_observed(&origin, &encoded, SOURCE, limits(), &mut meter).unwrap();
+    let (wire, after) = encode_observed(&origin, &encoded, SOURCE, limits(), &mut meter).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(before.allocation_requests_upper_bound, 0);
+    meter.finish().unwrap();
+
+    let decoded =
+        decode_connector_payloads(encoded.as_wire(), NAMESPACE_SOURCE, ns_limits(), &control)
+            .unwrap();
+    let payload = decoded.payload(u32::MAX).unwrap().unwrap();
+    assert!(payload.payload().is_unique());
+    let mut meter = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let before = preflight_decode_observed(&wire, &decoded, SOURCE, limits(), &mut meter).unwrap();
+    assert!(
+        payload.payload().is_unique(),
+        "preflight must not clone or promote the payload"
+    );
+    assert_eq!(before.allocation_requests_upper_bound, 1);
+    let mut refused = limits();
+    refused.max_allocation_requests = 0;
+    assert!(matches!(
+        preflight_decode_observed(&wire, &decoded, SOURCE, refused, &mut meter),
+        Err(Error::InvalidShape(_))
+    ));
+    assert!(
+        payload.payload().is_unique(),
+        "ordinary numerical refusal cannot request the clone"
+    );
+    let (actual, after) = decode_observed(&wire, &decoded, SOURCE, limits(), &mut meter).unwrap();
+    assert_eq!(actual, origin);
+    assert_eq!(before, after);
+    assert!(
+        !payload.payload().is_unique(),
+        "only emission shares the actual payload backing"
+    );
+    meter.finish().unwrap();
+
+    for (origin, expected) in nonprovider_cases() {
+        let mut encode_meter = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let before =
+            preflight_encode_observed(&origin, &encoded, SOURCE, limits(), &mut encode_meter)
+                .unwrap();
+        let (actual, after) =
+            encode_observed(&origin, &encoded, SOURCE, limits(), &mut encode_meter).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(before, after);
+        encode_meter.finish().unwrap();
+        let mut decode_meter = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let before =
+            preflight_decode_observed(&expected, &decoded, SOURCE, limits(), &mut decode_meter)
+                .unwrap();
+        let (actual, after) =
+            decode_observed(&expected, &decoded, SOURCE, limits(), &mut decode_meter).unwrap();
+        assert_eq!(actual, origin);
+        assert_eq!(before, after);
+        assert_eq!(before.allocation_requests_upper_bound, 0);
+        decode_meter.finish().unwrap();
+    }
+}
+
+#[test]
+fn value_origin_composing_original_meter_keeps_all_preflight_and_emission_control_prefixes() {
+    let origin = provider(ConnectorCodecCategory::ReadColumn, &[0, 255]);
+    let inputs = [(u32::MAX, original(&origin))];
+    every_prefix(
+        |control| {
+            let encoded =
+                encode_connector_payloads(&inputs, NAMESPACE_SOURCE, ns_limits(), control)?;
+            let mut meter = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+            let result = (|| {
+                preflight_encode_observed(&origin, &encoded, SOURCE, limits(), &mut meter)?;
+                encode_observed(&origin, &encoded, SOURCE, limits(), &mut meter).map(|_| ())
+            })();
+            finish(result, meter)
+        },
+        false,
+    );
+    let control = Control::default();
+    let encoded =
+        encode_connector_payloads(&inputs, NAMESPACE_SOURCE, ns_limits(), &control).unwrap();
+    let wire = encode_value_origin(&origin, &encoded, SOURCE, limits())
+        .unwrap()
+        .0;
+    for ordinary in [false, true] {
+        let mut input = wire;
+        if ordinary {
+            input.kind = Some(wire::value_origin::Kind::ProviderField(
+                wire::ProviderFieldOrigin {
+                    scan_node_id: Some(0),
+                    column_payload_id: Some(7),
+                },
+            ));
+        }
+        every_prefix(
+            |control| {
+                let decoded = decode_connector_payloads(
+                    encoded.as_wire(),
+                    NAMESPACE_SOURCE,
+                    ns_limits(),
+                    control,
+                )?;
+                let mut meter = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+                let result = (|| {
+                    preflight_decode_observed(&input, &decoded, SOURCE, limits(), &mut meter)?;
+                    decode_observed(&input, &decoded, SOURCE, limits(), &mut meter).map(|_| ())
+                })();
+                finish(result, meter)
+            },
+            ordinary,
+        );
+    }
+}

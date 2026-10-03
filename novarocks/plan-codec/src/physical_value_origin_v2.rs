@@ -267,10 +267,10 @@ pub fn encode_value_origin(
     limits: ValueOriginProjectionLimits,
 ) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(payloads.original_control(), CompilePhase::Encode)?;
-    let result = encode_core(source, payloads, source_retained_bytes, limits, &mut work);
+    let result = encode_observed(source, payloads, source_retained_bytes, limits, &mut work);
     finish(result, work)
 }
-fn encode_core(
+pub(crate) fn encode_observed(
     source: &physical::ValueOrigin,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
@@ -368,6 +368,19 @@ fn encode_core(
     Ok((wire::ValueOrigin { kind: Some(kind) }, facts))
 }
 
+/// The sole encoder constructs only inline DTO variants; this borrowed pass
+/// validates all source associations and returns the same numerical author
+/// without requesting storage. A composing namespace counts both passes.
+pub(crate) fn preflight_encode_observed(
+    source: &physical::ValueOrigin,
+    payloads: &EncodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValueOriginProjectionFacts, Error> {
+    encode_observed(source, payloads, source_bytes, limits, work).map(|(_, facts)| facts)
+}
+
 /// Materialize the complete typed origin with the original namespace control.
 /// ProviderField clones only the actual neutral payload selected by its ID;
 /// later Fragment validation still checks purpose, binding and references.
@@ -378,16 +391,26 @@ pub fn decode_value_origin(
     limits: ValueOriginProjectionLimits,
 ) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(payloads.original_control(), CompilePhase::Decode)?;
-    let result = decode_core(source, payloads, source_retained_bytes, limits, &mut work);
+    let result = decode_observed(source, payloads, source_retained_bytes, limits, &mut work);
     finish(result, work)
 }
-fn decode_core(
+enum DecodedOriginDecision<'a> {
+    Inline(physical::ValueOrigin),
+    Provider {
+        scan_node: physical::NodeId,
+        payload: &'a novarocks_connector_contract::ConnectorEncodedPayload,
+    },
+}
+
+// All presence, vocabulary and reference validation lives in this one
+// borrowed decision author. Only its Provider arm requires a later clone.
+fn decode_decision<'a>(
     source: &wire::ValueOrigin,
-    payloads: &DecodedConnectorPayloads<'_, '_>,
+    payloads: &'a DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
     limits: ValueOriginProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
+) -> Result<(DecodedOriginDecision<'a>, ValueOriginProjectionFacts), Error> {
     let kind = source.kind.as_ref();
     work.step()?;
     let kind = kind.ok_or_else(|| invalid("value origin kind is absent"))?;
@@ -415,17 +438,8 @@ fn decode_core(
         };
         work.step()?;
         let facts = facts(2, source_bytes, clone_bytes, bound, limits, work)?;
-        // Locked Bytes.clone may allocate one Shared for a direct promotable
-        // buffer. The sole shared request model is admitted first. Header Arc
-        // clones perform refcount operations without re-authoring names.
-        work.flush()?;
-        let column_payload = payload.clone();
-        work.flush()?;
         return Ok((
-            physical::ValueOrigin::ProviderField {
-                scan_node,
-                field: physical::ProviderColumnReference { column_payload },
-            },
+            DecodedOriginDecision::Provider { scan_node, payload },
             facts,
         ));
     }
@@ -498,6 +512,44 @@ fn decode_core(
     };
     work.step()?;
     let facts = facts(references, source_bytes, 0, bound, limits, work)?;
+    Ok((DecodedOriginDecision::Inline(origin), facts))
+}
+
+/// Validate and price the receiving origin without cloning a provider payload.
+/// The composing namespace admits all requests before invoking emission.
+pub(crate) fn preflight_decode_observed(
+    source: &wire::ValueOrigin,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValueOriginProjectionFacts, Error> {
+    decode_decision(source, payloads, source_bytes, limits, work).map(|(_, facts)| facts)
+}
+
+pub(crate) fn decode_observed(
+    source: &wire::ValueOrigin,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
+    let (decision, facts) = decode_decision(source, payloads, source_bytes, limits, work)?;
+    let origin = match decision {
+        DecodedOriginDecision::Inline(origin) => origin,
+        DecodedOriginDecision::Provider { scan_node, payload } => {
+            // Locked Bytes.clone may allocate one Shared for a promotable
+            // buffer. Both this single-origin gate and the namespace's total
+            // gate precede it. Header Arc clones only change reference counts.
+            work.flush()?;
+            let column_payload = payload.clone();
+            work.flush()?;
+            physical::ValueOrigin::ProviderField {
+                scan_node,
+                field: physical::ProviderColumnReference { column_payload },
+            }
+        }
+    };
     Ok((origin, facts))
 }
 
