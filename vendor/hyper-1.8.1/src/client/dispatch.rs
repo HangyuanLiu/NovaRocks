@@ -110,7 +110,7 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .send(Envelope(Some((val, Callback::retry(tx)))))
             .map(move |_| rx)
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
@@ -122,7 +122,7 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .send(Envelope(Some((val, Callback::no_retry(tx)))))
             .map(move |_| rx)
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
@@ -146,18 +146,32 @@ impl<T, U> UnboundedSender<T, U> {
         self.giver.is_canceled()
     }
 
-    pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
+    pub(crate) fn try_send_with_request_lease(
+        &mut self,
+        val: T,
+        lease: Option<crate::rt::ClientRequestTaskLease>,
+    ) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .send(Envelope(Some((
+                val,
+                Callback::retry(tx).with_request_lease(lease),
+            ))))
             .map(move |_| rx)
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
 
-    pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
+    pub(crate) fn send_with_request_lease(
+        &mut self,
+        val: T,
+        lease: Option<crate::rt::ClientRequestTaskLease>,
+    ) -> Result<Promise<U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .send(Envelope(Some((
+                val,
+                Callback::no_retry(tx).with_request_lease(lease),
+            ))))
             .map(move |_| rx)
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
@@ -227,16 +241,23 @@ impl<T, U> Drop for Envelope<T, U> {
     }
 }
 
-pub(crate) enum Callback<T, U> {
+enum CallbackKind<T, U> {
     #[allow(unused)]
     Retry(Option<oneshot::Sender<Result<U, TrySendError<T>>>>),
     NoRetry(Option<oneshot::Sender<Result<U, crate::Error>>>),
 }
 
+pub(crate) struct Callback<T, U> {
+    kind: CallbackKind<T, U>,
+    // Channel/callback destruction precedes this same request pair's exit.
+    #[cfg(feature = "http2")]
+    lease: Option<crate::rt::ClientRequestTaskLease>,
+}
+
 impl<T, U> Drop for Callback<T, U> {
     fn drop(&mut self) {
-        match self {
-            Callback::Retry(tx) => {
+        match &mut self.kind {
+            CallbackKind::Retry(tx) => {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(Err(TrySendError {
                         error: dispatch_gone(),
@@ -244,7 +265,7 @@ impl<T, U> Drop for Callback<T, U> {
                     }));
                 }
             }
-            Callback::NoRetry(tx) => {
+            CallbackKind::NoRetry(tx) => {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(Err(dispatch_gone()));
                 }
@@ -264,29 +285,50 @@ fn dispatch_gone() -> crate::Error {
 }
 
 impl<T, U> Callback<T, U> {
+    fn retry(tx: oneshot::Sender<Result<U, TrySendError<T>>>) -> Self {
+        Self {
+            kind: CallbackKind::Retry(Some(tx)),
+            #[cfg(feature = "http2")]
+            lease: None,
+        }
+    }
+    fn no_retry(tx: oneshot::Sender<Result<U, crate::Error>>) -> Self {
+        Self {
+            kind: CallbackKind::NoRetry(Some(tx)),
+            #[cfg(feature = "http2")]
+            lease: None,
+        }
+    }
+    #[cfg(feature = "http2")]
+    fn with_request_lease(mut self, lease: Option<crate::rt::ClientRequestTaskLease>) -> Self {
+        self.lease = lease;
+        self
+    }
+    #[cfg(feature = "http2")]
+    pub(crate) fn request_task_lease(&self) -> Option<crate::rt::ClientRequestTaskLease> {
+        self.lease.clone()
+    }
     #[cfg(feature = "http2")]
     pub(crate) fn is_canceled(&self) -> bool {
-        match *self {
-            Callback::Retry(Some(ref tx)) => tx.is_closed(),
-            Callback::NoRetry(Some(ref tx)) => tx.is_closed(),
+        match &self.kind {
+            CallbackKind::Retry(Some(tx)) => tx.is_closed(),
+            CallbackKind::NoRetry(Some(tx)) => tx.is_closed(),
             _ => unreachable!(),
         }
     }
-
     pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        match *self {
-            Callback::Retry(Some(ref mut tx)) => tx.poll_closed(cx),
-            Callback::NoRetry(Some(ref mut tx)) => tx.poll_closed(cx),
+        match &mut self.kind {
+            CallbackKind::Retry(Some(tx)) => tx.poll_closed(cx),
+            CallbackKind::NoRetry(Some(tx)) => tx.poll_closed(cx),
             _ => unreachable!(),
         }
     }
-
     pub(crate) fn send(mut self, val: Result<U, TrySendError<T>>) {
-        match self {
-            Callback::Retry(ref mut tx) => {
+        match &mut self.kind {
+            CallbackKind::Retry(tx) => {
                 let _ = tx.take().unwrap().send(val);
             }
-            Callback::NoRetry(ref mut tx) => {
+            CallbackKind::NoRetry(tx) => {
                 let _ = tx.take().unwrap().send(val.map_err(|e| e.error));
             }
         }
@@ -464,13 +506,13 @@ mod tests {
         let (tx, rx) = channel::<Custom, ()>();
         let mut tx = tx.unbound();
 
-        let _ = tx.try_send(Custom(1)).unwrap();
-        let _ = tx.try_send(Custom(2)).unwrap();
-        let _ = tx.try_send(Custom(3)).unwrap();
+        let _ = tx.try_send_with_request_lease(Custom(1), None).unwrap();
+        let _ = tx.try_send_with_request_lease(Custom(2), None).unwrap();
+        let _ = tx.try_send_with_request_lease(Custom(3), None).unwrap();
 
         drop(rx);
 
-        let _ = tx.try_send(Custom(4)).unwrap_err();
+        let _ = tx.try_send_with_request_lease(Custom(4), None).unwrap_err();
     }
 
     #[cfg(feature = "nightly")]

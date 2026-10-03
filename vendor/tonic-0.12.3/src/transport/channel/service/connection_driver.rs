@@ -18,8 +18,8 @@ use std::{
 };
 use tokio::task::JoinHandle;
 
-type DriverConnection<I> =
-    hyper::client::conn::http2::Connection<OwnedConnectionIo<I>, BoxBody, SharedExec>;
+type DriverConnection<I, E = SharedExec> =
+    hyper::client::conn::http2::Connection<OwnedConnectionIo<I>, BoxBody, E>;
 const UNBOUND: u8 = 0;
 const RESERVED: u8 = 1;
 const SPAWNED: u8 = 2;
@@ -127,7 +127,14 @@ impl OriginalConnectionDriver {
     where
         I: rt::Read + rt::Write + Unpin + Send + 'static,
     {
-        if driver_task_bound::<I>()? > self.core().task_bound {
+        self.reserve_with_executor::<I, SharedExec>()
+    }
+    pub(super) fn reserve_with_executor<I, E>(&self) -> io::Result<PreparedConnectionDriver>
+    where
+        I: rt::Read + rt::Write + Unpin + Send + 'static,
+        E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
+    {
+        if driver_task_bound::<I, E>()? > self.core().task_bound {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         self.core()
@@ -157,9 +164,10 @@ impl Drop for PreparedConnectionDriver {
     }
 }
 impl PreparedConnectionDriver {
-    pub(super) fn spawn<I>(mut self, conn: DriverConnection<I>) -> io::Result<()>
+    pub(super) fn spawn<I, E>(mut self, conn: DriverConnection<I, E>) -> io::Result<()>
     where
         I: rt::Read + rt::Write + Unpin + Send + 'static,
+        E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
     {
         let future = run_driver(conn);
         // This is the constructor used by the static query, not an erased model.
@@ -183,36 +191,43 @@ impl PreparedConnectionDriver {
         Ok(())
     }
 }
-pub(super) async fn run_driver<I>(conn: DriverConnection<I>)
+pub(super) async fn run_driver<I, E>(conn: DriverConnection<I, E>)
 where
     I: rt::Read + rt::Write + Unpin + Send + 'static,
+    E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
 {
     if let Err(error) = conn.await {
         tracing::debug!("connection task error: {:?}", error);
     }
 }
-fn driver_task_bound<I>() -> io::Result<usize>
+fn driver_task_bound<I, E>() -> io::Result<usize>
 where
     I: rt::Read + rt::Write + Unpin + Send + 'static,
+    E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
 {
-    fn query<I, F>(_: fn(DriverConnection<I>) -> F) -> io::Result<usize>
+    fn query<I, E, F>(_: fn(DriverConnection<I, E>) -> F) -> io::Result<usize>
     where
         I: rt::Read + rt::Write + Unpin + Send + 'static,
+        E: rt::bounds::Http2ClientConnExec<BoxBody, OwnedConnectionIo<I>> + Unpin + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
         tokio::runtime::Handle::task_allocation_capacity_bound::<F>()
     }
-    query(run_driver::<I>)
+    query(run_driver::<I, E>)
 }
+
 /// The closed connector outputs installed by Endpoint: direct/typed BoxedIo
 /// and the legacy timeout wrapper. This creates no future, IO or allocation.
 pub(super) fn endpoint_driver_task_bound() -> io::Result<usize> {
-    let direct = driver_task_bound::<BoxedIo>()?;
+    let direct = driver_task_bound::<BoxedIo, SharedExec>()?;
     type LegacyOutput = <hyper_timeout::TimeoutConnector<
         super::Connector<hyper_util::client::legacy::connect::HttpConnector>,
     > as tower_service::Service<http::Uri>>::Response;
-    let timeout = driver_task_bound::<LegacyOutput>()?;
-    Ok(direct.max(timeout))
+    let timeout = driver_task_bound::<LegacyOutput, SharedExec>()?;
+    type Split = super::request_task_executor::OriginalSplitClientExec;
+    let split_direct = driver_task_bound::<BoxedIo, Split>()?;
+    let split_timeout = driver_task_bound::<LegacyOutput, Split>()?;
+    Ok(direct.max(timeout).max(split_direct).max(split_timeout))
 }
 
 /// Query only the real Hyper internal client future's TaskCell and automatic
@@ -231,7 +246,8 @@ pub fn http2_protocol_task_allocation_capacity_bound() -> io::Result<usize> {
         OwnedConnectionIo<LegacyOutput>,
         BoxBody,
     >()?;
-    Ok(direct.max(timeout))
+    let split = http2_split_client_task_allocation_capacity_bounds()?;
+    Ok(direct.max(timeout).max(split.connection))
 }
 
 const PROTOCOL_PREPARED: u8 = 4;
@@ -271,7 +287,20 @@ impl OriginalHttp2ProtocolTask {
     where
         I: rt::Read + rt::Write + Unpin + Send + 'static,
     {
-        let bound = hyper::client::conn::http2::Builder::<SharedExec>::client_task_allocation_capacity_bound::<OwnedConnectionIo<I>,BoxBody>()?;
+        let bound = hyper::client::conn::http2::Builder::<SharedExec>::client_task_allocation_capacity_bound::<OwnedConnectionIo<I>, BoxBody>()?;
+        self.reserve_bound(bound)
+    }
+    pub(super) fn reserve_split<I>(&self) -> io::Result<()>
+    where
+        I: rt::Read + rt::Write + Unpin + Send + 'static,
+    {
+        let bound = hyper::client::conn::http2::Builder::<
+            super::request_task_executor::OriginalSplitClientExec,
+        >::client_task_allocation_capacity_bound::<OwnedConnectionIo<I>, BoxBody>(
+        )?;
+        self.reserve_bound(bound)
+    }
+    fn reserve_bound(&self, bound: usize) -> io::Result<()> {
         if bound > self.position.core().task_bound {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -344,4 +373,23 @@ impl OriginalHttp2ProtocolTask {
         drop(dispatch);
         Ok(())
     }
+}
+
+/// Facts for a candidate split executor over the same closed Endpoint IO set.
+/// This neither installs that executor nor funds request Pipe/Send dispatch.
+/// The Send bound includes the candidate adapter's actual executor fields.
+pub fn http2_split_client_task_allocation_capacity_bounds(
+) -> io::Result<hyper::rt::SplitClientTaskAllocationBounds> {
+    use hyper::rt::SplitClientTaskAllocationBounds;
+    type Split = super::request_task_executor::OriginalSplitClientExec;
+    type LegacyOutput = <hyper_timeout::TimeoutConnector<
+        super::Connector<hyper_util::client::legacy::connect::HttpConnector>,
+    > as tower_service::Service<http::Uri>>::Response;
+    let direct = Split::allocation_capacity_bounds::<BoxBody, OwnedConnectionIo<BoxedIo>>()?;
+    let timeout = Split::allocation_capacity_bounds::<BoxBody, OwnedConnectionIo<LegacyOutput>>()?;
+    Ok(SplitClientTaskAllocationBounds {
+        connection: direct.connection.max(timeout.connection),
+        pipe: direct.pipe.max(timeout.pipe),
+        send: direct.send.max(timeout.send),
+    })
 }

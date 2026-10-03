@@ -478,10 +478,12 @@ pin_project! {
         Pipe {
             #[pin]
             pipe: PipeMap<B>,
+            lease: Option<crate::rt::ClientRequestTaskLease>,
         },
         Send {
             #[pin]
             send_when: SendWhen<B, E>,
+            lease: Option<crate::rt::ClientRequestTaskLease>,
         },
         Task {
             #[pin]
@@ -503,8 +505,8 @@ where
         let this = self.project();
 
         match this {
-            H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
-            H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
+            H2ClientFutureProject::Pipe { pipe, .. } => pipe.poll(cx),
+            H2ClientFutureProject::Send { send_when, .. } => send_when.poll(cx),
             H2ClientFutureProject::Task { task } => task.poll(cx),
         }
     }
@@ -520,6 +522,7 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<IncomingBody>>,
+    lease: Option<crate::rt::ClientRequestTaskLease>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -598,7 +601,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T: Read + Write + Unpin,
 {
-    fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) {
+    fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) -> crate::Result<()> {
         let ping = self.ping.clone();
 
         let send_stream = if !f.is_connect {
@@ -623,9 +626,18 @@ where
                         };
                         // Clear send task
                         self.executor
-                            .execute_h2_future(H2ClientFuture::Pipe { pipe });
+                            .try_execute_h2_future(H2ClientFuture::Pipe {
+                                pipe,
+                                lease: f.lease.clone(),
+                            })
+                            .map_err(crate::Error::new_user_service)?;
                     }
                 }
+            } else {
+                // No Pipe task owns an EOS body. Destroy both unused fields
+                // before Send can finish on another thread and release the pair.
+                drop(f.body);
+                drop(f.body_tx);
             }
 
             None
@@ -633,17 +645,21 @@ where
             Some(f.body_tx)
         };
 
-        self.executor.execute_h2_future(H2ClientFuture::Send {
-            send_when: SendWhen {
-                when: ResponseFutMap {
-                    fut: f.fut,
-                    ping: Some(ping),
-                    send_stream: Some(send_stream),
-                    exec: self.executor.clone(),
+        self.executor
+            .try_execute_h2_future(H2ClientFuture::Send {
+                lease: f.lease,
+                send_when: SendWhen {
+                    when: ResponseFutMap {
+                        fut: f.fut,
+                        ping: Some(ping),
+                        send_stream: Some(send_stream),
+                        exec: self.executor.clone(),
+                    },
+                    call_back: Some(f.cb),
                 },
-                call_back: Some(f.cb),
-            },
-        });
+            })
+            .map_err(crate::Error::new_user_service)?;
+        Ok(())
     }
 }
 
@@ -752,15 +768,20 @@ where
             // If we were waiting on pending open
             // continue where we left off.
             if let Some(f) = self.fut_ctx.take() {
-                self.poll_pipe(f, cx);
+                self.poll_pipe(f, cx)?;
                 continue;
             }
 
             match self.req_rx.poll_recv(cx) {
                 Poll::Ready(Some((req, cb))) => {
-                    // check that future hasn't been canceled already
+                    // Keep the pair outside callback/body teardown, including
+                    // cancellation before the request is inspected.
+                    let lease = cb.request_task_lease();
                     if cb.is_canceled() {
                         trace!("request callback is canceled");
+                        drop(req);
+                        drop(cb);
+                        drop(lease);
                         continue;
                     }
                     let (head, body) = req.into_parts();
@@ -818,6 +839,7 @@ where
                         body_tx,
                         body,
                         cb,
+                        lease,
                     };
 
                     // Check poll_ready() again.
@@ -838,7 +860,7 @@ where
                             continue;
                         }
                     }
-                    self.poll_pipe(f, cx);
+                    self.poll_pipe(f, cx)?;
                     continue;
                 }
 

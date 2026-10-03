@@ -14,6 +14,17 @@
 //! To learn more, [check out the runtime guide](https://hyper.rs/guides/1/init/runtime/).
 
 pub mod bounds;
+#[cfg(all(feature = "client", feature = "http2"))]
+pub(crate) mod request_task;
+#[cfg(all(feature = "client", feature = "http2"))]
+mod split_client;
+#[cfg(all(feature = "client", feature = "http2"))]
+pub use self::request_task::{
+    ClientRequestAdmission, ClientRequestAdmissionProvider, ClientRequestTaskGrant,
+    ClientRequestTaskKind, ClientRequestTaskLease,
+};
+#[cfg(all(feature = "client", feature = "http2"))]
+pub use self::split_client::{SplitClientExecutor, SplitClientTaskAllocationBounds};
 mod io;
 mod timer;
 
@@ -91,6 +102,37 @@ pub trait Executor<Fut> {
     fn try_execute(&self, fut: Fut) -> std::io::Result<()> {
         self.execute(fut);
         Ok(())
+    }
+
+    /// Return a finite original request admission source. Default None retains
+    /// ordinary client dispatch. An error refuses before constructing dispatch.
+    #[cfg(all(feature = "client", feature = "http2"))]
+    fn client_request_admission(&self) -> std::io::Result<Option<ClientRequestAdmission>> {
+        Ok(None)
+    }
+
+    /// Whether this actual future executor can install a prepaid request lease.
+    /// A provider must never turn an unsupported lease into ordinary spawn.
+    #[cfg(all(feature = "client", feature = "http2"))]
+    fn supports_client_request_task_lease() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    /// Prepare this actual future's executor from the same prepaid request pair.
+    /// This must not allocate a task-owner wrapper or elect before actual spawn.
+    #[cfg(all(feature = "client", feature = "http2"))]
+    fn with_client_request_task_lease(
+        &self,
+        _kind: ClientRequestTaskKind,
+        _lease: ClientRequestTaskLease,
+    ) -> std::io::Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 
     /// Check an incoming HTTP/2 head before stream task preparation, body

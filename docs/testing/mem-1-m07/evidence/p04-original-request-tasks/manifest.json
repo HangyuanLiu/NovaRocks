@@ -1,0 +1,287 @@
+{
+  "parent": "5a3bfacfc23d5ed092123bd58b8ffacaa6bc5c0e",
+  "evidence_state": "frozen dirty candidate; checkpoint and whole M07 completion separate",
+  "focused": {
+    "native_lib": 686,
+    "related_targets": 17,
+    "related_passed": 97,
+    "new_actual_tests": 12,
+    "new_included_in_related": true,
+    "fe_native": 132
+  },
+  "negatives": {
+    "count": 6,
+    "compiled_exact_runtime_failed_101": true,
+    "byte_exact_restored": true,
+    "results": "source-negatives/summary.json"
+  },
+  "full_cargo_ci": {
+    "path": "logs/ci-full/20261003-234451",
+    "passed": 12002,
+    "ignored": 7,
+    "seconds": 516,
+    "component_passed": 11825,
+    "server_owner_passed": 173,
+    "binary_smoke_passed": 4,
+    "source_pins": "full-ci-source-pins.json",
+    "post_ci_change": "Only redundant closure in a new static query test replaced with identical associated function; product sources unchanged; focused Clippy and all3 actual target tests passed"
+  },
+  "system": {
+    "scenarios": [
+      "native-compatibility/island-drain-and-replacement",
+      "native-ingress/blocking-saturation-control",
+      "native-ingress/outer-preflight-rejection",
+      "native-ingress/partial-body-deadline",
+      "native-ingress/registry-contention-control",
+      "native-trust/automatic-dns",
+      "native-trust/pem-ip",
+      "native-trust/plaintext-ip"
+    ],
+    "cluster_size": 3,
+    "passed": 8,
+    "projection": "safe allowlist only; no effective config/JWT/key/private diagnostics",
+    "canonical_binary_equals_primary": true
+  },
+  "source_pins": "source-pins.json",
+  "standalone": {
+    "channel": "passed actual offline run",
+    "http1_only": "passed actual offline client+server check",
+    "portable_helpers": "syntax only, not re-executed"
+  },
+  "allocator_scope": "Neutral GrantArc dealloc address; final actual TaskCell construction query and real alias/credit lifetime; no blanket allocation address claim",
+  "remaining": [
+    "P04 whole transport graph",
+    "P05-P10",
+    "V1 support remains None",
+    "DNS material decision awaiting user",
+    "Linux testing manually by user",
+    "No final SQL/default system/release performance/Miri acceptance",
+    "No push/PR/archive"
+  ],
+  "logs": {
+    "20261003-234451-cargo-build.log.gz": {
+      "sha256": "b93ba840a28582d41b42e8b86599e790cc0bef373a6f4d8aafa1a26a8566af91",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-check-all-targets.log.gz": {
+      "sha256": "6343d38273b085dca70bf9fd046def7459dad1c628d447df2a8b55810fba5241",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-check-server-system-allocator.log.gz": {
+      "sha256": "75aa6036c181a22a82d2f88dcf9895a0366fa86e918d0540c80863f02e2cf2ac",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-clippy.log.gz": {
+      "sha256": "e6eb445e498af291d01809489939f36b4060ac04a366392ff84e0e79bce6b095",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-deny.log.gz": {
+      "sha256": "43a1bce5a8799fc9c26dbaf88b6dad354c319bfd6603cb2c8e6b3df66f48f609",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-fmt.log.gz": {
+      "sha256": "af1411edf6d98f2190ce8e3a334ac1c260665c99e1a0562289ebbb84440736f7",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-metadata.log.gz": {
+      "sha256": "0a078f355bab21d54203018ea5f5425778bd2a84af9ff8efce008d5ae277f886",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-test-component.log.gz": {
+      "sha256": "5c83f19ffd547c5b3c188df348d7fdc24de075a5fc379105696a37f5957b2fe8",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-test-server-owner.log.gz": {
+      "sha256": "e9273cbd33040b6fed924166c96c901d0676860b57369a7e3049c7d4210e27bc",
+      "lossless_gzip": true
+    },
+    "20261003-234451-cargo-test-server-smoke.log.gz": {
+      "sha256": "f8cb269c72e194d7a4da8526d387802542c506edd7c35d013f81d6ca2adfae95",
+      "lossless_gzip": true
+    },
+    "m07-hyper-http1-probe.log.gz": {
+      "sha256": "67c2234c76ac5e0655c28349ba3c633c6235f78d0a91142bfed0e42683d57edf",
+      "lossless_gzip": true
+    },
+    "m07-request-admission-api-check-second.log.gz": {
+      "sha256": "5322662b6b5249e3e479717148ca3422dabb6fcb5cb36e4a7566b7be0914ff42",
+      "lossless_gzip": true
+    },
+    "m07-request-admission-api-check.log.gz": {
+      "sha256": "1edfc2f6aceedfff06068addabea2500e2bd48d25bbdd7d633d2881199ca2ca1",
+      "lossless_gzip": true
+    },
+    "m07-request-channel-probe.log.gz": {
+      "sha256": "3837c517fca37cce0d68901077d5db26638ce552aca12a48718bc92f8b541270",
+      "lossless_gzip": true
+    },
+    "m07-request-dispatch-hooks-check-second.log.gz": {
+      "sha256": "afb8374b4c24226a6905a845d049f9c12c9bc18042cbd679e8b815b35c78d9d9",
+      "lossless_gzip": true
+    },
+    "m07-request-dispatch-hooks-check-third.log.gz": {
+      "sha256": "8732747212ecb4f963f03ee99118f324ed3cbfe55d5180c6a47e314f50bce843",
+      "lossless_gzip": true
+    },
+    "m07-request-dispatch-hooks-check.log.gz": {
+      "sha256": "e2fede07946535f9b76bcf0a08d45e577c5c08e9b0487fd1ee570ab47e05cbfe",
+      "lossless_gzip": true
+    },
+    "m07-request-eos-actual-first.log.gz": {
+      "sha256": "1755ae6a7b49e0f47a95b5b4f6bcf4b6112a236739df5b9926679a1be6beb398",
+      "lossless_gzip": true
+    },
+    "m07-request-eos-order-check.log.gz": {
+      "sha256": "08f4e8e1db5e18e478067b36905eab4e01b6c30b36c8eb891f91cb97ff3d5ae5",
+      "lossless_gzip": true
+    },
+    "m07-request-final-geometry-before-install.log.gz": {
+      "sha256": "0097a35a0cd97a95b1205ec2aaeea8bd2b40dd50efe7276bc1be02270579360d",
+      "lossless_gzip": true
+    },
+    "m07-request-installed-geometry.log.gz": {
+      "sha256": "c2dfd450787bec6e6322333a64695444ba22d693bf650854eb4a6fa4b75dd43d",
+      "lossless_gzip": true
+    },
+    "m07-request-native-lib-second.log.gz": {
+      "sha256": "6262d6678d177e6725830da7847145fa90efca386dec73c4e1a586a7d760dbbd",
+      "lossless_gzip": true
+    },
+    "m07-request-native-lib.log.gz": {
+      "sha256": "293340e9b9bcb2298d1dccd9221c94ec556a6d74a085fcb7ead53205ddd0d7ac",
+      "lossless_gzip": true
+    },
+    "m07-request-one-shot-check-second.log.gz": {
+      "sha256": "e4a4745fcc91e8415ad1756e081d4d8c94de368870f073ac124cac80c8d1e6c3",
+      "lossless_gzip": true
+    },
+    "m07-request-one-shot-check.log.gz": {
+      "sha256": "fb690f036e45a6bfa7a57e209467b3c8b2a5dac2f4b9703aed5006c6a472c24d",
+      "lossless_gzip": true
+    },
+    "m07-request-related-actual-first.log.gz": {
+      "sha256": "0e873eb03eeb3642d08b37bec3b8aebb18db2f054255f4a720c7d61e3e5851ca",
+      "lossless_gzip": true
+    },
+    "m07-request-response-features.log.gz": {
+      "sha256": "ba5d15513c87895c66bd2bc3a824b31a57b079855f34a5b15012855673efdd1d",
+      "lossless_gzip": true
+    },
+    "m07-request-response-final-receipt.log.gz": {
+      "sha256": "50aebb5156faf5c27072ffd91a7a1378a2d9285eb029c1ba5423968fc815fdb8",
+      "lossless_gzip": true
+    },
+    "m07-request-response-final-verify.log.gz": {
+      "sha256": "62864d45691cf57e0516f325487c3ea18ab07901d6b71e5d800e9cc6ce6cfd41",
+      "lossless_gzip": true
+    },
+    "m07-request-response-first-existing.log.gz": {
+      "sha256": "f79c97d3a5c829fdd68148c0bd957cfd03f46cf32b9c3b527c81101d8ae50ac3",
+      "lossless_gzip": true
+    },
+    "m07-request-response-negatives-driver.log.gz": {
+      "sha256": "54091abaf20cc7b734a98d8979f8250c9efae97208ebd0fad8840f9a76288630",
+      "lossless_gzip": true
+    },
+    "m07-request-response-new.log.gz": {
+      "sha256": "29c73133303787ad5643976abb4d03bab4714269ec331d2b60f31408fad2f178",
+      "lossless_gzip": true
+    },
+    "m07-request-response-pinned-final.log.gz": {
+      "sha256": "4cb1188c6ebd67b73681ccb7cf6954d08447705fc132022d91fcc25cb42a1574",
+      "lossless_gzip": true
+    },
+    "m07-request-restored-fe-native.log.gz": {
+      "sha256": "25159a774fe14782725c939707b5b421209c631e76f6235f1f3db6511a5942d3",
+      "lossless_gzip": true
+    },
+    "m07-request-restored-native-lib.log.gz": {
+      "sha256": "4a469274b8ed1f35782bc58aca6280d494308850cef64e368f5d7ef401715e76",
+      "lossless_gzip": true
+    },
+    "m07-request-restored-related.log.gz": {
+      "sha256": "e13223c7b6683bdbbcd3ba455f150c1a3d19ce5923e7b15fb82a41588782e147",
+      "lossless_gzip": true
+    },
+    "m07-request-sync-admission-check-second.log.gz": {
+      "sha256": "b40336fd53367b922cb5cbed3feaa864548abf27c0eaf975ff8de9f0b8cc55ac",
+      "lossless_gzip": true
+    },
+    "m07-request-sync-admission-check-third.log.gz": {
+      "sha256": "774d1517de2740ee7d452d7596ed46267ed17bb43789409828aecad73c24b91a",
+      "lossless_gzip": true
+    },
+    "m07-request-sync-admission-check.log.gz": {
+      "sha256": "46e2bebd0948dca120f0438b90f144e9c4a618a6e753fafb01b330c84dfe7459",
+      "lossless_gzip": true
+    },
+    "m07-request-sync-dispatch-actual-second.log.gz": {
+      "sha256": "50e8bbc494d64c54b41dec3af2235f5eabf5bb1a4082554ca9ed8457cb1cb3e7",
+      "lossless_gzip": true
+    },
+    "m07-request-sync-dispatch-actual.log.gz": {
+      "sha256": "880a5c34cb45a10ed005ea2ab3ea6904316c0b86d88eb79d526ccceedcb12a4a",
+      "lossless_gzip": true
+    },
+    "m07-request-task-actual-first.log.gz": {
+      "sha256": "8ed893ede0547ba5651252586bbc6b72223de2658031e3859e3920ba5f284362",
+      "lossless_gzip": true
+    },
+    "m07-request-task-actual-second.log.gz": {
+      "sha256": "016a863805f4a4aff36bbe6a0036d2c2f689b95936a82f40ffe7af3a6cf452b6",
+      "lossless_gzip": true
+    },
+    "m07-request-task-compat-binaries.log.gz": {
+      "sha256": "133df69dd93a3652f825b672d5ed3e375ec5e6562d91d31dfd36017cba74f605",
+      "lossless_gzip": true
+    },
+    "m07-request-task-full-ci.log.gz": {
+      "sha256": "fdad6e136e7bb039dd0d0e76d87c53b7e2f84bb678d4c0d667cceb6e2334f3d0",
+      "lossless_gzip": true
+    },
+    "m07-request-task-negatives-driver-second.log.gz": {
+      "sha256": "eb73b8a72d0ba205fa219a613648779f61c38ec8bcf7c400774526cf5a81a6a4",
+      "lossless_gzip": true
+    },
+    "m07-request-task-negatives-driver.log.gz": {
+      "sha256": "c26f59b6af022821c6df135dd8ec6a693814fd5a11f345f6aad2753be99349e6",
+      "lossless_gzip": true
+    },
+    "m07-request-test-closure-actual.log.gz": {
+      "sha256": "2350723bda0a74cf573683e50343c6a5ee66de74cfa606168326fb8f80ad367a",
+      "lossless_gzip": true
+    },
+    "m07-request-test-closure-clippy.log.gz": {
+      "sha256": "73a1b156478e8e1e771bfceb6673a8d84e3ef9b773bde20e1ee65d504e150795",
+      "lossless_gzip": true
+    },
+    "m07-request-unsupported-actual.log.gz": {
+      "sha256": "f3b81f3c6c9f5ab6c7f8518056e1e974ed956480b0d422b28ced89787474a4ce",
+      "lossless_gzip": true
+    },
+    "m07-request-unsupported-admission-check.log.gz": {
+      "sha256": "71e56e3e697f269bf1b437bcb0c4cd7dc826dead9756c837fdcc66dd677d559a",
+      "lossless_gzip": true
+    },
+    "m07-tonic-request-executor-check.log.gz": {
+      "sha256": "f31b544678827582bae7ec4d2e4f021ed952e26603484117d80185b683656bc8",
+      "lossless_gzip": true
+    },
+    "m07-tonic-request-pool-actual-first.log.gz": {
+      "sha256": "1b6858382b0eac8986af05ef363d682d69b9c0197a2e30dacb6e8a222894567e",
+      "lossless_gzip": true
+    },
+    "m07-tonic-request-pool-check.log.gz": {
+      "sha256": "6c3f1db61753ce252c5f6ba17a7ad9bc116099ce5820959e5ef3b2d01e465607",
+      "lossless_gzip": true
+    },
+    "m07-tonic-split-factory-check-second.log.gz": {
+      "sha256": "fb7bfdd72ab31d4b3e0122f4ad9855419d02ed2dff31c71399c8dbe764eef867",
+      "lossless_gzip": true
+    },
+    "m07-tonic-split-factory-check.log.gz": {
+      "sha256": "19d5aa29624d8acb9cdaf8cfecf12b841fcd4fde9529220e64ac3edf62093537",
+      "lossless_gzip": true
+    }
+  }
+}

@@ -308,7 +308,10 @@ async fn actual_same_channel_internal_reconnect_refuses_connecting_gate_before_n
         .unwrap();
     let first_exit = exits.lock().unwrap().pop_front().unwrap();
     drive(&executor, first_exit).await.unwrap();
-    assert!(executor.completed.load(Ordering::SeqCst) >= 1);
+    // Conn/Pipe/Send now use their original typed dispatcher. Only the still
+    // live Channel buffer worker belongs to this selected legacy executor.
+    assert_eq!(executor.completed.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.tasks.lock().unwrap().len(), 1);
     let refused = drive(&executor, channel.clone().oneshot(request(method)))
         .await
         .unwrap_err();

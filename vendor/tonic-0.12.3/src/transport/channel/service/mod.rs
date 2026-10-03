@@ -31,7 +31,11 @@ mod attempt_connector;
 pub(crate) use self::attempt_connector::AttemptTimeoutConnector;
 
 mod connection_driver;
+mod request_task_executor;
+mod request_task_pool;
+pub use self::request_task_pool::OriginalHttp2RequestTaskPool;
 pub use connection_driver::{
-    http2_protocol_task_allocation_capacity_bound, OriginalConnectionDriver,
+    http2_protocol_task_allocation_capacity_bound,
+    http2_split_client_task_allocation_capacity_bounds, OriginalConnectionDriver,
     OriginalHttp2ProtocolTask,
 };

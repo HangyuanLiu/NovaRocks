@@ -74,6 +74,8 @@ struct Dimensions {
     stream_task_bound: usize,
     driver_task_bound: usize,
     protocol_task_bound: usize,
+    request_pipe_task_bound: usize,
+    request_send_task_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -450,6 +452,8 @@ impl Dimensions {
             stream_task_bound: 0,
             driver_task_bound: 0,
             protocol_task_bound: 0,
+            request_pipe_task_bound: 0,
+            request_send_task_bound: 0,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -567,6 +571,17 @@ impl Dimensions {
                 streams,
                 dimensions.stream_task_bound,
             )?;
+        let split = tonic::transport::http2_split_client_task_allocation_capacity_bounds()?;
+        dimensions.request_pipe_task_bound = split.pipe;
+        dimensions.request_send_task_bound = split.send;
+        let request_tasks =
+            tonic::transport::OriginalHttp2RequestTaskPool::allocation_capacity_bound(
+                streams, split.pipe, split.send,
+            )?;
+        // Incoming and outgoing connections construct different finite pools.
+        // Prepay the larger actual pool, without lending or changing the cap.
+        // Callback, queue and body storage remains a separate composition proof.
+        let stream_tasks = stream_tasks.max(request_tasks);
         // Independently check this actual task/position/carrier subgraph
         // against the frozen bookkeeping envelope, not just the aggregate
         // connection ceiling. Other stream scaffolds still need composition.
@@ -944,6 +959,14 @@ impl NativeTransportCapacityFactory {
             self.core().dimensions.protocol_task_bound,
             config.io_owner.as_ref().ok_or_else(invalid)?.clone(),
         )?);
+        config.request_task_pool = Some(
+            tonic::transport::OriginalHttp2RequestTaskPool::with_original(
+                self.core().dimensions.streams,
+                self.core().dimensions.request_pipe_task_bound,
+                self.core().dimensions.request_send_task_bound,
+                config.io_owner.as_ref().ok_or_else(invalid)?.clone(),
+            )?,
+        );
         Ok(config)
     }
 
@@ -973,6 +996,7 @@ impl NativeTransportCapacityFactory {
         Ok((
             Http2ConnectionConfig {
                 protocol_task: None,
+                request_task_pool: None,
                 connection_driver: None,
                 acquisition_owner: Some(acquisition_owner),
                 io_owner: Some(owner.clone()),
@@ -1288,6 +1312,19 @@ mod tests {
         eprintln!(
             "Original actual Hyper connection protocol task backings bytes={}",
             d.protocol_task_bound
+        );
+        let split = tonic::transport::http2_split_client_task_allocation_capacity_bounds().unwrap();
+        eprintln!(
+            "Original split client task facts: connection={} pipe={} send={} request_pool_bytes={}",
+            split.connection,
+            split.pipe,
+            split.send,
+            tonic::transport::OriginalHttp2RequestTaskPool::allocation_capacity_bound(
+                d.streams,
+                d.request_pipe_task_bound,
+                d.request_send_task_bound
+            )
+            .unwrap()
         );
         assert_eq!((d.data_positions, d.control_positions), (518, 20));
         assert_eq!(

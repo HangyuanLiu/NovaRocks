@@ -68,6 +68,11 @@ mod h2_client {
         ) -> std::io::Result<()>;
 
         #[doc(hidden)]
+        fn client_request_admission(
+            &self,
+        ) -> std::io::Result<Option<crate::rt::ClientRequestAdmission>>;
+
+        #[doc(hidden)]
         fn execute_h2_future(&mut self, future: H2ClientFuture<B, T, Self>);
     }
 
@@ -94,6 +99,19 @@ mod h2_client {
             future: H2ClientFuture<B, T, E>,
         ) -> std::io::Result<()> {
             <E as Executor<H2ClientFuture<B, T, E>>>::try_execute(self, future)
+        }
+
+        fn client_request_admission(
+            &self,
+        ) -> std::io::Result<Option<crate::rt::ClientRequestAdmission>> {
+            let admission =
+                <E as Executor<H2ClientFuture<B, T, E>>>::client_request_admission(self)?;
+            if admission.is_some()
+                && !<E as Executor<H2ClientFuture<B, T, E>>>::supports_client_request_task_lease()
+            {
+                return Err(std::io::ErrorKind::Unsupported.into());
+            }
+            Ok(admission)
         }
 
         fn execute_h2_future(&mut self, future: H2ClientFuture<B, T, E>) {

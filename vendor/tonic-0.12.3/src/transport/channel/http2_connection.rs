@@ -17,6 +17,8 @@ pub struct Http2ConnectionConfig {
     /// One original internal HTTP/2 connection task position, separate from
     /// the live driver and later request Pipe/Send tasks. Reserved before dial.
     pub protocol_task: Option<super::OriginalHttp2ProtocolTask>,
+    /// Fresh finite original request pairs for this physical attempt.
+    pub request_task_pool: Option<super::OriginalHttp2RequestTaskPool>,
     /// One original prepaid live driver TaskCell for this physical attempt.
     /// Reserved before connector creation; clones cannot elect a second driver.
     /// None preserves the caller-selected executor and ordinary task ownership.

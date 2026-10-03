@@ -140,3 +140,30 @@ the real factory. Native outgoing factories pregrant the task and metadata
 from their existing physical stock; incoming configurations leave it None.
 Pipe/Send, Channel worker/queues, DNS/TLS/auth, shared scheduler and the complete
 connection budget remain separate.
+
+
+## Original split request task pool
+
+`Http2ConnectionConfig.request_task_pool` opts into a finite whole-request pair
+pool from the same caller-prepaid physical IO owner. Factory validation checks
+the final actual connector/executor Pipe and Send constructors before dialing.
+The pool elects its single provider before allocating that provider Arc; pool
+clones cannot create a second physical connection/provider. A fresh protocol
+position and live-driver position are required and elected separately.
+
+After Hyper's synchronous pair admission, the typed dispatcher elects each role
+before allocating its separate task-owner wrapper, then spawns the actual
+concrete future directly with Tokio's original-owner API. Missing/oversized or
+replayed leases fail without selected-executor fallback. No task handle, IO,
+Channel, Weak or provider backlink is stored in the pair/pool. Each final pair
+carrier returns its position after grant metadata and surviving TaskCells exit;
+the final pool Arc deallocates before its Vec and original carrier.
+
+The closed static driver/protocol queries include both legacy and split
+executors. Native outgoing configurations install 128 pairs; incoming
+configurations construct their independent server task pool. Startup prepays
+the larger actual pool, and separately checks it against the unchanged stream
+bookkeeping envelope. This closes only these actual Cells and their queried
+metadata/carriers. Callback/channel/queue/body/error/outer-future, Channel worker,
+DNS/TLS/auth and shared-scheduler backing still require separate composition.
+None retains the existing selected-executor path.

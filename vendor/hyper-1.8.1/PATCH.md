@@ -132,3 +132,27 @@ and the existing selected executor. Hyper remains independent of Tokio.
 This closes only the opt-in internal connection task dispatch seam. Pipe,
 Send, CONNECT, queues, protocol backing and the complete transport graph need
 separate original-owner composition and evidence.
+
+
+## Opt-in split client request task admission
+
+`SplitClientExecutor` adds an explicit concrete-future dispatcher for the actual
+ConnTask, PipeMap and SendWhen constructors. The old sealed enum executor and
+non-Send body contract remain available. `with_executor` changes the builder's
+type while preserving its settings. Static queries use the final adapter fields;
+they construct no temporary future, task, IO or allocation model.
+
+An optional caller-owned admission provider obtains a complete Pipe/Send pair
+synchronously in send_request/try_send_request, before oneshot/queue allocation,
+body inspection or HEADERS. Exhaustion returns the caller's IO error. CONNECT
+is refused before acquiring a pair in this original mode. Ordinary None keeps
+existing admission/upgrade behavior. A provider without lease-aware dispatch is
+refused at handshake before dispatch-channel allocation.
+
+The same opaque lease accompanies callbacks, the ordered response future,
+pending-open context and each actual derived dispatch. Cancellation drops the
+queued body before the pair; response receiver destruction precedes its lease.
+The caller elects each role once before task-owner allocation. Its separate
+original carrier must survive actual TaskCell deallocation and all aliases.
+Hyper attests no external provider Arc/Weak graph. Queue, callback, body, error,
+outer-future and shared-scheduler allocation backing remains separate.

@@ -23,12 +23,14 @@ use crate::rt::Timer;
 /// The sender side of an established connection.
 pub struct SendRequest<B> {
     dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody>>,
+    admission: Option<crate::rt::ClientRequestAdmission>,
 }
 
 impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> SendRequest<B> {
         SendRequest {
             dispatch: self.dispatch.clone(),
+            admission: self.admission.clone(),
         }
     }
 }
@@ -135,23 +137,37 @@ where
         &mut self,
         req: Request<B>,
     ) -> impl Future<Output = crate::Result<Response<IncomingBody>>> {
-        let sent = self.dispatch.send(req);
-
-        async move {
+        let admission = match &self.admission {
+            Some(_) if req.method() == http::Method::CONNECT => {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            }
+            Some(source) => source.try_acquire(req.method()).map(Some),
+            None => Ok(None),
+        };
+        let (sent, lease) = match admission {
+            Ok(lease) => {
+                let sent = self
+                    .dispatch
+                    .send_with_request_lease(req, lease.clone())
+                    .map_err(|_req| crate::Error::new_canceled().with("connection was not ready"));
+                (sent, lease)
+            }
+            Err(error) => {
+                // No oneshot, queue node, body inspection or HEADERS on refusal.
+                drop(req);
+                (Err(crate::Error::new_user_service(error)), None)
+            }
+        };
+        let future = async move {
             match sent {
                 Ok(rx) => match rx.await {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(err)) => Err(err),
-                    // this is definite bug if it happens, but it shouldn't happen!
+                    Ok(result) => result,
                     Err(_canceled) => panic!("dispatch dropped without returning error"),
                 },
-                Err(_req) => {
-                    debug!("connection was not ready");
-
-                    Err(crate::Error::new_canceled().with("connection was not ready"))
-                }
+                Err(error) => Err(error),
             }
-        }
+        };
+        crate::rt::request_task::OriginalClientResponseFuture::new(future, lease)
     }
 
     /// Sends a `Request` on the associated connection.
@@ -166,25 +182,42 @@ where
         &mut self,
         req: Request<B>,
     ) -> impl Future<Output = Result<Response<IncomingBody>, TrySendError<Request<B>>>> {
-        let sent = self.dispatch.try_send(req);
-        async move {
+        let admission = match &self.admission {
+            Some(_) if req.method() == http::Method::CONNECT => {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            }
+            Some(source) => source.try_acquire(req.method()).map(Some),
+            None => Ok(None),
+        };
+        let (sent, lease) = match admission {
+            Ok(lease) => {
+                let sent = self
+                    .dispatch
+                    .try_send_with_request_lease(req, lease.clone())
+                    .map_err(|req| TrySendError {
+                        error: crate::Error::new_canceled().with("connection was not ready"),
+                        message: Some(req),
+                    });
+                (sent, lease)
+            }
+            Err(error) => (
+                Err(TrySendError {
+                    error: crate::Error::new_user_service(error),
+                    message: Some(req),
+                }),
+                None,
+            ),
+        };
+        let future = async move {
             match sent {
                 Ok(rx) => match rx.await {
-                    Ok(Ok(res)) => Ok(res),
-                    Ok(Err(err)) => Err(err),
-                    // this is definite bug if it happens, but it shouldn't happen!
-                    Err(_) => panic!("dispatch dropped without returning error"),
+                    Ok(result) => result,
+                    Err(_canceled) => panic!("dispatch dropped without returning error"),
                 },
-                Err(req) => {
-                    debug!("connection was not ready");
-                    let error = crate::Error::new_canceled().with("connection was not ready");
-                    Err(TrySendError {
-                        error,
-                        message: Some(req),
-                    })
-                }
+                Err(error) => Err(error),
             }
-        }
+        };
+        crate::rt::request_task::OriginalClientResponseFuture::new(future, lease)
     }
 }
 
@@ -640,6 +673,16 @@ where
         self
     }
 
+    /// Change the executor type while preserving every connection setting.
+    /// The ordinary builder remains unchanged unless this method is invoked.
+    pub fn with_executor<NewEx>(self, executor: NewEx) -> Builder<NewEx> {
+        Builder {
+            exec: executor,
+            timer: self.timer,
+            h2_builder: self.h2_builder,
+        }
+    }
+
     /// Query the executor's allocation bound for the actual internal HTTP/2
     /// client task future. This constructs no IO, future, channel or task, and
     /// covers neither its external backing nor the separate live driver.
@@ -682,6 +725,10 @@ where
                 .exec
                 .try_take_prepared_client_task()
                 .map_err(crate::Error::new_user_service)?;
+            let admission = opts
+                .exec
+                .client_request_admission()
+                .map_err(crate::Error::new_user_service)?;
             let (tx, rx) = dispatch::channel();
             let h2 = proto::h2::client::handshake(
                 io,
@@ -695,6 +742,7 @@ where
             Ok((
                 SendRequest {
                     dispatch: tx.unbound(),
+                    admission,
                 },
                 Connection {
                     inner: (PhantomData, h2),

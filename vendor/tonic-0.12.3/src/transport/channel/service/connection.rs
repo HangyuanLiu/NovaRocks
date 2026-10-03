@@ -1,4 +1,5 @@
 use super::io::OwnedConnectionIo;
+use super::request_task_executor::{OriginalRequestTaskExecutor, OriginalSplitClientExec};
 use super::{AddOrigin, Reconnect, SharedExec, UserAgent};
 use crate::transport::channel::http2_connection::{Http2ConnectionAttempt, Http2ConnectionFactory};
 use crate::{
@@ -217,6 +218,20 @@ impl tower::Service<Request<BoxBody>> for SendRequest {
     }
 }
 
+enum LiveConnection<I>
+where
+    I: rt::Read + rt::Write + Unpin + Send + 'static,
+{
+    Legacy(hyper::client::conn::http2::Connection<OwnedConnectionIo<I>, BoxBody, SharedExec>),
+    Original(
+        hyper::client::conn::http2::Connection<
+            OwnedConnectionIo<I>,
+            BoxBody,
+            OriginalSplitClientExec,
+        >,
+    ),
+}
+
 struct MakeSendRequestService<C, R> {
     connector: C,
     executor: SharedExec,
@@ -268,6 +283,7 @@ where
         let mut acquisition_owner = None;
         let mut io_owner = None;
         let mut connection_driver = None;
+        let mut split_executor = None;
         let mut driver_lifecycle = AcquisitionLifecycle {
             lifecycle: None,
             completed: false,
@@ -285,15 +301,33 @@ where
                 acquisition_owner = config.acquisition_owner.take();
                 io_owner = config.io_owner.take();
                 connection_lifecycle.lifecycle = config.connection_lifecycle.clone();
-                if let Some(task) = config.protocol_task.take() {
-                    task.reserve::<C::Response>()?;
-                    builder.executor(self.executor.clone().with_protocol_task(task));
-                }
-                if let Some(driver) = config.connection_driver.take() {
-                    // Claim exactly once before creating the connector future.
-                    // The actual response type is checked, even for custom IO.
-                    connection_driver = Some(driver.reserve::<C::Response>()?);
+                if let Some(pool) = config.request_task_pool.take() {
+                    let protocol = config
+                        .protocol_task
+                        .take()
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+                    let driver = config
+                        .connection_driver
+                        .take()
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+                    // Single physical-attempt elections precede provider/IO growth.
+                    protocol.reserve_split::<C::Response>()?;
+                    connection_driver = Some(
+                        driver.reserve_with_executor::<C::Response, OriginalSplitClientExec>()?,
+                    );
                     driver_lifecycle.lifecycle = config.connection_lifecycle.clone();
+                    split_executor = Some(OriginalRequestTaskExecutor::new::<C::Response>(
+                        pool, protocol,
+                    )?);
+                } else {
+                    if let Some(task) = config.protocol_task.take() {
+                        task.reserve::<C::Response>()?;
+                        builder.executor(self.executor.clone().with_protocol_task(task));
+                    }
+                    if let Some(driver) = config.connection_driver.take() {
+                        connection_driver = Some(driver.reserve::<C::Response>()?);
+                        driver_lifecycle.lifecycle = config.connection_lifecycle.clone();
+                    }
                 }
                 if (acquisition_owner.is_some() || connection_lifecycle.lifecycle.is_some())
                     && config.initial_settings_timeout.is_none_or(|d| d.is_zero())
@@ -347,6 +381,7 @@ where
         // future. Cancellation before its first poll must also retire the
         // captured connector future before returning the acquisition position.
         let output_io_owner = io_owner.clone();
+        let split_legacy_executor = executor.clone();
         let io_scope = ConnectionAcquisition::new(
             async move {
                 let connecting = async move {
@@ -361,10 +396,27 @@ where
                     // The final output owns Native and Tonic IO boxes. Keep
                     // their original backing capability outside both layers.
                     let io = OwnedConnectionIo::new(io, output_io_owner);
-                    builder
-                        .handshake(io)
-                        .await
-                        .map_err(|error| -> crate::Error { error.into() })
+                    if let Some(typed) = split_executor {
+                        builder
+                            .with_executor(hyper::rt::SplitClientExecutor::new(
+                                split_legacy_executor,
+                                typed,
+                            ))
+                            .handshake(io)
+                            .await
+                            .map(|(sender, connection)| {
+                                (sender, LiveConnection::Original(connection))
+                            })
+                            .map_err(|error| -> crate::Error { error.into() })
+                    } else {
+                        builder
+                            .handshake(io)
+                            .await
+                            .map(|(sender, connection)| {
+                                (sender, LiveConnection::Legacy(connection))
+                            })
+                            .map_err(|error| -> crate::Error { error.into() })
+                    }
                 };
                 let result = match initial_settings_deadline {
                     Some(deadline) => tokio::time::timeout_at(
@@ -413,16 +465,24 @@ where
             let (send_request, conn) = acquisition.await?;
             // The ordered acquisition future has now exited and released its
             // position. The live connection retains its independent pools.
-            if let Some(driver) = connection_driver {
-                // Same concrete constructor as the static layout query; bypass
-                // both legacy type-erasure Boxes with the original task owner.
-                driver.spawn(conn)?;
-                driver_lifecycle.complete();
-            } else {
-                Executor::<BoxFuture<'static, ()>>::execute(
-                    &executor,
-                    Box::pin(super::connection_driver::run_driver(conn)) as _,
-                );
+            match conn {
+                LiveConnection::Original(conn) => {
+                    let driver = connection_driver
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+                    driver.spawn(conn)?;
+                    driver_lifecycle.complete();
+                }
+                LiveConnection::Legacy(conn) => {
+                    if let Some(driver) = connection_driver {
+                        driver.spawn(conn)?;
+                        driver_lifecycle.complete();
+                    } else {
+                        Executor::<BoxFuture<'static, ()>>::execute(
+                            &executor,
+                            Box::pin(super::connection_driver::run_driver(conn)) as _,
+                        );
+                    }
+                }
             }
             Ok(SendRequest::from(send_request))
         })
