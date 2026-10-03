@@ -1,3 +1,4 @@
+use super::io::OwnedConnectionIo;
 use super::{AddOrigin, Reconnect, SharedExec, UserAgent};
 use crate::transport::channel::http2_connection::Http2ConnectionFactory;
 use crate::{
@@ -227,6 +228,7 @@ where
         let started = std::time::Instant::now();
         let mut initial_settings_deadline = None;
         let mut acquisition_owner = None;
+        let mut io_owner = None;
         let mut connection_lifecycle = AcquisitionLifecycle {
             lifecycle: None,
             completed: false,
@@ -238,6 +240,7 @@ where
                 // any builder capabilities. Even rejected attempts retain it
                 // in the returned future until that future actually exits.
                 acquisition_owner = config.acquisition_owner.take();
+                io_owner = config.io_owner.take();
                 connection_lifecycle.lifecycle = config.connection_lifecycle.clone();
                 if (acquisition_owner.is_some() || connection_lifecycle.lifecycle.is_some())
                     && config.initial_settings_timeout.is_none_or(|d| d.is_zero())
@@ -269,14 +272,17 @@ where
             if let Err(error) = configured {
                 // No dial future or handshake is created on factory refusal.
                 return Box::pin(ConnectionAcquisition::new(
-                    async move { Err(error) },
+                    ConnectionAcquisition::new(async move { Err(error) }, io_owner),
                     acquisition_owner,
                 ));
             }
         }
         if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Box::pin(ConnectionAcquisition::new(
-                async { Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()) },
+                ConnectionAcquisition::new(
+                    async { Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()) },
+                    io_owner,
+                ),
                 acquisition_owner,
             ));
         }
@@ -286,7 +292,8 @@ where
         // Construct the ordered owner wrapper before returning the queued
         // future. Cancellation before its first poll must also retire the
         // captured connector future before returning the acquisition position.
-        let acquisition = ConnectionAcquisition::new(
+        let output_io_owner = io_owner.clone();
+        let io_scope = ConnectionAcquisition::new(
             async move {
                 let connecting = async move {
                     if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -297,6 +304,9 @@ where
                     let io = fut
                         .await
                         .map_err(|error| -> crate::Error { error.into() })?;
+                    // The final output owns Native and Tonic IO boxes. Keep
+                    // their original backing capability outside both layers.
+                    let io = OwnedConnectionIo::new(io, output_io_owner);
                     builder
                         .handshake(io)
                         .await
@@ -341,8 +351,9 @@ where
                 connection_lifecycle.complete();
                 Ok(result)
             },
-            acquisition_owner,
+            io_owner,
         );
+        let acquisition = ConnectionAcquisition::new(io_scope, acquisition_owner);
 
         Box::pin(async move {
             let (send_request, conn) = acquisition.await?;

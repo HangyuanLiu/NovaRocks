@@ -531,6 +531,8 @@ where
                     None => None,
                 };
                 let acquisition_owner = capacity.as_mut().and_then(|config| config.acquisition_owner.take());
+                let io_owner = capacity.as_mut().and_then(|config| config.io_owner.take());
+                let io_owner_for_stream = io_owner.clone();
                 let app = app.clone();
                 let incoming = incoming.clone();
                 let on_transport_handshake_failure = Arc::clone(&on_transport_handshake_failure);
@@ -542,11 +544,15 @@ where
                 // cancellation must drop its captured socket/future before
                 // returning the original acquisition position too.
                 let acquisition = tonic::transport::ConnectionAcquisition::new(async move {
-                    let bootstrap = async move {
+                    // Retain the original IO grant outside the captured future:
+                    // even cancellation before first poll destroys the socket
+                    // and any concrete IO Box before returning that grant.
+                    let bootstrap = tonic::transport::ConnectionAcquisition::new(async move {
                         if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                             return Err("Native acquisition deadline elapsed before first poll".to_owned());
                         }
                         let stream = incoming.accept(stream).await.map_err(|error| format!("{error:?}"))?;
+                        let stream = novarocks_native_trust::OwnedNativeIo::new(stream, io_owner_for_stream);
                         if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                             drop(stream);
                             return Err("Native acquisition deadline elapsed during TLS".to_owned());
@@ -599,7 +605,7 @@ where
                             lifecycle.release_acquisition_owner().map_err(|error| format!("Native acquisition owner refused release: {error}"))?;
                         }
                         Ok(AcquiredConnection::Installed(connection, capacity))
-                    };
+                    }, io_owner);
                     match initial_settings_deadline {
                         Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), bootstrap)
                             .await.map_err(|_| "Native TCP/TLS/HTTP2 initial settings deadline elapsed".to_owned())?,

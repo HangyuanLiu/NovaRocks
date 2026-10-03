@@ -27,7 +27,10 @@ mod deployment;
 mod error;
 mod transport;
 
-pub use adapter::{BoxedNativeIo, NativeEndpointConnector, NativeIncomingAdapter, NativeIo};
+pub use adapter::{
+    BoxedNativeIo, NativeEndpointConnector, NativeIncomingAdapter, NativeIo, NativeIoDirection,
+    OwnedNativeIo, native_io_box_layout,
+};
 pub use auth::{
     AuthenticatedNativeCaller, ManualClock, NativeCallerSubject, NativeClientAuthInterceptor,
     NativeListenerAuthLayer, NativeListenerAuthService, NativeServerAdmission, NativeTrust,

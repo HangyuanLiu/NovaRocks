@@ -24,6 +24,12 @@ pub struct Http2ConnectionConfig {
     /// success releases it before spawning the live connection task. This
     /// carrier does not fund the enclosing future, TLS or socket allocations.
     pub acquisition_owner: Option<bytes::Bytes>,
+    /// Original backing capability for the final connector output's owned IO
+    /// boxes. Held before connector creation and through actual IO destruction
+    /// and box deallocation, including error, cancellation and destructor panic.
+    /// The inline wrapper allocates nothing. TLS internals, socket registration,
+    /// enclosing futures and tasks require their own construction/exit proofs.
+    pub io_owner: Option<bytes::Bytes>,
     /// Original physical lifecycle shared with the real h2 connection. Initial
     /// SETTINGS and the caller's final acquisition verdict are separate events.
     /// Requires a positive acquisition timeout. None preserves legacy behavior.

@@ -3,6 +3,7 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use std::{
+    alloc::Layout,
     fmt,
     future::Future,
     io,
@@ -11,11 +12,12 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use hyper_util::rt::TokioIo;
 use novarocks_types::NativeEndpoint;
 use rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -29,6 +31,118 @@ use crate::{AutomaticTlsMaterial, NativeTlsMaterial, NativeTransportMode, Native
 pub trait NativeIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> NativeIo for T {}
 pub type BoxedNativeIo = Box<dyn NativeIo>;
+
+/// The concrete Native transport Box produced by the connector or acceptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeIoDirection {
+    Client,
+    Server,
+}
+
+/// Requested layout of the actual concrete Native transport Box.
+///
+/// Obtain original capacity before calling the connector or acceptor that
+/// constructs this Box. Automatic and PEM transports have the same Rust
+/// layout. This covers only the outer concrete Box: socket/runtime state,
+/// TLS configuration, cryptographic buffers and enclosing futures are separate.
+pub fn native_io_box_layout(mode: NativeTransportMode, direction: NativeIoDirection) -> Layout {
+    match (mode, direction) {
+        (NativeTransportMode::Disabled, _) => Layout::new::<TcpStream>(),
+        (NativeTransportMode::Automatic | NativeTransportMode::Pem, NativeIoDirection::Client) => {
+            Layout::new::<tokio_rustls::client::TlsStream<TcpStream>>()
+        }
+        (NativeTransportMode::Automatic | NativeTransportMode::Pem, NativeIoDirection::Server) => {
+            Layout::new::<tokio_rustls::server::TlsStream<TcpStream>>()
+        }
+    }
+}
+
+/// Native IO and the caller's original capacity for its actual concrete Box.
+///
+/// The wrapper allocates nothing. Its optional owner is retained until the
+/// boxed transport has been destroyed and its Box allocation has exited,
+/// including when the transport destructor unwinds. The original owner must
+/// already cover that concrete layout and its own carrier before allocation;
+/// retaining an unrelated Bytes value does not establish this funding proof.
+/// There is deliberately no IO or owner extraction API.
+pub struct OwnedNativeIo {
+    io: Option<BoxedNativeIo>,
+    owner: Option<Bytes>,
+}
+
+impl OwnedNativeIo {
+    pub fn new(io: BoxedNativeIo, owner: Option<Bytes>) -> Self {
+        Self {
+            io: Some(io),
+            owner,
+        }
+    }
+
+    fn io_mut(&mut self) -> &mut (dyn NativeIo + 'static) {
+        self.io.as_deref_mut().expect("owned Native IO is live")
+    }
+}
+
+impl fmt::Debug for OwnedNativeIo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedNativeIo")
+            .field("has_original_owner", &self.owner.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OwnedNativeIo {
+    fn drop(&mut self) {
+        // A local owner unwinds after drop(io), even if the boxed destructor
+        // panics. Box drop glue deallocates its backing during that unwind.
+        let owner = self.owner.take();
+        drop(self.io.take());
+        drop(owner);
+    }
+}
+
+impl AsyncRead for OwnedNativeIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().io_mut()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for OwnedNativeIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().io_mut()).poll_write(cx, bytes)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().io_mut()).poll_write_vectored(cx, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io
+            .as_deref()
+            .expect("owned Native IO is live")
+            .is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().io_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().io_mut()).poll_shutdown(cx)
+    }
+}
 
 #[derive(Clone)]
 pub struct NativeEndpointConnector {

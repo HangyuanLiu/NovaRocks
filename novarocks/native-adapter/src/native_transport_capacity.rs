@@ -17,7 +17,7 @@
 
 //! Startup-prepaid original HTTP/2 backing stock for a BE process.
 //!
-//! These explicit workspace caps do not advertise V1 support. Socket/TLS,
+//! These explicit workspace caps do not advertise V1 support. Socket registration/TLS internals,
 //! stream/task/queue scaffolds, the caller's enclosing factory closure, and
 //! independent request/body/message owners still require composition proofs.
 //! A slot is returned by the final carrier's physical exit, never by a deadline,
@@ -421,6 +421,35 @@ impl Dimensions {
             bound,
             h2::ConnectionLifecycle::allocation_capacity_bound::<NativeLifecycleObserver>()?,
         )?;
+        // Prepay the concrete Native IO Box before TCP/TLS can construct it.
+        // Both directions and all installed profiles share this stock, so its
+        // maximum covers the actual concrete types, not the trait-object handle.
+        // Rustls's private buffers and Tokio socket registration remain separate.
+        let native_io_box = [
+            novarocks_native_trust::NativeTransportMode::Disabled,
+            novarocks_native_trust::NativeTransportMode::Automatic,
+            novarocks_native_trust::NativeTransportMode::Pem,
+        ]
+        .into_iter()
+        .flat_map(|mode| {
+            [
+                novarocks_native_trust::NativeIoDirection::Client,
+                novarocks_native_trust::NativeIoDirection::Server,
+            ]
+            .into_iter()
+            .map(move |direction| {
+                novarocks_native_trust::native_io_box_layout(mode, direction).size()
+            })
+        })
+        .max()
+        .expect("closed Native IO profile set");
+        bound = add(bound, native_io_box)?;
+        // Tonic's Connector additionally Boxes this exact Native connector
+        // response. Its outer IO guard must cover this Box's actual dealloc.
+        bound = add(
+            bound,
+            Layout::new::<hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>>().size(),
+        )?;
         let stream_extra = add(
             add(
                 value(g.transport_stream_bookkeeping_bytes)?,
@@ -707,6 +736,7 @@ impl NativeTransportCapacityFactory {
         )?;
         Ok(Http2ConnectionConfig {
             acquisition_owner: Some(acquisition_owner),
+            io_owner: Some(owner.clone()),
             connection_lifecycle: Some(connection_lifecycle),
             stream_store_buffer: Some(h2::StreamStoreBuffer::new(
                 d.streams,
@@ -770,7 +800,8 @@ pub fn configure_server<E>(
 ) -> io::Result<()> {
     let d = Dimensions::frozen()?;
     let g = NativeResultSupportGeometry::V1;
-    if config.connection_lifecycle.is_none()
+    if config.io_owner.is_none()
+        || config.connection_lifecycle.is_none()
         || config.acquisition_owner.is_none()
         || config.max_frame_size != Some(d.frame as u32)
         || config.initial_settings_timeout
@@ -1175,6 +1206,42 @@ mod tests {
             )
             .unwrap();
         drop(second);
+        drop(factory);
+        released(&budget, bytes);
+    }
+
+    #[test]
+    fn original_io_alias_holds_physical_position_until_its_last_exit() {
+        let (factory, budget, bytes) = factory();
+        let mut config = factory.try_config(TransportClass::Data).unwrap();
+        let owner = config.io_owner.take().unwrap();
+        let alias = owner.clone();
+        drop(config);
+        drop(owner);
+        assert_eq!(factory.available_positions(TransportClass::Data), 517);
+        drop(alias);
+        assert_eq!(factory.available_positions(TransportClass::Data), 518);
+        drop(factory);
+        released(&budget, bytes);
+    }
+
+    #[test]
+    fn server_configuration_rejects_missing_original_io_before_mutation() {
+        let (factory, budget, bytes) = factory();
+        let mut config = factory.try_config(TransportClass::Data).unwrap();
+        let mut builder =
+            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let owner = config.io_owner.take().unwrap();
+        assert_eq!(
+            configure_server(&mut builder, &config).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        config.io_owner = Some(owner);
+        configure_server(&mut builder, &config).unwrap();
+        drop(config);
+        assert_eq!(factory.available_positions(TransportClass::Data), 517);
+        drop(builder);
+        assert_eq!(factory.available_positions(TransportClass::Data), 518);
         drop(factory);
         released(&budget, bytes);
     }
