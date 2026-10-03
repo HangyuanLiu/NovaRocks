@@ -1147,6 +1147,31 @@ impl BuiltinScalarResolver {
             resolved.argument_types[0] = value_type.clone();
             resolved.return_type = value_type.clone();
         }
+        if self.function_id.as_str() == "builtin.scalar/cardinality/v1" {
+            let ([FunctionArgument::Value { value_type, .. }], [target]) =
+                (request.arguments, resolved.argument_types.as_mut_slice())
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            // Each sole List/Map signature has independent unconstrained child
+            // variables. Counting offsets needs no conversion of those values.
+            // Preserve the actual fields and sorted-map fact instead of adding
+            // a nested cast merely to regenerate TypeSpec's field template.
+            let same_container = value_type.logical_type == ValueLogicalType::Physical
+                && target.logical_type == ValueLogicalType::Physical
+                && matches!(
+                    (&value_type.data_type, &target.data_type),
+                    (DataType::List(_), DataType::List(_))
+                        | (DataType::Map(_, _), DataType::Map(_, _))
+                );
+            work.step()?;
+            if same_container {
+                // These two root DataType variants clone one FieldRef Arc;
+                // they do not clone the nested field/metadata tree.
+                *target = value_type.clone();
+                work.step()?;
+            }
+        }
         resolved.return_type.nullable =
             scalar_result_nullable(&self.canonical_name, request, work)?;
         binding_control::value_type(&resolved.return_type, work)?;
@@ -2438,6 +2463,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::makedate_owner::operation(name).is_some() => {
                         Some(super::makedate_owner::effects())
                     }
+                    name if super::collection_cardinality_owner::operation(name).is_some() => {
+                        Some(super::collection_cardinality_owner::effects())
+                    }
                     name if super::calendar_period_diff_owner::operation(name).is_some() => {
                         Some(super::calendar_period_diff_owner::effects())
                     }
@@ -2678,6 +2706,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::makedate_owner::operation(name).is_some() => {
                 super::makedate_owner::definition(name, declaration, resolver)?
+            }
+            name if super::collection_cardinality_owner::operation(name).is_some() => {
+                super::collection_cardinality_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_period_diff_owner::operation(name).is_some() => {
                 super::calendar_period_diff_owner::definition(name, declaration, resolver)?
