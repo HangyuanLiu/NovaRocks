@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields};
 
+use crate::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 use crate::predicate::{is_integer, is_largeint};
 
 fn wider_decimal_type(
@@ -54,7 +55,8 @@ fn wider_decimal_type(
 ///
 /// So a nested field keeps only what the type says: a list's element is
 /// `item`, a map's entries are `entries` of `key` and `value`, struct fields
-/// keep the names the statement gave them, and none of them carries metadata.
+/// keep the names the statement gave them, and only logical identity metadata
+/// survives.
 /// What each field admits is left exactly as it was: nullability is a fact
 /// about the values, not decoration.
 pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
@@ -100,13 +102,18 @@ pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
                 return data_type.clone();
             }
             DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(Fields::from(vec![
-                        field("key", &fields[0]),
-                        field("value", &fields[1]),
-                    ])),
-                    entries.is_nullable(),
+                Arc::new(with_invalid_container_marker(
+                    Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            field("key", &fields[0]),
+                            field("value", &fields[1]),
+                        ])),
+                        entries.is_nullable(),
+                    ),
+                    entries
+                        .metadata()
+                        .contains_key(crate::logical::NR_LOGICAL_TYPE_KEY),
                 )),
                 *sorted,
             )
@@ -125,13 +132,9 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
             DataType::FixedSizeBinary(crate::largeint::LARGEINT_BYTE_WIDTH)
         }
-        (DataType::List(left_field), DataType::List(right_field)) => {
-            DataType::List(Arc::new(Field::new(
-                left_field.name(),
-                wider_type(left_field.data_type(), right_field.data_type()),
-                left_field.is_nullable() || right_field.is_nullable(),
-            )))
-        }
+        (DataType::List(left_field), DataType::List(right_field)) => DataType::List(
+            wider_nested_field(left_field.name(), left_field, right_field),
+        ),
         (DataType::Map(left_entries, _), DataType::Map(right_entries, _)) => {
             wider_map_type(left_entries, right_entries)
         }
@@ -146,11 +149,7 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
                     .iter()
                     .zip(right_fields.iter())
                     .map(|(left_field, right_field)| {
-                        Arc::new(Field::new(
-                            left_field.name(),
-                            wider_type(left_field.data_type(), right_field.data_type()),
-                            left_field.is_nullable() || right_field.is_nullable(),
-                        ))
+                        wider_nested_field(left_field.name(), left_field, right_field)
                     })
                     .collect::<Vec<_>>(),
             ))
@@ -221,6 +220,68 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
     }
 }
 
+fn logical_storage_matches(logical: LogicalType, storage: &DataType) -> bool {
+    match logical {
+        LogicalType::Json => matches!(storage, DataType::Utf8 | DataType::LargeUtf8),
+        LogicalType::Hll | LogicalType::Bitmap | LogicalType::Object | LogicalType::Percentile => {
+            matches!(storage, DataType::Binary | DataType::LargeBinary)
+        }
+    }
+}
+
+fn compatible_field_logical_type(field: &Field) -> Option<LogicalType> {
+    logical_type_of_field(field)
+        .filter(|logical| logical_storage_matches(*logical, field.data_type()))
+}
+
+/// Rebuilding a nested common type preserves a shared semantic domain, not a
+/// provider's decoration. A physical Null contributes no conflicting domain.
+fn wider_nested_field(name: &str, left: &Field, right: &Field) -> Arc<Field> {
+    let data_type = wider_type(left.data_type(), right.data_type());
+    let logical = match (left.data_type(), right.data_type()) {
+        (DataType::Null, _) => compatible_field_logical_type(right),
+        (_, DataType::Null) => compatible_field_logical_type(left),
+        _ => {
+            let left = compatible_field_logical_type(left);
+            let right = compatible_field_logical_type(right);
+            left.filter(|logical| right == Some(*logical))
+        }
+    }
+    .filter(|logical| logical_storage_matches(*logical, &data_type));
+    // Keep an invalid source fact visible to the exact type owner. Removing
+    // it would turn an unsupported declaration into an ordinary string, or
+    // turn conflicting LargeBinary opaque bytes into Native Variant.
+    let invalid_source = [left, right].iter().any(|field| {
+        !matches!(field.data_type(), DataType::Null)
+            && field
+                .metadata()
+                .contains_key(crate::logical::NR_LOGICAL_TYPE_KEY)
+            && compatible_field_logical_type(field).is_none()
+    });
+    let erased_opaque = matches!(data_type, DataType::LargeBinary)
+        && logical.is_none()
+        && [left, right]
+            .iter()
+            .any(|field| compatible_field_logical_type(field).is_some());
+    let field = Field::new(name, data_type, left.is_nullable() || right.is_nullable());
+    if invalid_source || erased_opaque {
+        // This is a rejection witness, not a new admitted logical type.
+        return Arc::new(
+            field.with_metadata(
+                [(
+                    crate::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "invalid".to_owned(),
+                )]
+                .into(),
+            ),
+        );
+    }
+    Arc::new(match logical {
+        Some(logical) => field_with_logical_type(field, logical),
+        None => field,
+    })
+}
+
 fn wider_struct_fields_by_name(left_fields: &Fields, right_fields: &Fields) -> Option<Fields> {
     let right_by_name = right_fields
         .iter()
@@ -237,11 +298,11 @@ fn wider_struct_fields_by_name(left_fields: &Fields, right_fields: &Fields) -> O
             .iter()
             .map(|left_field| {
                 let right_field = right_by_name.get(left_field.name().as_str())?;
-                Some(Arc::new(Field::new(
+                Some(wider_nested_field(
                     left_field.name(),
-                    wider_type(left_field.data_type(), right_field.data_type()),
-                    left_field.is_nullable() || right_field.is_nullable(),
-                )))
+                    left_field,
+                    right_field,
+                ))
             })
             .collect::<Option<Vec<_>>>()?,
     ))
@@ -258,30 +319,43 @@ fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
         return DataType::Map(Arc::new(left_entries.clone()), false);
     }
 
-    let key_type = wider_type(left_fields[0].data_type(), right_fields[0].data_type());
-    let value_type = wider_type(left_fields[1].data_type(), right_fields[1].data_type());
     DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new(
-                        "key",
-                        key_type,
-                        left_fields[0].is_nullable() || right_fields[0].is_nullable(),
-                    )),
-                    Arc::new(Field::new(
-                        "value",
-                        value_type,
-                        left_fields[1].is_nullable() || right_fields[1].is_nullable(),
-                    )),
-                ]
-                .into(),
+        Arc::new(with_invalid_container_marker(
+            Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        wider_nested_field("key", &left_fields[0], &right_fields[0]),
+                        wider_nested_field("value", &left_fields[1], &right_fields[1]),
+                    ]
+                    .into(),
+                ),
+                false,
             ),
-            false,
+            [left_entries, right_entries].iter().any(|field| {
+                field
+                    .metadata()
+                    .contains_key(crate::logical::NR_LOGICAL_TYPE_KEY)
+            }),
         )),
         false,
     )
+}
+
+fn with_invalid_container_marker(field: Field, has_marker: bool) -> Field {
+    // The Map entries container cannot own any scalar logical domain. Keep a
+    // bounded rejection witness through normalization instead of erasing it.
+    if has_marker {
+        field.with_metadata(
+            [(
+                crate::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
+                "invalid".to_owned(),
+            )]
+            .into(),
+        )
+    } else {
+        field
+    }
 }
 
 /// Common decimal type for a decimal-vs-decimal comparison / equi-join key.

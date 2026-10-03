@@ -990,12 +990,26 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
                     contract.output()
             {
                 match result.fields.as_ref() {
-                    [field] if novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                    [field] if result.scalar_schema.as_ref().is_some_and(|frozen| frozen.field() == schema.field()) && field.domain.matches_scalar(&schema.field().value_type) && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
                         schema.field(), &field.ty.data_type, field.ty.nullable
                     ) => {}
                     _ => errors.push(ValidationError::new(
                         "result_port.scalar_schema", "scalar schema differs from the sole ordered root occurrence"
                     )),
+                }
+            }
+            if let Some(schema) = &result.scalar_schema {
+                let consistent = match result.fields.as_ref() {
+                    [field] => field.domain.matches_scalar(&schema.field().value_type)
+                        && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                            schema.field(), &field.ty.data_type, field.ty.nullable),
+                    _ => false,
+                };
+                if !consistent {
+                    errors.push(ValidationError::new(
+                        "result_port.scalar_schema",
+                        "compiler scalar identity differs from the final result carrier",
+                    ));
                 }
             }
             if result.fields.len() != result.output.columns.len() {
@@ -1011,6 +1025,12 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
                     errors.push(ValidationError::new(
                         "result_port.fields",
                         format!("result value differs at ordinal {ordinal}"),
+                    ));
+                }
+                if !field.domain.matches_storage(&field.ty.data_type) {
+                    errors.push(ValidationError::new(
+                        "result_port.fields",
+                        format!("result logical domain differs from storage at ordinal {ordinal}"),
                     ));
                 }
                 if field.name.is_empty() {

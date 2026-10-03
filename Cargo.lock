@@ -4295,6 +4295,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-parser",
  "novarocks-physical-plan",
+ "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-type-contract",
  "novarocks-types",

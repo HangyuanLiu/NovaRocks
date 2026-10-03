@@ -4717,9 +4717,11 @@ mod tests {
         plan.add_fragment(deep_fragment)
             .expect("deep fragment in plan");
         plan.set_result_port(novarocks_physical_plan::ResultPort {
+            scalar_schema: None,
             fragment: fragment_id,
             output,
             fields: Box::from([novarocks_physical_plan::ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "one".into(),
                 alias: None,
                 value,

@@ -1757,6 +1757,20 @@ impl SqlCompletedPlan {
         &self.display_annotations
     }
 
+    /// Project the one exact typed result after optimization and root lowering.
+    /// Slot identity is bound later by the sole Native layout; this method
+    /// neither admits a child execution nor funds a collector.
+    pub fn scalar_schema(
+        &self,
+    ) -> Result<novarocks_result_contract::ScalarSchema, SqlCompileError> {
+        let result = self.plan.result_port().ok_or_else(|| {
+            SqlCompileError::InvalidRequest("scalar execution has no result port".into())
+        })?;
+        result.scalar_schema.clone().ok_or_else(|| SqlCompileError::InvalidRequest(
+            "scalar output requires one column with exact semantic facts inside its admitted type profile".into()
+        ))
+    }
+
     pub fn into_plan(self) -> novarocks_physical_plan::PhysicalPlan {
         self.plan
     }
@@ -3683,12 +3697,14 @@ mod tests {
         let mut plan = PlanBuilder::new(version);
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: FragmentId::new(1),
             output: OutputPort {
                 node,
                 columns: Box::from([output]),
             },
             fields: Box::from([ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "one".into(),
                 alias: None,
                 value: output,

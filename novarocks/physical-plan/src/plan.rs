@@ -98,8 +98,52 @@ pub struct OutputPort {
     pub columns: Box<[ValueId]>,
 }
 
+/// Proven identity of one physically ambiguous result value. `Plain` says
+/// that the result is the ordinary storage type, never an inferred JSON or
+/// opaque value. SQL freezes this fact from the resolved value owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultValueDomain {
+    Plain,
+    Json,
+    Variant,
+    Hll,
+    Bitmap,
+    Object,
+    Percentile,
+}
+
+impl ResultValueDomain {
+    pub fn matches_storage(self, data_type: &arrow_schema::DataType) -> bool {
+        use arrow_schema::DataType as D;
+        match self {
+            Self::Plain => true,
+            Self::Json => matches!(data_type, D::Utf8 | D::LargeUtf8),
+            Self::Variant => matches!(data_type, D::LargeBinary),
+            Self::Hll | Self::Bitmap | Self::Object | Self::Percentile => {
+                matches!(data_type, D::Binary | D::LargeBinary)
+            }
+        }
+    }
+
+    pub fn matches_scalar(self, value_type: &novarocks_result_contract::ScalarValueType) -> bool {
+        use novarocks_result_contract::{ScalarOpaqueType as O, ScalarValueType as S};
+        match (self, value_type) {
+            (Self::Json, S::Json)
+            | (Self::Variant, S::Variant)
+            | (Self::Hll, S::Opaque(O::Hll))
+            | (Self::Bitmap, S::Opaque(O::Bitmap))
+            | (Self::Object, S::Opaque(O::Object))
+            | (Self::Percentile, S::Opaque(O::Percentile)) => true,
+            (Self::Plain, S::Json | S::Variant | S::Opaque(_)) => false,
+            (Self::Plain, _) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResultField {
+    pub domain: ResultValueDomain,
     pub name: Box<str>,
     pub alias: Option<Box<str>>,
     pub value: ValueId,
@@ -108,6 +152,10 @@ pub struct ResultField {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResultPort {
+    /// Exact one-column scalar projection, when the SQL owner has proved the
+    /// complete declared identity against the final root carrier. Absence
+    /// means that typed scalar preparation must fail; it is never inferred.
+    pub scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
     pub fragment: FragmentId,
     pub output: OutputPort,
     pub fields: Box<[ResultField]>,

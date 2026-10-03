@@ -5442,12 +5442,14 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(20),
                 output: OutputPort {
                     node: join,
                     columns: Box::from([right_value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "right".into(),
                     alias: None,
                     value: right_value,
@@ -5515,12 +5517,14 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(22),
                 output: OutputPort {
                     node: join,
                     columns: Box::from([left_value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "left".into(),
                     alias: None,
                     value: left_value,
@@ -5665,6 +5669,7 @@ mod tests {
         let names = ["input_fields", "blob_type", "body", "properties"];
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(24),
                 output: OutputPort {
                     node: root,
@@ -5674,6 +5679,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, name)| ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: (*name).into(),
                         alias: None,
                         value: outputs[i],
@@ -5800,12 +5806,14 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: fragment_id,
                 output: OutputPort {
                     node: root,
                     columns: Box::from([value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value,
@@ -5937,12 +5945,14 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: fragment_id,
                 output: OutputPort {
                     node: project,
                     columns: Box::from([output]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value: output,
@@ -6534,12 +6544,14 @@ mod tests {
         })
         .unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: final_fragment,
             output: OutputPort {
                 node: final_topn,
                 columns: Box::from([final_value]),
             },
             fields: Box::from([ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "value".into(),
                 alias: None,
                 value: final_value,
@@ -6874,6 +6886,7 @@ mod tests {
         .unwrap();
         plan.add_runtime_filter(filter).unwrap();
         plan.set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: join_fragment,
             output: OutputPort {
                 node: join,
@@ -6881,12 +6894,14 @@ mod tests {
             },
             fields: Box::from([
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "left".into(),
                     alias: None,
                     value: left_value,
                     ty: ty.clone(),
                 },
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "right".into(),
                     alias: None,
                     value: right_value,
@@ -7040,6 +7055,7 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(19),
                 output: OutputPort {
                     node: project,
@@ -7047,12 +7063,14 @@ mod tests {
                 },
                 fields: Box::from([
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "first".into(),
                         alias: None,
                         value,
                         ty: ty.clone(),
                     },
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "second".into(),
                         alias: None,
                         value,
@@ -7113,12 +7131,14 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(21),
                 output: OutputPort {
                     node: limit,
                     columns: Box::from([value]),
                 },
                 fields: Box::from([ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "value".into(),
                     alias: None,
                     value,
@@ -7295,6 +7315,7 @@ mod tests {
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
+                scalar_schema: None,
                 fragment: FragmentId::new(18),
                 output: OutputPort {
                     node: repeat,
@@ -7302,18 +7323,21 @@ mod tests {
                 },
                 fields: Box::from([
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "left".into(),
                         alias: None,
                         value: nullable_left,
                         ty: ValueType::new(DataType::Int64, true),
                     },
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "right".into(),
                         alias: None,
                         value: nullable_right,
                         ty: ValueType::new(DataType::Int64, true),
                     },
                     ResultField {
+                        domain: novarocks_physical_plan::ResultValueDomain::Plain,
                         name: "grouping".into(),
                         alias: None,
                         value: grouping,

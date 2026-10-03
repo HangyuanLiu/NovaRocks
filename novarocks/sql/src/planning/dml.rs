@@ -783,6 +783,7 @@ fn complete_connector_write_plan(
 
 /// One internal DML read, optimized and waiting for its provider facts.
 pub struct DmlReadCompletion {
+    root_semantics: crate::compiler::root_output::RootOutputSemantics,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
 }
@@ -809,6 +810,7 @@ pub fn begin_final_dml_read_plan(
     .map_err(|error| error.to_string())?;
     Ok((
         DmlReadCompletion {
+            root_semantics: compiled.root_semantics,
             physical,
             query_statistics: compiled.statistics.snapshot,
         },
@@ -823,22 +825,15 @@ impl DmlReadCompletion {
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
     ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-        let mut builder = match reads.into_optional() {
-            Some(reads) => {
-                crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
-                    &self.physical,
-                    version,
-                    dop_domain,
-                    reads,
-                )
-            }
-            None => crate::planner::distributed::build::lower_final_physical_plan(
+        let mut builder =
+            crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
                 &self.physical,
                 version,
                 dop_domain,
-            ),
-        }
-        .map_err(|error| error.to_string())?;
+                reads.into_optional(),
+                self.root_semantics,
+            )
+            .map_err(|error| error.to_string())?;
         self.query_statistics.annotate_final_plan(&mut builder);
         builder.finish().map_err(|error| error.to_string())
     }

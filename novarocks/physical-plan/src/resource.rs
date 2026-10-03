@@ -433,6 +433,10 @@ pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut Validati
         ]);
     }
     if let Some(result) = plan.result_port() {
+        if let Some(schema) = &result.scalar_schema {
+            usage.add_item_counts([schema.type_nodes()]);
+            usage.add_byte_counts([schema.backing_bytes()]);
+        }
         usage.add_item_counts([result.output.columns.len(), result.fields.len()]);
         for (index, field) in result.fields.iter().enumerate() {
             if usage.exhausted() {

@@ -531,6 +531,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
     })
     .unwrap();
     plan.set_result_port(ResultPort {
+        scalar_schema: None,
         fragment: FragmentId::new(2),
         output: OutputPort {
             node: result_node,
@@ -538,12 +539,14 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         },
         fields: Box::from([
             ResultField {
+                domain: ResultValueDomain::Plain,
                 name: "x".into(),
                 alias: None,
                 value: destination_value,
                 ty: ty(DataType::Int64, false),
             },
             ResultField {
+                domain: ResultValueDomain::Plain,
                 name: "y".into(),
                 alias: None,
                 value: destination_value,

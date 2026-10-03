@@ -192,6 +192,14 @@ impl ColumnRefFactory {
             .is_some_and(|column| column.json_list_provenance)
     }
 
+    pub(crate) fn borrowed_logical_type(
+        &self,
+        id: ColumnId,
+    ) -> Option<&novarocks_types::schema::SqlType> {
+        let index = id.0.checked_sub(1)? as usize;
+        self.columns.get(index)?.logical_type.as_ref()
+    }
+
     pub(crate) fn logical_type(&self, id: ColumnId) -> Option<novarocks_types::schema::SqlType> {
         let index = id.0.checked_sub(1)? as usize;
         self.columns.get(index)?.logical_type.clone()

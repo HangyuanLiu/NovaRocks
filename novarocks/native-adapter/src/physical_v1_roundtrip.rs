@@ -289,6 +289,16 @@ fn finish_result_plan(
     root: novarocks_physical_plan::NodeId,
     outputs: Box<[ValueId]>,
 ) -> PhysicalPlan {
+    finish_result_plan_with_scalar_proof(builder, fragment_id, root, outputs, true)
+}
+
+fn finish_result_plan_with_scalar_proof(
+    builder: FragmentBuilder,
+    fragment_id: FragmentId,
+    root: novarocks_physical_plan::NodeId,
+    outputs: Box<[ValueId]>,
+    include_scalar_proof: bool,
+) -> PhysicalPlan {
     let fragment = builder
         .finish_definition(
             root,
@@ -300,21 +310,31 @@ fn finish_result_plan(
             },
         )
         .unwrap();
-    let fields = outputs
+    let fields: Box<[ResultField]> = outputs
         .iter()
         .enumerate()
         .map(|(ordinal, value)| ResultField {
+            domain: novarocks_physical_plan::ResultValueDomain::Plain,
             name: format!("column_{ordinal}").into(),
             alias: None,
             value: *value,
             ty: fragment.values()[value].ty.clone(),
         })
         .collect();
+    let scalar_schema = if include_scalar_proof {
+        match fields.as_ref() {
+            [field] => fixture_plain_scalar_schema(&field.ty),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut plan_builder =
         PlanBuilder::new(PlanVersionId::try_new([fragment_id.get() as u8; 16]).unwrap());
     plan_builder.add_fragment(fragment).unwrap();
     plan_builder
         .set_result_port(ResultPort {
+            scalar_schema,
             fragment: fragment_id,
             output: OutputPort {
                 node: root,
@@ -962,6 +982,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
         .unwrap();
     plan_builder
         .set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: finish_fragment,
             output: OutputPort {
                 node: finish,
@@ -970,6 +991,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
             fields: root_fields
                 .iter()
                 .map(|field| ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: field.name.clone(),
                     alias: None,
                     value: field.value,
@@ -1083,6 +1105,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
     plan_builder.add_fragment(fragment).unwrap();
     plan_builder
         .set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: FragmentId::new(71),
             output: OutputPort {
                 node: limit,
@@ -1090,12 +1113,14 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
             },
             fields: Box::from([
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "left".into(),
                     alias: None,
                     value,
                     ty: ty.clone(),
                 },
                 ResultField {
+                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
                     name: "right".into(),
                     alias: None,
                     value,
@@ -1179,12 +1204,14 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
     plan_builder.add_fragment(fragment).unwrap();
     plan_builder
         .set_result_port(ResultPort {
+            scalar_schema: None,
             fragment: FragmentId::new(72),
             output: OutputPort {
                 node: set_op,
                 columns: Box::from([output]),
             },
             fields: Box::from([ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: "value".into(),
                 alias: None,
                 value: output,
@@ -1602,6 +1629,14 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
 }
 
 fn empty_storage_result_plan(fragment_id: u32, types: &[ValueType]) -> PhysicalPlan {
+    empty_storage_result_plan_with_scalar_proof(fragment_id, types, true)
+}
+
+fn empty_storage_result_plan_with_scalar_proof(
+    fragment_id: u32,
+    types: &[ValueType],
+    include_scalar_proof: bool,
+) -> PhysicalPlan {
     let fragment_id = FragmentId::new(fragment_id);
     let mut builder = FragmentBuilder::new(fragment_id);
     let root = builder.reserve_node_id().unwrap();
@@ -1635,7 +1670,75 @@ fn empty_storage_result_plan(fragment_id: u32, types: &[ValueType]) -> PhysicalP
             },
         })
         .unwrap();
-    finish_result_plan(builder, fragment_id, root, outputs)
+    finish_result_plan_with_scalar_proof(builder, fragment_id, root, outputs, include_scalar_proof)
+}
+
+// These hand-built no-I/O fixtures explicitly declare their plain value
+// identities. They do not stand in for SQL's declared domain authority.
+fn fixture_plain_scalar_schema(ty: &ValueType) -> Option<novarocks_result_contract::ScalarSchema> {
+    use arrow::datatypes::TimeUnit;
+    use novarocks_result_contract::{
+        ScalarField, ScalarSchema, ScalarTimestampUnit as U, ScalarValueType as S,
+    };
+    let value_type = match &ty.data_type {
+        DataType::Null => S::Null,
+        DataType::Boolean => S::Boolean,
+        DataType::Int8 => S::SignedInteger(8),
+        DataType::Int16 => S::SignedInteger(16),
+        DataType::Int32 => S::SignedInteger(32),
+        DataType::Int64 => S::SignedInteger(64),
+        DataType::FixedSizeBinary(16) => S::LargeInt,
+        DataType::Float32 => S::Float32,
+        DataType::Float64 => S::Float64,
+        DataType::Utf8 => S::String,
+        DataType::Binary => S::Binary,
+        DataType::Date32 => S::Date,
+        DataType::Time64(TimeUnit::Microsecond) => S::TimeMicros,
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) if *s >= 0 => S::Decimal {
+            bits: if matches!(ty.data_type, DataType::Decimal128(..)) {
+                128
+            } else {
+                256
+            },
+            precision: *p,
+            scale: *s as u8,
+        },
+        DataType::Timestamp(unit @ (TimeUnit::Microsecond | TimeUnit::Nanosecond), zone) => {
+            S::Timestamp {
+                unit: if *unit == TimeUnit::Microsecond {
+                    U::Microsecond
+                } else {
+                    U::Nanosecond
+                },
+                timezone: zone.as_ref().map(|zone| zone.to_string()),
+            }
+        }
+        _ => return None,
+    };
+    ScalarSchema::try_new(ScalarField {
+        nullable: ty.nullable,
+        value_type,
+    })
+    .ok()
+}
+
+#[test]
+fn scalar_physical_root_refuses_missing_independent_semantic_proof() {
+    let physical = empty_storage_result_plan_with_scalar_proof(
+        108,
+        &[ValueType::new(DataType::Int64, false)],
+        false,
+    );
+    assert!(
+        physical
+            .with_root_output(scalar_root_contract(
+                novarocks_result_contract::ScalarField {
+                    nullable: false,
+                    value_type: novarocks_result_contract::ScalarValueType::SignedInteger(64),
+                }
+            ))
+            .is_err()
+    );
 }
 
 fn scalar_root_contract(

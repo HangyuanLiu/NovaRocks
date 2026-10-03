@@ -113,6 +113,16 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads))
 }
 
+pub(crate) fn lower_final_physical_plan_with_root_semantics(
+    plan: &PhysicalPlanNode,
+    version: PlanVersionId,
+    dop_domain: PipelineDopDomain,
+    reads: Option<FinalizedProviderReadSet>,
+    semantics: crate::compiler::root_output::RootOutputSemantics,
+) -> Result<PlanBuilder, ContractLoweringError> {
+    lower_final_physical_plan_inner_with_domains(plan, version, dop_domain, reads, Some(semantics))
+}
+
 /// Lower one admitted SQL write directly into the final physical-plan
 /// contract. The provider handle is consumed by exact target ordinal here;
 /// neither the logical tree nor the legacy distributed-plan carrier can own or
@@ -201,6 +211,21 @@ fn lower_final_physical_plan_inner(
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
 ) -> Result<PlanBuilder, ContractLoweringError> {
+    lower_final_physical_plan_inner_with_domains(plan, version, dop_domain, reads, None)
+}
+
+fn lower_final_physical_plan_inner_with_domains(
+    plan: &PhysicalPlanNode,
+    version: PlanVersionId,
+    dop_domain: PipelineDopDomain,
+    reads: Option<FinalizedProviderReadSet>,
+    semantics: Option<crate::compiler::root_output::RootOutputSemantics>,
+) -> Result<PlanBuilder, ContractLoweringError> {
+    let domains = semantics
+        .as_ref()
+        .map(|facts| facts.domains(&plan.output_columns))
+        .transpose()
+        .map_err(invalid_write)?;
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
     let root = visitor.lower_node(plan)?;
@@ -213,12 +238,24 @@ fn lower_final_physical_plan_inner(
         .iter()
         .map(|value| visitor.value_declared_type(*value))
         .collect::<Result<Vec<_>, _>>()?;
-    let result_fields = result_fields(plan, &root.output, &result_types, &root.display_names)?;
+    let mut result_fields = result_fields(plan, &root.output, &result_types, &root.display_names)?;
+    if let Some(domains) = &domains {
+        if domains.len() != result_fields.len() {
+            return Err(invalid_write("root semantic field count differs".into()));
+        }
+        for (field, domain) in result_fields.iter_mut().zip(domains) {
+            if !domain.matches_storage(&field.ty.data_type) {
+                return Err(invalid_write("root semantic field storage differs".into()));
+            }
+            field.domain = *domain;
+        }
+    }
     let result_output = OutputPort {
         node: root.node,
         columns: root.output.clone(),
     };
     let result_port = ResultPort {
+        scalar_schema: semantics.and_then(|facts| facts.scalar_schema(&result_types)),
         fragment: root.fragment,
         output: result_output,
         fields: result_fields,
@@ -3564,6 +3601,7 @@ impl ContractLoweringVisitor {
             .iter()
             .zip(output.iter())
             .map(|(field, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: field.name().clone().into_boxed_str(),
                 alias: None,
                 value: *value,
@@ -3573,6 +3611,7 @@ impl ContractLoweringVisitor {
             .into_boxed_slice();
         self.complete_fragment(finish_fragment, finish, FragmentSink::Result)?;
         self.finish_draft(ResultPort {
+            scalar_schema: None,
             fragment: finish_fragment,
             output: OutputPort {
                 node: finish,
@@ -8214,6 +8253,7 @@ fn result_fields(
             // statement that aliased nothing still has one.
             let alias = identity.and_then(|identity| identity.alias.as_deref());
             ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
                 name: name.into(),
                 alias: alias.map(Into::into),
                 value: *value,
