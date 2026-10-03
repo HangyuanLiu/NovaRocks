@@ -77,6 +77,8 @@ mod string_case;
 mod string_case_owner;
 mod string_concat;
 mod string_concat_owner;
+mod string_concat_ws;
+mod string_concat_ws_owner;
 mod string_find_in_set;
 mod string_find_in_set_owner;
 mod string_from_base64;

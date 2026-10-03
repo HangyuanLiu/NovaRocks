@@ -334,7 +334,16 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "concat",
         Signature::variadic(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
     );
-    for name in ["concat_ws", "elt", "format"] {
+    // CONCAT_WS requires the separator and one value before its repeated tail.
+    add(
+        m,
+        "concat_ws",
+        Signature::variadic(
+            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+            TypeSpec::Utf8,
+        ),
+    );
+    for name in ["elt", "format"] {
         add(
             m,
             name,
