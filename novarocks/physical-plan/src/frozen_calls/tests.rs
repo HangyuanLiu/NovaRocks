@@ -963,7 +963,7 @@ fn call_count_preflight_rejects_over_budget_without_visiting_entries() {
     );
     assert_eq!(
         *control.observations.lock().unwrap(),
-        vec![(CompilePhase::Validate, 0)]
+        vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 0)]
     );
 }
 

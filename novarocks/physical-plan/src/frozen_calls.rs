@@ -121,6 +121,19 @@ impl From<CompileControlError> for FrozenCallError {
     }
 }
 
+// Ordinary validation exits observe their completed tail. A refusal from this
+// or an exact nested owner is already primary and never receives another call.
+fn finish_frozen_calls<T>(
+    work: CompileCheckpoints<'_>,
+    result: Result<T, FrozenCallError>,
+) -> Result<T, FrozenCallError> {
+    if matches!(&result, Err(FrozenCallError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
 impl FrozenFragmentCalls {
     pub fn try_new(
         fragment: &Fragment,
@@ -129,23 +142,26 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<Self, FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        if calls.len() > MAX_CONTROL_USE_REFERENCES {
-            return Err(FrozenCallError::TooManyItems);
-        }
-        let mut entries = BTreeMap::new();
-        for call in calls {
-            if entries.insert(call.site, call).is_some() {
-                return Err(FrozenCallError::DuplicateSite);
+        let result = (|| {
+            if calls.len() > MAX_CONTROL_USE_REFERENCES {
+                return Err(FrozenCallError::TooManyItems);
             }
-            work.step()?;
-        }
-        let value = Self {
-            fragment: fragment.id(),
-            entries: Arc::new(entries),
-        };
-        value.validate_fragment(fragment, uses, control)?;
-        work.finish()?;
-        Ok(value)
+            let mut entries = BTreeMap::new();
+            for call in calls {
+                if entries.insert(call.site, call).is_some() {
+                    return Err(FrozenCallError::DuplicateSite);
+                }
+                work.step()?;
+            }
+            let value = Self {
+                fragment: fragment.id(),
+                entries: Arc::new(entries),
+            };
+            work.flush()?;
+            value.validate_fragment(fragment, uses, control)?;
+            Ok(value)
+        })();
+        finish_frozen_calls(work, result)
     }
 
     /// Recheck claims against this package's current snapshot. Changing a
@@ -158,106 +174,109 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<(), FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        if uses.roots().fragment() != fragment.id() {
-            return Err(FrozenCallError::Roots(RootUseBindingError::WrongFragment));
-        }
-        if self.fragment != fragment.id() {
-            return Err(FrozenCallError::WrongFragment);
-        }
-        uses.validate_fragment(fragment, control)
-            .map_err(|error| match error {
-                RootUseBindingError::Control(error) => FrozenCallError::Control(error),
-                error => FrozenCallError::Roots(error),
+        let result = (|| {
+            if uses.roots().fragment() != fragment.id() {
+                return Err(FrozenCallError::Roots(RootUseBindingError::WrongFragment));
+            }
+            if self.fragment != fragment.id() {
+                return Err(FrozenCallError::WrongFragment);
+            }
+            work.flush()?;
+            uses.validate_fragment(fragment, control)
+                .map_err(|error| match error {
+                    RootUseBindingError::Control(error) => FrozenCallError::Control(error),
+                    error => FrozenCallError::Roots(error),
+                })?;
+            // The same invocation budget covers scalar graph references and real
+            // relational calls. It does not multiply by an arena's maximum ID.
+            let mut references = uses.flow().use_reference_count();
+            let mut special_ids = BTreeSet::new();
+            let mut visited = 0usize;
+            visit_calls(fragment, uses, &mut work, |site, binding, work| {
+                let call = self
+                    .entries
+                    .get(&site)
+                    .ok_or(FrozenCallError::MissingSite(site))?;
+                if matches!(binding, PhysicalCallBinding::Aggregate(_))
+                    && binding.kind() != FunctionKind::Aggregate
+                {
+                    return Err(FrozenCallError::InvalidEffects(
+                        EffectContractError::KindMismatch,
+                    ));
+                }
+                match site {
+                    PhysicalCallSite::Expression(id) => {
+                        let invocation = &uses.flow().uses()[&id];
+                        if call.context != invocation.context {
+                            return Err(FrozenCallError::WrongContext);
+                        }
+                        match binding {
+                            PhysicalCallBinding::Scalar(_) => {
+                                if !call
+                                    .effects
+                                    .argument_control
+                                    .matches_scalar_shape(invocation.control)
+                                {
+                                    return Err(FrozenCallError::WrongControl);
+                                }
+                            }
+                            PhysicalCallBinding::Window { .. } => {
+                                if !matches!(
+                                    call.effects.argument_control,
+                                    ArgumentControl::Aggregate | ArgumentControl::Window
+                                ) {
+                                    return Err(FrozenCallError::WrongControl);
+                                }
+                            }
+                            PhysicalCallBinding::Aggregate(_) | PhysicalCallBinding::Table(_) => {
+                                unreachable!()
+                            }
+                        }
+                    }
+                    PhysicalCallSite::Aggregate { .. }
+                    | PhysicalCallSite::TopNState { .. }
+                    | PhysicalCallSite::WriterPartial { .. }
+                    | PhysicalCallSite::WriterFinal { .. }
+                    | PhysicalCallSite::Table { .. } => {
+                        references = references
+                            .checked_add(1)
+                            .ok_or(FrozenCallError::TooManyItems)?;
+                        if references > MAX_CONTROL_USE_REFERENCES {
+                            return Err(FrozenCallError::TooManyItems);
+                        }
+                        if call.context.demand != EvaluationDemand::Value {
+                            return Err(FrozenCallError::WrongContext);
+                        }
+                        if uses.flow().uses().contains_key(&call.context.use_id)
+                            || !special_ids.insert(call.context.use_id)
+                        {
+                            return Err(FrozenCallError::SharedUse);
+                        }
+                        let domain = uses
+                            .flow()
+                            .domains()
+                            .get(&call.context.domain)
+                            .ok_or(FrozenCallError::InvalidDomain)?;
+                        if domain.parent.is_some() || domain.guard.is_some() {
+                            return Err(FrozenCallError::InvalidDomain);
+                        }
+                    }
+                }
+                if call.effects.proof_scope != CallProofScope::Unconditional
+                    && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
+                {
+                    return Err(FrozenCallError::WrongProofScope);
+                }
+                validate_public_effect_shape(binding.kind(), &call.effects, work)?;
+                visited += 1;
+                Ok(())
             })?;
-        // The same invocation budget covers scalar graph references and real
-        // relational calls. It does not multiply by an arena's maximum ID.
-        let mut references = uses.flow().use_reference_count();
-        let mut special_ids = BTreeSet::new();
-        let mut visited = 0usize;
-        visit_calls(fragment, uses, &mut work, |site, binding, work| {
-            let call = self
-                .entries
-                .get(&site)
-                .ok_or(FrozenCallError::MissingSite(site))?;
-            if matches!(binding, PhysicalCallBinding::Aggregate(_))
-                && binding.kind() != FunctionKind::Aggregate
-            {
-                return Err(FrozenCallError::InvalidEffects(
-                    EffectContractError::KindMismatch,
-                ));
+            if visited != self.entries.len() {
+                return Err(FrozenCallError::InvalidSite);
             }
-            match site {
-                PhysicalCallSite::Expression(id) => {
-                    let invocation = &uses.flow().uses()[&id];
-                    if call.context != invocation.context {
-                        return Err(FrozenCallError::WrongContext);
-                    }
-                    match binding {
-                        PhysicalCallBinding::Scalar(_) => {
-                            if !call
-                                .effects
-                                .argument_control
-                                .matches_scalar_shape(invocation.control)
-                            {
-                                return Err(FrozenCallError::WrongControl);
-                            }
-                        }
-                        PhysicalCallBinding::Window { .. } => {
-                            if !matches!(
-                                call.effects.argument_control,
-                                ArgumentControl::Aggregate | ArgumentControl::Window
-                            ) {
-                                return Err(FrozenCallError::WrongControl);
-                            }
-                        }
-                        PhysicalCallBinding::Aggregate(_) | PhysicalCallBinding::Table(_) => {
-                            unreachable!()
-                        }
-                    }
-                }
-                PhysicalCallSite::Aggregate { .. }
-                | PhysicalCallSite::TopNState { .. }
-                | PhysicalCallSite::WriterPartial { .. }
-                | PhysicalCallSite::WriterFinal { .. }
-                | PhysicalCallSite::Table { .. } => {
-                    references = references
-                        .checked_add(1)
-                        .ok_or(FrozenCallError::TooManyItems)?;
-                    if references > MAX_CONTROL_USE_REFERENCES {
-                        return Err(FrozenCallError::TooManyItems);
-                    }
-                    if call.context.demand != EvaluationDemand::Value {
-                        return Err(FrozenCallError::WrongContext);
-                    }
-                    if uses.flow().uses().contains_key(&call.context.use_id)
-                        || !special_ids.insert(call.context.use_id)
-                    {
-                        return Err(FrozenCallError::SharedUse);
-                    }
-                    let domain = uses
-                        .flow()
-                        .domains()
-                        .get(&call.context.domain)
-                        .ok_or(FrozenCallError::InvalidDomain)?;
-                    if domain.parent.is_some() || domain.guard.is_some() {
-                        return Err(FrozenCallError::InvalidDomain);
-                    }
-                }
-            }
-            if call.effects.proof_scope != CallProofScope::Unconditional
-                && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
-            {
-                return Err(FrozenCallError::WrongProofScope);
-            }
-            validate_public_effect_shape(binding.kind(), &call.effects, work)?;
-            visited += 1;
             Ok(())
-        })?;
-        if visited != self.entries.len() {
-            return Err(FrozenCallError::InvalidSite);
-        }
-        work.finish()?;
-        Ok(())
+        })();
+        finish_frozen_calls(work, result)
     }
 
     pub const fn fragment(&self) -> FragmentId {
@@ -277,15 +296,17 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<usize, FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let mut items = self.entries.len();
-        for call in self.entries.values() {
-            items = items
-                .checked_add(call.effects.environment.len())
-                .ok_or(FrozenCallError::TooManyItems)?;
-            work.step()?;
-        }
-        work.finish()?;
-        Ok(items)
+        let result = (|| {
+            let mut items = self.entries.len();
+            for call in self.entries.values() {
+                items = items
+                    .checked_add(call.effects.environment.len())
+                    .ok_or(FrozenCallError::TooManyItems)?;
+                work.step()?;
+            }
+            Ok(items)
+        })();
+        finish_frozen_calls(work, result)
     }
 
     /// Lookup the real binding for this occurrence. This is not admission; the

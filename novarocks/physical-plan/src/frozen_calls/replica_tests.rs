@@ -107,6 +107,143 @@ fn prefixes(
 }
 
 #[test]
+fn frozen_construction_success_duplicate_and_missing_site_observe_all_original_tails() {
+    let fixture = scalar_fixture(2, u32::MAX);
+    for variant in 0..3 {
+        let mut calls = fixture.calls.clone();
+        match variant {
+            0 => {}
+            1 => calls.push(calls[0].clone()),
+            2 => {
+                calls.pop();
+            }
+            _ => unreachable!(),
+        }
+        let expected = match variant {
+            0 => None,
+            1 => Some(FrozenCallError::DuplicateSite),
+            2 => Some(FrozenCallError::MissingSite(fixture.calls[1].site)),
+            _ => unreachable!(),
+        };
+        let good = ReplicaControl::default();
+        assert_eq!(
+            FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls.clone(), &good)
+                .err(),
+            expected,
+        );
+        let trace = good.trace.lock().unwrap().clone();
+        assert!(trace.last().is_some());
+        if variant == 1 {
+            assert_eq!(
+                trace,
+                vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 2)]
+            );
+        }
+        prefixes(
+            |control| {
+                FrozenFragmentCalls::try_new(
+                    &fixture.fragment,
+                    &fixture.uses,
+                    calls.clone(),
+                    control,
+                )
+                .map(|_| ())
+            },
+            variant == 0,
+            true,
+        );
+    }
+}
+
+#[test]
+fn frozen_validation_success_ordinary_context_and_public_shape_keep_every_tail_cause() {
+    let fixture = scalar_fixture(2, 711);
+    let checked = fixture.checked().unwrap();
+    for variant in 0..3 {
+        let mut actual = checked.clone();
+        let entry = Arc::make_mut(&mut actual.entries)
+            .get_mut(&fixture.calls[1].site)
+            .unwrap();
+        let expected = match variant {
+            0 => None,
+            1 => {
+                entry.context.demand = EvaluationDemand::TruthOnly;
+                Some(FrozenCallError::WrongContext)
+            }
+            2 => {
+                entry.effects.argument_control = ArgumentControl::TypeOnly;
+                Some(FrozenCallError::WrongControl)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            actual
+                .validate_fragment(&fixture.fragment, &fixture.uses, &ReplicaControl::default())
+                .err(),
+            expected
+        );
+        prefixes(
+            |control| actual.validate_fragment(&fixture.fragment, &fixture.uses, control),
+            variant == 0,
+            true,
+        );
+    }
+}
+
+#[test]
+fn frozen_validation_foreign_fragment_and_extra_site_keep_zero_tail_observation() {
+    let fixture = scalar_fixture(2, 712);
+    let checked = fixture.checked().unwrap();
+    let foreign = scalar_fixture(2, 713);
+    assert_eq!(
+        checked.validate_fragment(&foreign.fragment, &foreign.uses, &ReplicaControl::default()),
+        Err(FrozenCallError::WrongFragment)
+    );
+    prefixes(
+        |control| checked.validate_fragment(&foreign.fragment, &foreign.uses, control),
+        false,
+        true,
+    );
+    let mut extra = checked.clone();
+    let mut call = fixture.calls[0].clone();
+    call.site = PhysicalCallSite::WriterPartial {
+        node: fixture.fragment.root(),
+        call: u32::MAX,
+    };
+    Arc::make_mut(&mut extra.entries).insert(call.site, call);
+    assert_eq!(
+        extra.validate_fragment(&fixture.fragment, &fixture.uses, &ReplicaControl::default()),
+        Err(FrozenCallError::InvalidSite)
+    );
+    prefixes(
+        |control| extra.validate_fragment(&fixture.fragment, &fixture.uses, control),
+        false,
+        true,
+    );
+}
+
+#[test]
+fn frozen_dynamic_item_invoice_success_uses_original_control_for_each_tail() {
+    let fixture = scalar_fixture(2, 714);
+    let checked = fixture.checked().unwrap();
+    let expected = checked.entries().len()
+        + checked
+            .entries()
+            .values()
+            .map(|call| call.effects.environment.len())
+            .sum::<usize>();
+    assert_eq!(
+        checked.dynamic_items_observed(&ReplicaControl::default()),
+        Ok(expected)
+    );
+    prefixes(
+        |control| checked.dynamic_items_observed(control).map(|_| ()),
+        true,
+        true,
+    );
+}
+
+#[test]
 fn replica_equivalence_shared_definition_checks_each_sparse_use_and_domain() {
     let mut fixture = scalar_fixture(2, 0);
     broadcast(&mut fixture);
