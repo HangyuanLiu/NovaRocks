@@ -2381,6 +2381,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_substring_owner::operation(name).is_some() => {
                         Some(super::string_substring_owner::effects())
                     }
+                    name if super::string_substring_index_owner::operation(name).is_some() => {
+                        Some(super::string_substring_index_owner::effects())
+                    }
                     name if super::string_left_right_owner::operation(name).is_some() => {
                         Some(super::string_left_right_owner::effects())
                     }
@@ -2576,6 +2579,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_substring_owner::operation(name).is_some() => {
                 super::string_substring_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_substring_index_owner::operation(name).is_some() => {
+                super::string_substring_index_owner::definition(name, declaration, resolver)?
             }
             name if super::string_left_right_owner::operation(name).is_some() => {
                 super::string_left_right_owner::definition(name, declaration, resolver)?
